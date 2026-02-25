@@ -5,8 +5,8 @@
 //! and ranking stability.
 
 use frankenterm_core::search::orchestrator::{
-    DaemonDispatch, EmbedderDispatch, LegacySearchInput, OrchestrationBackend, OrchestratorConfig,
-    RerankerDispatch, SearchModeConfig, SearchOrchestrator,
+    DaemonDispatch, EmbedderDispatch, LegacySearchInput, LexicalDispatch, OrchestrationBackend,
+    OrchestratorConfig, RerankerDispatch, SearchModeConfig, SearchOrchestrator,
 };
 use proptest::prelude::*;
 
@@ -54,49 +54,59 @@ fn arb_daemon_dispatch() -> impl Strategy<Value = DaemonDispatch> {
     ]
 }
 
+fn arb_lexical_dispatch() -> impl Strategy<Value = LexicalDispatch> {
+    prop_oneof![
+        Just(LexicalDispatch::Disabled),
+        Just(LexicalDispatch::RecorderDirect),
+        Just(LexicalDispatch::Managed),
+    ]
+}
+
 fn arb_config() -> impl Strategy<Value = OrchestratorConfig> {
     (
         arb_backend(),
         arb_search_mode(),
-        1..=200_u32,               // rrf_k
-        0.0..=1.0_f32,             // alpha
-        0.1..=5.0_f32,             // lexical_weight
-        0.1..=5.0_f32,             // semantic_weight
-        any::<bool>(),              // fallback_to_legacy
-        arb_embedder_dispatch(),    // embedder_dispatch
-        arb_vector_index_backend(), // vector_index_backend
-        any::<bool>(),              // chunking_adapter_enabled
-        arb_reranker_dispatch(),    // reranker_dispatch (B6)
-        arb_daemon_dispatch(),      // daemon_dispatch (B7)
+        1..=200_u32,                                     // rrf_k
+        0.0..=1.0_f32,                                   // alpha
+        0.1..=5.0_f32,                                   // lexical_weight
+        0.1..=5.0_f32,                                   // semantic_weight
+        any::<bool>(),                                   // fallback_to_legacy
+        arb_embedder_dispatch(),                         // embedder_dispatch
+        arb_vector_index_backend(),                      // vector_index_backend
+        any::<bool>(),                                   // chunking_adapter_enabled
+        arb_reranker_dispatch(),                         // reranker_dispatch (B6)
+        (arb_daemon_dispatch(), arb_lexical_dispatch()), // (B7, B8)
     )
-        .prop_map(|(backend, mode, rrf_k, alpha, lw, sw, fallback, emb, vib, cae, rd, dd)| {
-            OrchestratorConfig {
-                backend,
-                mode,
-                rrf_k,
-                alpha,
-                lexical_weight: lw,
-                semantic_weight: sw,
-                fallback_to_legacy: fallback,
-                embedder_dispatch: emb,
-                vector_index_backend: vib,
-                chunking_adapter_enabled: cae,
-                reranker_dispatch: rd,
-                daemon_dispatch: dd,
-            }
-        })
+        .prop_map(
+            |(backend, mode, rrf_k, alpha, lw, sw, fallback, emb, vib, cae, rd, (dd, ld))| {
+                OrchestratorConfig {
+                    backend,
+                    mode,
+                    rrf_k,
+                    alpha,
+                    lexical_weight: lw,
+                    semantic_weight: sw,
+                    fallback_to_legacy: fallback,
+                    embedder_dispatch: emb,
+                    vector_index_backend: vib,
+                    chunking_adapter_enabled: cae,
+                    reranker_dispatch: rd,
+                    daemon_dispatch: dd,
+                    lexical_dispatch: ld,
+                }
+            },
+        )
 }
 
 fn arb_ranked_list(max_len: usize) -> impl Strategy<Value = Vec<(u64, f32)>> {
-    prop::collection::vec((1..=1000_u64, 0.001..=100.0_f32), 0..=max_len)
-        .prop_map(|mut v| {
-            // Deduplicate by ID (first wins)
-            let mut seen = std::collections::HashSet::new();
-            v.retain(|(id, _)| seen.insert(*id));
-            // Sort by score descending
-            v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            v
-        })
+    prop::collection::vec((1..=1000_u64, 0.001..=100.0_f32), 0..=max_len).prop_map(|mut v| {
+        // Deduplicate by ID (first wins)
+        let mut seen = std::collections::HashSet::new();
+        v.retain(|(id, _)| seen.insert(*id));
+        // Sort by score descending
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    })
 }
 
 fn arb_input() -> impl Strategy<Value = LegacySearchInput> {

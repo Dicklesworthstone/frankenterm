@@ -74,7 +74,6 @@ pub struct PostIncidentInput {
 }
 
 /// Validate pipeline input.
-#[must_use]
 pub fn validate_input(input: &PostIncidentInput) -> Result<(), String> {
     if input.incident_id.is_empty() {
         return Err("incident_id is required".into());

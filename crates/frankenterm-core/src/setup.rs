@@ -363,10 +363,14 @@ pub fn unpatch_shell_rc_at(rc_path: &Path) -> Result<PatchResult> {
 
     // Remove the wa block (markers guaranteed present by has_shell_ft_block check above)
     let Some(begin_idx) = content.find(FT_BEGIN_MARKER_SHELL) else {
-        return Err(Error::SetupError("Begin marker not found in shell config".into()));
+        return Err(Error::SetupError(
+            "Begin marker not found in shell config".into(),
+        ));
     };
     let Some(end_marker_start) = content.find(FT_END_MARKER_SHELL) else {
-        return Err(Error::SetupError("End marker not found in shell config".into()));
+        return Err(Error::SetupError(
+            "End marker not found in shell config".into(),
+        ));
     };
     let end_idx = content[end_marker_start..]
         .find('\n')
@@ -821,10 +825,8 @@ fn find_return_line_start(content: &str) -> Option<usize> {
         let after_line = offset + line.len();
         let sep_len = if content[after_line..].starts_with("\r\n") {
             2
-        } else if content[after_line..].starts_with('\n') {
-            1
         } else {
-            0 // last line, no separator
+            usize::from(content[after_line..].starts_with('\n'))
         };
         offset = after_line + sep_len;
     }

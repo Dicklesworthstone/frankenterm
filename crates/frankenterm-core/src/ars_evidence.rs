@@ -263,7 +263,7 @@ impl EvidenceLedger {
             .unwrap_or_else(|| "0".repeat(64)); // Genesis hash.
 
         let entry_hash = if self.config.hash_chain_enabled {
-            compute_entry_hash(seq, &category, timestamp_us, &summary, &payload, &prev_hash)
+            compute_entry_hash(seq, category, timestamp_us, &summary, &payload, &prev_hash)
         } else {
             format!("unhashed-{}", seq)
         };
@@ -717,7 +717,7 @@ impl Default for EvidenceBuilder {
 /// Uses the same FNV-1a approach as recorder_audit.rs for consistency.
 fn compute_entry_hash(
     seq: u64,
-    category: &EvidenceCategory,
+    category: EvidenceCategory,
     timestamp_us: u64,
     summary: &str,
     payload: &BTreeMap<String, EvidenceValue>,
@@ -1198,7 +1198,7 @@ mod tests {
         let payload = BTreeMap::new();
         let h1 = compute_entry_hash(
             0,
-            &EvidenceCategory::ChangeDetection,
+            EvidenceCategory::ChangeDetection,
             1000,
             "test",
             &payload,
@@ -1206,7 +1206,7 @@ mod tests {
         );
         let h2 = compute_entry_hash(
             0,
-            &EvidenceCategory::ChangeDetection,
+            EvidenceCategory::ChangeDetection,
             1000,
             "test",
             &payload,
@@ -1220,7 +1220,7 @@ mod tests {
         let payload = BTreeMap::new();
         let h1 = compute_entry_hash(
             0,
-            &EvidenceCategory::ChangeDetection,
+            EvidenceCategory::ChangeDetection,
             1000,
             "test",
             &payload,
@@ -1228,7 +1228,7 @@ mod tests {
         );
         let h2 = compute_entry_hash(
             1,
-            &EvidenceCategory::ChangeDetection,
+            EvidenceCategory::ChangeDetection,
             1000,
             "test",
             &payload,
@@ -1241,7 +1241,7 @@ mod tests {
     fn hash_length_is_64() {
         let h = compute_entry_hash(
             0,
-            &EvidenceCategory::ChangeDetection,
+            EvidenceCategory::ChangeDetection,
             1000,
             "test",
             &BTreeMap::new(),

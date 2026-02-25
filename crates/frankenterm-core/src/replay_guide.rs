@@ -662,7 +662,7 @@ fn execute_test_rule_step(
                     .context
                     .baseline_path
                     .as_deref()
-                    .or(input.context.artifact_paths.first().map(|s| s.as_str()))
+                    .or_else(|| input.context.artifact_paths.first().map(String::as_str))
                     .unwrap_or("");
                 GuideStepOutput {
                     workflow: input.workflow,
@@ -730,11 +730,11 @@ fn execute_test_rule_step(
         }
         2 => {
             // Step 2: Run baseline + candidate replay with diff
-            let baseline = input.context.baseline_path.as_deref().or(input
+            let baseline = input
                 .context
-                .artifact_paths
-                .first()
-                .map(|s| s.as_str()));
+                .baseline_path
+                .as_deref()
+                .or_else(|| input.context.artifact_paths.first().map(String::as_str));
             let candidate = input.context.candidate_path.as_deref();
 
             if baseline.is_none() || candidate.is_none() {

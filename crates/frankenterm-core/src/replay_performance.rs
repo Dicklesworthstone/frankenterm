@@ -385,7 +385,7 @@ pub fn runs_within_relative_spread(values: &[f64], max_relative_spread: f64) -> 
 
     let mean = sum / count;
     if mean == 0.0 {
-        return min == max;
+        return (min - max).abs() < f64::EPSILON;
     }
 
     let spread = (max - min) / mean;

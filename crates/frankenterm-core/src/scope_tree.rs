@@ -244,7 +244,7 @@ impl ScopeNode {
             self.state,
             self.parent_id
                 .as_ref()
-                .map_or("none".to_string(), |p| p.0.clone()),
+                .map_or_else(|| "none".to_string(), |p| p.0.clone()),
             self.children.len(),
             self.created_at_ms,
         )

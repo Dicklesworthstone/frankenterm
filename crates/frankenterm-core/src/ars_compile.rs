@@ -439,6 +439,7 @@ impl ArsCompiler {
     }
 
     /// Validate bindings against safety regexes.
+    #[allow(clippy::unused_self)]
     fn validate_bindings(
         &self,
         commands: &[GeneralizedCommand],
@@ -576,54 +577,63 @@ impl CompileInputBuilder {
     }
 
     /// Set the description.
+    #[must_use]
     pub fn description(mut self, desc: impl Into<String>) -> Self {
         self.description = Some(desc.into());
         self
     }
 
     /// Add a generalized command.
+    #[must_use]
     pub fn command(mut self, cmd: GeneralizedCommand) -> Self {
         self.commands.push(cmd);
         self
     }
 
     /// Set commands from a vec.
+    #[must_use]
     pub fn commands(mut self, cmds: Vec<GeneralizedCommand>) -> Self {
         self.commands = cmds;
         self
     }
 
     /// Set the timeout decision.
+    #[must_use]
     pub fn timeout(mut self, td: TimeoutDecision) -> Self {
         self.timeout = Some(td);
         self
     }
 
     /// Set the evidence digest.
+    #[must_use]
     pub fn evidence(mut self, digest: LedgerDigest) -> Self {
         self.evidence_digest = Some(digest);
         self
     }
 
     /// Set the trigger.
+    #[must_use]
     pub fn trigger(mut self, trigger: DescriptorTrigger) -> Self {
         self.trigger = Some(trigger);
         self
     }
 
     /// Add a binding.
+    #[must_use]
     pub fn bind(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.bindings.insert(name.into(), value.into());
         self
     }
 
     /// Set bindings from a map.
+    #[must_use]
     pub fn bindings(mut self, map: HashMap<String, String>) -> Self {
         self.bindings = map;
         self
     }
 
     /// Set custom success pattern.
+    #[must_use]
     pub fn success_pattern(mut self, pattern: impl Into<String>) -> Self {
         self.success_pattern = Some(pattern.into());
         self

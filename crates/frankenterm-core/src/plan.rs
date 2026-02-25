@@ -3601,7 +3601,7 @@ pub fn execute_compensation_phase(
         .iter()
         .filter(|sr| sr.outcome.is_committed())
         .collect();
-    steps_to_compensate.sort_by(|a, b| b.ordinal.cmp(&a.ordinal));
+    steps_to_compensate.sort_by_key(|a| std::cmp::Reverse(a.ordinal));
 
     // If nothing to compensate
     if steps_to_compensate.is_empty() {

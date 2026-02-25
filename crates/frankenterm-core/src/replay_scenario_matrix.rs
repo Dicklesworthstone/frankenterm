@@ -135,8 +135,14 @@ impl MatrixResult {
     #[must_use]
     pub fn from_results(scenarios: Vec<ScenarioResult>) -> Self {
         let total_scenarios = scenarios.len();
-        let pass_count = scenarios.iter().filter(|s| s.is_ok() && !s.has_divergence()).count();
-        let divergence_count = scenarios.iter().filter(|s| s.is_ok() && s.has_divergence()).count();
+        let pass_count = scenarios
+            .iter()
+            .filter(|s| s.is_ok() && !s.has_divergence())
+            .count();
+        let divergence_count = scenarios
+            .iter()
+            .filter(|s| s.is_ok() && s.has_divergence())
+            .count();
         let error_count = scenarios.iter().filter(|s| !s.is_ok()).count();
         let total_duration_ms = scenarios.iter().map(|s| s.duration_ms).sum();
 
@@ -313,13 +319,9 @@ impl ScenarioMatrixRunner {
         let pairs = self.config.scenario_pairs();
         let total = pairs.len();
         let mut results = Vec::with_capacity(total);
-        let mut completed = 0usize;
 
-        for (art, ovr) in &pairs {
-            let override_label = ovr
-                .as_ref()
-                .map(|o| o.label.clone())
-                .unwrap_or_default();
+        for (completed, (art, ovr)) in pairs.iter().enumerate() {
+            let override_label = ovr.as_ref().map(|o| o.label.clone()).unwrap_or_default();
 
             on_progress(ProgressEvent {
                 completed,
@@ -331,10 +333,8 @@ impl ScenarioMatrixRunner {
             // Run baseline.
             let baseline_result = (self.generator)(&art.path, None);
             // Run candidate (with override if present).
-            let candidate_result = (self.generator)(
-                &art.path,
-                ovr.as_ref().map(|o| o.path.as_str()),
-            );
+            let candidate_result =
+                (self.generator)(&art.path, ovr.as_ref().map(|o| o.path.as_str()));
 
             let scenario = match (baseline_result, candidate_result) {
                 (Ok(baseline), Ok(candidate)) => {
@@ -371,7 +371,6 @@ impl ScenarioMatrixRunner {
 
             let has_divergence = scenario.has_divergence();
             results.push(scenario);
-            completed += 1;
 
             // fail_fast: stop on first divergence.
             if self.config.config.fail_fast && has_divergence {
@@ -422,9 +421,7 @@ fail_fast = false
 "#
     }
 
-    fn mock_generator(
-        decisions: Vec<String>,
-    ) -> DecisionGenerator {
+    fn mock_generator(decisions: Vec<String>) -> DecisionGenerator {
         Box::new(move |_art, ovr| {
             if ovr.is_some() {
                 // Candidate: add one extra decision.
@@ -438,9 +435,7 @@ fail_fast = false
     }
 
     fn identical_generator() -> DecisionGenerator {
-        Box::new(|_art, _ovr| {
-            Ok(vec!["d1".into(), "d2".into(), "d3".into()])
-        })
+        Box::new(|_art, _ovr| Ok(vec!["d1".into(), "d2".into(), "d3".into()]))
     }
 
     fn error_generator() -> DecisionGenerator {

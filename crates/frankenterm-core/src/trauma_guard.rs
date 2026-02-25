@@ -499,7 +499,7 @@ fn sanitize_config(mut config: TraumaConfig) -> TraumaConfig {
     config.execution_prefixes = sanitize_list(config.execution_prefixes);
     config
         .execution_prefixes
-        .sort_by(|left, right| right.len().cmp(&left.len()));
+        .sort_by_key(|s| std::cmp::Reverse(s.len()));
 
     if config.critical_flags.is_empty() {
         config.critical_flags = DEFAULT_CRITICAL_FLAGS
@@ -623,8 +623,10 @@ fn is_functional_mutation_path(path: &str) -> bool {
         return false;
     }
 
-    if normalized.ends_with(".md") || normalized.ends_with(".txt") {
-        return false;
+    if let Some(ext) = std::path::Path::new(&normalized).extension() {
+        if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("txt") {
+            return false;
+        }
     }
 
     true

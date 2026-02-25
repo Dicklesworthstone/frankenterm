@@ -154,16 +154,19 @@ pub fn chunks_to_documents(chunks: &[SemanticChunk]) -> Vec<ChunkDocument> {
 // ── ChunkDocument → metadata extraction helpers ─────────────────────────
 
 /// Extract the pane ID from document metadata.
+#[allow(clippy::implicit_hasher)]
 pub fn extract_pane_id(metadata: &HashMap<String, String>) -> Option<u64> {
     metadata.get(KEY_PANE_ID).and_then(|v| v.parse().ok())
 }
 
 /// Extract the session ID from document metadata.
+#[allow(clippy::implicit_hasher)]
 pub fn extract_session_id(metadata: &HashMap<String, String>) -> Option<String> {
     metadata.get(KEY_SESSION_ID).cloned()
 }
 
 /// Extract the chunk direction from document metadata.
+#[allow(clippy::implicit_hasher)]
 pub fn extract_direction(metadata: &HashMap<String, String>) -> Option<ChunkDirection> {
     metadata
         .get(KEY_DIRECTION)
@@ -171,21 +174,25 @@ pub fn extract_direction(metadata: &HashMap<String, String>) -> Option<ChunkDire
 }
 
 /// Extract the policy version from document metadata.
+#[allow(clippy::implicit_hasher)]
 pub fn extract_policy_version(metadata: &HashMap<String, String>) -> Option<String> {
     metadata.get(KEY_POLICY_VERSION).cloned()
 }
 
 /// Extract source offset from document metadata.
+#[allow(clippy::implicit_hasher)]
 pub fn extract_start_offset(metadata: &HashMap<String, String>) -> Option<ChunkSourceOffset> {
     unpack_offset(metadata, "start")
 }
 
 /// Extract end offset from document metadata.
+#[allow(clippy::implicit_hasher)]
 pub fn extract_end_offset(metadata: &HashMap<String, String>) -> Option<ChunkSourceOffset> {
     unpack_offset(metadata, "end")
 }
 
 /// Extract overlap metadata from document metadata.
+#[allow(clippy::implicit_hasher)]
 pub fn extract_overlap(metadata: &HashMap<String, String>) -> Option<(String, usize)> {
     let from = metadata.get(KEY_OVERLAP_FROM)?;
     let chars = metadata.get(KEY_OVERLAP_CHARS)?.parse().ok()?;
@@ -193,6 +200,7 @@ pub fn extract_overlap(metadata: &HashMap<String, String>) -> Option<(String, us
 }
 
 /// Extract event IDs from document metadata.
+#[allow(clippy::implicit_hasher)]
 pub fn extract_event_ids(metadata: &HashMap<String, String>) -> Vec<String> {
     metadata
         .get(KEY_EVENT_IDS)
@@ -201,6 +209,7 @@ pub fn extract_event_ids(metadata: &HashMap<String, String>) -> Vec<String> {
 }
 
 /// Count how many `ft.` prefixed keys exist in the metadata.
+#[allow(clippy::implicit_hasher)]
 pub fn terminal_metadata_count(metadata: &HashMap<String, String>) -> usize {
     metadata
         .keys()

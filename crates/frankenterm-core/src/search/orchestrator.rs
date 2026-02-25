@@ -36,6 +36,7 @@
 //! 6. **B5 (done)**: Preserve terminal-specific chunking via adapter layer
 //! 7. **B6 (done)**: Migrate reranker path to frankensearch-rerank bridge
 //! 8. **B7 (done)**: Adapt daemon/background indexing to frankensearch APIs
+//! 9. **B8 (done)**: Unify tantivy ingest/query into single lexical backend
 
 use super::reranker::RerankConfig;
 use super::{
@@ -185,6 +186,67 @@ impl DaemonDispatch {
 }
 
 impl fmt::Display for DaemonDispatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Lexical backend dispatch strategy (B8).
+///
+/// Controls whether lexical indexing/querying uses the recorder-lexical
+/// (direct tantivy) path or the frankensearch-managed lexical backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LexicalDispatch {
+    /// Lexical search disabled.
+    Disabled,
+    /// Direct tantivy via recorder-lexical pipeline.
+    RecorderDirect,
+    /// FrankenSearch-managed lexical backend.
+    Managed,
+}
+
+impl Default for LexicalDispatch {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl LexicalDispatch {
+    /// Canonical string representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::RecorderDirect => "recorder_direct",
+            Self::Managed => "managed",
+        }
+    }
+
+    /// Parse from string (case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_lowercase().as_str() {
+            "recorder_direct" | "recorder" | "direct" | "tantivy" => Self::RecorderDirect,
+            "managed" | "bridge" | "frankensearch" | "unified" => Self::Managed,
+            _ => Self::Disabled,
+        }
+    }
+
+    /// Whether lexical search is enabled (not Disabled).
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Whether the managed (frankensearch) path is active.
+    #[must_use]
+    pub fn is_managed(self) -> bool {
+        matches!(self, Self::Managed)
+    }
+}
+
+impl fmt::Display for LexicalDispatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -450,6 +512,12 @@ pub struct OrchestrationMetrics {
     /// Whether the daemon is enabled (B7).
     #[serde(default)]
     pub daemon_enabled: bool,
+    /// Lexical dispatch strategy used (B8).
+    #[serde(default)]
+    pub lexical_dispatch: String,
+    /// Whether lexical search is enabled (B8).
+    #[serde(default)]
+    pub lexical_enabled: bool,
 }
 
 /// Input for legacy orchestration: pre-ranked lists from caller.
@@ -503,6 +571,9 @@ pub struct OrchestratorConfig {
     /// Daemon dispatch strategy (B7).
     #[serde(default)]
     pub daemon_dispatch: DaemonDispatch,
+    /// Lexical backend dispatch strategy (B8).
+    #[serde(default)]
+    pub lexical_dispatch: LexicalDispatch,
 }
 
 impl Default for OrchestratorConfig {
@@ -520,6 +591,7 @@ impl Default for OrchestratorConfig {
             chunking_adapter_enabled: false,
             reranker_dispatch: RerankerDispatch::Disabled,
             daemon_dispatch: DaemonDispatch::Disabled,
+            lexical_dispatch: LexicalDispatch::Disabled,
         }
     }
 }
@@ -536,6 +608,8 @@ struct MigrationMetrics {
     reranker_enabled: bool,
     daemon_dispatch: String,
     daemon_enabled: bool,
+    lexical_dispatch: String,
+    lexical_enabled: bool,
 }
 
 /// Search orchestrator that encapsulates backend selection and fallback logic.
@@ -642,6 +716,8 @@ impl SearchOrchestrator {
             reranker_enabled: self.config.reranker_dispatch.is_enabled(),
             daemon_dispatch: self.config.daemon_dispatch.as_str().to_string(),
             daemon_enabled: self.config.daemon_dispatch.is_enabled(),
+            lexical_dispatch: self.config.lexical_dispatch.as_str().to_string(),
+            lexical_enabled: self.config.lexical_dispatch.is_enabled(),
         }
     }
 
@@ -661,11 +737,7 @@ impl SearchOrchestrator {
             .with_alpha(self.config.alpha)
             .with_rrf_weights(self.config.lexical_weight, self.config.semantic_weight);
 
-        let results = svc.fuse(
-            &input.lexical_ranked,
-            &input.semantic_ranked,
-            input.top_k,
-        );
+        let results = svc.fuse(&input.lexical_ranked, &input.semantic_ranked, input.top_k);
 
         let mm = self.migration_metrics();
 
@@ -689,6 +761,8 @@ impl SearchOrchestrator {
                 reranker_enabled: mm.reranker_enabled,
                 daemon_dispatch: mm.daemon_dispatch,
                 daemon_enabled: mm.daemon_enabled,
+                lexical_dispatch: mm.lexical_dispatch,
+                lexical_enabled: mm.lexical_enabled,
             },
         }
     }
@@ -703,11 +777,7 @@ impl SearchOrchestrator {
                 .with_fusion_backend(super::FusionBackend::FrankenSearchRrf)
                 .with_rrf_weights(self.config.lexical_weight, self.config.semantic_weight);
 
-            svc.fuse(
-                &input.lexical_ranked,
-                &input.semantic_ranked,
-                input.top_k,
-            )
+            svc.fuse(&input.lexical_ranked, &input.semantic_ranked, input.top_k)
         }));
 
         let mm = self.migration_metrics();
@@ -733,6 +803,8 @@ impl SearchOrchestrator {
                     reranker_enabled: mm.reranker_enabled,
                     daemon_dispatch: mm.daemon_dispatch,
                     daemon_enabled: mm.daemon_enabled,
+                    lexical_dispatch: mm.lexical_dispatch,
+                    lexical_enabled: mm.lexical_enabled,
                 },
             },
             Err(_) if self.config.fallback_to_legacy => {
@@ -907,6 +979,7 @@ mod tests {
             chunking_adapter_enabled: true,
             reranker_dispatch: RerankerDispatch::Managed,
             daemon_dispatch: DaemonDispatch::Managed,
+            lexical_dispatch: LexicalDispatch::Managed,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
@@ -917,6 +990,7 @@ mod tests {
         assert!(back.chunking_adapter_enabled);
         assert_eq!(back.reranker_dispatch, RerankerDispatch::Managed);
         assert_eq!(back.daemon_dispatch, DaemonDispatch::Managed);
+        assert_eq!(back.lexical_dispatch, LexicalDispatch::Managed);
     }
 
     // ── SearchOrchestrator ────────────────────────────────────────────
@@ -1067,6 +1141,8 @@ mod tests {
             reranker_enabled: false,
             daemon_dispatch: "disabled".to_string(),
             daemon_enabled: false,
+            lexical_dispatch: "disabled".to_string(),
+            lexical_enabled: false,
         };
         let json = serde_json::to_string(&metrics).unwrap();
         let back: OrchestrationMetrics = serde_json::from_str(&json).unwrap();
@@ -1078,6 +1154,8 @@ mod tests {
         assert!(!back.reranker_enabled);
         assert_eq!(back.daemon_dispatch, "disabled");
         assert!(!back.daemon_enabled);
+        assert_eq!(back.lexical_dispatch, "disabled");
+        assert!(!back.lexical_enabled);
     }
 
     #[test]
@@ -1197,18 +1275,10 @@ mod tests {
 
     #[test]
     fn embedder_availability_display() {
-        assert!(
-            format!("{}", EmbedderAvailability::Full).contains("quality")
-        );
-        assert!(
-            format!("{}", EmbedderAvailability::FastOnly).contains("degraded")
-        );
-        assert!(
-            format!("{}", EmbedderAvailability::HashOnly).contains("minimal")
-        );
-        assert!(
-            format!("{}", EmbedderAvailability::None).contains("legacy")
-        );
+        assert!(format!("{}", EmbedderAvailability::Full).contains("quality"));
+        assert!(format!("{}", EmbedderAvailability::FastOnly).contains("degraded"));
+        assert!(format!("{}", EmbedderAvailability::HashOnly).contains("minimal"));
+        assert!(format!("{}", EmbedderAvailability::None).contains("legacy"));
     }
 
     #[test]
@@ -1323,14 +1393,8 @@ mod tests {
     fn orchestrator_with_embedder_stack() {
         let orch = SearchOrchestrator::new(OrchestratorConfig::default())
             .with_embedder_stack(ManagedEmbedderStack::hash_only());
-        assert_eq!(
-            orch.embedder_availability(),
-            EmbedderAvailability::HashOnly
-        );
-        assert_eq!(
-            orch.config().embedder_dispatch,
-            EmbedderDispatch::Managed
-        );
+        assert_eq!(orch.embedder_availability(), EmbedderAvailability::HashOnly);
+        assert_eq!(orch.config().embedder_dispatch, EmbedderDispatch::Managed);
     }
 
     #[test]
@@ -1382,8 +1446,8 @@ mod tests {
         let fast: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(128));
         let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256));
         let stack = ManagedEmbedderStack::from_tiers(Some(quality), Some(fast), hash);
-        let orch = SearchOrchestrator::new(OrchestratorConfig::default())
-            .with_embedder_stack(stack);
+        let orch =
+            SearchOrchestrator::new(OrchestratorConfig::default()).with_embedder_stack(stack);
         assert_eq!(orch.embedder_availability(), EmbedderAvailability::Full);
         let result = orch.fuse_ranked(&sample_input());
         assert!(result.metrics.embedder_availability.contains("full"));
@@ -1504,14 +1568,8 @@ mod tests {
 
     #[test]
     fn reranker_dispatch_parse() {
-        assert_eq!(
-            RerankerDispatch::parse("legacy"),
-            RerankerDispatch::Legacy
-        );
-        assert_eq!(
-            RerankerDispatch::parse("local"),
-            RerankerDispatch::Legacy
-        );
+        assert_eq!(RerankerDispatch::parse("legacy"), RerankerDispatch::Legacy);
+        assert_eq!(RerankerDispatch::parse("local"), RerankerDispatch::Legacy);
         assert_eq!(
             RerankerDispatch::parse("passthrough"),
             RerankerDispatch::Legacy
@@ -1520,10 +1578,7 @@ mod tests {
             RerankerDispatch::parse("managed"),
             RerankerDispatch::Managed
         );
-        assert_eq!(
-            RerankerDispatch::parse("bridge"),
-            RerankerDispatch::Managed
-        );
+        assert_eq!(RerankerDispatch::parse("bridge"), RerankerDispatch::Managed);
         assert_eq!(
             RerankerDispatch::parse("frankensearch"),
             RerankerDispatch::Managed
@@ -1540,10 +1595,7 @@ mod tests {
             RerankerDispatch::parse("unknown"),
             RerankerDispatch::Disabled
         );
-        assert_eq!(
-            RerankerDispatch::parse(""),
-            RerankerDispatch::Disabled
-        );
+        assert_eq!(RerankerDispatch::parse(""), RerankerDispatch::Disabled);
     }
 
     #[test]
@@ -1669,7 +1721,10 @@ mod tests {
         assert_eq!(DaemonDispatch::parse("worker"), DaemonDispatch::Legacy);
         assert_eq!(DaemonDispatch::parse("managed"), DaemonDispatch::Managed);
         assert_eq!(DaemonDispatch::parse("bridge"), DaemonDispatch::Managed);
-        assert_eq!(DaemonDispatch::parse("frankensearch"), DaemonDispatch::Managed);
+        assert_eq!(
+            DaemonDispatch::parse("frankensearch"),
+            DaemonDispatch::Managed
+        );
         assert_eq!(DaemonDispatch::parse("batch"), DaemonDispatch::Managed);
         assert_eq!(DaemonDispatch::parse("coalescer"), DaemonDispatch::Managed);
         assert_eq!(DaemonDispatch::parse("MANAGED"), DaemonDispatch::Managed);
@@ -1776,6 +1831,179 @@ mod tests {
         let result = orch.fuse_ranked(&sample_input());
         assert_eq!(result.metrics.daemon_dispatch, "managed");
         assert!(result.metrics.daemon_enabled);
+        assert_eq!(result.metrics.backend, "bridge");
+    }
+
+    // ── B8: LexicalDispatch ──────────────────────────────────────────
+
+    #[test]
+    fn lexical_dispatch_default_is_disabled() {
+        assert_eq!(LexicalDispatch::default(), LexicalDispatch::Disabled);
+    }
+
+    #[test]
+    fn lexical_dispatch_as_str() {
+        assert_eq!(LexicalDispatch::Disabled.as_str(), "disabled");
+        assert_eq!(LexicalDispatch::RecorderDirect.as_str(), "recorder_direct");
+        assert_eq!(LexicalDispatch::Managed.as_str(), "managed");
+    }
+
+    #[test]
+    fn lexical_dispatch_display() {
+        assert_eq!(format!("{}", LexicalDispatch::Disabled), "disabled");
+        assert_eq!(
+            format!("{}", LexicalDispatch::RecorderDirect),
+            "recorder_direct"
+        );
+        assert_eq!(format!("{}", LexicalDispatch::Managed), "managed");
+    }
+
+    #[test]
+    fn lexical_dispatch_parse() {
+        assert_eq!(
+            LexicalDispatch::parse("recorder_direct"),
+            LexicalDispatch::RecorderDirect
+        );
+        assert_eq!(
+            LexicalDispatch::parse("recorder"),
+            LexicalDispatch::RecorderDirect
+        );
+        assert_eq!(
+            LexicalDispatch::parse("direct"),
+            LexicalDispatch::RecorderDirect
+        );
+        assert_eq!(
+            LexicalDispatch::parse("tantivy"),
+            LexicalDispatch::RecorderDirect
+        );
+        assert_eq!(LexicalDispatch::parse("managed"), LexicalDispatch::Managed);
+        assert_eq!(LexicalDispatch::parse("bridge"), LexicalDispatch::Managed);
+        assert_eq!(
+            LexicalDispatch::parse("frankensearch"),
+            LexicalDispatch::Managed
+        );
+        assert_eq!(LexicalDispatch::parse("unified"), LexicalDispatch::Managed);
+        assert_eq!(LexicalDispatch::parse("MANAGED"), LexicalDispatch::Managed);
+        assert_eq!(
+            LexicalDispatch::parse("disabled"),
+            LexicalDispatch::Disabled
+        );
+        assert_eq!(LexicalDispatch::parse("unknown"), LexicalDispatch::Disabled);
+        assert_eq!(LexicalDispatch::parse(""), LexicalDispatch::Disabled);
+    }
+
+    #[test]
+    fn lexical_dispatch_is_enabled() {
+        assert!(!LexicalDispatch::Disabled.is_enabled());
+        assert!(LexicalDispatch::RecorderDirect.is_enabled());
+        assert!(LexicalDispatch::Managed.is_enabled());
+    }
+
+    #[test]
+    fn lexical_dispatch_is_managed() {
+        assert!(!LexicalDispatch::Disabled.is_managed());
+        assert!(!LexicalDispatch::RecorderDirect.is_managed());
+        assert!(LexicalDispatch::Managed.is_managed());
+    }
+
+    #[test]
+    fn lexical_dispatch_serde_roundtrip() {
+        for d in [
+            LexicalDispatch::Disabled,
+            LexicalDispatch::RecorderDirect,
+            LexicalDispatch::Managed,
+        ] {
+            let json = serde_json::to_string(&d).unwrap();
+            let back: LexicalDispatch = serde_json::from_str(&json).unwrap();
+            assert_eq!(d, back);
+        }
+    }
+
+    #[test]
+    fn lexical_dispatch_debug() {
+        assert_eq!(format!("{:?}", LexicalDispatch::Disabled), "Disabled");
+        assert_eq!(
+            format!("{:?}", LexicalDispatch::RecorderDirect),
+            "RecorderDirect"
+        );
+        assert_eq!(format!("{:?}", LexicalDispatch::Managed), "Managed");
+    }
+
+    #[test]
+    fn config_default_lexical_disabled() {
+        let cfg = OrchestratorConfig::default();
+        assert_eq!(cfg.lexical_dispatch, LexicalDispatch::Disabled);
+    }
+
+    #[test]
+    fn config_lexical_dispatch_serde() {
+        let cfg = OrchestratorConfig {
+            lexical_dispatch: LexicalDispatch::Managed,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.lexical_dispatch, LexicalDispatch::Managed);
+    }
+
+    #[test]
+    fn config_lexical_serde_absent_defaults_disabled() {
+        let json = r#"{"backend":"legacy","mode":"hybrid","rrf_k":60,"alpha":0.7,"lexical_weight":1.0,"semantic_weight":1.0,"fallback_to_legacy":true,"embedder_dispatch":"legacy","vector_index_backend":"ftvi"}"#;
+        let cfg: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.lexical_dispatch, LexicalDispatch::Disabled);
+    }
+
+    #[test]
+    fn config_lexical_recorder_direct_serde() {
+        let cfg = OrchestratorConfig {
+            lexical_dispatch: LexicalDispatch::RecorderDirect,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.lexical_dispatch, LexicalDispatch::RecorderDirect);
+    }
+
+    #[test]
+    fn orchestrator_metrics_lexical_disabled_by_default() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.lexical_dispatch, "disabled");
+        assert!(!result.metrics.lexical_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_lexical_recorder_direct() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            lexical_dispatch: LexicalDispatch::RecorderDirect,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.lexical_dispatch, "recorder_direct");
+        assert!(result.metrics.lexical_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_lexical_managed() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            lexical_dispatch: LexicalDispatch::Managed,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.lexical_dispatch, "managed");
+        assert!(result.metrics.lexical_enabled);
+    }
+
+    #[test]
+    fn orchestrator_bridge_lexical_metrics() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Bridge,
+            lexical_dispatch: LexicalDispatch::Managed,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.lexical_dispatch, "managed");
+        assert!(result.metrics.lexical_enabled);
         assert_eq!(result.metrics.backend, "bridge");
     }
 }

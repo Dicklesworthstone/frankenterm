@@ -239,7 +239,11 @@ impl SeverityConfig {
 
     /// Find matching custom severity, or None.
     #[must_use]
-    pub fn lookup(&self, decision_type: Option<DecisionType>, rule_id: &str) -> Option<DivergenceSeverity> {
+    pub fn lookup(
+        &self,
+        decision_type: Option<DecisionType>,
+        rule_id: &str,
+    ) -> Option<DivergenceSeverity> {
         for rule in &self.rules {
             if rule.matches(decision_type, rule_id) {
                 return Some(rule.severity);
@@ -312,14 +316,12 @@ impl RiskScorer {
     /// Score multiple divergences and compute aggregate.
     #[must_use]
     pub fn aggregate(&self, divergences: &[Divergence]) -> AggregateRisk {
-        let scores: Vec<RiskScore> = divergences
-            .iter()
-            .map(|d| self.score(d, 0))
-            .collect();
+        let scores: Vec<RiskScore> = divergences.iter().map(|d| self.score(d, 0)).collect();
         AggregateRisk::from_scores(&scores)
     }
 
     /// Infer decision type from divergence nodes.
+    #[allow(clippy::unused_self)]
     fn infer_decision_type(&self, divergence: &Divergence) -> Option<DecisionType> {
         // We can't directly infer DecisionType from DivergenceNode since it
         // doesn't carry that field. Use the divergence type + root cause as proxy.
@@ -327,9 +329,9 @@ impl RiskScorer {
             RootCause::RuleDefinitionChange { rule_id, .. } => {
                 Self::guess_type_from_rule_id(rule_id)
             }
-            RootCause::InputDivergence { upstream_rule_id, .. } => {
-                Self::guess_type_from_rule_id(upstream_rule_id)
-            }
+            RootCause::InputDivergence {
+                upstream_rule_id, ..
+            } => Self::guess_type_from_rule_id(upstream_rule_id),
             RootCause::OverrideApplied { .. } => Some(DecisionType::OverrideApplied),
             _ => None,
         }
@@ -337,7 +339,10 @@ impl RiskScorer {
 
     /// Heuristic: guess decision type from rule_id prefix.
     fn guess_type_from_rule_id(rule_id: &str) -> Option<DecisionType> {
-        if rule_id.starts_with("pol_") || rule_id.starts_with("policy_") || rule_id.starts_with("rate_limit_") {
+        if rule_id.starts_with("pol_")
+            || rule_id.starts_with("policy_")
+            || rule_id.starts_with("rate_limit_")
+        {
             Some(DecisionType::PolicyDecision)
         } else if rule_id.starts_with("wf_") || rule_id.starts_with("workflow_") {
             Some(DecisionType::WorkflowStep)
@@ -351,6 +356,7 @@ impl RiskScorer {
     }
 
     /// Default severity classification.
+    #[allow(clippy::unused_self)]
     fn classify_default(&self, divergence: &Divergence) -> (DivergenceSeverity, f64, String) {
         match divergence.divergence_type {
             DivergenceType::Shifted => (
@@ -452,7 +458,9 @@ impl RiskScorer {
                             )
                         }
                     }
-                    RootCause::InputDivergence { upstream_rule_id, .. } => (
+                    RootCause::InputDivergence {
+                        upstream_rule_id, ..
+                    } => (
                         DivergenceSeverity::Medium,
                         0.6,
                         format!("Input diverged from upstream: {}", upstream_rule_id),
@@ -483,11 +491,7 @@ mod tests {
     use super::*;
     use crate::replay_decision_diff::{DivergenceNode, DivergenceType, RootCause};
 
-    fn make_divergence(
-        dtype: DivergenceType,
-        rule_id: &str,
-        root_cause: RootCause,
-    ) -> Divergence {
+    fn make_divergence(dtype: DivergenceType, rule_id: &str, root_cause: RootCause) -> Divergence {
         let node = DivergenceNode {
             node_id: 0,
             rule_id: rule_id.into(),
@@ -518,7 +522,9 @@ mod tests {
                 timestamp_ms: 100,
                 pane_id: 1,
             }),
-            root_cause: RootCause::NewDecision { rule_id: rule_id.into() },
+            root_cause: RootCause::NewDecision {
+                rule_id: rule_id.into(),
+            },
         }
     }
 
@@ -535,7 +541,9 @@ mod tests {
                 pane_id: 1,
             }),
             candidate_node: None,
-            root_cause: RootCause::DroppedDecision { rule_id: rule_id.into() },
+            root_cause: RootCause::DroppedDecision {
+                rule_id: rule_id.into(),
+            },
         }
     }
 
@@ -546,7 +554,11 @@ mod tests {
         let div = make_divergence(
             DivergenceType::Shifted,
             "rule_a",
-            RootCause::TimingShift { baseline_ms: 100, candidate_ms: 150, delta_ms: 50 },
+            RootCause::TimingShift {
+                baseline_ms: 100,
+                candidate_ms: 150,
+                delta_ms: 50,
+            },
         );
         let scorer = RiskScorer::new();
         let score = scorer.score(&div, 0);
@@ -651,11 +663,7 @@ mod tests {
 
     #[test]
     fn impact_radius_propagated() {
-        let div = make_divergence(
-            DivergenceType::Modified,
-            "rule_a",
-            RootCause::Unknown,
-        );
+        let div = make_divergence(DivergenceType::Modified, "rule_a", RootCause::Unknown);
         let scorer = RiskScorer::new();
         let score = scorer.score(&div, 42);
         assert_eq!(score.impact_radius, 42);
@@ -666,8 +674,24 @@ mod tests {
     #[test]
     fn aggregate_all_info_pass() {
         let divs = vec![
-            make_divergence(DivergenceType::Shifted, "r1", RootCause::TimingShift { baseline_ms: 100, candidate_ms: 150, delta_ms: 50 }),
-            make_divergence(DivergenceType::Shifted, "r2", RootCause::TimingShift { baseline_ms: 200, candidate_ms: 250, delta_ms: 50 }),
+            make_divergence(
+                DivergenceType::Shifted,
+                "r1",
+                RootCause::TimingShift {
+                    baseline_ms: 100,
+                    candidate_ms: 150,
+                    delta_ms: 50,
+                },
+            ),
+            make_divergence(
+                DivergenceType::Shifted,
+                "r2",
+                RootCause::TimingShift {
+                    baseline_ms: 200,
+                    candidate_ms: 250,
+                    delta_ms: 50,
+                },
+            ),
         ];
         let scorer = RiskScorer::new();
         let agg = scorer.aggregate(&divs);
@@ -680,12 +704,24 @@ mod tests {
     #[test]
     fn aggregate_critical_block() {
         let divs = vec![
-            make_divergence(DivergenceType::Shifted, "r1", RootCause::TimingShift { baseline_ms: 100, candidate_ms: 150, delta_ms: 50 }),
-            make_divergence(DivergenceType::Modified, "pol_auth", RootCause::RuleDefinitionChange {
-                rule_id: "pol_auth".into(),
-                baseline_hash: "h1".into(),
-                candidate_hash: "h2".into(),
-            }),
+            make_divergence(
+                DivergenceType::Shifted,
+                "r1",
+                RootCause::TimingShift {
+                    baseline_ms: 100,
+                    candidate_ms: 150,
+                    delta_ms: 50,
+                },
+            ),
+            make_divergence(
+                DivergenceType::Modified,
+                "pol_auth",
+                RootCause::RuleDefinitionChange {
+                    rule_id: "pol_auth".into(),
+                    baseline_hash: "h1".into(),
+                    candidate_hash: "h2".into(),
+                },
+            ),
         ];
         let scorer = RiskScorer::new();
         let agg = scorer.aggregate(&divs);
@@ -697,13 +733,15 @@ mod tests {
 
     #[test]
     fn aggregate_medium_review() {
-        let divs = vec![
-            make_divergence(DivergenceType::Modified, "rule_a", RootCause::RuleDefinitionChange {
+        let divs = vec![make_divergence(
+            DivergenceType::Modified,
+            "rule_a",
+            RootCause::RuleDefinitionChange {
                 rule_id: "rule_a".into(),
                 baseline_hash: "h1".into(),
                 candidate_hash: "h2".into(),
-            }),
-        ];
+            },
+        )];
         let scorer = RiskScorer::new();
         let agg = scorer.aggregate(&divs);
         assert_eq!(agg.recommendation, Recommendation::Review);
@@ -724,7 +762,15 @@ mod tests {
     #[test]
     fn aggregate_counts() {
         let divs = vec![
-            make_divergence(DivergenceType::Shifted, "r1", RootCause::TimingShift { baseline_ms: 100, candidate_ms: 150, delta_ms: 50 }),
+            make_divergence(
+                DivergenceType::Shifted,
+                "r1",
+                RootCause::TimingShift {
+                    baseline_ms: 100,
+                    candidate_ms: 150,
+                    delta_ms: 50,
+                },
+            ),
             make_added("rule_a"),
             make_divergence(DivergenceType::Modified, "rule_b", RootCause::Unknown),
         ];
@@ -826,8 +872,18 @@ mod tests {
     #[test]
     fn total_risk_score() {
         let scores = vec![
-            RiskScore { severity: DivergenceSeverity::Info, impact_radius: 0, confidence: 1.0, explanation: String::new() },
-            RiskScore { severity: DivergenceSeverity::Critical, impact_radius: 0, confidence: 1.0, explanation: String::new() },
+            RiskScore {
+                severity: DivergenceSeverity::Info,
+                impact_radius: 0,
+                confidence: 1.0,
+                explanation: String::new(),
+            },
+            RiskScore {
+                severity: DivergenceSeverity::Critical,
+                impact_radius: 0,
+                confidence: 1.0,
+                explanation: String::new(),
+            },
         ];
         let agg = AggregateRisk::from_scores(&scores);
         assert_eq!(agg.total_risk_score, 1 + 25); // Info(1) + Critical(25)
@@ -929,14 +985,26 @@ severity = "Critical"
     #[test]
     fn confidence_bounded() {
         let divs = vec![
-            make_divergence(DivergenceType::Shifted, "r1", RootCause::TimingShift { baseline_ms: 100, candidate_ms: 150, delta_ms: 50 }),
+            make_divergence(
+                DivergenceType::Shifted,
+                "r1",
+                RootCause::TimingShift {
+                    baseline_ms: 100,
+                    candidate_ms: 150,
+                    delta_ms: 50,
+                },
+            ),
             make_added("rule_a"),
             make_removed("wf_deploy"),
-            make_divergence(DivergenceType::Modified, "pol_auth", RootCause::RuleDefinitionChange {
-                rule_id: "pol_auth".into(),
-                baseline_hash: "h1".into(),
-                candidate_hash: "h2".into(),
-            }),
+            make_divergence(
+                DivergenceType::Modified,
+                "pol_auth",
+                RootCause::RuleDefinitionChange {
+                    rule_id: "pol_auth".into(),
+                    baseline_hash: "h1".into(),
+                    candidate_hash: "h2".into(),
+                },
+            ),
         ];
         let scorer = RiskScorer::new();
         for div in &divs {

@@ -343,6 +343,7 @@ impl ScopeWatchdog {
     }
 
     /// Detect orphan tasks: active scopes whose parent is closed.
+    #[allow(clippy::unused_self)]
     fn detect_orphans(&self, tree: &ScopeTree, current_ms: i64, alerts: &mut Vec<WatchdogAlert>) {
         let root = ScopeId::root();
         // Check all non-root scopes
@@ -645,6 +646,7 @@ impl ScopeWatchdog {
     }
 
     /// DFS-based cycle detection in the wait-for graph.
+    #[allow(clippy::only_used_in_recursion, clippy::self_only_used_in_recursion)]
     fn dfs_cycle(
         &self,
         node: &ScopeId,
@@ -686,7 +688,7 @@ impl ScopeWatchdog {
             self.scan_count,
             self.total_alerts,
             self.last_scan_ms
-                .map_or("none".to_string(), |ms| ms.to_string()),
+                .map_or_else(|| "none".to_string(), |ms| ms.to_string()),
         )
     }
 }

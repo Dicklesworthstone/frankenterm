@@ -341,7 +341,6 @@ impl PruneEngine {
                             final_failures: record.failures,
                         });
                     }
-                    continue;
                 }
             }
         }

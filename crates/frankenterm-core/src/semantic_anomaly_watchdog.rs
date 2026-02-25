@@ -32,8 +32,8 @@
 //! - **Dedicated OS thread**: avoids exhausting the async blocking pool
 //! - **Graceful shutdown**: poison pill via channel close
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam::queue::ArrayQueue;
@@ -312,11 +312,7 @@ impl SemanticAnomalyWatchdog {
     /// It should produce an embedding vector (e.g., via FastEmbed ONNX).
     ///
     /// `event_bus` is optional; if provided, anomalies are published to it.
-    pub fn start<F>(
-        config: WatchdogConfig,
-        embed_fn: F,
-        event_bus: Option<Arc<EventBus>>,
-    ) -> Self
+    pub fn start<F>(config: WatchdogConfig, embed_fn: F, event_bus: Option<Arc<EventBus>>) -> Self
     where
         F: Fn(&[u8]) -> Vec<f32> + Send + 'static,
     {
@@ -468,11 +464,9 @@ fn ml_thread_loop<F>(
             .total_batch_fill
             .fetch_add(batch_len, Ordering::Relaxed);
 
-        for envelope in batch.drain(..) {
-            let observation = detector.observe(&envelope.data, |seg| embed_fn(seg));
-            metrics
-                .segments_processed
-                .fetch_add(1, Ordering::Relaxed);
+        for envelope in std::mem::take(&mut batch) {
+            let observation = detector.observe(&envelope.data, &embed_fn);
+            metrics.segments_processed.fetch_add(1, Ordering::Relaxed);
 
             match observation {
                 GatedObservation::Skipped(_) => {
@@ -484,12 +478,8 @@ fn ml_thread_loop<F>(
                     anomaly: Some(shock),
                     ..
                 } => {
-                    metrics
-                        .segments_embedded
-                        .fetch_add(1, Ordering::Relaxed);
-                    metrics
-                        .anomalies_detected
-                        .fetch_add(1, Ordering::Relaxed);
+                    metrics.segments_embedded.fetch_add(1, Ordering::Relaxed);
+                    metrics.anomalies_detected.fetch_add(1, Ordering::Relaxed);
 
                     let event = SemanticAnomalyEvent {
                         pane_id: envelope.pane_id,
@@ -509,12 +499,8 @@ fn ml_thread_loop<F>(
                         publish_anomaly_event(bus, &event);
                     }
                 }
-                GatedObservation::Processed {
-                    anomaly: None, ..
-                } => {
-                    metrics
-                        .segments_embedded
-                        .fetch_add(1, Ordering::Relaxed);
+                GatedObservation::Processed { anomaly: None, .. } => {
+                    metrics.segments_embedded.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -810,7 +796,10 @@ mod tests {
 
         let snap = watchdog.metrics();
         assert_eq!(snap.segments_submitted, 10);
-        assert!(snap.segments_processed > 0, "ML thread should have processed segments");
+        assert!(
+            snap.segments_processed > 0,
+            "ML thread should have processed segments"
+        );
 
         watchdog.shutdown();
     }
@@ -931,10 +920,7 @@ mod tests {
         }
 
         // With capacity 4, we should have shed many segments.
-        assert!(
-            shed_count > 0,
-            "should shed segments when queue is full"
-        );
+        assert!(shed_count > 0, "should shed segments when queue is full");
 
         watchdog.shutdown();
     }

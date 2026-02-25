@@ -216,6 +216,7 @@ impl StageBudget {
     /// # Errors
     /// Returns `BudgetError::NegativeTarget` if any value < 0.
     /// Returns `BudgetError::NonMonotonic` if percentiles aren't ordered.
+    #[allow(clippy::similar_names)]
     pub fn new(
         stage: LatencyStage,
         p50_us: f64,
@@ -1525,6 +1526,7 @@ impl BudgetEnforcer {
     /// - `stage`: which pipeline stage was measured.
     /// - `latency_us`: observed latency in microseconds.
     /// - `correlation_id`: ID linking this to a pipeline run.
+    #[allow(clippy::similar_names)]
     pub fn record(
         &mut self,
         stage: LatencyStage,
@@ -1577,7 +1579,7 @@ impl BudgetEnforcer {
                     Percentile::P999 => state.policy.on_p999_overflow,
                     Percentile::P99 => state.policy.on_p99_overflow,
                     Percentile::P95 => state.policy.on_p95_overflow,
-                    _ => Mitigation::None,
+                    Percentile::P50 => Mitigation::None,
                 };
                 break; // Most severe violation wins.
             }
@@ -1586,7 +1588,7 @@ impl BudgetEnforcer {
         let overflow = violated.is_some();
         if overflow {
             state.overflow_count += 1;
-            state.last_overflow_reason = reason.clone();
+            state.last_overflow_reason.clone_from(&reason);
             state.last_mitigation = mitigation;
         }
 
@@ -2369,7 +2371,6 @@ impl FastProbe {
 ///
 /// This section implements the enforcement guards that sit on the critical path,
 /// applying deterministic mitigation when budgets are exceeded.
-
 /// Mitigation ladder with ordered escalation levels.
 ///
 /// The ladder defines a strict partial order of increasingly aggressive
@@ -2680,6 +2681,7 @@ impl RuntimeEnforcer {
     /// 4. Checks recovery conditions
     /// 5. Updates enforcement state
     /// 6. Emits a structured decision
+    #[allow(clippy::similar_names)]
     pub fn enforce(
         &mut self,
         stage: LatencyStage,
@@ -4065,7 +4067,7 @@ impl LaneScheduler {
                 AdmissionDecision::Deferred => Some("BULK_QUEUE_FULL".into()),
                 AdmissionDecision::Shed => Some("QUEUE_OVERFLOW".into()),
                 AdmissionDecision::Promoted { .. } => Some("DEADLINE_PROMOTION".into()),
-                _ => None,
+                AdmissionDecision::Admitted => None,
             },
         });
 
@@ -6433,6 +6435,7 @@ fn memchr_last_newline(data: &[u8]) -> Option<usize> {
 }
 
 /// Count newline bytes in a slice.
+#[allow(clippy::naive_bytecount)]
 fn count_newlines(data: &[u8]) -> usize {
     data.iter().filter(|&&b| b == b'\n').count()
 }
@@ -9098,12 +9101,12 @@ impl PolicyController {
 
         // Compute expected loss for each action
         let mut all_losses = [0.0_f64; 4];
-        for action_idx in 0..4 {
+        for (action_idx, loss_slot) in all_losses.iter_mut().enumerate() {
             let mut el = 0.0;
-            for state_idx in 0..4 {
-                el += p[state_idx] * self.config.loss_matrix[state_idx * 4 + action_idx];
+            for (state_idx, &pi) in p.iter().enumerate() {
+                el += pi * self.config.loss_matrix[state_idx * 4 + action_idx];
             }
-            all_losses[action_idx] = el;
+            *loss_slot = el;
         }
 
         // Find action with minimum expected loss
@@ -13875,6 +13878,7 @@ impl BreakerManager {
     }
 
     /// Record a failure for a stage.
+    #[allow(clippy::similar_names)]
     pub fn record_failure(&mut self, stage: LatencyStage, timestamp_us: u64) {
         let threshold = self.config.failure_threshold;
         let state = self.states.get_mut(&stage).unwrap();
@@ -13901,6 +13905,7 @@ impl BreakerManager {
     }
 
     /// Record a success for a stage.
+    #[allow(clippy::similar_names)]
     pub fn record_success(&mut self, stage: LatencyStage) {
         let success_threshold = self.config.half_open_success_threshold;
         let state = self.states.get_mut(&stage).unwrap();
@@ -13925,6 +13930,7 @@ impl BreakerManager {
     }
 
     /// Check if a request should be allowed through for a stage.
+    #[allow(clippy::similar_names)]
     pub fn allow_request(&mut self, stage: LatencyStage, current_us: u64) -> bool {
         let open_duration = self.config.open_duration_us;
         let max_probes = self.config.half_open_max_probes;
@@ -14731,14 +14737,20 @@ pub struct ValidationMatrix {
     gates: Vec<PromotionGate>,
 }
 
-impl ValidationMatrix {
-    /// Create a new empty matrix.
-    pub fn new() -> Self {
+impl Default for ValidationMatrix {
+    fn default() -> Self {
         Self {
             scenarios: Vec::new(),
             results: Vec::new(),
             gates: Vec::new(),
         }
+    }
+}
+
+impl ValidationMatrix {
+    /// Create a new empty matrix.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Register a scenario.

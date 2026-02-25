@@ -416,6 +416,7 @@ impl PaneFilterConfig {
 /// Use separate rules for OR logic (multiple rules in include/exclude lists).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+#[allow(clippy::unsafe_derive_deserialize)]
 pub struct PaneFilterRule {
     /// Unique identifier for this rule (shown in status output)
     pub id: String,
