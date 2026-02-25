@@ -15,10 +15,14 @@
 - `docs/asupersync-runtime-doctrine-v1.json` — versioned doctrine/invariants pack
 - `docs/asupersync-migration-scoreboard.json` — machine-readable progress/risk scoreboard
 - `docs/asupersync-migration-scoreboard.md` — operator-facing progress/risk scoreboard
+- `docs/asupersync-rch-execution-policy.md` — rch-only heavy compute policy contract
+- `docs/asupersync-rch-evidence-schema.json` — heavy-run evidence schema
 - `scripts/validate_asupersync_doctrine_pack.sh` — doctrine validator (unit/integration checks)
 - `scripts/generate_asupersync_migration_scoreboard.sh` — scoreboard generator
+- `scripts/validate_asupersync_rch_execution_policy.sh` — rch policy/evidence validator
 - `tests/e2e/test_ft_e34d9_10_1_2_doctrine_pack.sh` — doctrine e2e + failure injection
 - `tests/e2e/test_asupersync_migration_scoreboard.sh` — scoreboard e2e + failure injection
+- `tests/e2e/test_asupersync_rch_execution_policy.sh` — rch policy e2e + failure injection
 
 ---
 

@@ -100,6 +100,7 @@ It is the canonical source for:
 - doctrine ADR (`docs/adr/0012-asupersync-runtime-doctrine.md`)
 - machine-readable invariants (`docs/asupersync-runtime-invariants.json`)
 - migration scoreboard (`docs/asupersync-migration-scoreboard.json`, `docs/asupersync-migration-scoreboard.md`)
+- heavy-compute execution policy (`docs/asupersync-rch-execution-policy.md`)
 - risk ledger and sequencing scorecard used by downstream `ft-e34d9.*` beads
 
 ## Library integration map (Appendix F)
