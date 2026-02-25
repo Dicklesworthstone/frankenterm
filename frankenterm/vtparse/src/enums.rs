@@ -30,7 +30,7 @@ impl Action {
         ACTION_BY_U16
             .get(usize::from(v))
             .copied()
-            .unwrap_or_else(|| panic!("invalid Action discriminant: {v}"))
+            .unwrap_or_else(|| panic!("invalid Action discriminant: {}", v))
     }
 }
 
@@ -85,7 +85,7 @@ impl State {
         STATE_BY_U16
             .get(usize::from(v))
             .copied()
-            .unwrap_or_else(|| panic!("invalid State discriminant: {v}"))
+            .unwrap_or_else(|| panic!("invalid State discriminant: {}", v))
     }
 }
 
