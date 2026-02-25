@@ -213,10 +213,7 @@ struct SafeChannelShared<T> {
 /// Panics if `config.capacity == 0`.
 pub fn safe_channel<T: Send>(config: SafeChannelConfig) -> (SafeSender<T>, SafeReceiver<T>) {
     assert!(config.capacity > 0, "channel capacity must be > 0");
-    assert!(
-        config.max_reservations > 0,
-        "max_reservations must be > 0"
-    );
+    assert!(config.max_reservations > 0, "max_reservations must be > 0");
     let shared = Arc::new(SafeChannelShared {
         state: Mutex::new(ChannelState::new(config.capacity)),
         not_empty: Condvar::new(),
@@ -389,7 +386,10 @@ impl<T: Send> SafeReceiver<T> {
         }
         match state.queue.pop_front() {
             Some(item) => {
-                let rid = self.shared.global_res_counter.fetch_add(1, Ordering::Relaxed);
+                let rid = self
+                    .shared
+                    .global_res_counter
+                    .fetch_add(1, Ordering::Relaxed);
                 state.active_reservations += 1;
                 state.track_reservation_hwm();
                 self.shared.not_full.notify_one();
@@ -417,8 +417,10 @@ impl<T: Send> SafeReceiver<T> {
             let reservation_full = state.active_reservations >= self.shared.config.max_reservations;
             if !reservation_full {
                 if let Some(item) = state.queue.pop_front() {
-                    let rid =
-                        self.shared.global_res_counter.fetch_add(1, Ordering::Relaxed);
+                    let rid = self
+                        .shared
+                        .global_res_counter
+                        .fetch_add(1, Ordering::Relaxed);
                     state.active_reservations += 1;
                     state.track_reservation_hwm();
                     self.shared.not_full.notify_one();
@@ -458,8 +460,10 @@ impl<T: Send> SafeReceiver<T> {
             let reservation_full = state.active_reservations >= self.shared.config.max_reservations;
             if !reservation_full {
                 if let Some(item) = state.queue.pop_front() {
-                    let rid =
-                        self.shared.global_res_counter.fetch_add(1, Ordering::Relaxed);
+                    let rid = self
+                        .shared
+                        .global_res_counter
+                        .fetch_add(1, Ordering::Relaxed);
                     state.active_reservations += 1;
                     state.track_reservation_hwm();
                     self.shared.not_full.notify_one();
@@ -565,11 +569,7 @@ impl<T: Send> Reservation<T> {
     pub fn commit(mut self) -> T {
         self.resolved = true;
         let item = self.item.take().expect("reservation already resolved");
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.total_committed += 1;
         state.active_reservations = state.active_reservations.saturating_sub(1);
         drop(state);
@@ -582,11 +582,7 @@ impl<T: Send> Reservation<T> {
     pub fn rollback(mut self) {
         self.resolved = true;
         let item = self.item.take().expect("reservation already resolved");
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.queue.push_front(item);
         state.total_rollbacks += 1;
         state.active_reservations = state.active_reservations.saturating_sub(1);
@@ -609,11 +605,7 @@ impl<T: Send> Drop for Reservation<T> {
                 // Automatic rollback — the cancellation-safety guarantee.
                 // Use unwrap_or_else to handle mutex poisoning gracefully
                 // (we must not panic in a destructor).
-                let mut state = self
-                    .shared
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.queue.push_front(item);
                 state.total_drop_rollbacks += 1;
                 state.active_reservations = state.active_reservations.saturating_sub(1);
