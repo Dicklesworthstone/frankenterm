@@ -499,6 +499,7 @@ SCENARIO_REGISTRY=(
     "ft_1i2ge_3_2|Validate mission dispatch adapter target resolution and outcome normalization|false|cargo,jq,rch|Protects mission dispatch adapter dry-run/live contract"
     "ft_1i2ge_3_3|Validate mission outcome ingestion and assignment state reconciliation|false|cargo,jq,rch|Protects assignment signal reconciliation and drift detection"
     "ft_1i2ge_3_4|Validate adaptive mission replanning triggers and backoff policy|false|cargo,jq,rch|Protects deterministic replan trigger + backoff loop-guard behavior"
+    "ft_e34d9_10_1_2_doctrine_pack|Validate asupersync runtime doctrine contract/invariants + failure injection|false|jq,python3|Protects doctrine semantics, anti-pattern gates, and user-facing guarantees"
     "ft_1i2ge_4_2|Validate mission reservation and ownership enforcement contract|false|cargo,jq,rch|Protects assignment reservation/ownership enforcement surface"
     "ft_1i2ge_4_3|Validate mission approval-path integration (durability, idempotency, fallback)|false|cargo,jq,rch|Protects approval-required routing and post-approval continuation invariants"
     "ft_1i2ge_4_1|Validate mission policy preflight contract and denial feedback reason codes|false|cargo,jq,rch|Protects mission policy preflight plan/dispatch pipeline"
@@ -10989,6 +10990,47 @@ run_scenario_ft_1i2ge_3_4() {
     return 0
 }
 
+run_scenario_ft_e34d9_10_1_2_doctrine_pack() {
+    local scenario_dir="$1"
+    local case_name="ft_e34d9_10_1_2_doctrine_pack"
+    local script_path="$PROJECT_ROOT/tests/e2e/test_ft_e34d9_10_1_2_doctrine_pack.sh"
+    local scenario_stdout="$scenario_dir/${case_name}.stdout.log"
+    local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
+    local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/asupersync_runtime_doctrine_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+
+    log_info "[$case_name] Step 1: running asupersync runtime doctrine pack e2e harness"
+    set +e
+    timeout "$TIMEOUT" bash "$script_path" >"$scenario_stdout" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ "$rc" -eq 124 ]]; then
+        log_fail "[$case_name] harness timed out after ${TIMEOUT}s"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log_fail "[$case_name] harness failed (exit=$rc)"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return "$rc"
+    fi
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/asupersync_runtime_doctrine_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    while IFS= read -r log_path; do
+        if [[ -z "$log_path" ]]; then
+            continue
+        fi
+        if [[ ! -f "$before_snapshot" ]] || ! grep -Fxq "$log_path" "$before_snapshot"; then
+            cp -f "$log_path" "$scenario_dir/" || true
+        fi
+    done < "$after_snapshot"
+
+    log_pass "[$case_name] asupersync runtime doctrine pack e2e completed"
+    return 0
+}
+
 run_scenario_ft_1i2ge_4_2() {
     local scenario_dir="$1"
     local case_name="ft_1i2ge_4_2"
@@ -11324,6 +11366,9 @@ dispatch_scenario() {
             ;;
         ft_1i2ge_3_4)
             run_scenario_ft_1i2ge_3_4 "$scenario_dir" || result=$?
+            ;;
+        ft_e34d9_10_1_2_doctrine_pack)
+            run_scenario_ft_e34d9_10_1_2_doctrine_pack "$scenario_dir" || result=$?
             ;;
         ft_1i2ge_4_2)
             run_scenario_ft_1i2ge_4_2 "$scenario_dir" || result=$?
