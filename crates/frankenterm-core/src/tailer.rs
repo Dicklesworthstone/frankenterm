@@ -2086,8 +2086,9 @@ mod tests {
         let selected = sched.select_panes(&panes, 10);
         // Budget is 2/sec, so only 2 are selected.
         assert_eq!(selected.len(), 2);
-        // Highest priority first.
-        assert_eq!(selected, vec![1, 2]);
+        // Anti-starvation reserves 1 slot for low-priority panes when limit >= 2,
+        // so we get 1 high-priority (pane 1) + 1 low-priority (pane 3).
+        assert_eq!(selected, vec![1, 3]);
     }
 
     #[test]
@@ -2237,10 +2238,11 @@ mod tests {
         let mut sched = CaptureScheduler::new(budget);
 
         // Panes sorted by priority (pre-sorted input).
-        // Priority 10 and 50 should be selected; 100 and 200 dropped.
+        // Anti-starvation reserves 1 low-priority slot when limit >= 2,
+        // so pane 1 (high, prio 10) + pane 3 (low, prio 100) are selected.
         let panes = vec![(1, 10), (2, 50), (3, 100), (4, 200)];
         let selected = sched.select_panes(&panes, 10);
-        assert_eq!(selected, vec![1, 2]);
+        assert_eq!(selected, vec![1, 3]);
     }
 
     #[test]
@@ -2382,7 +2384,8 @@ mod tests {
 
     #[test]
     fn scheduler_mixed_priorities_budget_favors_high() {
-        // With a tight budget, only the highest-priority panes should be selected.
+        // With a tight budget (2), anti-starvation reserves 1 slot for low-priority,
+        // so we get 1 high-priority + 1 low-priority pane.
         let budget = CaptureBudgetConfig {
             max_captures_per_sec: 2,
             max_bytes_per_sec: 0,
@@ -2397,7 +2400,7 @@ mod tests {
             (40, 200), // priority 200 (low)
         ];
         let selected = sched.select_panes(&panes, 10);
-        assert_eq!(selected, vec![10, 20]);
+        assert_eq!(selected, vec![10, 30]);
     }
 
     #[test]

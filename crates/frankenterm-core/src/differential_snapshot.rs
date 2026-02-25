@@ -1678,7 +1678,8 @@ mod tests {
 
     #[test]
     fn engine_metadata_takes_priority_over_scrollback() {
-        // When a pane has both metadata and scrollback dirty, metadata wins
+        // When a pane has both metadata and scrollback dirty, both diffs are emitted
+        // (metadata first, then scrollback) since capture_diff uses independent checks.
         let mut engine = DiffSnapshotEngine::new(10);
         engine.initialize(make_base(&[1]));
 
@@ -1691,11 +1692,15 @@ mod tests {
         current.insert(1, ps);
 
         let diff = engine.capture_diff(&current, None, 2000).unwrap();
-        // Should emit PaneMetadataChanged (not PaneScrollbackChanged)
-        assert_eq!(diff.diffs.len(), 1);
+        // Both dirty fields are emitted: metadata first, then scrollback.
+        assert_eq!(diff.diffs.len(), 2);
         assert!(matches!(
             &diff.diffs[0],
             SnapshotDiff::PaneMetadataChanged { pane_id: 1, .. }
+        ));
+        assert!(matches!(
+            &diff.diffs[1],
+            SnapshotDiff::PaneScrollbackChanged { pane_id: 1, .. }
         ));
     }
 

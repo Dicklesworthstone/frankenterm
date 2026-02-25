@@ -4131,7 +4131,7 @@ mod tests {
 
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
-        assert_eq!(decision.rule_id(), Some("command.git_reset_hard"));
+        assert_eq!(decision.rule_id(), Some("dcg.core.git:reset-hard"));
     }
 
     #[test]
