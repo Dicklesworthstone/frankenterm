@@ -110,6 +110,25 @@ fn success_comp_inputs(num_steps: usize) -> Vec<TxCompensationStepInput> {
         .collect()
 }
 
+fn build_execution_record(
+    contract: &MissionTxContract,
+    state: MissionTxState,
+    commit_hash: Option<&str>,
+    comp_hash: Option<&str>,
+) -> TxExecutionRecord {
+    TxExecutionRecord {
+        tx_id: contract.intent.tx_id.clone(),
+        plan_id: contract.plan.plan_id.clone(),
+        lifecycle_state: state,
+        correlation_id: contract.intent.correlation_id.clone(),
+        tx_idempotency_key: TxExecutionRecord::compute_tx_key(contract),
+        step_records: vec![],
+        commit_report_hash: commit_hash.map(|s| s.to_string()),
+        compensation_report_hash: comp_hash.map(|s| s.to_string()),
+        updated_at_ms: 5000,
+    }
+}
+
 // ── State Machine Transition Tests ──────────────────────────────────────────
 
 #[test]
@@ -996,4 +1015,339 @@ fn compensation_outcome_target_states() {
         TxCompensationOutcome::NothingToCompensate.target_tx_state(),
         MissionTxState::Failed
     );
+}
+
+// ── Concurrency Stress Tests ────────────────────────────────────────────────
+//
+// These tests verify that tx semantics produce deterministic results under
+// concurrent execution. Since the tx types are pure (no shared mutable state),
+// the key invariant is: parallel calls on the same inputs yield identical outputs.
+
+#[tokio::test]
+async fn concurrent_commit_determinism() {
+    // Run 10 parallel commit phases on identical contracts — all must produce
+    // identical reports.
+    let handles: Vec<_> = (0..10)
+        .map(|_| {
+            tokio::spawn(async move {
+                let contract = build_contract(5, MissionTxState::Prepared);
+                let inputs = success_commit_inputs(5);
+                execute_commit_phase(
+                    &contract,
+                    &inputs,
+                    MissionKillSwitchLevel::Off,
+                    false,
+                    10_000,
+                )
+                .unwrap()
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let reference = &results[0];
+    for (i, report) in results.iter().enumerate().skip(1) {
+        assert_eq!(
+            reference.committed_count, report.committed_count,
+            "committed_count mismatch at iter {i}"
+        );
+        assert_eq!(
+            reference.failed_count, report.failed_count,
+            "failed_count mismatch at iter {i}"
+        );
+        assert_eq!(
+            reference.outcome, report.outcome,
+            "outcome mismatch at iter {i}"
+        );
+        assert_eq!(
+            reference.step_results.len(),
+            report.step_results.len(),
+            "step_results len mismatch at iter {i}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_compensation_determinism() {
+    // Build a commit report, then run 10 parallel compensation phases.
+    let contract = build_contract(5, MissionTxState::Prepared);
+    let commit_inputs = partial_commit_inputs(5, 3);
+    let commit_report = execute_commit_phase(
+        &contract,
+        &commit_inputs,
+        MissionKillSwitchLevel::Off,
+        false,
+        10_000,
+    )
+    .unwrap();
+
+    let handles: Vec<_> = (0..10)
+        .map(|_| {
+            let cr = commit_report.clone();
+            tokio::spawn(async move {
+                let comp_contract = build_contract(5, MissionTxState::Compensating);
+                let comp_inputs = success_comp_inputs(5);
+                execute_compensation_phase(&comp_contract, &cr, &comp_inputs, 20_000).unwrap()
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let reference = &results[0];
+    for (i, report) in results.iter().enumerate().skip(1) {
+        assert_eq!(
+            reference.compensated_count, report.compensated_count,
+            "compensated_count mismatch at iter {i}"
+        );
+        assert_eq!(
+            reference.outcome, report.outcome,
+            "outcome mismatch at iter {i}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_idempotency_checks_consistent() {
+    // Run 20 parallel idempotency checks on the same contract/record pair.
+    let contract = build_contract(5, MissionTxState::Prepared);
+    let record = build_execution_record(&contract, MissionTxState::Committed, Some("h1"), None);
+
+    let handles: Vec<_> = (0..20)
+        .map(|_| {
+            let c = contract.clone();
+            let r = record.clone();
+            tokio::spawn(async move {
+                validate_tx_idempotency(&c, TxPhase::Commit, Some(&r))
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // All must agree: double-commit blocked
+    for (i, result) in results.iter().enumerate() {
+        assert!(
+            !result.should_proceed(),
+            "should_proceed should be false at iter {i}"
+        );
+        let is_blocked = matches!(
+            result.verdict,
+            TxIdempotencyVerdict::DoubleExecutionBlocked { .. }
+        );
+        assert!(is_blocked, "expected DoubleExecutionBlocked at iter {i}");
+    }
+}
+
+#[tokio::test]
+async fn concurrent_resume_reconstruction_determinism() {
+    // Build a commit report, then reconstruct resume state from 10 parallel tasks.
+    let contract = build_contract(7, MissionTxState::Prepared);
+    let inputs = partial_commit_inputs(7, 4);
+    let commit_report = execute_commit_phase(
+        &contract,
+        &inputs,
+        MissionKillSwitchLevel::Off,
+        false,
+        10_000,
+    )
+    .unwrap();
+
+    let handles: Vec<_> = (0..10)
+        .map(|_| {
+            let c = contract.clone();
+            let cr = commit_report.clone();
+            tokio::spawn(async move {
+                reconstruct_tx_resume_state(&c, Some(&cr), None, 15_000)
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let reference = &results[0];
+    for (i, resume) in results.iter().enumerate().skip(1) {
+        assert_eq!(
+            reference.committed_step_ids, resume.committed_step_ids,
+            "committed_step_ids mismatch at iter {i}"
+        );
+        assert_eq!(
+            reference.pending_step_ids, resume.pending_step_ids,
+            "pending_step_ids mismatch at iter {i}"
+        );
+        assert_eq!(
+            reference.commit_phase_completed, resume.commit_phase_completed,
+            "commit_phase_completed mismatch at iter {i}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_tx_key_computation_determinism() {
+    // Compute tx idempotency keys from 50 parallel tasks.
+    let contract = build_contract(10, MissionTxState::Prepared);
+
+    let handles: Vec<_> = (0..50)
+        .map(|_| {
+            let c = contract.clone();
+            tokio::spawn(async move { TxExecutionRecord::compute_tx_key(&c) })
+        })
+        .collect();
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let reference = &results[0];
+    for (i, key) in results.iter().enumerate().skip(1) {
+        assert_eq!(reference, key, "key mismatch at iter {i}");
+    }
+}
+
+#[tokio::test]
+async fn concurrent_mixed_tx_non_interference() {
+    // Run commits on 10 different tx contracts in parallel — each should
+    // produce results independent of the others.
+    let handles: Vec<_> = (1..=10)
+        .map(|n| {
+            tokio::spawn(async move {
+                let contract = build_contract(n, MissionTxState::Prepared);
+                let inputs = success_commit_inputs(n);
+                let report = execute_commit_phase(
+                    &contract,
+                    &inputs,
+                    MissionKillSwitchLevel::Off,
+                    false,
+                    10_000,
+                )
+                .unwrap();
+                (n, report)
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    for (n, report) in &results {
+        assert_eq!(
+            report.committed_count, *n,
+            "contract with {n} steps should commit {n}"
+        );
+        assert_eq!(report.failed_count, 0, "no failures expected for contract {n}");
+    }
+}
+
+// ── Reason Code Exhaustion ──────────────────────────────────────────────────
+
+#[test]
+fn all_commit_outcomes_have_target_states() {
+    // Every TxCommitOutcome variant maps to a valid MissionTxState.
+    let outcomes = [
+        TxCommitOutcome::FullyCommitted,
+        TxCommitOutcome::PartialFailure,
+        TxCommitOutcome::ImmediateFailure,
+        TxCommitOutcome::KillSwitchBlocked,
+        TxCommitOutcome::PauseSuspended,
+    ];
+    for outcome in outcomes {
+        let state: MissionTxState = outcome.target_tx_state();
+        // Verify it's one of the expected states (not Draft/Planned/Prepared)
+        let valid = matches!(
+            state,
+            MissionTxState::Committed
+                | MissionTxState::Compensating
+                | MissionTxState::Failed
+                | MissionTxState::Committing // pause returns to committing
+        );
+        assert!(valid, "outcome {:?} maps to unexpected state {:?}", outcome, state);
+    }
+}
+
+#[test]
+fn all_compensation_outcomes_have_target_states() {
+    let outcomes = [
+        TxCompensationOutcome::FullyRolledBack,
+        TxCompensationOutcome::CompensationFailed,
+        TxCompensationOutcome::NothingToCompensate,
+    ];
+    for outcome in &outcomes {
+        let state = outcome.target_tx_state();
+        let valid = matches!(
+            state,
+            MissionTxState::RolledBack | MissionTxState::Failed
+        );
+        assert!(valid, "outcome {:?} maps to unexpected state {:?}", outcome, state);
+    }
+}
+
+// ── Kill-Switch and Pause in Pipeline ───────────────────────────────────────
+
+#[test]
+fn pipeline_kill_switch_safe_mode_blocks_commit() {
+    let contract = build_contract(5, MissionTxState::Prepared);
+    let inputs = success_commit_inputs(5);
+    let report = execute_commit_phase(
+        &contract,
+        &inputs,
+        MissionKillSwitchLevel::SafeMode,
+        false,
+        10_000,
+    )
+    .unwrap();
+
+    // Kill switch should block all steps
+    assert_eq!(report.committed_count, 0);
+    let is_killed = matches!(report.outcome, TxCommitOutcome::KillSwitchBlocked);
+    assert!(is_killed, "expected KillSwitchAborted, got {:?}", report.outcome);
+}
+
+#[test]
+fn pipeline_pause_suspends_commit_then_resume_idempotent() {
+    // Paused commit
+    let contract = build_contract(5, MissionTxState::Prepared);
+    let inputs = success_commit_inputs(5);
+    let paused_report = execute_commit_phase(
+        &contract,
+        &inputs,
+        MissionKillSwitchLevel::Off,
+        true, // paused
+        10_000,
+    )
+    .unwrap();
+
+    let is_paused = matches!(paused_report.outcome, TxCommitOutcome::PauseSuspended);
+    assert!(is_paused, "expected PauseSuspended, got {:?}", paused_report.outcome);
+
+    // Idempotency check on paused state should allow retry
+    let record = build_execution_record(
+        &contract,
+        MissionTxState::Committing,
+        None,
+        None,
+    );
+    let check = validate_tx_idempotency(&contract, TxPhase::Commit, Some(&record));
+    assert!(check.should_proceed(), "should be able to retry after pause");
 }
