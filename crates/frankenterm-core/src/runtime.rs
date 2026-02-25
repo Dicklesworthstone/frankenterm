@@ -3295,7 +3295,6 @@ fn record_bounded_sample(samples: &StdMutex<VecDeque<u64>>, value: u64) {
 }
 
 fn percentile_from_samples(samples: &StdMutex<VecDeque<u64>>, percentile: usize) -> u64 {
-    debug_assert!((1..=100).contains(&percentile));
     let mut values: Vec<u64> = {
         let guard = samples
             .lock()
@@ -3306,10 +3305,13 @@ fn percentile_from_samples(samples: &StdMutex<VecDeque<u64>>, percentile: usize)
         return 0;
     }
     values.sort_unstable();
+    // Keep out-of-range percentile inputs from panicking: values > 100 saturate
+    // to max index, while 0 maps to the minimum.
     let idx = (values.len() - 1)
         .saturating_mul(percentile)
         .saturating_add(99)
         / 100;
+    let idx = idx.min(values.len() - 1);
     values[idx]
 }
 
@@ -4950,6 +4952,18 @@ mod tests {
         let p50 = percentile_from_samples(&samples, 50);
         // Sorted: [10, 30, 50, 90, 100], p50 index = (4*50+99)/100 = 2 => 50
         assert!((30..=90).contains(&p50));
+    }
+
+    #[test]
+    fn percentile_from_samples_percentile_zero_returns_min() {
+        let samples = StdMutex::new(VecDeque::from([30, 10, 20]));
+        assert_eq!(percentile_from_samples(&samples, 0), 10);
+    }
+
+    #[test]
+    fn percentile_from_samples_percentile_above_hundred_is_bounded() {
+        let samples = StdMutex::new(VecDeque::from([10, 20, 30]));
+        assert_eq!(percentile_from_samples(&samples, 200), 30);
     }
 
     // =========================================================================

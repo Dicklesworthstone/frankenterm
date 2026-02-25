@@ -601,8 +601,11 @@ impl SessionRestorer {
             "Detected unclean session(s) from previous run"
         );
 
-        // Pick the most recent (already sorted by last_checkpoint_at DESC)
-        let best = candidates.into_iter().next().unwrap();
+        // Pick the most recent (already sorted by last_checkpoint_at DESC).
+        // Safe: we checked `!candidates.is_empty()` above.
+        let Some(best) = candidates.into_iter().next() else {
+            return Ok(None);
+        };
 
         info!(
             session_id = %best.session_id,

@@ -49,7 +49,10 @@ fn djb2(data: &[u8]) -> u64 {
 
 /// Generate `k` hash indices using double hashing: h(i) = (h1 + i*h2) mod m.
 fn hash_indices(data: &[u8], k: u32, m: usize) -> Vec<usize> {
-    debug_assert!(m > 0, "bit array size m must be > 0");
+    // Defensive guard for deserialized/corrupt states that bypass constructors.
+    if m == 0 || k == 0 {
+        return Vec::new();
+    }
     let h1 = fnv1a(data);
     let h2 = djb2(data);
     (0..k)
@@ -127,6 +130,9 @@ impl BloomFilter {
 
     /// Insert an element.
     pub fn insert(&mut self, data: &[u8]) {
+        if self.num_bits == 0 || self.num_hashes == 0 {
+            return;
+        }
         let indices = hash_indices(data, self.num_hashes, self.num_bits);
         for idx in indices {
             let word = idx / 64;
@@ -143,6 +149,9 @@ impl BloomFilter {
     /// the configured false-positive rate).
     #[must_use]
     pub fn contains(&self, data: &[u8]) -> bool {
+        if self.num_bits == 0 || self.num_hashes == 0 {
+            return false;
+        }
         let indices = hash_indices(data, self.num_hashes, self.num_bits);
         indices.iter().all(|&idx| {
             let word = idx / 64;
@@ -172,6 +181,9 @@ impl BloomFilter {
     /// Estimated current false-positive rate based on the number of set bits.
     #[must_use]
     pub fn estimated_fp_rate(&self) -> f64 {
+        if self.num_bits == 0 || self.num_hashes == 0 {
+            return 0.0;
+        }
         let set_bits = self
             .bits
             .iter()
@@ -304,6 +316,9 @@ impl CountingBloomFilter {
 
     /// Insert an element.
     pub fn insert(&mut self, data: &[u8]) {
+        if self.num_buckets == 0 || self.num_hashes == 0 {
+            return;
+        }
         let indices = hash_indices(data, self.num_hashes, self.num_buckets);
         for idx in indices {
             self.increment_counter(idx);
@@ -316,6 +331,9 @@ impl CountingBloomFilter {
     /// Only call this if the element was previously inserted. Removing
     /// elements that were never inserted can cause false negatives.
     pub fn remove(&mut self, data: &[u8]) {
+        if self.num_buckets == 0 || self.num_hashes == 0 {
+            return;
+        }
         let indices = hash_indices(data, self.num_hashes, self.num_buckets);
         for idx in indices {
             self.decrement_counter(idx);
@@ -326,6 +344,9 @@ impl CountingBloomFilter {
     /// Check if an element is (probably) in the set.
     #[must_use]
     pub fn contains(&self, data: &[u8]) -> bool {
+        if self.num_buckets == 0 || self.num_hashes == 0 {
+            return false;
+        }
         let indices = hash_indices(data, self.num_hashes, self.num_buckets);
         indices.iter().all(|&idx| self.get_counter(idx) > 0)
     }
@@ -408,7 +429,11 @@ impl BloomFilter {
             num_hashes: self.num_hashes,
             memory_bytes: self.memory_bytes(),
             estimated_fp_rate: self.estimated_fp_rate(),
-            fill_ratio: set_bits as f64 / self.num_bits as f64,
+            fill_ratio: if self.num_bits == 0 {
+                0.0
+            } else {
+                set_bits as f64 / self.num_bits as f64
+            },
         }
     }
 }
@@ -580,6 +605,27 @@ mod tests {
         assert_eq!(bf.num_hashes(), 5);
     }
 
+    #[test]
+    fn deserialized_bloom_filter_zero_bits_is_safe() {
+        let mut bf: BloomFilter =
+            serde_json::from_str(r#"{"bits":[],"num_bits":0,"num_hashes":3,"count":1}"#).unwrap();
+        assert!(!bf.contains(b"item"));
+        bf.insert(b"item");
+        assert_eq!(bf.count(), 1, "invalid-state insert should be a no-op");
+        let stats = bf.stats();
+        assert_eq!(stats.fill_ratio, 0.0);
+        assert_eq!(stats.estimated_fp_rate, 0.0);
+    }
+
+    #[test]
+    fn deserialized_bloom_filter_zero_hashes_is_safe() {
+        let mut bf: BloomFilter =
+            serde_json::from_str(r#"{"bits":[0],"num_bits":64,"num_hashes":0,"count":0}"#).unwrap();
+        assert!(!bf.contains(b"item"));
+        bf.insert(b"item");
+        assert_eq!(bf.count(), 0, "zero-hash insert should be a no-op");
+    }
+
     // -- BloomFilter stats ------------------------------------------------------
 
     #[test]
@@ -726,6 +772,28 @@ mod tests {
         let cbf = CountingBloomFilter::with_capacity(1000, 0.01);
         // 4-bit counters → 4× the bits, packed into u64s (16 per word).
         assert!(cbf.memory_bytes() > 0);
+    }
+
+    #[test]
+    fn deserialized_counting_bloom_filter_zero_buckets_is_safe() {
+        let mut cbf: CountingBloomFilter =
+            serde_json::from_str(r#"{"counters":[],"num_buckets":0,"num_hashes":4,"count":2}"#)
+                .unwrap();
+        assert!(!cbf.contains(b"item"));
+        cbf.insert(b"item");
+        cbf.remove(b"item");
+        assert_eq!(cbf.count(), 2, "invalid-state operations should be no-op");
+    }
+
+    #[test]
+    fn deserialized_counting_bloom_filter_zero_hashes_is_safe() {
+        let mut cbf: CountingBloomFilter =
+            serde_json::from_str(r#"{"counters":[0],"num_buckets":16,"num_hashes":0,"count":0}"#)
+                .unwrap();
+        assert!(!cbf.contains(b"item"));
+        cbf.insert(b"item");
+        cbf.remove(b"item");
+        assert_eq!(cbf.count(), 0);
     }
 
     #[test]

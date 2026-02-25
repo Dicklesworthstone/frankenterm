@@ -129,11 +129,23 @@ impl InnerNode {
                 children,
                 count,
             } => {
-                // Find first empty slot
-                let slot = children.iter().position(|c| c.is_none()).unwrap();
-                index[byte as usize] = slot as u8;
-                children[slot] = Some(child_idx);
-                *count += 1;
+                // Find first empty slot (guaranteed by caller invoking maybe_grow first).
+                if let Some(slot) = children.iter().position(|c| c.is_none()) {
+                    index[byte as usize] = slot as u8;
+                    children[slot] = Some(child_idx);
+                    *count += 1;
+                } else {
+                    // Invariant-violating state (for example deserialized stale `count`):
+                    // promote to Node256 and complete insertion instead of silently dropping.
+                    let mut promoted = vec![None; 256];
+                    for (existing_byte, &slot) in index.iter().enumerate() {
+                        if slot != 0xFF {
+                            promoted[existing_byte] = children[slot as usize];
+                        }
+                    }
+                    promoted[byte as usize] = Some(child_idx);
+                    *self = InnerNode::Node256 { children: promoted };
+                }
             }
             InnerNode::Node256 { children } => {
                 children[byte as usize] = Some(child_idx);
@@ -972,6 +984,34 @@ mod tests {
         assert_eq!(tree.len(), 256);
         for b in 0..=255u8 {
             assert_eq!(*tree.get(&[b]).unwrap(), b as i32);
+        }
+    }
+
+    #[test]
+    fn node48_insert_child_promotes_when_slots_full() {
+        let mut index = vec![0xFFu8; 256];
+        let mut children = vec![None; NODE48_MAX];
+        for slot in 0..NODE48_MAX {
+            index[slot] = slot as u8;
+            children[slot] = Some(slot);
+        }
+
+        let mut node = InnerNode::Node48 {
+            index,
+            children,
+            count: NODE48_MAX - 1, // Stale count with no free slot.
+        };
+
+        node.insert_child(200, 9_999);
+
+        match node {
+            InnerNode::Node256 { children } => {
+                assert_eq!(children[200], Some(9_999));
+                for slot in 0..NODE48_MAX {
+                    assert_eq!(children[slot], Some(slot));
+                }
+            }
+            _ => panic!("expected Node256 promotion when Node48 has no free slots"),
         }
     }
 

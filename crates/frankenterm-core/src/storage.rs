@@ -4860,6 +4860,9 @@ impl FtVersion {
         let major: u64 = parts.next()?.parse().ok()?;
         let minor: u64 = parts.next().unwrap_or("0").parse().ok()?;
         let patch: u64 = parts.next().unwrap_or("0").parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
         Some(Self {
             major,
             minor,
@@ -16037,6 +16040,40 @@ mod tests {
         assert_eq!(min_compatible, crate::VERSION);
         assert_eq!(created_by, crate::VERSION);
         assert!(created_at > 0, "created_at should be set");
+    }
+
+    #[test]
+    fn ft_version_parse_accepts_semver_core_with_optional_suffix() {
+        assert_eq!(
+            FtVersion::parse("1.2.3"),
+            Some(FtVersion {
+                major: 1,
+                minor: 2,
+                patch: 3
+            })
+        );
+        assert_eq!(
+            FtVersion::parse("1.2.3-alpha.1+build.7"),
+            Some(FtVersion {
+                major: 1,
+                minor: 2,
+                patch: 3
+            })
+        );
+        assert_eq!(
+            FtVersion::parse("4"),
+            Some(FtVersion {
+                major: 4,
+                minor: 0,
+                patch: 0
+            })
+        );
+    }
+
+    #[test]
+    fn ft_version_parse_rejects_extra_numeric_components() {
+        assert!(FtVersion::parse("1.2.3.4").is_none());
+        assert!(FtVersion::parse("1.2.3.4-alpha").is_none());
     }
 
     #[test]

@@ -435,11 +435,14 @@ pub struct MuxWatchdog {
 impl MuxWatchdog {
     /// Create a new mux watchdog.
     #[must_use]
-    pub fn new(config: MuxWatchdogConfig, wezterm: crate::wezterm::WeztermHandle) -> Self {
+    pub fn new(mut config: MuxWatchdogConfig, wezterm: crate::wezterm::WeztermHandle) -> Self {
+        // Keep at least one slot so history bookkeeping stays well-defined.
+        let history_capacity = config.history_capacity.max(1);
+        config.history_capacity = history_capacity;
         Self {
             config,
             wezterm,
-            history: std::collections::VecDeque::with_capacity(1000),
+            history: std::collections::VecDeque::with_capacity(history_capacity),
             consecutive_failures: 0,
             total_checks: 0,
             total_failures: 0,
@@ -832,6 +835,30 @@ mod tests {
         assert_eq!(config.memory_warning_bytes, 32 * 1024 * 1024 * 1024);
         assert_eq!(config.memory_critical_bytes, 64 * 1024 * 1024 * 1024);
         assert_eq!(config.history_capacity, 1000);
+    }
+
+    #[test]
+    fn mux_watchdog_new_uses_configured_history_capacity() {
+        let config = MuxWatchdogConfig {
+            history_capacity: 7,
+            ..MuxWatchdogConfig::default()
+        };
+        let wezterm = crate::wezterm::mock_wezterm_handle();
+        let watchdog = MuxWatchdog::new(config, wezterm);
+        assert_eq!(watchdog.config.history_capacity, 7);
+        assert!(watchdog.history.capacity() >= 7);
+    }
+
+    #[test]
+    fn mux_watchdog_new_clamps_zero_history_capacity() {
+        let config = MuxWatchdogConfig {
+            history_capacity: 0,
+            ..MuxWatchdogConfig::default()
+        };
+        let wezterm = crate::wezterm::mock_wezterm_handle();
+        let watchdog = MuxWatchdog::new(config, wezterm);
+        assert_eq!(watchdog.config.history_capacity, 1);
+        assert!(watchdog.history.capacity() >= 1);
     }
 
     #[test]

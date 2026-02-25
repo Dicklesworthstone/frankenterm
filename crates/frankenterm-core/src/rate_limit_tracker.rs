@@ -360,13 +360,14 @@ fn parse_retry_after(text: &str) -> Option<Duration> {
     if parts.len() >= 2 {
         if let Ok(n) = parts[0].parse::<u64>() {
             let unit = parts[1].trim_end_matches('s');
-            let multiplier = match unit {
+            let multiplier: u64 = match unit {
                 "second" => 1,
                 "minute" => 60,
                 "hour" => 3600,
                 _ => return None,
             };
-            return Some(Duration::from_secs(n * multiplier));
+            let secs = n.checked_mul(multiplier)?;
+            return Some(Duration::from_secs(secs));
         }
     }
 
@@ -419,6 +420,12 @@ mod tests {
         assert_eq!(parse_retry_after("soon"), None);
         assert_eq!(parse_retry_after(""), None);
         assert_eq!(parse_retry_after("5 widgets"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_overflow_returns_none() {
+        let text = format!("{} hours", u64::MAX);
+        assert_eq!(parse_retry_after(&text), None);
     }
 
     #[test]
