@@ -35,6 +35,7 @@
 //! 5. B4 (done): Migrate vector/chunk index internals to FSVI path
 //! 6. **B5 (done)**: Preserve terminal-specific chunking via adapter layer
 //! 7. **B6 (done)**: Migrate reranker path to frankensearch-rerank bridge
+//! 8. **B7 (done)**: Adapt daemon/background indexing to frankensearch APIs
 
 use super::reranker::RerankConfig;
 use super::{
@@ -123,6 +124,67 @@ impl RerankerDispatch {
 }
 
 impl fmt::Display for RerankerDispatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Daemon dispatch strategy (B7).
+///
+/// Controls whether the embedding daemon uses the local worker path or
+/// delegates to frankensearch's `BatchCoalescer` + `CachedEmbedder`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonDispatch {
+    /// Daemon is disabled (no background embedding).
+    Disabled,
+    /// Legacy daemon worker — processes requests one at a time.
+    Legacy,
+    /// Managed daemon via frankensearch BatchCoalescer + CachedEmbedder.
+    Managed,
+}
+
+impl Default for DaemonDispatch {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl DaemonDispatch {
+    /// Canonical string representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Legacy => "legacy",
+            Self::Managed => "managed",
+        }
+    }
+
+    /// Parse from string (case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_lowercase().as_str() {
+            "legacy" | "local" | "single" | "worker" => Self::Legacy,
+            "managed" | "bridge" | "frankensearch" | "batch" | "coalescer" => Self::Managed,
+            _ => Self::Disabled,
+        }
+    }
+
+    /// Whether the daemon is enabled (not Disabled).
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Whether managed batch coalescing is active.
+    #[must_use]
+    pub fn is_managed(self) -> bool {
+        matches!(self, Self::Managed)
+    }
+}
+
+impl fmt::Display for DaemonDispatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -382,6 +444,12 @@ pub struct OrchestrationMetrics {
     /// Whether reranking was enabled for this query (B6).
     #[serde(default)]
     pub reranker_enabled: bool,
+    /// Daemon dispatch strategy used (B7).
+    #[serde(default)]
+    pub daemon_dispatch: String,
+    /// Whether the daemon is enabled (B7).
+    #[serde(default)]
+    pub daemon_enabled: bool,
 }
 
 /// Input for legacy orchestration: pre-ranked lists from caller.
@@ -432,6 +500,9 @@ pub struct OrchestratorConfig {
     /// Reranker dispatch strategy (B6).
     #[serde(default)]
     pub reranker_dispatch: RerankerDispatch,
+    /// Daemon dispatch strategy (B7).
+    #[serde(default)]
+    pub daemon_dispatch: DaemonDispatch,
 }
 
 impl Default for OrchestratorConfig {
@@ -448,6 +519,7 @@ impl Default for OrchestratorConfig {
             vector_index_backend: "ftvi".to_string(),
             chunking_adapter_enabled: false,
             reranker_dispatch: RerankerDispatch::Disabled,
+            daemon_dispatch: DaemonDispatch::Disabled,
         }
     }
 }
@@ -462,6 +534,8 @@ struct MigrationMetrics {
     chunking_adapter_enabled: bool,
     reranker_dispatch: String,
     reranker_enabled: bool,
+    daemon_dispatch: String,
+    daemon_enabled: bool,
 }
 
 /// Search orchestrator that encapsulates backend selection and fallback logic.
@@ -566,6 +640,8 @@ impl SearchOrchestrator {
             chunking_adapter_enabled: self.config.chunking_adapter_enabled,
             reranker_dispatch: self.config.reranker_dispatch.as_str().to_string(),
             reranker_enabled: self.config.reranker_dispatch.is_enabled(),
+            daemon_dispatch: self.config.daemon_dispatch.as_str().to_string(),
+            daemon_enabled: self.config.daemon_dispatch.is_enabled(),
         }
     }
 
@@ -611,6 +687,8 @@ impl SearchOrchestrator {
                 chunking_adapter_enabled: mm.chunking_adapter_enabled,
                 reranker_dispatch: mm.reranker_dispatch,
                 reranker_enabled: mm.reranker_enabled,
+                daemon_dispatch: mm.daemon_dispatch,
+                daemon_enabled: mm.daemon_enabled,
             },
         }
     }
@@ -653,6 +731,8 @@ impl SearchOrchestrator {
                     chunking_adapter_enabled: mm.chunking_adapter_enabled,
                     reranker_dispatch: mm.reranker_dispatch,
                     reranker_enabled: mm.reranker_enabled,
+                    daemon_dispatch: mm.daemon_dispatch,
+                    daemon_enabled: mm.daemon_enabled,
                 },
             },
             Err(_) if self.config.fallback_to_legacy => {
@@ -826,6 +906,7 @@ mod tests {
             vector_index_backend: "fsvi".to_string(),
             chunking_adapter_enabled: true,
             reranker_dispatch: RerankerDispatch::Managed,
+            daemon_dispatch: DaemonDispatch::Managed,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
@@ -835,6 +916,7 @@ mod tests {
         assert_eq!(back.vector_index_backend, "fsvi");
         assert!(back.chunking_adapter_enabled);
         assert_eq!(back.reranker_dispatch, RerankerDispatch::Managed);
+        assert_eq!(back.daemon_dispatch, DaemonDispatch::Managed);
     }
 
     // ── SearchOrchestrator ────────────────────────────────────────────
@@ -983,6 +1065,8 @@ mod tests {
             chunking_adapter_enabled: false,
             reranker_dispatch: "disabled".to_string(),
             reranker_enabled: false,
+            daemon_dispatch: "disabled".to_string(),
+            daemon_enabled: false,
         };
         let json = serde_json::to_string(&metrics).unwrap();
         let back: OrchestrationMetrics = serde_json::from_str(&json).unwrap();
@@ -992,6 +1076,8 @@ mod tests {
         assert_eq!(back.vector_index_backend, "ftvi");
         assert_eq!(back.reranker_dispatch, "disabled");
         assert!(!back.reranker_enabled);
+        assert_eq!(back.daemon_dispatch, "disabled");
+        assert!(!back.daemon_enabled);
     }
 
     #[test]
@@ -1552,5 +1638,144 @@ mod tests {
         assert_eq!(format!("{:?}", RerankerDispatch::Disabled), "Disabled");
         assert_eq!(format!("{:?}", RerankerDispatch::Legacy), "Legacy");
         assert_eq!(format!("{:?}", RerankerDispatch::Managed), "Managed");
+    }
+
+    // ── B7: DaemonDispatch ─────────────────────────────────────────
+
+    #[test]
+    fn daemon_dispatch_default_is_disabled() {
+        assert_eq!(DaemonDispatch::default(), DaemonDispatch::Disabled);
+    }
+
+    #[test]
+    fn daemon_dispatch_as_str() {
+        assert_eq!(DaemonDispatch::Disabled.as_str(), "disabled");
+        assert_eq!(DaemonDispatch::Legacy.as_str(), "legacy");
+        assert_eq!(DaemonDispatch::Managed.as_str(), "managed");
+    }
+
+    #[test]
+    fn daemon_dispatch_display() {
+        assert_eq!(format!("{}", DaemonDispatch::Disabled), "disabled");
+        assert_eq!(format!("{}", DaemonDispatch::Legacy), "legacy");
+        assert_eq!(format!("{}", DaemonDispatch::Managed), "managed");
+    }
+
+    #[test]
+    fn daemon_dispatch_parse() {
+        assert_eq!(DaemonDispatch::parse("legacy"), DaemonDispatch::Legacy);
+        assert_eq!(DaemonDispatch::parse("local"), DaemonDispatch::Legacy);
+        assert_eq!(DaemonDispatch::parse("single"), DaemonDispatch::Legacy);
+        assert_eq!(DaemonDispatch::parse("worker"), DaemonDispatch::Legacy);
+        assert_eq!(DaemonDispatch::parse("managed"), DaemonDispatch::Managed);
+        assert_eq!(DaemonDispatch::parse("bridge"), DaemonDispatch::Managed);
+        assert_eq!(DaemonDispatch::parse("frankensearch"), DaemonDispatch::Managed);
+        assert_eq!(DaemonDispatch::parse("batch"), DaemonDispatch::Managed);
+        assert_eq!(DaemonDispatch::parse("coalescer"), DaemonDispatch::Managed);
+        assert_eq!(DaemonDispatch::parse("MANAGED"), DaemonDispatch::Managed);
+        assert_eq!(DaemonDispatch::parse("disabled"), DaemonDispatch::Disabled);
+        assert_eq!(DaemonDispatch::parse("unknown"), DaemonDispatch::Disabled);
+        assert_eq!(DaemonDispatch::parse(""), DaemonDispatch::Disabled);
+    }
+
+    #[test]
+    fn daemon_dispatch_is_enabled() {
+        assert!(!DaemonDispatch::Disabled.is_enabled());
+        assert!(DaemonDispatch::Legacy.is_enabled());
+        assert!(DaemonDispatch::Managed.is_enabled());
+    }
+
+    #[test]
+    fn daemon_dispatch_is_managed() {
+        assert!(!DaemonDispatch::Disabled.is_managed());
+        assert!(!DaemonDispatch::Legacy.is_managed());
+        assert!(DaemonDispatch::Managed.is_managed());
+    }
+
+    #[test]
+    fn daemon_dispatch_serde_roundtrip() {
+        for d in [
+            DaemonDispatch::Disabled,
+            DaemonDispatch::Legacy,
+            DaemonDispatch::Managed,
+        ] {
+            let json = serde_json::to_string(&d).unwrap();
+            let back: DaemonDispatch = serde_json::from_str(&json).unwrap();
+            assert_eq!(d, back);
+        }
+    }
+
+    #[test]
+    fn daemon_dispatch_debug() {
+        assert_eq!(format!("{:?}", DaemonDispatch::Disabled), "Disabled");
+        assert_eq!(format!("{:?}", DaemonDispatch::Legacy), "Legacy");
+        assert_eq!(format!("{:?}", DaemonDispatch::Managed), "Managed");
+    }
+
+    #[test]
+    fn config_default_daemon_disabled() {
+        let cfg = OrchestratorConfig::default();
+        assert_eq!(cfg.daemon_dispatch, DaemonDispatch::Disabled);
+    }
+
+    #[test]
+    fn config_daemon_dispatch_serde() {
+        let cfg = OrchestratorConfig {
+            daemon_dispatch: DaemonDispatch::Managed,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.daemon_dispatch, DaemonDispatch::Managed);
+    }
+
+    #[test]
+    fn config_daemon_serde_absent_defaults_disabled() {
+        let json = r#"{"backend":"legacy","mode":"hybrid","rrf_k":60,"alpha":0.7,"lexical_weight":1.0,"semantic_weight":1.0,"fallback_to_legacy":true,"embedder_dispatch":"legacy","vector_index_backend":"ftvi"}"#;
+        let cfg: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.daemon_dispatch, DaemonDispatch::Disabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_daemon_disabled_by_default() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.daemon_dispatch, "disabled");
+        assert!(!result.metrics.daemon_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_daemon_legacy() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            daemon_dispatch: DaemonDispatch::Legacy,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.daemon_dispatch, "legacy");
+        assert!(result.metrics.daemon_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_daemon_managed() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            daemon_dispatch: DaemonDispatch::Managed,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.daemon_dispatch, "managed");
+        assert!(result.metrics.daemon_enabled);
+    }
+
+    #[test]
+    fn orchestrator_bridge_daemon_metrics() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Bridge,
+            daemon_dispatch: DaemonDispatch::Managed,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.daemon_dispatch, "managed");
+        assert!(result.metrics.daemon_enabled);
+        assert_eq!(result.metrics.backend, "bridge");
     }
 }

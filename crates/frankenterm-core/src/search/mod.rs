@@ -13,6 +13,8 @@ mod indexing;
 pub mod orchestrator;
 mod reranker;
 #[cfg(feature = "frankensearch")]
+pub mod daemon_bridge;
+#[cfg(feature = "frankensearch")]
 pub mod reranker_bridge;
 mod vector_index;
 #[cfg(feature = "frankensearch")]
@@ -61,6 +63,15 @@ pub use reranker::{
 #[cfg(feature = "frankensearch")]
 pub use reranker::{FrankenSearchRerankAdapter, apply_frankensearch_rerank_scores};
 pub use vector_index::{FtviIndex, FtviRecord, FtviWriter, write_ftvi_vec};
+
+#[cfg(feature = "frankensearch")]
+pub use daemon_bridge::{
+    BatchEmbedRequest, BatchEmbedResult, DaemonBridgeConfig, DaemonBridgeMetrics,
+    DaemonBridgeExplanation, EmbedPriority, SingleEmbedEntry, SingleEmbedResult,
+    compute_batch_utilization, compute_cache_hit_rate, compute_priority_skew,
+    entries_to_texts, explain_bridge, from_coalescer_config, from_coalescer_metrics,
+    from_fs_priority, to_coalescer_config, to_fs_priority, vectors_to_results,
+};
 
 #[cfg(feature = "frankensearch")]
 pub use reranker_bridge::{

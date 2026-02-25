@@ -5,7 +5,7 @@
 //! and ranking stability.
 
 use frankenterm_core::search::orchestrator::{
-    EmbedderDispatch, LegacySearchInput, OrchestrationBackend, OrchestratorConfig,
+    DaemonDispatch, EmbedderDispatch, LegacySearchInput, OrchestrationBackend, OrchestratorConfig,
     RerankerDispatch, SearchModeConfig, SearchOrchestrator,
 };
 use proptest::prelude::*;
@@ -46,6 +46,14 @@ fn arb_reranker_dispatch() -> impl Strategy<Value = RerankerDispatch> {
     ]
 }
 
+fn arb_daemon_dispatch() -> impl Strategy<Value = DaemonDispatch> {
+    prop_oneof![
+        Just(DaemonDispatch::Disabled),
+        Just(DaemonDispatch::Legacy),
+        Just(DaemonDispatch::Managed),
+    ]
+}
+
 fn arb_config() -> impl Strategy<Value = OrchestratorConfig> {
     (
         arb_backend(),
@@ -59,8 +67,9 @@ fn arb_config() -> impl Strategy<Value = OrchestratorConfig> {
         arb_vector_index_backend(), // vector_index_backend
         any::<bool>(),              // chunking_adapter_enabled
         arb_reranker_dispatch(),    // reranker_dispatch (B6)
+        arb_daemon_dispatch(),      // daemon_dispatch (B7)
     )
-        .prop_map(|(backend, mode, rrf_k, alpha, lw, sw, fallback, emb, vib, cae, rd)| {
+        .prop_map(|(backend, mode, rrf_k, alpha, lw, sw, fallback, emb, vib, cae, rd, dd)| {
             OrchestratorConfig {
                 backend,
                 mode,
@@ -73,6 +82,7 @@ fn arb_config() -> impl Strategy<Value = OrchestratorConfig> {
                 vector_index_backend: vib,
                 chunking_adapter_enabled: cae,
                 reranker_dispatch: rd,
+                daemon_dispatch: dd,
             }
         })
 }
