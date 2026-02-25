@@ -281,6 +281,18 @@ impl TxExecutionLedger {
         &self.plan_id
     }
 
+    /// The deterministic plan hash.
+    #[must_use]
+    pub fn plan_hash(&self) -> u64 {
+        self.plan_hash
+    }
+
+    /// The hash chain tip (hash of the last appended record).
+    #[must_use]
+    pub fn last_hash(&self) -> &str {
+        &self.last_hash
+    }
+
     /// Current phase of this tx execution.
     #[must_use]
     pub fn phase(&self) -> TxPhase {
