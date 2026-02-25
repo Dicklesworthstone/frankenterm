@@ -4281,6 +4281,131 @@ fn resolve_robot_output_format(cli: Option<RobotOutputFormat>) -> RobotOutputFor
     RobotOutputFormat::Json
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeProcessRole {
+    Cli,
+    Watch,
+    Web,
+    Robot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeBootstrapSpec {
+    role: RuntimeProcessRole,
+    thread_name: &'static str,
+    startup_reason_code: &'static str,
+    shutdown_reason_code: &'static str,
+}
+
+fn runtime_process_role_for_subcommand(subcommand: Option<&str>) -> RuntimeProcessRole {
+    match subcommand {
+        Some("watch") => RuntimeProcessRole::Watch,
+        Some("web") => RuntimeProcessRole::Web,
+        Some("robot") => RuntimeProcessRole::Robot,
+        _ => RuntimeProcessRole::Cli,
+    }
+}
+
+fn runtime_bootstrap_spec_for_role(role: RuntimeProcessRole) -> RuntimeBootstrapSpec {
+    match role {
+        RuntimeProcessRole::Cli => RuntimeBootstrapSpec {
+            role,
+            thread_name: "ft-cli-runtime",
+            startup_reason_code: "runtime.bootstrap.cli.startup",
+            shutdown_reason_code: "runtime.bootstrap.cli.shutdown",
+        },
+        RuntimeProcessRole::Watch => RuntimeBootstrapSpec {
+            role,
+            thread_name: "ft-watch-runtime",
+            startup_reason_code: "runtime.bootstrap.watch.startup",
+            shutdown_reason_code: "runtime.bootstrap.watch.shutdown",
+        },
+        RuntimeProcessRole::Web => RuntimeBootstrapSpec {
+            role,
+            thread_name: "ft-web-runtime",
+            startup_reason_code: "runtime.bootstrap.web.startup",
+            shutdown_reason_code: "runtime.bootstrap.web.shutdown",
+        },
+        RuntimeProcessRole::Robot => RuntimeBootstrapSpec {
+            role,
+            thread_name: "ft-robot-runtime",
+            startup_reason_code: "runtime.bootstrap.robot.startup",
+            shutdown_reason_code: "runtime.bootstrap.robot.shutdown",
+        },
+    }
+}
+
+fn parse_runtime_worker_threads(value: Option<&str>) -> Result<Option<usize>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let parsed = trimmed.parse::<usize>().map_err(|_| {
+        format!(
+            "Invalid FT_RUNTIME_WORKER_THREADS value '{trimmed}': expected positive integer"
+        )
+    })?;
+    if parsed == 0 {
+        return Err(
+            "Invalid FT_RUNTIME_WORKER_THREADS value '0': value must be >= 1".to_string(),
+        );
+    }
+    Ok(Some(parsed))
+}
+
+fn build_process_runtime(
+    spec: RuntimeBootstrapSpec,
+    worker_threads: Option<usize>,
+) -> Result<frankenterm_core::runtime_compat::Runtime, String> {
+    let mut builder = frankenterm_core::runtime_compat::RuntimeBuilder::multi_thread()
+        .enable_all()
+        .thread_name(spec.thread_name);
+    if let Some(count) = worker_threads {
+        builder = builder.worker_threads(count);
+    }
+    builder.build()
+}
+
+fn emit_runtime_bootstrap_lifecycle(
+    spec: RuntimeBootstrapSpec,
+    phase: &'static str,
+    outcome: &'static str,
+    error_code: Option<&str>,
+) {
+    if std::env::var_os("FT_RUNTIME_BOOTSTRAP_LOG").is_none() {
+        return;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let payload = serde_json::json!({
+        "event": "runtime_bootstrap.lifecycle",
+        "phase": phase,
+        "role": match spec.role {
+            RuntimeProcessRole::Cli => "cli",
+            RuntimeProcessRole::Watch => "watch",
+            RuntimeProcessRole::Web => "web",
+            RuntimeProcessRole::Robot => "robot",
+        },
+        "thread_name": spec.thread_name,
+        "reason_code": if phase == "startup" {
+            spec.startup_reason_code
+        } else {
+            spec.shutdown_reason_code
+        },
+        "outcome": outcome,
+        "error_code": error_code,
+        "timestamp_s": now,
+    });
+    eprintln!("{payload}");
+}
+
 fn sniff_robot_output_format_from_args() -> Option<RobotOutputFormat> {
     let mut args = std::env::args();
     while let Some(arg) = args.next() {
@@ -4297,21 +4422,23 @@ fn sniff_robot_output_format_from_args() -> Option<RobotOutputFormat> {
     None
 }
 
-fn sniff_robot_mode_from_args() -> bool {
-    let mut args = std::env::args();
-    // Skip argv[0]
-    let _ = args.next();
-
+fn sniff_primary_subcommand_from_iter<I, S>(args: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter();
     let mut skip_next_value = false;
 
     while let Some(arg) = args.next() {
+        let arg = arg.as_ref();
         if skip_next_value {
             skip_next_value = false;
             continue;
         }
 
         if arg == "--" {
-            return args.next().is_some_and(|sub| sub == "robot");
+            return args.next().map(|sub| sub.as_ref().to_string());
         }
 
         // Known global options that take values.
@@ -4359,10 +4486,22 @@ fn sniff_robot_mode_from_args() -> bool {
         }
 
         // First positional token is the subcommand.
-        return arg == "robot";
+        return Some(arg.to_string());
     }
 
-    false
+    None
+}
+
+fn sniff_primary_subcommand_from_args() -> Option<String> {
+    sniff_primary_subcommand_from_iter(std::env::args().skip(1))
+}
+
+fn sniff_runtime_process_role_from_args() -> RuntimeProcessRole {
+    runtime_process_role_for_subcommand(sniff_primary_subcommand_from_args().as_deref())
+}
+
+fn sniff_robot_mode_from_args() -> bool {
+    sniff_runtime_process_role_from_args() == RuntimeProcessRole::Robot
 }
 
 fn should_show_toon_stats(cli_stats: bool) -> bool {
@@ -11824,22 +11963,47 @@ fn send_backup_notification(
 
 fn main() {
     use frankenterm_core::runtime_compat::CompatRuntime;
-    let rt = match frankenterm_core::runtime_compat::RuntimeBuilder::multi_thread()
-        .enable_all()
-        .build()
-    {
+
+    let runtime_role = sniff_runtime_process_role_from_args();
+    let runtime_spec = runtime_bootstrap_spec_for_role(runtime_role);
+    let runtime_worker_threads_env = std::env::var("FT_RUNTIME_WORKER_THREADS").ok();
+    let runtime_worker_threads =
+        match parse_runtime_worker_threads(runtime_worker_threads_env.as_deref()) {
+            Ok(value) => value,
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
+        };
+
+    let rt = match build_process_runtime(runtime_spec, runtime_worker_threads) {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("Failed to initialize async runtime: {e}");
+            eprintln!(
+                "Failed to initialize async runtime (role={:?}, thread_name={}): {e}",
+                runtime_spec.role, runtime_spec.thread_name
+            );
             std::process::exit(1);
         }
     };
 
-    let robot_mode = sniff_robot_mode_from_args();
+    emit_runtime_bootstrap_lifecycle(runtime_spec, "startup", "runtime_initialized", None);
+    let robot_mode = runtime_role == RuntimeProcessRole::Robot;
     rt.block_on(async {
-        if let Err(err) = Box::pin(run(robot_mode)).await {
-            handle_fatal_error(&err, robot_mode);
-            std::process::exit(1);
+        match Box::pin(run(robot_mode)).await {
+            Ok(()) => {
+                emit_runtime_bootstrap_lifecycle(runtime_spec, "shutdown", "run_completed", None);
+            }
+            Err(err) => {
+                emit_runtime_bootstrap_lifecycle(
+                    runtime_spec,
+                    "shutdown",
+                    "run_failed",
+                    Some("runtime.run_failed"),
+                );
+                handle_fatal_error(&err, robot_mode);
+                std::process::exit(1);
+            }
         }
     });
 }
@@ -34202,6 +34366,95 @@ mod tests {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64)
+    }
+
+    #[test]
+    fn runtime_bootstrap_subcommand_detection_covers_modes() {
+        assert_eq!(
+            sniff_primary_subcommand_from_iter(["watch", "--foreground"]),
+            Some("watch".to_string())
+        );
+        assert_eq!(
+            sniff_primary_subcommand_from_iter(["robot", "state"]),
+            Some("robot".to_string())
+        );
+        assert_eq!(
+            sniff_primary_subcommand_from_iter(["--workspace", "/tmp/ws", "web", "--port", "8080"]),
+            Some("web".to_string())
+        );
+        assert_eq!(
+            sniff_primary_subcommand_from_iter(["-vc", "/tmp/ft.toml", "watch"]),
+            Some("watch".to_string())
+        );
+        assert_eq!(
+            sniff_primary_subcommand_from_iter(["-c/tmp/ft.toml", "robot"]),
+            Some("robot".to_string())
+        );
+        assert_eq!(
+            sniff_primary_subcommand_from_iter(["--", "robot"]),
+            Some("robot".to_string())
+        );
+
+        assert_eq!(
+            runtime_process_role_for_subcommand(Some("watch")),
+            RuntimeProcessRole::Watch
+        );
+        assert_eq!(
+            runtime_process_role_for_subcommand(Some("web")),
+            RuntimeProcessRole::Web
+        );
+        assert_eq!(
+            runtime_process_role_for_subcommand(Some("robot")),
+            RuntimeProcessRole::Robot
+        );
+        assert_eq!(
+            runtime_process_role_for_subcommand(Some("status")),
+            RuntimeProcessRole::Cli
+        );
+        assert_eq!(runtime_process_role_for_subcommand(None), RuntimeProcessRole::Cli);
+    }
+
+    #[test]
+    fn runtime_bootstrap_worker_thread_parser_handles_errors() {
+        assert_eq!(parse_runtime_worker_threads(None).expect("none is valid"), None);
+        assert_eq!(
+            parse_runtime_worker_threads(Some("")).expect("empty is valid"),
+            None
+        );
+        assert_eq!(
+            parse_runtime_worker_threads(Some(" 4 ")).expect("numeric is valid"),
+            Some(4)
+        );
+
+        let zero_err = parse_runtime_worker_threads(Some("0")).expect_err("zero should fail");
+        assert!(zero_err.contains(">= 1"));
+
+        let parse_err =
+            parse_runtime_worker_threads(Some("abc")).expect_err("non-integer should fail");
+        assert!(parse_err.contains("FT_RUNTIME_WORKER_THREADS"));
+    }
+
+    #[test]
+    fn runtime_bootstrap_spec_maps_modes_to_thread_names() {
+        let cli = runtime_bootstrap_spec_for_role(RuntimeProcessRole::Cli);
+        assert_eq!(cli.thread_name, "ft-cli-runtime");
+        assert_eq!(cli.startup_reason_code, "runtime.bootstrap.cli.startup");
+        assert_eq!(cli.shutdown_reason_code, "runtime.bootstrap.cli.shutdown");
+
+        let watch = runtime_bootstrap_spec_for_role(RuntimeProcessRole::Watch);
+        assert_eq!(watch.thread_name, "ft-watch-runtime");
+        assert_eq!(watch.startup_reason_code, "runtime.bootstrap.watch.startup");
+        assert_eq!(watch.shutdown_reason_code, "runtime.bootstrap.watch.shutdown");
+
+        let web = runtime_bootstrap_spec_for_role(RuntimeProcessRole::Web);
+        assert_eq!(web.thread_name, "ft-web-runtime");
+        assert_eq!(web.startup_reason_code, "runtime.bootstrap.web.startup");
+        assert_eq!(web.shutdown_reason_code, "runtime.bootstrap.web.shutdown");
+
+        let robot = runtime_bootstrap_spec_for_role(RuntimeProcessRole::Robot);
+        assert_eq!(robot.thread_name, "ft-robot-runtime");
+        assert_eq!(robot.startup_reason_code, "runtime.bootstrap.robot.startup");
+        assert_eq!(robot.shutdown_reason_code, "runtime.bootstrap.robot.shutdown");
     }
 
     fn sample_cli_mission() -> frankenterm_core::plan::Mission {
