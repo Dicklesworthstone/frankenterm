@@ -34,7 +34,9 @@
 //! 4. B3 (done): Migrate embedder stack dispatch + fallback tiers
 //! 5. B4 (done): Migrate vector/chunk index internals to FSVI path
 //! 6. **B5 (done)**: Preserve terminal-specific chunking via adapter layer
+//! 7. **B6 (done)**: Migrate reranker path to frankensearch-rerank bridge
 
+use super::reranker::RerankConfig;
 use super::{
     EmbedError, Embedder, EmbedderInfo, EmbedderTier, FusedResult, HashEmbedder,
     HybridSearchService, SearchMode, TwoTierMetrics,
@@ -73,6 +75,58 @@ impl From<SearchMode> for SearchModeConfig {
 }
 
 // ── B3: Embedder dispatch types ───────────────────────────────────────
+
+/// Reranker dispatch strategy (B6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankerDispatch {
+    /// Reranking disabled (no post-fusion reranking step).
+    Disabled,
+    /// Use local reranker implementation (PassthroughReranker or CrossEncoderReranker).
+    Legacy,
+    /// Use frankensearch reranker via bridge adapter.
+    Managed,
+}
+
+impl Default for RerankerDispatch {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl RerankerDispatch {
+    /// Canonical string representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Legacy => "legacy",
+            Self::Managed => "managed",
+        }
+    }
+
+    /// Parse from string (case-insensitive).
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_lowercase().as_str() {
+            "legacy" | "local" | "passthrough" => Self::Legacy,
+            "managed" | "bridge" | "frankensearch" | "flashrank" => Self::Managed,
+            _ => Self::Disabled,
+        }
+    }
+
+    /// Whether reranking is enabled (not Disabled).
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+impl fmt::Display for RerankerDispatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Embedder dispatch strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,6 +376,12 @@ pub struct OrchestrationMetrics {
     /// Whether the chunking adapter was active for this query (B5).
     #[serde(default)]
     pub chunking_adapter_enabled: bool,
+    /// Reranker dispatch strategy used (B6).
+    #[serde(default)]
+    pub reranker_dispatch: String,
+    /// Whether reranking was enabled for this query (B6).
+    #[serde(default)]
+    pub reranker_enabled: bool,
 }
 
 /// Input for legacy orchestration: pre-ranked lists from caller.
@@ -369,6 +429,9 @@ pub struct OrchestratorConfig {
     /// When true, SemanticChunks are converted through the adapter before indexing.
     #[serde(default)]
     pub chunking_adapter_enabled: bool,
+    /// Reranker dispatch strategy (B6).
+    #[serde(default)]
+    pub reranker_dispatch: RerankerDispatch,
 }
 
 impl Default for OrchestratorConfig {
@@ -384,6 +447,7 @@ impl Default for OrchestratorConfig {
             embedder_dispatch: EmbedderDispatch::Legacy,
             vector_index_backend: "ftvi".to_string(),
             chunking_adapter_enabled: false,
+            reranker_dispatch: RerankerDispatch::Disabled,
         }
     }
 }
@@ -396,6 +460,8 @@ struct MigrationMetrics {
     embedder_fallback: bool,
     vector_index_backend: String,
     chunking_adapter_enabled: bool,
+    reranker_dispatch: String,
+    reranker_enabled: bool,
 }
 
 /// Search orchestrator that encapsulates backend selection and fallback logic.
@@ -467,6 +533,28 @@ impl SearchOrchestrator {
             .map(|stack| stack.embed_with_fallback(text))
     }
 
+    /// Build the effective `RerankConfig` from the orchestrator's `RerankerDispatch`.
+    ///
+    /// Maps the high-level dispatch enum to a detailed config struct that the
+    /// reranking pipeline step consumes.
+    #[must_use]
+    pub fn effective_rerank_config(&self) -> RerankConfig {
+        use super::reranker::RerankBackend;
+        match self.config.reranker_dispatch {
+            RerankerDispatch::Disabled => RerankConfig::default(), // enabled = false
+            RerankerDispatch::Legacy => RerankConfig {
+                enabled: true,
+                backend: RerankBackend::Passthrough,
+                ..Default::default()
+            },
+            RerankerDispatch::Managed => RerankConfig {
+                enabled: true,
+                backend: RerankBackend::FrankenSearch,
+                ..Default::default()
+            },
+        }
+    }
+
     /// Build embedder + vector-index metrics based on current state.
     fn migration_metrics(&self) -> MigrationMetrics {
         MigrationMetrics {
@@ -476,6 +564,8 @@ impl SearchOrchestrator {
             embedder_fallback: false,
             vector_index_backend: self.config.vector_index_backend.clone(),
             chunking_adapter_enabled: self.config.chunking_adapter_enabled,
+            reranker_dispatch: self.config.reranker_dispatch.as_str().to_string(),
+            reranker_enabled: self.config.reranker_dispatch.is_enabled(),
         }
     }
 
@@ -519,6 +609,8 @@ impl SearchOrchestrator {
                 embedder_fallback: mm.embedder_fallback,
                 vector_index_backend: mm.vector_index_backend,
                 chunking_adapter_enabled: mm.chunking_adapter_enabled,
+                reranker_dispatch: mm.reranker_dispatch,
+                reranker_enabled: mm.reranker_enabled,
             },
         }
     }
@@ -559,6 +651,8 @@ impl SearchOrchestrator {
                     embedder_fallback: mm.embedder_fallback,
                     vector_index_backend: mm.vector_index_backend,
                     chunking_adapter_enabled: mm.chunking_adapter_enabled,
+                    reranker_dispatch: mm.reranker_dispatch,
+                    reranker_enabled: mm.reranker_enabled,
                 },
             },
             Err(_) if self.config.fallback_to_legacy => {
@@ -715,6 +809,7 @@ mod tests {
         assert!(cfg.fallback_to_legacy);
         assert_eq!(cfg.embedder_dispatch, EmbedderDispatch::Legacy);
         assert!(!cfg.chunking_adapter_enabled);
+        assert_eq!(cfg.reranker_dispatch, RerankerDispatch::Disabled);
     }
 
     #[test]
@@ -730,6 +825,7 @@ mod tests {
             embedder_dispatch: EmbedderDispatch::Managed,
             vector_index_backend: "fsvi".to_string(),
             chunking_adapter_enabled: true,
+            reranker_dispatch: RerankerDispatch::Managed,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
@@ -738,6 +834,7 @@ mod tests {
         assert_eq!(back.embedder_dispatch, EmbedderDispatch::Managed);
         assert_eq!(back.vector_index_backend, "fsvi");
         assert!(back.chunking_adapter_enabled);
+        assert_eq!(back.reranker_dispatch, RerankerDispatch::Managed);
     }
 
     // ── SearchOrchestrator ────────────────────────────────────────────
@@ -884,6 +981,8 @@ mod tests {
             embedder_fallback: false,
             vector_index_backend: "ftvi".to_string(),
             chunking_adapter_enabled: false,
+            reranker_dispatch: "disabled".to_string(),
+            reranker_enabled: false,
         };
         let json = serde_json::to_string(&metrics).unwrap();
         let back: OrchestrationMetrics = serde_json::from_str(&json).unwrap();
@@ -891,6 +990,8 @@ mod tests {
         assert_eq!(back.lexical_candidates, 100);
         assert_eq!(back.embedder_dispatch, "Legacy");
         assert_eq!(back.vector_index_backend, "ftvi");
+        assert_eq!(back.reranker_dispatch, "disabled");
+        assert!(!back.reranker_enabled);
     }
 
     #[test]
@@ -1292,5 +1393,164 @@ mod tests {
         });
         let result = orch.fuse_ranked(&sample_input());
         assert!(result.metrics.chunking_adapter_enabled);
+    }
+
+    // ── B6: RerankerDispatch ─────────────────────────────────────────
+
+    #[test]
+    fn reranker_dispatch_default_is_disabled() {
+        assert_eq!(RerankerDispatch::default(), RerankerDispatch::Disabled);
+    }
+
+    #[test]
+    fn reranker_dispatch_as_str() {
+        assert_eq!(RerankerDispatch::Disabled.as_str(), "disabled");
+        assert_eq!(RerankerDispatch::Legacy.as_str(), "legacy");
+        assert_eq!(RerankerDispatch::Managed.as_str(), "managed");
+    }
+
+    #[test]
+    fn reranker_dispatch_display() {
+        assert_eq!(format!("{}", RerankerDispatch::Disabled), "disabled");
+        assert_eq!(format!("{}", RerankerDispatch::Legacy), "legacy");
+        assert_eq!(format!("{}", RerankerDispatch::Managed), "managed");
+    }
+
+    #[test]
+    fn reranker_dispatch_parse() {
+        assert_eq!(
+            RerankerDispatch::parse("legacy"),
+            RerankerDispatch::Legacy
+        );
+        assert_eq!(
+            RerankerDispatch::parse("local"),
+            RerankerDispatch::Legacy
+        );
+        assert_eq!(
+            RerankerDispatch::parse("passthrough"),
+            RerankerDispatch::Legacy
+        );
+        assert_eq!(
+            RerankerDispatch::parse("managed"),
+            RerankerDispatch::Managed
+        );
+        assert_eq!(
+            RerankerDispatch::parse("bridge"),
+            RerankerDispatch::Managed
+        );
+        assert_eq!(
+            RerankerDispatch::parse("frankensearch"),
+            RerankerDispatch::Managed
+        );
+        assert_eq!(
+            RerankerDispatch::parse("flashrank"),
+            RerankerDispatch::Managed
+        );
+        assert_eq!(
+            RerankerDispatch::parse("disabled"),
+            RerankerDispatch::Disabled
+        );
+        assert_eq!(
+            RerankerDispatch::parse("unknown"),
+            RerankerDispatch::Disabled
+        );
+        assert_eq!(
+            RerankerDispatch::parse(""),
+            RerankerDispatch::Disabled
+        );
+    }
+
+    #[test]
+    fn reranker_dispatch_is_enabled() {
+        assert!(!RerankerDispatch::Disabled.is_enabled());
+        assert!(RerankerDispatch::Legacy.is_enabled());
+        assert!(RerankerDispatch::Managed.is_enabled());
+    }
+
+    #[test]
+    fn reranker_dispatch_serde_roundtrip() {
+        for d in [
+            RerankerDispatch::Disabled,
+            RerankerDispatch::Legacy,
+            RerankerDispatch::Managed,
+        ] {
+            let json = serde_json::to_string(&d).unwrap();
+            let back: RerankerDispatch = serde_json::from_str(&json).unwrap();
+            assert_eq!(d, back);
+        }
+    }
+
+    #[test]
+    fn config_default_reranker_disabled() {
+        let cfg = OrchestratorConfig::default();
+        assert_eq!(cfg.reranker_dispatch, RerankerDispatch::Disabled);
+    }
+
+    #[test]
+    fn config_reranker_dispatch_serde() {
+        let cfg = OrchestratorConfig {
+            reranker_dispatch: RerankerDispatch::Managed,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reranker_dispatch, RerankerDispatch::Managed);
+    }
+
+    #[test]
+    fn config_reranker_serde_absent_defaults_disabled() {
+        let json = r#"{"backend":"legacy","mode":"hybrid","rrf_k":60,"alpha":0.7,"lexical_weight":1.0,"semantic_weight":1.0,"fallback_to_legacy":true,"embedder_dispatch":"legacy","vector_index_backend":"ftvi"}"#;
+        let cfg: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.reranker_dispatch, RerankerDispatch::Disabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_reranker_disabled_by_default() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.reranker_dispatch, "disabled");
+        assert!(!result.metrics.reranker_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_reranker_legacy() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            reranker_dispatch: RerankerDispatch::Legacy,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.reranker_dispatch, "legacy");
+        assert!(result.metrics.reranker_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_reranker_managed() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            reranker_dispatch: RerankerDispatch::Managed,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.reranker_dispatch, "managed");
+        assert!(result.metrics.reranker_enabled);
+    }
+
+    #[test]
+    fn orchestrator_bridge_reranker_metrics() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Bridge,
+            reranker_dispatch: RerankerDispatch::Managed,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.reranker_dispatch, "managed");
+        assert!(result.metrics.reranker_enabled);
+        assert_eq!(result.metrics.backend, "bridge");
+    }
+
+    #[test]
+    fn reranker_dispatch_debug() {
+        assert_eq!(format!("{:?}", RerankerDispatch::Disabled), "Disabled");
+        assert_eq!(format!("{:?}", RerankerDispatch::Legacy), "Legacy");
+        assert_eq!(format!("{:?}", RerankerDispatch::Managed), "Managed");
     }
 }

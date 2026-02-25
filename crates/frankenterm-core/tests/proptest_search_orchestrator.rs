@@ -6,7 +6,7 @@
 
 use frankenterm_core::search::orchestrator::{
     EmbedderDispatch, LegacySearchInput, OrchestrationBackend, OrchestratorConfig,
-    SearchModeConfig, SearchOrchestrator,
+    RerankerDispatch, SearchModeConfig, SearchOrchestrator,
 };
 use proptest::prelude::*;
 
@@ -38,20 +38,29 @@ fn arb_vector_index_backend() -> impl Strategy<Value = String> {
     prop_oneof![Just("ftvi".to_string()), Just("fsvi".to_string()),]
 }
 
+fn arb_reranker_dispatch() -> impl Strategy<Value = RerankerDispatch> {
+    prop_oneof![
+        Just(RerankerDispatch::Disabled),
+        Just(RerankerDispatch::Legacy),
+        Just(RerankerDispatch::Managed),
+    ]
+}
+
 fn arb_config() -> impl Strategy<Value = OrchestratorConfig> {
     (
         arb_backend(),
         arb_search_mode(),
-        1..=200_u32,              // rrf_k
-        0.0..=1.0_f32,            // alpha
-        0.1..=5.0_f32,            // lexical_weight
-        0.1..=5.0_f32,            // semantic_weight
-        any::<bool>(),             // fallback_to_legacy
-        arb_embedder_dispatch(),   // embedder_dispatch
+        1..=200_u32,               // rrf_k
+        0.0..=1.0_f32,             // alpha
+        0.1..=5.0_f32,             // lexical_weight
+        0.1..=5.0_f32,             // semantic_weight
+        any::<bool>(),              // fallback_to_legacy
+        arb_embedder_dispatch(),    // embedder_dispatch
         arb_vector_index_backend(), // vector_index_backend
-        any::<bool>(),             // chunking_adapter_enabled
+        any::<bool>(),              // chunking_adapter_enabled
+        arb_reranker_dispatch(),    // reranker_dispatch (B6)
     )
-        .prop_map(|(backend, mode, rrf_k, alpha, lw, sw, fallback, emb, vib, cae)| {
+        .prop_map(|(backend, mode, rrf_k, alpha, lw, sw, fallback, emb, vib, cae, rd)| {
             OrchestratorConfig {
                 backend,
                 mode,
@@ -63,6 +72,7 @@ fn arb_config() -> impl Strategy<Value = OrchestratorConfig> {
                 embedder_dispatch: emb,
                 vector_index_backend: vib,
                 chunking_adapter_enabled: cae,
+                reranker_dispatch: rd,
             }
         })
 }

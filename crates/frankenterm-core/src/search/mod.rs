@@ -12,6 +12,8 @@ mod hybrid_search;
 mod indexing;
 pub mod orchestrator;
 mod reranker;
+#[cfg(feature = "frankensearch")]
+pub mod reranker_bridge;
 mod vector_index;
 #[cfg(feature = "frankensearch")]
 pub mod vector_index_bridge;
@@ -52,8 +54,21 @@ pub use indexing::{
     SearchDocumentSource, SearchIndex, SearchIndexError, SearchIndexStats, chunk_scrollback_lines,
     extract_agent_artifacts, extract_command_output_blocks,
 };
-pub use reranker::{PassthroughReranker, RerankError, Reranker, ScoredDoc};
+pub use reranker::{
+    PassthroughReranker, RerankBackend, RerankConfig, RerankError, RerankOutcome, Reranker,
+    ScoredDoc, rerank_fused_results,
+};
+#[cfg(feature = "frankensearch")]
+pub use reranker::{FrankenSearchRerankAdapter, apply_frankensearch_rerank_scores};
 pub use vector_index::{FtviIndex, FtviRecord, FtviWriter, write_ftvi_vec};
+
+#[cfg(feature = "frankensearch")]
+pub use reranker_bridge::{
+    FsToLocalRerankerAdapter, LocalToFsRerankerAdapter, RerankerBridgeConfig,
+    RerankBridgeMetrics, RerankExplanation, compute_bridge_metrics, explain_rerank,
+    parse_doc_id, rerank_scores_to_scored_docs, scored_doc_to_rerank_document,
+    scored_docs_to_rerank_documents,
+};
 
 #[cfg(feature = "semantic-search")]
 pub use fastembed_embedder::{
