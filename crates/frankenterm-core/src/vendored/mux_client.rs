@@ -947,6 +947,7 @@ mod tests {
     use crate::runtime_compat::{CompatRuntime, RuntimeBuilder, sleep};
     use proptest::prelude::*;
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     const COMPRESSED_MASK: u64 = 1 << 63;
 
@@ -1378,6 +1379,124 @@ mod tests {
 
             drop(client);
             server.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn concurrent_get_pane_render_changes_operations_share_connection_safely() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("concurrent-ops.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+            let expected_requests = 5usize;
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut render_serials = Vec::with_capacity(expected_requests);
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "concurrent-ops-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(request) => {
+                                render_serials.push(decoded.serial);
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: request.pane_id,
+                                    mouse_grabbed: false,
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    dirty_lines: Vec::new(),
+                                    title: format!("pane-{}", request.pane_id),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno: request.pane_id,
+                                })
+                            }
+                            _ => continue,
+                        };
+
+                        let mut out = Vec::new();
+                        response
+                            .encode(&mut out, decoded.serial)
+                            .expect("encode response");
+                        stream.write_all(&out).await.expect("write response");
+
+                        if render_serials.len() == expected_requests {
+                            return render_serials;
+                        }
+                    }
+                }
+
+                render_serials
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let client = Arc::new(tokio::sync::Mutex::new(
+                DirectMuxClient::connect(config).await.expect("connect"),
+            ));
+            let pane_ids = vec![11_u64, 22, 33, 44, 55];
+            let mut joins = Vec::with_capacity(pane_ids.len());
+
+            for pane_id in &pane_ids {
+                let client = Arc::clone(&client);
+                let pane_id = *pane_id;
+                joins.push(task::spawn(async move {
+                    let mut guard = client.lock().await;
+                    let response = guard
+                        .get_pane_render_changes(pane_id)
+                        .await
+                        .expect("get_pane_render_changes");
+                    (pane_id, response.pane_id, response.seqno)
+                }));
+            }
+
+            let mut seen_panes = HashSet::new();
+            for join in joins {
+                let (requested, received_pane_id, received_seqno) =
+                    join.await.expect("join request task");
+                assert_eq!(received_pane_id as u64, requested);
+                assert_eq!(received_seqno as u64, requested);
+                seen_panes.insert(received_pane_id);
+            }
+            assert_eq!(seen_panes.len(), pane_ids.len());
+
+            drop(client);
+            let render_serials = server.await.expect("server task");
+            assert_eq!(render_serials.len(), expected_requests);
+            let unique_serials: HashSet<u64> = render_serials.iter().copied().collect();
+            assert_eq!(unique_serials.len(), expected_requests);
         });
     }
 

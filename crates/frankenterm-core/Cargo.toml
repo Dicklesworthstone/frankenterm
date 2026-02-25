@@ -216,6 +216,11 @@ harness = false
 required-features = ["vendored"]
 
 [[bench]]
+name = "mux_client_ops"
+harness = false
+required-features = ["vendored"]
+
+[[bench]]
 name = "shard_routing"
 harness = false
 

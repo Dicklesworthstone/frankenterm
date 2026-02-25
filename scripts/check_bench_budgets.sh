@@ -60,6 +60,12 @@ declare -A BUDGETS=(
     # Watcher loop overhead
     ["watcher_loop"]=5000000                  # ceiling 5ms
 
+    # Mux client operation benchmarks (coarse regression guards)
+    ["mux_client_ops/pdu_encode_write"]=100000000    # encode+write path, ceiling 100ms
+    ["mux_client_ops/pdu_read_decode"]=200000000     # read+decode path, ceiling 200ms
+    ["mux_client_ops/pdu_roundtrip"]=200000000       # command roundtrip path, ceiling 200ms
+    ["mux_client_ops/subscription_setup"]=500000000  # subscribe+cancel setup path, ceiling 500ms
+
     # Backpressure (fast in-memory ops)
     ["backpressure_tier"]=10000               # ceiling 10us
     ["backpressure_scheduler"]=500000         # ceiling 500us

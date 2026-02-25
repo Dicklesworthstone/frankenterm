@@ -125,6 +125,27 @@ pub const CI_BUDGETS: &[CiBudgetEntry] = &[
         max_median_ns: 5_000_000,
         note: "watcher loop: ceiling 5ms",
     },
+    // Direct mux client operation benchmarks (coarse regression guards).
+    CiBudgetEntry {
+        group_prefix: "mux_client_ops/pdu_encode_write",
+        max_median_ns: 100_000_000,
+        note: "mux client encode+write path: coarse ceiling 100ms",
+    },
+    CiBudgetEntry {
+        group_prefix: "mux_client_ops/pdu_read_decode",
+        max_median_ns: 200_000_000,
+        note: "mux client read+decode path: coarse ceiling 200ms",
+    },
+    CiBudgetEntry {
+        group_prefix: "mux_client_ops/pdu_roundtrip",
+        max_median_ns: 200_000_000,
+        note: "mux client roundtrip path: coarse ceiling 200ms",
+    },
+    CiBudgetEntry {
+        group_prefix: "mux_client_ops/subscription_setup",
+        max_median_ns: 500_000_000,
+        note: "mux subscription setup+cancel path: coarse ceiling 500ms",
+    },
     // Quota selection warm path: target <10ms p99, observed in µs range → ceiling 10ms
     CiBudgetEntry {
         group_prefix: "caut_quota_scheduling/quota_lookup_warm_cache",
