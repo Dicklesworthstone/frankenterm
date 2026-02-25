@@ -1,0 +1,136 @@
+{
+  "version": 1,
+  "generated_at": "2026-02-25T08:20:00Z",
+  "bead_id": "ft-e34d9.10.5.1",
+  "risk_id": "R6",
+  "description": "Vendored runtime primitive inventory and migration map for asupersync",
+  "total_vendored_crates": 29,
+  "async_vendored_crates": 9,
+  "global_smol_refs": 68,
+  "global_asupersync_refs": 7,
+  "global_tokio_refs": 0,
+  "key_finding": "Vendored crates use exclusively smol (68 refs) with zero tokio. Three crates already have async-asupersync feature gates.",
+  "migration_waves": [
+    {
+      "wave": "W0",
+      "label": "Already compatible",
+      "crates": ["async_ossl", "uds", "promise"],
+      "total_refs": 4,
+      "action": "Validate and lock async-asupersync feature contracts",
+      "risk": "low",
+      "dependencies": []
+    },
+    {
+      "wave": "W1",
+      "label": "Codec adapter",
+      "crates": ["codec"],
+      "total_refs": 13,
+      "action": "Replace smol I/O traits with asupersync adapter",
+      "risk": "medium",
+      "dependencies": ["W0"]
+    },
+    {
+      "wave": "W2",
+      "label": "SSH adapter",
+      "crates": ["ssh"],
+      "total_refs": 46,
+      "action": "Adapter for smol channels, block_on, and async I/O; migrate 37 test harness calls",
+      "risk": "high",
+      "dependencies": ["W0", "W1"]
+    },
+    {
+      "wave": "W3",
+      "label": "Config/scripting isolation",
+      "crates": ["config", "scripting"],
+      "total_refs": 7,
+      "action": "Feature-gate isolation for Lua-only smol usage; harmonize with ssh/promise",
+      "risk": "medium",
+      "dependencies": ["W2"]
+    },
+    {
+      "wave": "W4",
+      "label": "Mux transitivity",
+      "crates": ["mux"],
+      "total_refs": 0,
+      "action": "No direct work; migration follows upstream ssh/config/promise",
+      "risk": "medium",
+      "dependencies": ["W2", "W3"]
+    },
+    {
+      "wave": "W5",
+      "label": "Dev-only traits",
+      "crates": ["pty"],
+      "total_refs": 5,
+      "action": "Transparent; futures trait re-exports only in dev-deps",
+      "risk": "low",
+      "dependencies": []
+    }
+  ],
+  "sync_only_crates": [
+    "base91", "bidi", "bintree", "blob-leases", "cell", "char-props",
+    "color-types", "dynamic", "escape-parser", "filedescriptor",
+    "input-types", "luahelper", "rangeset", "surface", "term",
+    "termwiz", "umask", "vtparse", "lua-api-crates", "procinfo"
+  ],
+  "feature_gate_matrix": {
+    "ssh": {
+      "default": "async-smol",
+      "async-smol": true,
+      "async-asupersync": true,
+      "note": "async-asupersync pulls async-smol transitively"
+    },
+    "codec": {
+      "default": "async-smol",
+      "async-smol": true,
+      "async-asupersync": true
+    },
+    "config": {
+      "default": "lua (no async default)",
+      "async-smol": true,
+      "async-asupersync": true
+    },
+    "mux": {
+      "default": "lua + async-smol",
+      "async-smol": true,
+      "async-asupersync": true
+    },
+    "promise": {
+      "default": "(none)",
+      "async-smol": false,
+      "async-asupersync": true
+    },
+    "async_ossl": {
+      "default": "async-io",
+      "async-smol": false,
+      "async-asupersync": true
+    },
+    "uds": {
+      "default": "async-io",
+      "async-smol": false,
+      "async-asupersync": true
+    },
+    "scripting": {
+      "default": "(none)",
+      "async-smol": false,
+      "async-asupersync": false,
+      "note": "smol only via lua feature → config dep"
+    },
+    "pty": {
+      "default": "(none)",
+      "async-smol": false,
+      "async-asupersync": false,
+      "note": "smol + futures in dev-deps only"
+    }
+  },
+  "dependency_graph": {
+    "ssh": ["async_ossl", "uds", "codec"],
+    "config": ["ssh", "promise"],
+    "scripting": ["config"],
+    "mux": ["config", "ssh", "promise"]
+  },
+  "downstream_beads": {
+    "ft-e34d9.10.5.2": "Mux client/pool/runtime migration completion (depends on this)",
+    "ft-e34d9.10.5.3": "wezterm-ssh and remote transport migration (depends on this)",
+    "ft-e34d9.10.5.4": "core↔vendored async contract tests (depends on this)"
+  }
+}

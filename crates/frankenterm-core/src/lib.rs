@@ -463,12 +463,15 @@ pub mod trie;
 pub mod tx_idempotency;
 #[cfg(feature = "subprocess-bridge")]
 pub mod tx_plan_compiler;
+#[cfg(feature = "subprocess-bridge")]
+pub mod tx_observability;
 pub mod undo;
 pub mod union_find;
 pub mod user_preferences;
 pub mod van_emde_boas;
 #[cfg(feature = "vc-export")]
 pub mod vc_export;
+pub mod vendored_migration_map;
 pub mod viewport_reflow_planner;
 pub mod voi;
 pub mod wait;
