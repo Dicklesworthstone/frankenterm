@@ -143,9 +143,9 @@ proptest! {
         let k_commit = TxStepExecutionRecord::compute_step_key(&tx_id, &step_id, &TxPhase::Commit);
         let k_comp = TxStepExecutionRecord::compute_step_key(&tx_id, &step_id, &TxPhase::Compensate);
         let k_prep = TxStepExecutionRecord::compute_step_key(&tx_id, &step_id, &TxPhase::Prepare);
-        prop_assert_ne!(k_commit, k_comp);
-        prop_assert_ne!(k_commit, k_prep);
-        prop_assert_ne!(k_comp, k_prep);
+        prop_assert!(k_commit != k_comp, "commit key must differ from compensate key");
+        prop_assert!(k_commit != k_prep, "commit key must differ from prepare key");
+        prop_assert!(k_comp != k_prep, "compensate key must differ from prepare key");
     }
 
     #[test]

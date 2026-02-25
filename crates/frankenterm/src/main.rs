@@ -29941,7 +29941,9 @@ fn mission_run_transition_plan(
             (State::Running, Kind::ExecutionStarted),
         ]),
         State::Dispatching => Ok(vec![(State::Running, Kind::ExecutionStarted)]),
-        State::RetryPending | State::Blocked => Ok(vec![(State::Running, Kind::RetryResumed)]),
+        State::RetryPending | State::Blocked | State::Paused => {
+            Ok(vec![(State::Running, Kind::RetryResumed)])
+        }
         State::Running => Ok(Vec::new()),
         State::AwaitingApproval => Err(MissionCommandError {
             exit_code: MISSION_EXIT_TRANSITION,
@@ -29972,9 +29974,9 @@ fn mission_pause_transition_plan(
 
     match state {
         State::Dispatching | State::Running | State::RetryPending => {
-            Ok(vec![(State::Blocked, Kind::ExecutionBlocked)])
+            Ok(vec![(State::Paused, Kind::ExecutionBlocked)])
         }
-        State::Blocked => Ok(Vec::new()),
+        State::Blocked | State::Paused => Ok(Vec::new()),
         State::Planning | State::Planned | State::AwaitingApproval => Err(MissionCommandError {
             exit_code: MISSION_EXIT_TRANSITION,
             error_code: "mission.transition.pause_not_active",
@@ -30003,7 +30005,7 @@ fn mission_resume_transition_plan(
     use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
 
     match state {
-        State::Blocked => Ok(vec![(State::Running, Kind::RetryResumed)]),
+        State::Blocked | State::Paused => Ok(vec![(State::Running, Kind::RetryResumed)]),
         State::RetryPending => Ok(vec![(State::Dispatching, Kind::RetryResumed)]),
         State::Running | State::Dispatching => Ok(Vec::new()),
         State::AwaitingApproval => Err(MissionCommandError {

@@ -876,7 +876,7 @@ impl MissionLoop {
             self.state.metrics_history.remove(0);
         }
         self.state.metrics_history.push(sample);
-        self.state.previous_ready_ids = readiness.ready_ids.clone();
+        self.state.previous_ready_ids.clone_from(&readiness.ready_ids);
         self.state.previous_assignment_by_bead = current_assignment_by_bead;
     }
 
@@ -950,7 +950,7 @@ impl MissionLoop {
         let messages = if config.generate_messages {
             conflicts
                 .iter()
-                .flat_map(|c| generate_conflict_messages(c))
+                .flat_map(generate_conflict_messages)
                 .collect()
         } else {
             Vec::new()
