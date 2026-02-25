@@ -9,6 +9,7 @@ pub mod chunking_adapter;
 #[cfg(feature = "frankensearch")]
 pub mod daemon_bridge;
 mod embedder;
+pub mod facade;
 mod hash_embedder;
 mod hybrid_search;
 mod indexing;
@@ -17,6 +18,7 @@ pub mod orchestrator;
 mod reranker;
 #[cfg(feature = "frankensearch")]
 pub mod reranker_bridge;
+pub mod schema_gate;
 mod vector_index;
 #[cfg(feature = "frankensearch")]
 pub mod vector_index_bridge;
@@ -99,3 +101,11 @@ pub use model_registry::{ModelInfo, ModelRegistry};
 pub use model2vec_embedder::Model2VecEmbedder;
 #[cfg(feature = "semantic-search")]
 pub use reranker::CrossEncoderReranker;
+
+pub use facade::{FacadeConfig, FacadeResult, FacadeRouting, SearchFacade, ShadowComparison};
+pub use schema_gate::{
+    SchemaField, SchemaGateResult, SchemaSnapshot, SchemaTypeMismatch, check_schema_preservation,
+    gate_fusion_schema, gate_orchestration_schema, snapshot_bridge_document_schema,
+    snapshot_facade_result_schema, snapshot_fused_result_schema,
+    snapshot_orchestration_metrics_schema, snapshot_orchestration_result_schema,
+};
