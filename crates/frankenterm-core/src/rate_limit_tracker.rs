@@ -154,7 +154,13 @@ impl RateLimitTracker {
         rule_id: String,
         retry_after_text: Option<String>,
     ) {
-        self.record_at(pane_id, agent_type, rule_id, retry_after_text, Instant::now())
+        self.record_at(
+            pane_id,
+            agent_type,
+            rule_id,
+            retry_after_text,
+            Instant::now(),
+        )
     }
 
     /// Record a rate limit event with an explicit timestamp (for testing).
@@ -168,9 +174,11 @@ impl RateLimitTracker {
     ) {
         // Evict oldest pane if at capacity
         if !self.panes.contains_key(&pane_id) && self.panes.len() >= MAX_TRACKED_PANES {
-            if let Some(oldest_id) = self.pane_order.first().copied() {
-                self.panes.remove(&oldest_id);
+            while let Some(oldest_id) = self.pane_order.first().copied() {
                 self.pane_order.remove(0);
+                if self.panes.remove(&oldest_id).is_some() {
+                    break;
+                }
             }
         }
 
@@ -193,10 +201,7 @@ impl RateLimitTracker {
             .entry(pane_id)
             .or_insert_with(|| PaneRateLimitState::new(agent_type));
         state.record_event(event);
-
-        if !self.pane_order.contains(&pane_id) {
-            self.pane_order.push(pane_id);
-        }
+        self.touch_pane_order(pane_id);
     }
 
     /// Check if a specific pane is currently rate-limited.
@@ -332,6 +337,13 @@ impl RateLimitTracker {
     pub fn total_event_count(&self) -> usize {
         self.panes.values().map(|s| s.events.len()).sum()
     }
+
+    fn touch_pane_order(&mut self, pane_id: u64) {
+        if let Some(pos) = self.pane_order.iter().position(|&id| id == pane_id) {
+            self.pane_order.remove(pos);
+        }
+        self.pane_order.push(pane_id);
+    }
 }
 
 impl Default for RateLimitTracker {
@@ -385,10 +397,7 @@ mod tests {
             parse_retry_after("30 seconds"),
             Some(Duration::from_secs(30))
         );
-        assert_eq!(
-            parse_retry_after("1 second"),
-            Some(Duration::from_secs(1))
-        );
+        assert_eq!(parse_retry_after("1 second"), Some(Duration::from_secs(1)));
     }
 
     #[test]
@@ -397,18 +406,12 @@ mod tests {
             parse_retry_after("5 minutes"),
             Some(Duration::from_secs(300))
         );
-        assert_eq!(
-            parse_retry_after("1 minute"),
-            Some(Duration::from_secs(60))
-        );
+        assert_eq!(parse_retry_after("1 minute"), Some(Duration::from_secs(60)));
     }
 
     #[test]
     fn parse_retry_after_hours() {
-        assert_eq!(
-            parse_retry_after("1 hour"),
-            Some(Duration::from_secs(3600))
-        );
+        assert_eq!(parse_retry_after("1 hour"), Some(Duration::from_secs(3600)));
         assert_eq!(
             parse_retry_after("2 hours"),
             Some(Duration::from_secs(7200))
@@ -498,8 +501,20 @@ mod tests {
     fn provider_status_fully_limited() {
         let mut tracker = RateLimitTracker::new();
         let now = Instant::now();
-        tracker.record_at(1, AgentType::Codex, "r1".into(), Some("60 seconds".into()), now);
-        tracker.record_at(2, AgentType::Codex, "r2".into(), Some("60 seconds".into()), now);
+        tracker.record_at(
+            1,
+            AgentType::Codex,
+            "r1".into(),
+            Some("60 seconds".into()),
+            now,
+        );
+        tracker.record_at(
+            2,
+            AgentType::Codex,
+            "r2".into(),
+            Some("60 seconds".into()),
+            now,
+        );
 
         let summary = tracker.provider_status_at(AgentType::Codex, now);
         assert_eq!(summary.status, ProviderRateLimitStatus::FullyLimited);
@@ -511,8 +526,20 @@ mod tests {
     fn provider_status_partially_limited() {
         let mut tracker = RateLimitTracker::new();
         let now = Instant::now();
-        tracker.record_at(1, AgentType::Codex, "r1".into(), Some("60 seconds".into()), now);
-        tracker.record_at(2, AgentType::Codex, "r2".into(), Some("10 seconds".into()), now);
+        tracker.record_at(
+            1,
+            AgentType::Codex,
+            "r1".into(),
+            Some("60 seconds".into()),
+            now,
+        );
+        tracker.record_at(
+            2,
+            AgentType::Codex,
+            "r2".into(),
+            Some("10 seconds".into()),
+            now,
+        );
 
         // After 15s, pane 2 expires but pane 1 is still limited
         let later = now + Duration::from_secs(15);
@@ -526,8 +553,20 @@ mod tests {
     fn provider_status_clear_after_all_expire() {
         let mut tracker = RateLimitTracker::new();
         let now = Instant::now();
-        tracker.record_at(1, AgentType::Codex, "r1".into(), Some("10 seconds".into()), now);
-        tracker.record_at(2, AgentType::Codex, "r2".into(), Some("20 seconds".into()), now);
+        tracker.record_at(
+            1,
+            AgentType::Codex,
+            "r1".into(),
+            Some("10 seconds".into()),
+            now,
+        );
+        tracker.record_at(
+            2,
+            AgentType::Codex,
+            "r2".into(),
+            Some("20 seconds".into()),
+            now,
+        );
 
         let later = now + Duration::from_secs(25);
         let summary = tracker.provider_status_at(AgentType::Codex, later);
@@ -538,8 +577,20 @@ mod tests {
     fn different_providers_tracked_separately() {
         let mut tracker = RateLimitTracker::new();
         let now = Instant::now();
-        tracker.record_at(1, AgentType::Codex, "r1".into(), Some("60 seconds".into()), now);
-        tracker.record_at(2, AgentType::ClaudeCode, "r2".into(), Some("60 seconds".into()), now);
+        tracker.record_at(
+            1,
+            AgentType::Codex,
+            "r1".into(),
+            Some("60 seconds".into()),
+            now,
+        );
+        tracker.record_at(
+            2,
+            AgentType::ClaudeCode,
+            "r2".into(),
+            Some("60 seconds".into()),
+            now,
+        );
 
         let codex = tracker.provider_status_at(AgentType::Codex, now);
         assert_eq!(codex.status, ProviderRateLimitStatus::FullyLimited);
@@ -608,13 +659,7 @@ mod tests {
         let now = Instant::now();
 
         for i in 0..MAX_TRACKED_PANES + 5 {
-            tracker.record_at(
-                i as u64,
-                AgentType::Codex,
-                "r1".into(),
-                None,
-                now,
-            );
+            tracker.record_at(i as u64, AgentType::Codex, "r1".into(), None, now);
         }
 
         assert_eq!(tracker.tracked_pane_count(), MAX_TRACKED_PANES);
@@ -626,11 +671,58 @@ mod tests {
     }
 
     #[test]
+    fn max_tracked_panes_evicts_least_recently_used() {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+
+        for i in 0..MAX_TRACKED_PANES {
+            tracker.record_at(i as u64, AgentType::Codex, "seed".into(), None, now);
+        }
+
+        // Refresh pane 0 so it's no longer the least-recently-used entry.
+        tracker.record_at(
+            0,
+            AgentType::Codex,
+            "refresh".into(),
+            Some("60 seconds".into()),
+            now + Duration::from_secs(1),
+        );
+
+        // Insert one new pane; this should evict pane 1 (the oldest untouched pane).
+        tracker.record_at(
+            MAX_TRACKED_PANES as u64,
+            AgentType::Codex,
+            "new".into(),
+            None,
+            now + Duration::from_secs(2),
+        );
+
+        assert_eq!(tracker.tracked_pane_count(), MAX_TRACKED_PANES);
+        assert!(tracker.is_pane_rate_limited_at(0, now + Duration::from_secs(2)));
+        assert!(!tracker.is_pane_rate_limited_at(1, now + Duration::from_secs(2)));
+        assert!(
+            tracker.is_pane_rate_limited_at(MAX_TRACKED_PANES as u64, now + Duration::from_secs(2))
+        );
+    }
+
+    #[test]
     fn earliest_clear_secs_reflects_soonest_expiry() {
         let mut tracker = RateLimitTracker::new();
         let now = Instant::now();
-        tracker.record_at(1, AgentType::Codex, "r1".into(), Some("60 seconds".into()), now);
-        tracker.record_at(2, AgentType::Codex, "r2".into(), Some("30 seconds".into()), now);
+        tracker.record_at(
+            1,
+            AgentType::Codex,
+            "r1".into(),
+            Some("60 seconds".into()),
+            now,
+        );
+        tracker.record_at(
+            2,
+            AgentType::Codex,
+            "r2".into(),
+            Some("30 seconds".into()),
+            now,
+        );
 
         let summary = tracker.provider_status_at(AgentType::Codex, now);
         // earliest_clear should be ~30 seconds (the sooner one)
@@ -643,7 +735,13 @@ mod tests {
         let mut tracker = RateLimitTracker::new();
         let now = Instant::now();
 
-        tracker.record_at(1, AgentType::Codex, "r1".into(), Some("10 seconds".into()), now);
+        tracker.record_at(
+            1,
+            AgentType::Codex,
+            "r1".into(),
+            Some("10 seconds".into()),
+            now,
+        );
         // Record another event extending cooldown
         tracker.record_at(
             1,
@@ -680,7 +778,13 @@ mod tests {
     fn gc_removes_stale_entries() {
         let mut tracker = RateLimitTracker::new();
         let now = Instant::now();
-        tracker.record_at(1, AgentType::Codex, "r1".into(), Some("10 seconds".into()), now);
+        tracker.record_at(
+            1,
+            AgentType::Codex,
+            "r1".into(),
+            Some("10 seconds".into()),
+            now,
+        );
 
         // GC before cooldown expires: pane should remain
         tracker.gc_at(now + Duration::from_secs(5));
