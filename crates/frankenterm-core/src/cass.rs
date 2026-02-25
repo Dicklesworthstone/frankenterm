@@ -713,7 +713,15 @@ fn redact_and_truncate(input: &str, max_len: usize) -> String {
     if redacted.len() <= max_len {
         return redacted;
     }
-    let mut truncated = redacted.chars().take(max_len).collect::<String>();
+
+    // `max_len` is byte-oriented (CLI/output budgets). Truncate on a UTF-8
+    // boundary so previews remain valid UTF-8 while respecting byte budgets.
+    let mut end = max_len.min(redacted.len());
+    while end > 0 && !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let mut truncated = redacted[..end].to_string();
     truncated.push_str("...");
     truncated
 }
@@ -957,6 +965,19 @@ mod tests {
         let redacted = redact_and_truncate(&text, 200);
         assert!(!redacted.contains("sk-"));
         assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_and_truncate_multibyte_respects_byte_budget() {
+        let text = "🚀".repeat(10);
+        let redacted = redact_and_truncate(&text, 5);
+        assert!(redacted.ends_with("..."));
+        assert!(
+            redacted.len() <= 8,
+            "preview bytes {} exceed max+ellipsis",
+            redacted.len()
+        );
+        assert!(std::str::from_utf8(redacted.as_bytes()).is_ok());
     }
 
     #[test]
