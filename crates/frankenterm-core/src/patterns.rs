@@ -1167,6 +1167,29 @@ fn builtin_codex_pack() -> PatternPack {
                 preview_command: None,
                 learn_more_url: None,
             },
+            // Rate limit detection (HTTP 429 / explicit rate limit messages)
+            RuleDef {
+                id: "codex.rate_limit.detected".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: "rate_limit.detected".to_string(),
+                severity: Severity::Critical,
+                anchors: vec![
+                    "rate limit".to_string(),
+                    "Rate limit".to_string(),
+                    "429".to_string(),
+                    "too many requests".to_string(),
+                    "Too Many Requests".to_string(),
+                ],
+                regex: Some(
+                    r"(?:retry|reset|wait|try again).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                ),
+                description: "Codex rate limit detected - provider throttling active".to_string(),
+                remediation: Some("Wait for cooldown or switch to alternate account/provider".to_string()),
+                workflow: Some("handle_rate_limit".to_string()),
+                manual_fix: Some("Wait for rate limit cooldown, or switch to a different account".to_string()),
+                preview_command: Some("ft workflow run handle_rate_limit --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
+            },
         ],
     )
 }
@@ -1285,6 +1308,28 @@ fn builtin_claude_code_pack() -> PatternPack {
                 workflow: Some("handle_auth_required".to_string()),
                 manual_fix: None,
                 preview_command: None,
+                learn_more_url: None,
+            },
+            // Rate limit detection (HTTP 429 / Anthropic rate limits)
+            RuleDef {
+                id: "claude_code.rate_limit.detected".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "rate_limit.detected".to_string(),
+                severity: Severity::Critical,
+                anchors: vec![
+                    "rate limit".to_string(),
+                    "Rate limit".to_string(),
+                    "529".to_string(),
+                    "too many requests".to_string(),
+                ],
+                regex: Some(
+                    r"(?:retry|reset|wait|try again|back off).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                ),
+                description: "Claude Code rate limit detected - Anthropic throttling active".to_string(),
+                remediation: Some("Wait for cooldown or switch to alternate account".to_string()),
+                workflow: Some("handle_rate_limit".to_string()),
+                manual_fix: Some("Wait for rate limit cooldown, or switch Anthropic account".to_string()),
+                preview_command: Some("ft workflow run handle_rate_limit --pane {pane} --dry-run".to_string()),
                 learn_more_url: None,
             },
             // Auth login required (browser auth flow)
@@ -1567,6 +1612,29 @@ fn builtin_gemini_pack() -> PatternPack {
                 workflow: Some("handle_gemini_quota".to_string()),
                 manual_fix: Some("Switch to a non-Pro model or wait for quota reset".to_string()),
                 preview_command: Some("ft workflow run handle_gemini_quota --pane {pane} --dry-run".to_string()),
+                learn_more_url: None,
+            },
+            // Rate limit detection (Google API rate limits)
+            RuleDef {
+                id: "gemini.rate_limit.detected".to_string(),
+                agent_type: AgentType::Gemini,
+                event_type: "rate_limit.detected".to_string(),
+                severity: Severity::Critical,
+                anchors: vec![
+                    "rate limit".to_string(),
+                    "Rate limit".to_string(),
+                    "RESOURCE_EXHAUSTED".to_string(),
+                    "quota exceeded".to_string(),
+                    "too many requests".to_string(),
+                ],
+                regex: Some(
+                    r"(?:retry|reset|wait|try again|back off).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                ),
+                description: "Gemini rate limit detected - Google API throttling active".to_string(),
+                remediation: Some("Wait for cooldown or switch to alternate model/account".to_string()),
+                workflow: Some("handle_rate_limit".to_string()),
+                manual_fix: Some("Wait for rate limit cooldown, or switch to a different Google account".to_string()),
+                preview_command: Some("ft workflow run handle_rate_limit --pane {pane} --dry-run".to_string()),
                 learn_more_url: None,
             },
             // Session summary

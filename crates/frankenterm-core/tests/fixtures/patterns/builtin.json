@@ -133,13 +133,13 @@
   },
   {
     "name": "claude_usage_reached_positive",
-    "text": "rate limit reached, try again in 2 minutes",
+    "text": "usage limit reached, try again in 2 minutes",
     "expected_rule_ids": ["claude_code.usage.reached"],
     "expected_extracted": {"reset_time": "2 minutes"}
   },
   {
     "name": "claude_usage_reached_negative",
-    "text": "rate limit reached, please wait",
+    "text": "usage limit reached, please wait",
     "expected_rule_ids": [],
     "negative_for": "claude_code.usage.reached"
   },
@@ -389,5 +389,41 @@
     "text": "Authorization successful. You are now signed in with Google.",
     "expected_rule_ids": [],
     "negative_for": "gemini.auth.oauth_required"
+  },
+  {
+    "name": "codex_rate_limit_detected_positive",
+    "text": "Error 429: retry after 60 seconds",
+    "expected_rule_ids": ["codex.rate_limit.detected"],
+    "expected_extracted": {"retry_after": "60 seconds"}
+  },
+  {
+    "name": "codex_rate_limit_detected_negative",
+    "text": "Error 429: service unavailable",
+    "expected_rule_ids": [],
+    "negative_for": "codex.rate_limit.detected"
+  },
+  {
+    "name": "claude_rate_limit_detected_positive",
+    "text": "Error 529: retry after 30 seconds",
+    "expected_rule_ids": ["claude_code.rate_limit.detected"],
+    "expected_extracted": {"retry_after": "30 seconds"}
+  },
+  {
+    "name": "claude_rate_limit_detected_negative",
+    "text": "Error 529: please try again later",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.rate_limit.detected"
+  },
+  {
+    "name": "gemini_rate_limit_detected_positive",
+    "text": "RESOURCE_EXHAUSTED: retry after 2 minutes",
+    "expected_rule_ids": ["gemini.rate_limit.detected"],
+    "expected_extracted": {"retry_after": "2 minutes"}
+  },
+  {
+    "name": "gemini_rate_limit_detected_negative",
+    "text": "RESOURCE_EXHAUSTED: quota limit reached",
+    "expected_rule_ids": [],
+    "negative_for": "gemini.rate_limit.detected"
   }
 ]
