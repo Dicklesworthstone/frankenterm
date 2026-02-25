@@ -110,10 +110,7 @@ pub enum TxChannelError {
     /// Channel is at capacity (for try_reserve).
     Full,
     /// Reservation belongs to a different channel.
-    WrongChannel {
-        expected: u64,
-        actual: u64,
-    },
+    WrongChannel { expected: u64, actual: u64 },
     /// Reservation was already committed.
     AlreadyCommitted { seq: u64 },
 }
@@ -206,26 +203,40 @@ impl<T> TxProducer<T> {
     /// Returns `Err(Full)` if the channel is at capacity, or `Err(Closed)`
     /// if the channel has been closed.
     pub fn try_reserve(&self) -> Result<Reservation, TxChannelError> {
-        if self.shared.closed.load(Ordering::Acquire) {
-            return Err(TxChannelError::Closed);
+        loop {
+            if self.shared.closed.load(Ordering::Acquire) {
+                return Err(TxChannelError::Closed);
+            }
+
+            let active = self
+                .shared
+                .rollback_state
+                .active_reservations
+                .load(Ordering::Acquire);
+            let queued = self.shared.queue.len();
+            let used = queued.saturating_add(active as usize);
+
+            if used >= self.shared.capacity {
+                return Err(TxChannelError::Full);
+            }
+
+            let next_active = match active.checked_add(1) {
+                Some(next) => next,
+                None => return Err(TxChannelError::Full),
+            };
+
+            if self
+                .shared
+                .rollback_state
+                .active_reservations
+                .compare_exchange_weak(active, next_active, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+
+            std::hint::spin_loop();
         }
-
-        let active = self
-            .shared
-            .rollback_state
-            .active_reservations
-            .load(Ordering::Acquire);
-        let queued = self.shared.queue.len();
-
-        if (active as usize + queued) >= self.shared.capacity {
-            return Err(TxChannelError::Full);
-        }
-
-        // Claim the slot
-        self.shared
-            .rollback_state
-            .active_reservations
-            .fetch_add(1, Ordering::Release);
 
         let seq = self.shared.next_seq.fetch_add(1, Ordering::Relaxed);
 
@@ -260,11 +271,7 @@ impl<T> TxProducer<T> {
     ///
     /// The reservation is consumed and marked as committed. The value is
     /// placed in the channel and consumers are notified.
-    pub fn commit(
-        &self,
-        reservation: &Reservation,
-        value: T,
-    ) -> Result<(), TxChannelError> {
+    pub fn commit(&self, reservation: &Reservation, value: T) -> Result<(), TxChannelError> {
         // Validate reservation
         if reservation.channel_id != self.shared.channel_id {
             return Err(TxChannelError::WrongChannel {
@@ -283,30 +290,29 @@ impl<T> TxProducer<T> {
             });
         }
 
-        // Release the reservation count (the value will now occupy queue space)
-        self.shared
-            .rollback_state
-            .active_reservations
-            .fetch_sub(1, Ordering::Release);
-
         // Place value in queue
         let envelope = TxEnvelope {
             seq: reservation.seq,
             value,
         };
 
-        // This should always succeed because we held a reservation
+        // With a valid reservation this should not fail. If it does, keep the
+        // reservation active by reverting the committed flag; dropping the
+        // reservation will release capacity.
         if self.shared.queue.push(envelope).is_err() {
-            // This shouldn't happen, but handle gracefully
-            self.shared
-                .rollback_state
-                .capacity_freed
-                .notify_one();
+            reservation.committed.store(false, Ordering::Release);
             return Err(TxChannelError::Full);
         }
 
+        // Convert the active reservation slot into a queued item slot.
+        self.shared
+            .rollback_state
+            .active_reservations
+            .fetch_sub(1, Ordering::Release);
+
         // Notify consumers
         self.shared.not_empty.notify_one();
+        self.shared.rollback_state.capacity_freed.notify_one();
         Ok(())
     }
 
@@ -324,8 +330,8 @@ impl<T> TxProducer<T> {
     /// Close the producer side. Consumers will drain remaining values.
     pub fn close(&self) {
         self.shared.closed.store(true, Ordering::Release);
-        self.shared.not_empty.notify_one();
-        self.shared.rollback_state.capacity_freed.notify_one();
+        self.shared.not_empty.notify_waiters();
+        self.shared.rollback_state.capacity_freed.notify_waiters();
     }
 
     /// Whether the channel is closed.
@@ -553,9 +559,7 @@ impl TxChannelRegistry {
     /// Look up a channel by name.
     #[must_use]
     pub fn by_name(&self, name: &str) -> Option<&ChannelMetadata> {
-        self.names
-            .get(name)
-            .and_then(|id| self.metadata.get(id))
+        self.names.get(name).and_then(|id| self.metadata.get(id))
     }
 
     /// Look up a channel by ID.
@@ -664,6 +668,9 @@ impl<T> Drop for ReserveGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
 
     #[test]
     fn basic_reserve_commit() {
@@ -716,6 +723,35 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_try_reserve_respects_capacity() {
+        let (tx, _rx) = tx_channel::<u32>(1);
+        let workers = 16usize;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::with_capacity(workers);
+
+        for _ in 0..workers {
+            let tx_clone = tx.clone();
+            let barrier_clone = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier_clone.wait();
+                tx_clone.try_reserve().ok()
+            }));
+        }
+
+        let reservations = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>();
+        let successes = reservations.iter().filter(|res| res.is_some()).count();
+
+        assert_eq!(
+            successes, 1,
+            "only one reservation should succeed for capacity=1"
+        );
+        assert_eq!(tx.active_reservations(), 1);
+    }
+
+    #[test]
     fn try_send_convenience() {
         let (tx, rx) = tx_channel::<u32>(4);
 
@@ -743,7 +779,10 @@ mod tests {
         tx.commit(&r, 42).unwrap();
 
         let result = tx.commit(&r, 43);
-        assert!(matches!(result, Err(TxChannelError::AlreadyCommitted { .. })));
+        assert!(matches!(
+            result,
+            Err(TxChannelError::AlreadyCommitted { .. })
+        ));
     }
 
     #[test]
