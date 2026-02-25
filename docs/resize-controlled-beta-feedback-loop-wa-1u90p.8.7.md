@@ -1,7 +1,7 @@
 # Controlled Beta Feedback Loop (`ft-1u90p.8.7`)
 
-Date: 2026-02-22  
-Status: In progress (unblocked; instrumentation + checkpoint artifacts active)  
+Date: 2026-02-25  
+Status: In progress (unblocked; instrumentation + checkpoint artifacts active; e2e validation harness active)  
 Depends on: `ft-1u90p.8.1`, `ft-1u90p.8.2`, `ft-1u90p.8.3`, `ft-1u90p.7.5`, `docs/resize-performance-slos.md`  
 Related closure: `ft-1u90p.7.7` (closed 2026-02-22)
 
@@ -119,12 +119,15 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
 - `evidence/wa-1u90p.8.7/telemetry_feedback_correlation.csv`
 - `evidence/wa-1u90p.8.7/cohort_daily_summary.json`
 - `evidence/wa-1u90p.8.7/decision_checkpoint_<YYYYMMDD>.md`
+- `tests/e2e/test_ft_1u90p_8_7.sh`
+- `tests/e2e/logs/ft_1u90p_8_7_<RUN_ID>.jsonl`
 
-### Current Checkpoint (2026-02-22)
+### Current Checkpoint (2026-02-25)
 
 - Decision: `HOLD`
 - Basis:
   - instrumentation path verified using deterministic fixture-only alt-screen conformance run
+  - e2e evidence guardrail harness validates baseline/negative/recovery decision paths
   - sample sufficiency thresholds for promotion are not yet met
   - real-user feedback ingestion has not started
 - Evidence:
@@ -133,6 +136,9 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
   - `evidence/wa-1u90p.8.7/telemetry_feedback_correlation.csv`
   - `evidence/wa-1u90p.8.7/cohort_daily_summary.json`
   - `evidence/wa-1u90p.8.7/decision_checkpoint_20260222.md`
+  - `evidence/wa-1u90p.8.7/decision_checkpoint_20260225.md`
+  - `tests/e2e/test_ft_1u90p_8_7.sh`
+  - `tests/e2e/logs/ft_1u90p_8_7_<RUN_ID>.jsonl`
 
 ## Decision Rubric (Promotion / Hold / Rollback)
 
@@ -191,6 +197,9 @@ ft robot search "resize OR reflow OR artifact OR watchdog OR emergency_disable" 
 # Deterministic scenario replay for correlation checkpoints
 ft simulate run fixtures/simulations/resize_baseline/resize_multi_tab_storm.yaml --json --resize-timeline-json
 ft simulate run fixtures/simulations/resize_baseline/font_churn_multi_pane.yaml --json --resize-timeline-json
+
+# Evidence guardrail e2e (baseline + negative + recovery paths)
+tests/e2e/test_ft_1u90p_8_7.sh
 ```
 
 ## Exit Criteria for `ft-1u90p.8.7`

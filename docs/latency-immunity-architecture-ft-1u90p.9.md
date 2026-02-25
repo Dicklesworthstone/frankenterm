@@ -1,7 +1,7 @@
 # Latency-Immunity Architecture Contract (`ft-1u90p.9`)
 
 Date: 2026-02-22  
-Status: Draft v1 (implementation-track contract)  
+Status: Closure-audited (2026-02-25)  
 Parent: `ft-1u90p`  
 Related: `ft-3kxe`, `ft-e34d9`, `ft-brc7d`, `ft-283h4`
 
@@ -15,6 +15,28 @@ Guarantee that FrankenTerm stays locally responsive for:
 even when remote mux servers are degraded (high CPU, swap pressure, disk/IO stalls, protocol lag).
 
 This is a **hard architecture contract**, not a best-effort tuning note.
+
+## Closure Audit (2026-02-25)
+
+Audit owner: `MagentaDesert`  
+Bead: `ft-1u90p.9`
+
+Summary:
+- All child execution tracks are closed: `ft-1u90p.9.1` through `ft-1u90p.9.7`.
+- Child granular beads under each track are closed.
+- This parent contract remains the authoritative architecture reference and can be treated as complete for track-level delivery.
+
+Evidence anchors:
+- SLO baseline and thresholds: `docs/resize-performance-slos.md`
+- Backpressure guardrail e2e harness: `tests/e2e/rio/test_input_preserving_backpressure_guardrails.sh`
+- Controlled beta loop contract and checkpoint artifacts:
+  - `docs/resize-controlled-beta-feedback-loop-wa-1u90p.8.7.md`
+  - `evidence/wa-1u90p.8.7/cohort_daily_summary.json`
+  - `evidence/wa-1u90p.8.7/decision_checkpoint_20260222.md`
+
+Residual gate note:
+- `ft-1u90p.8.7` (controlled beta feedback loop) remains `in_progress` with current checkpoint `HOLD`.
+- That rollout-confidence gate is tracked in the rollout track (`ft-1u90p.8.*`) and does not reopen this architecture contract.
 
 ## Incident Archetype (What We Must Be Immune To)
 
@@ -241,4 +263,3 @@ rch exec -- cargo test --workspace
 
 Every card is feature-flagged and independently reversible.  
 Any breach of `LI-1..LI-5` or latency-immunity SLO addendum forces immediate rollback to prior stable path.
-

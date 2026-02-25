@@ -50,6 +50,17 @@
     "m1_p99_ms": 6,
     "artifact_dir": "e2e-artifacts/2026-02-22T17-53-14Z/scenario_01_alt_screen_conformance"
   },
+  "validation": {
+    "last_validated_at_utc": "2026-02-25T07:09:15Z",
+    "validation_scope": "evidence consistency + decision guardrails",
+    "e2e_script": "tests/e2e/test_ft_1u90p_8_7.sh",
+    "checks": [
+      "baseline_hold_when_thresholds_unmet",
+      "summary_csv_feedback_join_consistency",
+      "negative_guardrail_reject_go_without_thresholds",
+      "recovery_guardrail_accept_go_with_thresholds"
+    ]
+  },
   "next_actions": [
     "Collect real-user C2 feedback across low/mid/high hardware tiers",
     "Ingest survey + telemetry joins into beta_feedback_log.jsonl and telemetry_feedback_correlation.csv",
