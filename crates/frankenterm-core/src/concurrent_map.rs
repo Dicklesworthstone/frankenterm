@@ -51,10 +51,10 @@ fn fx_hash_u64(key: u64) -> usize {
 /// Generic hash for non-u64 keys.
 #[inline]
 fn hash_key<K: Hash>(key: &K, shard_count: usize) -> usize {
-    assert!(shard_count > 0, "shard_count must be > 0");
+    let safe_shard_count = shard_count.max(1);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
-    (hasher.finish() as usize) % shard_count
+    (hasher.finish() as usize) % safe_shard_count
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +373,8 @@ impl<V> PaneMap<V> {
 
     #[inline]
     fn shard_idx(&self, pane_id: u64) -> usize {
-        fx_hash_u64(pane_id) % self.shard_count
+        let safe_shard_count = self.shard_count.max(1);
+        fx_hash_u64(pane_id) % safe_shard_count
     }
 
     /// Insert a pane entry.
@@ -924,6 +925,20 @@ mod tests {
             chi2 < 120.0,
             "chi2={chi2:.1} exceeds threshold — poor distribution. counts: {counts:?}"
         );
+    }
+
+    #[test]
+    fn hash_key_with_zero_shards_returns_zero_index() {
+        assert_eq!(hash_key(&"pane-42", 0), 0);
+    }
+
+    #[test]
+    fn pane_map_shard_idx_with_zero_shards_returns_zero_index() {
+        let map: PaneMap<String> = PaneMap {
+            shards: vec![Shard::new()].into_boxed_slice(),
+            shard_count: 0,
+        };
+        assert_eq!(map.shard_idx(42), 0);
     }
 
     // -----------------------------------------------------------------------

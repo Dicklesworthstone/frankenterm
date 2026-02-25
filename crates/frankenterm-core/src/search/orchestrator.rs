@@ -31,8 +31,8 @@
 //! 1. A1 (done): Freeze API contract + baseline regression corpus
 //! 2. B1 (done): Create orchestration abstraction with legacy + bridge backends
 //! 3. B2 (done): Weight-aware frankensearch RRF fusion + bridge fallback
-//! 4. **B3 (done)**: Migrate embedder stack dispatch + fallback tiers
-//! 5. B4: Migrate vector/chunk index internals
+//! 4. B3 (done): Migrate embedder stack dispatch + fallback tiers
+//! 5. **B4 (done)**: Migrate vector/chunk index internals to FSVI path
 
 use super::{
     EmbedError, Embedder, EmbedderInfo, EmbedderTier, FusedResult, HashEmbedder,
@@ -316,6 +316,8 @@ pub struct OrchestrationMetrics {
     pub embedder_tier_used: Option<String>,
     /// Whether an embedder fallback occurred (e.g. quality→hash).
     pub embedder_fallback: bool,
+    /// Vector index backend used (ftvi or fsvi).
+    pub vector_index_backend: String,
 }
 
 /// Input for legacy orchestration: pre-ranked lists from caller.
@@ -357,6 +359,8 @@ pub struct OrchestratorConfig {
     pub fallback_to_legacy: bool,
     /// Embedder dispatch strategy.
     pub embedder_dispatch: EmbedderDispatch,
+    /// Vector index backend (ftvi = legacy, fsvi = frankensearch).
+    pub vector_index_backend: String,
 }
 
 impl Default for OrchestratorConfig {
@@ -370,8 +374,18 @@ impl Default for OrchestratorConfig {
             semantic_weight: 1.0,
             fallback_to_legacy: true,
             embedder_dispatch: EmbedderDispatch::Legacy,
+            vector_index_backend: "ftvi".to_string(),
         }
     }
+}
+
+/// Internal helper for migration metrics.
+struct MigrationMetrics {
+    embedder_dispatch: String,
+    embedder_availability: String,
+    embedder_tier_used: Option<String>,
+    embedder_fallback: bool,
+    vector_index_backend: String,
 }
 
 /// Search orchestrator that encapsulates backend selection and fallback logic.
@@ -443,11 +457,15 @@ impl SearchOrchestrator {
             .map(|stack| stack.embed_with_fallback(text))
     }
 
-    /// Build embedder-related metrics based on current stack state.
-    fn embedder_metrics(&self) -> (String, String, Option<String>, bool) {
-        let dispatch = format!("{:?}", self.config.embedder_dispatch);
-        let availability = format!("{}", self.embedder_availability());
-        (dispatch, availability, None, false)
+    /// Build embedder + vector-index metrics based on current state.
+    fn migration_metrics(&self) -> MigrationMetrics {
+        MigrationMetrics {
+            embedder_dispatch: format!("{:?}", self.config.embedder_dispatch),
+            embedder_availability: format!("{}", self.embedder_availability()),
+            embedder_tier_used: None,
+            embedder_fallback: false,
+            vector_index_backend: self.config.vector_index_backend.clone(),
+        }
     }
 
     /// Execute search using pre-ranked lists (legacy-compatible entry point).
@@ -480,7 +498,7 @@ impl SearchOrchestrator {
             input.top_k,
         );
 
-        let (emb_dispatch, emb_avail, emb_tier, emb_fallback) = self.embedder_metrics();
+        let mm = self.migration_metrics();
 
         OrchestrationResult {
             results,
@@ -492,10 +510,11 @@ impl SearchOrchestrator {
                 lexical_candidates: input.lexical_ranked.len(),
                 semantic_candidates: input.semantic_ranked.len(),
                 fusion: TwoTierMetrics::default(),
-                embedder_dispatch: emb_dispatch,
-                embedder_availability: emb_avail,
-                embedder_tier_used: emb_tier,
-                embedder_fallback: emb_fallback,
+                embedder_dispatch: mm.embedder_dispatch,
+                embedder_availability: mm.embedder_availability,
+                embedder_tier_used: mm.embedder_tier_used,
+                embedder_fallback: mm.embedder_fallback,
+                vector_index_backend: mm.vector_index_backend,
             },
         }
     }
@@ -525,7 +544,7 @@ impl SearchOrchestrator {
             )
         }));
 
-        let (emb_dispatch, emb_avail, emb_tier, emb_fallback) = self.embedder_metrics();
+        let mm = self.migration_metrics();
 
         match bridge_result {
             Ok(results) => OrchestrationResult {
@@ -538,10 +557,11 @@ impl SearchOrchestrator {
                     lexical_candidates: input.lexical_ranked.len(),
                     semantic_candidates: input.semantic_ranked.len(),
                     fusion: TwoTierMetrics::default(),
-                    embedder_dispatch: emb_dispatch,
-                    embedder_availability: emb_avail,
-                    embedder_tier_used: emb_tier,
-                    embedder_fallback: emb_fallback,
+                    embedder_dispatch: mm.embedder_dispatch,
+                    embedder_availability: mm.embedder_availability,
+                    embedder_tier_used: mm.embedder_tier_used,
+                    embedder_fallback: mm.embedder_fallback,
+                    vector_index_backend: mm.vector_index_backend,
                 },
             },
             Err(_) if self.config.fallback_to_legacy => {
@@ -713,12 +733,14 @@ mod tests {
             semantic_weight: 1.2,
             fallback_to_legacy: false,
             embedder_dispatch: EmbedderDispatch::Managed,
+            vector_index_backend: "fsvi".to_string(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.backend, OrchestrationBackend::Bridge);
         assert_eq!(back.rrf_k, 50);
         assert_eq!(back.embedder_dispatch, EmbedderDispatch::Managed);
+        assert_eq!(back.vector_index_backend, "fsvi");
     }
 
     // ── SearchOrchestrator ────────────────────────────────────────────
@@ -863,12 +885,14 @@ mod tests {
             embedder_availability: "none (legacy dispatch)".to_string(),
             embedder_tier_used: None,
             embedder_fallback: false,
+            vector_index_backend: "ftvi".to_string(),
         };
         let json = serde_json::to_string(&metrics).unwrap();
         let back: OrchestrationMetrics = serde_json::from_str(&json).unwrap();
         assert_eq!(back.backend, "legacy");
         assert_eq!(back.lexical_candidates, 100);
         assert_eq!(back.embedder_dispatch, "Legacy");
+        assert_eq!(back.vector_index_backend, "ftvi");
     }
 
     #[test]
@@ -1153,6 +1177,7 @@ mod tests {
         assert_eq!(result.metrics.embedder_dispatch, "Legacy");
         assert!(result.metrics.embedder_availability.contains("legacy"));
         assert!(result.metrics.embedder_tier_used.is_none());
+        assert_eq!(result.metrics.vector_index_backend, "ftvi");
     }
 
     #[test]
@@ -1198,5 +1223,34 @@ mod tests {
     fn embedder_availability_debug() {
         assert_eq!(format!("{:?}", EmbedderAvailability::Full), "Full");
         assert_eq!(format!("{:?}", EmbedderAvailability::None), "None");
+    }
+
+    // ── B4: Vector index backend config ───────────────────────────────
+
+    #[test]
+    fn config_default_vector_index_backend() {
+        let cfg = OrchestratorConfig::default();
+        assert_eq!(cfg.vector_index_backend, "ftvi");
+    }
+
+    #[test]
+    fn config_fsvi_backend_serde() {
+        let cfg = OrchestratorConfig {
+            vector_index_backend: "fsvi".to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.vector_index_backend, "fsvi");
+    }
+
+    #[test]
+    fn orchestrator_metrics_include_vector_backend() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            vector_index_backend: "fsvi".to_string(),
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert_eq!(result.metrics.vector_index_backend, "fsvi");
     }
 }

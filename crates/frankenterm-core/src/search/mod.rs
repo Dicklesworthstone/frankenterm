@@ -12,6 +12,8 @@ mod indexing;
 pub mod orchestrator;
 mod reranker;
 mod vector_index;
+#[cfg(feature = "frankensearch")]
+pub mod vector_index_bridge;
 
 #[cfg(feature = "semantic-search")]
 mod fastembed_embedder;

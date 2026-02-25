@@ -256,6 +256,18 @@ impl FtviIndex {
         self.ids.is_empty()
     }
 
+    /// Get the ID at a given index position.
+    #[must_use]
+    pub fn id_at(&self, index: usize) -> u64 {
+        self.ids[index]
+    }
+
+    /// Get the vector at a given index position.
+    #[must_use]
+    pub fn vector_at(&self, index: usize) -> &[f32] {
+        &self.vectors[index]
+    }
+
     /// Search for top-k nearest neighbors by dot product similarity.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
         if query.len() != self.dimension || self.is_empty() {
