@@ -141,16 +141,29 @@ pub fn rrf_fuse_weighted(
     results
 }
 
+/// Weighted RRF fusion delegated to frankensearch.
+///
+/// Uses frankensearch's `rrf_fuse()` for rank assignment (which lane each item
+/// came from and its rank within that lane), then recomputes final scores using
+/// the weight-adjusted RRF formula: `weight / (k + rank + 1)` per lane.
+///
+/// This preserves frankensearch's deduplication and rank-assignment logic while
+/// adding weight support that frankensearch's raw `rrf_fuse()` does not expose.
+///
+/// When the `frankensearch` feature is disabled, falls back to the local
+/// `rrf_fuse_weighted()` implementation.
 fn rrf_fuse_with_frankensearch(
     lexical: &[(u64, f32)],
     semantic: &[(u64, f32)],
     k: u32,
+    lexical_weight: f32,
+    semantic_weight: f32,
 ) -> Vec<FusedResult> {
     let lexical = dedupe_ranked_hits(lexical);
     let semantic = dedupe_ranked_hits(semantic);
     #[cfg(not(feature = "frankensearch"))]
     {
-        rrf_fuse_weighted(&lexical, &semantic, k, 1.0, 1.0)
+        rrf_fuse_weighted(&lexical, &semantic, k, lexical_weight, semantic_weight)
     }
 
     #[cfg(feature = "frankensearch")]
@@ -187,15 +200,28 @@ fn rrf_fuse_with_frankensearch(
             frankensearch::rrf_fuse(&lexical_hits, &semantic_hits, limit, 0, &config)
                 .into_iter()
                 .filter_map(|hit| {
-                    hit.doc_id.parse::<u64>().ok().map(|id| FusedResult {
-                        id,
-                        score: hit.rrf_score as f32,
-                        lexical_rank: hit.lexical_rank,
-                        semantic_rank: hit.semantic_rank,
+                    hit.doc_id.parse::<u64>().ok().map(|id| {
+                        // Recompute score with weight-adjusted RRF formula.
+                        // frankensearch provides per-lane ranks; we apply per-lane
+                        // weights to compute the final fused score.
+                        let mut score = 0.0f32;
+                        if let Some(r) = hit.lexical_rank {
+                            score += rrf_component_score(r, k, lexical_weight);
+                        }
+                        if let Some(r) = hit.semantic_rank {
+                            score += rrf_component_score(r, k, semantic_weight);
+                        }
+                        FusedResult {
+                            id,
+                            score,
+                            lexical_rank: hit.lexical_rank,
+                            semantic_rank: hit.semantic_rank,
+                        }
                     })
                 })
                 .collect();
 
+        // Re-sort by weighted score (weights may reorder vs unweighted).
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -436,10 +462,16 @@ impl HybridSearchService {
             SearchMode::Hybrid => {
                 let fused = match self.fusion_backend {
                     FusionBackend::FrankenSearchRrf => {
-                        // Force FrankenSearch RRF in all production search paths.
-                        // We keep lexical/semantic weights in config/metrics for forward compatibility,
-                        // but fusion itself is sourced from frankensearch.
-                        rrf_fuse_with_frankensearch(lexical, semantic, self.rrf_k)
+                        // Delegate ranking to frankensearch with weight-aware scoring.
+                        // frankensearch assigns per-lane ranks; we apply per-lane
+                        // weights via the local RRF component score formula.
+                        rrf_fuse_with_frankensearch(
+                            lexical,
+                            semantic,
+                            self.rrf_k,
+                            self.lexical_weight,
+                            self.semantic_weight,
+                        )
                     }
                 };
                 fused.into_iter().take(top_k).collect()
@@ -1061,26 +1093,67 @@ mod tests {
     }
 
     #[test]
-    fn frankensearch_rrf_backend_is_stable_across_weight_inputs() {
+    fn frankensearch_rrf_weights_affect_ranking() {
+        // B2: Weights now influence the fused ranking. A heavy lexical weight
+        // should promote lexical-only items over semantic-only items.
         let lexical = vec![(10, 1.0), (20, 0.8), (30, 0.7), (40, 0.6)];
-        let semantic = vec![(20, 0.9), (10, 0.85), (50, 0.8), (30, 0.75)];
+        let semantic = vec![(50, 0.9), (60, 0.85), (70, 0.8)];
 
-        let unit_weight_results = HybridSearchService::new()
+        // Heavily lexical-biased
+        let lex_biased = HybridSearchService::new()
+            .with_fusion_backend(FusionBackend::FrankenSearchRrf)
+            .with_mode(SearchMode::Hybrid)
+            .with_rrf_weights(10.0, 0.1)
+            .fuse(&lexical, &semantic, 7);
+
+        // Heavily semantic-biased
+        let sem_biased = HybridSearchService::new()
+            .with_fusion_backend(FusionBackend::FrankenSearchRrf)
+            .with_mode(SearchMode::Hybrid)
+            .with_rrf_weights(0.1, 10.0)
+            .fuse(&lexical, &semantic, 7);
+
+        // With lexical bias, top result should be a lexical item
+        assert!(
+            [10, 20, 30, 40].contains(&lex_biased[0].id),
+            "lexical bias should promote lexical items, got id={}",
+            lex_biased[0].id
+        );
+
+        // With semantic bias, top result should be a semantic item
+        assert!(
+            [50, 60, 70].contains(&sem_biased[0].id),
+            "semantic bias should promote semantic items, got id={}",
+            sem_biased[0].id
+        );
+    }
+
+    #[test]
+    fn frankensearch_rrf_unit_weights_match_local_rrf() {
+        // With unit weights, frankensearch path should produce the same ranking
+        // as the local rrf_fuse (both use standard RRF formula).
+        let lexical = vec![(10, 1.0), (20, 0.8), (30, 0.7)];
+        let semantic = vec![(20, 0.9), (10, 0.85), (40, 0.8)];
+
+        let fs_results = HybridSearchService::new()
             .with_fusion_backend(FusionBackend::FrankenSearchRrf)
             .with_mode(SearchMode::Hybrid)
             .with_rrf_weights(1.0, 1.0)
-            .fuse(&lexical, &semantic, 5);
-        let non_unit_weight_results = HybridSearchService::new()
-            .with_fusion_backend(FusionBackend::FrankenSearchRrf)
-            .with_mode(SearchMode::Hybrid)
-            .with_rrf_weights(2.0, 0.5)
-            .fuse(&lexical, &semantic, 5);
+            .fuse(&lexical, &semantic, 10);
 
-        let unit_ids: Vec<u64> = unit_weight_results.into_iter().map(|hit| hit.id).collect();
-        let non_unit_ids: Vec<u64> = non_unit_weight_results
-            .into_iter()
-            .map(|hit| hit.id)
-            .collect();
-        assert_eq!(unit_ids, non_unit_ids);
+        let local_results = rrf_fuse(&lexical, &semantic, 60);
+
+        let fs_ids: Vec<u64> = fs_results.iter().map(|r| r.id).collect();
+        let local_ids: Vec<u64> = local_results.iter().map(|r| r.id).collect();
+        assert_eq!(fs_ids, local_ids, "unit-weight frankensearch should match local RRF ranking");
+
+        // Scores should be very close (both compute weight/(k+rank+1) with weight=1.0)
+        for (fs, local) in fs_results.iter().zip(local_results.iter()) {
+            assert!(
+                (fs.score - local.score).abs() < 1e-5,
+                "score mismatch for id={}: fs={} local={}",
+                fs.id, fs.score, local.score
+            );
+        }
     }
 }

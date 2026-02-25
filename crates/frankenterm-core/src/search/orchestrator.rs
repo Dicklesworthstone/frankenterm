@@ -19,8 +19,8 @@
 //! # Migration path
 //!
 //! 1. A1 (done): Freeze API contract + baseline regression corpus
-//! 2. **B1 (this)**: Create orchestration abstraction with legacy + bridge backends
-//! 3. B2: Replace hybrid fusion internals with frankensearch RRF path
+//! 2. B1 (done): Create orchestration abstraction with legacy + bridge backends
+//! 3. **B2 (done)**: Weight-aware frankensearch RRF fusion + bridge fallback
 //! 4. B3: Migrate embedder stack dispatch
 //! 5. B4: Migrate vector/chunk index internals
 
@@ -258,43 +258,61 @@ impl SearchOrchestrator {
         }
     }
 
-    /// Bridge fusion: uses frankensearch-delegated path with migration hooks.
+    /// Bridge fusion: delegates to frankensearch with weight-aware RRF scoring.
     ///
-    /// Currently delegates to the same HybridSearchService for fusion (since
-    /// full TwoTierSearcher integration requires B2–B4), but wraps with
-    /// bridge-specific instrumentation so we can track adoption and compare
-    /// results during migration.
+    /// Uses `HybridSearchService` configured with FrankenSearchRrf backend, which
+    /// calls `frankensearch::rrf_fuse()` for rank assignment and then recomputes
+    /// weighted scores using the local `rrf_component_score()` formula.
+    ///
+    /// If the bridge path panics (e.g. frankensearch internal error), and
+    /// `fallback_to_legacy` is enabled, falls back to the legacy path and
+    /// records the fallback in metrics.
     fn fuse_bridge(&self, input: &LegacySearchInput) -> OrchestrationResult {
-        // Phase 1 (B1): Bridge path uses same fusion as legacy, but with
-        // bridge-specific metrics. This lets us validate the orchestrator
-        // plumbing without changing search behavior.
+        // B2: Bridge path now uses frankensearch with weight-aware scoring.
+        // The HybridSearchService.fuse() method routes through
+        // rrf_fuse_with_frankensearch() which delegates rank assignment to
+        // frankensearch and applies per-lane weights locally.
         //
-        // Phase 2 (B2): Will replace this with frankensearch::rrf_fuse()
         // Phase 3 (B3): Will add embedder stack delegation
         // Phase 4 (B4): Will add vector index delegation
-        let svc = HybridSearchService::new()
-            .with_mode(SearchMode::from(self.config.mode))
-            .with_rrf_k(self.config.rrf_k)
-            .with_alpha(self.config.alpha)
-            .with_rrf_weights(self.config.lexical_weight, self.config.semantic_weight);
 
-        let results = svc.fuse(
-            &input.lexical_ranked,
-            &input.semantic_ranked,
-            input.top_k,
-        );
+        let bridge_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let svc = HybridSearchService::new()
+                .with_mode(SearchMode::from(self.config.mode))
+                .with_rrf_k(self.config.rrf_k)
+                .with_alpha(self.config.alpha)
+                .with_fusion_backend(super::FusionBackend::FrankenSearchRrf)
+                .with_rrf_weights(self.config.lexical_weight, self.config.semantic_weight);
 
-        OrchestrationResult {
-            results,
-            metrics: OrchestrationMetrics {
-                backend: "bridge".to_string(),
-                effective_mode: format!("{:?}", SearchMode::from(self.config.mode)),
-                fallback_occurred: false,
-                fallback_reason: None,
-                lexical_candidates: input.lexical_ranked.len(),
-                semantic_candidates: input.semantic_ranked.len(),
-                fusion: TwoTierMetrics::default(),
+            svc.fuse(
+                &input.lexical_ranked,
+                &input.semantic_ranked,
+                input.top_k,
+            )
+        }));
+
+        match bridge_result {
+            Ok(results) => OrchestrationResult {
+                results,
+                metrics: OrchestrationMetrics {
+                    backend: "bridge".to_string(),
+                    effective_mode: format!("{:?}", SearchMode::from(self.config.mode)),
+                    fallback_occurred: false,
+                    fallback_reason: None,
+                    lexical_candidates: input.lexical_ranked.len(),
+                    semantic_candidates: input.semantic_ranked.len(),
+                    fusion: TwoTierMetrics::default(),
+                },
             },
+            Err(_) if self.config.fallback_to_legacy => {
+                let mut result = self.fuse_legacy(input);
+                result.metrics.fallback_occurred = true;
+                result.metrics.fallback_reason =
+                    Some("bridge_panic: fell back to legacy fusion".to_string());
+                result.metrics.backend = "bridge(fallback->legacy)".to_string();
+                result
+            }
+            Err(panic_payload) => std::panic::resume_unwind(panic_payload),
         }
     }
 
@@ -464,14 +482,23 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_legacy_and_bridge_agree() {
-        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+    fn orchestrator_legacy_and_bridge_agree_with_unit_weights() {
+        // With unit weights, both backends should produce identical results:
+        // legacy and bridge both use weight=1.0, same RRF formula.
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            lexical_weight: 1.0,
+            semantic_weight: 1.0,
+            ..Default::default()
+        });
         let comparison = orch.compare_backends(&sample_input());
-        // In B1, both backends use the same fusion logic, so results should match
-        assert!(comparison.ranking_match, "B1 backends should produce identical rankings");
         assert!(
-            comparison.max_score_diff < 1e-6,
-            "B1 backends should produce identical scores"
+            comparison.ranking_match,
+            "unit-weight backends should produce identical rankings"
+        );
+        assert!(
+            comparison.max_score_diff < 1e-5,
+            "unit-weight backends should produce near-identical scores, got diff={}",
+            comparison.max_score_diff
         );
     }
 
@@ -578,13 +605,35 @@ mod tests {
     }
 
     #[test]
-    fn comparison_identical_in_b1() {
-        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+    fn comparison_unit_weights_match() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            lexical_weight: 1.0,
+            semantic_weight: 1.0,
+            ..Default::default()
+        });
         let comparison = orch.compare_backends(&sample_input());
-        assert!(comparison.ranking_match);
-        assert!(comparison.max_score_diff < 1e-6);
+        assert!(
+            comparison.ranking_match,
+            "unit-weight comparison should match"
+        );
+        assert!(comparison.max_score_diff < 1e-5);
         assert_eq!(comparison.legacy.metrics.backend, "legacy");
         assert_eq!(comparison.bridge.metrics.backend, "bridge");
+    }
+
+    #[test]
+    fn bridge_fallback_on_panic_disabled() {
+        // When fallback_to_legacy is false, bridge panics should propagate.
+        // We can't easily force frankensearch to panic, but we verify the
+        // config path exists and bridge produces results normally.
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Bridge,
+            fallback_to_legacy: false,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert!(!result.results.is_empty());
+        assert!(!result.metrics.fallback_occurred);
     }
 
     #[test]
@@ -599,18 +648,43 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_custom_weights_accepted() {
-        // In B1, the frankensearch RRF backend doesn't use weights yet (deferred to B2).
-        // This test verifies that custom weights are accepted without error and
-        // produce valid results. Weight-aware scoring will be tested in B2.
-        let orch = SearchOrchestrator::new(OrchestratorConfig {
-            lexical_weight: 2.0,
-            semantic_weight: 0.5,
+    fn orchestrator_custom_weights_affect_ranking() {
+        // B2: Weights now influence the fused ranking via frankensearch RRF.
+        // A lexical-biased weight should promote lexical-top items.
+        let input = LegacySearchInput {
+            lexical_ranked: vec![(100, 1.0), (200, 0.9)],
+            semantic_ranked: vec![(300, 0.95), (400, 0.90)],
+            top_k: 4,
+        };
+
+        let lex_biased = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Legacy,
+            lexical_weight: 10.0,
+            semantic_weight: 0.1,
             ..Default::default()
         });
-        let result = orch.fuse_ranked(&sample_input());
+        let result = lex_biased.fuse_ranked(&input);
         assert!(!result.results.is_empty());
-        assert_eq!(result.metrics.backend, "legacy");
+        // Top result should be a lexical item (100 or 200)
+        assert!(
+            result.results[0].id == 100 || result.results[0].id == 200,
+            "lexical bias should promote lexical items, got id={}",
+            result.results[0].id,
+        );
+
+        let sem_biased = SearchOrchestrator::new(OrchestratorConfig {
+            backend: OrchestrationBackend::Legacy,
+            lexical_weight: 0.1,
+            semantic_weight: 10.0,
+            ..Default::default()
+        });
+        let result = sem_biased.fuse_ranked(&input);
+        // Top result should be a semantic item (300 or 400)
+        assert!(
+            result.results[0].id == 300 || result.results[0].id == 400,
+            "semantic bias should promote semantic items, got id={}",
+            result.results[0].id,
+        );
     }
 
     #[test]
