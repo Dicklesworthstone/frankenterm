@@ -496,7 +496,7 @@ impl<T: Send> SafeReceiver<T> {
     /// Whether the queue and reservations are both empty.
     pub fn is_drained(&self) -> bool {
         let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.queue.is_empty() && state.reservations.is_empty()
+        state.queue.is_empty() && state.active_reservations == 0
     }
 
     /// Snapshot current metrics.

@@ -314,7 +314,7 @@ impl RateLimitTracker {
         let expired: Vec<u64> = self
             .panes
             .iter()
-            .filter(|(_, state)| !state.is_rate_limited(now) && state.events.is_empty())
+            .filter(|(_, state)| !state.is_rate_limited(now))
             .map(|(&id, _)| id)
             .collect();
         for id in expired {
@@ -675,11 +675,12 @@ mod tests {
         let now = Instant::now();
         tracker.record_at(1, AgentType::Codex, "r1".into(), Some("10 seconds".into()), now);
 
-        // Clear events first (GC checks events.is_empty())
-        // After cooldown expires and events are drained, gc should clean up
-        // For this test, we just verify gc doesn't panic and handles expired state
-        tracker.gc_at(now + Duration::from_secs(15));
-        // Pane still tracked (has events even if expired)
+        // GC before cooldown expires: pane should remain
+        tracker.gc_at(now + Duration::from_secs(5));
         assert_eq!(tracker.tracked_pane_count(), 1);
+
+        // GC after cooldown expires: pane should be removed
+        tracker.gc_at(now + Duration::from_secs(15));
+        assert_eq!(tracker.tracked_pane_count(), 0);
     }
 }
