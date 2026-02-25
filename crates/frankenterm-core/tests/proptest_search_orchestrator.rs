@@ -5,8 +5,8 @@
 //! and ranking stability.
 
 use frankenterm_core::search::orchestrator::{
-    LegacySearchInput, OrchestrationBackend, OrchestratorConfig, SearchModeConfig,
-    SearchOrchestrator,
+    EmbedderDispatch, LegacySearchInput, OrchestrationBackend, OrchestratorConfig,
+    SearchModeConfig, SearchOrchestrator,
 };
 use proptest::prelude::*;
 
@@ -27,24 +27,41 @@ fn arb_search_mode() -> impl Strategy<Value = SearchModeConfig> {
     ]
 }
 
+fn arb_embedder_dispatch() -> impl Strategy<Value = EmbedderDispatch> {
+    prop_oneof![
+        Just(EmbedderDispatch::Legacy),
+        Just(EmbedderDispatch::Managed),
+    ]
+}
+
+fn arb_vector_index_backend() -> impl Strategy<Value = String> {
+    prop_oneof![Just("ftvi".to_string()), Just("fsvi".to_string()),]
+}
+
 fn arb_config() -> impl Strategy<Value = OrchestratorConfig> {
     (
         arb_backend(),
         arb_search_mode(),
-        1..=200_u32,          // rrf_k
-        0.0..=1.0_f32,        // alpha
-        0.1..=5.0_f32,        // lexical_weight
-        0.1..=5.0_f32,        // semantic_weight
-        any::<bool>(),         // fallback_to_legacy
+        1..=200_u32,              // rrf_k
+        0.0..=1.0_f32,            // alpha
+        0.1..=5.0_f32,            // lexical_weight
+        0.1..=5.0_f32,            // semantic_weight
+        any::<bool>(),             // fallback_to_legacy
+        arb_embedder_dispatch(),   // embedder_dispatch
+        arb_vector_index_backend(), // vector_index_backend
     )
-        .prop_map(|(backend, mode, rrf_k, alpha, lw, sw, fallback)| OrchestratorConfig {
-            backend,
-            mode,
-            rrf_k,
-            alpha,
-            lexical_weight: lw,
-            semantic_weight: sw,
-            fallback_to_legacy: fallback,
+        .prop_map(|(backend, mode, rrf_k, alpha, lw, sw, fallback, emb, vib)| {
+            OrchestratorConfig {
+                backend,
+                mode,
+                rrf_k,
+                alpha,
+                lexical_weight: lw,
+                semantic_weight: sw,
+                fallback_to_legacy: fallback,
+                embedder_dispatch: emb,
+                vector_index_backend: vib,
+            }
         })
 }
 

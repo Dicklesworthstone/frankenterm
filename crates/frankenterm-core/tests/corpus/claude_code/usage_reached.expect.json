@@ -1,13 +1,46 @@
 [
   {
-    "rule_id": "claude_code.usage.reached",
     "agent_type": "claude_code",
-    "event_type": "usage.reached",
-    "severity": "critical",
     "confidence": 0.95,
+    "event_type": "rate_limit.detected",
+    "extracted": {
+      "retry_after": "15 minutes"
+    },
+    "matched_text": "try again in 15 minutes",
+    "rule_id": "claude_code.rate_limit.detected",
+    "severity": "critical"
+  },
+  {
+    "agent_type": "claude_code",
+    "confidence": 0.95,
+    "event_type": "usage.reached",
     "extracted": {
       "reset_time": "15 minutes"
     },
-    "matched_text": "try again in 15 minutes"
+    "matched_text": "try again in 15 minutes",
+    "rule_id": "claude_code.usage.reached",
+    "severity": "critical"
+  },
+  {
+    "agent_type": "codex",
+    "confidence": 0.95,
+    "event_type": "rate_limit.detected",
+    "extracted": {
+      "retry_after": "15 minutes"
+    },
+    "matched_text": "try again in 15 minutes",
+    "rule_id": "codex.rate_limit.detected",
+    "severity": "critical"
+  },
+  {
+    "agent_type": "gemini",
+    "confidence": 0.95,
+    "event_type": "rate_limit.detected",
+    "extracted": {
+      "retry_after": "15 minutes"
+    },
+    "matched_text": "try again in 15 minutes",
+    "rule_id": "gemini.rate_limit.detected",
+    "severity": "critical"
   }
 ]

@@ -1,13 +1,24 @@
 [
   {
-    "rule_id": "claude_code.usage.reached",
     "agent_type": "claude_code",
-    "event_type": "usage.reached",
-    "severity": "critical",
     "confidence": 0.95,
+    "event_type": "usage.reached",
     "extracted": {
       "reset_time": "30 seconds"
     },
-    "matched_text": "retry after 30 seconds"
+    "matched_text": "retry after 30 seconds",
+    "rule_id": "claude_code.usage.reached",
+    "severity": "critical"
+  },
+  {
+    "agent_type": "gemini",
+    "confidence": 0.95,
+    "event_type": "rate_limit.detected",
+    "extracted": {
+      "retry_after": "30 seconds"
+    },
+    "matched_text": "retry after 30 seconds",
+    "rule_id": "gemini.rate_limit.detected",
+    "severity": "critical"
   }
 ]
