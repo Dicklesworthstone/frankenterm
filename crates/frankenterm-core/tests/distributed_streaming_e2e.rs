@@ -704,6 +704,61 @@ async fn distributed_streaming_e2e_duplicate_refresh_prevents_false_stale_evicti
     assert_eq!(panes[0].pane_id, 51);
 }
 
+#[tokio::test]
+async fn distributed_streaming_e2e_accepted_regressed_timestamp_does_not_trigger_false_stale_prune()
+{
+    use frankenterm_core::wire_protocol::WireProtocolError;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir
+        .path()
+        .join("distributed_streaming_regressed_accepted_liveness.db");
+    let mut bridge =
+        DistributedBridge::new_with_capacity_and_stale(db_path.to_str().expect("db path"), 1, 50)
+            .await
+            .expect("bridge");
+
+    let mut first = WireEnvelope::new(1, "agent-reg-a", WirePayload::PaneMeta(pane_meta(61)));
+    first.sent_at_ms = 100;
+    bridge
+        .ingest_envelope(first)
+        .await
+        .expect("first sender should be accepted");
+
+    // Sender clock regresses, but this is still a new accepted sequence.
+    let mut regressed = WireEnvelope::new(2, "agent-reg-a", WirePayload::PaneMeta(pane_meta(61)));
+    regressed.sent_at_ms = 90;
+    bridge
+        .ingest_envelope(regressed)
+        .await
+        .expect("regressed timestamp on accepted seq should not evict sender liveness");
+
+    let mut second = WireEnvelope::new(1, "agent-reg-b", WirePayload::PaneMeta(pane_meta(62)));
+    second.sent_at_ms = 149;
+    let err = bridge.ingest_envelope(second).await.expect_err(
+        "sender-a should remain recent (last_seen=100), so capacity reject should fire",
+    );
+    let wire_err = err
+        .downcast_ref::<WireProtocolError>()
+        .expect("expected WireProtocolError");
+    assert!(matches!(
+        wire_err,
+        WireProtocolError::TooManyAgents { max: 1, sender: _ }
+    ));
+    assert_eq!(bridge.aggregator.total_accepted(), 2);
+    assert_eq!(bridge.aggregator.total_rejected(), 1);
+    assert_eq!(bridge.aggregator.agent_last_seq("agent-reg-a"), Some(2));
+    assert_eq!(bridge.aggregator.agent_last_seq("agent-reg-b"), None);
+
+    let panes = bridge.storage.get_panes().await.expect("panes");
+    assert_eq!(
+        panes.len(),
+        1,
+        "rejected sender metadata must not persist after false-stale guard"
+    );
+    assert_eq!(panes[0].pane_id, 61);
+}
+
 #[test]
 fn distributed_streaming_e2e_auth_missing_or_invalid_token_rejected_and_redacted() {
     use frankenterm_core::config::DistributedAuthMode;
