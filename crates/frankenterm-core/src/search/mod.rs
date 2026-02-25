@@ -15,6 +15,7 @@ mod hybrid_search;
 mod indexing;
 pub mod lexical_backend_bridge;
 pub mod orchestrator;
+pub mod regression_diff;
 mod reranker;
 #[cfg(feature = "frankensearch")]
 pub mod reranker_bridge;
@@ -103,6 +104,11 @@ pub use model2vec_embedder::Model2VecEmbedder;
 pub use reranker::CrossEncoderReranker;
 
 pub use facade::{FacadeConfig, FacadeResult, FacadeRouting, SearchFacade, ShadowComparison};
+pub use regression_diff::{
+    DiffArtifact, RegressionDiffReport, RegressionScenario, ReplayGateConfig, ReplayGateVerdict,
+    ScenarioOutcome, default_scenarios, run_regression_suite, run_replay_gate,
+    run_replay_gate_default,
+};
 pub use schema_gate::{
     SchemaField, SchemaGateResult, SchemaSnapshot, SchemaTypeMismatch, check_schema_preservation,
     gate_fusion_schema, gate_orchestration_schema, snapshot_bridge_document_schema,
