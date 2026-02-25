@@ -405,7 +405,7 @@ pub fn weekly_digest(metrics: &RolloutMetrics) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replay_ci_gate::GateCheck;
+    use crate::replay_ci_gate::{GateCheck, ALL_GATES};
 
     fn make_pass_report(gate: GateId) -> GateReport {
         GateReport::new(gate, vec![GateCheck {

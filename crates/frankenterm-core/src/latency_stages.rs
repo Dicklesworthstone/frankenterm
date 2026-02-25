@@ -6426,6 +6426,7 @@ impl IngestParser {
 }
 
 /// Find the position of the first newline byte in a slice.
+#[cfg(test)]
 fn memchr_newline(data: &[u8]) -> Option<usize> {
     data.iter().position(|&b| b == b'\n')
 }
@@ -9545,6 +9546,7 @@ impl CalibrationHarness {
     }
 
     /// Evaluate a single result against gate criteria.
+    #[allow(dead_code)]
     fn evaluate_result(&self, result: &CalibrationResult) -> bool {
         result.false_positive_rate <= self.config.max_fpr
             && result.miss_rate <= self.config.max_miss_rate

@@ -21,8 +21,6 @@
 //! for MCP `tool_use` integration. Schemas are also available at runtime
 //! via [`ReplayToolSchema::input_schema`].
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------

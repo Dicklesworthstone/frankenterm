@@ -9,9 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::replay_ci_gate::{
-    EvidenceBundle, GateId, GateReport, GateStatus, ALL_GATES,
-};
+use crate::replay_ci_gate::{GateId, GateReport, GateStatus, ALL_GATES};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -270,7 +268,7 @@ impl Default for RetentionPolicy {
 pub fn evaluate_retention(
     files: &[RetentionCandidate],
     policy: &RetentionPolicy,
-    current_age_days: u64,
+    _current_age_days: u64,
 ) -> Vec<PruneDecision> {
     files
         .iter()

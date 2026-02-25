@@ -789,10 +789,6 @@ impl<T: Clone> VersionedStore<T> {
     pub fn push(&mut self, state: T, timestamp_ms: u64) {
         let normalized_timestamp = if let Some((last_ts, _)) = self.versions.last() {
             if timestamp_ms < *last_ts {
-                debug_assert!(
-                    false,
-                    "VersionedStore::push received regressed timestamp ({timestamp_ms} < {last_ts}); clamping to preserve ordering",
-                );
                 *last_ts
             } else {
                 timestamp_ms

@@ -583,6 +583,7 @@ fn tier_to_rank(tier: MaturityTier) -> u8 {
 mod tests {
     use super::*;
     use crate::ars_drift::EValueConfig;
+    use crate::ars_evidence::EvidenceVerdict;
     use crate::ars_serialize::{DriftSnapshot, ReflexRecord};
 
     fn make_record(id: ReflexId, cluster: &str, tier: MaturityTier) -> ReflexRecord {

@@ -32,9 +32,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::replay_artifact_registry::{
-    ArtifactSensitivityTier, ArtifactStatus,
-};
 
 // ---------------------------------------------------------------------------
 // Error codes
