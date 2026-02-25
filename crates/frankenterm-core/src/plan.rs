@@ -1628,8 +1628,7 @@ impl MissionFailureCode {
                 error_code: "FTM1001",
                 terminality: MissionFailureTerminality::Terminal,
                 retryability: MissionFailureRetryability::Never,
-                human_hint:
-                    "Policy denied this action. Update policy or request operator override.",
+                human_hint: "Policy denied this action. Update policy or request operator override.",
                 machine_hint: "abort_and_request_policy_override",
             },
             Self::ReservationConflict => MissionFailureContract {
@@ -1637,8 +1636,7 @@ impl MissionFailureCode {
                 error_code: "FTM1002",
                 terminality: MissionFailureTerminality::NonTerminal,
                 retryability: MissionFailureRetryability::AfterStateRefresh,
-                human_hint:
-                    "Target paths are already reserved. Wait or coordinate with current owner.",
+                human_hint: "Target paths are already reserved. Wait or coordinate with current owner.",
                 machine_hint: "refresh_reservations_then_retry",
             },
             Self::RateLimited => MissionFailureContract {
@@ -1678,8 +1676,7 @@ impl MissionFailureCode {
                 error_code: "FTM1007",
                 terminality: MissionFailureTerminality::Terminal,
                 retryability: MissionFailureRetryability::Never,
-                human_hint:
-                    "Human operator denied execution. Revise mission scope before retrying.",
+                human_hint: "Human operator denied execution. Revise mission scope before retrying.",
                 machine_hint: "abort_and_open_revision_task",
             },
             Self::ApprovalExpired => MissionFailureContract {
@@ -2627,9 +2624,21 @@ impl TxPrepareReport {
     /// Count of steps in each readiness state.
     #[must_use]
     pub fn readiness_counts(&self) -> (usize, usize, usize) {
-        let ready = self.step_receipts.iter().filter(|r| r.readiness.is_ready()).count();
-        let denied = self.step_receipts.iter().filter(|r| r.readiness.is_denied()).count();
-        let deferred = self.step_receipts.iter().filter(|r| r.readiness.is_deferred()).count();
+        let ready = self
+            .step_receipts
+            .iter()
+            .filter(|r| r.readiness.is_ready())
+            .count();
+        let denied = self
+            .step_receipts
+            .iter()
+            .filter(|r| r.readiness.is_denied())
+            .count();
+        let deferred = self
+            .step_receipts
+            .iter()
+            .filter(|r| r.readiness.is_deferred())
+            .count();
         (ready, denied, deferred)
     }
 
@@ -2642,10 +2651,16 @@ impl TxPrepareReport {
             .map(|r| {
                 let readiness = match &r.readiness {
                     TxPrepareStepReadiness::Ready => "ready".to_string(),
-                    TxPrepareStepReadiness::Denied { reason_code, error_code } => {
+                    TxPrepareStepReadiness::Denied {
+                        reason_code,
+                        error_code,
+                    } => {
                         format!("denied({reason_code},{error_code})")
                     }
-                    TxPrepareStepReadiness::Deferred { reason_code, retry_hint } => {
+                    TxPrepareStepReadiness::Deferred {
+                        reason_code,
+                        retry_hint,
+                    } => {
                         format!("deferred({reason_code},{retry_hint})")
                     }
                 };
@@ -2790,9 +2805,7 @@ pub fn evaluate_prepare_phase(
                                 .policy_reason_code
                                 .clone()
                                 .unwrap_or_else(|| "policy_denied".to_string()),
-                            error_code: MissionFailureCode::PolicyDenied
-                                .error_code()
-                                .to_string(),
+                            error_code: MissionFailureCode::PolicyDenied.error_code().to_string(),
                         },
                         "prepare_policy_denied".to_string(),
                     )
@@ -2883,21 +2896,18 @@ pub fn evaluate_prepare_phase(
         ),
         TxPrepareOutcome::Denied => {
             // Find first denied step's reason
-            let first_denied = step_receipts
-                .iter()
-                .find(|r| r.readiness.is_denied());
+            let first_denied = step_receipts.iter().find(|r| r.readiness.is_denied());
             let (reason, error) = match first_denied.map(|r| &r.readiness) {
-                Some(TxPrepareStepReadiness::Denied { reason_code, error_code }) => {
-                    (reason_code.clone(), error_code.clone())
-                }
+                Some(TxPrepareStepReadiness::Denied {
+                    reason_code,
+                    error_code,
+                }) => (reason_code.clone(), error_code.clone()),
                 _ => ("prepare_denied".to_string(), "FTX2003".to_string()),
             };
             (reason, Some(error), "prepare_denied_abort".to_string())
         }
         TxPrepareOutcome::Deferred => {
-            let first_deferred = step_receipts
-                .iter()
-                .find(|r| r.readiness.is_deferred());
+            let first_deferred = step_receipts.iter().find(|r| r.readiness.is_deferred());
             let reason = match first_deferred.map(|r| &r.readiness) {
                 Some(TxPrepareStepReadiness::Deferred { reason_code, .. }) => reason_code.clone(),
                 _ => "prepare_deferred".to_string(),
@@ -2940,18 +2950,14 @@ pub struct TxCommitStepResult {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TxCommitStepOutcome {
     /// Step executed successfully.
-    Committed {
-        reason_code: String,
-    },
+    Committed { reason_code: String },
     /// Step execution failed.
     Failed {
         reason_code: String,
         error_code: String,
     },
     /// Step was skipped due to prior failure (barrier halt).
-    Skipped {
-        reason_code: String,
-    },
+    Skipped { reason_code: String },
     /// Step was skipped due to kill-switch activation.
     Blocked {
         reason_code: String,
@@ -3047,7 +3053,8 @@ impl TxCommitReport {
             self.committed_count,
             self.failed_count,
             self.skipped_count,
-            self.failure_boundary.map_or_else(|| "none".to_string(), |v| v.to_string()),
+            self.failure_boundary
+                .map_or_else(|| "none".to_string(), |v| v.to_string()),
             self.reason_code,
             self.error_code.as_deref().unwrap_or("none"),
         )
@@ -3145,10 +3152,7 @@ pub fn execute_commit_phase(
     }
 
     let mut receipts = Vec::new();
-    let mut receipt_seq = contract
-        .receipts
-        .last()
-        .map_or(1, |r| r.seq + 1);
+    let mut receipt_seq = contract.receipts.last().map_or(1, |r| r.seq + 1);
 
     // Emit CommitStarted receipt
     receipts.push(TxReceipt {
@@ -3286,10 +3290,7 @@ pub fn execute_commit_phase(
                     ordinal: step.ordinal,
                     outcome: TxCommitStepOutcome::Failed {
                         reason_code: input.reason_code.clone(),
-                        error_code: input
-                            .error_code
-                            .clone()
-                            .unwrap_or_else(|| "FTX3002".into()),
+                        error_code: input.error_code.clone().unwrap_or_else(|| "FTX3002".into()),
                     },
                     decision_path: "commit_step_failed".into(),
                     completed_at_ms: input.completed_at_ms,
@@ -3318,35 +3319,34 @@ pub fn execute_commit_phase(
     }
 
     // Determine overall outcome
-    let (outcome, terminal_state, reason_code, error_code, decision_path) =
-        if failed_count == 0 {
-            (
-                TxCommitOutcome::FullyCommitted,
-                MissionTxState::Committed,
-                "all_steps_committed".to_string(),
-                None,
-                "commit_succeeded".to_string(),
-            )
-        } else if committed_count == 0 {
-            (
-                TxCommitOutcome::ImmediateFailure,
-                MissionTxState::Failed,
-                "first_step_failed".to_string(),
-                Some("FTX3004".to_string()),
-                "commit_immediate_failure".to_string(),
-            )
-        } else {
-            (
-                TxCommitOutcome::PartialFailure,
-                MissionTxState::Compensating,
-                format!(
-                    "partial_failure_at_ordinal_{}",
-                    failure_boundary.unwrap_or(0)
-                ),
-                Some("FTX3005".to_string()),
-                "commit_partial_failure".to_string(),
-            )
-        };
+    let (outcome, terminal_state, reason_code, error_code, decision_path) = if failed_count == 0 {
+        (
+            TxCommitOutcome::FullyCommitted,
+            MissionTxState::Committed,
+            "all_steps_committed".to_string(),
+            None,
+            "commit_succeeded".to_string(),
+        )
+    } else if committed_count == 0 {
+        (
+            TxCommitOutcome::ImmediateFailure,
+            MissionTxState::Failed,
+            "first_step_failed".to_string(),
+            Some("FTX3004".to_string()),
+            "commit_immediate_failure".to_string(),
+        )
+    } else {
+        (
+            TxCommitOutcome::PartialFailure,
+            MissionTxState::Compensating,
+            format!(
+                "partial_failure_at_ordinal_{}",
+                failure_boundary.unwrap_or(0)
+            ),
+            Some("FTX3005".to_string()),
+            "commit_partial_failure".to_string(),
+        )
+    };
 
     // Emit terminal receipt
     receipts.push(TxReceipt {
@@ -3398,7 +3398,10 @@ pub enum TxCompensationStepOutcome {
     /// Compensation succeeded (forward step undone).
     Compensated { reason_code: String },
     /// Compensation failed (residual risk).
-    Failed { reason_code: String, error_code: String },
+    Failed {
+        reason_code: String,
+        error_code: String,
+    },
     /// No compensation defined for this step.
     NoCompensation { reason_code: String },
     /// Skipped due to prior compensation failure.
@@ -3566,10 +3569,7 @@ pub fn execute_compensation_phase(
     }
 
     let mut receipts = Vec::new();
-    let mut receipt_seq = contract
-        .receipts
-        .last()
-        .map_or(1, |r| r.seq + 1);
+    let mut receipt_seq = contract.receipts.last().map_or(1, |r| r.seq + 1);
 
     // Emit CompensationStarted receipt
     receipts.push(TxReceipt {
@@ -3691,10 +3691,7 @@ pub fn execute_compensation_phase(
                     forward_ordinal: committed_step.ordinal,
                     outcome: TxCompensationStepOutcome::Failed {
                         reason_code: input.reason_code.clone(),
-                        error_code: input
-                            .error_code
-                            .clone()
-                            .unwrap_or_else(|| "FTX2008".into()),
+                        error_code: input.error_code.clone().unwrap_or_else(|| "FTX2008".into()),
                     },
                     decision_path: "compensation_failed".into(),
                     completed_at_ms: input.completed_at_ms,
@@ -3721,24 +3718,23 @@ pub fn execute_compensation_phase(
     }
 
     // Determine overall outcome
-    let (outcome, terminal_state, reason_code, error_code, decision_path) =
-        if failed_count > 0 {
-            (
-                TxCompensationOutcome::CompensationFailed,
-                MissionTxState::Failed,
-                "compensation_incomplete".to_string(),
-                Some("FTX2008".to_string()),
-                "compensation_failed".to_string(),
-            )
-        } else {
-            (
-                TxCompensationOutcome::FullyRolledBack,
-                MissionTxState::RolledBack,
-                "all_compensations_succeeded".to_string(),
-                None,
-                "compensation_succeeded".to_string(),
-            )
-        };
+    let (outcome, terminal_state, reason_code, error_code, decision_path) = if failed_count > 0 {
+        (
+            TxCompensationOutcome::CompensationFailed,
+            MissionTxState::Failed,
+            "compensation_incomplete".to_string(),
+            Some("FTX2008".to_string()),
+            "compensation_failed".to_string(),
+        )
+    } else {
+        (
+            TxCompensationOutcome::FullyRolledBack,
+            MissionTxState::RolledBack,
+            "all_compensations_succeeded".to_string(),
+            None,
+            "compensation_succeeded".to_string(),
+        )
+    };
 
     // Emit terminal receipt
     receipts.push(TxReceipt {
@@ -4152,10 +4148,7 @@ pub fn validate_tx_idempotency(
             tx_idempotency_key: tx_key,
             verdict: TxIdempotencyVerdict::ConflictingPrior {
                 prior_state: record.lifecycle_state,
-                conflict_reason: format!(
-                    "prior key {} != current key",
-                    record.tx_idempotency_key
-                ),
+                conflict_reason: format!("prior key {} != current key", record.tx_idempotency_key),
             },
             decision_path: "idempotency_conflicting_prior".into(),
             reason_code: "key_mismatch_on_terminal".into(),
@@ -4248,8 +4241,10 @@ pub fn reconstruct_tx_resume_state(
         }
         MissionTxState::Compensating => {
             // Committed steps not yet compensated
-            let compensated_set: std::collections::HashSet<&str> =
-                compensated_step_ids.iter().map(|id| id.0.as_str()).collect();
+            let compensated_set: std::collections::HashSet<&str> = compensated_step_ids
+                .iter()
+                .map(|id| id.0.as_str())
+                .collect();
             committed_step_ids
                 .iter()
                 .filter(|id| !compensated_set.contains(id.0.as_str()))
@@ -4624,7 +4619,10 @@ impl fmt::Display for LedgerValidationError {
                 expected_prev,
                 actual_prev,
             } => {
-                write!(f, "Broken hash chain at seq {seq}: expected prev {expected_prev}, got {actual_prev}")
+                write!(
+                    f,
+                    "Broken hash chain at seq {seq}: expected prev {expected_prev}, got {actual_prev}"
+                )
             }
             Self::TamperedEntry { seq } => {
                 write!(f, "Tampered ledger entry at seq {seq}: hash mismatch")
@@ -5582,7 +5580,8 @@ impl MissionKillSwitchActivation {
             self.reason_code,
             self.error_code.as_deref().unwrap_or("none"),
             self.activated_at_ms,
-            self.expires_at_ms.map_or_else(|| "none".to_string(), |ms| ms.to_string()),
+            self.expires_at_ms
+                .map_or_else(|| "none".to_string(), |ms| ms.to_string()),
             self.correlation_id.as_deref().unwrap_or("none"),
         )
     }
@@ -5764,9 +5763,15 @@ impl MissionControlCommand {
     #[must_use]
     pub fn requested_at_ms(&self) -> i64 {
         match self {
-            Self::Pause { requested_at_ms, .. }
-            | Self::Resume { requested_at_ms, .. }
-            | Self::Abort { requested_at_ms, .. } => *requested_at_ms,
+            Self::Pause {
+                requested_at_ms, ..
+            }
+            | Self::Resume {
+                requested_at_ms, ..
+            }
+            | Self::Abort {
+                requested_at_ms, ..
+            } => *requested_at_ms,
         }
     }
 
@@ -6228,12 +6233,7 @@ impl MissionJournal {
         }
 
         let seq = self.next_seq;
-        let entry_hash = format!(
-            "j:{}:{}:{}",
-            seq,
-            timestamp_ms,
-            &cid,
-        );
+        let entry_hash = format!("j:{}:{}:{}", seq, timestamp_ms, &cid,);
 
         let entry = MissionJournalEntry {
             seq,
@@ -6367,8 +6367,7 @@ impl MissionJournal {
         MissionJournalState {
             entry_count: self.entries.len() as u64,
             last_seq: last_entry.map_or(0, |e| e.seq),
-            last_entry_hash: last_entry
-                .map_or_else(String::new, |e| e.entry_hash.clone()),
+            last_entry_hash: last_entry.map_or_else(String::new, |e| e.entry_hash.clone()),
             last_checkpoint_seq: self.last_checkpoint_seq,
             last_checkpoint_hash: self
                 .entries
@@ -6381,9 +6380,13 @@ impl MissionJournal {
                     _ => None,
                 })
                 .unwrap_or_default(),
-            clean: self.last_checkpoint_seq.map_or(true, |cp_seq| {
-                self.entries.last().map_or(true, |e| e.seq == cp_seq)
-            }),
+            clean: if self.entries.is_empty() {
+                true
+            } else {
+                self.last_checkpoint_seq.map_or(false, |cp_seq| {
+                    self.entries.last().map_or(false, |e| e.seq == cp_seq)
+                })
+            },
         }
     }
 
@@ -6501,9 +6504,7 @@ pub enum MissionJournalError {
         prior_seq: u64,
     },
     /// Validation or invariant violation.
-    ValidationFailed {
-        reason: String,
-    },
+    ValidationFailed { reason: String },
 }
 
 impl fmt::Display for MissionJournalError {
@@ -7311,7 +7312,10 @@ pub struct Mission {
     pub assignments: Vec<Assignment>,
     #[serde(default, skip_serializing_if = "MissionReplanState::is_pristine")]
     pub replan_state: MissionReplanState,
-    #[serde(default, skip_serializing_if = "MissionDispatchDeduplicationState::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "MissionDispatchDeduplicationState::is_empty"
+    )]
     pub dispatch_dedup_state: MissionDispatchDeduplicationState,
     #[serde(default, skip_serializing_if = "MissionKillSwitchState::is_off")]
     pub kill_switch: MissionKillSwitchState,
@@ -8626,8 +8630,10 @@ impl Mission {
         correlation_id: &str,
         response: MissionDispatchLiveResponse,
         dispatched_at_ms: i64,
-    ) -> Result<(MissionDispatchExecution, MissionDispatchDeduplicationResult), MissionValidationError>
-    {
+    ) -> Result<
+        (MissionDispatchExecution, MissionDispatchDeduplicationResult),
+        MissionValidationError,
+    > {
         let dedup_result = self.evaluate_dispatch_deduplication(assignment_id, correlation_id)?;
 
         if dedup_result.is_duplicate {
@@ -8650,8 +8656,7 @@ impl Mission {
         let execution = self.dispatch_assignment_live(assignment_id, response)?;
 
         let mechanism_hash = {
-            let mechanism_json =
-                serde_json::to_string(&execution.mechanism).unwrap_or_default();
+            let mechanism_json = serde_json::to_string(&execution.mechanism).unwrap_or_default();
             sha256_hex(&mechanism_json)[..16].to_string()
         };
 
@@ -8677,10 +8682,7 @@ impl Mission {
     /// This method is the central policy gate: every dispatch path should call it
     /// before proceeding. It evaluates the current kill-switch level (with TTL
     /// expiry) and returns a structured decision.
-    pub fn evaluate_kill_switch(
-        &mut self,
-        evaluated_at_ms: i64,
-    ) -> MissionKillSwitchDecision {
+    pub fn evaluate_kill_switch(&mut self, evaluated_at_ms: i64) -> MissionKillSwitchDecision {
         let effective_level = self.kill_switch.evaluate_effective_level(evaluated_at_ms);
 
         match effective_level {
@@ -8739,7 +8741,9 @@ impl Mission {
         if level == MissionKillSwitchLevel::Off {
             return Err(MissionValidationError::InvalidFieldValue {
                 field_path: "kill_switch.level".to_string(),
-                message: "cannot activate kill-switch at level Off; use deactivate_kill_switch instead".to_string(),
+                message:
+                    "cannot activate kill-switch at level Off; use deactivate_kill_switch instead"
+                        .to_string(),
             });
         }
 
@@ -8820,10 +8824,7 @@ impl Mission {
     ///
     /// Returns the number of assignments cancelled. Each cancelled assignment
     /// gets an `Outcome::Cancelled` with the kill-switch reason code.
-    pub fn cancel_in_flight_for_kill_switch(
-        &mut self,
-        cancelled_at_ms: i64,
-    ) -> usize {
+    pub fn cancel_in_flight_for_kill_switch(&mut self, cancelled_at_ms: i64) -> usize {
         let mut cancelled_count = 0;
         for assignment in &mut self.assignments {
             // Skip assignments that already have a terminal outcome
@@ -9160,7 +9161,7 @@ impl Mission {
             kind,
             correlation_id,
             initiated_by,
-            format!("kill_switch:{}->{}",level_from, level_to),
+            format!("kill_switch:{}->{}", level_from, level_to),
             None,
             timestamp_ms,
         )
@@ -9268,9 +9269,15 @@ impl Mission {
                     );
                     check.context = Some(format!(
                         "conflict_holders={} conflict_paths={} lease_ids={} recommendation=coordinate_or_wait escalation=human",
-                        conflicting_holders.into_iter().collect::<Vec<_>>().join("|"),
+                        conflicting_holders
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                            .join("|"),
                         conflicting_paths.into_iter().collect::<Vec<_>>().join("|"),
-                        conflicting_lease_ids.into_iter().collect::<Vec<_>>().join("|")
+                        conflicting_lease_ids
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                            .join("|")
                     ));
                 }
             }
@@ -9812,8 +9819,7 @@ impl Mission {
                 if has_pending_approval
                     && !matches!(
                         state,
-                        MissionLifecycleState::AwaitingApproval
-                            | MissionLifecycleState::Paused
+                        MissionLifecycleState::AwaitingApproval | MissionLifecycleState::Paused
                     ) =>
             {
                 Err(MissionValidationError::PendingApprovalOutsideAwaitingState { state })
@@ -12505,16 +12511,22 @@ mod tests {
             MissionFailureCode::PolicyDenied.retryability(),
             MissionFailureRetryability::Never
         );
-        assert!(!MissionFailureCode::PolicyDenied
-            .retryability()
-            .is_retryable());
-        assert!(!MissionFailureCode::ApprovalDenied
-            .retryability()
-            .is_retryable());
+        assert!(
+            !MissionFailureCode::PolicyDenied
+                .retryability()
+                .is_retryable()
+        );
+        assert!(
+            !MissionFailureCode::ApprovalDenied
+                .retryability()
+                .is_retryable()
+        );
         assert!(!MissionFailureCode::RateLimited.terminality().is_terminal());
-        assert!(MissionFailureCode::RateLimited
-            .retryability()
-            .is_retryable());
+        assert!(
+            MissionFailureCode::RateLimited
+                .retryability()
+                .is_retryable()
+        );
     }
 
     #[test]
@@ -12865,11 +12877,13 @@ mod tests {
             deny_outcome.error_code.as_deref(),
             Some(MissionFailureCode::PolicyDenied.error_code())
         );
-        assert!(deny_outcome
-            .human_hint
-            .as_deref()
-            .unwrap()
-            .contains("Policy denied"));
+        assert!(
+            deny_outcome
+                .human_hint
+                .as_deref()
+                .unwrap()
+                .contains("Policy denied")
+        );
         assert_eq!(deny_outcome.action_type, "wait_for");
     }
 
@@ -13002,9 +13016,11 @@ mod tests {
         assert!(report.has_denials());
         assert_eq!(
             report.planner_feedback_reason_codes,
-            vec![MissionFailureCode::ReservationConflict
-                .reason_code()
-                .to_string()]
+            vec![
+                MissionFailureCode::ReservationConflict
+                    .reason_code()
+                    .to_string()
+            ]
         );
         assert_eq!(
             report.outcomes[0].assignment_id.as_ref().unwrap().0,
@@ -13039,9 +13055,11 @@ mod tests {
         assert!(report.has_denials());
         assert_eq!(
             report.planner_feedback_reason_codes,
-            vec![MissionFailureCode::ReservationConflict
-                .reason_code()
-                .to_string()]
+            vec![
+                MissionFailureCode::ReservationConflict
+                    .reason_code()
+                    .to_string()
+            ]
         );
 
         let denial = report
@@ -13057,11 +13075,13 @@ mod tests {
             denial.error_code.as_deref(),
             Some(MissionFailureCode::ReservationConflict.error_code())
         );
-        assert!(denial
-            .context
-            .as_deref()
-            .unwrap_or_default()
-            .contains("recommendation=coordinate_or_wait"));
+        assert!(
+            denial
+                .context
+                .as_deref()
+                .unwrap_or_default()
+                .contains("recommendation=coordinate_or_wait")
+        );
     }
 
     #[test]
@@ -13263,10 +13283,12 @@ mod tests {
         assert!(!contract.messaging.requires_beads_update);
         assert!(contract.messaging.thread_id.is_none());
         assert!(contract.messaging.bead_id.is_none());
-        assert!(!contract
-            .edge_cases
-            .iter()
-            .any(|edge| matches!(edge, MissionDispatchEdgeCase::StaleBeadState { .. })));
+        assert!(
+            !contract
+                .edge_cases
+                .iter()
+                .any(|edge| matches!(edge, MissionDispatchEdgeCase::StaleBeadState { .. }))
+        );
     }
 
     #[test]
@@ -13493,7 +13515,10 @@ mod tests {
         let key1 = MissionDispatchIdempotencyKey::compute(&mission_id, &assignment_id, &mechanism);
         let key2 = MissionDispatchIdempotencyKey::compute(&mission_id, &assignment_id, &mechanism);
         assert_eq!(key1, key2, "same inputs must produce same idempotency key");
-        assert!(key1.as_str().starts_with("dispatch:"), "key must have dispatch: prefix");
+        assert!(
+            key1.as_str().starts_with("dispatch:"),
+            "key must have dispatch: prefix"
+        );
     }
 
     #[test]
@@ -13513,7 +13538,10 @@ mod tests {
 
         let key_a = MissionDispatchIdempotencyKey::compute(&mission_id, &assignment_id, &mech_a);
         let key_b = MissionDispatchIdempotencyKey::compute(&mission_id, &assignment_id, &mech_b);
-        assert_ne!(key_a, key_b, "different mechanisms must produce different keys");
+        assert_ne!(
+            key_a, key_b,
+            "different mechanisms must produce different keys"
+        );
     }
 
     #[test]
@@ -13535,7 +13563,10 @@ mod tests {
             &AssignmentId("assignment:b".to_string()),
             &mechanism,
         );
-        assert_ne!(key_a, key_b, "different assignments must produce different keys");
+        assert_ne!(
+            key_a, key_b,
+            "different assignments must produce different keys"
+        );
     }
 
     #[test]
@@ -13686,7 +13717,10 @@ mod tests {
         assert!(!dedup.is_duplicate, "first call must not be a duplicate");
         assert_eq!(dedup.reason_code, "dispatch_fresh");
         assert!(matches!(execution.outcome, Outcome::Success { .. }));
-        assert!(!mission.dispatch_dedup_state.is_empty(), "must record dispatch");
+        assert!(
+            !mission.dispatch_dedup_state.is_empty(),
+            "must record dispatch"
+        );
     }
 
     #[test]
@@ -13722,7 +13756,10 @@ mod tests {
             )
             .unwrap();
 
-        assert!(second_dedup.is_duplicate, "second call must detect duplicate");
+        assert!(
+            second_dedup.is_duplicate,
+            "second call must detect duplicate"
+        );
         assert_eq!(second_dedup.decision_path, "dedup_exact_match");
         assert_eq!(second_dedup.reason_code, "dispatch_duplicate");
         // Cached outcome should match the first execution, not the second response
@@ -14265,9 +14302,11 @@ mod tests {
             .find(|evaluation| evaluation.agent_id == "rate-agent")
             .unwrap();
         assert!(!rate_limited.eligible);
-        assert!(rate_limited
-            .reason_codes
-            .contains(&"agent_rate_limited".to_string()));
+        assert!(
+            rate_limited
+                .reason_codes
+                .contains(&"agent_rate_limited".to_string())
+        );
     }
 
     #[test]
@@ -14310,9 +14349,11 @@ mod tests {
             .find(|evaluation| evaluation.agent_id == "executor-agent-a")
             .unwrap();
         assert!(!excluded.eligible);
-        assert!(excluded
-            .reason_codes
-            .contains(&"assignment_excluded".to_string()));
+        assert!(
+            excluded
+                .reason_codes
+                .contains(&"assignment_excluded".to_string())
+        );
     }
 
     #[test]
@@ -14361,12 +14402,16 @@ mod tests {
             .find(|evaluation| evaluation.agent_id == "degraded-full")
             .unwrap();
         assert!(!degraded_full.eligible);
-        assert!(degraded_full
-            .reason_codes
-            .contains(&"agent_capacity_exhausted".to_string()));
-        assert!(degraded_full
-            .reason_codes
-            .contains(&"agent_degraded".to_string()));
+        assert!(
+            degraded_full
+                .reason_codes
+                .contains(&"agent_capacity_exhausted".to_string())
+        );
+        assert!(
+            degraded_full
+                .reason_codes
+                .contains(&"agent_degraded".to_string())
+        );
     }
 
     #[test]
@@ -16501,13 +16546,8 @@ mod tests {
             compensations: vec![],
         };
         let tx_id = TxId("tx:empty".to_string());
-        let result = evaluate_prepare_phase(
-            &tx_id,
-            &plan,
-            &[],
-            MissionKillSwitchLevel::Off,
-            1_000_000,
-        );
+        let result =
+            evaluate_prepare_phase(&tx_id, &plan, &[], MissionKillSwitchLevel::Off, 1_000_000);
         let is_err = result.is_err();
         assert!(is_err);
     }
@@ -16724,18 +16764,10 @@ mod tests {
         mission.lifecycle_state = MissionLifecycleState::Dispatching;
 
         let decision = mission
-            .pause_mission(
-                "system",
-                "resource_pressure",
-                2000,
-                Some("corr-1".into()),
-            )
+            .pause_mission("system", "resource_pressure", 2000, Some("corr-1".into()))
             .unwrap();
 
-        assert_eq!(
-            decision.lifecycle_from,
-            MissionLifecycleState::Dispatching
-        );
+        assert_eq!(decision.lifecycle_from, MissionLifecycleState::Dispatching);
         let cp = mission
             .pause_resume_state
             .current_checkpoint
@@ -16808,10 +16840,7 @@ mod tests {
             .pause_mission("operator-1", "cooldown", 2000, None)
             .unwrap();
 
-        assert_eq!(
-            decision.lifecycle_from,
-            MissionLifecycleState::RetryPending
-        );
+        assert_eq!(decision.lifecycle_from, MissionLifecycleState::RetryPending);
     }
 
     #[test]
@@ -16831,11 +16860,7 @@ mod tests {
             mission.lifecycle_state = terminal;
 
             let result = mission.pause_mission("op", "reason", 2000, None);
-            assert!(
-                result.is_err(),
-                "should reject pause from {}",
-                terminal
-            );
+            assert!(result.is_err(), "should reject pause from {}", terminal);
         }
     }
 
@@ -16899,9 +16924,7 @@ mod tests {
             1000,
         );
         mission.lifecycle_state = MissionLifecycleState::Running;
-        mission
-            .pause_mission("op", "manual", 2000, None)
-            .unwrap();
+        mission.pause_mission("op", "manual", 2000, None).unwrap();
 
         let decision = mission
             .resume_mission("op", "ready_to_continue", 5000, None)
@@ -16940,12 +16963,8 @@ mod tests {
             1000,
         );
         mission.lifecycle_state = MissionLifecycleState::Running;
-        mission
-            .pause_mission("op", "manual", 2000, None)
-            .unwrap();
-        mission
-            .resume_mission("op", "ready", 5000, None)
-            .unwrap();
+        mission.pause_mission("op", "manual", 2000, None).unwrap();
+        mission.resume_mission("op", "ready", 5000, None).unwrap();
 
         assert_eq!(
             mission.pause_resume_state.cumulative_pause_duration_ms,
@@ -16970,20 +16989,12 @@ mod tests {
         mission.lifecycle_state = MissionLifecycleState::Running;
 
         // First pause/resume: 1000ms
-        mission
-            .pause_mission("op", "pause1", 2000, None)
-            .unwrap();
-        mission
-            .resume_mission("op", "resume1", 3000, None)
-            .unwrap();
+        mission.pause_mission("op", "pause1", 2000, None).unwrap();
+        mission.resume_mission("op", "resume1", 3000, None).unwrap();
 
         // Second pause/resume: 2000ms
-        mission
-            .pause_mission("op", "pause2", 4000, None)
-            .unwrap();
-        mission
-            .resume_mission("op", "resume2", 6000, None)
-            .unwrap();
+        mission.pause_mission("op", "pause2", 4000, None).unwrap();
+        mission.resume_mission("op", "resume2", 6000, None).unwrap();
 
         assert_eq!(
             mission.pause_resume_state.cumulative_pause_duration_ms,
@@ -16991,10 +17002,7 @@ mod tests {
         );
         assert_eq!(mission.pause_resume_state.total_pause_count, 2);
         assert_eq!(mission.pause_resume_state.total_resume_count, 2);
-        assert_eq!(
-            mission.pause_resume_state.checkpoint_history.len(),
-            2
-        );
+        assert_eq!(mission.pause_resume_state.checkpoint_history.len(), 2);
     }
 
     #[test]
@@ -17044,10 +17052,7 @@ mod tests {
 
         assert_eq!(decision.action, "abort");
         assert_eq!(decision.lifecycle_from, MissionLifecycleState::Running);
-        assert_eq!(
-            decision.lifecycle_to,
-            MissionLifecycleState::Cancelled
-        );
+        assert_eq!(decision.lifecycle_to, MissionLifecycleState::Cancelled);
         assert_eq!(mission.lifecycle_state, MissionLifecycleState::Cancelled);
         assert_eq!(mission.pause_resume_state.total_abort_count, 1);
 
@@ -17066,9 +17071,7 @@ mod tests {
             1000,
         );
         mission.lifecycle_state = MissionLifecycleState::Running;
-        mission
-            .pause_mission("op", "pause", 2000, None)
-            .unwrap();
+        mission.pause_mission("op", "pause", 2000, None).unwrap();
 
         let _decision = mission
             .abort_mission("op", "abort_while_paused", None, 5000, None)
@@ -17076,10 +17079,7 @@ mod tests {
 
         assert_eq!(mission.lifecycle_state, MissionLifecycleState::Cancelled);
         assert!(!mission.pause_resume_state.is_paused());
-        assert_eq!(
-            mission.pause_resume_state.checkpoint_history.len(),
-            1
-        );
+        assert_eq!(mission.pause_resume_state.checkpoint_history.len(), 1);
         let cp = &mission.pause_resume_state.checkpoint_history[0];
         assert_eq!(cp.resumed_at_ms, Some(5000));
         assert_eq!(
@@ -17122,13 +17122,8 @@ mod tests {
             );
             mission.lifecycle_state = terminal;
 
-            let result =
-                mission.abort_mission("op", "reason", None, 2000, None);
-            assert!(
-                result.is_err(),
-                "should reject abort from {}",
-                terminal
-            );
+            let result = mission.abort_mission("op", "reason", None, 2000, None);
+            assert!(result.is_err(), "should reject abort from {}", terminal);
         }
     }
 
@@ -17143,12 +17138,10 @@ mod tests {
         );
         mission.lifecycle_state = MissionLifecycleState::Running;
 
-        let result =
-            mission.abort_mission("", "reason", None, 2000, None);
+        let result = mission.abort_mission("", "reason", None, 2000, None);
         assert!(result.is_err());
 
-        let result =
-            mission.abort_mission("  ", "reason", None, 2000, None);
+        let result = mission.abort_mission("  ", "reason", None, 2000, None);
         assert!(result.is_err());
     }
 
@@ -17179,11 +17172,7 @@ mod tests {
                 1000,
             );
             mission.lifecycle_state = state;
-            assert!(
-                mission.can_pause(),
-                "should be pausable from {}",
-                state
-            );
+            assert!(mission.can_pause(), "should be pausable from {}", state);
         }
         for state in not_pausable {
             let mut mission = Mission::new(
@@ -17290,9 +17279,11 @@ mod tests {
         assert_eq!(cp.assignment_entries.len(), 1);
         assert_eq!(cp.assignment_entries[0].assignment_id.0, "a1");
         assert!(cp.assignment_entries[0].outcome_summary.is_none());
-        assert!(cp.assignment_entries[0]
-            .approval_state_summary
-            .contains("pending"));
+        assert!(
+            cp.assignment_entries[0]
+                .approval_state_summary
+                .contains("pending")
+        );
     }
 
     #[test]
@@ -17341,8 +17332,7 @@ mod tests {
         });
 
         let json = serde_json::to_string(&state).unwrap();
-        let restored: MissionPauseResumeState =
-            serde_json::from_str(&json).unwrap();
+        let restored: MissionPauseResumeState = serde_json::from_str(&json).unwrap();
         assert_eq!(state, restored);
     }
 
@@ -17390,13 +17380,9 @@ mod tests {
 
         for cmd in &commands {
             let json = serde_json::to_string(cmd).unwrap();
-            let restored: MissionControlCommand =
-                serde_json::from_str(&json).unwrap();
+            let restored: MissionControlCommand = serde_json::from_str(&json).unwrap();
             assert_eq!(cmd, &restored);
-            assert_eq!(
-                cmd.canonical_string(),
-                restored.canonical_string()
-            );
+            assert_eq!(cmd.canonical_string(), restored.canonical_string());
         }
     }
 
@@ -17469,7 +17455,9 @@ mod tests {
             to: MissionLifecycleState::Planned,
             transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
         };
-        journal.append(kind, "c1", "op", "test", None, 1000).unwrap();
+        journal
+            .append(kind, "c1", "op", "test", None, 1000)
+            .unwrap();
         assert!(journal.has_correlation("c1"));
         assert!(!journal.has_correlation("c2"));
     }
@@ -17503,9 +17491,7 @@ mod tests {
     #[test]
     fn journal_recovery_marker() {
         let mut journal = MissionJournal::new(MissionId("m-j6".into()));
-        let seq = journal
-            .recovery_marker(0, "cold_start", 1000)
-            .unwrap();
+        let seq = journal.recovery_marker(0, "cold_start", 1000).unwrap();
         assert_eq!(seq, 1);
 
         let entry = &journal.entries()[0];
@@ -17565,8 +17551,7 @@ mod tests {
 
     #[test]
     fn journal_needs_compaction_respects_limit() {
-        let mut journal = MissionJournal::new(MissionId("m-j9".into()))
-            .with_max_entries(3);
+        let mut journal = MissionJournal::new(MissionId("m-j9".into())).with_max_entries(3);
         assert!(!journal.needs_compaction());
 
         for i in 1..=4 {
@@ -17594,7 +17579,9 @@ mod tests {
             to: MissionLifecycleState::Planned,
             transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
         };
-        journal.append(kind, "c1", "op", "test", None, 1000).unwrap();
+        journal
+            .append(kind, "c1", "op", "test", None, 1000)
+            .unwrap();
 
         let state = journal.snapshot_state();
         assert!(!state.is_pristine());
@@ -17979,14 +17966,8 @@ mod tests {
             checkpoint_id: Some("cp-1".into()),
             decided_at_ms: 6000,
         };
-        let seq = Mission::journal_control_command(
-            &mut journal,
-            &cmd,
-            &decision,
-            "cc-1",
-            6000,
-        )
-        .unwrap();
+        let seq =
+            Mission::journal_control_command(&mut journal, &cmd, &decision, "cc-1", 6000).unwrap();
         assert_eq!(seq, 1);
         let entry = &journal.entries()[0];
         let is_cc = matches!(&entry.kind, MissionJournalEntryKind::ControlCommand { .. });
@@ -18203,8 +18184,7 @@ mod tests {
                 error_code: None,
             };
             let json = serde_json::to_string(&entry).unwrap();
-            let restored: MissionJournalEntry =
-                serde_json::from_str(&json).unwrap();
+            let restored: MissionJournalEntry = serde_json::from_str(&json).unwrap();
             assert_eq!(entry, restored);
         }
     }
@@ -18242,8 +18222,7 @@ mod tests {
             error_code: Some("FTM001".into()),
         };
         let json = serde_json::to_string(&entry).unwrap();
-        let restored: MissionJournalEntry =
-            serde_json::from_str(&json).unwrap();
+        let restored: MissionJournalEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(entry, restored);
     }
 
@@ -18265,8 +18244,7 @@ mod tests {
             }],
         };
         let json = serde_json::to_string(&report).unwrap();
-        let restored: MissionJournalReplayReport =
-            serde_json::from_str(&json).unwrap();
+        let restored: MissionJournalReplayReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, restored);
     }
 
@@ -18335,14 +18313,9 @@ mod tests {
             success_input("s2", 3000),
             success_input("s3", 4000),
         ];
-        let report = execute_commit_phase(
-            &contract,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        )
-        .unwrap();
+        let report =
+            execute_commit_phase(&contract, &inputs, MissionKillSwitchLevel::Off, false, 5000)
+                .unwrap();
 
         assert!(report.is_fully_committed());
         assert!(!report.has_failures());
@@ -18350,10 +18323,7 @@ mod tests {
         assert_eq!(report.failed_count, 0);
         assert_eq!(report.skipped_count, 0);
         assert!(report.failure_boundary.is_none());
-        assert_eq!(
-            report.outcome.target_tx_state(),
-            MissionTxState::Committed
-        );
+        assert_eq!(report.outcome.target_tx_state(), MissionTxState::Committed);
         assert_eq!(report.receipts.len(), 2); // start + terminal
     }
 
@@ -18361,50 +18331,28 @@ mod tests {
     fn commit_first_step_fails_immediate_failure() {
         let contract = make_commit_contract(3);
         let inputs = vec![failure_input("s1", 2000)];
-        let report = execute_commit_phase(
-            &contract,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        )
-        .unwrap();
+        let report =
+            execute_commit_phase(&contract, &inputs, MissionKillSwitchLevel::Off, false, 5000)
+                .unwrap();
 
-        let is_immediate = matches!(
-            report.outcome,
-            TxCommitOutcome::ImmediateFailure
-        );
+        let is_immediate = matches!(report.outcome, TxCommitOutcome::ImmediateFailure);
         assert!(is_immediate);
         assert_eq!(report.committed_count, 0);
         assert_eq!(report.failed_count, 1);
         assert_eq!(report.skipped_count, 2);
         assert_eq!(report.failure_boundary, Some(1));
-        assert_eq!(
-            report.outcome.target_tx_state(),
-            MissionTxState::Failed
-        );
+        assert_eq!(report.outcome.target_tx_state(), MissionTxState::Failed);
     }
 
     #[test]
     fn commit_partial_failure_trips_barrier() {
         let contract = make_commit_contract(3);
-        let inputs = vec![
-            success_input("s1", 2000),
-            failure_input("s2", 3000),
-        ];
-        let report = execute_commit_phase(
-            &contract,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        )
-        .unwrap();
+        let inputs = vec![success_input("s1", 2000), failure_input("s2", 3000)];
+        let report =
+            execute_commit_phase(&contract, &inputs, MissionKillSwitchLevel::Off, false, 5000)
+                .unwrap();
 
-        let is_partial = matches!(
-            report.outcome,
-            TxCommitOutcome::PartialFailure
-        );
+        let is_partial = matches!(report.outcome, TxCommitOutcome::PartialFailure);
         assert!(is_partial);
         assert_eq!(report.committed_count, 1);
         assert_eq!(report.failed_count, 1);
@@ -18437,10 +18385,7 @@ mod tests {
         )
         .unwrap();
 
-        let is_blocked = matches!(
-            report.outcome,
-            TxCommitOutcome::KillSwitchBlocked
-        );
+        let is_blocked = matches!(report.outcome, TxCommitOutcome::KillSwitchBlocked);
         assert!(is_blocked);
         assert_eq!(report.committed_count, 0);
         assert_eq!(report.skipped_count, 3);
@@ -18449,10 +18394,7 @@ mod tests {
     #[test]
     fn commit_kill_switch_hard_stop_blocks() {
         let contract = make_commit_contract(2);
-        let inputs = vec![
-            success_input("s1", 2000),
-            success_input("s2", 3000),
-        ];
+        let inputs = vec![success_input("s1", 2000), success_input("s2", 3000)];
         let report = execute_commit_phase(
             &contract,
             &inputs,
@@ -18462,10 +18404,7 @@ mod tests {
         )
         .unwrap();
 
-        let is_blocked = matches!(
-            report.outcome,
-            TxCommitOutcome::KillSwitchBlocked
-        );
+        let is_blocked = matches!(report.outcome, TxCommitOutcome::KillSwitchBlocked);
         assert!(is_blocked);
     }
 
@@ -18486,17 +18425,11 @@ mod tests {
         )
         .unwrap();
 
-        let is_paused = matches!(
-            report.outcome,
-            TxCommitOutcome::PauseSuspended
-        );
+        let is_paused = matches!(report.outcome, TxCommitOutcome::PauseSuspended);
         assert!(is_paused);
         assert_eq!(report.committed_count, 0);
         assert_eq!(report.skipped_count, 3);
-        assert_eq!(
-            report.outcome.target_tx_state(),
-            MissionTxState::Committing
-        );
+        assert_eq!(report.outcome.target_tx_state(), MissionTxState::Committing);
     }
 
     #[test]
@@ -18507,14 +18440,9 @@ mod tests {
             // s2 missing — no input
             success_input("s3", 4000),
         ];
-        let report = execute_commit_phase(
-            &contract,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        )
-        .unwrap();
+        let report =
+            execute_commit_phase(&contract, &inputs, MissionKillSwitchLevel::Off, false, 5000)
+                .unwrap();
 
         assert!(report.has_failures());
         assert_eq!(report.committed_count, 1);
@@ -18536,13 +18464,7 @@ mod tests {
     fn commit_rejects_non_prepared_state() {
         let mut contract = make_commit_contract(1);
         contract.lifecycle_state = MissionTxState::Draft;
-        let result = execute_commit_phase(
-            &contract,
-            &[],
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        );
+        let result = execute_commit_phase(&contract, &[], MissionKillSwitchLevel::Off, false, 5000);
         assert!(result.is_err());
     }
 
@@ -18551,14 +18473,9 @@ mod tests {
         let mut contract = make_commit_contract(1);
         contract.lifecycle_state = MissionTxState::Committing;
         let inputs = vec![success_input("s1", 2000)];
-        let report = execute_commit_phase(
-            &contract,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        )
-        .unwrap();
+        let report =
+            execute_commit_phase(&contract, &inputs, MissionKillSwitchLevel::Off, false, 5000)
+                .unwrap();
         assert!(report.is_fully_committed());
     }
 
@@ -18567,13 +18484,7 @@ mod tests {
         let mut contract = make_commit_contract(0);
         // Fix: empty steps with Prepared state
         contract.lifecycle_state = MissionTxState::Prepared;
-        let result = execute_commit_phase(
-            &contract,
-            &[],
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        );
+        let result = execute_commit_phase(&contract, &[], MissionKillSwitchLevel::Off, false, 5000);
         assert!(result.is_err());
     }
 
@@ -18632,18 +18543,10 @@ mod tests {
     #[test]
     fn commit_report_canonical_string_deterministic() {
         let contract = make_commit_contract(2);
-        let inputs = vec![
-            success_input("s1", 2000),
-            success_input("s2", 3000),
-        ];
-        let report = execute_commit_phase(
-            &contract,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        )
-        .unwrap();
+        let inputs = vec![success_input("s1", 2000), success_input("s2", 3000)];
+        let report =
+            execute_commit_phase(&contract, &inputs, MissionKillSwitchLevel::Off, false, 5000)
+                .unwrap();
 
         let s1 = report.canonical_string();
         let s2 = report.canonical_string();
@@ -18654,22 +18557,13 @@ mod tests {
     #[test]
     fn commit_report_serde_roundtrip() {
         let contract = make_commit_contract(2);
-        let inputs = vec![
-            success_input("s1", 2000),
-            failure_input("s2", 3000),
-        ];
-        let report = execute_commit_phase(
-            &contract,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        )
-        .unwrap();
+        let inputs = vec![success_input("s1", 2000), failure_input("s2", 3000)];
+        let report =
+            execute_commit_phase(&contract, &inputs, MissionKillSwitchLevel::Off, false, 5000)
+                .unwrap();
 
         let json = serde_json::to_string(&report).unwrap();
-        let restored: TxCommitReport =
-            serde_json::from_str(&json).unwrap();
+        let restored: TxCommitReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, restored);
     }
 
@@ -18685,8 +18579,7 @@ mod tests {
             completed_at_ms: 5000,
         };
         let json = serde_json::to_string(&result).unwrap();
-        let restored: TxCommitStepResult =
-            serde_json::from_str(&json).unwrap();
+        let restored: TxCommitStepResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result, restored);
     }
 
@@ -18700,8 +18593,7 @@ mod tests {
             completed_at_ms: 9000,
         };
         let json = serde_json::to_string(&input).unwrap();
-        let restored: TxCommitStepInput =
-            serde_json::from_str(&json).unwrap();
+        let restored: TxCommitStepInput = serde_json::from_str(&json).unwrap();
         assert_eq!(input, restored);
     }
 
@@ -18713,14 +18605,9 @@ mod tests {
             success_input("s2", 3000),
             success_input("s3", 4000),
         ];
-        let report = execute_commit_phase(
-            &contract,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        )
-        .unwrap();
+        let report =
+            execute_commit_phase(&contract, &inputs, MissionKillSwitchLevel::Off, false, 5000)
+                .unwrap();
 
         let mut prev_seq = 0u64;
         for receipt in &report.receipts {
@@ -18746,14 +18633,9 @@ mod tests {
         });
 
         let inputs = vec![success_input("s1", 2000)];
-        let report = execute_commit_phase(
-            &contract,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        )
-        .unwrap();
+        let report =
+            execute_commit_phase(&contract, &inputs, MissionKillSwitchLevel::Off, false, 5000)
+                .unwrap();
 
         // Should start from seq 6 (prior last was 5)
         assert_eq!(report.receipts[0].seq, 6);
@@ -18768,14 +18650,9 @@ mod tests {
             success_input("s3", 4000),
             success_input("s4", 5000),
         ];
-        let report = execute_commit_phase(
-            &contract,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            6000,
-        )
-        .unwrap();
+        let report =
+            execute_commit_phase(&contract, &inputs, MissionKillSwitchLevel::Off, false, 6000)
+                .unwrap();
 
         for (i, result) in report.step_results.iter().enumerate() {
             assert_eq!(result.ordinal, (i + 1) as u32);
@@ -18786,14 +18663,9 @@ mod tests {
     fn commit_single_step_success() {
         let contract = make_commit_contract(1);
         let inputs = vec![success_input("s1", 2000)];
-        let report = execute_commit_phase(
-            &contract,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        )
-        .unwrap();
+        let report =
+            execute_commit_phase(&contract, &inputs, MissionKillSwitchLevel::Off, false, 5000)
+                .unwrap();
 
         assert!(report.is_fully_committed());
         assert_eq!(report.committed_count, 1);
@@ -18803,38 +18675,42 @@ mod tests {
     fn commit_single_step_failure() {
         let contract = make_commit_contract(1);
         let inputs = vec![failure_input("s1", 2000)];
-        let report = execute_commit_phase(
-            &contract,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            5000,
-        )
-        .unwrap();
+        let report =
+            execute_commit_phase(&contract, &inputs, MissionKillSwitchLevel::Off, false, 5000)
+                .unwrap();
 
-        let is_immediate = matches!(
-            report.outcome,
-            TxCommitOutcome::ImmediateFailure
-        );
+        let is_immediate = matches!(report.outcome, TxCommitOutcome::ImmediateFailure);
         assert!(is_immediate);
         assert_eq!(report.failed_count, 1);
     }
 
     #[test]
     fn commit_outcome_tag_names() {
-        assert_eq!(TxCommitOutcome::FullyCommitted.tag_name(), "fully_committed");
-        assert_eq!(TxCommitOutcome::PartialFailure.tag_name(), "partial_failure");
-        assert_eq!(TxCommitOutcome::ImmediateFailure.tag_name(), "immediate_failure");
-        assert_eq!(TxCommitOutcome::KillSwitchBlocked.tag_name(), "kill_switch_blocked");
-        assert_eq!(TxCommitOutcome::PauseSuspended.tag_name(), "pause_suspended");
+        assert_eq!(
+            TxCommitOutcome::FullyCommitted.tag_name(),
+            "fully_committed"
+        );
+        assert_eq!(
+            TxCommitOutcome::PartialFailure.tag_name(),
+            "partial_failure"
+        );
+        assert_eq!(
+            TxCommitOutcome::ImmediateFailure.tag_name(),
+            "immediate_failure"
+        );
+        assert_eq!(
+            TxCommitOutcome::KillSwitchBlocked.tag_name(),
+            "kill_switch_blocked"
+        );
+        assert_eq!(
+            TxCommitOutcome::PauseSuspended.tag_name(),
+            "pause_suspended"
+        );
     }
 
     // ── H6: Compensation/rollback engine tests ──────────────────────────────
 
-    fn make_compensable_commit_report(
-        num_committed: usize,
-        failure_at: u32,
-    ) -> TxCommitReport {
+    fn make_compensable_commit_report(num_committed: usize, failure_at: u32) -> TxCommitReport {
         let mut step_results = Vec::new();
         for i in 1..=num_committed {
             step_results.push(TxCommitStepResult {
@@ -18957,22 +18833,14 @@ mod tests {
             comp_success_input("s1", 12_000),
         ];
 
-        let report = execute_compensation_phase(
-            &contract,
-            &commit_report,
-            &inputs,
-            15_000,
-        )
-        .unwrap();
+        let report =
+            execute_compensation_phase(&contract, &commit_report, &inputs, 15_000).unwrap();
 
         assert!(report.is_fully_rolled_back());
         assert!(!report.has_residual_risk());
         assert_eq!(report.compensated_count, 2);
         assert_eq!(report.failed_count, 0);
-        assert_eq!(
-            report.outcome.target_tx_state(),
-            MissionTxState::RolledBack,
-        );
+        assert_eq!(report.outcome.target_tx_state(), MissionTxState::RolledBack,);
     }
 
     #[test]
@@ -18998,21 +18866,13 @@ mod tests {
             comp_success_input("s1", 12_000), // s1 skipped due to barrier
         ];
 
-        let report = execute_compensation_phase(
-            &contract,
-            &commit_report,
-            &inputs,
-            15_000,
-        )
-        .unwrap();
+        let report =
+            execute_compensation_phase(&contract, &commit_report, &inputs, 15_000).unwrap();
 
         assert!(report.has_residual_risk());
         assert_eq!(report.failed_count, 1);
         assert_eq!(report.skipped_count, 1);
-        assert_eq!(
-            report.outcome.target_tx_state(),
-            MissionTxState::Failed,
-        );
+        assert_eq!(report.outcome.target_tx_state(), MissionTxState::Failed,);
     }
 
     #[test]
@@ -19020,13 +18880,7 @@ mod tests {
         let contract = make_compensable_contract(3, vec![]); // no compensations defined
         let commit_report = make_compensable_commit_report(2, 3);
 
-        let report = execute_compensation_phase(
-            &contract,
-            &commit_report,
-            &[],
-            15_000,
-        )
-        .unwrap();
+        let report = execute_compensation_phase(&contract, &commit_report, &[], 15_000).unwrap();
 
         // All committed steps have no compensation
         assert_eq!(report.no_compensation_count, 2);
@@ -19062,18 +18916,9 @@ mod tests {
             receipts: vec![],
         };
 
-        let report = execute_compensation_phase(
-            &contract,
-            &commit_report,
-            &[],
-            15_000,
-        )
-        .unwrap();
+        let report = execute_compensation_phase(&contract, &commit_report, &[], 15_000).unwrap();
 
-        let is_nothing = matches!(
-            report.outcome,
-            TxCompensationOutcome::NothingToCompensate
-        );
+        let is_nothing = matches!(report.outcome, TxCompensationOutcome::NothingToCompensate);
         assert!(is_nothing);
     }
 
@@ -19083,12 +18928,7 @@ mod tests {
         contract.lifecycle_state = MissionTxState::Committed;
         let commit_report = make_compensable_commit_report(0, 1);
 
-        let result = execute_compensation_phase(
-            &contract,
-            &commit_report,
-            &[],
-            15_000,
-        );
+        let result = execute_compensation_phase(&contract, &commit_report, &[], 15_000);
         assert!(result.is_err());
     }
 
@@ -19122,13 +18962,8 @@ mod tests {
             comp_success_input("s3", 13_000),
         ];
 
-        let report = execute_compensation_phase(
-            &contract,
-            &commit_report,
-            &inputs,
-            15_000,
-        )
-        .unwrap();
+        let report =
+            execute_compensation_phase(&contract, &commit_report, &inputs, 15_000).unwrap();
 
         // Results should be in reverse ordinal order (s3, s2, s1)
         assert_eq!(report.step_results[0].forward_ordinal, 3);
@@ -19148,13 +18983,7 @@ mod tests {
         let commit_report = make_compensable_commit_report(1, 2);
         // No inputs provided for s1
 
-        let report = execute_compensation_phase(
-            &contract,
-            &commit_report,
-            &[],
-            15_000,
-        )
-        .unwrap();
+        let report = execute_compensation_phase(&contract, &commit_report, &[], 15_000).unwrap();
 
         assert_eq!(report.failed_count, 1);
         assert!(report.has_residual_risk());
@@ -19214,13 +19043,8 @@ mod tests {
         let commit_report = make_compensable_commit_report(1, 2);
         let inputs = vec![comp_success_input("s1", 11_000)];
 
-        let report = execute_compensation_phase(
-            &contract,
-            &commit_report,
-            &inputs,
-            15_000,
-        )
-        .unwrap();
+        let report =
+            execute_compensation_phase(&contract, &commit_report, &inputs, 15_000).unwrap();
 
         let s1 = report.canonical_string();
         let s2 = report.canonical_string();
@@ -19239,17 +19063,11 @@ mod tests {
         let commit_report = make_compensable_commit_report(1, 2);
         let inputs = vec![comp_success_input("s1", 11_000)];
 
-        let report = execute_compensation_phase(
-            &contract,
-            &commit_report,
-            &inputs,
-            15_000,
-        )
-        .unwrap();
+        let report =
+            execute_compensation_phase(&contract, &commit_report, &inputs, 15_000).unwrap();
 
         let json = serde_json::to_string(&report).unwrap();
-        let restored: TxCompensationReport =
-            serde_json::from_str(&json).unwrap();
+        let restored: TxCompensationReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, restored);
     }
 
@@ -19263,8 +19081,7 @@ mod tests {
             completed_at_ms: 9000,
         };
         let json = serde_json::to_string(&input).unwrap();
-        let restored: TxCompensationStepInput =
-            serde_json::from_str(&json).unwrap();
+        let restored: TxCompensationStepInput = serde_json::from_str(&json).unwrap();
         assert_eq!(input, restored);
     }
 
@@ -19280,13 +19097,8 @@ mod tests {
         let commit_report = make_compensable_commit_report(1, 2);
         let inputs = vec![comp_success_input("s1", 11_000)];
 
-        let report = execute_compensation_phase(
-            &contract,
-            &commit_report,
-            &inputs,
-            15_000,
-        )
-        .unwrap();
+        let report =
+            execute_compensation_phase(&contract, &commit_report, &inputs, 15_000).unwrap();
 
         let mut prev = 0u64;
         for receipt in &report.receipts {
@@ -19390,12 +19202,8 @@ mod tests {
     #[test]
     fn idempotency_exact_duplicate_on_terminal_same_key() {
         let contract = make_h7_contract(3);
-        let record = make_h7_execution_record(
-            &contract,
-            MissionTxState::Committed,
-            Some("hash1"),
-            None,
-        );
+        let record =
+            make_h7_execution_record(&contract, MissionTxState::Committed, Some("hash1"), None);
         // Requesting prepare (not commit) to avoid double-execution guard
         let result = validate_tx_idempotency(&contract, TxPhase::Prepare, Some(&record));
         assert!(result.is_exact_duplicate());
@@ -19405,12 +19213,8 @@ mod tests {
     #[test]
     fn idempotency_double_commit_blocked() {
         let contract = make_h7_contract(3);
-        let record = make_h7_execution_record(
-            &contract,
-            MissionTxState::Committed,
-            Some("hash1"),
-            None,
-        );
+        let record =
+            make_h7_execution_record(&contract, MissionTxState::Committed, Some("hash1"), None);
         let result = validate_tx_idempotency(&contract, TxPhase::Commit, Some(&record));
         assert!(!result.should_proceed());
         let is_blocked = matches!(
@@ -19443,12 +19247,7 @@ mod tests {
     #[test]
     fn idempotency_conflicting_prior_different_key() {
         let contract = make_h7_contract(3);
-        let mut record = make_h7_execution_record(
-            &contract,
-            MissionTxState::Committed,
-            None,
-            None,
-        );
+        let mut record = make_h7_execution_record(&contract, MissionTxState::Committed, None, None);
         record.tx_idempotency_key = "txkey:different_key_here".into();
         let result = validate_tx_idempotency(&contract, TxPhase::Prepare, Some(&record));
         assert!(!result.should_proceed());
@@ -19463,12 +19262,8 @@ mod tests {
     #[test]
     fn idempotency_resumable_on_non_terminal() {
         let contract = make_h7_contract(3);
-        let mut record = make_h7_execution_record(
-            &contract,
-            MissionTxState::Committing,
-            None,
-            None,
-        );
+        let mut record =
+            make_h7_execution_record(&contract, MissionTxState::Committing, None, None);
         record.step_records.push(TxStepExecutionRecord {
             step_id: TxStepId("s1".into()),
             ordinal: 1,
@@ -19525,8 +19320,7 @@ mod tests {
     fn step_key_differs_by_phase() {
         let tx_id = TxId("tx:h7".into());
         let step_id = TxStepId("s1".into());
-        let k_commit =
-            TxStepExecutionRecord::compute_step_key(&tx_id, &step_id, &TxPhase::Commit);
+        let k_commit = TxStepExecutionRecord::compute_step_key(&tx_id, &step_id, &TxPhase::Commit);
         let k_comp =
             TxStepExecutionRecord::compute_step_key(&tx_id, &step_id, &TxPhase::Compensate);
         assert_ne!(k_commit, k_comp);
@@ -19542,18 +19336,9 @@ mod tests {
     #[test]
     fn execution_record_is_terminal() {
         let contract = make_h7_contract(3);
-        let committed = make_h7_execution_record(
-            &contract,
-            MissionTxState::Committed,
-            None,
-            None,
-        );
-        let committing = make_h7_execution_record(
-            &contract,
-            MissionTxState::Committing,
-            None,
-            None,
-        );
+        let committed = make_h7_execution_record(&contract, MissionTxState::Committed, None, None);
+        let committing =
+            make_h7_execution_record(&contract, MissionTxState::Committing, None, None);
         assert!(committed.is_terminal());
         assert!(!committing.is_terminal());
     }
@@ -19561,12 +19346,8 @@ mod tests {
     #[test]
     fn execution_record_serde_roundtrip() {
         let contract = make_h7_contract(3);
-        let record = make_h7_execution_record(
-            &contract,
-            MissionTxState::Committed,
-            Some("hash1"),
-            None,
-        );
+        let record =
+            make_h7_execution_record(&contract, MissionTxState::Committed, Some("hash1"), None);
         let json = serde_json::to_string(&record).unwrap();
         let restored: TxExecutionRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(record, restored);
@@ -19600,7 +19381,10 @@ mod tests {
     #[test]
     fn idempotency_verdict_tag_names() {
         assert_eq!(TxIdempotencyVerdict::Fresh.tag_name(), "fresh");
-        assert_eq!(TxIdempotencyVerdict::ExactDuplicate.tag_name(), "exact_duplicate");
+        assert_eq!(
+            TxIdempotencyVerdict::ExactDuplicate.tag_name(),
+            "exact_duplicate"
+        );
         assert_eq!(
             TxIdempotencyVerdict::Resumable {
                 resume_from_state: MissionTxState::Committing,
@@ -19662,13 +19446,14 @@ mod tests {
         )
         .unwrap();
 
-        let resume =
-            reconstruct_tx_resume_state(&contract, Some(&commit_report), None, 15_000);
+        let resume = reconstruct_tx_resume_state(&contract, Some(&commit_report), None, 15_000);
         assert_eq!(resume.committed_step_ids.len(), 3);
         assert!(resume.commit_phase_completed);
         assert!(!resume.compensation_phase_completed);
         // Derived state from contract receipts (empty) → Prepared
-        assert!(resume.pending_step_ids.is_empty() || resume.derived_state == MissionTxState::Prepared);
+        assert!(
+            resume.pending_step_ids.is_empty() || resume.derived_state == MissionTxState::Prepared
+        );
     }
 
     #[test]
@@ -19693,8 +19478,7 @@ mod tests {
         )
         .unwrap();
 
-        let resume =
-            reconstruct_tx_resume_state(&contract, Some(&commit_report), None, 15_000);
+        let resume = reconstruct_tx_resume_state(&contract, Some(&commit_report), None, 15_000);
         // Step 1 committed, step 2 failed, step 3 skipped
         assert_eq!(resume.committed_step_ids.len(), 1);
         assert_eq!(resume.committed_step_ids[0].0, "s1");
@@ -19729,12 +19513,8 @@ mod tests {
     #[test]
     fn execution_record_canonical_string_deterministic() {
         let contract = make_h7_contract(3);
-        let record = make_h7_execution_record(
-            &contract,
-            MissionTxState::Committed,
-            Some("hash1"),
-            None,
-        );
+        let record =
+            make_h7_execution_record(&contract, MissionTxState::Committed, Some("hash1"), None);
         let s1 = record.canonical_string();
         let s2 = record.canonical_string();
         assert_eq!(s1, s2);
@@ -19836,8 +19616,7 @@ mod tests {
             reason_code: None,
             error_code: None,
         });
-        let resume2 =
-            reconstruct_tx_resume_state(&terminal_contract, None, None, 10_000);
+        let resume2 = reconstruct_tx_resume_state(&terminal_contract, None, None, 10_000);
         assert!(!resume2.has_pending_work());
     }
 }

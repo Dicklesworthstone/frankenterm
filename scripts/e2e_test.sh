@@ -499,7 +499,15 @@ SCENARIO_REGISTRY=(
     "ft_1i2ge_3_2|Validate mission dispatch adapter target resolution and outcome normalization|false|cargo,jq,rch|Protects mission dispatch adapter dry-run/live contract"
     "ft_1i2ge_3_3|Validate mission outcome ingestion and assignment state reconciliation|false|cargo,jq,rch|Protects assignment signal reconciliation and drift detection"
     "ft_1i2ge_3_4|Validate adaptive mission replanning triggers and backoff policy|false|cargo,jq,rch|Protects deterministic replan trigger + backoff loop-guard behavior"
+    "ft_1i2ge_3_5|Validate pause/resume/abort semantics and checkpoint recovery|false|cargo,jq,rch|Protects operator control transitions, checkpoint durability, and cumulative duration tracking"
+    "ft_1i2ge_3_8|Validate crash-consistent mission journal and deterministic restart recovery|false|cargo,jq,rch|Protects journal append monotonicity, checkpoint/recovery markers, compaction, and serde contracts"
+    "ft_1i2ge_3_7|Validate orchestration integration and e2e scenario harness with rich logs|false|cargo,jq,rch|Protects mission lifecycle journal dedup dispatch idempotency and kill-switch integration"
+    "ft_1i2ge_8_5|Validate commit-phase executor with deterministic ordering and barrier semantics|false|cargo,jq,rch|Protects barrier semantics kill-switch pause and deterministic commit ordering"
+    "ft_1i2ge_8_6|Validate compensation planner and automatic rollback engine|false|cargo,jq,rch|Protects compensation barrier semantics reverse ordering and rollback state contracts"
     "ft_e34d9_10_1_2_doctrine_pack|Validate asupersync runtime doctrine contract/invariants + failure injection|false|jq,python3|Protects doctrine semantics, anti-pattern gates, and user-facing guarantees"
+    "ft_e34d9_10_2_1_runtime_bootstrap|Validate unified runtime bootstrap contract for CLI/watch/web/robot + failure injection|false|jq,python3|Protects runtime bootstrap lifecycle parity and configuration parsing contract"
+    "ft_e34d9_10_2_2_cx_outcome_contract|Validate Cx/Outcome wait-boundary adapter propagation + failure/recovery contract|false|jq,python3|Protects explicit Cx propagation and reason-coded Outcome boundary mapping"
+    "ft_124z4|Validate tailer LabRuntime coverage and bench feature-gate failure/recovery contract|false|cargo,jq,rch|Protects tailer asupersync capture semantics and bench gating invariants"
     "ft_1i2ge_4_2|Validate mission reservation and ownership enforcement contract|false|cargo,jq,rch|Protects assignment reservation/ownership enforcement surface"
     "ft_1i2ge_4_3|Validate mission approval-path integration (durability, idempotency, fallback)|false|cargo,jq,rch|Protects approval-required routing and post-approval continuation invariants"
     "ft_1i2ge_4_1|Validate mission policy preflight contract and denial feedback reason codes|false|cargo,jq,rch|Protects mission policy preflight plan/dispatch pipeline"
@@ -10990,6 +10998,211 @@ run_scenario_ft_1i2ge_3_4() {
     return 0
 }
 
+run_scenario_ft_1i2ge_3_5() {
+    local scenario_dir="$1"
+    local case_name="ft_1i2ge_3_5"
+    local script_path="$PROJECT_ROOT/tests/e2e/test_ft_1i2ge_3_5.sh"
+    local scenario_stdout="$scenario_dir/${case_name}.stdout.log"
+    local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
+    local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_5_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+
+    log_info "[$case_name] Step 1: running pause/resume/abort semantics e2e harness"
+    set +e
+    timeout "$TIMEOUT" bash "$script_path" >"$scenario_stdout" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ "$rc" -eq 124 ]]; then
+        log_fail "[$case_name] harness timed out after ${TIMEOUT}s"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log_fail "[$case_name] harness failed (exit=$rc)"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return "$rc"
+    fi
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_5_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    while IFS= read -r log_path; do
+        if [[ -z "$log_path" ]]; then
+            continue
+        fi
+        if [[ ! -f "$before_snapshot" ]] || ! grep -Fxq "$log_path" "$before_snapshot"; then
+            cp -f "$log_path" "$scenario_dir/" || true
+        fi
+    done < "$after_snapshot"
+
+    log_pass "[$case_name] pause/resume/abort semantics e2e completed"
+    return 0
+}
+
+run_scenario_ft_1i2ge_3_8() {
+    local scenario_dir="$1"
+    local case_name="ft_1i2ge_3_8"
+    local script_path="$PROJECT_ROOT/tests/e2e/test_ft_1i2ge_3_8.sh"
+    local scenario_stdout="$scenario_dir/${case_name}.stdout.log"
+    local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
+    local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_8_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+
+    log_info "[$case_name] Step 1: running crash-consistent mission journal e2e harness"
+    set +e
+    timeout "$TIMEOUT" bash "$script_path" >"$scenario_stdout" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ "$rc" -eq 124 ]]; then
+        log_fail "[$case_name] harness timed out after ${TIMEOUT}s"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log_fail "[$case_name] harness failed (exit=$rc)"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return "$rc"
+    fi
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_8_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    while IFS= read -r log_path; do
+        if [[ -z "$log_path" ]]; then
+            continue
+        fi
+        if [[ ! -f "$before_snapshot" ]] || ! grep -Fxq "$log_path" "$before_snapshot"; then
+            cp -f "$log_path" "$scenario_dir/" || true
+        fi
+    done < "$after_snapshot"
+
+    log_pass "[$case_name] crash-consistent mission journal e2e completed"
+    return 0
+}
+
+run_scenario_ft_1i2ge_3_7() {
+    local scenario_dir="$1"
+    local case_name="ft_1i2ge_3_7"
+    local script_path="$PROJECT_ROOT/tests/e2e/test_ft_1i2ge_3_7.sh"
+    local scenario_stdout="$scenario_dir/${case_name}.stdout.log"
+    local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
+    local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_7_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+
+    log_info "[$case_name] Step 1: running orchestration integration e2e harness"
+    set +e
+    timeout "$TIMEOUT" bash "$script_path" >"$scenario_stdout" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ "$rc" -eq 124 ]]; then
+        log_fail "[$case_name] harness timed out after ${TIMEOUT}s"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log_fail "[$case_name] harness failed (exit=$rc)"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return "$rc"
+    fi
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_3_7_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    while IFS= read -r log_path; do
+        if [[ -z "$log_path" ]]; then
+            continue
+        fi
+        if [[ ! -f "$before_snapshot" ]] || ! grep -Fxq "$log_path" "$before_snapshot"; then
+            cp -f "$log_path" "$scenario_dir/" || true
+        fi
+    done < "$after_snapshot"
+
+    log_pass "[$case_name] orchestration integration e2e completed"
+    return 0
+}
+
+run_scenario_ft_1i2ge_8_5() {
+    local scenario_dir="$1"
+    local case_name="ft_1i2ge_8_5"
+    local script_path="$PROJECT_ROOT/tests/e2e/test_ft_1i2ge_8_5.sh"
+    local scenario_stdout="$scenario_dir/${case_name}.stdout.log"
+    local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
+    local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_5_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+
+    log_info "[$case_name] Step 1: running commit-phase executor e2e harness"
+    set +e
+    timeout "$TIMEOUT" bash "$script_path" >"$scenario_stdout" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ "$rc" -eq 124 ]]; then
+        log_fail "[$case_name] harness timed out after ${TIMEOUT}s"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log_fail "[$case_name] harness failed (exit=$rc)"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return "$rc"
+    fi
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_5_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    while IFS= read -r log_path; do
+        if [[ -z "$log_path" ]]; then
+            continue
+        fi
+        if [[ ! -f "$before_snapshot" ]] || ! grep -Fxq "$log_path" "$before_snapshot"; then
+            cp -f "$log_path" "$scenario_dir/" || true
+        fi
+    done < "$after_snapshot"
+
+    log_pass "[$case_name] commit-phase executor e2e completed"
+    return 0
+}
+
+run_scenario_ft_1i2ge_8_6() {
+    local scenario_dir="$1"
+    local case_name="ft_1i2ge_8_6"
+    local script_path="$PROJECT_ROOT/tests/e2e/test_ft_1i2ge_8_6.sh"
+    local scenario_stdout="$scenario_dir/${case_name}.stdout.log"
+    local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
+    local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_6_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+
+    log_info "[$case_name] Step 1: running compensation planner and rollback engine e2e harness"
+    set +e
+    timeout "$TIMEOUT" bash "$script_path" >"$scenario_stdout" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ "$rc" -eq 124 ]]; then
+        log_fail "[$case_name] harness timed out after ${TIMEOUT}s"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log_fail "[$case_name] harness failed (exit=$rc)"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return "$rc"
+    fi
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_1i2ge_8_6_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    while IFS= read -r log_path; do
+        if [[ -z "$log_path" ]]; then
+            continue
+        fi
+        if [[ ! -f "$before_snapshot" ]] || ! grep -Fxq "$log_path" "$before_snapshot"; then
+            cp -f "$log_path" "$scenario_dir/" || true
+        fi
+    done < "$after_snapshot"
+
+    log_pass "[$case_name] compensation planner and rollback engine e2e completed"
+    return 0
+}
+
 run_scenario_ft_e34d9_10_1_2_doctrine_pack() {
     local scenario_dir="$1"
     local case_name="ft_e34d9_10_1_2_doctrine_pack"
@@ -11028,6 +11241,88 @@ run_scenario_ft_e34d9_10_1_2_doctrine_pack() {
     done < "$after_snapshot"
 
     log_pass "[$case_name] asupersync runtime doctrine pack e2e completed"
+    return 0
+}
+
+run_scenario_ft_e34d9_10_2_1_runtime_bootstrap() {
+    local scenario_dir="$1"
+    local case_name="ft_e34d9_10_2_1_runtime_bootstrap"
+    local script_path="$PROJECT_ROOT/tests/e2e/test_ft_e34d9_10_2_1_runtime_bootstrap.sh"
+    local scenario_stdout="$scenario_dir/${case_name}.stdout.log"
+    local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
+    local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/asupersync_runtime_bootstrap_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+
+    log_info "[$case_name] Step 1: running asupersync runtime bootstrap contract e2e harness"
+    set +e
+    timeout "$TIMEOUT" bash "$script_path" >"$scenario_stdout" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ "$rc" -eq 124 ]]; then
+        log_fail "[$case_name] harness timed out after ${TIMEOUT}s"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log_fail "[$case_name] harness failed (exit=$rc)"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return "$rc"
+    fi
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/asupersync_runtime_bootstrap_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    while IFS= read -r log_path; do
+        if [[ -z "$log_path" ]]; then
+            continue
+        fi
+        if [[ ! -f "$before_snapshot" ]] || ! grep -Fxq "$log_path" "$before_snapshot"; then
+            cp -f "$log_path" "$scenario_dir/" || true
+        fi
+    done < "$after_snapshot"
+
+    log_pass "[$case_name] asupersync runtime bootstrap contract e2e completed"
+    return 0
+}
+
+run_scenario_ft_e34d9_10_2_2_cx_outcome_contract() {
+    local scenario_dir="$1"
+    local case_name="ft_e34d9_10_2_2_cx_outcome_contract"
+    local script_path="$PROJECT_ROOT/tests/e2e/test_ft_e34d9_10_2_2_cx_outcome_contract.sh"
+    local scenario_stdout="$scenario_dir/${case_name}.stdout.log"
+    local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
+    local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/asupersync_cx_outcome_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+
+    log_info "[$case_name] Step 1: running asupersync Cx/Outcome contract e2e harness"
+    set +e
+    timeout "$TIMEOUT" bash "$script_path" >"$scenario_stdout" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ "$rc" -eq 124 ]]; then
+        log_fail "[$case_name] harness timed out after ${TIMEOUT}s"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log_fail "[$case_name] harness failed (exit=$rc)"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return "$rc"
+    fi
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/asupersync_cx_outcome_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    while IFS= read -r log_path; do
+        if [[ -z "$log_path" ]]; then
+            continue
+        fi
+        if [[ ! -f "$before_snapshot" ]] || ! grep -Fxq "$log_path" "$before_snapshot"; then
+            cp -f "$log_path" "$scenario_dir/" || true
+        fi
+    done < "$after_snapshot"
+
+    log_pass "[$case_name] asupersync Cx/Outcome contract e2e completed"
     return 0
 }
 
@@ -11236,6 +11531,47 @@ run_scenario_ft_l5em3_2() {
     return 0
 }
 
+run_scenario_ft_124z4() {
+    local scenario_dir="$1"
+    local case_name="ft_124z4"
+    local script_path="$PROJECT_ROOT/tests/e2e/test_ft_124z4.sh"
+    local scenario_stdout="$scenario_dir/${case_name}.stdout.log"
+    local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
+    local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_124z4_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+
+    log_info "[$case_name] Step 1: running tailer asupersync e2e harness"
+    set +e
+    timeout "$TIMEOUT" bash "$script_path" >"$scenario_stdout" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ "$rc" -eq 124 ]]; then
+        log_fail "[$case_name] harness timed out after ${TIMEOUT}s"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log_fail "[$case_name] harness failed (exit=$rc)"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return "$rc"
+    fi
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_124z4_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    while IFS= read -r log_path; do
+        if [[ -z "$log_path" ]]; then
+            continue
+        fi
+        if [[ ! -f "$before_snapshot" ]] || ! grep -Fxq "$log_path" "$before_snapshot"; then
+            cp -f "$log_path" "$scenario_dir/" || true
+        fi
+    done < "$after_snapshot"
+
+    log_pass "[$case_name] tailer asupersync e2e completed"
+    return 0
+}
+
 dispatch_scenario() {
     local name="$1"
     local scenario_dir="$2"
@@ -11367,8 +11703,29 @@ dispatch_scenario() {
         ft_1i2ge_3_4)
             run_scenario_ft_1i2ge_3_4 "$scenario_dir" || result=$?
             ;;
+        ft_1i2ge_3_5)
+            run_scenario_ft_1i2ge_3_5 "$scenario_dir" || result=$?
+            ;;
+        ft_1i2ge_3_8)
+            run_scenario_ft_1i2ge_3_8 "$scenario_dir" || result=$?
+            ;;
+        ft_1i2ge_3_7)
+            run_scenario_ft_1i2ge_3_7 "$scenario_dir" || result=$?
+            ;;
+        ft_1i2ge_8_5)
+            run_scenario_ft_1i2ge_8_5 "$scenario_dir" || result=$?
+            ;;
+        ft_1i2ge_8_6)
+            run_scenario_ft_1i2ge_8_6 "$scenario_dir" || result=$?
+            ;;
         ft_e34d9_10_1_2_doctrine_pack)
             run_scenario_ft_e34d9_10_1_2_doctrine_pack "$scenario_dir" || result=$?
+            ;;
+        ft_e34d9_10_2_1_runtime_bootstrap)
+            run_scenario_ft_e34d9_10_2_1_runtime_bootstrap "$scenario_dir" || result=$?
+            ;;
+        ft_e34d9_10_2_2_cx_outcome_contract)
+            run_scenario_ft_e34d9_10_2_2_cx_outcome_contract "$scenario_dir" || result=$?
             ;;
         ft_1i2ge_4_2)
             run_scenario_ft_1i2ge_4_2 "$scenario_dir" || result=$?
@@ -11384,6 +11741,9 @@ dispatch_scenario() {
             ;;
         ft_l5em3_2)
             run_scenario_ft_l5em3_2 "$scenario_dir" || result=$?
+            ;;
+        ft_124z4)
+            run_scenario_ft_124z4 "$scenario_dir" || result=$?
             ;;
         replay_capture_pipeline)
             run_scenario_replay_capture_pipeline "$scenario_dir" || result=$?

@@ -117,6 +117,43 @@ pub mod cross_pane_correlation;
 pub mod cuckoo_filter;
 #[cfg(feature = "asupersync-runtime")]
 pub mod cx;
+
+/// Stub `cx` module providing no-op types when `asupersync-runtime` is disabled.
+/// Keeps downstream code (workflows.rs, etc.) compilable without feature gates on
+/// every call-site.
+#[cfg(not(feature = "asupersync-runtime"))]
+pub mod cx {
+    /// No-op capability context stub.
+    #[derive(Debug, Clone)]
+    pub struct Cx;
+
+    impl Cx {
+        /// Stub checkpoint — always succeeds.
+        pub fn checkpoint(&self) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    /// Construct a test-only stub context.
+    #[must_use]
+    pub fn for_testing() -> Cx {
+        Cx
+    }
+
+    /// Execute a closure with the same stub Cx.
+    #[inline]
+    pub fn with_cx<T>(_cx: &Cx, f: impl FnOnce(&Cx) -> T) -> T {
+        f(&Cx)
+    }
+
+    /// Async version of [`with_cx`].
+    pub async fn with_cx_async<T, Fut>(_cx: &Cx, f: impl FnOnce(&Cx) -> Fut) -> T
+    where
+        Fut: std::future::Future<Output = T>,
+    {
+        f(&Cx).await
+    }
+}
 pub mod dancing_links;
 pub mod dataflow;
 pub mod degradation;
@@ -178,6 +215,8 @@ pub mod mcp;
 pub mod mcp_client;
 #[cfg(feature = "mcp")]
 pub mod mcp_error;
+#[cfg(any(feature = "mcp", feature = "mcp-client"))]
+mod mcp_framework;
 pub mod mdl_extraction;
 pub mod memory_budget;
 pub mod memory_pressure;
@@ -193,6 +232,90 @@ pub mod notifications;
 pub mod orphan_reaper;
 #[cfg(any(feature = "web", feature = "sync", feature = "asupersync-runtime"))]
 pub mod outcome;
+
+/// Stub `outcome` module providing minimal Outcome types when web/sync/asupersync
+/// features are disabled. Keeps workflows.rs and other downstream code compilable.
+#[cfg(not(any(feature = "web", feature = "sync", feature = "asupersync-runtime")))]
+pub mod outcome {
+    use crate::Error;
+
+    /// Four-variant outcome: Ok, Err, Cancelled, Panicked.
+    #[derive(Debug, Clone)]
+    pub enum Outcome<T, E> {
+        Ok(T),
+        Err(E),
+        Cancelled(CancelReason),
+        Panicked(PanicPayload),
+    }
+
+    impl<T, E> From<Result<T, E>> for Outcome<T, E> {
+        fn from(r: Result<T, E>) -> Self {
+            match r {
+                Ok(v) => Outcome::Ok(v),
+                Err(e) => Outcome::Err(e),
+            }
+        }
+    }
+
+    /// Reason for cancellation.
+    #[derive(Debug, Clone)]
+    pub struct CancelReason {
+        pub message: String,
+        pub kind: CancelKind,
+    }
+
+    /// Kind of cancellation.
+    #[derive(Debug, Clone)]
+    pub enum CancelKind {
+        Explicit,
+        Timeout,
+        Budget,
+    }
+
+    impl std::fmt::Display for CancelKind {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                CancelKind::Explicit => write!(f, "explicit"),
+                CancelKind::Timeout => write!(f, "timeout"),
+                CancelKind::Budget => write!(f, "budget"),
+            }
+        }
+    }
+
+    /// Payload from a caught panic.
+    #[derive(Debug, Clone)]
+    pub struct PanicPayload {
+        msg: String,
+    }
+
+    impl PanicPayload {
+        #[must_use]
+        pub fn new(msg: impl Into<String>) -> Self {
+            Self {
+                msg: msg.into(),
+            }
+        }
+
+        #[must_use]
+        pub fn message(&self) -> &str {
+            &self.msg
+        }
+    }
+
+    impl std::fmt::Display for PanicPayload {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "panic: {}", self.msg)
+        }
+    }
+
+    /// Convenience alias.
+    pub type FtOutcome<T> = Outcome<T, Error>;
+
+    /// Convert a `Result<T, E>` into an `Outcome<T, E>`.
+    pub fn result_to_outcome<T, E>(result: Result<T, E>) -> Outcome<T, E> {
+        Outcome::from(result)
+    }
+}
 pub mod output;
 pub mod output_compression;
 pub mod pairing_heap;
@@ -204,10 +327,6 @@ pub mod persistent_ds;
 pub mod plan;
 #[cfg(feature = "subprocess-bridge")]
 pub mod planner_features;
-#[cfg(feature = "subprocess-bridge")]
-pub mod tx_idempotency;
-#[cfg(feature = "subprocess-bridge")]
-pub mod tx_plan_compiler;
 pub mod policy;
 pub mod pool;
 pub mod priority;
@@ -231,6 +350,7 @@ pub mod replay;
 pub mod replay_artifact_registry;
 pub mod replay_capture;
 pub mod replay_checkpoint;
+pub mod replay_ci_gate;
 pub mod replay_cli;
 pub mod replay_counterfactual;
 pub mod replay_decision_diff;
@@ -239,22 +359,21 @@ pub mod replay_fault_injection;
 pub mod replay_fixture_harvest;
 pub mod replay_guardrails;
 pub mod replay_guardrails_gate;
-pub mod replay_ci_gate;
 pub mod replay_guide;
 pub mod replay_mcp;
+pub mod replay_merge;
 pub mod replay_performance;
+pub mod replay_post_incident;
+pub mod replay_provenance;
 pub mod replay_remediation;
 pub mod replay_report;
-pub mod replay_robot;
 pub mod replay_risk_scoring;
+pub mod replay_robot;
 pub mod replay_scenario_matrix;
 pub mod replay_shadow_rollout;
-pub mod replay_test_orchestrator;
-pub mod replay_post_incident;
-pub mod replay_usability_pilot;
-pub mod replay_merge;
-pub mod replay_provenance;
 pub mod replay_side_effect_barrier;
+pub mod replay_test_orchestrator;
+pub mod replay_usability_pilot;
 pub mod reports;
 pub mod reservoir_sampler;
 pub mod resize_crash_forensics;
@@ -273,6 +392,7 @@ pub mod rope;
 pub mod rulesets;
 pub mod runtime;
 pub mod runtime_compat;
+pub mod scope_tree;
 pub mod screen_state;
 pub mod scrollback_eviction;
 pub mod search;
@@ -284,8 +404,8 @@ pub mod segment_tree;
 pub mod self_stabilize;
 pub mod semantic_anomaly;
 pub mod semantic_anomaly_watchdog;
-pub mod semantic_shock_response;
 pub mod semantic_quality;
+pub mod semantic_shock_response;
 pub mod sequence_model;
 pub mod session_correlation;
 pub mod session_dna;
@@ -339,6 +459,10 @@ pub mod topological_sort;
 pub mod trauma_guard;
 pub mod treap;
 pub mod trie;
+#[cfg(feature = "subprocess-bridge")]
+pub mod tx_idempotency;
+#[cfg(feature = "subprocess-bridge")]
+pub mod tx_plan_compiler;
 pub mod undo;
 pub mod union_find;
 pub mod user_preferences;
@@ -394,6 +518,8 @@ pub mod tui;
 
 #[cfg(feature = "web")]
 pub mod web;
+#[cfg(feature = "web")]
+mod web_framework;
 
 pub mod ui_query;
 
