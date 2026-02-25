@@ -49,6 +49,7 @@ fn djb2(data: &[u8]) -> u64 {
 
 /// Generate `k` hash indices using double hashing: h(i) = (h1 + i*h2) mod m.
 fn hash_indices(data: &[u8], k: u32, m: usize) -> Vec<usize> {
+    debug_assert!(m > 0, "bit array size m must be > 0");
     let h1 = fnv1a(data);
     let h2 = djb2(data);
     (0..k)

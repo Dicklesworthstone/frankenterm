@@ -126,6 +126,7 @@ struct BandIndex {
 
 impl BandIndex {
     fn new(num_hashes: usize, num_bands: usize) -> Self {
+        assert!(num_bands > 0, "num_bands must be > 0");
         assert!(
             num_hashes % num_bands == 0,
             "num_hashes must be divisible by num_bands"

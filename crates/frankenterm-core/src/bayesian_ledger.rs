@@ -413,8 +413,10 @@ impl BayesianClassifier {
 
         // Recompute log-prior from Dirichlet counts
         let total: f64 = self.dirichlet_counts.iter().sum();
-        for (i, &count) in self.dirichlet_counts.iter().enumerate() {
-            self.log_prior[i] = (count / total).ln();
+        if total > 0.0 {
+            for (i, &count) in self.dirichlet_counts.iter().enumerate() {
+                self.log_prior[i] = (count / total).ln();
+            }
         }
     }
 

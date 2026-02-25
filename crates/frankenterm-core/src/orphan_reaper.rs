@@ -275,7 +275,11 @@ fn parse_etime(etime: &str) -> Result<u64, String> {
         _ => return Err(format!("unexpected etime format: {etime}")),
     };
 
-    Ok(days * 86400 + hours * 3600 + minutes * 60 + seconds)
+    days.checked_mul(86400)
+        .and_then(|d| hours.checked_mul(3600).and_then(|h| d.checked_add(h)))
+        .and_then(|d| minutes.checked_mul(60).and_then(|m| d.checked_add(m)))
+        .and_then(|d| d.checked_add(seconds))
+        .ok_or_else(|| format!("etime overflow: {etime}"))
 }
 
 /// Send SIGKILL to a process.
