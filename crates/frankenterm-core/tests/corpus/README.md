@@ -26,6 +26,22 @@ Dogfood metadata
   - `complete`: both `macos` and `linux` fixtures exist for that scenario.
 - `sanitized` must be `true` before committing.
 
+Live capture workflow (`ft-nu4.3.9.5`)
+1) Run the bead E2E gate:
+   - `tests/e2e/test_ft_nu4_3_9_5.sh`
+2) The gate enforces:
+   - `rch` worker availability before any cargo invocation.
+   - `rch`-only execution for `cargo test -p frankenterm-core --test pattern_corpus`.
+   - live capture prerequisites (`ft`, `wezterm`, reachable mux, and an active pane).
+3) If prerequisites are missing, the script fails fast and writes a structured JSONL reason code in `tests/e2e/logs/`.
+4) If capture succeeds, promote the captured text into a sanitized dogfood fixture and add/update:
+   - `<name>.txt`
+   - `<name>.expect.json`
+   - `<name>.meta.json`
+5) Update `cross_platform` state:
+   - keep `pending` until both `macos` and `linux` captures exist for the same `scenario`.
+   - switch to `complete` only after both platform fixtures are present and validated by `pattern_corpus`.
+
 Example metadata:
 ```json
 {
