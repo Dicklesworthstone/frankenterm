@@ -206,21 +206,54 @@ pub fn explain_search(ctx: &SearchExplainContext) -> SearchExplainResult {
 }
 
 fn check_no_indexed_data(ctx: &SearchExplainContext, reasons: &mut Vec<SearchExplainReason>) {
-    let total_segments: u64 = ctx.indexing_stats.iter().map(|s| s.segment_count).sum();
+    let (total_segments, pane_scope) = if let Some(pane_id) = ctx.pane_filter {
+        if !ctx.panes.iter().any(|p| p.pane_id == pane_id) {
+            // Let PANE_NOT_FOUND own this case.
+            return;
+        }
+        (
+            ctx.indexing_stats
+                .iter()
+                .filter(|s| s.pane_id == pane_id)
+                .map(|s| s.segment_count)
+                .sum::<u64>(),
+            Some(pane_id),
+        )
+    } else {
+        (
+            ctx.indexing_stats
+                .iter()
+                .map(|s| s.segment_count)
+                .sum::<u64>(),
+            None,
+        )
+    };
 
     if total_segments == 0 {
+        let summary = if let Some(pane_id) = pane_scope {
+            format!("Pane {pane_id} has no indexed terminal output yet.")
+        } else {
+            "No terminal output has been captured yet.".to_string()
+        };
+        let mut evidence = vec![SearchExplainEvidence {
+            key: "total_segments".to_string(),
+            value: "0".to_string(),
+        }];
+        if let Some(pane_id) = pane_scope {
+            evidence.push(SearchExplainEvidence {
+                key: "pane_id".to_string(),
+                value: pane_id.to_string(),
+            });
+        }
         reasons.push(SearchExplainReason {
             code: "NO_INDEXED_DATA",
-            summary: "No terminal output has been captured yet.".to_string(),
-            evidence: vec![SearchExplainEvidence {
-                key: "total_segments".to_string(),
-                value: "0".to_string(),
-            }],
+            summary,
+            evidence,
             suggestions: vec![
                 "Start the watcher: ft watch".to_string(),
                 "Check that panes are active and not excluded.".to_string(),
             ],
-            confidence: 1.0,
+            confidence: if pane_scope.is_some() { 0.8 } else { 1.0 },
         });
     }
 }
@@ -302,7 +335,13 @@ fn check_fts_inconsistency(ctx: &SearchExplainContext, reasons: &mut Vec<SearchE
     let inconsistent: Vec<_> = ctx
         .indexing_stats
         .iter()
-        .filter(|s| !s.fts_consistent && s.segment_count > 0)
+        .filter(|s| {
+            if let Some(pane_id) = ctx.pane_filter {
+                s.pane_id == pane_id && !s.fts_consistent && s.segment_count > 0
+            } else {
+                !s.fts_consistent && s.segment_count > 0
+            }
+        })
         .collect();
 
     if !inconsistent.is_empty() {
@@ -335,19 +374,30 @@ fn check_fts_inconsistency(ctx: &SearchExplainContext, reasons: &mut Vec<SearchE
 }
 
 fn check_gaps(ctx: &SearchExplainContext, reasons: &mut Vec<SearchExplainReason>) {
-    if ctx.gaps.is_empty() {
+    let relevant_gaps: Vec<_> = ctx
+        .gaps
+        .iter()
+        .filter(|gap| {
+            if let Some(pane_id) = ctx.pane_filter {
+                gap.pane_id == pane_id
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    if relevant_gaps.is_empty() {
         return;
     }
 
     // Group gaps by pane
     let mut pane_gaps: std::collections::HashMap<u64, Vec<&GapInfo>> =
         std::collections::HashMap::new();
-    for gap in &ctx.gaps {
+    for gap in &relevant_gaps {
         pane_gaps.entry(gap.pane_id).or_default().push(gap);
     }
 
-    let total_gap_segments: u64 = ctx
-        .gaps
+    let total_gap_segments: u64 = relevant_gaps
         .iter()
         .map(|g| g.seq_after.saturating_sub(g.seq_before))
         .sum();
@@ -355,7 +405,7 @@ fn check_gaps(ctx: &SearchExplainContext, reasons: &mut Vec<SearchExplainReason>
     let mut evidence = vec![
         SearchExplainEvidence {
             key: "total_gaps".to_string(),
-            value: ctx.gaps.len().to_string(),
+            value: relevant_gaps.len().to_string(),
         },
         SearchExplainEvidence {
             key: "affected_panes".to_string(),
@@ -368,7 +418,7 @@ fn check_gaps(ctx: &SearchExplainContext, reasons: &mut Vec<SearchExplainReason>
     ];
 
     // Add gap reasons
-    let mut gap_reasons: Vec<String> = ctx.gaps.iter().map(|g| g.reason.clone()).collect();
+    let mut gap_reasons: Vec<String> = relevant_gaps.iter().map(|g| g.reason.clone()).collect();
     gap_reasons.sort();
     gap_reasons.dedup();
     evidence.push(SearchExplainEvidence {
@@ -380,7 +430,7 @@ fn check_gaps(ctx: &SearchExplainContext, reasons: &mut Vec<SearchExplainReason>
         code: "CAPTURE_GAPS",
         summary: format!(
             "{} capture gap(s) detected across {} pane(s). ~{} segments may be missing.",
-            ctx.gaps.len(),
+            relevant_gaps.len(),
             pane_gaps.len(),
             total_gap_segments,
         ),
@@ -432,7 +482,14 @@ fn check_stale_panes(ctx: &SearchExplainContext, reasons: &mut Vec<SearchExplain
     let stale: Vec<_> = ctx
         .panes
         .iter()
-        .filter(|p| p.observed && (ctx.now_ms - p.last_seen_at) > stale_threshold_ms)
+        .filter(|p| {
+            let in_scope = if let Some(pane_id) = ctx.pane_filter {
+                p.pane_id == pane_id
+            } else {
+                true
+            };
+            p.observed && in_scope && ctx.now_ms.saturating_sub(p.last_seen_at) > stale_threshold_ms
+        })
         .collect();
 
     if stale.is_empty() {
@@ -1217,6 +1274,82 @@ mod tests {
     }
 
     #[test]
+    fn pane_filter_reports_no_indexed_data_when_selected_pane_empty() {
+        let now = now_ms();
+        let ctx = SearchExplainContext {
+            pane_filter: Some(1),
+            panes: vec![
+                PaneExplainInfo {
+                    pane_id: 1,
+                    observed: true,
+                    ignore_reason: None,
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+                PaneExplainInfo {
+                    pane_id: 2,
+                    observed: true,
+                    ignore_reason: None,
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+            ],
+            indexing_stats: vec![PaneIndexingInfo {
+                pane_id: 2,
+                segment_count: 10,
+                total_bytes: 500,
+                last_segment_at: Some(now),
+                fts_row_count: 10,
+                fts_consistent: true,
+            }],
+            ..empty_context()
+        };
+        let result = explain_search(&ctx);
+        let reason = result
+            .reasons
+            .iter()
+            .find(|r| r.code == "NO_INDEXED_DATA")
+            .expect("should report pane-scoped NO_INDEXED_DATA");
+        assert!(reason.summary.contains("Pane 1"));
+        assert!(
+            reason
+                .evidence
+                .iter()
+                .any(|e| e.key == "pane_id" && e.value == "1")
+        );
+    }
+
+    #[test]
+    fn pane_filter_not_found_does_not_emit_no_indexed_data() {
+        let now = now_ms();
+        let ctx = SearchExplainContext {
+            pane_filter: Some(99),
+            panes: vec![PaneExplainInfo {
+                pane_id: 1,
+                observed: true,
+                ignore_reason: None,
+                domain: "local".to_string(),
+                last_seen_at: now,
+            }],
+            indexing_stats: vec![PaneIndexingInfo {
+                pane_id: 1,
+                segment_count: 10,
+                total_bytes: 500,
+                last_segment_at: Some(now),
+                fts_row_count: 10,
+                fts_consistent: true,
+            }],
+            ..empty_context()
+        };
+        let result = explain_search(&ctx);
+        assert!(result.reasons.iter().any(|r| r.code == "PANE_NOT_FOUND"));
+        assert!(
+            !result.reasons.iter().any(|r| r.code == "NO_INDEXED_DATA"),
+            "pane not found should not be shadowed by NO_INDEXED_DATA"
+        );
+    }
+
+    #[test]
     fn pane_excluded_filter_on_observed_pane_no_exclusion_reason() {
         let now = now_ms();
         let ctx = SearchExplainContext {
@@ -1331,6 +1464,41 @@ mod tests {
     }
 
     #[test]
+    fn pane_filter_scopes_fts_inconsistency_to_selected_pane() {
+        let now = now_ms();
+        let ctx = SearchExplainContext {
+            pane_filter: Some(1),
+            indexing_stats: vec![
+                PaneIndexingInfo {
+                    pane_id: 1,
+                    segment_count: 50,
+                    total_bytes: 2500,
+                    last_segment_at: Some(now),
+                    fts_row_count: 50,
+                    fts_consistent: true,
+                },
+                PaneIndexingInfo {
+                    pane_id: 2,
+                    segment_count: 100,
+                    total_bytes: 5000,
+                    last_segment_at: Some(now),
+                    fts_row_count: 10,
+                    fts_consistent: false,
+                },
+            ],
+            ..empty_context()
+        };
+        let result = explain_search(&ctx);
+        assert!(
+            !result
+                .reasons
+                .iter()
+                .any(|r| r.code == "FTS_INDEX_INCONSISTENT"),
+            "pane-filtered explain should ignore unrelated pane FTS inconsistency"
+        );
+    }
+
+    #[test]
     fn gap_saturating_sub_handles_inversion() {
         let now = now_ms();
         let ctx = SearchExplainContext {
@@ -1424,6 +1592,43 @@ mod tests {
     }
 
     #[test]
+    fn pane_filter_scopes_capture_gaps_to_selected_pane() {
+        let now = now_ms();
+        let ctx = SearchExplainContext {
+            pane_filter: Some(1),
+            gaps: vec![GapInfo {
+                pane_id: 2,
+                seq_before: 10,
+                seq_after: 20,
+                reason: "restart".to_string(),
+                detected_at: now,
+            }],
+            panes: vec![
+                PaneExplainInfo {
+                    pane_id: 1,
+                    observed: true,
+                    ignore_reason: None,
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+                PaneExplainInfo {
+                    pane_id: 2,
+                    observed: true,
+                    ignore_reason: None,
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+            ],
+            ..empty_context()
+        };
+        let result = explain_search(&ctx);
+        assert!(
+            !result.reasons.iter().any(|r| r.code == "CAPTURE_GAPS"),
+            "pane-filtered explain should ignore unrelated pane gaps"
+        );
+    }
+
+    #[test]
     fn retention_cleanup_includes_earliest_segment() {
         let now = now_ms();
         let earliest = now - 7_200_000;
@@ -1512,6 +1717,57 @@ mod tests {
         assert!(
             !result.reasons.iter().any(|r| r.code == "STALE_PANES"),
             "pane at exactly 5min threshold should not be stale (need > threshold)"
+        );
+    }
+
+    #[test]
+    fn pane_filter_scopes_stale_panes_to_selected_pane() {
+        let now = now_ms();
+        let ctx = SearchExplainContext {
+            pane_filter: Some(1),
+            panes: vec![
+                PaneExplainInfo {
+                    pane_id: 1,
+                    observed: true,
+                    ignore_reason: None,
+                    domain: "local".to_string(),
+                    last_seen_at: now,
+                },
+                PaneExplainInfo {
+                    pane_id: 2,
+                    observed: true,
+                    ignore_reason: None,
+                    domain: "local".to_string(),
+                    last_seen_at: now - (10 * 60 * 1000),
+                },
+            ],
+            indexing_stats: vec![
+                PaneIndexingInfo {
+                    pane_id: 1,
+                    segment_count: 10,
+                    total_bytes: 500,
+                    last_segment_at: Some(now),
+                    fts_row_count: 10,
+                    fts_consistent: true,
+                },
+                PaneIndexingInfo {
+                    pane_id: 2,
+                    segment_count: 10,
+                    total_bytes: 500,
+                    last_segment_at: Some(now),
+                    fts_row_count: 10,
+                    fts_consistent: true,
+                },
+            ],
+            earliest_segment_at: Some(now - 3_600_000),
+            latest_segment_at: Some(now),
+            now_ms: now,
+            ..empty_context()
+        };
+        let result = explain_search(&ctx);
+        assert!(
+            !result.reasons.iter().any(|r| r.code == "STALE_PANES"),
+            "pane-filtered explain should ignore stale state from unrelated panes"
         );
     }
 
