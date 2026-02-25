@@ -217,6 +217,7 @@ pub mod protocol_recovery;
 pub mod quantile_sketch;
 pub mod query_contract;
 pub mod r_tree;
+pub mod rate_limit_tracker;
 pub mod recorder_audit;
 pub mod recorder_export;
 pub mod recorder_invariants;
