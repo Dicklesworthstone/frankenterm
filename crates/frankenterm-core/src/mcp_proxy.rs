@@ -6,15 +6,29 @@
 //! - remote tools are mounted under `<proxy_prefix>/<server>/<tool>`.
 
 mod mcp_proxy_framework {
-    pub(crate) use fastmcp::ServerBuilder as FrameworkServerBuilder;
+    pub(crate) use fastmcp::{
+        Content as FrameworkContent, McpContext as FrameworkMcpContext,
+        McpError as FrameworkMcpError, McpResult as FrameworkMcpResult, Server as FrameworkServer,
+        ServerBuilder as FrameworkServerBuilder, Tool as FrameworkTool,
+        ToolHandler as FrameworkToolHandler,
+    };
 }
 
-use super::*;
-use crate::config::McpClientConfig;
-use crate::mcp_client::{ExternalServerConfig, FtMcpClient, discover_servers};
-use mcp_proxy_framework::FrameworkServerBuilder;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use mcp_proxy_framework::{
+    FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
+    FrameworkMcpResult as McpResult, FrameworkServer as Server, FrameworkServerBuilder,
+    FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
+};
+
+use super::mcp_middleware::{AuditedToolHandler, FormatAwareToolHandler};
+use crate::Result;
+use crate::config::{Config, McpClientConfig};
+use crate::mcp_client::{ExternalServerConfig, FtMcpClient, discover_servers};
 
 const LOG_TARGET: &str = "ft::mcp_proxy";
 

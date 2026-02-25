@@ -2,7 +2,35 @@
 //!
 //! This module is extraction-only and keeps resource behavior/URIs stable.
 
-use super::*;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use serde::Serialize;
+
+mod mcp_resources_framework {
+    pub(crate) use fastmcp::{
+        Content as FrameworkContent, McpContext as FrameworkMcpContext,
+        McpError as FrameworkMcpError, McpResult as FrameworkMcpResult,
+        Resource as FrameworkResource, ResourceContent as FrameworkResourceContent,
+        ResourceHandler as FrameworkResourceHandler, ResourceTemplate as FrameworkResourceTemplate,
+        ToolHandler as FrameworkToolHandler,
+    };
+}
+
+use mcp_resources_framework::{
+    FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
+    FrameworkMcpResult as McpResult, FrameworkResource as Resource,
+    FrameworkResourceContent as ResourceContent, FrameworkResourceHandler as ResourceHandler,
+    FrameworkResourceTemplate as ResourceTemplate, FrameworkToolHandler as ToolHandler,
+};
+
+use super::mcp_tools::{
+    WaAccountsTool, WaEventsTool, WaReservationsTool, WaRulesListTool, WaStateTool,
+};
+use super::{McpEnvelope, McpWorkflowItem, McpWorkflowsData, builtin_workflows, elapsed_ms};
+use crate::config::{Config, PaneFilterConfig};
 
 fn tool_output_as_resource(uri: &str, contents: Vec<Content>) -> McpResult<Vec<ResourceContent>> {
     let text = contents
