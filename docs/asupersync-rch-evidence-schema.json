@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ft.asupersync.rch.evidence.schema.v1",
+  "title": "asupersync Migration Heavy-Compute Evidence Schema",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "bead_id",
+    "policy_version",
+    "runs"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "bead_id": {
+      "type": "string",
+      "pattern": "^ft-e34d9\\.10\\..+"
+    },
+    "policy_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "timestamp",
+          "command",
+          "is_heavy",
+          "used_rch",
+          "worker_context",
+          "artifact_paths",
+          "elapsed_seconds",
+          "exit_status",
+          "residual_risk_notes"
+        ],
+        "properties": {
+          "timestamp": {
+            "type": "string",
+            "minLength": 1
+          },
+          "command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "is_heavy": {
+            "type": "boolean"
+          },
+          "used_rch": {
+            "type": "boolean"
+          },
+          "worker_context": {
+            "type": "string",
+            "minLength": 1
+          },
+          "artifact_paths": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "elapsed_seconds": {
+            "type": "number",
+            "minimum": 0
+          },
+          "exit_status": {
+            "type": "integer"
+          },
+          "residual_risk_notes": {
+            "type": "string"
+          },
+          "fallback_reason_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fallback_approved_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
