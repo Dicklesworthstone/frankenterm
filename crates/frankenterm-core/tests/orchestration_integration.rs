@@ -12,16 +12,45 @@
 //! - Conflict detection integration with dispatch decisions
 
 use frankenterm_core::plan::{
-    Mission, MissionActorRole, MissionDispatchDeduplicationState, MissionDispatchMechanism,
-    MissionFailureCode, MissionFailureTerminality, MissionId, MissionJournalEntryKind,
+    AssignmentId, Mission, MissionControlCommand, MissionControlDecision,
+    MissionDispatchDeduplicationState, MissionDispatchMechanism, MissionFailureCode,
+    MissionFailureTerminality, MissionId, MissionJournalEntryKind,
     MissionKillSwitchActivation, MissionKillSwitchLevel, MissionLifecycleState,
-    MissionLifecycleTransitionKind, Outcome,
+    MissionLifecycleTransitionKind, MissionOwnership, Outcome,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn create_test_mission(id: &str) -> Mission {
-    Mission::new(MissionId(id.into()))
+    Mission::new(
+        MissionId(id.into()),
+        "orch-test",
+        "ws-orch",
+        MissionOwnership::solo("agent-orch"),
+        1000,
+    )
+}
+
+/// Build a `ControlCommand` journal entry kind for tests.
+fn make_control_cmd(label: &str, ts: i64) -> MissionJournalEntryKind {
+    MissionJournalEntryKind::ControlCommand {
+        command: MissionControlCommand::Pause {
+            requested_by: "test-op".into(),
+            reason_code: label.into(),
+            requested_at_ms: ts,
+            correlation_id: None,
+        },
+        decision: MissionControlDecision {
+            action: label.into(),
+            lifecycle_from: MissionLifecycleState::Running,
+            lifecycle_to: MissionLifecycleState::Paused,
+            decision_path: format!("test-{label}"),
+            reason_code: label.into(),
+            error_code: None,
+            checkpoint_id: None,
+            decided_at_ms: ts,
+        },
+    }
 }
 
 // ── Journal Integration ─────────────────────────────────────────────────────
@@ -37,11 +66,11 @@ fn journal_lifecycle_transition_append_and_replay() {
             MissionJournalEntryKind::LifecycleTransition {
                 from: MissionLifecycleState::Planning,
                 to: MissionLifecycleState::Planned,
-                kind: MissionLifecycleTransitionKind::PlanFinalized,
+                transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
             },
-            "corr-1".into(),
-            MissionActorRole::Planner,
-            "plan_complete".into(),
+            "corr-1",
+            "planner",
+            "plan_complete",
             None,
             1000,
         )
@@ -53,11 +82,11 @@ fn journal_lifecycle_transition_append_and_replay() {
             MissionJournalEntryKind::LifecycleTransition {
                 from: MissionLifecycleState::Planned,
                 to: MissionLifecycleState::Dispatching,
-                kind: MissionLifecycleTransitionKind::DispatchStarted,
+                transition_kind: MissionLifecycleTransitionKind::DispatchStarted,
             },
-            "corr-2".into(),
-            MissionActorRole::Dispatcher,
-            "dispatch_started".into(),
+            "corr-2",
+            "dispatcher",
+            "dispatch_started",
             None,
             2000,
         )
@@ -65,7 +94,7 @@ fn journal_lifecycle_transition_append_and_replay() {
     assert_eq!(seq2, 2);
 
     // Replay from start
-    let report = journal.replay_from_checkpoint(0);
+    let report = journal.replay_from_checkpoint();
     assert_eq!(report.entries_scanned, 2);
     assert_eq!(report.lifecycle_transitions, 2);
     assert!(report.is_clean());
@@ -73,7 +102,7 @@ fn journal_lifecycle_transition_append_and_replay() {
 
 #[test]
 fn journal_checkpoint_and_recovery() {
-    let mut mission = create_test_mission("m:orch-2");
+    let mission = create_test_mission("m:orch-2");
     let mut journal = mission.create_journal();
 
     // Append some entries
@@ -82,11 +111,11 @@ fn journal_checkpoint_and_recovery() {
             MissionJournalEntryKind::LifecycleTransition {
                 from: MissionLifecycleState::Planning,
                 to: MissionLifecycleState::Planned,
-                kind: MissionLifecycleTransitionKind::PlanFinalized,
+                transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
             },
-            "corr-cp-1".into(),
-            MissionActorRole::Planner,
-            "plan_finalized".into(),
+            "corr-cp-1",
+            "planner",
+            "plan_finalized",
             None,
             1000,
         )
@@ -95,29 +124,28 @@ fn journal_checkpoint_and_recovery() {
     journal
         .append(
             MissionJournalEntryKind::AssignmentOutcome {
-                assignment_id: "a:1".into(),
-                outcome: "success".into(),
+                assignment_id: AssignmentId("a:1".into()),
+                outcome_before: None,
+                outcome_after: "success".into(),
             },
-            "corr-cp-2".into(),
-            MissionActorRole::Dispatcher,
-            "assignment_outcome".into(),
+            "corr-cp-2",
+            "dispatcher",
+            "assignment_outcome",
             None,
             2000,
         )
         .unwrap();
 
     // Create checkpoint
-    journal.checkpoint(&mission, 3000);
+    journal.checkpoint(&mission, 3000).unwrap();
 
     // Append more after checkpoint
     journal
         .append(
-            MissionJournalEntryKind::ControlCommand {
-                command: "pause".into(),
-            },
-            "corr-cp-3".into(),
-            MissionActorRole::Operator,
-            "pause_requested".into(),
+            make_control_cmd("pause", 4000),
+            "corr-cp-3",
+            "operator",
+            "pause_requested",
             None,
             4000,
         )
@@ -125,9 +153,9 @@ fn journal_checkpoint_and_recovery() {
 
     // Replay from checkpoint should only see post-checkpoint entries
     let snapshot = journal.snapshot_state();
-    let report = journal.replay_from_checkpoint(snapshot.last_checkpoint_seq);
+    let _report = journal.replay_from_checkpoint();
     // entries_since returns entries after the given seq
-    let entries_after = journal.entries_since(snapshot.last_checkpoint_seq);
+    let entries_after = journal.entries_since(snapshot.last_checkpoint_seq.unwrap_or(0));
     assert!(!entries_after.is_empty());
 }
 
@@ -138,24 +166,20 @@ fn journal_duplicate_correlation_rejected() {
 
     journal
         .append(
-            MissionJournalEntryKind::ControlCommand {
-                command: "pause".into(),
-            },
-            "dup-corr".into(),
-            MissionActorRole::Operator,
-            "first".into(),
+            make_control_cmd("pause", 1000),
+            "dup-corr",
+            "operator",
+            "first",
             None,
             1000,
         )
         .unwrap();
 
     let result = journal.append(
-        MissionJournalEntryKind::ControlCommand {
-            command: "resume".into(),
-        },
-        "dup-corr".into(),
-        MissionActorRole::Operator,
-        "second".into(),
+        make_control_cmd("resume", 2000),
+        "dup-corr",
+        "operator",
+        "second",
         None,
         2000,
     );
@@ -171,11 +195,9 @@ fn journal_compaction_preserves_post_checkpoint() {
     for i in 1..=5 {
         journal
             .append(
-                MissionJournalEntryKind::ControlCommand {
-                    command: format!("cmd-{i}"),
-                },
+                make_control_cmd(&format!("cmd-{i}"), i * 1000),
                 format!("corr-compact-{i}"),
-                MissionActorRole::Operator,
+                "operator",
                 format!("reason-{i}"),
                 None,
                 i * 1000,
@@ -184,7 +206,7 @@ fn journal_compaction_preserves_post_checkpoint() {
     }
 
     // Checkpoint at seq 3
-    journal.checkpoint(&mission, 6000);
+    journal.checkpoint(&mission, 6000).unwrap();
 
     // Compact before seq 3
     journal.compact_before(3);
@@ -202,18 +224,18 @@ fn journal_kill_switch_change_entry() {
     journal
         .append(
             MissionJournalEntryKind::KillSwitchChange {
-                from: MissionKillSwitchLevel::Off,
-                to: MissionKillSwitchLevel::SafeMode,
+                level_from: MissionKillSwitchLevel::Off,
+                level_to: MissionKillSwitchLevel::SafeMode,
             },
-            "corr-ks-1".into(),
-            MissionActorRole::Operator,
-            "emergency_pause".into(),
+            "corr-ks-1",
+            "operator",
+            "emergency_pause",
             None,
             1000,
         )
         .unwrap();
 
-    let report = journal.replay_from_checkpoint(0);
+    let report = journal.replay_from_checkpoint();
     assert_eq!(report.kill_switch_changes, 1);
 }
 
@@ -227,20 +249,20 @@ fn journal_recovery_marker() {
             MissionJournalEntryKind::LifecycleTransition {
                 from: MissionLifecycleState::Planning,
                 to: MissionLifecycleState::Planned,
-                kind: MissionLifecycleTransitionKind::PlanFinalized,
+                transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
             },
-            "corr-rm-1".into(),
-            MissionActorRole::Planner,
-            "plan".into(),
+            "corr-rm-1",
+            "planner",
+            "plan",
             None,
             1000,
         )
         .unwrap();
 
     // Add recovery marker at seq 1
-    journal.recovery_marker(1, "crash_recovery".into(), 5000);
+    journal.recovery_marker(1, "crash_recovery", 5000).unwrap();
 
-    let report = journal.replay_from_checkpoint(0);
+    let report = journal.replay_from_checkpoint();
     assert_eq!(report.recovery_markers, 1);
 }
 
@@ -251,12 +273,10 @@ fn journal_sync_to_mission_state() {
 
     journal
         .append(
-            MissionJournalEntryKind::ControlCommand {
-                command: "tick".into(),
-            },
-            "corr-sync-1".into(),
-            MissionActorRole::Dispatcher,
-            "tick".into(),
+            make_control_cmd("tick", 1000),
+            "corr-sync-1",
+            "dispatcher",
+            "tick",
             None,
             1000,
         )
@@ -273,7 +293,7 @@ fn journal_sync_to_mission_state() {
 #[test]
 fn dedup_state_record_and_find() {
     use frankenterm_core::plan::{
-        AssignmentId, MissionDispatchDeduplicationRecord, MissionDispatchIdempotencyKey,
+        MissionDispatchDeduplicationRecord, MissionDispatchIdempotencyKey,
     };
 
     let mut dedup = MissionDispatchDeduplicationState::default();
@@ -285,6 +305,7 @@ fn dedup_state_record_and_find() {
         &MissionDispatchMechanism::RobotSend {
             pane_id: 1,
             text: "hello".into(),
+            paste_mode: None,
         },
     );
 
@@ -309,7 +330,7 @@ fn dedup_state_record_and_find() {
 #[test]
 fn dedup_state_evict_before_cutoff() {
     use frankenterm_core::plan::{
-        AssignmentId, MissionDispatchDeduplicationRecord, MissionDispatchIdempotencyKey,
+        MissionDispatchDeduplicationRecord, MissionDispatchIdempotencyKey,
     };
 
     let mut dedup = MissionDispatchDeduplicationState::default();
@@ -322,6 +343,7 @@ fn dedup_state_evict_before_cutoff() {
         &MissionDispatchMechanism::RobotSend {
             pane_id: 1,
             text: "old".into(),
+            paste_mode: None,
         },
     );
     dedup.record_dispatch(MissionDispatchDeduplicationRecord {
@@ -343,6 +365,7 @@ fn dedup_state_evict_before_cutoff() {
         &MissionDispatchMechanism::RobotSend {
             pane_id: 2,
             text: "new".into(),
+            paste_mode: None,
         },
     );
     dedup.record_dispatch(MissionDispatchDeduplicationRecord {
@@ -367,8 +390,6 @@ fn dedup_state_evict_before_cutoff() {
 
 #[test]
 fn failure_code_terminality_classification() {
-    use frankenterm_core::plan::MissionFailureContract;
-
     // Terminal failures
     let pd = MissionFailureCode::PolicyDenied.contract();
     assert!(matches!(pd.terminality, MissionFailureTerminality::Terminal));
@@ -473,12 +494,12 @@ fn kill_switch_levels_behavior() {
 fn kill_switch_activation_serde_roundtrip() {
     let activation = MissionKillSwitchActivation {
         level: MissionKillSwitchLevel::SafeMode,
-        activated_by: MissionActorRole::Operator,
+        activated_by: "operator".into(),
         reason_code: "emergency".into(),
         error_code: Some("FTX_KS01".into()),
         activated_at_ms: 1000,
         expires_at_ms: Some(60_000),
-        correlation_id: "ks-corr-1".into(),
+        correlation_id: Some("ks-corr-1".into()),
     };
 
     let json = serde_json::to_string(&activation).unwrap();
@@ -503,12 +524,10 @@ fn mission_canonical_string_includes_journal_state() {
 
     journal
         .append(
-            MissionJournalEntryKind::ControlCommand {
-                command: "test".into(),
-            },
-            "corr-canon-1".into(),
-            MissionActorRole::Dispatcher,
-            "test".into(),
+            make_control_cmd("test", 1000),
+            "corr-canon-1",
+            "dispatcher",
+            "test",
             None,
             1000,
         )
@@ -543,33 +562,41 @@ fn lifecycle_non_terminal_states() {
 
 #[test]
 fn dispatch_mechanism_serde_roundtrip() {
+    use frankenterm_core::plan::WaitCondition;
+
     let mechanisms = vec![
         MissionDispatchMechanism::RobotSend {
             pane_id: 42,
             text: "hello agent".into(),
+            paste_mode: None,
         },
         MissionDispatchMechanism::RobotWaitFor {
-            pane_id: 42,
-            pattern: "ready>".into(),
+            pane_id: Some(42),
+            condition: WaitCondition::Pattern {
+                pane_id: Some(42),
+                rule_id: "ready>".into(),
+            },
             timeout_ms: 5000,
         },
         MissionDispatchMechanism::InternalLockAcquire {
-            resource_id: "res:1".into(),
-            timeout_ms: 3000,
+            lock_name: "res:1".into(),
+            timeout_ms: Some(3000),
         },
         MissionDispatchMechanism::InternalLockRelease {
-            resource_id: "res:1".into(),
+            lock_name: "res:1".into(),
         },
         MissionDispatchMechanism::InternalStoreData {
             key: "k1".into(),
-            value: "v1".into(),
+            value: serde_json::json!("v1"),
         },
     ];
 
     for mechanism in &mechanisms {
         let json = serde_json::to_string(mechanism).unwrap();
         let restored: MissionDispatchMechanism = serde_json::from_str(&json).unwrap();
-        assert_eq!(*mechanism, restored);
+        // Compare via re-serialized JSON (MissionDispatchMechanism doesn't derive PartialEq)
+        let json2 = serde_json::to_string(&restored).unwrap();
+        assert_eq!(json, json2);
     }
 }
 
@@ -577,13 +604,14 @@ fn dispatch_mechanism_serde_roundtrip() {
 
 #[test]
 fn dispatch_idempotency_key_deterministic() {
-    use frankenterm_core::plan::{AssignmentId, MissionDispatchIdempotencyKey};
+    use frankenterm_core::plan::MissionDispatchIdempotencyKey;
 
     let mission_id = MissionId("m:idem-1".into());
     let assignment_id = AssignmentId("a:1".into());
     let mechanism = MissionDispatchMechanism::RobotSend {
         pane_id: 1,
         text: "cmd".into(),
+        paste_mode: None,
     };
 
     let k1 = MissionDispatchIdempotencyKey::compute(&mission_id, &assignment_id, &mechanism);
@@ -593,7 +621,7 @@ fn dispatch_idempotency_key_deterministic() {
 
 #[test]
 fn dispatch_idempotency_key_differs_by_mechanism() {
-    use frankenterm_core::plan::{AssignmentId, MissionDispatchIdempotencyKey};
+    use frankenterm_core::plan::MissionDispatchIdempotencyKey;
 
     let mission_id = MissionId("m:idem-2".into());
     let assignment_id = AssignmentId("a:1".into());
@@ -604,6 +632,7 @@ fn dispatch_idempotency_key_differs_by_mechanism() {
         &MissionDispatchMechanism::RobotSend {
             pane_id: 1,
             text: "cmd-a".into(),
+            paste_mode: None,
         },
     );
     let k2 = MissionDispatchIdempotencyKey::compute(
@@ -612,6 +641,7 @@ fn dispatch_idempotency_key_differs_by_mechanism() {
         &MissionDispatchMechanism::RobotSend {
             pane_id: 1,
             text: "cmd-b".into(),
+            paste_mode: None,
         },
     );
     assert_ne!(k1.0, k2.0);
@@ -619,6 +649,7 @@ fn dispatch_idempotency_key_differs_by_mechanism() {
 
 // ── Mission Loop State Basics ───────────────────────────────────────────────
 
+#[cfg(feature = "subprocess-bridge")]
 #[test]
 fn mission_loop_initial_state() {
     use frankenterm_core::mission_loop::{MissionLoop, MissionLoopConfig};
@@ -630,6 +661,7 @@ fn mission_loop_initial_state() {
     assert_eq!(mloop.state().total_rejections, 0);
 }
 
+#[cfg(feature = "subprocess-bridge")]
 #[test]
 fn mission_loop_trigger_accumulates() {
     use frankenterm_core::mission_loop::{MissionLoop, MissionLoopConfig, MissionTrigger};
@@ -656,18 +688,17 @@ fn journal_entry_all_kinds_serde_roundtrip() {
         MissionJournalEntryKind::LifecycleTransition {
             from: MissionLifecycleState::Planning,
             to: MissionLifecycleState::Planned,
-            kind: MissionLifecycleTransitionKind::PlanFinalized,
+            transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
         },
-        MissionJournalEntryKind::ControlCommand {
-            command: "pause".into(),
-        },
+        make_control_cmd("pause", 0),
         MissionJournalEntryKind::KillSwitchChange {
-            from: MissionKillSwitchLevel::Off,
-            to: MissionKillSwitchLevel::HardStop,
+            level_from: MissionKillSwitchLevel::Off,
+            level_to: MissionKillSwitchLevel::HardStop,
         },
         MissionJournalEntryKind::AssignmentOutcome {
-            assignment_id: "a:1".into(),
-            outcome: "success".into(),
+            assignment_id: AssignmentId("a:1".into()),
+            outcome_before: None,
+            outcome_after: "success".into(),
         },
     ];
 
@@ -676,7 +707,7 @@ fn journal_entry_all_kinds_serde_roundtrip() {
             .append(
                 kind,
                 format!("corr-serde-{i}"),
-                MissionActorRole::Operator,
+                "operator",
                 format!("reason-{i}"),
                 None,
                 (i as i64 + 1) * 1000,
@@ -703,12 +734,10 @@ fn journal_state_serde_roundtrip() {
 
     journal
         .append(
-            MissionJournalEntryKind::ControlCommand {
-                command: "test".into(),
-            },
-            "corr-js-1".into(),
-            MissionActorRole::Dispatcher,
-            "test".into(),
+            make_control_cmd("test", 1000),
+            "corr-js-1",
+            "dispatcher",
+            "test",
             None,
             1000,
         )

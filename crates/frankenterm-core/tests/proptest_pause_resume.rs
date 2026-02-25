@@ -15,10 +15,9 @@
 //! - Checkpoint assignment entries match mission assignments count
 
 use frankenterm_core::plan::{
-    ApprovalState, Assignment, AssignmentCheckpointEntry, AssignmentId, CandidateAction,
-    CandidateId, DispatchMechanism, Mission, MissionCheckpoint, MissionControlCommand,
-    MissionControlDecision, MissionId, MissionLifecycleState, MissionOwnership,
-    MissionPauseResumeState,
+    ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId, Mission,
+    MissionActorRole, MissionCheckpoint, MissionControlCommand, MissionId,
+    MissionLifecycleState, MissionOwnership, MissionPauseResumeState, StepAction,
 };
 use proptest::prelude::*;
 
@@ -125,26 +124,30 @@ fn make_mission(state: MissionLifecycleState, num_assignments: usize) -> Mission
     mission.lifecycle_state = state;
 
     for i in 0..num_assignments {
-        let cid = CandidateId(format!("c{i}"));
+        let cid = CandidateActionId(format!("c{i}"));
         mission.candidates.push(CandidateAction {
             candidate_id: cid.clone(),
-            mechanism: DispatchMechanism::AgentMail {
-                target_agent: format!("agent-{i}"),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::SendText {
+                pane_id: 0,
+                text: format!("action-{i}"),
+                paste_mode: None,
             },
             rationale: "proptest".into(),
             score: None,
-            labels: Vec::new(),
             created_at_ms: 1000,
         });
         mission.assignments.push(Assignment {
             assignment_id: AssignmentId(format!("a{i}")),
             candidate_id: cid,
+            assigned_by: MissionActorRole::Dispatcher,
             assignee: format!("agent-{i}"),
-            assigned_at_ms: 1000,
+            created_at_ms: 1000,
             updated_at_ms: None,
             approval_state: ApprovalState::NotRequired,
             outcome: None,
             reservation_intent: None,
+            escalation: None,
         });
     }
 

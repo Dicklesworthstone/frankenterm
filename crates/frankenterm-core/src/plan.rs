@@ -1276,6 +1276,16 @@ impl MissionOwnership {
         )
     }
 
+    /// Convenience constructor: single agent fills all roles.
+    #[must_use]
+    pub fn solo(agent: &str) -> Self {
+        Self {
+            planner: agent.to_string(),
+            dispatcher: agent.to_string(),
+            operator: agent.to_string(),
+        }
+    }
+
     /// Validate explicit ownership boundaries.
     pub fn validate(&self) -> Result<(), MissionValidationError> {
         let planner = self.planner.trim();
@@ -16998,24 +17008,28 @@ mod tests {
         );
         mission.lifecycle_state = MissionLifecycleState::Running;
         mission.candidates.push(CandidateAction {
-            candidate_id: CandidateId("c1".into()),
-            mechanism: DispatchMechanism::AgentMail {
-                target_agent: "agent-1".into(),
+            candidate_id: CandidateActionId("c1".into()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::SendText {
+                pane_id: 0,
+                text: "test".into(),
+                paste_mode: None,
             },
             rationale: "test".into(),
             score: None,
-            labels: Vec::new(),
             created_at_ms: 1000,
         });
         mission.assignments.push(Assignment {
             assignment_id: AssignmentId("a1".into()),
-            candidate_id: CandidateId("c1".into()),
+            candidate_id: CandidateActionId("c1".into()),
+            assigned_by: MissionActorRole::Dispatcher,
             assignee: "agent-1".into(),
-            assigned_at_ms: 1000,
+            created_at_ms: 1000,
             updated_at_ms: None,
             approval_state: ApprovalState::NotRequired,
             outcome: None,
             reservation_intent: None,
+            escalation: None,
         });
 
         let decision = mission
@@ -17237,20 +17251,23 @@ mod tests {
         );
         mission.lifecycle_state = MissionLifecycleState::Running;
         mission.candidates.push(CandidateAction {
-            candidate_id: CandidateId("c1".into()),
-            mechanism: DispatchMechanism::AgentMail {
-                target_agent: "agent-1".into(),
+            candidate_id: CandidateActionId("c1".into()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::SendText {
+                pane_id: 0,
+                text: "test".into(),
+                paste_mode: None,
             },
             rationale: "test".into(),
             score: None,
-            labels: Vec::new(),
             created_at_ms: 1000,
         });
         mission.assignments.push(Assignment {
             assignment_id: AssignmentId("a1".into()),
-            candidate_id: CandidateId("c1".into()),
+            candidate_id: CandidateActionId("c1".into()),
+            assigned_by: MissionActorRole::Dispatcher,
             assignee: "agent-1".into(),
-            assigned_at_ms: 1000,
+            created_at_ms: 1000,
             updated_at_ms: None,
             approval_state: ApprovalState::Pending {
                 requested_by: "op".into(),
@@ -17258,6 +17275,7 @@ mod tests {
             },
             outcome: None,
             reservation_intent: None,
+            escalation: None,
         });
 
         mission
