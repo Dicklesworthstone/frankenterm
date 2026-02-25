@@ -89,6 +89,7 @@ pub mod bocpd;
 pub mod build_coord;
 #[cfg(feature = "session-resume")]
 pub mod casr_types;
+pub mod cancellation;
 pub mod cass;
 pub mod causal_dag;
 pub mod caut;
