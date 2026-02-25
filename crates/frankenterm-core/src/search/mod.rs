@@ -5,6 +5,7 @@
 
 mod chunk_vector_store;
 mod chunking;
+pub mod chunking_adapter;
 mod embedder;
 mod hash_embedder;
 mod hybrid_search;
@@ -32,6 +33,12 @@ pub use chunk_vector_store::{
 pub use chunking::{
     ChunkDirection, ChunkInputEvent, ChunkOverlap, ChunkPolicyConfig, ChunkSourceOffset,
     RECORDER_CHUNKING_POLICY_V1, SemanticChunk, build_semantic_chunks,
+};
+pub use chunking_adapter::{
+    ChunkAdapterStats, ChunkDocument, batch_stats, chunk_to_document, chunks_to_documents,
+    document_to_partial_chunk, extract_direction, extract_end_offset, extract_event_ids,
+    extract_overlap, extract_pane_id, extract_policy_version, extract_session_id,
+    extract_start_offset, terminal_metadata_count,
 };
 pub use embedder::{EmbedError, Embedder, EmbedderInfo, EmbedderTier};
 pub use hash_embedder::HashEmbedder;

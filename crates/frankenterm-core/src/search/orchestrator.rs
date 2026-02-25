@@ -32,7 +32,8 @@
 //! 2. B1 (done): Create orchestration abstraction with legacy + bridge backends
 //! 3. B2 (done): Weight-aware frankensearch RRF fusion + bridge fallback
 //! 4. B3 (done): Migrate embedder stack dispatch + fallback tiers
-//! 5. **B4 (done)**: Migrate vector/chunk index internals to FSVI path
+//! 5. B4 (done): Migrate vector/chunk index internals to FSVI path
+//! 6. **B5 (done)**: Preserve terminal-specific chunking via adapter layer
 
 use super::{
     EmbedError, Embedder, EmbedderInfo, EmbedderTier, FusedResult, HashEmbedder,
@@ -318,6 +319,9 @@ pub struct OrchestrationMetrics {
     pub embedder_fallback: bool,
     /// Vector index backend used (ftvi or fsvi).
     pub vector_index_backend: String,
+    /// Whether the chunking adapter was active for this query (B5).
+    #[serde(default)]
+    pub chunking_adapter_enabled: bool,
 }
 
 /// Input for legacy orchestration: pre-ranked lists from caller.
@@ -361,6 +365,10 @@ pub struct OrchestratorConfig {
     pub embedder_dispatch: EmbedderDispatch,
     /// Vector index backend (ftvi = legacy, fsvi = frankensearch).
     pub vector_index_backend: String,
+    /// Whether the chunking adapter layer is enabled (B5).
+    /// When true, SemanticChunks are converted through the adapter before indexing.
+    #[serde(default)]
+    pub chunking_adapter_enabled: bool,
 }
 
 impl Default for OrchestratorConfig {
@@ -375,6 +383,7 @@ impl Default for OrchestratorConfig {
             fallback_to_legacy: true,
             embedder_dispatch: EmbedderDispatch::Legacy,
             vector_index_backend: "ftvi".to_string(),
+            chunking_adapter_enabled: false,
         }
     }
 }
@@ -386,6 +395,7 @@ struct MigrationMetrics {
     embedder_tier_used: Option<String>,
     embedder_fallback: bool,
     vector_index_backend: String,
+    chunking_adapter_enabled: bool,
 }
 
 /// Search orchestrator that encapsulates backend selection and fallback logic.
@@ -465,18 +475,11 @@ impl SearchOrchestrator {
             embedder_tier_used: None,
             embedder_fallback: false,
             vector_index_backend: self.config.vector_index_backend.clone(),
+            chunking_adapter_enabled: self.config.chunking_adapter_enabled,
         }
     }
 
     /// Execute search using pre-ranked lists (legacy-compatible entry point).
-    ///
-    /// This is the synchronous orchestration path used by `storage.rs`. Both the
-    /// legacy and bridge backends can accept this input — the bridge path would
-    /// ignore the pre-ranked lists and run its own retrieval, but we haven't
-    /// implemented that yet (deferred to B2–B4).
-    ///
-    /// For now, both backends use the legacy fusion path, with the bridge backend
-    /// adding instrumentation and metrics hooks for migration observability.
     pub fn fuse_ranked(&self, input: &LegacySearchInput) -> OrchestrationResult {
         match self.config.backend {
             OrchestrationBackend::Legacy => self.fuse_legacy(input),
@@ -515,19 +518,12 @@ impl SearchOrchestrator {
                 embedder_tier_used: mm.embedder_tier_used,
                 embedder_fallback: mm.embedder_fallback,
                 vector_index_backend: mm.vector_index_backend,
+                chunking_adapter_enabled: mm.chunking_adapter_enabled,
             },
         }
     }
 
     /// Bridge fusion: delegates to frankensearch with weight-aware RRF scoring.
-    ///
-    /// Uses `HybridSearchService` configured with FrankenSearchRrf backend, which
-    /// calls `frankensearch::rrf_fuse()` for rank assignment and then recomputes
-    /// weighted scores using the local `rrf_component_score()` formula.
-    ///
-    /// If the bridge path panics (e.g. frankensearch internal error), and
-    /// `fallback_to_legacy` is enabled, falls back to the legacy path and
-    /// records the fallback in metrics.
     fn fuse_bridge(&self, input: &LegacySearchInput) -> OrchestrationResult {
         let bridge_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let svc = HybridSearchService::new()
@@ -562,6 +558,7 @@ impl SearchOrchestrator {
                     embedder_tier_used: mm.embedder_tier_used,
                     embedder_fallback: mm.embedder_fallback,
                     vector_index_backend: mm.vector_index_backend,
+                    chunking_adapter_enabled: mm.chunking_adapter_enabled,
                 },
             },
             Err(_) if self.config.fallback_to_legacy => {
@@ -577,9 +574,6 @@ impl SearchOrchestrator {
     }
 
     /// Compare legacy and bridge results for the same input (migration validation).
-    ///
-    /// Returns both results and a comparison report. Use this during the migration
-    /// to validate that the bridge path produces equivalent results to legacy.
     pub fn compare_backends(&self, input: &LegacySearchInput) -> OrchestrationComparison {
         let legacy = self.fuse_legacy(input);
         let bridge = self.fuse_bridge(input);
@@ -720,6 +714,7 @@ mod tests {
         assert!((cfg.semantic_weight - 1.0).abs() < 1e-6);
         assert!(cfg.fallback_to_legacy);
         assert_eq!(cfg.embedder_dispatch, EmbedderDispatch::Legacy);
+        assert!(!cfg.chunking_adapter_enabled);
     }
 
     #[test]
@@ -734,6 +729,7 @@ mod tests {
             fallback_to_legacy: false,
             embedder_dispatch: EmbedderDispatch::Managed,
             vector_index_backend: "fsvi".to_string(),
+            chunking_adapter_enabled: true,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
@@ -741,6 +737,7 @@ mod tests {
         assert_eq!(back.rrf_k, 50);
         assert_eq!(back.embedder_dispatch, EmbedderDispatch::Managed);
         assert_eq!(back.vector_index_backend, "fsvi");
+        assert!(back.chunking_adapter_enabled);
     }
 
     // ── SearchOrchestrator ────────────────────────────────────────────
@@ -886,6 +883,7 @@ mod tests {
             embedder_tier_used: None,
             embedder_fallback: false,
             vector_index_backend: "ftvi".to_string(),
+            chunking_adapter_enabled: false,
         };
         let json = serde_json::to_string(&metrics).unwrap();
         let back: OrchestrationMetrics = serde_json::from_str(&json).unwrap();
@@ -1048,7 +1046,7 @@ mod tests {
         assert_eq!(stack.availability(), EmbedderAvailability::HashOnly);
         let (emb, tier) = stack.best_embedder();
         assert_eq!(tier, EmbedderTier::Hash);
-        assert_eq!(emb.dimension(), 128); // default HashEmbedder
+        assert_eq!(emb.dimension(), 128);
     }
 
     #[test]
@@ -1105,7 +1103,6 @@ mod tests {
         let quality: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(256));
         let stack = ManagedEmbedderStack::from_tiers(Some(quality), Some(fast), hash);
         let (vec, tier) = stack.embed_with_fallback("test query").unwrap();
-        // Should use quality (first available)
         assert_eq!(tier, EmbedderTier::Quality);
         assert_eq!(vec.len(), 256);
     }
@@ -1252,5 +1249,48 @@ mod tests {
         });
         let result = orch.fuse_ranked(&sample_input());
         assert_eq!(result.metrics.vector_index_backend, "fsvi");
+    }
+
+    // ── B5: Chunking adapter config ──────────────────────────────────
+
+    #[test]
+    fn config_default_chunking_adapter_disabled() {
+        let cfg = OrchestratorConfig::default();
+        assert!(!cfg.chunking_adapter_enabled);
+    }
+
+    #[test]
+    fn config_chunking_adapter_serde() {
+        let cfg = OrchestratorConfig {
+            chunking_adapter_enabled: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: OrchestratorConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.chunking_adapter_enabled);
+    }
+
+    #[test]
+    fn config_chunking_adapter_serde_absent_defaults_false() {
+        let json = r#"{"backend":"legacy","mode":"hybrid","rrf_k":60,"alpha":0.7,"lexical_weight":1.0,"semantic_weight":1.0,"fallback_to_legacy":true,"embedder_dispatch":"legacy","vector_index_backend":"ftvi"}"#;
+        let cfg: OrchestratorConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.chunking_adapter_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_chunking_adapter_disabled() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig::default());
+        let result = orch.fuse_ranked(&sample_input());
+        assert!(!result.metrics.chunking_adapter_enabled);
+    }
+
+    #[test]
+    fn orchestrator_metrics_chunking_adapter_enabled() {
+        let orch = SearchOrchestrator::new(OrchestratorConfig {
+            chunking_adapter_enabled: true,
+            ..Default::default()
+        });
+        let result = orch.fuse_ranked(&sample_input());
+        assert!(result.metrics.chunking_adapter_enabled);
     }
 }

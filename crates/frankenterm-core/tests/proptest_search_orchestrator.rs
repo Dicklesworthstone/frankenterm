@@ -49,8 +49,9 @@ fn arb_config() -> impl Strategy<Value = OrchestratorConfig> {
         any::<bool>(),             // fallback_to_legacy
         arb_embedder_dispatch(),   // embedder_dispatch
         arb_vector_index_backend(), // vector_index_backend
+        any::<bool>(),             // chunking_adapter_enabled
     )
-        .prop_map(|(backend, mode, rrf_k, alpha, lw, sw, fallback, emb, vib)| {
+        .prop_map(|(backend, mode, rrf_k, alpha, lw, sw, fallback, emb, vib, cae)| {
             OrchestratorConfig {
                 backend,
                 mode,
@@ -61,6 +62,7 @@ fn arb_config() -> impl Strategy<Value = OrchestratorConfig> {
                 fallback_to_legacy: fallback,
                 embedder_dispatch: emb,
                 vector_index_backend: vib,
+                chunking_adapter_enabled: cae,
             }
         })
 }
