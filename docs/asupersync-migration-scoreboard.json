@@ -1,0 +1,550 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-02-25T07:22:32Z",
+  "bead_id": "ft-e34d9.10.1.3",
+  "issue_scope_prefix": "ft-e34d9.10",
+  "source": {
+    "issues": "br list --json or fixture",
+    "ready": "br ready --json or fixture"
+  },
+  "counts": {
+    "total": 42,
+    "by_status": {
+      "open": 41,
+      "in_progress": 1
+    }
+  },
+  "critical_path": [
+    {
+      "id": "ft-e34d9.10.1",
+      "title": "[asupersync][track] Architecture doctrine and migration baseline",
+      "status": "open",
+      "priority": 2,
+      "assignee": null
+    },
+    {
+      "id": "ft-e34d9.10.2",
+      "title": "[asupersync][track] Core runtime substrate convergence",
+      "status": "open",
+      "priority": 2,
+      "assignee": null
+    },
+    {
+      "id": "ft-e34d9.10.3",
+      "title": "[asupersync][track] Structured concurrency and cancellation correctness",
+      "status": "open",
+      "priority": 2,
+      "assignee": null
+    },
+    {
+      "id": "ft-e34d9.10.4",
+      "title": "[asupersync][track] IPC and network stack harmonization",
+      "status": "open",
+      "priority": 2,
+      "assignee": null
+    },
+    {
+      "id": "ft-e34d9.10.5",
+      "title": "[asupersync][track] Vendored crate runtime harmonization",
+      "status": "open",
+      "priority": 2,
+      "assignee": null
+    },
+    {
+      "id": "ft-e34d9.10.6",
+      "title": "[asupersync][track] Deterministic verification and deep testing",
+      "status": "open",
+      "priority": 2,
+      "assignee": null
+    },
+    {
+      "id": "ft-e34d9.10.7",
+      "title": "[asupersync][track] Observability, operability, and SLO gates",
+      "status": "open",
+      "priority": 2,
+      "assignee": null
+    },
+    {
+      "id": "ft-e34d9.10.8",
+      "title": "[asupersync][track] Dependency eradication and cutover governance",
+      "status": "open",
+      "priority": 2,
+      "assignee": null
+    }
+  ],
+  "ready_candidates": [],
+  "issue_progress": [
+    {
+      "id": "ft-e34d9.10",
+      "title": "[asupersync][deep] Program: profound runtime integration and harmonization",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10 --json and evidence/ft-e34d9.10/"
+    },
+    {
+      "id": "ft-e34d9.10.1",
+      "title": "[asupersync][track] Architecture doctrine and migration baseline",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.1 --json and evidence/ft-e34d9.10.1/"
+    },
+    {
+      "id": "ft-e34d9.10.1.3",
+      "title": "[asupersync][baseline] Migration scoreboard, critical path, and risk ledger",
+      "status": "in_progress",
+      "priority": 2,
+      "assignee": "SageHawk",
+      "completion_signal": 0.5,
+      "evidence_hint": "br show ft-e34d9.10.1.3 --json and evidence/ft-e34d9.10.1.3/"
+    },
+    {
+      "id": "ft-e34d9.10.1.4",
+      "title": "[asupersync][baseline] Execution policy contract: rch-only heavy compute + evidence logging",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.1.4 --json and evidence/ft-e34d9.10.1.4/"
+    },
+    {
+      "id": "ft-e34d9.10.2",
+      "title": "[asupersync][track] Core runtime substrate convergence",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.2 --json and evidence/ft-e34d9.10.2/"
+    },
+    {
+      "id": "ft-e34d9.10.2.1",
+      "title": "[asupersync][substrate] Unify runtime bootstrap for CLI/watch/web/robot",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.2.1 --json and evidence/ft-e34d9.10.2.1/"
+    },
+    {
+      "id": "ft-e34d9.10.2.2",
+      "title": "[asupersync][substrate] Cx/Outcome call-graph propagation and adapter plan",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.2.2 --json and evidence/ft-e34d9.10.2.2/"
+    },
+    {
+      "id": "ft-e34d9.10.2.3",
+      "title": "[asupersync][substrate] runtime_compat contraction and target-state minimization",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.2.3 --json and evidence/ft-e34d9.10.2.3/"
+    },
+    {
+      "id": "ft-e34d9.10.2.4",
+      "title": "[asupersync][substrate] User-facing latency/throughput contract and regression gates",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.2.4 --json and evidence/ft-e34d9.10.2.4/"
+    },
+    {
+      "id": "ft-e34d9.10.3",
+      "title": "[asupersync][track] Structured concurrency and cancellation correctness",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.3 --json and evidence/ft-e34d9.10.3/"
+    },
+    {
+      "id": "ft-e34d9.10.3.1",
+      "title": "[asupersync][concurrency] Scope tree for daemons, watchers, workers",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.3.1 --json and evidence/ft-e34d9.10.3.1/"
+    },
+    {
+      "id": "ft-e34d9.10.3.2",
+      "title": "[asupersync][concurrency] Two-phase cancellation + shutdown protocol rollout",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.3.2 --json and evidence/ft-e34d9.10.3.2/"
+    },
+    {
+      "id": "ft-e34d9.10.3.3",
+      "title": "[asupersync][concurrency] Cancellation-safe channel reserve/commit adoption",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.3.3 --json and evidence/ft-e34d9.10.3.3/"
+    },
+    {
+      "id": "ft-e34d9.10.3.4",
+      "title": "[asupersync][concurrency] Orphan-task, deadlock, and stuck-cancel detectors",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.3.4 --json and evidence/ft-e34d9.10.3.4/"
+    },
+    {
+      "id": "ft-e34d9.10.4",
+      "title": "[asupersync][track] IPC and network stack harmonization",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.4 --json and evidence/ft-e34d9.10.4/"
+    },
+    {
+      "id": "ft-e34d9.10.4.1",
+      "title": "[asupersync][network] Complete Unix IPC/socket cutover and invariants",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.4.1 --json and evidence/ft-e34d9.10.4.1/"
+    },
+    {
+      "id": "ft-e34d9.10.4.2",
+      "title": "[asupersync][network] TCP/TLS/HTTP service and client migration",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.4.2 --json and evidence/ft-e34d9.10.4.2/"
+    },
+    {
+      "id": "ft-e34d9.10.4.3",
+      "title": "[asupersync][network] Timeout/backoff/error taxonomy harmonization",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.4.3 --json and evidence/ft-e34d9.10.4.3/"
+    },
+    {
+      "id": "ft-e34d9.10.5",
+      "title": "[asupersync][track] Vendored crate runtime harmonization",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.5 --json and evidence/ft-e34d9.10.5/"
+    },
+    {
+      "id": "ft-e34d9.10.5.1",
+      "title": "[asupersync][vendored] Vendored runtime primitive inventory and migration map",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.5.1 --json and evidence/ft-e34d9.10.5.1/"
+    },
+    {
+      "id": "ft-e34d9.10.5.2",
+      "title": "[asupersync][vendored] Mux client/pool/runtime migration completion",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.5.2 --json and evidence/ft-e34d9.10.5.2/"
+    },
+    {
+      "id": "ft-e34d9.10.5.3",
+      "title": "[asupersync][vendored] wezterm-ssh and remote transport migration",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.5.3 --json and evidence/ft-e34d9.10.5.3/"
+    },
+    {
+      "id": "ft-e34d9.10.5.4",
+      "title": "[asupersync][vendored] Core↔vendored async contract and compatibility tests",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.5.4 --json and evidence/ft-e34d9.10.5.4/"
+    },
+    {
+      "id": "ft-e34d9.10.6",
+      "title": "[asupersync][track] Deterministic verification and deep testing",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.6 --json and evidence/ft-e34d9.10.6/"
+    },
+    {
+      "id": "ft-e34d9.10.6.1",
+      "title": "[asupersync][verify] LabRuntime deterministic suites for critical state machines",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.6.1 --json and evidence/ft-e34d9.10.6.1/"
+    },
+    {
+      "id": "ft-e34d9.10.6.2",
+      "title": "[asupersync][verify] DPOR + concurrency failure injection matrix",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.6.2 --json and evidence/ft-e34d9.10.6.2/"
+    },
+    {
+      "id": "ft-e34d9.10.6.3",
+      "title": "[asupersync][verify] Cross-crate integration suite for full runtime stack",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.6.3 --json and evidence/ft-e34d9.10.6.3/"
+    },
+    {
+      "id": "ft-e34d9.10.6.4",
+      "title": "[asupersync][verify] End-to-end runtime migration scripts and artifact contracts",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.6.4 --json and evidence/ft-e34d9.10.6.4/"
+    },
+    {
+      "id": "ft-e34d9.10.6.5",
+      "title": "[asupersync][verify] Unified unit/integration/e2e harness and structured logging contract",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.6.5 --json and evidence/ft-e34d9.10.6.5/"
+    },
+    {
+      "id": "ft-e34d9.10.6.6",
+      "title": "[asupersync][verify] Crash/restart persistence invariants and recovery replay gate",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.6.6 --json and evidence/ft-e34d9.10.6.6/"
+    },
+    {
+      "id": "ft-e34d9.10.7",
+      "title": "[asupersync][track] Observability, operability, and SLO gates",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.7 --json and evidence/ft-e34d9.10.7/"
+    },
+    {
+      "id": "ft-e34d9.10.7.1",
+      "title": "[asupersync][ops] Runtime telemetry schema and logging harmonization",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.7.1 --json and evidence/ft-e34d9.10.7.1/"
+    },
+    {
+      "id": "ft-e34d9.10.7.2",
+      "title": "[asupersync][ops] Health/doctor surfaces and incident bundle enrichment",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.7.2 --json and evidence/ft-e34d9.10.7.2/"
+    },
+    {
+      "id": "ft-e34d9.10.7.3",
+      "title": "[asupersync][ops] Runtime SLOs, alerts, and automated gate policies",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.7.3 --json and evidence/ft-e34d9.10.7.3/"
+    },
+    {
+      "id": "ft-e34d9.10.7.4",
+      "title": "[asupersync][ops] User-facing diagnostics and remediation UX certification",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.7.4 --json and evidence/ft-e34d9.10.7.4/"
+    },
+    {
+      "id": "ft-e34d9.10.7.5",
+      "title": "[asupersync][ops] Secret-safe diagnostics: redaction, privacy, and artifact hygiene gate",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.7.5 --json and evidence/ft-e34d9.10.7.5/"
+    },
+    {
+      "id": "ft-e34d9.10.8",
+      "title": "[asupersync][track] Dependency eradication and cutover governance",
+      "status": "open",
+      "priority": 2,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.8 --json and evidence/ft-e34d9.10.8/"
+    },
+    {
+      "id": "ft-e34d9.10.8.1",
+      "title": "[asupersync][cutover] Runtime dependency eradication (tokio/smol/async-io)",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.8.1 --json and evidence/ft-e34d9.10.8.1/"
+    },
+    {
+      "id": "ft-e34d9.10.8.2",
+      "title": "[asupersync][cutover] Compile-time/runtime guards against forbidden regressions",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.8.2 --json and evidence/ft-e34d9.10.8.2/"
+    },
+    {
+      "id": "ft-e34d9.10.8.3",
+      "title": "[asupersync][cutover] Canary rollout, rollback rehearsals, and fail-safe drills",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.8.3 --json and evidence/ft-e34d9.10.8.3/"
+    },
+    {
+      "id": "ft-e34d9.10.8.4",
+      "title": "[asupersync][cutover] Final go/no-go review and closure evidence package",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.8.4 --json and evidence/ft-e34d9.10.8.4/"
+    },
+    {
+      "id": "ft-e34d9.10.8.5",
+      "title": "[asupersync][cutover] Post-cutover soak and user-journey confidence gate",
+      "status": "open",
+      "priority": 1,
+      "assignee": null,
+      "completion_signal": 0.0,
+      "evidence_hint": "br show ft-e34d9.10.8.5 --json and evidence/ft-e34d9.10.8.5/"
+    }
+  ],
+  "blocked_count": 0,
+  "risk_ledger": [
+    {
+      "id": "R1",
+      "hazard": "Cx threading breaks function signatures across async modules",
+      "probability": 5,
+      "impact": 4,
+      "score": 20,
+      "mitigation": "Thread Cx through scope boundaries first, then leaf functions.",
+      "owner": "ft-e34d9.10.3"
+    },
+    {
+      "id": "R2",
+      "hazard": "select/join migration introduces cancellation bugs",
+      "probability": 4,
+      "impact": 5,
+      "score": 20,
+      "mitigation": "Catalog race sites and add cancellation-focused tests before/after migration.",
+      "owner": "ft-e34d9.10.3"
+    },
+    {
+      "id": "R3",
+      "hazard": "Broadcast migration breaks event bus fanout",
+      "probability": 4,
+      "impact": 4,
+      "score": 16,
+      "mitigation": "Prototype asupersync broadcast replacement in isolation before wide rollout.",
+      "owner": "ft-e34d9.10.2"
+    },
+    {
+      "id": "R4",
+      "hazard": "Signal handling gap blocks graceful shutdown",
+      "probability": 3,
+      "impact": 5,
+      "score": 15,
+      "mitigation": "Implement runtime_compat signal bridge with explicit shutdown assertions.",
+      "owner": "ft-e34d9.10.4"
+    },
+    {
+      "id": "R5",
+      "hazard": "Vendored smol surfaces delay runtime convergence",
+      "probability": 4,
+      "impact": 3,
+      "score": 12,
+      "mitigation": "Isolate vendored harmonization wave and lock interface contracts early.",
+      "owner": "ft-e34d9.10.5"
+    }
+  ],
+  "highest_risk": {
+    "id": "R2",
+    "hazard": "select/join migration introduces cancellation bugs",
+    "probability": 4,
+    "impact": 5,
+    "score": 20,
+    "mitigation": "Catalog race sites and add cancellation-focused tests before/after migration.",
+    "owner": "ft-e34d9.10.3"
+  },
+  "rollback_impact_tiers": [
+    {
+      "tier": "red",
+      "threshold_score": 20,
+      "action": "freeze merges touching runtime bootstrap, prioritize mitigation owner bead"
+    },
+    {
+      "tier": "amber",
+      "threshold_score": 15,
+      "action": "allow scoped merges with explicit risk evidence and rollback notes"
+    },
+    {
+      "tier": "green",
+      "threshold_score": 0,
+      "action": "normal execution with standard quality gates"
+    }
+  ],
+  "evidence_contract": {
+    "required_artifacts": [
+      "docs/asupersync-migration-scoreboard.json",
+      "docs/asupersync-migration-scoreboard.md",
+      "tests/e2e/test_asupersync_migration_scoreboard.sh"
+    ],
+    "structured_log_fields": [
+      "timestamp",
+      "component",
+      "scenario_id",
+      "correlation_id",
+      "decision_path",
+      "input_summary",
+      "outcome",
+      "reason_code",
+      "error_code",
+      "artifact_path"
+    ],
+    "heavy_compute_policy": "rch exec -- <command>"
+  }
+}
