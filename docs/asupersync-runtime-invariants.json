@@ -1,0 +1,148 @@
+{
+  "doctrine_version": "1.0.0",
+  "bead_id": "ft-e34d9.10.1.2",
+  "adr_ref": "docs/adr/0012-asupersync-runtime-doctrine.md",
+  "updated_at": "2026-02-25T00:00:00Z",
+  "invariants": [
+    {
+      "id": "INV-001",
+      "title": "Scope ownership is explicit",
+      "statement": "Long-lived loops and workers must have explicit scope ownership; detached task lifetimes are forbidden unless explicitly audited.",
+      "enforcement_level": "must",
+      "validation_hooks": [
+        "doctrine_pack_validation",
+        "shutdown_trace_validation"
+      ]
+    },
+    {
+      "id": "INV-002",
+      "title": "Capability context propagation is explicit",
+      "statement": "Runtime-effectful paths propagate Cx (or approved adapters). Cx::for_testing() remains test-only.",
+      "enforcement_level": "must",
+      "validation_hooks": [
+        "doctrine_pack_validation",
+        "integration_reference_check"
+      ]
+    },
+    {
+      "id": "INV-003",
+      "title": "Outcome semantics are preserved",
+      "statement": "Success, error, cancellation, and panic paths remain distinguishable in logs and contracts.",
+      "enforcement_level": "must",
+      "validation_hooks": [
+        "mapping_coverage_check",
+        "structured_log_contract_check"
+      ]
+    },
+    {
+      "id": "INV-004",
+      "title": "Cancellation boundaries are intentional",
+      "statement": "Cancellation checkpoints are explicit and positioned to avoid irreversible side-effect loss windows.",
+      "enforcement_level": "must",
+      "validation_hooks": [
+        "failure_injection_check",
+        "recovery_check"
+      ]
+    },
+    {
+      "id": "INV-005",
+      "title": "Runtime API access is centralized",
+      "statement": "Doctrine-compliant modules use runtime_compat/cx boundaries rather than ad hoc mixed runtime calls.",
+      "enforcement_level": "must",
+      "validation_hooks": [
+        "baseline_reference_check",
+        "inventory_surface_check"
+      ]
+    }
+  ],
+  "legacy_to_target_map": [
+    {
+      "legacy_pattern": "tokio::spawn",
+      "target_pattern": "scope-owned spawn / cx::spawn_with_cx",
+      "required_behavior": "No orphan tasks; explicit ownership and cancellation lifecycle.",
+      "user_visible_change": "Shutdown progress reports identify owning scope and reason codes."
+    },
+    {
+      "legacy_pattern": "tokio::select!",
+      "target_pattern": "asupersync race/select with explicit cancellation handling",
+      "required_behavior": "No dropped critical messages during race resolution.",
+      "user_visible_change": "Cancellation outcomes are deterministic and reason-coded."
+    },
+    {
+      "legacy_pattern": "tokio::time::sleep/timeout",
+      "target_pattern": "runtime_compat::sleep/timeout then Cx-aware adapters",
+      "required_behavior": "Deterministic timeout behavior with structured error taxonomy.",
+      "user_visible_change": "Timeout failures include actionable reason and remediation hints."
+    },
+    {
+      "legacy_pattern": "lossy channel/send/write sequences",
+      "target_pattern": "reserve/commit or equivalent guarded sequencing",
+      "required_behavior": "No silent cancellation-loss windows in command/event paths.",
+      "user_visible_change": "Event/command delivery failures are explicit, never silent."
+    },
+    {
+      "legacy_pattern": "ambient runtime bootstrap",
+      "target_pattern": "unified runtime bootstrap policy",
+      "required_behavior": "Single startup/shutdown policy surface per process role.",
+      "user_visible_change": "Consistent startup and shutdown status messaging across CLI/watch/robot/web."
+    }
+  ],
+  "anti_patterns": [
+    {
+      "id": "AP-001",
+      "description": "New direct tokio::* usage in doctrine-migrated modules."
+    },
+    {
+      "id": "AP-002",
+      "description": "Mixed direct asupersync::* and runtime_compat::* usage without explicit boundary rationale."
+    },
+    {
+      "id": "AP-003",
+      "description": "Cx::for_testing() appearing in non-test production paths."
+    },
+    {
+      "id": "AP-004",
+      "description": "Detached spawn without ownership/cancellation narrative."
+    },
+    {
+      "id": "AP-005",
+      "description": "Cancellation/panic collapsed into generic errors that erase reason visibility."
+    }
+  ],
+  "user_facing_guarantees": [
+    {
+      "id": "UG-001",
+      "title": "No silent command/event loss",
+      "contract": "Command/event paths must report cancellation and delivery outcomes explicitly.",
+      "operator_signal": "reason_code plus correlation_id in structured logs"
+    },
+    {
+      "id": "UG-002",
+      "title": "Deterministic shutdown messaging",
+      "contract": "Shutdown progression must remain visible with reason-coded final state.",
+      "operator_signal": "stage transition logs with decision_path"
+    },
+    {
+      "id": "UG-003",
+      "title": "Actionable failure guidance",
+      "contract": "Failure responses include reason code, concise remediation hint, and evidence reference.",
+      "operator_signal": "error_code plus artifact_path in structured logs"
+    }
+  ],
+  "structured_log_contract": {
+    "component": "asupersync_runtime_doctrine.e2e",
+    "required_fields": [
+      "timestamp",
+      "component",
+      "scenario_id",
+      "correlation_id",
+      "decision_path",
+      "input_summary",
+      "outcome",
+      "reason_code",
+      "error_code",
+      "artifact_path"
+    ],
+    "secret_safe_redaction_required": true
+  }
+}

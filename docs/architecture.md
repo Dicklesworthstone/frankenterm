@@ -97,7 +97,9 @@ The migration baseline for runtime convergence is documented in
 `docs/asupersync-migration-baseline.md`.
 It is the canonical source for:
 - inventory truth (`docs/asupersync-runtime-inventory.json`)
-- doctrine invariants (`Cx` propagation, scope ownership, cancellation boundaries)
+- doctrine ADR (`docs/adr/0012-asupersync-runtime-doctrine.md`)
+- machine-readable invariants (`docs/asupersync-runtime-invariants.json`)
+- migration scoreboard (`docs/asupersync-migration-scoreboard.json`, `docs/asupersync-migration-scoreboard.md`)
 - risk ledger and sequencing scorecard used by downstream `ft-e34d9.*` beads
 
 ## Library integration map (Appendix F)

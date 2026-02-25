@@ -1,0 +1,165 @@
+{
+  "contract_id": "ft.runtime.doctrine.v1",
+  "version": "1.0.0",
+  "status": "accepted-baseline",
+  "bead_id": "ft-e34d9.10.1.2",
+  "last_updated": "2026-02-25",
+  "scope": "FrankenTerm async runtime doctrine for asupersync migration",
+  "invariants": [
+    {
+      "id": "I1",
+      "title": "Single Runtime Boundary",
+      "invariant": "Production async primitives must enter via runtime_compat or explicit asupersync boundary adapters.",
+      "enforcement": "forbid_new_direct_tokio_calls_outside_runtime_compat"
+    },
+    {
+      "id": "I2",
+      "title": "Scope-Owned Task Lifetimes",
+      "invariant": "Spawned tasks require explicit scope ownership and deterministic shutdown behavior.",
+      "enforcement": "scope_ownership_required_for_spawn_paths"
+    },
+    {
+      "id": "I3",
+      "title": "Explicit Cx Propagation",
+      "invariant": "Runtime-effectful async paths require explicit Cx threading or an approved wrapper.",
+      "enforcement": "cx_required_in_runtime_effectful_paths"
+    },
+    {
+      "id": "I4",
+      "title": "Outcome Semantics Preservation",
+      "invariant": "Success, error, cancellation, and panic pathways remain distinguishable at scope boundaries.",
+      "enforcement": "no_silent_outcome_collapse"
+    },
+    {
+      "id": "I5",
+      "title": "Cancellation-Safe Messaging",
+      "invariant": "Cancellation-sensitive send/write paths must use reserve/commit or equivalent guarded sequencing.",
+      "enforcement": "reserve_commit_or_equivalent_required"
+    },
+    {
+      "id": "I6",
+      "title": "Deterministic Shutdown Signals",
+      "invariant": "CLI, robot, and watcher shutdown transitions must emit deterministic state/reason signaling.",
+      "enforcement": "stable_shutdown_reason_and_phase_contract"
+    }
+  ],
+  "anti_patterns": [
+    {
+      "id": "A1",
+      "pattern": "Direct tokio::* usage added in doctrine-migrated production modules",
+      "review_action": "reject"
+    },
+    {
+      "id": "A2",
+      "pattern": "Detached spawn with no owner/cancellation narrative",
+      "review_action": "reject"
+    },
+    {
+      "id": "A3",
+      "pattern": "Outcome::Cancelled / Outcome::Panicked collapsed into generic error without reason propagation",
+      "review_action": "reject"
+    },
+    {
+      "id": "A4",
+      "pattern": "Cancellation-sensitive channel send/write with no reserve/commit guard",
+      "review_action": "reject"
+    },
+    {
+      "id": "A5",
+      "pattern": "Ambient runtime handles/builders introduced outside approved bootstrap surfaces",
+      "review_action": "reject"
+    }
+  ],
+  "legacy_to_target_mapping": [
+    {
+      "semantic_key": "spawn",
+      "legacy_pattern": "tokio::spawn(...) detached from call-site context",
+      "target_pattern": "scope-owned spawn via cx::spawn_with_cx or explicit scope bridge",
+      "user_visible_behavior_change": "owned-task shutdown reporting prevents silent orphan work"
+    },
+    {
+      "semantic_key": "select",
+      "legacy_pattern": "tokio::select! race with implicit cancellation branch-loss risk",
+      "target_pattern": "explicit race/select semantics with cancellation checkpoints",
+      "user_visible_behavior_change": "reduced silent branch-loss with explicit cancellation diagnostics"
+    },
+    {
+      "semantic_key": "timeout",
+      "legacy_pattern": "ad-hoc tokio timeout handling with inconsistent errors",
+      "target_pattern": "runtime_compat timeout + stable reason/error mapping",
+      "user_visible_behavior_change": "timeout failures emit deterministic reason/error codes"
+    },
+    {
+      "semantic_key": "channel",
+      "legacy_pattern": "single-phase tx.send().await in cancellation-sensitive paths",
+      "target_pattern": "reserve/commit two-phase send semantics",
+      "user_visible_behavior_change": "no silent command/event loss across cancellation windows"
+    },
+    {
+      "semantic_key": "shutdown",
+      "legacy_pattern": "runtime drop-driven implicit shutdown behavior",
+      "target_pattern": "scope-directed teardown with explicit lifecycle phases",
+      "user_visible_behavior_change": "deterministic shutdown messaging and operator recovery hints"
+    }
+  ],
+  "user_facing_guarantees": [
+    {
+      "id": "no_silent_command_event_loss",
+      "guarantee": "Cancellation-sensitive send/write flows will not silently lose command/event payloads."
+    },
+    {
+      "id": "deterministic_shutdown_messaging",
+      "guarantee": "Shutdown transitions expose deterministic phase + reason signals for operators and robot clients."
+    },
+    {
+      "id": "actionable_error_contract",
+      "guarantee": "Runtime migration paths emit stable reason/error codes with actionable remediation hints."
+    }
+  ],
+  "representative_modules": [
+    {
+      "path": "crates/frankenterm-core/src/cpu_pressure.rs",
+      "must_contain_any": [
+        "runtime_compat::sleep"
+      ],
+      "must_not_contain": [
+        "tokio::"
+      ]
+    },
+    {
+      "path": "crates/frankenterm-core/src/memory_pressure.rs",
+      "must_contain_any": [
+        "runtime_compat::sleep"
+      ],
+      "must_not_contain": [
+        "tokio::"
+      ]
+    },
+    {
+      "path": "crates/frankenterm-core/src/survival.rs",
+      "must_contain_any": [
+        "runtime_compat::sleep"
+      ],
+      "must_not_contain": [
+        "tokio::"
+      ]
+    }
+  ],
+  "validation_contract": {
+    "unit": "bash scripts/validate_asupersync_doctrine_pack.sh --self-test",
+    "integration": "bash scripts/validate_asupersync_doctrine_pack.sh",
+    "e2e": "bash tests/e2e/test_ft_e34d9_10_1_2_doctrine_pack.sh",
+    "structured_log_fields": [
+      "timestamp",
+      "component",
+      "scenario_id",
+      "correlation_id",
+      "decision_path",
+      "input_summary",
+      "outcome",
+      "reason_code",
+      "error_code",
+      "artifact_path"
+    ]
+  }
+}

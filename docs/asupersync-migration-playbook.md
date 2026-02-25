@@ -1,4 +1,4 @@
-# asupersync Runtime Migration Playbook (wa-e34d9)
+# asupersync Runtime Migration Playbook (ft-e34d9)
 
 This document is an operator/developer playbook for migrating FrankenTerm from `tokio` to `asupersync`.
 
@@ -7,7 +7,7 @@ mechanical rewrite patterns, and lists “gotchas” that tend to cause long-tai
 
 ## Scope
 
-`wa-e34d9` is the umbrella epic: **replace all tokio usage** across the workspace with asupersync concepts:
+`ft-e34d9` is the umbrella epic: **replace all tokio usage** across the workspace with asupersync concepts:
 
 - runtime entrypoints (`#[tokio::main]`, `Runtime`, `spawn`)
 - sync primitives (`Mutex`, `RwLock`, `Semaphore`, atomics + notify patterns)
@@ -19,6 +19,18 @@ mechanical rewrite patterns, and lists “gotchas” that tend to cause long-tai
 
 This playbook assumes we will run **dual-runtime** during the transition (feature gated), so we can land work
 incrementally while keeping `main` green.
+
+## Doctrine Contract Inputs
+
+Before implementing migration slices, use these baseline contracts as the source of truth:
+
+1. `docs/adr/0012-asupersync-runtime-doctrine.md` (normative runtime doctrine)
+2. `docs/asupersync-runtime-invariants.json` (machine-readable invariants and anti-patterns)
+3. `docs/asupersync-migration-baseline.md` (risk/sequencing baseline)
+4. `tests/e2e/test_asupersync_runtime_doctrine.sh` (doctrine contract validator with failure/recovery scenarios)
+5. `docs/asupersync-migration-scoreboard.json` and `docs/asupersync-migration-scoreboard.md` (live scoreboard + risk tracking)
+
+When in doubt, update doctrine first, then implementation.
 
 ## Terminology (asupersync mental model)
 
@@ -105,6 +117,16 @@ These areas tend to cause the most merge conflicts if multiple agents work witho
 
 Use Agent Mail file reservations aggressively around those files, and prefer “small vertical slices” per bead.
 
+## Validation Policy Reminder
+
+- Heavy compile/test/clippy workloads must run via `rch exec -- <command>`.
+- Keep command records and artifact paths in bead evidence/comments for auditability.
+- Validation logs must follow structured fields and secret-safe redaction gates.
+- Enforce classifier/evidence rules via:
+  - `docs/asupersync-rch-execution-policy.md`
+  - `scripts/validate_asupersync_rch_execution_policy.sh`
+  - `tests/e2e/test_asupersync_rch_execution_policy.sh`
+
 ## Suggested Inventory Commands
 
 These are intended for quick sizing and routing work to beads:
@@ -120,4 +142,3 @@ rg -n "async fn" crates frankenterm
 - Avoid landing partial feature‑flag wiring without the accompanying `cargo check --all-targets` pass.
 - If the shared checkout is dirty on reserved files, **do not** “clean it up” for someone else; message the
 reservation holder and wait, or work on docs/specs that don’t touch those paths.
-

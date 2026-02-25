@@ -6,9 +6,19 @@
 
 **Bead:** ft-e34d9.10.1
 **Status:** Living document (update as migration progresses)
+**Contract ID:** `ft.runtime.doctrine.v1`
+**Contract Version:** `1.0.0`
+**Doctrinal Pack Owner Bead:** `ft-e34d9.10.1.2`
 **Companion files:**
 - `docs/asupersync-migration-playbook.md` — mechanical rewrite patterns
 - `docs/asupersync-runtime-inventory.json` — machine-readable snapshot
+- `docs/asupersync-runtime-doctrine-v1.json` — versioned doctrine/invariants pack
+- `docs/asupersync-migration-scoreboard.json` — machine-readable progress/risk scoreboard
+- `docs/asupersync-migration-scoreboard.md` — operator-facing progress/risk scoreboard
+- `scripts/validate_asupersync_doctrine_pack.sh` — doctrine validator (unit/integration checks)
+- `scripts/generate_asupersync_migration_scoreboard.sh` — scoreboard generator
+- `tests/e2e/test_ft_e34d9_10_1_2_doctrine_pack.sh` — doctrine e2e + failure injection
+- `tests/e2e/test_asupersync_migration_scoreboard.sh` — scoreboard e2e + failure injection
 
 ---
 
@@ -75,6 +85,20 @@ All effects are gated through the Cx capability token. This enables:
 - Deterministic testing via LabRuntime
 - Per-scope resource budgets
 - Auditable task ownership
+
+### 1.7 Anti-Patterns (Reject in Review)
+
+1. Introducing new direct `tokio::*` usage in non-`runtime_compat` production modules.
+2. Spawning detached tasks without explicit scope ownership and shutdown semantics.
+3. Collapsing `Outcome::{Cancelled, Panicked}` into generic errors without preserving reason in logs.
+4. Performing cancellation-sensitive sends/writes without reserve/commit or equivalent guarded sequencing.
+5. Introducing ambient runtime state (global handles/builders) outside approved bootstrap boundaries.
+
+### 1.8 User-Facing Guarantees
+
+1. No silent command/event loss during cancellation-sensitive send/write workflows.
+2. Deterministic shutdown messaging and state transitions for CLI/robot/watcher paths.
+3. Actionable errors: failures surface stable reason/error codes and remediation hints.
 
 ---
 
@@ -156,6 +180,16 @@ asupersync           tokio (fallback)
 | wezterm.rs | sleep, timeout, process::Command | -- |
 | workflows.rs | sleep | -- |
 
+### 2.4 Legacy-to-Doctrine Semantic Mapping
+
+| Legacy semantics | Doctrine target | User-visible behavior change |
+|---|---|---|
+| `tokio::spawn(...)` detached from call-site context | scope-owned spawn (`cx::spawn_with_cx` / explicit scope owner) | orphan/background task behavior becomes auditable; shutdown now reports outstanding owned tasks |
+| `tokio::select!` race + implicit cancellation | explicit race/select with cancellation checkpoints | reduced silent branch-loss; cancellation outcomes surface as explicit diagnostic events |
+| ad-hoc `tokio::time::timeout` error handling | `runtime_compat::timeout` + stable reason/error mapping | timeout failures include deterministic reason/error codes instead of ad-hoc strings |
+| direct `tx.send().await` on cancellation-sensitive paths | reserve/commit two-phase channel semantics | no silent message loss on mid-send cancellation windows |
+| implicit shutdown via dropped runtimes/tasks | explicit scope teardown + deterministic lifecycle transitions | operator/robot clients receive stable shutdown phase messaging and recovery hints |
+
 ---
 
 ## 3. Dependency Inventory Summary
@@ -164,38 +198,38 @@ asupersync           tokio (fallback)
 
 | Pattern | References | Files |
 |---------|:-:|:-:|
-| `tokio::` | 1,234 | 73 |
-| `runtime_compat::` | 476 | 72 |
-| `asupersync::` | 246 | 31 |
-| `smol::` | 68 | 12 |
+| `tokio::` | 1,272 | 76 |
+| `runtime_compat::` | 547 | 74 |
+| `asupersync::` | 166 | 32 |
+| `smol::` | 68 | 11 |
 
 ### 3.2 By Crate
 
 | Crate | tokio | runtime_compat | asupersync | smol |
 |-------|:-:|:-:|:-:|:-:|
-| frankenterm-core | 1,234 | 430 | 119 | 0 |
-| frankenterm (binary) | 0 | 46 | 120 | 0 |
+| frankenterm-core | 1,243 | 440 | 124 | 0 |
+| frankenterm (binary) | 29 | 107 | 35 | 0 |
 | frankenterm/ssh | 0 | 0 | 2 | 44 |
 | frankenterm/codec | 0 | 0 | 1 | 12 |
 | frankenterm/config | 0 | 0 | 0 | 5 |
-| frankenterm/pty | 0 | 0 | 0 | 4 |
+| frankenterm/pty | 0 | 0 | 0 | 5 |
 | frankenterm/scripting | 0 | 0 | 0 | 2 |
-| frankenterm/mux | 0 | 0 | 0 | 1 |
+| frankenterm/promise | 0 | 0 | 2 | 0 |
 
 ### 3.3 Hotspot Files (top 10 by runtime references)
 
 | File | Refs | Notes |
 |------|:-:|---|
-| runtime_compat.rs | 213 | Abstraction layer itself |
-| main.rs | 166 | Binary entrypoint; uses asupersync |
+| runtime_compat.rs | 215 | Abstraction layer itself |
+| main.rs | 171 | Binary entrypoint; mixed migration hotspot |
 | storage.rs | 86 | Heavy channel + spawn usage |
-| workflows.rs | 82 | Sleep + channel patterns |
+| workflows.rs | 86 | Sleep + channel patterns |
 | pool.rs | 65 | Mutex + Semaphore |
+| proptest_runtime_compat.rs | 59 | Runtime-compat stress/property test surface |
 | snapshot_engine.rs | 54 | Full primitive spread |
 | wezterm.rs | 46 | Backend adapter |
 | tantivy_ingest.rs | 46 | Feature-gated (recorder-lexical) |
 | tantivy_reindex.rs | 45 | Feature-gated (recorder-lexical) |
-| simulation.rs | 42 | Test infrastructure |
 
 ### 3.4 Test Infrastructure
 
@@ -251,6 +285,16 @@ Impact  5 |         R4    R2
 ---
 
 ## 5. Migration Scorecard
+
+Operational source of truth for live completion state is generated from Beads into:
+- `docs/asupersync-migration-scoreboard.json`
+- `docs/asupersync-migration-scoreboard.md`
+
+Generate/validate with:
+```bash
+bash scripts/generate_asupersync_migration_scoreboard.sh
+bash tests/e2e/test_asupersync_migration_scoreboard.sh
+```
 
 ### 5.1 Phase Completion
 
