@@ -2299,14 +2299,28 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
         }
     }
 
-    // Check command patterns (regex)
+    // Check command patterns (regex) — cached to avoid recompilation on every policy check
     if !match_on.command_patterns.is_empty() {
         match &input.command_text {
             Some(text) => {
-                let matches_any = match_on
-                    .command_patterns
-                    .iter()
-                    .any(|pattern| Regex::new(pattern).is_ok_and(|re| re.is_match(text)));
+                thread_local! {
+                    static CMD_REGEX_CACHE: std::cell::RefCell<crate::lru_cache::LruCache<String, Regex>> =
+                        std::cell::RefCell::new(crate::lru_cache::LruCache::new(128));
+                }
+                let matches_any = match_on.command_patterns.iter().any(|pattern| {
+                    CMD_REGEX_CACHE.with(|cache| {
+                        let mut cache = cache.borrow_mut();
+                        if let Some(re) = cache.get(pattern) {
+                            return re.is_match(text);
+                        }
+                        if let Ok(re) = Regex::new(pattern) {
+                            let is_match = re.is_match(text);
+                            cache.put(pattern.clone(), re);
+                            return is_match;
+                        }
+                        false
+                    })
+                });
                 if !matches_any {
                     return false;
                 }
@@ -2337,6 +2351,9 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
 /// Simple glob pattern matching
 ///
 /// Supports `*` (any characters) and `?` (single character)
+///
+/// Uses a thread-local LRU cache to avoid recompiling the same glob-derived
+/// regex on every policy evaluation.
 fn glob_match(pattern: &str, text: &str) -> bool {
     let mut regex_pattern = String::with_capacity(pattern.len() + 4);
     regex_pattern.push('^');
@@ -2352,7 +2369,24 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         }
     }
     regex_pattern.push('$');
-    Regex::new(&regex_pattern).is_ok_and(|re| re.is_match(text))
+
+    thread_local! {
+        static GLOB_REGEX_CACHE: std::cell::RefCell<crate::lru_cache::LruCache<String, Regex>> =
+            std::cell::RefCell::new(crate::lru_cache::LruCache::new(128));
+    }
+
+    GLOB_REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(re) = cache.get(&regex_pattern) {
+            return re.is_match(text);
+        }
+        if let Ok(re) = Regex::new(&regex_pattern) {
+            let is_match = re.is_match(text);
+            cache.put(regex_pattern, re);
+            return is_match;
+        }
+        false
+    })
 }
 
 // ============================================================================

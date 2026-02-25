@@ -24,7 +24,8 @@ const INDEX_FORMAT_VERSION: u32 = 1;
 const ONE_DAY_MS: i64 = 86_400_000;
 const DEFAULT_PROMPT_PATTERN: &str = r"^\s*[\w\-./:@~]+\s*[$#>]\s*$";
 
-static DEFAULT_PROMPT_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(DEFAULT_PROMPT_PATTERN).unwrap());
+static DEFAULT_PROMPT_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(DEFAULT_PROMPT_PATTERN).unwrap());
 
 /// Logical document source used for filtering and diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -957,9 +958,21 @@ pub fn extract_command_output_blocks(
     let prompt_regex = if config.prompt_pattern == DEFAULT_PROMPT_PATTERN {
         Some(DEFAULT_PROMPT_REGEX.clone())
     } else {
-        Regex::new(&config.prompt_pattern)
-            .ok()
-            .or_else(|| Some(DEFAULT_PROMPT_REGEX.clone()))
+        thread_local! {
+            static CUSTOM_PROMPT_CACHE: std::cell::RefCell<crate::lru_cache::LruCache<String, Regex>> =
+                std::cell::RefCell::new(crate::lru_cache::LruCache::new(16));
+        }
+        CUSTOM_PROMPT_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(re) = cache.get(&config.prompt_pattern) {
+                Some(re.clone())
+            } else if let Ok(re) = Regex::new(&config.prompt_pattern) {
+                cache.put(config.prompt_pattern.clone(), re.clone());
+                Some(re)
+            } else {
+                Some(DEFAULT_PROMPT_REGEX.clone())
+            }
+        })
     };
     let mut docs = Vec::new();
     let mut current_lines: Vec<String> = Vec::new();

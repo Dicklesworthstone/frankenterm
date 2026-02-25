@@ -51,6 +51,7 @@ fn fx_hash_u64(key: u64) -> usize {
 /// Generic hash for non-u64 keys.
 #[inline]
 fn hash_key<K: Hash>(key: &K, shard_count: usize) -> usize {
+    assert!(shard_count > 0, "shard_count must be > 0");
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
     (hasher.finish() as usize) % shard_count

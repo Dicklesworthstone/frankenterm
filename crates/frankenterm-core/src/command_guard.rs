@@ -940,6 +940,9 @@ impl CommandGuard {
                 .as_secs(),
         };
 
+        if self.policy.audit_capacity == 0 {
+            return;
+        }
         if self.audit_log.len() < self.policy.audit_capacity {
             self.audit_log.push(entry);
         } else {

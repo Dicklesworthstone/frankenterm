@@ -1335,6 +1335,7 @@ struct LatencyWindow {
 
 impl LatencyWindow {
     fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             samples: Vec::with_capacity(capacity),
             pos: 0,

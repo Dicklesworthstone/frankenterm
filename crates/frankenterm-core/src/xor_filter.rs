@@ -203,7 +203,7 @@ impl XorFilter {
     /// or with probability ≈ 1/256 for keys not in the set.
     #[must_use]
     pub fn contains(&self, key: u64) -> bool {
-        if self.fingerprints.is_empty() {
+        if self.fingerprints.is_empty() || self.block_length == 0 {
             return false;
         }
 
@@ -376,7 +376,7 @@ impl XorFilter16 {
     /// FP rate ≈ 1/65535 ≈ 0.0015%.
     #[must_use]
     pub fn contains(&self, key: u64) -> bool {
-        if self.fingerprints.is_empty() {
+        if self.fingerprints.is_empty() || self.block_length == 0 {
             return false;
         }
 

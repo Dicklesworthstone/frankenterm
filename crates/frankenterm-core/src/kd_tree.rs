@@ -114,8 +114,13 @@ pub struct KdTree<P, V> {
 
 impl<P: Point, V: Clone> KdTree<P, V> {
     /// Creates an empty KD-tree with the given dimensionality.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dims` is zero.
     #[must_use]
     pub fn new(dims: usize) -> Self {
+        assert!(dims > 0, "KdTree dimensionality must be > 0");
         Self {
             nodes: Vec::new(),
             root: None,
@@ -124,8 +129,13 @@ impl<P: Point, V: Clone> KdTree<P, V> {
     }
 
     /// Builds a KD-tree from a collection of (point, value) pairs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dims` is zero.
     #[must_use]
     pub fn build(items: Vec<(P, V)>, dims: usize) -> Self {
+        assert!(dims > 0, "KdTree dimensionality must be > 0");
         if items.is_empty() {
             return Self::new(dims);
         }

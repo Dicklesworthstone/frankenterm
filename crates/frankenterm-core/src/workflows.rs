@@ -1742,9 +1742,24 @@ impl Workflow for DescriptorWorkflow {
                         DescriptorMatcher::Substring { value } => {
                             actual_text.contains(value.as_str())
                         }
-                        DescriptorMatcher::Regex { pattern } => fancy_regex::Regex::new(&pattern)
-                            .map(|re| re.is_match(&actual_text).unwrap_or(false))
-                            .unwrap_or(false),
+                        DescriptorMatcher::Regex { pattern } => {
+                            thread_local! {
+                                static DESC_REGEX_CACHE: std::cell::RefCell<crate::lru_cache::LruCache<String, fancy_regex::Regex>> =
+                                    std::cell::RefCell::new(crate::lru_cache::LruCache::new(64));
+                            }
+                            DESC_REGEX_CACHE.with(|cache| {
+                                let mut cache = cache.borrow_mut();
+                                if let Some(re) = cache.get(&pattern) {
+                                    return re.is_match(&actual_text).unwrap_or(false);
+                                }
+                                if let Ok(re) = fancy_regex::Regex::new(&pattern) {
+                                    let is_match = re.is_match(&actual_text).unwrap_or(false);
+                                    cache.put(pattern.clone(), re);
+                                    return is_match;
+                                }
+                                false
+                            })
+                        }
                     };
                     if matches {
                         StepResult::cont()
@@ -4504,25 +4519,50 @@ fn truncate_snippet(s: &str, max_len: usize) -> String {
     let trimmed = s.trim();
     if trimmed.len() <= max_len {
         trimmed.to_string()
+    } else if max_len == 0 {
+        String::new()
+    } else if max_len <= 3 {
+        ".".repeat(max_len)
     } else {
-        format!("{}...", &trimmed[..max_len.saturating_sub(3)])
+        let prefix_budget = max_len - 3;
+        let mut end = 0usize;
+        for ch in trimmed.chars() {
+            let next = end.saturating_add(ch.len_utf8());
+            if next > prefix_budget {
+                break;
+            }
+            end = next;
+        }
+
+        let mut out = trimmed[..end].to_string();
+        out.push_str("...");
+        out
     }
 }
 
 /// Regex patterns for text-based scanning (fallback when ast-grep is not available).
+///
+/// Hoisted into `LazyLock` statics so each regex is compiled exactly once.
 struct TextScanPatterns {
-    todo: regex::Regex,
-    panic_site: regex::Regex,
-    suppressed_error: regex::Regex,
+    todo: &'static regex::Regex,
+    panic_site: &'static regex::Regex,
+    suppressed_error: &'static regex::Regex,
 }
+
+static TEXT_SCAN_TODO: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)\b(TODO|FIXME|HACK|XXX)\b").expect("valid regex"));
+static TEXT_SCAN_PANIC_SITE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\b(unwrap|expect|panic!)\s*\(").expect("valid regex"));
+static TEXT_SCAN_SUPPRESSED_ERROR: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"let\s+_\s*=.*\?|let\s+_\s*=.*\.unwrap").expect("valid regex")
+});
 
 impl TextScanPatterns {
     fn new() -> Self {
         Self {
-            todo: regex::Regex::new(r"(?i)\b(TODO|FIXME|HACK|XXX)\b").expect("valid regex"),
-            panic_site: regex::Regex::new(r"\b(unwrap|expect|panic!)\s*\(").expect("valid regex"),
-            suppressed_error: regex::Regex::new(r"let\s+_\s*=.*\?|let\s+_\s*=.*\.unwrap")
-                .expect("valid regex"),
+            todo: &TEXT_SCAN_TODO,
+            panic_site: &TEXT_SCAN_PANIC_SITE,
+            suppressed_error: &TEXT_SCAN_SUPPRESSED_ERROR,
         }
     }
 }
@@ -14078,6 +14118,23 @@ steps:
         let result = truncate_snippet(&long, 20);
         assert!(result.len() <= 20);
         assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_snippet_small_limit_stays_bounded() {
+        let long = "abcdef";
+        assert_eq!(truncate_snippet(long, 0), "");
+        assert_eq!(truncate_snippet(long, 1), ".");
+        assert_eq!(truncate_snippet(long, 2), "..");
+        assert_eq!(truncate_snippet(long, 3), "...");
+    }
+
+    #[test]
+    fn truncate_snippet_unicode_boundary_safe() {
+        let emoji = "😀😀😀😀";
+        let result = truncate_snippet(emoji, 7);
+        assert_eq!(result, "😀...");
+        assert!(result.len() <= 7);
     }
 
     #[test]
