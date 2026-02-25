@@ -1324,9 +1324,20 @@ impl StreamingHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::CompatRuntime;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build runtime for tailer tests");
+        runtime.block_on(future);
+    }
 
     fn make_pane(id: u64) -> PaneInfo {
         PaneInfo {
@@ -1489,234 +1500,249 @@ mod tests {
         assert_eq!(tailer.current_interval, config.max_interval);
     }
 
-    #[tokio::test]
-    async fn supervisor_sync_tailers() {
-        let config = TailerConfig::default();
-        let (tx, _rx) = mpsc::channel(10);
-        let cursors = Arc::new(RwLock::new(HashMap::new()));
-        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let source = Arc::new(StaticSource);
+    #[test]
+    fn supervisor_sync_tailers() {
+        run_async_test(async {
+            let config = TailerConfig::default();
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
 
-        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
-        assert_eq!(supervisor.active_count(), 0);
+            assert_eq!(supervisor.active_count(), 0);
 
-        // Add some panes
-        let mut panes = HashMap::new();
-        panes.insert(1, make_pane(1));
-        panes.insert(2, make_pane(2));
+            // Add some panes
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            panes.insert(2, make_pane(2));
 
-        supervisor.sync_tailers(&panes);
-        assert_eq!(supervisor.active_count(), 2);
+            supervisor.sync_tailers(&panes);
+            assert_eq!(supervisor.active_count(), 2);
 
-        // Remove a pane
-        panes.remove(&1);
-        supervisor.sync_tailers(&panes);
-        assert_eq!(supervisor.active_count(), 1);
+            // Remove a pane
+            panes.remove(&1);
+            supervisor.sync_tailers(&panes);
+            assert_eq!(supervisor.active_count(), 1);
+        });
     }
 
-    #[tokio::test]
-    async fn supervisor_respects_concurrency_limit() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let max = Arc::new(AtomicUsize::new(0));
-        let source = Arc::new(CountingSource::new(
-            Arc::clone(&active),
-            Arc::clone(&max),
-            Duration::from_millis(20),
-        ));
+    #[test]
+    fn supervisor_respects_concurrency_limit() {
+        run_async_test(async {
+            let active = Arc::new(AtomicUsize::new(0));
+            let max = Arc::new(AtomicUsize::new(0));
+            let source = Arc::new(CountingSource::new(
+                Arc::clone(&active),
+                Arc::clone(&max),
+                Duration::from_millis(20),
+            ));
 
-        let config = TailerConfig {
-            min_interval: Duration::from_millis(1),
-            max_interval: Duration::from_millis(50),
-            max_concurrent: 2,
-            send_timeout: Duration::from_millis(50),
-            ..Default::default()
-        };
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 2,
+                send_timeout: Duration::from_millis(50),
+                ..Default::default()
+            };
 
-        let (tx, _rx) = mpsc::channel(10);
-        let cursors = Arc::new(RwLock::new(HashMap::new()));
-        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
 
-        {
-            let mut cursor_guard = cursors.write().await;
-            for pane_id in 1..=4 {
-                cursor_guard.insert(pane_id, PaneCursor::new(pane_id));
+            {
+                let mut cursor_guard = cursors.write().await;
+                for pane_id in 1..=4 {
+                    cursor_guard.insert(pane_id, PaneCursor::new(pane_id));
+                }
             }
-        }
 
-        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
-        let mut panes = HashMap::new();
-        for pane_id in 1..=4 {
-            panes.insert(pane_id, make_pane(pane_id));
-        }
-        supervisor.sync_tailers(&panes);
+            let mut panes = HashMap::new();
+            for pane_id in 1..=4 {
+                panes.insert(pane_id, make_pane(pane_id));
+            }
+            supervisor.sync_tailers(&panes);
 
-        let mut poll_tasks = TailerPollTaskSet::new();
-        supervisor.spawn_ready(&mut poll_tasks);
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
 
-        // Wait for a bit to let tasks start
-        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            // Wait for a bit to let tasks start
+            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
-        let max_seen = max.load(Ordering::SeqCst);
-        assert!(max_seen <= 2, "max concurrency observed: {max_seen}");
+            let max_seen = max.load(Ordering::SeqCst);
+            assert!(max_seen <= 2, "max concurrency observed: {max_seen}");
 
-        // Cleanup
-        while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+            // Cleanup
+            while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
+        });
+    }
+
+    #[test]
+    fn supervisor_spawns_higher_priority_panes_first() {
+        run_async_test(async {
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 1,
+                send_timeout: Duration::from_millis(50),
+                ..Default::default()
+            };
+
+            let (tx, rx) = mpsc::channel(10);
+            let _keep_rx_alive = rx;
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
+
+            {
+                let mut cursor_guard = cursors.write().await;
+                cursor_guard.insert(1, PaneCursor::new(1));
+                cursor_guard.insert(2, PaneCursor::new(2));
+            }
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            panes.insert(2, make_pane(2));
+            supervisor.sync_tailers(&panes);
+
+            // Lower value => higher priority. Pane 2 should be spawned before pane 1.
+            supervisor.update_pane_priorities(HashMap::from([(1, 100), (2, 10)]));
+
+            // Wait for tailers to become ready to poll.
+            crate::runtime_compat::sleep(Duration::from_millis(2)).await;
+
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
+
+            let (pane_id, outcome) = poll_tasks.join_next().await.expect("expected one task");
             supervisor.handle_poll_result(pane_id, outcome);
-        }
+
+            assert_eq!(pane_id, 2, "higher priority pane should spawn first");
+        });
     }
 
-    #[tokio::test]
-    async fn supervisor_spawns_higher_priority_panes_first() {
-        let config = TailerConfig {
-            min_interval: Duration::from_millis(1),
-            max_interval: Duration::from_millis(50),
-            max_concurrent: 1,
-            send_timeout: Duration::from_millis(50),
-            ..Default::default()
-        };
+    #[test]
+    fn supervisor_backpressure_records_timeout() {
+        run_async_test(async {
+            // Use a slow source that holds the permit long enough for the second
+            // tailer to timeout waiting for channel capacity.
+            let active = Arc::new(AtomicUsize::new(0));
+            let max = Arc::new(AtomicUsize::new(0));
+            // Source delay must be longer than send_timeout so second tailer times out
+            let source = Arc::new(CountingSource::new(
+                active.clone(),
+                max.clone(),
+                Duration::from_millis(50), // Longer than send_timeout
+            ));
 
-        let (tx, rx) = mpsc::channel(10);
-        let _keep_rx_alive = rx;
-        let cursors = Arc::new(RwLock::new(HashMap::new()));
-        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let source = Arc::new(StaticSource);
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 2,
+                send_timeout: Duration::from_millis(10), // Short timeout
+                ..Default::default()
+            };
 
-        {
-            let mut cursor_guard = cursors.write().await;
-            cursor_guard.insert(1, PaneCursor::new(1));
-            cursor_guard.insert(2, PaneCursor::new(2));
-        }
+            // Channel capacity of 1 + keep receiver alive (but don't consume)
+            // so second send times out instead of getting ChannelClosed
+            let (tx, rx) = mpsc::channel(1);
+            let _keep_rx_alive = rx; // Prevent receiver from being dropped
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
 
-        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            {
+                let mut cursor_guard = cursors.write().await;
+                cursor_guard.insert(1, PaneCursor::new(1));
+                cursor_guard.insert(2, PaneCursor::new(2));
+            }
 
-        let mut panes = HashMap::new();
-        panes.insert(1, make_pane(1));
-        panes.insert(2, make_pane(2));
-        supervisor.sync_tailers(&panes);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
-        // Lower value => higher priority. Pane 2 should be spawned before pane 1.
-        supervisor.update_pane_priorities(HashMap::from([(1, 100), (2, 10)]));
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            panes.insert(2, make_pane(2));
+            supervisor.sync_tailers(&panes);
 
-        // Wait for tailers to become ready to poll.
-        crate::runtime_compat::sleep(Duration::from_millis(2)).await;
+            // Wait for tailers to become ready to poll (min_interval must elapse)
+            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
-        let mut poll_tasks = TailerPollTaskSet::new();
-        supervisor.spawn_ready(&mut poll_tasks);
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
 
-        let (pane_id, outcome) = poll_tasks.join_next().await.expect("expected one task");
-        supervisor.handle_poll_result(pane_id, outcome);
+            let mut outcomes = Vec::new();
+            while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                outcomes.push((pane_id, format!("{outcome:?}")));
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
 
-        assert_eq!(pane_id, 2, "higher priority pane should spawn first");
+            let metrics = supervisor.metrics();
+            assert!(
+                metrics.send_timeouts >= 1,
+                "Expected at least 1 backpressure timeout, got 0. Outcomes: {outcomes:?}, metrics: {metrics:?}"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn supervisor_backpressure_records_timeout() {
-        // Use a slow source that holds the permit long enough for the second
-        // tailer to timeout waiting for channel capacity.
-        let active = Arc::new(AtomicUsize::new(0));
-        let max = Arc::new(AtomicUsize::new(0));
-        // Source delay must be longer than send_timeout so second tailer times out
-        let source = Arc::new(CountingSource::new(
-            active.clone(),
-            max.clone(),
-            Duration::from_millis(50), // Longer than send_timeout
-        ));
+    #[test]
+    fn supervisor_capture_timeout_records_metric() {
+        run_async_test(async {
+            let source = Arc::new(HangingSource::new(Duration::from_millis(50)));
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 1,
+                send_timeout: Duration::from_millis(100),
+                capture_timeout: Duration::from_millis(5),
+                ..Default::default()
+            };
 
-        let config = TailerConfig {
-            min_interval: Duration::from_millis(1),
-            max_interval: Duration::from_millis(50),
-            max_concurrent: 2,
-            send_timeout: Duration::from_millis(10), // Short timeout
-            ..Default::default()
-        };
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
 
-        // Channel capacity of 1 + keep receiver alive (but don't consume)
-        // so second send times out instead of getting ChannelClosed
-        let (tx, rx) = mpsc::channel(1);
-        let _keep_rx_alive = rx; // Prevent receiver from being dropped
-        let cursors = Arc::new(RwLock::new(HashMap::new()));
-        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+            {
+                let mut cursor_guard = cursors.write().await;
+                cursor_guard.insert(1, PaneCursor::new(1));
+            }
 
-        {
-            let mut cursor_guard = cursors.write().await;
-            cursor_guard.insert(1, PaneCursor::new(1));
-            cursor_guard.insert(2, PaneCursor::new(2));
-        }
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
-        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            supervisor.sync_tailers(&panes);
 
-        let mut panes = HashMap::new();
-        panes.insert(1, make_pane(1));
-        panes.insert(2, make_pane(2));
-        supervisor.sync_tailers(&panes);
+            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
-        // Wait for tailers to become ready to poll (min_interval must elapse)
-        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
 
-        let mut poll_tasks = TailerPollTaskSet::new();
-        supervisor.spawn_ready(&mut poll_tasks);
-
-        let mut outcomes = Vec::new();
-        while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
-            outcomes.push((pane_id, format!("{outcome:?}")));
+            let (pane_id, outcome) = poll_tasks
+                .join_next()
+                .await
+                .expect("expected timeout outcome");
+            assert!(matches!(outcome, PollOutcome::CaptureTimeout));
             supervisor.handle_poll_result(pane_id, outcome);
-        }
 
-        let metrics = supervisor.metrics();
-        assert!(
-            metrics.send_timeouts >= 1,
-            "Expected at least 1 backpressure timeout, got 0. Outcomes: {outcomes:?}, metrics: {metrics:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn supervisor_capture_timeout_records_metric() {
-        let source = Arc::new(HangingSource::new(Duration::from_millis(50)));
-        let config = TailerConfig {
-            min_interval: Duration::from_millis(1),
-            max_interval: Duration::from_millis(50),
-            max_concurrent: 1,
-            send_timeout: Duration::from_millis(100),
-            capture_timeout: Duration::from_millis(5),
-            ..Default::default()
-        };
-
-        let (tx, _rx) = mpsc::channel(10);
-        let cursors = Arc::new(RwLock::new(HashMap::new()));
-        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        {
-            let mut cursor_guard = cursors.write().await;
-            cursor_guard.insert(1, PaneCursor::new(1));
-        }
-
-        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
-
-        let mut panes = HashMap::new();
-        panes.insert(1, make_pane(1));
-        supervisor.sync_tailers(&panes);
-
-        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
-
-        let mut poll_tasks = TailerPollTaskSet::new();
-        supervisor.spawn_ready(&mut poll_tasks);
-
-        let (pane_id, outcome) = poll_tasks
-            .join_next()
-            .await
-            .expect("expected timeout outcome");
-        assert!(matches!(outcome, PollOutcome::CaptureTimeout));
-        supervisor.handle_poll_result(pane_id, outcome);
-
-        assert_eq!(supervisor.metrics().capture_timeouts, 1);
-        assert!(!supervisor.capturing_panes.contains(&pane_id));
+            assert_eq!(supervisor.metrics().capture_timeouts, 1);
+            assert!(!supervisor.capturing_panes.contains(&pane_id));
+        });
     }
 
     #[test]
@@ -1907,119 +1933,124 @@ mod tests {
         assert_eq!(supervisor.metrics().events_sent, 1);
     }
 
-    #[tokio::test]
-    async fn overflow_gap_emitted_via_spawn_ready() {
-        let source = Arc::new(FixedSource);
-        let config = TailerConfig {
-            min_interval: Duration::from_millis(1),
-            max_interval: Duration::from_millis(50),
-            max_concurrent: 4,
-            send_timeout: Duration::from_millis(100),
-            ..Default::default()
-        };
+    #[test]
+    fn overflow_gap_emitted_via_spawn_ready() {
+        run_async_test(async {
+            let source = Arc::new(FixedSource);
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 4,
+                send_timeout: Duration::from_millis(100),
+                ..Default::default()
+            };
 
-        let (tx, mut rx) = mpsc::channel(10);
-        let cursors = Arc::new(RwLock::new(HashMap::new()));
-        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+            let (tx, mut rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
 
-        {
-            let mut cursor_guard = cursors.write().await;
-            cursor_guard.insert(1, PaneCursor::new(1));
-        }
+            {
+                let mut cursor_guard = cursors.write().await;
+                cursor_guard.insert(1, PaneCursor::new(1));
+            }
 
-        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
-        let mut panes = HashMap::new();
-        panes.insert(1, make_pane(1));
-        supervisor.sync_tailers(&panes);
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            supervisor.sync_tailers(&panes);
 
-        // Force overflow_gap_pending
-        supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
+            // Force overflow_gap_pending
+            supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
 
-        // Wait for min_interval
-        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            // Wait for min_interval
+            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
-        let mut poll_tasks = TailerPollTaskSet::new();
-        supervisor.spawn_ready(&mut poll_tasks);
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
 
-        // Collect outcomes
-        while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
-            assert_eq!(pane_id, 1);
-            assert!(
-                matches!(outcome, PollOutcome::OverflowGapEmitted),
-                "Expected OverflowGapEmitted, got {outcome:?}"
-            );
-            supervisor.handle_poll_result(pane_id, outcome);
-        }
+            // Collect outcomes
+            while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                assert_eq!(pane_id, 1);
+                assert!(
+                    matches!(outcome, PollOutcome::OverflowGapEmitted),
+                    "Expected OverflowGapEmitted, got {outcome:?}"
+                );
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
 
-        // Verify the gap event was sent
-        let event = crate::runtime_compat::mpsc_recv_option(&mut rx)
-            .await
-            .expect("should have received overflow gap event");
-        assert_eq!(event.segment.pane_id, 1);
-        assert_eq!(event.segment.content, "");
-        assert!(matches!(
-            event.segment.kind,
-            crate::ingest::CapturedSegmentKind::Gap { ref reason } if reason == "backpressure_overflow"
-        ));
+            // Verify the gap event was sent
+            let event = crate::runtime_compat::mpsc_recv_option(&mut rx)
+                .await
+                .expect("should have received overflow gap event");
+            assert_eq!(event.segment.pane_id, 1);
+            assert_eq!(event.segment.content, "");
+            assert!(matches!(
+                event.segment.kind,
+                crate::ingest::CapturedSegmentKind::Gap { ref reason } if reason == "backpressure_overflow"
+            ));
 
-        // Verify pending flag was cleared
-        assert!(!supervisor.tailers.get(&1).unwrap().overflow_gap_pending);
-        assert_eq!(supervisor.metrics().overflow_gaps_emitted, 1);
+            // Verify pending flag was cleared
+            assert!(!supervisor.tailers.get(&1).unwrap().overflow_gap_pending);
+            assert_eq!(supervisor.metrics().overflow_gaps_emitted, 1);
+        });
     }
 
-    #[tokio::test]
-    async fn overflow_gap_advances_cursor_seq() {
-        let source = Arc::new(FixedSource);
-        let config = TailerConfig {
-            min_interval: Duration::from_millis(1),
-            max_interval: Duration::from_millis(50),
-            max_concurrent: 4,
-            send_timeout: Duration::from_millis(100),
-            ..Default::default()
-        };
+    #[test]
+    fn overflow_gap_advances_cursor_seq() {
+        run_async_test(async {
+            let source = Arc::new(FixedSource);
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 4,
+                send_timeout: Duration::from_millis(100),
+                ..Default::default()
+            };
 
-        let (tx, mut rx) = mpsc::channel(10);
-        let cursors = Arc::new(RwLock::new(HashMap::new()));
-        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
+            let (tx, mut rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
 
-        {
-            let mut cursor_guard = cursors.write().await;
-            let mut cursor = PaneCursor::new(1);
-            // Advance seq to 5 to verify gap gets seq=5
-            cursor.next_seq = 5;
-            cursor_guard.insert(1, cursor);
-        }
+            {
+                let mut cursor_guard = cursors.write().await;
+                let mut cursor = PaneCursor::new(1);
+                // Advance seq to 5 to verify gap gets seq=5
+                cursor.next_seq = 5;
+                cursor_guard.insert(1, cursor);
+            }
 
-        let mut supervisor =
-            TailerSupervisor::new(config, tx, Arc::clone(&cursors), registry, shutdown, source);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, Arc::clone(&cursors), registry, shutdown, source);
 
-        let mut panes = HashMap::new();
-        panes.insert(1, make_pane(1));
-        supervisor.sync_tailers(&panes);
-        supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            supervisor.sync_tailers(&panes);
+            supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
 
-        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
-        let mut poll_tasks = TailerPollTaskSet::new();
-        supervisor.spawn_ready(&mut poll_tasks);
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
 
-        while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
-            supervisor.handle_poll_result(pane_id, outcome);
-        }
+            while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
 
-        let event = crate::runtime_compat::mpsc_recv_option(&mut rx)
-            .await
-            .expect("should have received gap event");
-        assert_eq!(event.segment.seq, 5, "gap should use cursor's next_seq");
+            let event = crate::runtime_compat::mpsc_recv_option(&mut rx)
+                .await
+                .expect("should have received gap event");
+            assert_eq!(event.segment.seq, 5, "gap should use cursor's next_seq");
 
-        // Cursor should have advanced to 6
-        let cursor_guard = cursors.read().await;
-        let cursor = cursor_guard.get(&1).unwrap();
-        assert_eq!(cursor.next_seq, 6);
-        assert!(cursor.in_gap, "cursor should be in gap state");
+            // Cursor should have advanced to 6
+            let cursor_guard = cursors.read().await;
+            let cursor = cursor_guard.get(&1).unwrap();
+            assert_eq!(cursor.next_seq, 6);
+            assert!(cursor.in_gap, "cursor should be in gap state");
+        });
     }
 
     #[test]
@@ -2212,55 +2243,58 @@ mod tests {
         assert_eq!(selected, vec![1, 2]);
     }
 
-    #[tokio::test]
-    async fn supervisor_with_budget_limits_captures() {
-        let config = TailerConfig {
-            min_interval: Duration::from_millis(1),
-            max_interval: Duration::from_millis(50),
-            max_concurrent: 10,
-            send_timeout: Duration::from_millis(50),
-            ..Default::default()
-        };
+    #[test]
+    fn supervisor_with_budget_limits_captures() {
+        run_async_test(async {
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(50),
+                max_concurrent: 10,
+                send_timeout: Duration::from_millis(50),
+                ..Default::default()
+            };
 
-        let budget = CaptureBudgetConfig {
-            max_captures_per_sec: 1,
-            max_bytes_per_sec: 0,
-        };
+            let budget = CaptureBudgetConfig {
+                max_captures_per_sec: 1,
+                max_bytes_per_sec: 0,
+            };
 
-        let (tx, _rx) = mpsc::channel(10);
-        let cursors = Arc::new(RwLock::new(HashMap::new()));
-        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let source = Arc::new(StaticSource);
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
 
-        {
-            let mut cursor_guard = cursors.write().await;
-            for pane_id in 1..=4 {
-                cursor_guard.insert(pane_id, PaneCursor::new(pane_id));
+            {
+                let mut cursor_guard = cursors.write().await;
+                for pane_id in 1..=4 {
+                    cursor_guard.insert(pane_id, PaneCursor::new(pane_id));
+                }
             }
-        }
 
-        let mut supervisor =
-            TailerSupervisor::with_budget(config, tx, cursors, registry, shutdown, source, budget);
+            let mut supervisor = TailerSupervisor::with_budget(
+                config, tx, cursors, registry, shutdown, source, budget,
+            );
 
-        let mut panes = HashMap::new();
-        for pane_id in 1..=4 {
-            panes.insert(pane_id, make_pane(pane_id));
-        }
-        supervisor.sync_tailers(&panes);
+            let mut panes = HashMap::new();
+            for pane_id in 1..=4 {
+                panes.insert(pane_id, make_pane(pane_id));
+            }
+            supervisor.sync_tailers(&panes);
 
-        // Wait for tailers to become ready.
-        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            // Wait for tailers to become ready.
+            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
-        let mut poll_tasks = TailerPollTaskSet::new();
-        supervisor.spawn_ready(&mut poll_tasks);
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
 
-        // With budget of 1 capture/sec and 10 permits, only 1 should spawn.
-        assert!(
-            poll_tasks.len() <= 1,
-            "Expected at most 1 task spawned with budget=1, got {}",
-            poll_tasks.len()
-        );
+            // With budget of 1 capture/sec and 10 permits, only 1 should spawn.
+            assert!(
+                poll_tasks.len() <= 1,
+                "Expected at most 1 task spawned with budget=1, got {}",
+                poll_tasks.len()
+            );
+        });
     }
 
     // ─── bd-1tem: determinism + burst + edge-case coverage ──────────
@@ -2440,38 +2474,41 @@ mod tests {
         assert!(sched.metrics().throttle_events >= 3);
     }
 
-    #[tokio::test]
-    async fn supervisor_changed_outcome_records_bytes() {
-        let config = TailerConfig::default();
-        let (tx, _rx) = mpsc::channel(10);
-        let cursors = Arc::new(RwLock::new(HashMap::new()));
-        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let source = Arc::new(StaticSource);
+    #[test]
+    fn supervisor_changed_outcome_records_bytes() {
+        run_async_test(async {
+            let config = TailerConfig::default();
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
 
-        let budget = CaptureBudgetConfig {
-            max_captures_per_sec: 0,
-            max_bytes_per_sec: 1000,
-        };
+            let budget = CaptureBudgetConfig {
+                max_captures_per_sec: 0,
+                max_bytes_per_sec: 1000,
+            };
 
-        let mut supervisor =
-            TailerSupervisor::with_budget(config, tx, cursors, registry, shutdown, source, budget);
+            let mut supervisor = TailerSupervisor::with_budget(
+                config, tx, cursors, registry, shutdown, source, budget,
+            );
 
-        let mut panes = HashMap::new();
-        panes.insert(1, make_pane(1));
-        supervisor.sync_tailers(&panes);
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            supervisor.sync_tailers(&panes);
 
-        // Simulate a capture that produced 256 bytes.
-        supervisor.capturing_panes.insert(1);
-        supervisor.handle_poll_result(1, PollOutcome::Changed { bytes: 256 });
+            // Simulate a capture that produced 256 bytes.
+            supervisor.capturing_panes.insert(1);
+            supervisor.handle_poll_result(1, PollOutcome::Changed { bytes: 256 });
 
-        // The scheduler should have recorded the bytes.
-        let tracker = &supervisor.scheduler.pane_trackers[&1];
-        assert_eq!(tracker.bytes_in_window, 256);
-        assert_eq!(tracker.captures_in_window, 1);
+            // The scheduler should have recorded the bytes.
+            let tracker = &supervisor.scheduler.pane_trackers[&1];
+            assert_eq!(tracker.bytes_in_window, 256);
+            assert_eq!(tracker.captures_in_window, 1);
 
-        // Global bytes should be debited.
-        assert_eq!(supervisor.scheduler.global_bytes_remaining, 744);
+            // Global bytes should be debited.
+            assert_eq!(supervisor.scheduler.global_bytes_remaining, 744);
+        });
     }
 
     #[test]
@@ -3115,27 +3152,30 @@ mod tests {
         assert_eq!(supervisor.semaphore.available_permits(), 1);
     }
 
-    #[tokio::test]
-    async fn supervisor_shutdown_clears_all_state() {
-        let config = TailerConfig::default();
-        let (tx, _rx) = mpsc::channel(10);
-        let cursors = Arc::new(RwLock::new(HashMap::new()));
-        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let source = Arc::new(StaticSource);
+    #[test]
+    fn supervisor_shutdown_clears_all_state() {
+        run_async_test(async {
+            let config = TailerConfig::default();
+            let (tx, _rx) = mpsc::channel(10);
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
 
-        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
-        let mut panes = HashMap::new();
-        panes.insert(1, make_pane(1));
-        panes.insert(2, make_pane(2));
-        supervisor.sync_tailers(&panes);
-        supervisor.capturing_panes.insert(1);
-        assert_eq!(supervisor.active_count(), 2);
+            let mut panes = HashMap::new();
+            panes.insert(1, make_pane(1));
+            panes.insert(2, make_pane(2));
+            supervisor.sync_tailers(&panes);
+            supervisor.capturing_panes.insert(1);
+            assert_eq!(supervisor.active_count(), 2);
 
-        supervisor.shutdown().await;
-        assert_eq!(supervisor.active_count(), 0);
-        assert!(supervisor.capturing_panes.is_empty());
+            supervisor.shutdown().await;
+            assert_eq!(supervisor.active_count(), 0);
+            assert!(supervisor.capturing_panes.is_empty());
+        });
     }
 
     #[test]
