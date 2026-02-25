@@ -497,3 +497,130 @@ fn lab_tailer_shutdown_prevents_follow_up_spawns() {
 
     assert!(report.passed());
 }
+
+#[test]
+fn lab_tailer_sync_handles_pane_restart_without_resurrecting_removed_pane() {
+    let report = run_lab_test(
+        LabTestConfig::new(
+            1337,
+            "tailer_sync_handles_pane_restart_without_resurrecting_removed_pane",
+        )
+        .worker_count(3)
+        .max_steps(140_000),
+        |runtime| {
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_active = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let source = Arc::new(CountingYieldSource::new(
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+                Arc::clone(&calls),
+                4,
+            ));
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
+            let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            let task_source = Arc::clone(&source);
+            let task_cursors = Arc::clone(&cursors);
+            let task_registry = Arc::clone(&registry);
+            let task_shutdown = Arc::clone(&shutdown);
+
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+            let (task_id, _) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    let tailer_config = TailerConfig {
+                        min_interval: Duration::ZERO,
+                        max_interval: Duration::from_millis(1),
+                        max_concurrent: 3,
+                        send_timeout: Duration::from_millis(250),
+                        capture_timeout: Duration::from_millis(250),
+                        ..Default::default()
+                    };
+
+                    {
+                        let mut guard = task_cursors.write().await;
+                        for pane_id in 1..=4_u64 {
+                            guard.insert(pane_id, PaneCursor::new(pane_id));
+                        }
+                    }
+
+                    let mut supervisor = TailerSupervisor::new(
+                        tailer_config,
+                        tx,
+                        task_cursors,
+                        task_registry,
+                        Arc::clone(&task_shutdown),
+                        task_source,
+                    );
+
+                    let mut round_one_panes = HashMap::new();
+                    for pane_id in [1_u64, 2, 3] {
+                        round_one_panes.insert(pane_id, make_pane(pane_id));
+                    }
+                    supervisor.sync_tailers(&round_one_panes);
+
+                    let mut first_round = TailerPollTaskSet::new();
+                    supervisor.spawn_ready(&mut first_round);
+                    assert_eq!(first_round.len(), 3);
+                    while let Some((pane_id, outcome)) = first_round.join_next().await {
+                        supervisor.handle_poll_result(pane_id, outcome);
+                    }
+
+                    let mut first_seen = HashSet::new();
+                    for _ in 0..3 {
+                        let event = runtime_compat::mpsc_recv_option(&mut rx)
+                            .await
+                            .expect("round one should emit initial capture events");
+                        first_seen.insert(event.segment.pane_id);
+                    }
+                    assert_eq!(first_seen, HashSet::from([1_u64, 2, 3]));
+
+                    let mut round_two_panes = HashMap::new();
+                    for pane_id in [1_u64, 3, 4] {
+                        round_two_panes.insert(pane_id, make_pane(pane_id));
+                    }
+                    supervisor.sync_tailers(&round_two_panes);
+
+                    let mut second_round = TailerPollTaskSet::new();
+                    supervisor.spawn_ready(&mut second_round);
+                    assert_eq!(second_round.len(), 3);
+                    while let Some((pane_id, outcome)) = second_round.join_next().await {
+                        supervisor.handle_poll_result(pane_id, outcome);
+                    }
+
+                    let event = runtime_compat::mpsc_recv_option(&mut rx)
+                        .await
+                        .expect("round two should emit new-pane capture event");
+                    assert_eq!(
+                        event.segment.pane_id, 4,
+                        "removed pane 2 must not be resurrected after sync"
+                    );
+
+                    assert_eq!(
+                        supervisor.metrics().events_sent,
+                        4,
+                        "round one emits 3 segments; round two emits only pane 4"
+                    );
+                    assert_eq!(
+                        supervisor.metrics().no_change_captures,
+                        2,
+                        "existing panes should be treated as no-change on round two"
+                    );
+                })
+                .expect("create tailer task");
+
+            schedule_task(runtime, task_id);
+            runtime.run_until_quiescent();
+
+            assert_eq!(calls.load(Ordering::SeqCst), 6);
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+            assert!(max_active.load(Ordering::SeqCst) <= 3);
+        },
+    );
+
+    assert!(report.passed());
+}

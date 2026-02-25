@@ -581,3 +581,271 @@ fn dpor_stream_redaction_is_consistent_across_subscribers() {
 
     assert!(!report.has_violations());
 }
+
+#[test]
+fn dpor_stream_reconnect_receives_ordered_suffix_after_restart() {
+    let config = ExplorerConfig {
+        base_seed: 211,
+        max_runs: 12,
+        max_steps_per_run: 160_000,
+        worker_count: 4,
+        record_traces: true,
+    };
+
+    let mut explorer = ScheduleExplorer::new(config);
+    let report = explorer.explore(|runtime| {
+        let total_events = 18_u64;
+        let disconnect_after = 6_u64;
+        let reconnect_after = 10_u64;
+
+        let queues: Arc<Mutex<HashMap<u8, VecDeque<u64>>>> = Arc::new(Mutex::new(HashMap::from([
+            (1_u8, VecDeque::new()),
+            (2_u8, VecDeque::new()),
+            (3_u8, VecDeque::new()),
+        ])));
+        let active_ids = Arc::new(Mutex::new(vec![1_u8, 2_u8]));
+        let received: Arc<Mutex<HashMap<u8, Vec<u64>>>> = Arc::new(Mutex::new(HashMap::from([
+            (1_u8, Vec::new()),
+            (2_u8, Vec::new()),
+            (3_u8, Vec::new()),
+        ])));
+
+        let published = Arc::new(AtomicU64::new(0));
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let reconnected = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+
+        let sub1_queues = Arc::clone(&queues);
+        let sub1_received = Arc::clone(&received);
+        let sub1_done = Arc::clone(&done);
+        let (sub1_id, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                loop {
+                    if let Some(message) = {
+                        let mut guard = sub1_queues.lock().expect("lock queue");
+                        guard.get_mut(&1).and_then(VecDeque::pop_front)
+                    } {
+                        sub1_received
+                            .lock()
+                            .expect("lock received")
+                            .get_mut(&1)
+                            .expect("subscriber 1 log")
+                            .push(message);
+                        continue;
+                    }
+                    let should_exit = sub1_done.load(Ordering::SeqCst) && {
+                        let guard = sub1_queues.lock().expect("lock queue");
+                        guard.get(&1).is_none_or(VecDeque::is_empty)
+                    };
+                    if should_exit {
+                        break;
+                    }
+                    yield_now().await;
+                }
+            })
+            .expect("create subscriber 1");
+
+        let sub2_queues = Arc::clone(&queues);
+        let sub2_received = Arc::clone(&received);
+        let sub2_done = Arc::clone(&done);
+        let sub2_disconnected = Arc::clone(&disconnected);
+        let (sub2_id, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                loop {
+                    if let Some(message) = {
+                        let mut guard = sub2_queues.lock().expect("lock queue");
+                        guard.get_mut(&2).and_then(VecDeque::pop_front)
+                    } {
+                        sub2_received
+                            .lock()
+                            .expect("lock received")
+                            .get_mut(&2)
+                            .expect("subscriber 2 log")
+                            .push(message);
+                        continue;
+                    }
+
+                    let queue_missing = {
+                        let guard = sub2_queues.lock().expect("lock queue");
+                        !guard.contains_key(&2)
+                    };
+                    if queue_missing && sub2_disconnected.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    let should_exit = sub2_done.load(Ordering::SeqCst) && {
+                        let guard = sub2_queues.lock().expect("lock queue");
+                        guard.get(&2).is_none_or(VecDeque::is_empty)
+                    };
+                    if should_exit {
+                        break;
+                    }
+                    yield_now().await;
+                }
+            })
+            .expect("create subscriber 2");
+
+        let sub3_queues = Arc::clone(&queues);
+        let sub3_received = Arc::clone(&received);
+        let sub3_done = Arc::clone(&done);
+        let (sub3_id, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                loop {
+                    if let Some(message) = {
+                        let mut guard = sub3_queues.lock().expect("lock queue");
+                        guard.get_mut(&3).and_then(VecDeque::pop_front)
+                    } {
+                        sub3_received
+                            .lock()
+                            .expect("lock received")
+                            .get_mut(&3)
+                            .expect("subscriber 3 log")
+                            .push(message);
+                        continue;
+                    }
+
+                    let should_exit = sub3_done.load(Ordering::SeqCst) && {
+                        let guard = sub3_queues.lock().expect("lock queue");
+                        guard.get(&3).is_none_or(VecDeque::is_empty)
+                    };
+                    if should_exit {
+                        break;
+                    }
+                    yield_now().await;
+                }
+            })
+            .expect("create subscriber 3");
+
+        let disc_published = Arc::clone(&published);
+        let disc_active_ids = Arc::clone(&active_ids);
+        let disc_queues = Arc::clone(&queues);
+        let disc_flag = Arc::clone(&disconnected);
+        let (disconnect_id, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                while disc_published.load(Ordering::SeqCst) < disconnect_after {
+                    yield_now().await;
+                }
+                {
+                    let mut ids = disc_active_ids.lock().expect("lock active ids");
+                    ids.retain(|id| *id != 2);
+                }
+                {
+                    let mut guard = disc_queues.lock().expect("lock queues");
+                    guard.remove(&2);
+                }
+                disc_flag.store(true, Ordering::SeqCst);
+            })
+            .expect("create disconnect task");
+
+        let reconn_published = Arc::clone(&published);
+        let reconn_active_ids = Arc::clone(&active_ids);
+        let reconn_flag = Arc::clone(&reconnected);
+        let (reconnect_id, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                while reconn_published.load(Ordering::SeqCst) < reconnect_after {
+                    yield_now().await;
+                }
+                {
+                    let mut ids = reconn_active_ids.lock().expect("lock active ids");
+                    if !ids.contains(&3) {
+                        ids.push(3);
+                    }
+                }
+                reconn_flag.store(true, Ordering::SeqCst);
+            })
+            .expect("create reconnect task");
+
+        let pub_queues = Arc::clone(&queues);
+        let pub_active_ids = Arc::clone(&active_ids);
+        let pub_published = Arc::clone(&published);
+        let pub_done = Arc::clone(&done);
+        let pub_reconnected = Arc::clone(&reconnected);
+        let (publisher_id, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                for seq in 1..=total_events {
+                    let ids = {
+                        let guard = pub_active_ids.lock().expect("lock active ids");
+                        guard.clone()
+                    };
+                    {
+                        let mut queues = pub_queues.lock().expect("lock queues");
+                        for id in ids {
+                            if let Some(queue) = queues.get_mut(&id) {
+                                queue.push_back(seq);
+                            }
+                        }
+                    }
+                    pub_published.store(seq, Ordering::SeqCst);
+                    yield_now().await;
+                    if seq == reconnect_after {
+                        while !pub_reconnected.load(Ordering::SeqCst) {
+                            yield_now().await;
+                        }
+                    }
+                }
+                pub_done.store(true, Ordering::SeqCst);
+            })
+            .expect("create publisher");
+
+        schedule_task(runtime, sub1_id);
+        schedule_task(runtime, sub2_id);
+        schedule_task(runtime, sub3_id);
+        schedule_task(runtime, disconnect_id);
+        schedule_task(runtime, reconnect_id);
+        schedule_task(runtime, publisher_id);
+        runtime.run_until_quiescent();
+
+        let logs = received.lock().expect("lock received");
+        let sub1 = logs.get(&1).expect("subscriber 1 log");
+        let sub2 = logs.get(&2).expect("subscriber 2 log");
+        let sub3 = logs.get(&3).expect("subscriber 3 log");
+
+        let expected_sub1: Vec<u64> = (1..=total_events).collect();
+        assert_eq!(
+            sub1, &expected_sub1,
+            "always-connected subscriber should observe full ordered stream"
+        );
+
+        assert!(
+            sub2.windows(2).all(|pair| pair[0] < pair[1]),
+            "disconnected subscriber must keep strict ordering for observed prefix"
+        );
+        assert!(
+            sub2.last().copied().unwrap_or(0) <= total_events,
+            "disconnected subscriber must not see events beyond stream end"
+        );
+
+        assert!(
+            !sub3.is_empty(),
+            "reconnected subscriber should receive a post-restart suffix"
+        );
+        assert!(
+            sub3[0] >= reconnect_after + 1,
+            "reconnected subscriber must not receive pre-restart backlog"
+        );
+        assert!(
+            sub3.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "reconnected subscriber suffix should remain contiguous"
+        );
+        assert_eq!(
+            sub3.last().copied(),
+            Some(total_events),
+            "reconnected subscriber should catch up to latest published event"
+        );
+        assert!(
+            reconnected.load(Ordering::SeqCst),
+            "reconnect task should complete before stream shutdown"
+        );
+    });
+
+    assert!(!report.has_violations());
+    assert!(report.total_runs >= 8);
+}

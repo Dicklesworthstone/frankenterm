@@ -274,3 +274,118 @@ fn dpor_distributed_disconnect_yields_contiguous_prefix() {
 
     assert!(report.passed());
 }
+
+#[test]
+fn dpor_distributed_reconnect_replay_preserves_contiguous_sequence() {
+    let config = ExplorationTestConfig::new("distributed_reconnect_replay_contiguous", 12)
+        .base_seed(89)
+        .worker_count(4)
+        .max_steps_per_run(160_000);
+
+    let report = run_exploration_test(config, |runtime| {
+        let aggregator = Arc::new(Mutex::new(Aggregator::new(8)));
+        let accepted: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let disconnect = Arc::new(AtomicBool::new(false));
+        let emitted = Arc::new(AtomicU64::new(0));
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+
+        let agg_for_primary = Arc::clone(&aggregator);
+        let accepted_for_primary = Arc::clone(&accepted);
+        let disconnect_for_primary = Arc::clone(&disconnect);
+        let emitted_for_primary = Arc::clone(&emitted);
+        let (primary_id, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                for seq in 1..=12_u64 {
+                    if disconnect_for_primary.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let envelope = WireEnvelope::new(
+                        seq,
+                        "agent-reconnect",
+                        WirePayload::PaneDelta(pane_delta(
+                            21,
+                            seq,
+                            format!("RECONNECT_PRIMARY seq={seq}"),
+                        )),
+                    );
+                    let result = {
+                        let mut guard = agg_for_primary.lock().expect("lock aggregator");
+                        guard.ingest_envelope(envelope).expect("ingest")
+                    };
+                    if let IngestResult::Accepted(WirePayload::PaneDelta(delta)) = result {
+                        accepted_for_primary
+                            .lock()
+                            .expect("lock accepted")
+                            .push(delta.seq);
+                        emitted_for_primary.fetch_add(1, Ordering::SeqCst);
+                    }
+                    yield_now().await;
+                }
+            })
+            .expect("create primary producer");
+
+        let disconnect_for_task = Arc::clone(&disconnect);
+        let emitted_for_task = Arc::clone(&emitted);
+        let (disconnect_id, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                while emitted_for_task.load(Ordering::SeqCst) < 6 {
+                    yield_now().await;
+                }
+                disconnect_for_task.store(true, Ordering::SeqCst);
+            })
+            .expect("create disconnect task");
+
+        let agg_for_reconnect = Arc::clone(&aggregator);
+        let accepted_for_reconnect = Arc::clone(&accepted);
+        let disconnect_for_reconnect = Arc::clone(&disconnect);
+        let (reconnect_id, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                while !disconnect_for_reconnect.load(Ordering::SeqCst) {
+                    yield_now().await;
+                }
+                for seq in 4..=12_u64 {
+                    let envelope = WireEnvelope::new(
+                        seq,
+                        "agent-reconnect",
+                        WirePayload::PaneDelta(pane_delta(
+                            21,
+                            seq,
+                            format!("RECONNECT_RESUME seq={seq}"),
+                        )),
+                    );
+                    let result = {
+                        let mut guard = agg_for_reconnect.lock().expect("lock aggregator");
+                        guard.ingest_envelope(envelope).expect("ingest")
+                    };
+                    if let IngestResult::Accepted(WirePayload::PaneDelta(delta)) = result {
+                        accepted_for_reconnect
+                            .lock()
+                            .expect("lock accepted")
+                            .push(delta.seq);
+                    }
+                    yield_now().await;
+                }
+            })
+            .expect("create reconnect producer");
+
+        schedule_task(runtime, primary_id);
+        schedule_task(runtime, disconnect_id);
+        schedule_task(runtime, reconnect_id);
+        runtime.run_until_quiescent();
+
+        let mut seqs = accepted.lock().expect("lock accepted").clone();
+        seqs.sort_unstable();
+        seqs.dedup();
+        let expected: Vec<u64> = (1..=12_u64).collect();
+        assert_eq!(
+            seqs, expected,
+            "reconnect replay should fill gaps and avoid duplicates, yielding contiguous accepted sequence"
+        );
+    });
+
+    assert!(report.passed());
+    assert!(report.total_runs >= 8);
+}
