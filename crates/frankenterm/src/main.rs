@@ -387,6 +387,24 @@ SEE ALSO:
         command: WorkflowCommands,
     },
 
+    /// Mission control commands (plan/run/status/explain/pause/resume/abort)
+    #[command(after_help = r#"EXAMPLES:
+    ft mission plan                    Validate mission contract and compute hash
+    ft mission run                     Advance mission into active execution state
+    ft mission status                  Show mission lifecycle + assignment summary
+    ft mission explain                 Show legal lifecycle transitions and contracts
+    ft mission pause --reason overload Pause active mission dispatch
+    ft mission resume                  Resume blocked/retry-pending mission state
+    ft mission abort --reason operator_cancel
+
+NOTES:
+    Mission state defaults to .ft/mission/active.json inside the workspace.
+    Use --mission-file to operate on an explicit mission artifact."#)]
+    Mission {
+        #[command(subcommand)]
+        command: MissionCommands,
+    },
+
     /// Show system status and pane overview
     #[command(after_help = r#"EXAMPLES:
     ft status                         System and pane overview
@@ -2478,6 +2496,12 @@ enum RobotCommands {
         command: RobotReservationCommands,
     },
 
+    /// Mission state and decision/explainability endpoints for agentic control loops
+    Mission {
+        #[command(subcommand)]
+        command: RobotMissionCommands,
+    },
+
     /// Get watcher health snapshot and resize control-plane lifecycle/stall introspection
     Health,
 
@@ -2878,6 +2902,79 @@ enum RobotReservationCommands {
     List,
 }
 
+#[derive(Subcommand)]
+enum RobotMissionCommands {
+    /// Get mission state with assignment-level filtering
+    State {
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Filter by mission lifecycle state
+        #[arg(long, value_enum)]
+        mission_state: Option<RobotMissionLifecycleStateArg>,
+
+        /// Filter assignments by run/outcome state
+        #[arg(long, value_enum)]
+        run_state: Option<RobotMissionRunState>,
+
+        /// Filter assignments by agent approval state
+        #[arg(long, value_enum)]
+        agent_state: Option<RobotMissionAgentState>,
+
+        /// Filter assignments by dispatch action state
+        #[arg(long, value_enum)]
+        action_state: Option<RobotMissionActionState>,
+
+        /// Filter to a specific assignment
+        #[arg(long)]
+        assignment_id: Option<String>,
+
+        /// Filter to a specific assignee
+        #[arg(long)]
+        assignee: Option<String>,
+
+        /// Maximum assignments to return after filtering
+        #[arg(long, default_value = "100")]
+        limit: usize,
+    },
+
+    /// Get decision/explainability payloads for filtered mission assignments
+    Decisions {
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Filter by mission lifecycle state
+        #[arg(long, value_enum)]
+        mission_state: Option<RobotMissionLifecycleStateArg>,
+
+        /// Filter assignments by run/outcome state
+        #[arg(long, value_enum)]
+        run_state: Option<RobotMissionRunState>,
+
+        /// Filter assignments by agent approval state
+        #[arg(long, value_enum)]
+        agent_state: Option<RobotMissionAgentState>,
+
+        /// Filter assignments by dispatch action state
+        #[arg(long, value_enum)]
+        action_state: Option<RobotMissionActionState>,
+
+        /// Filter to a specific assignment
+        #[arg(long)]
+        assignment_id: Option<String>,
+
+        /// Filter to a specific assignee
+        #[arg(long)]
+        assignee: Option<String>,
+
+        /// Maximum decisions to return after filtering
+        #[arg(long, default_value = "100")]
+        limit: usize,
+    },
+}
+
 #[cfg(feature = "mcp")]
 #[derive(Subcommand)]
 enum McpCommands {
@@ -2916,6 +3013,102 @@ enum WorkflowCommands {
         /// Include action plan and step logs (-v verbose, -vv debug)
         #[arg(long, short, action = clap::ArgAction::Count)]
         verbose: u8,
+    },
+}
+
+#[derive(Subcommand)]
+enum MissionCommands {
+    /// Validate mission contract and compute deterministic planning summary
+    Plan {
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Include candidate dispatch contracts in output
+        #[arg(long)]
+        include_dispatch_contracts: bool,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
+
+    /// Advance mission lifecycle into execution state and persist updated mission
+    Run {
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
+
+    /// Show mission lifecycle and assignment/approval status counts
+    Status {
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
+
+    /// Explain legal lifecycle transitions and optional assignment dispatch target
+    Explain {
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Optional assignment ID to resolve dispatch targeting context
+        #[arg(long)]
+        assignment_id: Option<String>,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
+
+    /// Pause mission execution using canonical blocked lifecycle transition
+    Pause {
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Operator reason attached to the pause summary output
+        #[arg(long)]
+        reason: Option<String>,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
+
+    /// Resume mission execution from blocked or retry-pending state
+    Resume {
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
+    },
+
+    /// Abort mission execution using canonical cancelled lifecycle transition
+    Abort {
+        /// Mission JSON file (default: .ft/mission/active.json)
+        #[arg(long)]
+        mission_file: Option<PathBuf>,
+
+        /// Operator reason attached to the abort summary output
+        #[arg(long)]
+        reason: Option<String>,
+
+        /// Output format: plain or json
+        #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
+        format: String,
     },
 }
 
@@ -3820,6 +4013,65 @@ enum SearchModeArg {
     Hybrid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum RobotMissionLifecycleStateArg {
+    Planning,
+    Planned,
+    Dispatching,
+    AwaitingApproval,
+    Running,
+    RetryPending,
+    Blocked,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl From<RobotMissionLifecycleStateArg> for frankenterm_core::plan::MissionLifecycleState {
+    fn from(value: RobotMissionLifecycleStateArg) -> Self {
+        match value {
+            RobotMissionLifecycleStateArg::Planning => Self::Planning,
+            RobotMissionLifecycleStateArg::Planned => Self::Planned,
+            RobotMissionLifecycleStateArg::Dispatching => Self::Dispatching,
+            RobotMissionLifecycleStateArg::AwaitingApproval => Self::AwaitingApproval,
+            RobotMissionLifecycleStateArg::Running => Self::Running,
+            RobotMissionLifecycleStateArg::RetryPending => Self::RetryPending,
+            RobotMissionLifecycleStateArg::Blocked => Self::Blocked,
+            RobotMissionLifecycleStateArg::Completed => Self::Completed,
+            RobotMissionLifecycleStateArg::Failed => Self::Failed,
+            RobotMissionLifecycleStateArg::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum RobotMissionRunState {
+    Pending,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum RobotMissionAgentState {
+    NotRequired,
+    Pending,
+    Approved,
+    Denied,
+    Expired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum RobotMissionActionState {
+    Ready,
+    Blocked,
+    Completed,
+}
+
 impl From<SearchModeArg> for frankenterm_core::query_contract::UnifiedSearchMode {
     fn from(value: SearchModeArg) -> Self {
         match value {
@@ -4279,6 +4531,105 @@ struct QuickStartErrorCode {
     code: &'static str,
     meaning: &'static str,
     recovery: &'static str,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RobotMissionFilters {
+    mission_state: Option<RobotMissionLifecycleStateArg>,
+    run_state: Option<RobotMissionRunState>,
+    agent_state: Option<RobotMissionAgentState>,
+    action_state: Option<RobotMissionActionState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignee: Option<String>,
+    limit: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RobotMissionTransitionInfo {
+    kind: String,
+    to: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RobotMissionAssignmentData {
+    assignment_id: String,
+    candidate_id: String,
+    assignee: String,
+    assigned_by: frankenterm_core::plan::MissionActorRole,
+    action_type: String,
+    run_state: RobotMissionRunState,
+    agent_state: RobotMissionAgentState,
+    action_state: RobotMissionActionState,
+    approval_state: frankenterm_core::plan::ApprovalState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<frankenterm_core::plan::Outcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RobotMissionStateData {
+    mission_file: String,
+    mission_id: String,
+    title: String,
+    mission_hash: String,
+    lifecycle_state: frankenterm_core::plan::MissionLifecycleState,
+    mission_matches_filter: bool,
+    candidate_count: usize,
+    assignment_count: usize,
+    matched_assignment_count: usize,
+    returned_assignment_count: usize,
+    filters: RobotMissionFilters,
+    assignment_counters: MissionAssignmentCounters,
+    available_transitions: Vec<RobotMissionTransitionInfo>,
+    assignments: Vec<RobotMissionAssignmentData>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RobotMissionFailureCatalogEntry {
+    reason_code: &'static str,
+    error_code: &'static str,
+    terminality: String,
+    retryability: String,
+    human_hint: &'static str,
+    machine_hint: &'static str,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RobotMissionDecisionData {
+    assignment: RobotMissionAssignmentData,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_action: Option<frankenterm_core::plan::StepAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch_contract: Option<frankenterm_core::plan::MissionDispatchContract>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch_target: Option<frankenterm_core::plan::MissionDispatchTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_run_execution: Option<frankenterm_core::plan::MissionDispatchExecution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RobotMissionDecisionsData {
+    mission_file: String,
+    mission_id: String,
+    title: String,
+    mission_hash: String,
+    lifecycle_state: frankenterm_core::plan::MissionLifecycleState,
+    mission_matches_filter: bool,
+    candidate_count: usize,
+    assignment_count: usize,
+    matched_assignment_count: usize,
+    returned_assignment_count: usize,
+    filters: RobotMissionFilters,
+    available_transitions: Vec<RobotMissionTransitionInfo>,
+    failure_catalog: Vec<RobotMissionFailureCatalogEntry>,
+    decisions: Vec<RobotMissionDecisionData>,
 }
 
 /// Pane state for CLI output (list and robot state commands)
@@ -7161,6 +7512,14 @@ fn build_robot_help() -> RobotHelp {
                 description: "Abort a running workflow",
             },
             RobotCommandInfo {
+                name: "mission state",
+                description: "Get mission lifecycle + filtered assignment state",
+            },
+            RobotCommandInfo {
+                name: "mission decisions",
+                description: "Get mission decision/explainability payloads",
+            },
+            RobotCommandInfo {
                 name: "why",
                 description: "Explain an error code or policy denial",
             },
@@ -7379,6 +7738,24 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 summary: "Abort a running workflow",
                 examples: vec![
                     "ft robot workflow abort robot-handle_compaction-1234567890 --reason \"User requested\"",
+                ],
+            },
+            QuickStartCommand {
+                name: "mission state",
+                args: "[--mission-file <path>] [--mission-state <state>] [--run-state <state>] [--agent-state <state>] [--action-state <state>]",
+                summary: "Read mission lifecycle + assignment state via robot envelope",
+                examples: vec![
+                    "ft robot mission state",
+                    "ft robot mission state --mission-state running --run-state failed",
+                ],
+            },
+            QuickStartCommand {
+                name: "mission decisions",
+                args: "[--mission-file <path>] [--assignment-id <id>] [--run-state <state>] [--agent-state <state>] [--action-state <state>]",
+                summary: "Read dispatch/explainability decision payloads for mission assignments",
+                examples: vec![
+                    "ft robot mission decisions",
+                    "ft robot mission decisions --assignment-id assignment:cli-a",
                 ],
             },
             QuickStartCommand {
@@ -15346,6 +15723,140 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        RobotCommands::Mission { command } => {
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(layout) => layout,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<RobotMissionStateData>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to get workspace layout: {e}"),
+                                            Some("Check --workspace or FT_WORKSPACE".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            match command {
+                                RobotMissionCommands::State {
+                                    mission_file,
+                                    mission_state,
+                                    run_state,
+                                    agent_state,
+                                    action_state,
+                                    assignment_id,
+                                    assignee,
+                                    limit,
+                                } => {
+                                    let filters = match build_robot_mission_filters(
+                                        mission_state,
+                                        run_state,
+                                        agent_state,
+                                        action_state,
+                                        assignment_id,
+                                        assignee,
+                                        limit,
+                                    ) {
+                                        Ok(filters) => filters,
+                                        Err(err) => {
+                                            let response =
+                                                RobotResponse::<RobotMissionStateData>::error_with_code(
+                                                    robot_mission_error_code(err.error_code),
+                                                    err.message,
+                                                    err.hint,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    let mission_path =
+                                        resolve_mission_file_path(&layout, mission_file);
+                                    let mission = match load_mission_from_path(&mission_path) {
+                                        Ok(mission) => mission,
+                                        Err(err) => {
+                                            let response =
+                                                RobotResponse::<RobotMissionStateData>::error_with_code(
+                                                    robot_mission_error_code(err.error_code),
+                                                    err.message,
+                                                    err.hint,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    let data =
+                                        build_robot_mission_state_data(&mission, &mission_path, filters);
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
+                                    print_robot_response(&response, format, stats)?;
+                                }
+                                RobotMissionCommands::Decisions {
+                                    mission_file,
+                                    mission_state,
+                                    run_state,
+                                    agent_state,
+                                    action_state,
+                                    assignment_id,
+                                    assignee,
+                                    limit,
+                                } => {
+                                    let filters = match build_robot_mission_filters(
+                                        mission_state,
+                                        run_state,
+                                        agent_state,
+                                        action_state,
+                                        assignment_id,
+                                        assignee,
+                                        limit,
+                                    ) {
+                                        Ok(filters) => filters,
+                                        Err(err) => {
+                                            let response = RobotResponse::<
+                                                RobotMissionDecisionsData,
+                                            >::error_with_code(
+                                                robot_mission_error_code(err.error_code),
+                                                err.message,
+                                                err.hint,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    let mission_path =
+                                        resolve_mission_file_path(&layout, mission_file);
+                                    let mission = match load_mission_from_path(&mission_path) {
+                                        Ok(mission) => mission,
+                                        Err(err) => {
+                                            let response = RobotResponse::<
+                                                RobotMissionDecisionsData,
+                                            >::error_with_code(
+                                                robot_mission_error_code(err.error_code),
+                                                err.message,
+                                                err.hint,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    let data = build_robot_mission_decisions_data(
+                                        &mission,
+                                        &mission_path,
+                                        filters,
+                                    );
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
+                                    print_robot_response(&response, format, stats)?;
+                                }
+                            }
+                        }
                         RobotCommands::Agents { command } => {
                             if !frankenterm_core::agent_correlator::filesystem_detection_available()
                             {
@@ -18615,6 +19126,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+
+        Some(Commands::Mission { command }) => {
+            handle_mission_command(command, &layout)?;
         }
 
         Some(Commands::Status {
@@ -28815,6 +29330,1268 @@ fn emit_notify_test_response(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissionCommandOutputFormat {
+    Plain,
+    Json,
+}
+
+impl MissionCommandOutputFormat {
+    fn from_flag(flag: &str) -> Self {
+        if flag.eq_ignore_ascii_case("json") {
+            Self::Json
+        } else {
+            Self::Plain
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MissionCommandError {
+    exit_code: i32,
+    error_code: &'static str,
+    message: String,
+    hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MissionTransitionRecord {
+    from: frankenterm_core::plan::MissionLifecycleState,
+    to: frankenterm_core::plan::MissionLifecycleState,
+    kind: frankenterm_core::plan::MissionLifecycleTransitionKind,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+struct MissionAssignmentCounters {
+    pending_approval: usize,
+    approved: usize,
+    denied: usize,
+    expired: usize,
+    succeeded: usize,
+    failed: usize,
+    cancelled: usize,
+    unresolved: usize,
+}
+
+const MISSION_EXIT_NOT_FOUND: i32 = 3;
+const MISSION_EXIT_IO: i32 = 4;
+const MISSION_EXIT_VALIDATION: i32 = 5;
+const MISSION_EXIT_TRANSITION: i32 = 6;
+const MISSION_EXIT_INVALID_INPUT: i32 = 7;
+
+fn mission_now_ms() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as i64,
+        Err(_) => 0,
+    }
+}
+
+fn default_mission_file_path(layout: &frankenterm_core::config::WorkspaceLayout) -> PathBuf {
+    layout.ft_dir.join("mission").join("active.json")
+}
+
+fn resolve_mission_file_path(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    mission_file: Option<PathBuf>,
+) -> PathBuf {
+    mission_file.unwrap_or_else(|| default_mission_file_path(layout))
+}
+
+fn load_mission_from_path(path: &Path) -> Result<frankenterm_core::plan::Mission, MissionCommandError> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            MissionCommandError {
+                exit_code: MISSION_EXIT_NOT_FOUND,
+                error_code: "mission.file_not_found",
+                message: format!("Mission file not found: {}", path.display()),
+                hint: Some("Pass --mission-file <path> or create .ft/mission/active.json.".to_string()),
+            }
+        } else {
+            MissionCommandError {
+                exit_code: MISSION_EXIT_IO,
+                error_code: "mission.file_read_failed",
+                message: format!("Failed to read mission file {}: {err}", path.display()),
+                hint: None,
+            }
+        }
+    })?;
+
+    let mission: frankenterm_core::plan::Mission =
+        serde_json::from_str(&raw).map_err(|err| MissionCommandError {
+            exit_code: MISSION_EXIT_INVALID_INPUT,
+            error_code: "mission.invalid_json",
+            message: format!("Invalid mission JSON in {}: {err}", path.display()),
+            hint: Some("Ensure the mission file is valid JSON and matches mission schema.".to_string()),
+        })?;
+
+    mission.validate().map_err(|err| MissionCommandError {
+        exit_code: MISSION_EXIT_VALIDATION,
+        error_code: "mission.validation_failed",
+        message: format!("Mission validation failed: {err}"),
+        hint: Some("Use `ft mission explain` to inspect legal transitions and dispatch contracts.".to_string()),
+    })?;
+
+    Ok(mission)
+}
+
+fn persist_mission_to_path(
+    path: &Path,
+    mission: &frankenterm_core::plan::Mission,
+) -> Result<(), MissionCommandError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| MissionCommandError {
+            exit_code: MISSION_EXIT_IO,
+            error_code: "mission.file_write_failed",
+            message: format!("Failed to create mission directory {}: {err}", parent.display()),
+            hint: None,
+        })?;
+    }
+
+    let serialized = serde_json::to_string_pretty(mission).map_err(|err| MissionCommandError {
+        exit_code: MISSION_EXIT_IO,
+        error_code: "mission.serialize_failed",
+        message: format!("Failed to serialize mission: {err}"),
+        hint: None,
+    })?;
+
+    fs::write(path, format!("{serialized}\n")).map_err(|err| MissionCommandError {
+        exit_code: MISSION_EXIT_IO,
+        error_code: "mission.file_write_failed",
+        message: format!("Failed to write mission file {}: {err}", path.display()),
+        hint: None,
+    })
+}
+
+fn mission_assignment_counters(
+    mission: &frankenterm_core::plan::Mission,
+) -> MissionAssignmentCounters {
+    let mut counters = MissionAssignmentCounters {
+        pending_approval: 0,
+        approved: 0,
+        denied: 0,
+        expired: 0,
+        succeeded: 0,
+        failed: 0,
+        cancelled: 0,
+        unresolved: 0,
+    };
+
+    for assignment in &mission.assignments {
+        match &assignment.approval_state {
+            frankenterm_core::plan::ApprovalState::NotRequired => {}
+            frankenterm_core::plan::ApprovalState::Pending { .. } => counters.pending_approval += 1,
+            frankenterm_core::plan::ApprovalState::Approved { .. } => counters.approved += 1,
+            frankenterm_core::plan::ApprovalState::Denied { .. } => counters.denied += 1,
+            frankenterm_core::plan::ApprovalState::Expired { .. } => counters.expired += 1,
+        }
+
+        match &assignment.outcome {
+            Some(frankenterm_core::plan::Outcome::Success { .. }) => counters.succeeded += 1,
+            Some(frankenterm_core::plan::Outcome::Failed { .. }) => counters.failed += 1,
+            Some(frankenterm_core::plan::Outcome::Cancelled { .. }) => counters.cancelled += 1,
+            None => counters.unresolved += 1,
+        }
+    }
+
+    counters
+}
+
+fn mission_available_transitions(
+    state: frankenterm_core::plan::MissionLifecycleState,
+) -> Vec<(
+    frankenterm_core::plan::MissionLifecycleTransitionKind,
+    frankenterm_core::plan::MissionLifecycleState,
+)> {
+    frankenterm_core::plan::mission_lifecycle_transition_table()
+        .iter()
+        .filter(|rule| rule.from == state)
+        .map(|rule| (rule.kind, rule.to))
+        .collect()
+}
+
+fn robot_mission_error_code(mission_error_code: &str) -> &'static str {
+    match mission_error_code {
+        "mission.file_not_found" => "robot.mission_not_found",
+        "mission.file_read_failed" => "robot.mission_read_failed",
+        "mission.invalid_json" => "robot.mission_invalid_json",
+        "mission.validation_failed" => "robot.mission_validation_failed",
+        "mission.assignment_not_found" => "robot.assignment_not_found",
+        "mission.assignment_id_empty" => ROBOT_ERR_INVALID_ARGS,
+        "mission.limit_invalid" => ROBOT_ERR_INVALID_ARGS,
+        "mission.assignee_empty" => ROBOT_ERR_INVALID_ARGS,
+        _ => "robot.mission_error",
+    }
+}
+
+fn build_robot_mission_filters(
+    mission_state: Option<RobotMissionLifecycleStateArg>,
+    run_state: Option<RobotMissionRunState>,
+    agent_state: Option<RobotMissionAgentState>,
+    action_state: Option<RobotMissionActionState>,
+    assignment_id: Option<String>,
+    assignee: Option<String>,
+    limit: usize,
+) -> Result<RobotMissionFilters, MissionCommandError> {
+    if limit == 0 {
+        return Err(MissionCommandError {
+            exit_code: MISSION_EXIT_INVALID_INPUT,
+            error_code: "mission.limit_invalid",
+            message: "limit must be greater than zero".to_string(),
+            hint: Some("Use --limit <n> with n >= 1.".to_string()),
+        });
+    }
+
+    let assignment_id = match assignment_id {
+        Some(raw) if raw.trim().is_empty() => {
+            return Err(MissionCommandError {
+                exit_code: MISSION_EXIT_INVALID_INPUT,
+                error_code: "mission.assignment_id_empty",
+                message: "assignment_id cannot be empty".to_string(),
+                hint: None,
+            });
+        }
+        Some(raw) => Some(raw.trim().to_string()),
+        None => None,
+    };
+
+    let assignee = match assignee {
+        Some(raw) if raw.trim().is_empty() => {
+            return Err(MissionCommandError {
+                exit_code: MISSION_EXIT_INVALID_INPUT,
+                error_code: "mission.assignee_empty",
+                message: "assignee cannot be empty".to_string(),
+                hint: None,
+            });
+        }
+        Some(raw) => Some(raw.trim().to_string()),
+        None => None,
+    };
+
+    Ok(RobotMissionFilters {
+        mission_state,
+        run_state,
+        agent_state,
+        action_state,
+        assignment_id,
+        assignee,
+        limit,
+    })
+}
+
+fn robot_mission_run_state(
+    outcome: &Option<frankenterm_core::plan::Outcome>,
+) -> RobotMissionRunState {
+    match outcome {
+        Some(frankenterm_core::plan::Outcome::Success { .. }) => RobotMissionRunState::Succeeded,
+        Some(frankenterm_core::plan::Outcome::Failed { .. }) => RobotMissionRunState::Failed,
+        Some(frankenterm_core::plan::Outcome::Cancelled { .. }) => RobotMissionRunState::Cancelled,
+        None => RobotMissionRunState::Pending,
+    }
+}
+
+fn robot_mission_agent_state(
+    approval_state: &frankenterm_core::plan::ApprovalState,
+) -> RobotMissionAgentState {
+    match approval_state {
+        frankenterm_core::plan::ApprovalState::NotRequired => RobotMissionAgentState::NotRequired,
+        frankenterm_core::plan::ApprovalState::Pending { .. } => RobotMissionAgentState::Pending,
+        frankenterm_core::plan::ApprovalState::Approved { .. } => RobotMissionAgentState::Approved,
+        frankenterm_core::plan::ApprovalState::Denied { .. } => RobotMissionAgentState::Denied,
+        frankenterm_core::plan::ApprovalState::Expired { .. } => RobotMissionAgentState::Expired,
+    }
+}
+
+fn robot_mission_action_state(
+    run_state: RobotMissionRunState,
+    agent_state: RobotMissionAgentState,
+) -> RobotMissionActionState {
+    if !matches!(run_state, RobotMissionRunState::Pending) {
+        return RobotMissionActionState::Completed;
+    }
+    match agent_state {
+        RobotMissionAgentState::Pending
+        | RobotMissionAgentState::Denied
+        | RobotMissionAgentState::Expired => RobotMissionActionState::Blocked,
+        RobotMissionAgentState::NotRequired | RobotMissionAgentState::Approved => {
+            RobotMissionActionState::Ready
+        }
+    }
+}
+
+fn robot_mission_reason_and_error(
+    outcome: &Option<frankenterm_core::plan::Outcome>,
+) -> (Option<String>, Option<String>) {
+    match outcome {
+        Some(frankenterm_core::plan::Outcome::Success { reason_code, .. }) => {
+            (Some(reason_code.clone()), None)
+        }
+        Some(frankenterm_core::plan::Outcome::Failed {
+            reason_code,
+            error_code,
+            ..
+        }) => (Some(reason_code.clone()), Some(error_code.clone())),
+        Some(frankenterm_core::plan::Outcome::Cancelled { reason_code, .. }) => {
+            (Some(reason_code.clone()), None)
+        }
+        None => (None, None),
+    }
+}
+
+fn robot_mission_transition_info(
+    state: frankenterm_core::plan::MissionLifecycleState,
+) -> Vec<RobotMissionTransitionInfo> {
+    mission_available_transitions(state)
+        .iter()
+        .map(|(kind, to)| RobotMissionTransitionInfo {
+            kind: kind.to_string(),
+            to: to.to_string(),
+        })
+        .collect()
+}
+
+fn robot_mission_failure_catalog() -> Vec<RobotMissionFailureCatalogEntry> {
+    use frankenterm_core::plan::MissionFailureCode as Code;
+
+    [
+        Code::PolicyDenied,
+        Code::ReservationConflict,
+        Code::RateLimited,
+        Code::StaleState,
+        Code::DispatchError,
+        Code::ApprovalRequired,
+        Code::ApprovalDenied,
+        Code::ApprovalExpired,
+        Code::KillSwitchActivated,
+    ]
+    .iter()
+    .map(|code| RobotMissionFailureCatalogEntry {
+        reason_code: code.reason_code(),
+        error_code: code.error_code(),
+        terminality: format!("{:?}", code.terminality()).to_lowercase(),
+        retryability: format!("{:?}", code.retryability()).to_lowercase(),
+        human_hint: code.human_hint(),
+        machine_hint: code.machine_hint(),
+    })
+    .collect()
+}
+
+fn robot_mission_assignment_data(
+    assignment: &frankenterm_core::plan::Assignment,
+    candidate_action: Option<&frankenterm_core::plan::CandidateAction>,
+) -> RobotMissionAssignmentData {
+    let run_state = robot_mission_run_state(&assignment.outcome);
+    let agent_state = robot_mission_agent_state(&assignment.approval_state);
+    let action_state = robot_mission_action_state(run_state, agent_state);
+    let action_type = candidate_action
+        .map(|candidate| candidate.action.action_type_name().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let (reason_code, error_code) = robot_mission_reason_and_error(&assignment.outcome);
+
+    RobotMissionAssignmentData {
+        assignment_id: assignment.assignment_id.0.clone(),
+        candidate_id: assignment.candidate_id.0.clone(),
+        assignee: assignment.assignee.clone(),
+        assigned_by: assignment.assigned_by,
+        action_type,
+        run_state,
+        agent_state,
+        action_state,
+        approval_state: assignment.approval_state.clone(),
+        outcome: assignment.outcome.clone(),
+        reason_code,
+        error_code,
+    }
+}
+
+fn robot_mission_assignment_matches_filters(
+    assignment: &RobotMissionAssignmentData,
+    filters: &RobotMissionFilters,
+) -> bool {
+    if let Some(expected_assignment_id) = filters.assignment_id.as_deref()
+        && assignment.assignment_id != expected_assignment_id
+    {
+        return false;
+    }
+
+    if let Some(expected_assignee) = filters.assignee.as_deref()
+        && !assignment.assignee.eq_ignore_ascii_case(expected_assignee)
+    {
+        return false;
+    }
+
+    if let Some(run_state) = filters.run_state && assignment.run_state != run_state {
+        return false;
+    }
+    if let Some(agent_state) = filters.agent_state && assignment.agent_state != agent_state {
+        return false;
+    }
+    if let Some(action_state) = filters.action_state && assignment.action_state != action_state {
+        return false;
+    }
+
+    true
+}
+
+fn build_robot_mission_state_data(
+    mission: &frankenterm_core::plan::Mission,
+    mission_path: &Path,
+    filters: RobotMissionFilters,
+) -> RobotMissionStateData {
+    let candidate_lookup: HashMap<&str, &frankenterm_core::plan::CandidateAction> = mission
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.candidate_id.0.as_str(), candidate))
+        .collect();
+    let mission_matches_filter = filters
+        .mission_state
+        .map(frankenterm_core::plan::MissionLifecycleState::from)
+        .map_or(true, |state| state == mission.lifecycle_state);
+
+    let mut matched = Vec::new();
+    if mission_matches_filter {
+        for assignment in &mission.assignments {
+            let candidate_action = candidate_lookup.get(assignment.candidate_id.0.as_str()).copied();
+            let row = robot_mission_assignment_data(assignment, candidate_action);
+            if robot_mission_assignment_matches_filters(&row, &filters) {
+                matched.push(row);
+            }
+        }
+    }
+    let matched_assignment_count = matched.len();
+    let assignments = matched.into_iter().take(filters.limit).collect::<Vec<_>>();
+    let returned_assignment_count = assignments.len();
+
+    RobotMissionStateData {
+        mission_file: mission_path.display().to_string(),
+        mission_id: mission.mission_id.0.clone(),
+        title: mission.title.clone(),
+        mission_hash: mission.compute_hash(),
+        lifecycle_state: mission.lifecycle_state,
+        mission_matches_filter,
+        candidate_count: mission.candidates.len(),
+        assignment_count: mission.assignments.len(),
+        matched_assignment_count,
+        returned_assignment_count,
+        filters,
+        assignment_counters: mission_assignment_counters(mission),
+        available_transitions: robot_mission_transition_info(mission.lifecycle_state),
+        assignments,
+    }
+}
+
+fn build_robot_mission_decisions_data(
+    mission: &frankenterm_core::plan::Mission,
+    mission_path: &Path,
+    filters: RobotMissionFilters,
+) -> RobotMissionDecisionsData {
+    let candidate_lookup: HashMap<&str, &frankenterm_core::plan::CandidateAction> = mission
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.candidate_id.0.as_str(), candidate))
+        .collect();
+    let mission_matches_filter = filters
+        .mission_state
+        .map(frankenterm_core::plan::MissionLifecycleState::from)
+        .map_or(true, |state| state == mission.lifecycle_state);
+    let dry_run_completed_at_ms = mission.updated_at_ms.unwrap_or(mission.created_at_ms);
+
+    let mut decisions = Vec::new();
+    let mut matched_assignment_count = 0usize;
+    if mission_matches_filter {
+        for assignment in &mission.assignments {
+            let candidate_action = candidate_lookup.get(assignment.candidate_id.0.as_str()).copied();
+            let assignment_row = robot_mission_assignment_data(assignment, candidate_action);
+            if !robot_mission_assignment_matches_filters(&assignment_row, &filters) {
+                continue;
+            }
+            matched_assignment_count += 1;
+            if decisions.len() >= filters.limit {
+                continue;
+            }
+
+            let assignment_id =
+                frankenterm_core::plan::AssignmentId(assignment_row.assignment_id.clone());
+            let candidate_id =
+                frankenterm_core::plan::CandidateActionId(assignment_row.candidate_id.clone());
+            let mut decision_error = None;
+            let dispatch_contract = match mission.dispatch_contract_for_candidate(&candidate_id) {
+                Ok(contract) => Some(contract),
+                Err(err) => {
+                    decision_error = Some(format!("dispatch_contract_error: {err}"));
+                    None
+                }
+            };
+            let dispatch_target = match mission.resolve_dispatch_target(&assignment_id) {
+                Ok(target) => Some(target),
+                Err(err) => {
+                    decision_error
+                        .get_or_insert_with(|| format!("dispatch_target_resolution_error: {err}"));
+                    None
+                }
+            };
+            let dry_run_execution =
+                match mission.dispatch_assignment_dry_run(&assignment_id, dry_run_completed_at_ms) {
+                    Ok(execution) => Some(execution),
+                    Err(err) => {
+                        decision_error.get_or_insert_with(|| format!("dispatch_dry_run_error: {err}"));
+                        None
+                    }
+                };
+
+            decisions.push(RobotMissionDecisionData {
+                assignment: assignment_row,
+                candidate_action: candidate_action.map(|candidate| candidate.action.clone()),
+                dispatch_contract,
+                dispatch_target,
+                dry_run_execution,
+                decision_error,
+            });
+        }
+    }
+
+    let returned_assignment_count = decisions.len();
+    RobotMissionDecisionsData {
+        mission_file: mission_path.display().to_string(),
+        mission_id: mission.mission_id.0.clone(),
+        title: mission.title.clone(),
+        mission_hash: mission.compute_hash(),
+        lifecycle_state: mission.lifecycle_state,
+        mission_matches_filter,
+        candidate_count: mission.candidates.len(),
+        assignment_count: mission.assignments.len(),
+        matched_assignment_count,
+        returned_assignment_count,
+        filters,
+        available_transitions: robot_mission_transition_info(mission.lifecycle_state),
+        failure_catalog: robot_mission_failure_catalog(),
+        decisions,
+    }
+}
+
+fn emit_mission_success(
+    format: MissionCommandOutputFormat,
+    data: serde_json::Value,
+    plain_lines: &[String],
+) -> anyhow::Result<()> {
+    match format {
+        MissionCommandOutputFormat::Json => {
+            let envelope = serde_json::json!({
+                "ok": true,
+                "data": data,
+            });
+            println!("{}", serde_json::to_string_pretty(&envelope)?);
+        }
+        MissionCommandOutputFormat::Plain => {
+            for line in plain_lines {
+                println!("{line}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn emit_mission_error(format: MissionCommandOutputFormat, err: MissionCommandError) -> ! {
+    match format {
+        MissionCommandOutputFormat::Json => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": err.message,
+                "error_code": err.error_code,
+                "exit_code": err.exit_code,
+                "hint": err.hint,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| "{}".to_string())
+            );
+        }
+        MissionCommandOutputFormat::Plain => {
+            eprintln!("Error: {}", err.message);
+            eprintln!("Code: {}", err.error_code);
+            if let Some(hint) = err.hint {
+                eprintln!("Hint: {hint}");
+            }
+        }
+    }
+
+    std::process::exit(err.exit_code);
+}
+
+fn mission_run_transition_plan(
+    state: frankenterm_core::plan::MissionLifecycleState,
+) -> Result<
+    Vec<(
+        frankenterm_core::plan::MissionLifecycleState,
+        frankenterm_core::plan::MissionLifecycleTransitionKind,
+    )>,
+    MissionCommandError,
+> {
+    use frankenterm_core::plan::MissionLifecycleState as State;
+    use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
+
+    match state {
+        State::Planning => Ok(vec![
+            (State::Planned, Kind::PlanFinalized),
+            (State::Dispatching, Kind::DispatchStarted),
+            (State::Running, Kind::ExecutionStarted),
+        ]),
+        State::Planned => Ok(vec![
+            (State::Dispatching, Kind::DispatchStarted),
+            (State::Running, Kind::ExecutionStarted),
+        ]),
+        State::Dispatching => Ok(vec![(State::Running, Kind::ExecutionStarted)]),
+        State::RetryPending | State::Blocked => Ok(vec![(State::Running, Kind::RetryResumed)]),
+        State::Running => Ok(Vec::new()),
+        State::AwaitingApproval => Err(MissionCommandError {
+            exit_code: MISSION_EXIT_TRANSITION,
+            error_code: "mission.transition.awaiting_approval",
+            message: "Mission is awaiting approval and cannot enter run state directly.".to_string(),
+            hint: Some("Resolve approval first, then retry `ft mission run`.".to_string()),
+        }),
+        State::Completed | State::Failed | State::Cancelled => Err(MissionCommandError {
+            exit_code: MISSION_EXIT_TRANSITION,
+            error_code: "mission.transition.terminal_state",
+            message: format!("Mission is terminal ({state}) and cannot be run."),
+            hint: None,
+        }),
+    }
+}
+
+fn mission_pause_transition_plan(
+    state: frankenterm_core::plan::MissionLifecycleState,
+) -> Result<
+    Vec<(
+        frankenterm_core::plan::MissionLifecycleState,
+        frankenterm_core::plan::MissionLifecycleTransitionKind,
+    )>,
+    MissionCommandError,
+> {
+    use frankenterm_core::plan::MissionLifecycleState as State;
+    use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
+
+    match state {
+        State::Dispatching | State::Running | State::RetryPending => {
+            Ok(vec![(State::Blocked, Kind::ExecutionBlocked)])
+        }
+        State::Blocked => Ok(Vec::new()),
+        State::Planning | State::Planned | State::AwaitingApproval => Err(MissionCommandError {
+            exit_code: MISSION_EXIT_TRANSITION,
+            error_code: "mission.transition.pause_not_active",
+            message: format!("Mission is {state} and cannot be paused."),
+            hint: Some("Use `ft mission run` first.".to_string()),
+        }),
+        State::Completed | State::Failed | State::Cancelled => Err(MissionCommandError {
+            exit_code: MISSION_EXIT_TRANSITION,
+            error_code: "mission.transition.terminal_state",
+            message: format!("Mission is terminal ({state}) and cannot be paused."),
+            hint: None,
+        }),
+    }
+}
+
+fn mission_resume_transition_plan(
+    state: frankenterm_core::plan::MissionLifecycleState,
+) -> Result<
+    Vec<(
+        frankenterm_core::plan::MissionLifecycleState,
+        frankenterm_core::plan::MissionLifecycleTransitionKind,
+    )>,
+    MissionCommandError,
+> {
+    use frankenterm_core::plan::MissionLifecycleState as State;
+    use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
+
+    match state {
+        State::Blocked => Ok(vec![(State::Running, Kind::RetryResumed)]),
+        State::RetryPending => Ok(vec![(State::Dispatching, Kind::RetryResumed)]),
+        State::Running | State::Dispatching => Ok(Vec::new()),
+        State::AwaitingApproval => Err(MissionCommandError {
+            exit_code: MISSION_EXIT_TRANSITION,
+            error_code: "mission.transition.awaiting_approval",
+            message: "Mission is awaiting approval and cannot be resumed.".to_string(),
+            hint: Some("Resolve approval, then use `ft mission run`.".to_string()),
+        }),
+        State::Planning | State::Planned => Err(MissionCommandError {
+            exit_code: MISSION_EXIT_TRANSITION,
+            error_code: "mission.transition.resume_not_started",
+            message: format!("Mission is {state} and has not started execution."),
+            hint: Some("Use `ft mission run` first.".to_string()),
+        }),
+        State::Completed | State::Failed | State::Cancelled => Err(MissionCommandError {
+            exit_code: MISSION_EXIT_TRANSITION,
+            error_code: "mission.transition.terminal_state",
+            message: format!("Mission is terminal ({state}) and cannot be resumed."),
+            hint: None,
+        }),
+    }
+}
+
+fn mission_abort_transition_plan(
+    state: frankenterm_core::plan::MissionLifecycleState,
+) -> Result<
+    Vec<(
+        frankenterm_core::plan::MissionLifecycleState,
+        frankenterm_core::plan::MissionLifecycleTransitionKind,
+    )>,
+    MissionCommandError,
+> {
+    use frankenterm_core::plan::MissionLifecycleState as State;
+    use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
+
+    match state {
+        State::Cancelled => Ok(Vec::new()),
+        State::Completed => Err(MissionCommandError {
+            exit_code: MISSION_EXIT_TRANSITION,
+            error_code: "mission.transition.completed",
+            message: "Mission is already completed and cannot be aborted.".to_string(),
+            hint: None,
+        }),
+        _ => Ok(vec![(State::Cancelled, Kind::MissionCancelled)]),
+    }
+}
+
+fn apply_mission_transition_plan(
+    mission: &mut frankenterm_core::plan::Mission,
+    plan: &[(
+        frankenterm_core::plan::MissionLifecycleState,
+        frankenterm_core::plan::MissionLifecycleTransitionKind,
+    )],
+    transitioned_at_ms: i64,
+) -> Result<Vec<MissionTransitionRecord>, MissionCommandError> {
+    let mut transitions = Vec::with_capacity(plan.len());
+    for (to, kind) in plan {
+        let from = mission.lifecycle_state;
+        mission
+            .transition_lifecycle(*to, *kind, transitioned_at_ms)
+            .map_err(|err| MissionCommandError {
+                exit_code: MISSION_EXIT_TRANSITION,
+                error_code: "mission.transition.invalid",
+                message: format!("Illegal lifecycle transition {from} -> {to} ({kind}): {err}"),
+                hint: Some("Use `ft mission explain` to inspect legal transitions.".to_string()),
+            })?;
+        transitions.push(MissionTransitionRecord {
+            from,
+            to: *to,
+            kind: *kind,
+        });
+    }
+    Ok(transitions)
+}
+
+fn handle_mission_command(
+    command: MissionCommands,
+    layout: &frankenterm_core::config::WorkspaceLayout,
+) -> anyhow::Result<()> {
+    match command {
+        MissionCommands::Plan {
+            mission_file,
+            include_dispatch_contracts,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            let mission_path = resolve_mission_file_path(layout, mission_file);
+            let mission = match load_mission_from_path(&mission_path) {
+                Ok(mission) => mission,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+
+            let mut dispatch_contracts = Vec::new();
+            if include_dispatch_contracts {
+                for candidate in &mission.candidates {
+                    let contract = match mission.dispatch_contract_for_candidate(&candidate.candidate_id)
+                    {
+                        Ok(contract) => contract,
+                        Err(err) => {
+                            emit_mission_error(
+                                output_format,
+                                MissionCommandError {
+                                    exit_code: MISSION_EXIT_VALIDATION,
+                                    error_code: "mission.dispatch_contract_failed",
+                                    message: format!(
+                                        "Failed to build dispatch contract for {}: {err}",
+                                        candidate.candidate_id.0
+                                    ),
+                                    hint: Some(
+                                        "Verify candidate action payload and mission provenance."
+                                            .to_string(),
+                                    ),
+                                },
+                            )
+                        }
+                    };
+                    dispatch_contracts.push(contract);
+                }
+            }
+
+            let counters = mission_assignment_counters(&mission);
+            let transitions = mission_available_transitions(mission.lifecycle_state);
+            let transitions_json = transitions
+                .iter()
+                .map(|(kind, to)| {
+                    serde_json::json!({
+                        "kind": kind.to_string(),
+                        "to": to.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mission_id = mission.mission_id.0.clone();
+            let mission_title = mission.title.clone();
+            let mission_hash = mission.compute_hash();
+            let data = serde_json::json!({
+                "command": "plan",
+                "mission_file": mission_path.display().to_string(),
+                "mission_id": mission_id,
+                "title": mission_title,
+                "lifecycle_state": mission.lifecycle_state.to_string(),
+                "mission_hash": mission_hash,
+                "candidate_count": mission.candidates.len(),
+                "assignment_count": mission.assignments.len(),
+                "assignment_counters": {
+                    "pending_approval": counters.pending_approval,
+                    "approved": counters.approved,
+                    "denied": counters.denied,
+                    "expired": counters.expired,
+                    "succeeded": counters.succeeded,
+                    "failed": counters.failed,
+                    "cancelled": counters.cancelled,
+                    "unresolved": counters.unresolved,
+                },
+                "available_transitions": transitions_json,
+                "dispatch_contract_count": dispatch_contracts.len(),
+                "dispatch_contracts": dispatch_contracts,
+            });
+            let plain_lines = vec![
+                format!("Mission plan summary for {}", mission.mission_id.0.as_str()),
+                format!("  File: {}", mission_path.display()),
+                format!("  Title: {}", mission.title.as_str()),
+                format!("  Lifecycle: {}", mission.lifecycle_state),
+                format!("  Hash: {}", mission_hash),
+                format!("  Candidates: {}", mission.candidates.len()),
+                format!("  Assignments: {}", mission.assignments.len()),
+                format!("  Dispatch contracts: {}", if include_dispatch_contracts { "included" } else { "skipped" }),
+            ];
+            emit_mission_success(output_format, data, &plain_lines)?;
+        }
+
+        MissionCommands::Status {
+            mission_file,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            let mission_path = resolve_mission_file_path(layout, mission_file);
+            let mission = match load_mission_from_path(&mission_path) {
+                Ok(mission) => mission,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+
+            let counters = mission_assignment_counters(&mission);
+            let transitions = mission_available_transitions(mission.lifecycle_state);
+            let transitions_json = transitions
+                .iter()
+                .map(|(kind, to)| {
+                    serde_json::json!({
+                        "kind": kind.to_string(),
+                        "to": to.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mission_id = mission.mission_id.0.clone();
+            let mission_title = mission.title.clone();
+            let mission_hash = mission.compute_hash();
+            let data = serde_json::json!({
+                "command": "status",
+                "mission_file": mission_path.display().to_string(),
+                "mission_id": mission_id,
+                "title": mission_title,
+                "lifecycle_state": mission.lifecycle_state.to_string(),
+                "terminal": mission.lifecycle_state.is_terminal(),
+                "mission_hash": mission_hash,
+                "candidate_count": mission.candidates.len(),
+                "assignment_count": mission.assignments.len(),
+                "assignment_counters": {
+                    "pending_approval": counters.pending_approval,
+                    "approved": counters.approved,
+                    "denied": counters.denied,
+                    "expired": counters.expired,
+                    "succeeded": counters.succeeded,
+                    "failed": counters.failed,
+                    "cancelled": counters.cancelled,
+                    "unresolved": counters.unresolved,
+                },
+                "available_transitions": transitions_json,
+            });
+            let plain_lines = vec![
+                format!("Mission status: {}", mission.mission_id.0.as_str()),
+                format!("  File: {}", mission_path.display()),
+                format!("  Lifecycle: {}", mission.lifecycle_state),
+                format!("  Terminal: {}", mission.lifecycle_state.is_terminal()),
+                format!("  Hash: {}", mission_hash),
+                format!("  Candidates: {}", mission.candidates.len()),
+                format!("  Assignments: {} (succeeded={}, failed={}, unresolved={})", mission.assignments.len(), counters.succeeded, counters.failed, counters.unresolved),
+                format!("  Awaiting approval: {}", counters.pending_approval),
+                format!("  Legal transitions from current state: {}", transitions.len()),
+            ];
+            emit_mission_success(output_format, data, &plain_lines)?;
+        }
+
+        MissionCommands::Explain {
+            mission_file,
+            assignment_id,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            let mission_path = resolve_mission_file_path(layout, mission_file);
+            let mission = match load_mission_from_path(&mission_path) {
+                Ok(mission) => mission,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+
+            let transitions = mission_available_transitions(mission.lifecycle_state);
+            let transitions_json = transitions
+                .iter()
+                .map(|(kind, to)| {
+                    serde_json::json!({
+                        "kind": kind.to_string(),
+                        "to": to.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let assignment_context = if let Some(raw_assignment_id) = assignment_id {
+                let trimmed = raw_assignment_id.trim();
+                if trimmed.is_empty() {
+                    emit_mission_error(
+                        output_format,
+                        MissionCommandError {
+                            exit_code: MISSION_EXIT_INVALID_INPUT,
+                            error_code: "mission.assignment_id_empty",
+                            message: "assignment_id cannot be empty".to_string(),
+                            hint: None,
+                        },
+                    );
+                }
+                let assignment_id = frankenterm_core::plan::AssignmentId(trimmed.to_string());
+                let target = match mission.resolve_dispatch_target(&assignment_id) {
+                    Ok(target) => target,
+                    Err(err) => emit_mission_error(
+                        output_format,
+                        MissionCommandError {
+                            exit_code: MISSION_EXIT_INVALID_INPUT,
+                            error_code: "mission.assignment_not_found",
+                            message: format!(
+                                "Unable to resolve assignment dispatch target for {}: {err}",
+                                assignment_id.0
+                            ),
+                            hint: Some(
+                                "Use `ft mission status` to inspect known assignment IDs.".to_string(),
+                            ),
+                        },
+                    ),
+                };
+                let dry_run = match mission.dispatch_assignment_dry_run(&assignment_id, mission_now_ms()) {
+                    Ok(execution) => execution,
+                    Err(err) => emit_mission_error(
+                        output_format,
+                        MissionCommandError {
+                            exit_code: MISSION_EXIT_VALIDATION,
+                            error_code: "mission.dispatch_dry_run_failed",
+                            message: format!(
+                                "Unable to generate dry-run dispatch envelope for {}: {err}",
+                                assignment_id.0
+                            ),
+                            hint: None,
+                        },
+                    ),
+                };
+                Some(serde_json::json!({
+                    "assignment_id": assignment_id.0,
+                    "target": target,
+                    "dry_run_execution": dry_run,
+                }))
+            } else {
+                None
+            };
+            let failure_catalog = [
+                frankenterm_core::plan::MissionFailureCode::PolicyDenied,
+                frankenterm_core::plan::MissionFailureCode::ReservationConflict,
+                frankenterm_core::plan::MissionFailureCode::RateLimited,
+                frankenterm_core::plan::MissionFailureCode::StaleState,
+                frankenterm_core::plan::MissionFailureCode::DispatchError,
+                frankenterm_core::plan::MissionFailureCode::ApprovalRequired,
+                frankenterm_core::plan::MissionFailureCode::ApprovalDenied,
+                frankenterm_core::plan::MissionFailureCode::ApprovalExpired,
+            ]
+            .iter()
+            .map(|code| {
+                serde_json::json!({
+                    "code": format!("{code:?}"),
+                    "reason_code": code.reason_code(),
+                    "error_code": code.error_code(),
+                })
+            })
+            .collect::<Vec<_>>();
+            let mission_id = mission.mission_id.0.clone();
+
+            let data = serde_json::json!({
+                "command": "explain",
+                "mission_file": mission_path.display().to_string(),
+                "mission_id": mission_id,
+                "lifecycle_state": mission.lifecycle_state.to_string(),
+                "available_transitions": transitions_json,
+                "failure_catalog": failure_catalog,
+                "assignment_context": assignment_context,
+            });
+            let mut plain_lines = vec![
+                format!("Mission explain: {}", mission.mission_id.0.as_str()),
+                format!("  File: {}", mission_path.display()),
+                format!("  Lifecycle: {}", mission.lifecycle_state),
+                "  Legal transitions:".to_string(),
+            ];
+            for (kind, to) in &transitions {
+                plain_lines.push(format!("    - {} -> {}", kind, to));
+            }
+            if let Some(context) = data
+                .get("assignment_context")
+                .and_then(|value| value.as_object())
+                .filter(|obj| !obj.is_empty())
+            {
+                plain_lines.push("  Assignment context:".to_string());
+                if let Some(assignment) = context
+                    .get("assignment_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    plain_lines.push(format!("    - assignment_id: {assignment}"));
+                }
+            }
+            emit_mission_success(output_format, data, &plain_lines)?;
+        }
+
+        MissionCommands::Run {
+            mission_file,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            let mission_path = resolve_mission_file_path(layout, mission_file);
+            let mut mission = match load_mission_from_path(&mission_path) {
+                Ok(mission) => mission,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let plan = match mission_run_transition_plan(mission.lifecycle_state) {
+                Ok(plan) => plan,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let transitions = match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms())
+            {
+                Ok(transitions) => transitions,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            if !transitions.is_empty() {
+                if let Err(err) = persist_mission_to_path(&mission_path, &mission) {
+                    emit_mission_error(output_format, err);
+                }
+            }
+            let transitions_json = transitions
+                .iter()
+                .map(|transition| {
+                    serde_json::json!({
+                        "from": transition.from.to_string(),
+                        "to": transition.to.to_string(),
+                        "kind": transition.kind.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mission_hash = mission.compute_hash();
+            let data = serde_json::json!({
+                "command": "run",
+                "mission_file": mission_path.display().to_string(),
+                "mission_id": mission.mission_id.0.clone(),
+                "lifecycle_state": mission.lifecycle_state.to_string(),
+                "no_op": transitions.is_empty(),
+                "transitions": transitions_json,
+                "mission_hash": mission_hash,
+            });
+            let plain_lines = vec![
+                format!("Mission run: {}", mission.mission_id.0.as_str()),
+                format!("  File: {}", mission_path.display()),
+                format!("  Lifecycle: {}", mission.lifecycle_state),
+                format!("  Transitions applied: {}", transitions.len()),
+                format!("  Hash: {}", mission_hash),
+            ];
+            emit_mission_success(output_format, data, &plain_lines)?;
+        }
+
+        MissionCommands::Pause {
+            mission_file,
+            reason,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            let mission_path = resolve_mission_file_path(layout, mission_file);
+            let mut mission = match load_mission_from_path(&mission_path) {
+                Ok(mission) => mission,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let plan = match mission_pause_transition_plan(mission.lifecycle_state) {
+                Ok(plan) => plan,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let transitions = match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms())
+            {
+                Ok(transitions) => transitions,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            if !transitions.is_empty() {
+                if let Err(err) = persist_mission_to_path(&mission_path, &mission) {
+                    emit_mission_error(output_format, err);
+                }
+            }
+            let transitions_json = transitions
+                .iter()
+                .map(|transition| {
+                    serde_json::json!({
+                        "from": transition.from.to_string(),
+                        "to": transition.to.to_string(),
+                        "kind": transition.kind.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let reason_label = reason.as_deref().unwrap_or("none").to_string();
+            let mission_hash = mission.compute_hash();
+            let data = serde_json::json!({
+                "command": "pause",
+                "mission_file": mission_path.display().to_string(),
+                "mission_id": mission.mission_id.0.clone(),
+                "lifecycle_state": mission.lifecycle_state.to_string(),
+                "reason": reason,
+                "no_op": transitions.is_empty(),
+                "transitions": transitions_json,
+                "mission_hash": mission_hash,
+            });
+            let plain_lines = vec![
+                format!("Mission pause: {}", mission.mission_id.0.as_str()),
+                format!("  File: {}", mission_path.display()),
+                format!("  Lifecycle: {}", mission.lifecycle_state),
+                format!("  Transitions applied: {}", transitions.len()),
+                format!("  Reason: {}", reason_label),
+            ];
+            emit_mission_success(output_format, data, &plain_lines)?;
+        }
+
+        MissionCommands::Resume {
+            mission_file,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            let mission_path = resolve_mission_file_path(layout, mission_file);
+            let mut mission = match load_mission_from_path(&mission_path) {
+                Ok(mission) => mission,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let plan = match mission_resume_transition_plan(mission.lifecycle_state) {
+                Ok(plan) => plan,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let transitions = match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms())
+            {
+                Ok(transitions) => transitions,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            if !transitions.is_empty() {
+                if let Err(err) = persist_mission_to_path(&mission_path, &mission) {
+                    emit_mission_error(output_format, err);
+                }
+            }
+            let transitions_json = transitions
+                .iter()
+                .map(|transition| {
+                    serde_json::json!({
+                        "from": transition.from.to_string(),
+                        "to": transition.to.to_string(),
+                        "kind": transition.kind.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mission_hash = mission.compute_hash();
+            let data = serde_json::json!({
+                "command": "resume",
+                "mission_file": mission_path.display().to_string(),
+                "mission_id": mission.mission_id.0.clone(),
+                "lifecycle_state": mission.lifecycle_state.to_string(),
+                "no_op": transitions.is_empty(),
+                "transitions": transitions_json,
+                "mission_hash": mission_hash,
+            });
+            let plain_lines = vec![
+                format!("Mission resume: {}", mission.mission_id.0.as_str()),
+                format!("  File: {}", mission_path.display()),
+                format!("  Lifecycle: {}", mission.lifecycle_state),
+                format!("  Transitions applied: {}", transitions.len()),
+                format!("  Hash: {}", mission_hash),
+            ];
+            emit_mission_success(output_format, data, &plain_lines)?;
+        }
+
+        MissionCommands::Abort {
+            mission_file,
+            reason,
+            format,
+        } => {
+            let output_format = MissionCommandOutputFormat::from_flag(&format);
+            let mission_path = resolve_mission_file_path(layout, mission_file);
+            let mut mission = match load_mission_from_path(&mission_path) {
+                Ok(mission) => mission,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let plan = match mission_abort_transition_plan(mission.lifecycle_state) {
+                Ok(plan) => plan,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            let transitions = match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms())
+            {
+                Ok(transitions) => transitions,
+                Err(err) => emit_mission_error(output_format, err),
+            };
+            if !transitions.is_empty() {
+                if let Err(err) = persist_mission_to_path(&mission_path, &mission) {
+                    emit_mission_error(output_format, err);
+                }
+            }
+            let transitions_json = transitions
+                .iter()
+                .map(|transition| {
+                    serde_json::json!({
+                        "from": transition.from.to_string(),
+                        "to": transition.to.to_string(),
+                        "kind": transition.kind.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let reason_label = reason.as_deref().unwrap_or("none").to_string();
+            let mission_hash = mission.compute_hash();
+            let data = serde_json::json!({
+                "command": "abort",
+                "mission_file": mission_path.display().to_string(),
+                "mission_id": mission.mission_id.0.clone(),
+                "lifecycle_state": mission.lifecycle_state.to_string(),
+                "reason": reason,
+                "no_op": transitions.is_empty(),
+                "transitions": transitions_json,
+                "mission_hash": mission_hash,
+            });
+            let plain_lines = vec![
+                format!("Mission abort: {}", mission.mission_id.0.as_str()),
+                format!("  File: {}", mission_path.display()),
+                format!("  Lifecycle: {}", mission.lifecycle_state),
+                format!("  Transitions applied: {}", transitions.len()),
+                format!("  Reason: {}", reason_label),
+            ];
+            emit_mission_success(output_format, data, &plain_lines)?;
+        }
+    }
+
+    Ok(())
+}
+
 async fn handle_backup_command(
     command: BackupCommands,
     layout: &frankenterm_core::config::WorkspaceLayout,
@@ -32423,6 +34200,575 @@ mod tests {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64)
+    }
+
+    fn sample_cli_mission() -> frankenterm_core::plan::Mission {
+        use frankenterm_core::plan::{
+            ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId,
+            Mission, MissionActorRole, MissionId, MissionLifecycleState, MissionOwnership,
+            MissionProvenance, Outcome, StepAction,
+        };
+
+        let mut mission = Mission::new(
+            MissionId("mission:cli-test".to_string()),
+            "CLI mission test",
+            "ws-cli",
+            MissionOwnership {
+                planner: "planner-agent".to_string(),
+                dispatcher: "dispatcher-agent".to_string(),
+                operator: "operator-human".to_string(),
+            },
+            1_704_200_000_000,
+        );
+        mission.provenance = Some(MissionProvenance {
+            bead_id: Some("ft-1i2ge.5.1".to_string()),
+            thread_id: Some("ft-1i2ge.5.1".to_string()),
+            source_command: Some("ft mission plan".to_string()),
+            source_sha: Some("deadbeef".to_string()),
+        });
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:cli-a".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::SendText {
+                pane_id: 7,
+                text: "/retry".to_string(),
+                paste_mode: Some(false),
+            },
+            rationale: "retry stalled lane".to_string(),
+            score: Some(0.87),
+            created_at_ms: 1_704_200_000_100,
+        });
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("assignment:cli-a".to_string()),
+            candidate_id: CandidateActionId("candidate:cli-a".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "executor-1".to_string(),
+            reservation_intent: None,
+            approval_state: ApprovalState::Pending {
+                requested_by: "operator-human".to_string(),
+                requested_at_ms: 1_704_200_000_140,
+            },
+            outcome: None,
+            escalation: None,
+            created_at_ms: 1_704_200_000_130,
+            updated_at_ms: Some(1_704_200_000_140),
+        });
+        mission.lifecycle_state = MissionLifecycleState::AwaitingApproval;
+        mission
+    }
+
+    fn sample_robot_mission() -> frankenterm_core::plan::Mission {
+        use frankenterm_core::plan::{
+            ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId,
+            MissionActorRole, MissionLifecycleState, Outcome, StepAction, WaitCondition,
+        };
+
+        let mut mission = sample_cli_mission();
+        mission.lifecycle_state = MissionLifecycleState::Running;
+
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:robot-b".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::WaitFor {
+                pane_id: Some(7),
+                condition: WaitCondition::PaneIdle {
+                    pane_id: Some(7),
+                    idle_threshold_ms: 2_000,
+                },
+                timeout_ms: 30_000,
+            },
+            rationale: "wait for pane idle before recovery".to_string(),
+            score: Some(0.51),
+            created_at_ms: 1_704_200_000_200,
+        });
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:robot-c".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::AcquireLock {
+                lock_name: "mission-lock".to_string(),
+                timeout_ms: Some(2_000),
+            },
+            rationale: "serialize mission control lane".to_string(),
+            score: Some(0.33),
+            created_at_ms: 1_704_200_000_300,
+        });
+
+        mission.assignments[0].approval_state = ApprovalState::Approved {
+            approved_by: "operator-human".to_string(),
+            approved_at_ms: 1_704_200_000_141,
+            approval_code_hash: "sha256:runstate".to_string(),
+        };
+
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("assignment:robot-b".to_string()),
+            candidate_id: CandidateActionId("candidate:robot-b".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "executor-2".to_string(),
+            reservation_intent: None,
+            approval_state: ApprovalState::Approved {
+                approved_by: "operator-human".to_string(),
+                approved_at_ms: 1_704_200_000_242,
+                approval_code_hash: "sha256:ok".to_string(),
+            },
+            outcome: Some(Outcome::Failed {
+                reason_code: "dispatch_error".to_string(),
+                error_code: "FTM1005".to_string(),
+                completed_at_ms: 1_704_200_000_260,
+            }),
+            escalation: None,
+            created_at_ms: 1_704_200_000_230,
+            updated_at_ms: Some(1_704_200_000_260),
+        });
+
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("assignment:robot-c".to_string()),
+            candidate_id: CandidateActionId("candidate:robot-c".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "executor-3".to_string(),
+            reservation_intent: None,
+            approval_state: ApprovalState::Denied {
+                denied_by: "operator-human".to_string(),
+                denied_at_ms: 1_704_200_000_280,
+                reason_code: "policy_denied".to_string(),
+            },
+            outcome: None,
+            escalation: None,
+            created_at_ms: 1_704_200_000_270,
+            updated_at_ms: Some(1_704_200_000_280),
+        });
+
+        mission
+    }
+
+    #[test]
+    fn mission_cli_command_family_parses_all_subcommands() {
+        let plan_cli = Cli::try_parse_from([
+            "ft",
+            "mission",
+            "plan",
+            "--mission-file",
+            "/tmp/mission.json",
+            "--include-dispatch-contracts",
+            "--format",
+            "json",
+        ])
+        .expect("mission plan should parse");
+        match plan_cli.command.map(|cmd| *cmd) {
+            Some(Commands::Mission {
+                command:
+                    MissionCommands::Plan {
+                        mission_file,
+                        include_dispatch_contracts,
+                        format,
+                    },
+            }) => {
+                assert_eq!(mission_file, Some(PathBuf::from("/tmp/mission.json")));
+                assert!(include_dispatch_contracts);
+                assert_eq!(format, "json");
+            }
+            _ => panic!("unexpected mission plan parse result"),
+        }
+
+        let run_cli =
+            Cli::try_parse_from(["ft", "mission", "run"]).expect("mission run should parse");
+        match run_cli.command.map(|cmd| *cmd) {
+            Some(Commands::Mission {
+                command:
+                    MissionCommands::Run {
+                        mission_file,
+                        format,
+                    },
+            }) => {
+                assert_eq!(mission_file, None);
+                assert_eq!(format, "plain");
+            }
+            _ => panic!("unexpected mission run parse result"),
+        }
+
+        let explain_cli = Cli::try_parse_from([
+            "ft",
+            "mission",
+            "explain",
+            "--assignment-id",
+            "assignment:1",
+            "--format",
+            "json",
+        ])
+        .expect("mission explain should parse");
+        match explain_cli.command.map(|cmd| *cmd) {
+            Some(Commands::Mission {
+                command:
+                    MissionCommands::Explain {
+                        assignment_id,
+                        format,
+                        ..
+                    },
+            }) => {
+                assert_eq!(assignment_id.as_deref(), Some("assignment:1"));
+                assert_eq!(format, "json");
+            }
+            _ => panic!("unexpected mission explain parse result"),
+        }
+
+        let pause_cli = Cli::try_parse_from([
+            "ft",
+            "mission",
+            "pause",
+            "--reason",
+            "operator_backpressure",
+        ])
+        .expect("mission pause should parse");
+        match pause_cli.command.map(|cmd| *cmd) {
+            Some(Commands::Mission {
+                command:
+                    MissionCommands::Pause {
+                        reason,
+                        format,
+                        ..
+                    },
+            }) => {
+                assert_eq!(reason.as_deref(), Some("operator_backpressure"));
+                assert_eq!(format, "plain");
+            }
+            _ => panic!("unexpected mission pause parse result"),
+        }
+    }
+
+    #[test]
+    fn mission_cli_run_transition_plan_matches_contract() {
+        use frankenterm_core::plan::MissionLifecycleState as State;
+        use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
+
+        assert_eq!(
+            mission_run_transition_plan(State::Planning).expect("planning should be runnable"),
+            vec![
+                (State::Planned, Kind::PlanFinalized),
+                (State::Dispatching, Kind::DispatchStarted),
+                (State::Running, Kind::ExecutionStarted),
+            ]
+        );
+        assert_eq!(
+            mission_run_transition_plan(State::Planned).expect("planned should be runnable"),
+            vec![
+                (State::Dispatching, Kind::DispatchStarted),
+                (State::Running, Kind::ExecutionStarted),
+            ]
+        );
+        assert_eq!(
+            mission_run_transition_plan(State::Dispatching)
+                .expect("dispatching should transition directly to running"),
+            vec![(State::Running, Kind::ExecutionStarted)]
+        );
+        assert_eq!(
+            mission_run_transition_plan(State::RetryPending)
+                .expect("retry pending should resume into running"),
+            vec![(State::Running, Kind::RetryResumed)]
+        );
+        assert!(mission_run_transition_plan(State::AwaitingApproval).is_err());
+        assert!(mission_run_transition_plan(State::Completed).is_err());
+    }
+
+    #[test]
+    fn mission_cli_pause_resume_abort_transition_contract() {
+        use frankenterm_core::plan::MissionLifecycleState as State;
+        use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
+
+        assert_eq!(
+            mission_pause_transition_plan(State::Running).expect("running can pause"),
+            vec![(State::Blocked, Kind::ExecutionBlocked)]
+        );
+        assert_eq!(
+            mission_pause_transition_plan(State::Blocked).expect("blocked pause is idempotent"),
+            Vec::<(State, Kind)>::new()
+        );
+        assert!(mission_pause_transition_plan(State::Planned).is_err());
+
+        assert_eq!(
+            mission_resume_transition_plan(State::Blocked).expect("blocked can resume"),
+            vec![(State::Running, Kind::RetryResumed)]
+        );
+        assert_eq!(
+            mission_resume_transition_plan(State::RetryPending)
+                .expect("retry_pending can resume to dispatching"),
+            vec![(State::Dispatching, Kind::RetryResumed)]
+        );
+        assert!(mission_resume_transition_plan(State::AwaitingApproval).is_err());
+
+        assert_eq!(
+            mission_abort_transition_plan(State::Running).expect("running can abort"),
+            vec![(State::Cancelled, Kind::MissionCancelled)]
+        );
+        assert_eq!(
+            mission_abort_transition_plan(State::Cancelled).expect("cancelled abort is idempotent"),
+            Vec::<(State, Kind)>::new()
+        );
+        assert!(mission_abort_transition_plan(State::Completed).is_err());
+    }
+
+    #[test]
+    fn mission_cli_status_and_explain_helpers_report_expected_contract_state() {
+        let mut mission = sample_cli_mission();
+        mission
+            .assignments
+            .push(frankenterm_core::plan::Assignment {
+                assignment_id: frankenterm_core::plan::AssignmentId("assignment:cli-b".to_string()),
+                candidate_id: frankenterm_core::plan::CandidateActionId("candidate:cli-a".to_string()),
+                assigned_by: frankenterm_core::plan::MissionActorRole::Dispatcher,
+                assignee: "executor-2".to_string(),
+                reservation_intent: None,
+                approval_state: frankenterm_core::plan::ApprovalState::Approved {
+                    approved_by: "operator-human".to_string(),
+                    approved_at_ms: 1_704_200_000_240,
+                    approval_code_hash: "sha256:abcd".to_string(),
+                },
+                outcome: Some(frankenterm_core::plan::Outcome::Success {
+                    reason_code: "dispatch_executed".to_string(),
+                    completed_at_ms: 1_704_200_000_260,
+                }),
+                escalation: None,
+                created_at_ms: 1_704_200_000_230,
+                updated_at_ms: Some(1_704_200_000_260),
+            });
+
+        let counters = mission_assignment_counters(&mission);
+        assert_eq!(counters.pending_approval, 1);
+        assert_eq!(counters.approved, 1);
+        assert_eq!(counters.succeeded, 1);
+        assert_eq!(counters.unresolved, 1);
+
+        let transitions = mission_available_transitions(mission.lifecycle_state);
+        assert!(
+            transitions
+                .iter()
+                .any(|(kind, to)| kind.to_string() == "approval_granted" && to.to_string() == "running")
+        );
+    }
+
+    #[test]
+    fn mission_robot_command_family_parses_all_subcommands() {
+        let state_cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "mission",
+            "state",
+            "--mission-file",
+            "/tmp/mission.json",
+            "--mission-state",
+            "running",
+            "--run-state",
+            "failed",
+            "--agent-state",
+            "denied",
+            "--action-state",
+            "blocked",
+            "--assignment-id",
+            "assignment:robot-c",
+            "--assignee",
+            "executor-3",
+            "--limit",
+            "5",
+        ])
+        .expect("robot mission state should parse");
+
+        match state_cli.command.map(|cmd| *cmd) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Mission {
+                    command:
+                        RobotMissionCommands::State {
+                            mission_file,
+                            mission_state,
+                            run_state,
+                            agent_state,
+                            action_state,
+                            assignment_id,
+                            assignee,
+                            limit,
+                        },
+                }) => {
+                    assert_eq!(mission_file, Some(PathBuf::from("/tmp/mission.json")));
+                    assert_eq!(mission_state, Some(RobotMissionLifecycleStateArg::Running));
+                    assert_eq!(run_state, Some(RobotMissionRunState::Failed));
+                    assert_eq!(agent_state, Some(RobotMissionAgentState::Denied));
+                    assert_eq!(action_state, Some(RobotMissionActionState::Blocked));
+                    assert_eq!(assignment_id.as_deref(), Some("assignment:robot-c"));
+                    assert_eq!(assignee.as_deref(), Some("executor-3"));
+                    assert_eq!(limit, 5);
+                }
+                _ => panic!("expected RobotCommands::Mission::State"),
+            },
+            _ => panic!("expected robot command"),
+        }
+
+        let decisions_cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "mission",
+            "decisions",
+            "--run-state",
+            "pending",
+            "--agent-state",
+            "approved",
+            "--action-state",
+            "ready",
+        ])
+        .expect("robot mission decisions should parse");
+        match decisions_cli.command.map(|cmd| *cmd) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Mission {
+                    command:
+                        RobotMissionCommands::Decisions {
+                            mission_file,
+                            mission_state,
+                            run_state,
+                            agent_state,
+                            action_state,
+                            assignment_id,
+                            assignee,
+                            limit,
+                        },
+                }) => {
+                    assert_eq!(mission_file, None);
+                    assert_eq!(mission_state, None);
+                    assert_eq!(run_state, Some(RobotMissionRunState::Pending));
+                    assert_eq!(agent_state, Some(RobotMissionAgentState::Approved));
+                    assert_eq!(action_state, Some(RobotMissionActionState::Ready));
+                    assert_eq!(assignment_id, None);
+                    assert_eq!(assignee, None);
+                    assert_eq!(limit, 100);
+                }
+                _ => panic!("expected RobotCommands::Mission::Decisions"),
+            },
+            _ => panic!("expected robot command"),
+        }
+    }
+
+    #[test]
+    fn mission_robot_filters_apply_state_and_assignment_constraints() {
+        let mission = sample_robot_mission();
+        let filters = build_robot_mission_filters(
+            Some(RobotMissionLifecycleStateArg::Running),
+            Some(RobotMissionRunState::Failed),
+            Some(RobotMissionAgentState::Approved),
+            Some(RobotMissionActionState::Completed),
+            Some("assignment:robot-b".to_string()),
+            Some("executor-2".to_string()),
+            10,
+        )
+        .expect("valid filters");
+
+        let payload = build_robot_mission_state_data(&mission, Path::new("/tmp/mission.json"), filters);
+        assert!(payload.mission_matches_filter);
+        assert_eq!(payload.assignment_count, 3);
+        assert_eq!(payload.matched_assignment_count, 1);
+        assert_eq!(payload.returned_assignment_count, 1);
+        assert_eq!(payload.assignments[0].assignment_id, "assignment:robot-b");
+        assert_eq!(payload.assignments[0].run_state, RobotMissionRunState::Failed);
+        assert_eq!(payload.assignments[0].agent_state, RobotMissionAgentState::Approved);
+        assert_eq!(
+            payload.assignments[0].action_state,
+            RobotMissionActionState::Completed
+        );
+    }
+
+    #[test]
+    fn mission_robot_state_returns_empty_when_mission_filter_mismatches() {
+        let mission = sample_robot_mission();
+        let filters = build_robot_mission_filters(
+            Some(RobotMissionLifecycleStateArg::Completed),
+            None,
+            None,
+            None,
+            None,
+            None,
+            10,
+        )
+        .expect("valid filters");
+
+        let payload = build_robot_mission_state_data(&mission, Path::new("/tmp/mission.json"), filters);
+        assert!(!payload.mission_matches_filter);
+        assert_eq!(payload.matched_assignment_count, 0);
+        assert_eq!(payload.returned_assignment_count, 0);
+        assert!(payload.assignments.is_empty());
+    }
+
+    #[test]
+    fn mission_robot_decisions_include_explainability_payloads() {
+        let mission = sample_robot_mission();
+        let filters = build_robot_mission_filters(
+            Some(RobotMissionLifecycleStateArg::Running),
+            Some(RobotMissionRunState::Pending),
+            Some(RobotMissionAgentState::Approved),
+            Some(RobotMissionActionState::Ready),
+            Some("assignment:cli-a".to_string()),
+            Some("executor-1".to_string()),
+            5,
+        )
+        .expect("valid filters");
+
+        let payload =
+            build_robot_mission_decisions_data(&mission, Path::new("/tmp/mission.json"), filters);
+
+        assert!(payload.mission_matches_filter);
+        assert_eq!(payload.matched_assignment_count, 1);
+        assert_eq!(payload.returned_assignment_count, 1);
+        assert!(payload.failure_catalog.len() >= 8);
+        let decision = &payload.decisions[0];
+        assert_eq!(decision.assignment.assignment_id, "assignment:cli-a");
+        assert!(decision.dispatch_target.is_some());
+        assert!(decision.dispatch_contract.is_some());
+        assert!(decision.dry_run_execution.is_some());
+    }
+
+    #[test]
+    fn mission_robot_filters_validate_edge_inputs() {
+        let err = build_robot_mission_filters(None, None, None, None, None, None, 0)
+            .expect_err("limit=0 should be rejected");
+        assert_eq!(err.error_code, "mission.limit_invalid");
+
+        let err = build_robot_mission_filters(
+            None,
+            None,
+            None,
+            None,
+            Some("   ".to_string()),
+            None,
+            1,
+        )
+        .expect_err("blank assignment should be rejected");
+        assert_eq!(err.error_code, "mission.assignment_id_empty");
+
+        let err = build_robot_mission_filters(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("  ".to_string()),
+            1,
+        )
+        .expect_err("blank assignee should be rejected");
+        assert_eq!(err.error_code, "mission.assignee_empty");
+    }
+
+    #[test]
+    fn robot_mission_error_code_mapping_is_stable() {
+        assert_eq!(
+            robot_mission_error_code("mission.file_not_found"),
+            "robot.mission_not_found"
+        );
+        assert_eq!(
+            robot_mission_error_code("mission.validation_failed"),
+            "robot.mission_validation_failed"
+        );
+        assert_eq!(
+            robot_mission_error_code("mission.assignment_not_found"),
+            "robot.assignment_not_found"
+        );
+        assert_eq!(robot_mission_error_code("mission.limit_invalid"), ROBOT_ERR_INVALID_ARGS);
+        assert_eq!(
+            robot_mission_error_code("mission.unmapped"),
+            "robot.mission_error"
+        );
     }
 
     #[test]
