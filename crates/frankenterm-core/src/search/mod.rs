@@ -14,6 +14,7 @@ mod hash_embedder;
 mod hybrid_search;
 mod indexing;
 pub mod lexical_backend_bridge;
+pub mod migration_controller;
 pub mod orchestrator;
 pub mod regression_diff;
 mod reranker;
@@ -104,6 +105,10 @@ pub use model2vec_embedder::Model2VecEmbedder;
 pub use reranker::CrossEncoderReranker;
 
 pub use facade::{FacadeConfig, FacadeResult, FacadeRouting, SearchFacade, ShadowComparison};
+pub use migration_controller::{
+    HealthCheckResult, MigrationController, MigrationControllerConfig, MigrationPhase,
+    PhaseTransitionError, RetirementGateResult, run_default_retirement_gate,
+};
 pub use regression_diff::{
     DiffArtifact, RegressionDiffReport, RegressionScenario, ReplayGateConfig, ReplayGateVerdict,
     ScenarioOutcome, default_scenarios, run_regression_suite, run_replay_gate,
