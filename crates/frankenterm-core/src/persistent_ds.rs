@@ -784,18 +784,24 @@ impl<T: Clone> VersionedStore<T> {
 
     /// Push a new version.
     ///
-    /// # Panics
-    ///
-    /// Debug-asserts that `timestamp_ms` is monotonically non-decreasing
+    /// Timestamps are normalized to a monotonic non-decreasing sequence
     /// (required by [`at_timestamp`] binary search).
     pub fn push(&mut self, state: T, timestamp_ms: u64) {
-        debug_assert!(
-            self.versions
-                .last()
-                .is_none_or(|(ts, _)| timestamp_ms >= *ts),
-            "VersionedStore::push requires monotonically non-decreasing timestamps"
-        );
-        self.versions.push((timestamp_ms, state));
+        let normalized_timestamp = if let Some((last_ts, _)) = self.versions.last() {
+            if timestamp_ms < *last_ts {
+                debug_assert!(
+                    false,
+                    "VersionedStore::push received regressed timestamp ({timestamp_ms} < {last_ts}); clamping to preserve ordering",
+                );
+                *last_ts
+            } else {
+                timestamp_ms
+            }
+        } else {
+            timestamp_ms
+        };
+
+        self.versions.push((normalized_timestamp, state));
         self.current = self.versions.len() - 1;
     }
 
@@ -1464,6 +1470,18 @@ mod tests {
         store.push(1, 2000);
         store.push(2, 3000);
         assert_eq!(store.at_timestamp(2000), Some(&1));
+    }
+
+    #[test]
+    fn versioned_push_clamps_regressed_timestamp_to_preserve_sort_order() {
+        let mut store = VersionedStore::new("v0", 1000);
+        store.push("v1", 2000);
+        store.push("v2", 1500); // regressed timestamp input
+
+        assert_eq!(store.timestamp_at(0), Some(1000));
+        assert_eq!(store.timestamp_at(1), Some(2000));
+        assert_eq!(store.timestamp_at(2), Some(2000));
+        assert_eq!(store.at_timestamp(9999), Some(&"v2"));
     }
 
     #[test]
