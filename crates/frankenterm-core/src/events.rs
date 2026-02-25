@@ -1068,7 +1068,23 @@ pub fn match_rule_glob(pattern: &str, value: &str) -> bool {
     }
     re.push('$');
 
-    fancy_regex::Regex::new(&re).is_ok_and(|r| r.is_match(value).unwrap_or(false))
+    thread_local! {
+        static REGEX_CACHE: std::cell::RefCell<crate::lru_cache::LruCache<String, fancy_regex::Regex>> =
+            std::cell::RefCell::new(crate::lru_cache::LruCache::new(256));
+    }
+
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(r) = cache.get(&re) {
+            return r.is_match(value).unwrap_or(false);
+        }
+        if let Ok(r) = fancy_regex::Regex::new(&re) {
+            let is_match = r.is_match(value).unwrap_or(false);
+            cache.put(re, r);
+            return is_match;
+        }
+        false
+    })
 }
 
 /// Event notification filter.
