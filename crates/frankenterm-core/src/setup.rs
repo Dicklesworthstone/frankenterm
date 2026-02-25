@@ -361,9 +361,13 @@ pub fn unpatch_shell_rc_at(rc_path: &Path) -> Result<PatchResult> {
     // Create backup before modifying
     let backup_path = create_backup(rc_path)?;
 
-    // Remove the wa block
-    let begin_idx = content.find(FT_BEGIN_MARKER_SHELL).unwrap(); // ubs:ignore
-    let end_marker_start = content.find(FT_END_MARKER_SHELL).unwrap(); // ubs:ignore
+    // Remove the wa block (markers guaranteed present by has_shell_ft_block check above)
+    let Some(begin_idx) = content.find(FT_BEGIN_MARKER_SHELL) else {
+        return Err(Error::SetupError("Begin marker not found in shell config".into()));
+    };
+    let Some(end_marker_start) = content.find(FT_END_MARKER_SHELL) else {
+        return Err(Error::SetupError("End marker not found in shell config".into()));
+    };
     let end_idx = content[end_marker_start..]
         .find('\n')
         .map_or(content.len(), |i| end_marker_start + i + 1);
@@ -581,14 +585,30 @@ fn is_wildcard_host(alias: &str) -> bool {
 }
 
 fn strip_inline_comment(line: &str) -> &str {
-    let mut in_quotes = false;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
     for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
         match ch {
-            '"' => in_quotes = !in_quotes,
-            '#' if !in_quotes => return &line[..idx],
+            // Only double-quoted values honor backslash escaping.
+            '\\' if quote == Some('"') => {
+                escaped = true;
+            }
+            '"' | '\'' => match quote {
+                Some(active) if active == ch => quote = None,
+                None => quote = Some(ch),
+                _ => {}
+            },
+            '#' if quote.is_none() => return &line[..idx],
             _ => {}
         }
     }
+
     line
 }
 
@@ -993,8 +1013,12 @@ pub fn patch_wezterm_config_block_at(config_path: &Path, ft_block: &str) -> Resu
 
         let backup_path = create_backup(config_path)?;
 
-        let begin_idx = content.find(FT_BEGIN_MARKER).unwrap(); // ubs:ignore // ubs:ignore
-        let end_marker_start = content.find(FT_END_MARKER).unwrap(); // ubs:ignore // ubs:ignore
+        let Some(begin_idx) = content.find(FT_BEGIN_MARKER) else {
+            return Err(Error::SetupError("Begin marker not found in config".into()));
+        };
+        let Some(end_marker_start) = content.find(FT_END_MARKER) else {
+            return Err(Error::SetupError("End marker not found in config".into()));
+        };
         let end_idx = content[end_marker_start..]
             .find('\n')
             .map_or(content.len(), |i| end_marker_start + i + 1);
@@ -2320,8 +2344,30 @@ alias ll='ls -la'
     }
 
     #[test]
+    fn strip_inline_comment_hash_inside_single_quotes() {
+        assert_eq!(
+            strip_inline_comment("HostName 'server#1.example.com'"),
+            "HostName 'server#1.example.com'"
+        );
+    }
+
+    #[test]
     fn strip_inline_comment_hash_after_quoted_value() {
         assert_eq!(strip_inline_comment(r#""value" # comment"#), r#""value" "#);
+    }
+
+    #[test]
+    fn strip_inline_comment_escaped_quote_inside_double_quotes() {
+        let input = "HostName \"server\\\"#1.example.com\" # trailing comment";
+        let expected = "HostName \"server\\\"#1.example.com\" ";
+        assert_eq!(strip_inline_comment(input), expected);
+    }
+
+    #[test]
+    fn strip_inline_comment_backslash_in_single_quotes_does_not_escape_quote() {
+        let input = "HostName 'server\\' # trailing comment";
+        let expected = "HostName 'server\\' ";
+        assert_eq!(strip_inline_comment(input), expected);
     }
 
     #[test]
