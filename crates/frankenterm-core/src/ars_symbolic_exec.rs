@@ -521,7 +521,7 @@ pub fn path_within_boundary(path: &Path, boundary: &Path) -> bool {
 // =============================================================================
 
 /// Result of symbolic execution safety analysis.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SafetyVerdict {
     /// All commands are safe within the CWD boundary.
     Safe,
@@ -542,7 +542,7 @@ impl SafetyVerdict {
 }
 
 /// Details of safety violations found during analysis.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SafetyViolations {
     /// Individual violations.
     pub violations: Vec<SafetyViolation>,
@@ -776,7 +776,7 @@ impl SymbolicExecutor {
                 continue;
             }
 
-            if has_recursive && resolved == PathBuf::from(&self.config.cwd) {
+            if has_recursive && resolved == self.config.cwd {
                 violations.push(SafetyViolation {
                     block_index,
                     category: ViolationCategory::UnboundedDeletion,

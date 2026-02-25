@@ -85,9 +85,7 @@ pub enum AlertKind {
         elapsed_ms: i64,
     },
     /// Circular wait-for dependency detected among draining scopes.
-    DeadlockRisk {
-        cycle: Vec<ScopeId>,
-    },
+    DeadlockRisk { cycle: Vec<ScopeId> },
     /// More scopes exist than expected — possible scope leak.
     ScopeLeak {
         tier: ScopeTier,
@@ -345,12 +343,7 @@ impl ScopeWatchdog {
     }
 
     /// Detect orphan tasks: active scopes whose parent is closed.
-    fn detect_orphans(
-        &self,
-        tree: &ScopeTree,
-        current_ms: i64,
-        alerts: &mut Vec<WatchdogAlert>,
-    ) {
+    fn detect_orphans(&self, tree: &ScopeTree, current_ms: i64, alerts: &mut Vec<WatchdogAlert>) {
         let root = ScopeId::root();
         // Check all non-root scopes
         for id in all_scope_ids(tree) {
@@ -381,7 +374,8 @@ impl ScopeWatchdog {
                                 "Scope {} is {} but parent {} is {}",
                                 id, node.state, parent_id, parent.state
                             ),
-                            "Force-close the orphan scope or re-register under a live parent".to_string(),
+                            "Force-close the orphan scope or re-register under a live parent"
+                                .to_string(),
                         ));
                     }
                 }
@@ -433,7 +427,8 @@ impl ScopeWatchdog {
                         "Scope {} has been draining for {}ms (grace: {}ms)",
                         id, elapsed, grace
                     ),
-                    "Check if child scopes are blocking drain; consider force-close escalation".to_string(),
+                    "Check if child scopes are blocking drain; consider force-close escalation"
+                        .to_string(),
                 ));
             }
         }
@@ -455,9 +450,7 @@ impl ScopeWatchdog {
                 continue;
             }
             // Estimate when finalizing started — use shutdown_requested_at as lower bound
-            let finalize_start = node
-                .shutdown_requested_at_ms
-                .unwrap_or(node.created_at_ms);
+            let finalize_start = node.shutdown_requested_at_ms.unwrap_or(node.created_at_ms);
             let elapsed = current_ms - finalize_start;
             let timeout = self.config.finalizer_timeout_ms as i64;
 
@@ -474,7 +467,8 @@ impl ScopeWatchdog {
                         "Scope {} has been finalizing for {}ms (timeout: {}ms)",
                         id, elapsed, timeout
                     ),
-                    "Check for hung finalizers; consider skipping remaining and force-closing".to_string(),
+                    "Check for hung finalizers; consider skipping remaining and force-closing"
+                        .to_string(),
                 ));
             }
         }
@@ -515,7 +509,8 @@ impl ScopeWatchdog {
                         threshold: limit,
                     },
                     format!("{} tier has {} scopes (limit: {})", tier, count, limit),
-                    "Investigate scope registration; ensure ephemeral scopes are being closed".to_string(),
+                    "Investigate scope registration; ensure ephemeral scopes are being closed"
+                        .to_string(),
                 ));
             }
         }
@@ -551,7 +546,8 @@ impl ScopeWatchdog {
                         "Scope {} has been in Created state for {}ms without starting",
                         id, elapsed
                     ),
-                    "Start or remove the scope; it may have been registered but never activated".to_string(),
+                    "Start or remove the scope; it may have been registered but never activated"
+                        .to_string(),
                 ));
             }
         }
@@ -591,12 +587,7 @@ impl ScopeWatchdog {
     /// is a child of A), and scope B is waiting for scope A (because it depends on
     /// some resource held by A). We detect this as cycles in the parent→child
     /// wait-for graph among draining scopes.
-    fn detect_deadlocks(
-        &self,
-        tree: &ScopeTree,
-        current_ms: i64,
-        alerts: &mut Vec<WatchdogAlert>,
-    ) {
+    fn detect_deadlocks(&self, tree: &ScopeTree, current_ms: i64, alerts: &mut Vec<WatchdogAlert>) {
         // Build wait-for graph: scope → set of scopes it's waiting for
         // A draining parent waits for its non-closed children.
         let mut wait_for: HashMap<ScopeId, Vec<ScopeId>> = HashMap::new();
@@ -613,10 +604,7 @@ impl ScopeWatchdog {
             let waiting_on: Vec<ScopeId> = node
                 .children
                 .iter()
-                .filter(|cid| {
-                    tree.get(cid)
-                        .map_or(false, |c| !c.state.is_terminal())
-                })
+                .filter(|cid| tree.get(cid).is_some_and(|c| !c.state.is_terminal()))
                 .cloned()
                 .collect();
 
@@ -632,13 +620,9 @@ impl ScopeWatchdog {
 
         for start_id in wait_for.keys() {
             if !visited.contains(start_id) {
-                if let Some(cycle) = self.dfs_cycle(
-                    start_id,
-                    &wait_for,
-                    &mut visited,
-                    &mut on_stack,
-                    &mut path,
-                ) {
+                if let Some(cycle) =
+                    self.dfs_cycle(start_id, &wait_for, &mut visited, &mut on_stack, &mut path)
+                {
                     alerts.push(WatchdogAlert::new(
                         current_ms,
                         AlertSeverity::Critical,
@@ -701,7 +685,8 @@ impl ScopeWatchdog {
             "scope_watchdog|scans={}|alerts={}|last_scan={}",
             self.scan_count,
             self.total_alerts,
-            self.last_scan_ms.map_or("none".to_string(), |ms| ms.to_string()),
+            self.last_scan_ms
+                .map_or("none".to_string(), |ms| ms.to_string()),
         )
     }
 }
@@ -751,9 +736,7 @@ impl ScanSummary {
         let mut depth = 0;
 
         for alert in alerts {
-            *by_severity
-                .entry(alert.severity.to_string())
-                .or_insert(0) += 1;
+            *by_severity.entry(alert.severity.to_string()).or_insert(0) += 1;
 
             match &alert.kind {
                 AlertKind::OrphanTask { .. } => orphans += 1,
@@ -793,7 +776,7 @@ impl ScanSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scope_tree::{register_standard_scopes, well_known, ScopeTree};
+    use crate::scope_tree::{ScopeTree, register_standard_scopes, well_known};
 
     fn setup_tree() -> ScopeTree {
         let mut tree = ScopeTree::new(1000);
@@ -811,7 +794,11 @@ mod tests {
         let tree = setup_tree();
         let mut watchdog = ScopeWatchdog::new();
         let alerts = watchdog.scan(&tree, 2000);
-        assert!(alerts.is_empty(), "clean tree should have no alerts: {:?}", alerts);
+        assert!(
+            alerts.is_empty(),
+            "clean tree should have no alerts: {:?}",
+            alerts
+        );
     }
 
     #[test]
@@ -832,7 +819,8 @@ mod tests {
         // Close capture daemon (skip normal lifecycle for test — force states)
         tree.request_shutdown(&well_known::capture(), 2000).unwrap();
         // Force-close capture's children check: close worker first normally
-        tree.request_shutdown(&well_known::capture_worker(0), 2100).unwrap();
+        tree.request_shutdown(&well_known::capture_worker(0), 2100)
+            .unwrap();
         tree.finalize(&well_known::capture_worker(0)).unwrap();
         tree.close(&well_known::capture_worker(0), 2200).unwrap();
 
@@ -851,7 +839,13 @@ mod tests {
         let child = ScopeId("worker:child".into());
 
         tree2
-            .register(parent.clone(), ScopeTier::Daemon, &ScopeId::root(), "parent", 1000)
+            .register(
+                parent.clone(),
+                ScopeTier::Daemon,
+                &ScopeId::root(),
+                "parent",
+                1000,
+            )
             .unwrap();
         tree2.start(&parent, 1100).unwrap();
 
@@ -895,7 +889,8 @@ mod tests {
         let mut tree = setup_tree();
 
         // Request shutdown on discovery daemon
-        tree.request_shutdown(&well_known::discovery(), 5000).unwrap();
+        tree.request_shutdown(&well_known::discovery(), 5000)
+            .unwrap();
 
         let mut watchdog = ScopeWatchdog::new();
 
@@ -922,7 +917,8 @@ mod tests {
     #[test]
     fn stuck_cancellation_severity_escalates() {
         let mut tree = setup_tree();
-        tree.request_shutdown(&well_known::discovery(), 5000).unwrap();
+        tree.request_shutdown(&well_known::discovery(), 5000)
+            .unwrap();
 
         let mut watchdog = ScopeWatchdog::new();
 
@@ -971,7 +967,11 @@ mod tests {
 
         let is_daemon_leak = matches!(
             &leaks[0].kind,
-            AlertKind::ScopeLeak { tier: ScopeTier::Daemon, count: 25, threshold: 20 }
+            AlertKind::ScopeLeak {
+                tier: ScopeTier::Daemon,
+                count: 25,
+                threshold: 20
+            }
         );
         assert!(is_daemon_leak);
     }
@@ -1071,7 +1071,8 @@ mod tests {
     #[test]
     fn scan_summary_from_alerts() {
         let mut tree = setup_tree();
-        tree.request_shutdown(&well_known::discovery(), 5000).unwrap();
+        tree.request_shutdown(&well_known::discovery(), 5000)
+            .unwrap();
 
         let mut watchdog = ScopeWatchdog::new();
         let alerts = watchdog.scan(&tree, 25_000);

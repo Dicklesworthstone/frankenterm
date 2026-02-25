@@ -48,12 +48,18 @@ impl PilotScenario {
     #[must_use]
     pub fn description(self) -> &'static str {
         match self {
-            Self::CaptureSession => "Capture a 10-minute swarm session and produce .ftreplay artifact",
+            Self::CaptureSession => {
+                "Capture a 10-minute swarm session and produce .ftreplay artifact"
+            }
             Self::ReplayTrace => "Replay captured trace and verify L1 structural equivalence",
-            Self::CounterfactualDiff => "Modify pattern rule, run counterfactual diff, verify divergence attribution",
+            Self::CounterfactualDiff => {
+                "Modify pattern rule, run counterfactual diff, verify divergence attribution"
+            }
             Self::RegressionGate => "Run regression suite and verify pass/fail gate behavior",
             Self::InspectExport => "Inspect and export artifacts, verify human-readable output",
-            Self::RobotModeAgent => "Agent issues replay commands via Robot Mode, verify structured responses",
+            Self::RobotModeAgent => {
+                "Agent issues replay commands via Robot Mode, verify structured responses"
+            }
         }
     }
 
@@ -88,7 +94,7 @@ pub enum ParticipantType {
     AgentWorkflow,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Participant {
     pub id: String,
     pub participant_type: ParticipantType,
@@ -107,7 +113,7 @@ pub enum ScenarioOutcome {
     Skipped,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioResult {
     pub scenario: PilotScenario,
     pub participant_id: String,
@@ -127,7 +133,9 @@ impl ScenarioResult {
 
     #[must_use]
     pub fn needed_docs_lookup(&self) -> bool {
-        self.friction_points.iter().any(|f| f.category == FrictionCategory::DocumentationLookup)
+        self.friction_points
+            .iter()
+            .any(|f| f.category == FrictionCategory::DocumentationLookup)
     }
 }
 
@@ -162,7 +170,7 @@ impl FrictionCategory {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrictionPoint {
     pub category: FrictionCategory,
     pub description: String,
@@ -174,7 +182,7 @@ pub struct FrictionPoint {
 
 // ── Feedback Log ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedbackLog {
     pub pilot_id: String,
     pub started_at: String,
@@ -206,14 +214,21 @@ impl FeedbackLog {
 
     #[must_use]
     pub fn success_count(&self) -> usize {
-        self.results.iter().filter(|r| {
-            r.outcome == ScenarioOutcome::Success || r.outcome == ScenarioOutcome::SuccessWithFriction
-        }).count()
+        self.results
+            .iter()
+            .filter(|r| {
+                r.outcome == ScenarioOutcome::Success
+                    || r.outcome == ScenarioOutcome::SuccessWithFriction
+            })
+            .count()
     }
 
     #[must_use]
     pub fn failure_count(&self) -> usize {
-        self.results.iter().filter(|r| r.outcome == ScenarioOutcome::Failed).count()
+        self.results
+            .iter()
+            .filter(|r| r.outcome == ScenarioOutcome::Failed)
+            .count()
     }
 
     #[must_use]
@@ -232,13 +247,20 @@ impl FeedbackLog {
         if total == 0 {
             return 0.0;
         }
-        let confused = self.results.iter().filter(|r| r.needed_docs_lookup()).count();
+        let confused = self
+            .results
+            .iter()
+            .filter(|r| r.needed_docs_lookup())
+            .count();
         confused as f64 / total as f64
     }
 
     #[must_use]
     pub fn all_friction_points(&self) -> Vec<&FrictionPoint> {
-        self.results.iter().flat_map(|r| &r.friction_points).collect()
+        self.results
+            .iter()
+            .flat_map(|r| &r.friction_points)
+            .collect()
     }
 }
 
@@ -264,18 +286,32 @@ pub fn calculate_metrics(log: &FeedbackLog) -> PilotMetrics {
     let total = log.results.len();
     let successful = log.success_count();
     let failed = log.failure_count();
-    let skipped = log.results.iter().filter(|r| r.outcome == ScenarioOutcome::Skipped).count();
-    let within_time_budget = log.results.iter().filter(|r| r.is_within_time_budget()).count();
+    let skipped = log
+        .results
+        .iter()
+        .filter(|r| r.outcome == ScenarioOutcome::Skipped)
+        .count();
+    let within_time_budget = log
+        .results
+        .iter()
+        .filter(|r| r.is_within_time_budget())
+        .count();
     let avg_duration_secs = if total == 0 {
         0.0
     } else {
-        log.results.iter().map(|r| r.duration_secs as f64).sum::<f64>() / total as f64
+        log.results
+            .iter()
+            .map(|r| r.duration_secs as f64)
+            .sum::<f64>()
+            / total as f64
     };
 
     let all_friction = log.all_friction_points();
     let mut friction_by_category: BTreeMap<String, usize> = BTreeMap::new();
     for fp in &all_friction {
-        *friction_by_category.entry(fp.category.as_str().into()).or_insert(0) += 1;
+        *friction_by_category
+            .entry(fp.category.as_str().into())
+            .or_insert(0) += 1;
     }
 
     PilotMetrics {
@@ -365,8 +401,22 @@ pub fn evaluate_pilot(log: &FeedbackLog, criteria: &SuccessCriteria) -> PilotEva
         .map(|(cat, count)| format!("{} ({}x)", cat, count))
         .collect();
     top_improvements.sort_by(|a, b| {
-        let count_a: usize = a.rsplit('(').next().unwrap_or("0").trim_end_matches('x').trim_end_matches(')').parse().unwrap_or(0);
-        let count_b: usize = b.rsplit('(').next().unwrap_or("0").trim_end_matches('x').trim_end_matches(')').parse().unwrap_or(0);
+        let count_a: usize = a
+            .rsplit('(')
+            .next()
+            .unwrap_or("0")
+            .trim_end_matches('x')
+            .trim_end_matches(')')
+            .parse()
+            .unwrap_or(0);
+        let count_b: usize = b
+            .rsplit('(')
+            .next()
+            .unwrap_or("0")
+            .trim_end_matches('x')
+            .trim_end_matches(')')
+            .parse()
+            .unwrap_or(0);
         count_b.cmp(&count_a)
     });
     top_improvements.truncate(5);
@@ -390,7 +440,11 @@ pub fn pilot_summary_report(eval: &PilotEvaluation) -> String {
     lines.push(String::new());
     lines.push(format!(
         "**Overall: {}**",
-        if eval.passed { "PASSED" } else { "NEEDS IMPROVEMENT" }
+        if eval.passed {
+            "PASSED"
+        } else {
+            "NEEDS IMPROVEMENT"
+        }
     ));
     lines.push(String::new());
 
@@ -399,11 +453,26 @@ pub fn pilot_summary_report(eval: &PilotEvaluation) -> String {
     lines.push(format!("- Successful: {}", eval.metrics.successful));
     lines.push(format!("- Failed: {}", eval.metrics.failed));
     lines.push(format!("- Skipped: {}", eval.metrics.skipped));
-    lines.push(format!("- Error rate: {:.1}%", eval.metrics.error_rate * 100.0));
-    lines.push(format!("- Confusion rate: {:.1}%", eval.metrics.confusion_rate * 100.0));
-    lines.push(format!("- Within time budget: {}/{}", eval.metrics.within_time_budget, eval.metrics.total_scenarios));
-    lines.push(format!("- Avg duration: {:.0}s", eval.metrics.avg_duration_secs));
-    lines.push(format!("- Total friction points: {}", eval.metrics.friction_point_count));
+    lines.push(format!(
+        "- Error rate: {:.1}%",
+        eval.metrics.error_rate * 100.0
+    ));
+    lines.push(format!(
+        "- Confusion rate: {:.1}%",
+        eval.metrics.confusion_rate * 100.0
+    ));
+    lines.push(format!(
+        "- Within time budget: {}/{}",
+        eval.metrics.within_time_budget, eval.metrics.total_scenarios
+    ));
+    lines.push(format!(
+        "- Avg duration: {:.0}s",
+        eval.metrics.avg_duration_secs
+    ));
+    lines.push(format!(
+        "- Total friction points: {}",
+        eval.metrics.friction_point_count
+    ));
     lines.push(String::new());
 
     if !eval.violations.is_empty() {
@@ -433,64 +502,83 @@ pub fn pilot_summary_report(eval: &PilotEvaluation) -> String {
 pub fn validate_scenario_interfaces() -> BTreeMap<String, ScenarioValidation> {
     let mut results = BTreeMap::new();
 
-    results.insert("capture_session".into(), ScenarioValidation {
-        scenario: PilotScenario::CaptureSession,
-        cli_interface_available: true,
-        robot_interface_available: false,
-        mcp_interface_available: false,
-        dependencies_met: true,
-        notes: "Uses ft replay capture CLI command".into(),
-    });
+    results.insert(
+        "capture_session".into(),
+        ScenarioValidation {
+            scenario: PilotScenario::CaptureSession,
+            cli_interface_available: true,
+            robot_interface_available: false,
+            mcp_interface_available: false,
+            dependencies_met: true,
+            notes: "Uses ft replay capture CLI command".into(),
+        },
+    );
 
-    results.insert("replay_trace".into(), ScenarioValidation {
-        scenario: PilotScenario::ReplayTrace,
-        cli_interface_available: true,
-        robot_interface_available: true,
-        mcp_interface_available: true,
-        dependencies_met: true,
-        notes: "DiffRunner, InspectRequest, replay.inspect MCP tool".into(),
-    });
+    results.insert(
+        "replay_trace".into(),
+        ScenarioValidation {
+            scenario: PilotScenario::ReplayTrace,
+            cli_interface_available: true,
+            robot_interface_available: true,
+            mcp_interface_available: true,
+            dependencies_met: true,
+            notes: "DiffRunner, InspectRequest, replay.inspect MCP tool".into(),
+        },
+    );
 
-    results.insert("counterfactual_diff".into(), ScenarioValidation {
-        scenario: PilotScenario::CounterfactualDiff,
-        cli_interface_available: true,
-        robot_interface_available: true,
-        mcp_interface_available: true,
-        dependencies_met: true,
-        notes: "DiffRunner, DiffRequest, replay.diff MCP tool".into(),
-    });
+    results.insert(
+        "counterfactual_diff".into(),
+        ScenarioValidation {
+            scenario: PilotScenario::CounterfactualDiff,
+            cli_interface_available: true,
+            robot_interface_available: true,
+            mcp_interface_available: true,
+            dependencies_met: true,
+            notes: "DiffRunner, DiffRequest, replay.diff MCP tool".into(),
+        },
+    );
 
-    results.insert("regression_gate".into(), ScenarioValidation {
-        scenario: PilotScenario::RegressionGate,
-        cli_interface_available: true,
-        robot_interface_available: true,
-        mcp_interface_available: true,
-        dependencies_met: true,
-        notes: "RegressionSuiteResult, RegressionSuiteRequest, replay.regression MCP tool".into(),
-    });
+    results.insert(
+        "regression_gate".into(),
+        ScenarioValidation {
+            scenario: PilotScenario::RegressionGate,
+            cli_interface_available: true,
+            robot_interface_available: true,
+            mcp_interface_available: true,
+            dependencies_met: true,
+            notes: "RegressionSuiteResult, RegressionSuiteRequest, replay.regression MCP tool"
+                .into(),
+        },
+    );
 
-    results.insert("inspect_export".into(), ScenarioValidation {
-        scenario: PilotScenario::InspectExport,
-        cli_interface_available: true,
-        robot_interface_available: true,
-        mcp_interface_available: true,
-        dependencies_met: true,
-        notes: "InspectResult, ArtifactListRequest, replay.artifact_list MCP tool".into(),
-    });
+    results.insert(
+        "inspect_export".into(),
+        ScenarioValidation {
+            scenario: PilotScenario::InspectExport,
+            cli_interface_available: true,
+            robot_interface_available: true,
+            mcp_interface_available: true,
+            dependencies_met: true,
+            notes: "InspectResult, ArtifactListRequest, replay.artifact_list MCP tool".into(),
+        },
+    );
 
-    results.insert("robot_mode_agent".into(), ScenarioValidation {
-        scenario: PilotScenario::RobotModeAgent,
-        cli_interface_available: false,
-        robot_interface_available: true,
-        mcp_interface_available: true,
-        dependencies_met: true,
-        notes: "ReplayRobotCommand dispatch, all MCP tools".into(),
-    });
+    results.insert(
+        "robot_mode_agent".into(),
+        ScenarioValidation {
+            scenario: PilotScenario::RobotModeAgent,
+            cli_interface_available: false,
+            robot_interface_available: true,
+            mcp_interface_available: true,
+            dependencies_met: true,
+            notes: "ReplayRobotCommand dispatch, all MCP tools".into(),
+        },
+    );
 
     results
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioValidation {
     pub scenario: PilotScenario,
     pub cli_interface_available: bool,
@@ -511,7 +599,7 @@ pub enum ImprovementPriority {
     Low,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImprovementItem {
     pub id: String,
     pub priority: ImprovementPriority,
@@ -539,9 +627,8 @@ pub fn extract_improvements(log: &FeedbackLog) -> Vec<ImprovementItem> {
             // Only create item on first occurrence
             if *count == 1 {
                 let priority = match fp.category {
-                    FrictionCategory::UnclearErrorMessage | FrictionCategory::UnexpectedBehavior => {
-                        ImprovementPriority::High
-                    }
+                    FrictionCategory::UnclearErrorMessage
+                    | FrictionCategory::UnexpectedBehavior => ImprovementPriority::High,
                     FrictionCategory::MissingDocumentation | FrictionCategory::MissingFeature => {
                         ImprovementPriority::Medium
                     }
@@ -613,14 +700,12 @@ mod tests {
             outcome: ScenarioOutcome::SuccessWithFriction,
             duration_secs: 240,
             errors: vec![],
-            friction_points: vec![
-                FrictionPoint {
-                    category: FrictionCategory::DocumentationLookup,
-                    description: "Had to check docs for diff flags".into(),
-                    severity: Some("low".into()),
-                    suggested_fix: Some("Add inline help".into()),
-                },
-            ],
+            friction_points: vec![FrictionPoint {
+                category: FrictionCategory::DocumentationLookup,
+                description: "Had to check docs for diff flags".into(),
+                severity: Some("low".into()),
+                suggested_fix: Some("Add inline help".into()),
+            }],
             notes: Some("Eventually completed".into()),
         }
     }
@@ -784,7 +869,10 @@ mod tests {
     fn metrics_friction_by_category() {
         let log = sample_log();
         let metrics = calculate_metrics(&log);
-        assert_eq!(metrics.friction_by_category.get("documentation_lookup"), Some(&1));
+        assert_eq!(
+            metrics.friction_by_category.get("documentation_lookup"),
+            Some(&1)
+        );
     }
 
     // ── Evaluation ──────────────────────────────────────────────────────
@@ -932,9 +1020,14 @@ mod tests {
         // High priority items should come before Low
         if items.len() >= 2 {
             let priorities: Vec<_> = items.iter().map(|i| i.priority).collect();
-            let has_high_before_low = priorities.iter().position(|p| *p == ImprovementPriority::High)
-                .unwrap_or(usize::MAX) <
-                priorities.iter().position(|p| *p == ImprovementPriority::Low).unwrap_or(usize::MAX);
+            let has_high_before_low = priorities
+                .iter()
+                .position(|p| *p == ImprovementPriority::High)
+                .unwrap_or(usize::MAX)
+                < priorities
+                    .iter()
+                    .position(|p| *p == ImprovementPriority::Low)
+                    .unwrap_or(usize::MAX);
             assert!(has_high_before_low);
         }
     }

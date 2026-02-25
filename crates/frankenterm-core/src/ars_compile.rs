@@ -99,7 +99,7 @@ impl Default for CompileConfig {
 // =============================================================================
 
 /// Compilation error.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompileError {
     /// An operator has locked a manual YAML for this cluster.
     OperatorLocked { cluster_id: String },

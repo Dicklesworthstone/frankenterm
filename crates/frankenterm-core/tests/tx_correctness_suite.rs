@@ -10,12 +10,12 @@
 //! - Receipt chain monotonicity and continuity
 
 use frankenterm_core::plan::{
+    MissionActorRole, MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction,
+    TxCommitOutcome, TxCommitStepInput, TxCompensation, TxCompensationOutcome,
+    TxCompensationStepInput, TxExecutionRecord, TxId, TxIdempotencyVerdict, TxIntent, TxOutcome,
+    TxPhase, TxPlan, TxPlanId, TxReceipt, TxResumeState, TxStep, TxStepExecutionRecord, TxStepId,
     execute_commit_phase, execute_compensation_phase, reconstruct_tx_resume_state,
-    validate_tx_idempotency, MissionActorRole, MissionKillSwitchLevel, MissionTxContract,
-    MissionTxState, MissionTxTransitionKind, MissionTxValidationError, StepAction, TxCommitOutcome,
-    TxCommitStepInput, TxCompensation, TxCompensationOutcome, TxCompensationStepInput,
-    TxExecutionRecord, TxId, TxIdempotencyVerdict, TxIntent, TxOutcome, TxPhase, TxPlan, TxPlanId,
-    TxReceipt, TxResumeState, TxStep, TxStepExecutionRecord, TxStepId,
+    validate_tx_idempotency,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -151,11 +151,7 @@ fn sm_commit_requires_prepared_or_committing() {
             false,
             10_000,
         );
-        assert!(
-            result.is_err(),
-            "commit should fail for state {:?}",
-            state
-        );
+        assert!(result.is_err(), "commit should fail for state {:?}", state);
     }
 }
 
@@ -211,8 +207,7 @@ fn sm_compensation_requires_compensating() {
         )
         .unwrap();
         let comp_inputs = success_comp_inputs(3);
-        let result =
-            execute_compensation_phase(&contract, &commit_report, &comp_inputs, 20_000);
+        let result = execute_compensation_phase(&contract, &commit_report, &comp_inputs, 20_000);
         assert!(
             result.is_err(),
             "compensation should fail for state {:?}",
@@ -258,13 +253,8 @@ fn pipeline_full_commit_then_full_rollback() {
     // 2. Compensate all 5 steps
     let comp_contract = build_contract(5, MissionTxState::Compensating);
     let comp_inputs = success_comp_inputs(5);
-    let comp_report = execute_compensation_phase(
-        &comp_contract,
-        &commit_report,
-        &comp_inputs,
-        20_000,
-    )
-    .unwrap();
+    let comp_report =
+        execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
     assert!(comp_report.is_fully_rolled_back());
     assert_eq!(comp_report.compensated_count, 5);
     assert!(!comp_report.has_residual_risk());
@@ -290,13 +280,8 @@ fn pipeline_partial_commit_then_partial_rollback() {
     // 2. Compensate the 2 committed steps
     let comp_contract = build_contract(5, MissionTxState::Compensating);
     let comp_inputs = success_comp_inputs(5);
-    let comp_report = execute_compensation_phase(
-        &comp_contract,
-        &commit_report,
-        &comp_inputs,
-        20_000,
-    )
-    .unwrap();
+    let comp_report =
+        execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
     assert!(comp_report.is_fully_rolled_back());
     // Only 2 steps were committed, so only 2 should be compensated
     assert_eq!(comp_report.compensated_count, 2);
@@ -323,14 +308,12 @@ fn pipeline_first_step_failure_nothing_to_compensate() {
     // 2. Compensation → NothingToCompensate
     let comp_contract = build_contract(3, MissionTxState::Compensating);
     let comp_inputs = success_comp_inputs(3);
-    let comp_report = execute_compensation_phase(
-        &comp_contract,
-        &commit_report,
-        &comp_inputs,
-        20_000,
-    )
-    .unwrap();
-    let is_nothing = matches!(comp_report.outcome, TxCompensationOutcome::NothingToCompensate);
+    let comp_report =
+        execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
+    let is_nothing = matches!(
+        comp_report.outcome,
+        TxCompensationOutcome::NothingToCompensate
+    );
     assert!(is_nothing);
 }
 
@@ -349,11 +332,7 @@ fn pipeline_commit_step_counts_sum() {
         .unwrap();
 
         let total = report.committed_count + report.failed_count + report.skipped_count;
-        assert_eq!(
-            total, num_steps,
-            "counts must sum for {} steps",
-            num_steps
-        );
+        assert_eq!(total, num_steps, "counts must sum for {} steps", num_steps);
     }
 }
 
@@ -373,13 +352,9 @@ fn pipeline_compensation_step_counts_sum() {
 
         let comp_contract = build_contract(num_steps, MissionTxState::Compensating);
         let comp_inputs = success_comp_inputs(num_steps);
-        let comp_report = execute_compensation_phase(
-            &comp_contract,
-            &commit_report,
-            &comp_inputs,
-            20_000,
-        )
-        .unwrap();
+        let comp_report =
+            execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000)
+                .unwrap();
 
         let total = comp_report.compensated_count
             + comp_report.failed_count
@@ -411,7 +386,12 @@ fn receipts_monotonic_through_commit() {
     assert!(!report.receipts.is_empty());
     let mut prev = 0u64;
     for r in &report.receipts {
-        assert!(r.seq > prev, "receipt seq {} must be > prev {}", r.seq, prev);
+        assert!(
+            r.seq > prev,
+            "receipt seq {} must be > prev {}",
+            r.seq,
+            prev
+        );
         prev = r.seq;
     }
 }
@@ -431,17 +411,17 @@ fn receipts_monotonic_through_compensation() {
 
     let comp_contract = build_contract(3, MissionTxState::Compensating);
     let comp_inputs = success_comp_inputs(3);
-    let comp_report = execute_compensation_phase(
-        &comp_contract,
-        &commit_report,
-        &comp_inputs,
-        20_000,
-    )
-    .unwrap();
+    let comp_report =
+        execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
 
     let mut prev = 0u64;
     for r in &comp_report.receipts {
-        assert!(r.seq > prev, "comp receipt seq {} must be > prev {}", r.seq, prev);
+        assert!(
+            r.seq > prev,
+            "comp receipt seq {} must be > prev {}",
+            r.seq,
+            prev
+        );
         prev = r.seq;
     }
 }
@@ -509,7 +489,7 @@ fn idempotency_resume_after_crash_mid_commit() {
     let contract = build_contract(5, MissionTxState::Prepared);
 
     // Simulate crash mid-commit: record shows Committing with step 1 done
-    let mut record = TxExecutionRecord {
+    let record = TxExecutionRecord {
         tx_id: contract.intent.tx_id.clone(),
         plan_id: contract.plan.plan_id.clone(),
         lifecycle_state: MissionTxState::Committing,
@@ -623,12 +603,8 @@ fn resume_after_full_commit_no_pending() {
         error_code: None,
     });
 
-    let resume = reconstruct_tx_resume_state(
-        &terminal_contract,
-        Some(&commit_report),
-        None,
-        15_000,
-    );
+    let resume =
+        reconstruct_tx_resume_state(&terminal_contract, Some(&commit_report), None, 15_000);
     assert_eq!(resume.committed_step_ids.len(), 3);
     assert!(resume.commit_phase_completed);
     assert!(resume.is_fully_resolved());
@@ -670,13 +646,8 @@ fn resume_after_full_pipeline_is_resolved() {
     // Full compensation
     let comp_contract = build_contract(3, MissionTxState::Compensating);
     let comp_inputs = success_comp_inputs(3);
-    let comp_report = execute_compensation_phase(
-        &comp_contract,
-        &commit_report,
-        &comp_inputs,
-        20_000,
-    )
-    .unwrap();
+    let comp_report =
+        execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
 
     // Resume with terminal receipt
     let mut final_contract = build_contract(3, MissionTxState::Prepared);
@@ -807,21 +778,11 @@ fn deterministic_compensation_replay() {
     let comp_contract = build_contract(3, MissionTxState::Compensating);
     let comp_inputs = success_comp_inputs(3);
 
-    let c1 = execute_compensation_phase(
-        &comp_contract,
-        &commit_report,
-        &comp_inputs,
-        20_000,
-    )
-    .unwrap();
+    let c1 =
+        execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
 
-    let c2 = execute_compensation_phase(
-        &comp_contract,
-        &commit_report,
-        &comp_inputs,
-        20_000,
-    )
-    .unwrap();
+    let c2 =
+        execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
 
     assert_eq!(c1.canonical_string(), c2.canonical_string());
     assert_eq!(c1.outcome, c2.outcome);
@@ -886,13 +847,8 @@ fn serde_roundtrip_full_pipeline() {
     // Compensation
     let comp_contract = build_contract(4, MissionTxState::Compensating);
     let comp_inputs = success_comp_inputs(4);
-    let comp_report = execute_compensation_phase(
-        &comp_contract,
-        &commit_report,
-        &comp_inputs,
-        20_000,
-    )
-    .unwrap();
+    let comp_report =
+        execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
     let comp_json = serde_json::to_string(&comp_report).unwrap();
     let comp_restored: frankenterm_core::plan::TxCompensationReport =
         serde_json::from_str(&comp_json).unwrap();
@@ -947,13 +903,8 @@ fn compensation_step_results_in_reverse_ordinal_order() {
 
     let comp_contract = build_contract(5, MissionTxState::Compensating);
     let comp_inputs = success_comp_inputs(5);
-    let comp_report = execute_compensation_phase(
-        &comp_contract,
-        &commit_report,
-        &comp_inputs,
-        20_000,
-    )
-    .unwrap();
+    let comp_report =
+        execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();
 
     // Should be in descending ordinal order
     for i in 1..comp_report.step_results.len() {
@@ -1126,9 +1077,7 @@ async fn concurrent_idempotency_checks_consistent() {
         .map(|_| {
             let c = contract.clone();
             let r = record.clone();
-            tokio::spawn(async move {
-                validate_tx_idempotency(&c, TxPhase::Commit, Some(&r))
-            })
+            tokio::spawn(async move { validate_tx_idempotency(&c, TxPhase::Commit, Some(&r)) })
         })
         .collect();
 
@@ -1170,9 +1119,7 @@ async fn concurrent_resume_reconstruction_determinism() {
         .map(|_| {
             let c = contract.clone();
             let cr = commit_report.clone();
-            tokio::spawn(async move {
-                reconstruct_tx_resume_state(&c, Some(&cr), None, 15_000)
-            })
+            tokio::spawn(async move { reconstruct_tx_resume_state(&c, Some(&cr), None, 15_000) })
         })
         .collect();
 
@@ -1256,7 +1203,10 @@ async fn concurrent_mixed_tx_non_interference() {
             report.committed_count, *n,
             "contract with {n} steps should commit {n}"
         );
-        assert_eq!(report.failed_count, 0, "no failures expected for contract {n}");
+        assert_eq!(
+            report.failed_count, 0,
+            "no failures expected for contract {n}"
+        );
     }
 }
 
@@ -1282,7 +1232,11 @@ fn all_commit_outcomes_have_target_states() {
                 | MissionTxState::Failed
                 | MissionTxState::Committing // pause returns to committing
         );
-        assert!(valid, "outcome {:?} maps to unexpected state {:?}", outcome, state);
+        assert!(
+            valid,
+            "outcome {:?} maps to unexpected state {:?}",
+            outcome, state
+        );
     }
 }
 
@@ -1295,11 +1249,12 @@ fn all_compensation_outcomes_have_target_states() {
     ];
     for outcome in &outcomes {
         let state = outcome.target_tx_state();
-        let valid = matches!(
-            state,
-            MissionTxState::RolledBack | MissionTxState::Failed
+        let valid = matches!(state, MissionTxState::RolledBack | MissionTxState::Failed);
+        assert!(
+            valid,
+            "outcome {:?} maps to unexpected state {:?}",
+            outcome, state
         );
-        assert!(valid, "outcome {:?} maps to unexpected state {:?}", outcome, state);
     }
 }
 
@@ -1321,7 +1276,11 @@ fn pipeline_kill_switch_safe_mode_blocks_commit() {
     // Kill switch should block all steps
     assert_eq!(report.committed_count, 0);
     let is_killed = matches!(report.outcome, TxCommitOutcome::KillSwitchBlocked);
-    assert!(is_killed, "expected KillSwitchAborted, got {:?}", report.outcome);
+    assert!(
+        is_killed,
+        "expected KillSwitchAborted, got {:?}",
+        report.outcome
+    );
 }
 
 #[test]
@@ -1339,15 +1298,17 @@ fn pipeline_pause_suspends_commit_then_resume_idempotent() {
     .unwrap();
 
     let is_paused = matches!(paused_report.outcome, TxCommitOutcome::PauseSuspended);
-    assert!(is_paused, "expected PauseSuspended, got {:?}", paused_report.outcome);
+    assert!(
+        is_paused,
+        "expected PauseSuspended, got {:?}",
+        paused_report.outcome
+    );
 
     // Idempotency check on paused state should allow retry
-    let record = build_execution_record(
-        &contract,
-        MissionTxState::Committing,
-        None,
-        None,
-    );
+    let record = build_execution_record(&contract, MissionTxState::Committing, None, None);
     let check = validate_tx_idempotency(&contract, TxPhase::Commit, Some(&record));
-    assert!(check.should_proceed(), "should be able to retry after pause");
+    assert!(
+        check.should_proceed(),
+        "should be able to retry after pause"
+    );
 }

@@ -417,7 +417,7 @@ impl BudgetNode {
                 let else_val = else_branch
                     .as_ref()
                     .map_or(0.0, |e| e.aggregate(percentile));
-                probability * then_val + (1.0 - probability) * else_val
+                (1.0 - probability).mul_add(else_val, probability * then_val)
             }
         }
     }
@@ -807,7 +807,7 @@ impl std::error::Error for BudgetError {}
 /// This struct defines the structured logging contract for the AARSP
 /// latency pipeline. Every log entry at critical decision points and
 /// stage boundaries must include these fields.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatencyLogEntry {
     /// ISO-8601 timestamp with microsecond precision.
     pub timestamp: String,
@@ -983,7 +983,7 @@ pub enum TestCategory {
 }
 
 /// A single entry in the verification matrix.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationEntry {
     /// Test scenario name.
     pub name: String,
@@ -1255,7 +1255,7 @@ impl Default for BudgetEnforcerConfig {
 }
 
 /// Mitigation policy for a specific stage.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageMitigationPolicy {
     pub stage: LatencyStage,
     /// Which mitigation to apply when the stage overflows at p95.
@@ -1931,7 +1931,7 @@ impl CorrelationContext {
 ///
 /// Created by `CorrelationContext::begin_stage()`, consumed by `end_stage()`.
 /// Carries the stage identity and start timestamp.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageProbe {
     /// Which stage is being timed.
     pub stage: LatencyStage,
@@ -2537,7 +2537,7 @@ pub fn default_policy_constraints() -> Vec<PolicyConstraint> {
 /// After mitigation is applied, the system should recover once latency
 /// returns to acceptable levels. RecoveryProtocol defines how quickly
 /// and under what conditions recovery occurs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryProtocol {
     /// Number of consecutive within-budget observations before de-escalating.
     pub cooldown_observations: u64,
@@ -2558,7 +2558,7 @@ impl Default for RecoveryProtocol {
 }
 
 /// Per-stage enforcement state tracking mitigation and recovery.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageEnforcementState {
     /// Current active mitigation level for this stage.
     pub current_level: MitigationLevel,
@@ -3267,9 +3267,10 @@ impl AdaptiveAllocator {
         // Update EWMA headroom for each observed stage.
         for pressure in pressures {
             if let Some(lane) = self.lanes.iter_mut().find(|l| l.stage == pressure.stage) {
-                lane.smoothed_headroom = lane.smoothed_headroom
-                    * (1.0 - self.config.pressure_alpha)
-                    + pressure.headroom * self.config.pressure_alpha;
+                lane.smoothed_headroom = lane.smoothed_headroom.mul_add(
+                    1.0 - self.config.pressure_alpha,
+                    pressure.headroom * self.config.pressure_alpha,
+                );
                 if pressure.is_over_budget() {
                     lane.over_budget_epochs += 1;
                 }
@@ -3567,7 +3568,7 @@ impl AdaptiveAllocator {
                 let orig = defaults
                     .iter()
                     .find(|b| b.stage == lane.stage)
-                    .cloned()
+                    .copied()
                     .unwrap_or(StageBudget {
                         stage: lane.stage,
                         p50_us: lane.default_p95_us * 0.5,
@@ -3612,7 +3613,10 @@ impl AdaptiveAllocator {
             .lanes
             .iter()
             .filter(|l| {
-                (l.current_p95_us - l.default_p95_us * self.config.min_budget_pct).abs() < 1e-6
+                l.default_p95_us
+                    .mul_add(-self.config.min_budget_pct, l.current_p95_us)
+                    .abs()
+                    < 1e-6
             })
             .count();
 
@@ -3952,7 +3956,7 @@ impl LaneState {
 }
 
 /// Scheduling event for structured logging.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchedulingEvent {
     pub item_id: u64,
     pub lane: SchedulerLane,
@@ -4305,7 +4309,7 @@ impl LaneScheduler {
 }
 
 /// Scheduler degradation states.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SchedulerDegradation {
     /// All lanes operating normally.
     Healthy,
@@ -4760,7 +4764,7 @@ impl fmt::Display for Resource {
 }
 
 /// A priority inheritance event — records when a task's effective priority was boosted.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InheritanceEvent {
     /// Correlation ID of the task that received the boost.
     pub holder_id: String,
@@ -4779,7 +4783,7 @@ pub struct InheritanceEvent {
 }
 
 /// Lock acquisition attempt result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LockResult {
     /// Lock acquired immediately.
     Acquired,
@@ -4798,7 +4802,7 @@ pub enum LockResult {
 }
 
 /// Configuration for the priority inheritance protocol.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriorityInheritanceConfig {
     /// Maximum chain depth for transitive inheritance.
     pub max_chain_depth: usize,
@@ -4819,7 +4823,7 @@ impl Default for PriorityInheritanceConfig {
 }
 
 /// State of a single held lock.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldLock {
     /// Resource held.
     pub resource: Resource,
@@ -4836,7 +4840,7 @@ pub struct HeldLock {
 }
 
 /// Snapshot of the priority inheritance tracker.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InheritanceSnapshot {
     /// Currently held locks.
     pub held_locks: Vec<HeldLock>,
@@ -4904,15 +4908,13 @@ impl PriorityInheritanceTracker {
         // acquiring this one would violate canonical order.
         if self.config.enforce_lock_order {
             let requested_idx = resource.order_index();
-            for lock_opt in &self.locks {
-                if let Some(held) = lock_opt {
-                    if held.holder_id == task_id && held.resource.order_index() > requested_idx {
-                        self.total_order_violations += 1;
-                        return LockResult::OrderViolation {
-                            requested: resource,
-                            held_after: held.resource,
-                        };
-                    }
+            for held in self.locks.iter().flatten() {
+                if held.holder_id == task_id && held.resource.order_index() > requested_idx {
+                    self.total_order_violations += 1;
+                    return LockResult::OrderViolation {
+                        requested: resource,
+                        held_after: held.resource,
+                    };
                 }
             }
         }
@@ -5029,14 +5031,12 @@ impl PriorityInheritanceTracker {
     /// Get effective priority of a task across all held locks.
     pub fn effective_priority(&self, task_id: &str) -> Option<Priority> {
         let mut max_priority: Option<Priority> = None;
-        for lock_opt in &self.locks {
-            if let Some(held) = lock_opt {
-                if held.holder_id == task_id {
-                    max_priority = Some(match max_priority {
-                        Some(p) if p >= held.effective_priority => p,
-                        _ => held.effective_priority,
-                    });
-                }
+        for held in self.locks.iter().flatten() {
+            if held.holder_id == task_id {
+                max_priority = Some(match max_priority {
+                    Some(p) if p >= held.effective_priority => p,
+                    _ => held.effective_priority,
+                });
             }
         }
         max_priority
@@ -5046,11 +5046,9 @@ impl PriorityInheritanceTracker {
     /// Returns list of violations (if any).
     pub fn check_lock_order(&self, task_id: &str) -> Vec<(Resource, Resource)> {
         let mut held_indices: Vec<(usize, Resource)> = Vec::new();
-        for lock_opt in &self.locks {
-            if let Some(held) = lock_opt {
-                if held.holder_id == task_id {
-                    held_indices.push((held.resource.order_index(), held.resource));
-                }
+        for held in self.locks.iter().flatten() {
+            if held.holder_id == task_id {
+                held_indices.push((held.resource.order_index(), held.resource));
             }
         }
         held_indices.sort_by_key(|(idx, _)| *idx);
@@ -5109,14 +5107,12 @@ impl PriorityInheritanceTracker {
         let max_dur = self.config.max_inheritance_duration_us;
         let mut expired_count = 0;
 
-        for lock_opt in &mut self.locks {
-            if let Some(held) = lock_opt {
-                if held.effective_priority > held.original_priority
-                    && now_us.saturating_sub(held.acquired_us) > max_dur
-                {
-                    held.effective_priority = held.original_priority;
-                    expired_count += 1;
-                }
+        for held in self.locks.iter_mut().flatten() {
+            if held.effective_priority > held.original_priority
+                && now_us.saturating_sub(held.acquired_us) > max_dur
+            {
+                held.effective_priority = held.original_priority;
+                expired_count += 1;
             }
         }
 
@@ -5148,7 +5144,7 @@ impl PriorityInheritanceTracker {
 // AARSP Bead: ft-2p9cb.2.3.2
 
 /// Degradation signal from the priority inheritance tracker.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InheritanceDegradation {
     /// Everything is fine.
     Healthy,
@@ -5194,7 +5190,7 @@ impl fmt::Display for InheritanceDegradation {
 }
 
 /// Structured log entry for priority inheritance events.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InheritanceLogEntry {
     /// Timestamp.
     pub timestamp_us: u64,
@@ -6055,7 +6051,7 @@ impl MemoryPool {
 // AARSP Bead: ft-2p9cb.3.2.1
 
 /// Ingestion chunk — a borrowed byte slice with metadata for zero-copy parsing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestChunk {
     /// Source pane ID.
     pub pane_id: u64,
@@ -6070,7 +6066,7 @@ pub struct IngestChunk {
 }
 
 /// Parsing result from the ingestion parser.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParseResult {
     /// Complete line(s) found — ready for downstream.
     Complete { lines: usize, bytes_consumed: usize },
@@ -6084,7 +6080,7 @@ pub enum ParseResult {
 }
 
 /// Configuration for the zero-copy ingestion parser.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestParserConfig {
     /// Maximum line length before forced split.
     pub max_line_bytes: usize,
@@ -6549,7 +6545,7 @@ impl Default for TierMigrationPolicy {
 }
 
 /// A contiguous segment of scrollback data tracked by the tier manager.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScrollbackSegment {
     pub segment_id: u64,
     pub pane_id: u64,
@@ -6562,7 +6558,7 @@ pub struct ScrollbackSegment {
 }
 
 /// Migration event capturing a tier transition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TierMigrationEvent {
     pub segment_id: u64,
     pub from_tier: ScrollbackTier,
@@ -6863,13 +6859,13 @@ impl TieredScrollbackManager {
             if s.pane_id == pane_id {
                 match s.tier {
                     ScrollbackTier::Hot => {
-                        self.hot_bytes = self.hot_bytes.saturating_sub(s.byte_size)
+                        self.hot_bytes = self.hot_bytes.saturating_sub(s.byte_size);
                     }
                     ScrollbackTier::Warm => {
-                        self.warm_bytes = self.warm_bytes.saturating_sub(s.byte_size)
+                        self.warm_bytes = self.warm_bytes.saturating_sub(s.byte_size);
                     }
                     ScrollbackTier::Cold => {
-                        self.cold_bytes = self.cold_bytes.saturating_sub(s.byte_size)
+                        self.cold_bytes = self.cold_bytes.saturating_sub(s.byte_size);
                     }
                 }
                 false
@@ -7251,9 +7247,13 @@ impl TransportPolicy {
         }
         // Cost comparison: bypass vs compressed
         let bypass_cost = payload_bytes as f64 * cm.network_cost_per_byte_us;
-        let compress_cost = payload_bytes as f64 * cm.compress_cost_per_byte_us
-            + payload_bytes as f64 * cm.expected_compression_ratio * cm.network_cost_per_byte_us
-            + payload_bytes as f64 * cm.expected_compression_ratio * cm.decompress_cost_per_byte_us;
+        let compress_cost = (payload_bytes as f64 * cm.expected_compression_ratio).mul_add(
+            cm.decompress_cost_per_byte_us,
+            (payload_bytes as f64).mul_add(
+                cm.compress_cost_per_byte_us,
+                payload_bytes as f64 * cm.expected_compression_ratio * cm.network_cost_per_byte_us,
+            ),
+        );
         if bypass_cost <= compress_cost {
             TransportMode::Bypass
         } else {
@@ -7282,7 +7282,7 @@ impl TransportPolicy {
 
         // EWMA update
         let alpha = self.config.ewma_alpha;
-        self.ewma_cost_us = alpha * actual_cost_us + (1.0 - alpha) * self.ewma_cost_us;
+        self.ewma_cost_us = alpha.mul_add(actual_cost_us, (1.0 - alpha) * self.ewma_cost_us);
 
         let decision = TransportDecision {
             payload_bytes,
@@ -7587,7 +7587,7 @@ impl std::fmt::Display for AffinityHint {
 }
 
 /// Configuration for the tail-latency controller.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TailLatencyConfig {
     /// Syscall batching strategy.
     pub syscall_strategy: SyscallStrategy,
@@ -7617,7 +7617,7 @@ impl Default for TailLatencyConfig {
 }
 
 /// A single wakeup event observation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WakeupEvent {
     pub source: WakeupSource,
     pub latency_us: u64,
@@ -7802,7 +7802,7 @@ impl TailLatencyController {
 }
 
 /// Degradation states for tail-latency controller.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TailLatencyDegradation {
     Healthy,
     P99Breach { observed_us: u64, budget_us: u64 },
@@ -8586,7 +8586,7 @@ impl EProcessDetector {
         let deviation = value - self.config.null_mean;
         // Universal e-variable: 1 + lambda * deviation
         // Clamped to be nonneg (required for e-process validity).
-        (1.0 + lambda * deviation).max(0.0)
+        lambda.mul_add(deviation, 1.0).max(0.0)
     }
 
     /// Current alert level based on the log-e-value vs the threshold.
@@ -9738,7 +9738,7 @@ impl CalibrationHarness {
 }
 
 /// Degradation status for the calibration harness.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CalibrationDegradation {
     Healthy,
     GateMarginal { passing: usize, total: usize },
@@ -9830,7 +9830,7 @@ impl fmt::Display for InvariantSeverity {
 /// Each `FormalInvariant` encodes a single property that must hold.
 /// The `predicate_id` is a stable identifier (e.g. "scheduler.no_starvation")
 /// used for audit trails and counterexample references.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormalInvariant {
     /// Stable identifier (dot-separated, e.g. "budget.percentile_monotonic").
     pub predicate_id: String,
@@ -9864,7 +9864,7 @@ impl fmt::Display for FormalInvariant {
 /// - Lane capacity is never exceeded
 /// - Starvation freedom (bounded wait)
 /// - Deterministic replay (same input → same schedule)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SchedulerInvariant {
     /// Lane queue length never exceeds configured capacity.
     CapacityBound {
@@ -10128,7 +10128,7 @@ impl fmt::Display for BudgetInvariant {
 /// - Cooldown enforcement: recovery only after sufficient consecutive-ok
 /// - Timeout enforcement: forced recovery after max_degraded_duration
 /// - No spurious escalation during recovery window
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecoveryInvariant {
     /// In gradual mode, recovery steps down exactly one MitigationLevel at a time.
     GradualDeescalation {
@@ -10240,7 +10240,7 @@ impl fmt::Display for RecoveryInvariant {
 // ── E1.6 Invariant Check Result ──────────────────────────────────
 
 /// Outcome of evaluating a single formal invariant.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InvariantOutcome {
     /// Invariant holds.
     Satisfied,
@@ -10261,7 +10261,7 @@ impl fmt::Display for InvariantOutcome {
 }
 
 /// Result of checking one invariant, with timing and context.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvariantCheckResult {
     /// The predicate ID that was checked.
     pub predicate_id: String,
@@ -10302,7 +10302,7 @@ impl fmt::Display for InvariantCheckResult {
 // ── E1.7 Invariant Checker ───────────────────────────────────────
 
 /// Configuration for the runtime invariant checker.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvariantCheckerConfig {
     /// Maximum evaluation time per invariant (μs) before marking inconclusive.
     pub max_eval_time_us: u64,
@@ -10581,7 +10581,7 @@ pub struct InvariantCheckerSnapshot {
 }
 
 /// Degradation state for the invariant checker.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InvariantCheckerDegradation {
     /// No violations detected.
     Healthy,
@@ -10939,7 +10939,7 @@ impl fmt::Display for ExplorationStrategy {
 }
 
 /// Configuration for the model checker.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCheckerConfig {
     /// Maximum depth (steps) to explore.
     pub max_depth: u64,
@@ -10966,7 +10966,7 @@ impl Default for ModelCheckerConfig {
 }
 
 /// Snapshot of the model checker's exploration state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCheckerSnapshot {
     pub states_explored: u64,
     pub current_depth: u64,
@@ -11219,7 +11219,7 @@ impl ModelChecker {
 }
 
 /// Degradation state for the model checker.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelCheckerDegradation {
     /// No violations found.
     Healthy,
@@ -11535,7 +11535,7 @@ impl fmt::Display for DeterministicTrace {
 }
 
 /// Result of comparing two traces for replay isomorphism.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplayComparisonResult {
     /// Traces are identical (same ordering and content).
     Identical,
@@ -11571,7 +11571,7 @@ impl fmt::Display for ReplayComparisonResult {
 }
 
 /// Mismatch diagnostic for trace comparison debugging.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceMismatch {
     /// Position in the canonical trace.
     pub canonical_idx: usize,
@@ -11584,7 +11584,7 @@ pub struct TraceMismatch {
 }
 
 /// Configuration for the replay canonicalizer.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalizerConfig {
     /// Ordering mode for canonical form.
     pub ordering: CanonicalOrdering,
@@ -11608,7 +11608,7 @@ impl Default for CanonicalizerConfig {
 }
 
 /// Snapshot of canonicalizer state for telemetry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalizerSnapshot {
     /// Total traces canonicalized.
     pub traces_processed: u64,
@@ -11644,7 +11644,7 @@ impl fmt::Display for CanonicalizerDegradation {
 }
 
 /// Log entry for canonicalizer operations.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalizerLogEntry {
     /// Timestamp of the log event.
     pub timestamp_us: u64,
@@ -11706,7 +11706,7 @@ impl ReplayCanonicalizer {
                 });
             }
             CanonicalOrdering::Causal => {
-                entries.sort_by(|a, b| a.seq.cmp(&b.seq));
+                entries.sort_by_key(|a| a.seq);
             }
         }
 
@@ -12137,7 +12137,12 @@ pub struct GoldenArtifact {
 
 impl GoldenArtifact {
     /// Create a new golden artifact from a trace.
-    pub fn new(artifact_id: String, trace: DeterministicTrace, description: String, created_at_us: u64) -> Self {
+    pub fn new(
+        artifact_id: String,
+        trace: DeterministicTrace,
+        description: String,
+        created_at_us: u64,
+    ) -> Self {
         let checksum = trace.digest();
         Self {
             artifact_id,
@@ -12168,13 +12173,16 @@ impl fmt::Display for GoldenArtifact {
         write!(
             f,
             "Golden[{} v{}, entries={}, checksum={:#x}]",
-            self.artifact_id, self.version, self.trace.len(), self.checksum
+            self.artifact_id,
+            self.version,
+            self.trace.len(),
+            self.checksum
         )
     }
 }
 
 /// Verdict from an optimization proof gate check.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProofGateVerdict {
     /// Optimization preserves behavior exactly.
     Equivalent,
@@ -12190,10 +12198,7 @@ pub enum ProofGateVerdict {
         summary: String,
     },
     /// Checksum mismatch on golden artifact (corruption or tampering).
-    ChecksumFailure {
-        expected: u64,
-        actual: u64,
-    },
+    ChecksumFailure { expected: u64, actual: u64 },
 }
 
 impl ProofGateVerdict {
@@ -12215,7 +12220,11 @@ impl fmt::Display for ProofGateVerdict {
             Self::IsomorphicEquivalent { reordered_count } => {
                 write!(f, "PASS: isomorphic ({reordered_count} reordered)")
             }
-            Self::SemanticDrift { first_divergence_idx, mismatches, summary } => {
+            Self::SemanticDrift {
+                first_divergence_idx,
+                mismatches,
+                summary,
+            } => {
                 write!(
                     f,
                     "FAIL: semantic drift at [{first_divergence_idx}], {} mismatches: {summary}",
@@ -12230,7 +12239,7 @@ impl fmt::Display for ProofGateVerdict {
 }
 
 /// Configuration for the proof gate.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofGateConfig {
     /// Whether to allow isomorphic equivalence (reordered but same content).
     pub allow_isomorphic: bool,
@@ -12251,7 +12260,7 @@ impl Default for ProofGateConfig {
 }
 
 /// A proof summary for logging/CI output.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofSummary {
     /// Artifact being checked.
     pub artifact_id: String,
@@ -12285,7 +12294,7 @@ impl fmt::Display for ProofSummary {
 }
 
 /// Snapshot of the proof gate state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofGateSnapshot {
     /// Total checks run.
     pub checks_run: u64,
@@ -12321,7 +12330,7 @@ impl fmt::Display for ProofGateDegradation {
 }
 
 /// Log entry for proof gate operations.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofGateLogEntry {
     /// Timestamp.
     pub timestamp_us: u64,
@@ -12360,7 +12369,11 @@ impl ProofGate {
     /// Register a golden artifact.
     pub fn register_golden(&mut self, artifact: GoldenArtifact) {
         // Replace if same artifact_id exists.
-        if let Some(pos) = self.artifacts.iter().position(|a| a.artifact_id == artifact.artifact_id) {
+        if let Some(pos) = self
+            .artifacts
+            .iter()
+            .position(|a| a.artifact_id == artifact.artifact_id)
+        {
             self.artifacts[pos] = artifact;
         } else {
             self.artifacts.push(artifact);
@@ -12423,7 +12436,9 @@ impl ProofGate {
         let comparison = self.canonicalizer.compare(&golden.trace, candidate);
         let verdict = match comparison {
             ReplayComparisonResult::Identical => ProofGateVerdict::Equivalent,
-            ReplayComparisonResult::Isomorphic { reordered_count } if self.config.allow_isomorphic => {
+            ReplayComparisonResult::Isomorphic { reordered_count }
+                if self.config.allow_isomorphic =>
+            {
                 ProofGateVerdict::IsomorphicEquivalent { reordered_count }
             }
             ReplayComparisonResult::Isomorphic { reordered_count } => {
@@ -12433,8 +12448,13 @@ impl ProofGate {
                     summary: format!("isomorphic not allowed ({reordered_count} reordered)"),
                 }
             }
-            ReplayComparisonResult::Divergent { first_divergence_idx, description } => {
-                let mut mismatches = self.canonicalizer.diagnose_mismatches(&golden.trace, candidate);
+            ReplayComparisonResult::Divergent {
+                first_divergence_idx,
+                description,
+            } => {
+                let mut mismatches = self
+                    .canonicalizer
+                    .diagnose_mismatches(&golden.trace, candidate);
                 if mismatches.len() > self.config.max_mismatches {
                     mismatches.truncate(self.config.max_mismatches);
                 }
@@ -12470,7 +12490,11 @@ impl ProofGate {
         candidates: &std::collections::HashMap<String, DeterministicTrace>,
         timestamp_us: u64,
     ) -> Vec<ProofSummary> {
-        let artifact_ids: Vec<String> = self.artifacts.iter().map(|a| a.artifact_id.clone()).collect();
+        let artifact_ids: Vec<String> = self
+            .artifacts
+            .iter()
+            .map(|a| a.artifact_id.clone())
+            .collect();
         let mut summaries = Vec::new();
         for id in &artifact_ids {
             if let Some(candidate) = candidates.get(id) {
@@ -12494,7 +12518,9 @@ impl ProofGate {
     /// Detect degradation.
     pub fn detect_degradation(&self) -> ProofGateDegradation {
         if self.artifacts.len() > 100 {
-            return ProofGateDegradation::HighArtifactCount { count: self.artifacts.len() };
+            return ProofGateDegradation::HighArtifactCount {
+                count: self.artifacts.len(),
+            };
         }
         if self.checks_run > 0 {
             let rate = self.failures as f64 / self.checks_run as f64;
@@ -12506,7 +12532,12 @@ impl ProofGate {
     }
 
     /// Create a log entry.
-    pub fn log_entry(&self, artifact_id: &str, passed: bool, check_duration_us: u64) -> ProofGateLogEntry {
+    pub fn log_entry(
+        &self,
+        artifact_id: &str,
+        passed: bool,
+        check_duration_us: u64,
+    ) -> ProofGateLogEntry {
         ProofGateLogEntry {
             timestamp_us: self.checks_run,
             artifact_id: artifact_id.to_string(),
@@ -12522,7 +12553,10 @@ impl ProofGate {
 
     /// All artifact IDs.
     pub fn artifact_ids(&self) -> Vec<String> {
-        self.artifacts.iter().map(|a| a.artifact_id.clone()).collect()
+        self.artifacts
+            .iter()
+            .map(|a| a.artifact_id.clone())
+            .collect()
     }
 
     /// Reset counters (keeps artifacts).
@@ -12558,7 +12592,9 @@ impl ProofGate {
         seed: u64,
         timestamp_us: u64,
     ) -> ProofSummary {
-        let candidate = self.canonicalizer.upgrade_trace(mc_steps, "mc-candidate".to_string(), seed);
+        let candidate =
+            self.canonicalizer
+                .upgrade_trace(mc_steps, "mc-candidate".to_string(), seed);
         self.check(artifact_id, &candidate, timestamp_us)
     }
 
@@ -12571,7 +12607,9 @@ impl ProofGate {
         description: String,
         created_at_us: u64,
     ) {
-        let trace = self.canonicalizer.upgrade_trace(mc_steps, artifact_id.clone(), seed);
+        let trace = self
+            .canonicalizer
+            .upgrade_trace(mc_steps, artifact_id.clone(), seed);
         let ga = GoldenArtifact::new(artifact_id, trace, description, created_at_us);
         self.register_golden(ga);
     }
@@ -12583,7 +12621,11 @@ impl ProofGate {
         candidate: &DeterministicTrace,
         created_at_us: u64,
     ) -> bool {
-        if let Some(pos) = self.artifacts.iter().position(|a| a.artifact_id == artifact_id) {
+        if let Some(pos) = self
+            .artifacts
+            .iter()
+            .position(|a| a.artifact_id == artifact_id)
+        {
             self.artifacts[pos].update(candidate.clone(), created_at_us);
             true
         } else {
@@ -12593,7 +12635,8 @@ impl ProofGate {
 
     /// Get all failing artifact IDs from the latest check_all results.
     pub fn failing_artifacts(summaries: &[ProofSummary]) -> Vec<String> {
-        summaries.iter()
+        summaries
+            .iter()
             .filter(|s| s.verdict.is_fail())
             .map(|s| s.artifact_id.clone())
             .collect()
@@ -12601,7 +12644,8 @@ impl ProofGate {
 
     /// Get all passing artifact IDs from the latest check_all results.
     pub fn passing_artifacts(summaries: &[ProofSummary]) -> Vec<String> {
-        summaries.iter()
+        summaries
+            .iter()
             .filter(|s| s.verdict.is_pass())
             .map(|s| s.artifact_id.clone())
             .collect()
@@ -12703,7 +12747,7 @@ impl fmt::Display for DomainHealth {
 }
 
 /// Crash-only service contract: specifies restart behavior for a domain.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrashOnlyContract {
     /// Domain this contract governs.
     pub domain: FaultDomain,
@@ -12730,7 +12774,7 @@ impl Default for CrashOnlyContract {
 }
 
 /// A fault event recording a domain failure.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaultEvent {
     /// Domain that faulted.
     pub domain: FaultDomain,
@@ -12745,7 +12789,7 @@ pub struct FaultEvent {
 }
 
 /// Snapshot of a fault domain's state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaultDomainState {
     /// The domain.
     pub domain: FaultDomain,
@@ -12764,7 +12808,7 @@ pub struct FaultDomainState {
 }
 
 /// Configuration for the fault isolation manager.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaultIsolationConfig {
     /// Contracts for each domain.
     pub contracts: Vec<CrashOnlyContract>,
@@ -12777,9 +12821,13 @@ pub struct FaultIsolationConfig {
 impl Default for FaultIsolationConfig {
     fn default() -> Self {
         Self {
-            contracts: FaultDomain::ALL.iter().map(|d| {
-                CrashOnlyContract { domain: *d, ..Default::default() }
-            }).collect(),
+            contracts: FaultDomain::ALL
+                .iter()
+                .map(|d| CrashOnlyContract {
+                    domain: *d,
+                    ..Default::default()
+                })
+                .collect(),
             auto_isolate: true,
             max_history: 1000,
         }
@@ -12787,7 +12835,7 @@ impl Default for FaultIsolationConfig {
 }
 
 /// Degradation state for the fault isolation manager.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FaultIsolationDegradation {
     /// All domains healthy.
     Healthy,
@@ -12813,7 +12861,7 @@ impl fmt::Display for FaultIsolationDegradation {
 }
 
 /// Log entry for fault isolation events.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaultIsolationLogEntry {
     /// Timestamp.
     pub timestamp_us: u64,
@@ -12828,7 +12876,7 @@ pub struct FaultIsolationLogEntry {
 }
 
 /// Snapshot of the entire fault isolation manager.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaultIsolationSnapshot {
     /// Per-domain states.
     pub domains: Vec<FaultDomainState>,
@@ -12853,17 +12901,24 @@ impl FaultIsolationManager {
     pub fn new(config: FaultIsolationConfig) -> Self {
         let mut states = std::collections::HashMap::new();
         for domain in FaultDomain::ALL {
-            states.insert(*domain, FaultDomainState {
-                domain: *domain,
-                health: DomainHealth::Healthy,
-                total_faults: 0,
-                total_restarts: 0,
-                consecutive_failures: 0,
-                last_fault_us: 0,
-                last_restart_us: 0,
-            });
+            states.insert(
+                *domain,
+                FaultDomainState {
+                    domain: *domain,
+                    health: DomainHealth::Healthy,
+                    total_faults: 0,
+                    total_restarts: 0,
+                    consecutive_failures: 0,
+                    last_fault_us: 0,
+                    last_restart_us: 0,
+                },
+            );
         }
-        Self { config, states, history: Vec::new() }
+        Self {
+            config,
+            states,
+            history: Vec::new(),
+        }
     }
 
     /// Record a fault in a domain.
@@ -12905,7 +12960,8 @@ impl FaultIsolationManager {
             DomainHealth::Crashed => {
                 // Enforce cooldown.
                 if state.last_restart_us > 0
-                    && timestamp_us.saturating_sub(state.last_restart_us) < contract.restart_cooldown_us
+                    && timestamp_us.saturating_sub(state.last_restart_us)
+                        < contract.restart_cooldown_us
                 {
                     return false;
                 }
@@ -12963,7 +13019,9 @@ impl FaultIsolationManager {
 
     /// Get the health of a domain.
     pub fn domain_health(&self, domain: FaultDomain) -> DomainHealth {
-        self.states.get(&domain).map_or(DomainHealth::Healthy, |s| s.health)
+        self.states
+            .get(&domain)
+            .map_or(DomainHealth::Healthy, |s| s.health)
     }
 
     /// Get the state of a domain.
@@ -12973,12 +13031,15 @@ impl FaultIsolationManager {
 
     /// Check if any domains are isolated.
     pub fn has_isolated_domains(&self) -> bool {
-        self.states.values().any(|s| s.health == DomainHealth::Isolated)
+        self.states
+            .values()
+            .any(|s| s.health == DomainHealth::Isolated)
     }
 
     /// List isolated domains.
     pub fn isolated_domains(&self) -> Vec<FaultDomain> {
-        self.states.values()
+        self.states
+            .values()
             .filter(|s| s.health == DomainHealth::Isolated)
             .map(|s| s.domain)
             .collect()
@@ -12986,7 +13047,9 @@ impl FaultIsolationManager {
 
     /// Get the crash-only contract for a domain.
     fn contract_for(&self, domain: FaultDomain) -> CrashOnlyContract {
-        self.config.contracts.iter()
+        self.config
+            .contracts
+            .iter()
             .find(|c| c.domain == domain)
             .cloned()
             .unwrap_or_default()
@@ -12994,7 +13057,8 @@ impl FaultIsolationManager {
 
     /// Get a snapshot.
     pub fn snapshot(&self) -> FaultIsolationSnapshot {
-        let domains: Vec<FaultDomainState> = FaultDomain::ALL.iter()
+        let domains: Vec<FaultDomainState> = FaultDomain::ALL
+            .iter()
             .filter_map(|d| self.states.get(d).cloned())
             .collect();
         let total_faults = domains.iter().map(|d| d.total_faults).sum();
@@ -13011,10 +13075,18 @@ impl FaultIsolationManager {
     pub fn detect_degradation(&self) -> FaultIsolationDegradation {
         let isolated: Vec<FaultDomain> = self.isolated_domains();
         if !isolated.is_empty() {
-            return FaultIsolationDegradation::DomainIsolated { isolated_domains: isolated };
+            return FaultIsolationDegradation::DomainIsolated {
+                isolated_domains: isolated,
+            };
         }
-        let degraded_count = self.states.values()
-            .filter(|s| s.health == DomainHealth::Degraded || s.health == DomainHealth::Crashed || s.health == DomainHealth::Restarting)
+        let degraded_count = self
+            .states
+            .values()
+            .filter(|s| {
+                s.health == DomainHealth::Degraded
+                    || s.health == DomainHealth::Crashed
+                    || s.health == DomainHealth::Restarting
+            })
             .count();
         if degraded_count > 0 {
             return FaultIsolationDegradation::PartialDegradation { degraded_count };
@@ -13031,7 +13103,13 @@ impl FaultIsolationManager {
         description: String,
         timestamp_us: u64,
     ) -> FaultIsolationLogEntry {
-        FaultIsolationLogEntry { timestamp_us, domain, from_health, to_health, description }
+        FaultIsolationLogEntry {
+            timestamp_us,
+            domain,
+            from_health,
+            to_health,
+            description,
+        }
     }
 
     /// Fault history.
@@ -13054,12 +13132,18 @@ impl FaultIsolationManager {
 
     /// Count of healthy domains.
     pub fn healthy_count(&self) -> usize {
-        self.states.values().filter(|s| s.health == DomainHealth::Healthy).count()
+        self.states
+            .values()
+            .filter(|s| s.health == DomainHealth::Healthy)
+            .count()
     }
 
     /// Count of non-healthy domains.
     pub fn unhealthy_count(&self) -> usize {
-        self.states.values().filter(|s| s.health != DomainHealth::Healthy).count()
+        self.states
+            .values()
+            .filter(|s| s.health != DomainHealth::Healthy)
+            .count()
     }
 
     /// Total faults across all domains.
@@ -13084,7 +13168,9 @@ impl FaultIsolationManager {
 
     /// Whether all domains are healthy.
     pub fn all_healthy(&self) -> bool {
-        self.states.values().all(|s| s.health == DomainHealth::Healthy)
+        self.states
+            .values()
+            .all(|s| s.health == DomainHealth::Healthy)
     }
 
     /// Map FaultDomain to InvariantDomain for cross-system integration.
@@ -13122,7 +13208,7 @@ pub struct DomainDependency {
 }
 
 /// Result of a blast-radius analysis for a given source fault.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlastRadiusReport {
     /// The domain that originally faulted.
     pub origin: FaultDomain,
@@ -13151,15 +13237,29 @@ impl BlastRadiusAnalyzer {
     /// Recovery → Scheduler (recovery failures leave scheduler in bad state).
     pub fn default_graph() -> Self {
         Self::new(vec![
-            DomainDependency { source: FaultDomain::Io, target: FaultDomain::Storage, cascade_weight: 80 },
-            DomainDependency { source: FaultDomain::Scheduler, target: FaultDomain::Budget, cascade_weight: 60 },
-            DomainDependency { source: FaultDomain::Recovery, target: FaultDomain::Scheduler, cascade_weight: 40 },
+            DomainDependency {
+                source: FaultDomain::Io,
+                target: FaultDomain::Storage,
+                cascade_weight: 80,
+            },
+            DomainDependency {
+                source: FaultDomain::Scheduler,
+                target: FaultDomain::Budget,
+                cascade_weight: 60,
+            },
+            DomainDependency {
+                source: FaultDomain::Recovery,
+                target: FaultDomain::Scheduler,
+                cascade_weight: 40,
+            },
         ])
     }
 
     /// Analyze blast radius from a source domain failure.
     pub fn analyze(&self, origin: FaultDomain) -> BlastRadiusReport {
-        let direct_risk: Vec<FaultDomain> = self.edges.iter()
+        let direct_risk: Vec<FaultDomain> = self
+            .edges
+            .iter()
             .filter(|e| e.source == origin)
             .map(|e| e.target)
             .collect();
@@ -13170,7 +13270,8 @@ impl BlastRadiusAnalyzer {
         for d in &direct_risk {
             visited.insert(*d);
         }
-        let mut queue: std::collections::VecDeque<FaultDomain> = direct_risk.iter().copied().collect();
+        let mut queue: std::collections::VecDeque<FaultDomain> =
+            direct_risk.iter().copied().collect();
         let mut transitive = Vec::new();
         while let Some(current) = queue.pop_front() {
             for edge in &self.edges {
@@ -13183,7 +13284,12 @@ impl BlastRadiusAnalyzer {
         }
 
         let total_at_risk = direct_risk.len() + transitive.len();
-        BlastRadiusReport { origin, direct_risk, transitive_risk: transitive, total_at_risk }
+        BlastRadiusReport {
+            origin,
+            direct_risk,
+            transitive_risk: transitive,
+            total_at_risk,
+        }
     }
 
     /// Edges in the dependency graph.
@@ -13199,7 +13305,9 @@ impl BlastRadiusAnalyzer {
     /// All domains reachable from origin (direct + transitive), sorted.
     pub fn reachable_from(&self, origin: FaultDomain) -> Vec<FaultDomain> {
         let report = self.analyze(origin);
-        let mut all: Vec<FaultDomain> = report.direct_risk.into_iter()
+        let mut all: Vec<FaultDomain> = report
+            .direct_risk
+            .into_iter()
             .chain(report.transitive_risk)
             .collect();
         all.sort_by_key(|d| *d as u8);
@@ -13214,7 +13322,7 @@ impl BlastRadiusAnalyzer {
 // structured logging required by the acceptance criteria.
 
 /// A structured log entry emitted at every health transition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaultTransitionLog {
     /// Monotonic sequence number.
     pub seq: u64,
@@ -13300,8 +13408,16 @@ impl InstrumentedFaultManager {
     }
 
     /// Emit a transition log entry.
-    fn emit(&mut self, domain: FaultDomain, from: DomainHealth, to: DomainHealth,
-            reason_code: FaultReasonCode, description: String, timestamp_us: u64, correlation_id: u64) {
+    fn emit(
+        &mut self,
+        domain: FaultDomain,
+        from: DomainHealth,
+        to: DomainHealth,
+        reason_code: FaultReasonCode,
+        description: String,
+        timestamp_us: u64,
+        correlation_id: u64,
+    ) {
         if from == to {
             return; // No transition — don't log.
         }
@@ -13323,14 +13439,23 @@ impl InstrumentedFaultManager {
     pub fn record_fault(&mut self, domain: FaultDomain, description: String, timestamp_us: u64) {
         let before = self.inner.domain_health(domain);
         let corr = self.next_correlation();
-        self.inner.record_fault(domain, description.clone(), timestamp_us);
+        self.inner
+            .record_fault(domain, description.clone(), timestamp_us);
         let after = self.inner.domain_health(domain);
         let reason = if after == DomainHealth::Isolated {
             FaultReasonCode::AutoIsolated
         } else {
             FaultReasonCode::FaultRecorded
         };
-        self.emit(domain, before, after, reason, description, timestamp_us, corr);
+        self.emit(
+            domain,
+            before,
+            after,
+            reason,
+            description,
+            timestamp_us,
+            corr,
+        );
     }
 
     /// Attempt restart with transition logging.
@@ -13340,8 +13465,15 @@ impl InstrumentedFaultManager {
         let ok = self.inner.attempt_restart(domain, timestamp_us);
         if ok {
             let after = self.inner.domain_health(domain);
-            self.emit(domain, before, after, FaultReasonCode::RestartAttempted,
-                      "restart initiated".to_string(), timestamp_us, corr);
+            self.emit(
+                domain,
+                before,
+                after,
+                FaultReasonCode::RestartAttempted,
+                "restart initiated".to_string(),
+                timestamp_us,
+                corr,
+            );
         }
         ok
     }
@@ -13352,8 +13484,15 @@ impl InstrumentedFaultManager {
         let corr = self.next_correlation();
         self.inner.restart_succeeded(domain);
         let after = self.inner.domain_health(domain);
-        self.emit(domain, before, after, FaultReasonCode::RestartSucceeded,
-                  "restart completed".to_string(), timestamp_us, corr);
+        self.emit(
+            domain,
+            before,
+            after,
+            FaultReasonCode::RestartSucceeded,
+            "restart completed".to_string(),
+            timestamp_us,
+            corr,
+        );
     }
 
     /// Restart failed with transition logging.
@@ -13367,8 +13506,15 @@ impl InstrumentedFaultManager {
         } else {
             FaultReasonCode::RestartFailed
         };
-        self.emit(domain, before, after, reason,
-                  "restart failed".to_string(), timestamp_us, corr);
+        self.emit(
+            domain,
+            before,
+            after,
+            reason,
+            "restart failed".to_string(),
+            timestamp_us,
+            corr,
+        );
     }
 
     /// Mark degraded with transition logging.
@@ -13377,8 +13523,15 @@ impl InstrumentedFaultManager {
         let corr = self.next_correlation();
         self.inner.mark_degraded(domain);
         let after = self.inner.domain_health(domain);
-        self.emit(domain, before, after, FaultReasonCode::ManualDegraded,
-                  "manual degradation".to_string(), timestamp_us, corr);
+        self.emit(
+            domain,
+            before,
+            after,
+            FaultReasonCode::ManualDegraded,
+            "manual degradation".to_string(),
+            timestamp_us,
+            corr,
+        );
     }
 
     /// Un-isolate with transition logging.
@@ -13387,8 +13540,15 @@ impl InstrumentedFaultManager {
         let corr = self.next_correlation();
         self.inner.un_isolate(domain);
         let after = self.inner.domain_health(domain);
-        self.emit(domain, before, after, FaultReasonCode::ManualUnIsolate,
-                  "manual un-isolate".to_string(), timestamp_us, corr);
+        self.emit(
+            domain,
+            before,
+            after,
+            FaultReasonCode::ManualUnIsolate,
+            "manual un-isolate".to_string(),
+            timestamp_us,
+            corr,
+        );
     }
 
     /// Delegate to inner.
@@ -13510,7 +13670,7 @@ impl fmt::Display for ReplayAction {
 }
 
 /// A replayable event for deterministic replay.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayableEvent {
     /// Domain this event targets.
     pub domain: FaultDomain,
@@ -13549,7 +13709,7 @@ impl fmt::Display for BreakerState {
 }
 
 /// Configuration for a stage circuit breaker.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageBreakerConfig {
     /// Failure count threshold to trip the breaker.
     pub failure_threshold: u32,
@@ -13573,7 +13733,7 @@ impl Default for StageBreakerConfig {
 }
 
 /// Per-stage breaker state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageBreakerState {
     /// Stage this breaker guards.
     pub stage: LatencyStage,
@@ -13594,7 +13754,7 @@ pub struct StageBreakerState {
 }
 
 /// A recovery step in a choreography sequence.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryStep {
     /// Stage being recovered.
     pub stage: LatencyStage,
@@ -13609,12 +13769,15 @@ pub struct RecoveryStep {
 }
 
 /// Recovery choreography outcome.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChoreographyOutcome {
     /// All stages recovered successfully.
     FullRecovery,
     /// Some stages recovered, others remain degraded.
-    PartialRecovery { recovered: Vec<LatencyStage>, failed: Vec<LatencyStage> },
+    PartialRecovery {
+        recovered: Vec<LatencyStage>,
+        failed: Vec<LatencyStage>,
+    },
     /// Recovery was aborted (e.g., timeout, cascade failure).
     Aborted { reason: String },
 }
@@ -13624,7 +13787,12 @@ impl fmt::Display for ChoreographyOutcome {
         match self {
             Self::FullRecovery => write!(f, "full-recovery"),
             Self::PartialRecovery { recovered, failed } => {
-                write!(f, "partial({} ok, {} failed)", recovered.len(), failed.len())
+                write!(
+                    f,
+                    "partial({} ok, {} failed)",
+                    recovered.len(),
+                    failed.len()
+                )
             }
             Self::Aborted { reason } => write!(f, "aborted: {reason}"),
         }
@@ -13632,7 +13800,7 @@ impl fmt::Display for ChoreographyOutcome {
 }
 
 /// Snapshot of the circuit breaker manager.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BreakerManagerSnapshot {
     /// Per-stage states.
     pub stages: Vec<StageBreakerState>,
@@ -13643,7 +13811,7 @@ pub struct BreakerManagerSnapshot {
 }
 
 /// Degradation state for the breaker manager.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BreakerManagerDegradation {
     /// All breakers closed.
     Healthy,
@@ -13664,7 +13832,7 @@ impl fmt::Display for BreakerManagerDegradation {
 }
 
 /// Log entry for breaker events.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BreakerLogEntry {
     /// Timestamp.
     pub timestamp_us: u64,
@@ -13689,16 +13857,19 @@ impl BreakerManager {
     pub fn new(config: StageBreakerConfig) -> Self {
         let mut states = std::collections::HashMap::new();
         for stage in LatencyStage::PIPELINE_STAGES {
-            states.insert(*stage, StageBreakerState {
-                stage: *stage,
-                state: BreakerState::Closed,
-                consecutive_failures: 0,
-                opened_at_us: 0,
-                half_open_probes: 0,
-                half_open_successes: 0,
-                total_trips: 0,
-                total_recoveries: 0,
-            });
+            states.insert(
+                *stage,
+                StageBreakerState {
+                    stage: *stage,
+                    state: BreakerState::Closed,
+                    consecutive_failures: 0,
+                    opened_at_us: 0,
+                    half_open_probes: 0,
+                    half_open_successes: 0,
+                    total_trips: 0,
+                    total_recoveries: 0,
+                },
+            );
         }
         Self { config, states }
     }
@@ -13784,27 +13955,39 @@ impl BreakerManager {
 
     /// Get the state of a stage's breaker.
     pub fn breaker_state(&self, stage: LatencyStage) -> BreakerState {
-        self.states.get(&stage).map_or(BreakerState::Closed, |s| s.state)
+        self.states
+            .get(&stage)
+            .map_or(BreakerState::Closed, |s| s.state)
     }
 
     /// Count of open (tripped) breakers.
     pub fn open_count(&self) -> usize {
-        self.states.values().filter(|s| s.state == BreakerState::Open || s.state == BreakerState::HalfOpen).count()
+        self.states
+            .values()
+            .filter(|s| s.state == BreakerState::Open || s.state == BreakerState::HalfOpen)
+            .count()
     }
 
     /// Whether all breakers are closed.
     pub fn all_closed(&self) -> bool {
-        self.states.values().all(|s| s.state == BreakerState::Closed)
+        self.states
+            .values()
+            .all(|s| s.state == BreakerState::Closed)
     }
 
     /// Get a snapshot.
     pub fn snapshot(&self) -> BreakerManagerSnapshot {
-        let stages: Vec<StageBreakerState> = LatencyStage::PIPELINE_STAGES.iter()
+        let stages: Vec<StageBreakerState> = LatencyStage::PIPELINE_STAGES
+            .iter()
             .filter_map(|s| self.states.get(s).cloned())
             .collect();
         let total_trips = stages.iter().map(|s| s.total_trips).sum();
         let total_recoveries = stages.iter().map(|s| s.total_recoveries).sum();
-        BreakerManagerSnapshot { stages, total_trips, total_recoveries }
+        BreakerManagerSnapshot {
+            stages,
+            total_trips,
+            total_recoveries,
+        }
     }
 
     /// Detect degradation.
@@ -13820,8 +14003,21 @@ impl BreakerManager {
     }
 
     /// Create a log entry.
-    pub fn log_entry(&self, stage: LatencyStage, from: BreakerState, to: BreakerState, reason: String, timestamp_us: u64) -> BreakerLogEntry {
-        BreakerLogEntry { timestamp_us, stage, from_state: from, to_state: to, reason }
+    pub fn log_entry(
+        &self,
+        stage: LatencyStage,
+        from: BreakerState,
+        to: BreakerState,
+        reason: String,
+        timestamp_us: u64,
+    ) -> BreakerLogEntry {
+        BreakerLogEntry {
+            timestamp_us,
+            stage,
+            from_state: from,
+            to_state: to,
+            reason,
+        }
     }
 
     /// Reset all breakers to closed.
@@ -13861,7 +14057,8 @@ impl BreakerManager {
 
     /// Stages currently in the Open state.
     pub fn open_stages(&self) -> Vec<LatencyStage> {
-        self.states.iter()
+        self.states
+            .iter()
             .filter(|(_, s)| s.state == BreakerState::Open)
             .map(|(stage, _)| *stage)
             .collect()
@@ -13869,7 +14066,8 @@ impl BreakerManager {
 
     /// Stages currently in the HalfOpen state.
     pub fn half_open_stages(&self) -> Vec<LatencyStage> {
-        self.states.iter()
+        self.states
+            .iter()
             .filter(|(_, s)| s.state == BreakerState::HalfOpen)
             .map(|(stage, _)| *stage)
             .collect()
@@ -13877,7 +14075,8 @@ impl BreakerManager {
 
     /// Stages currently in the Closed state.
     pub fn closed_stages(&self) -> Vec<LatencyStage> {
-        self.states.iter()
+        self.states
+            .iter()
             .filter(|(_, s)| s.state == BreakerState::Closed)
             .map(|(stage, _)| *stage)
             .collect()
@@ -13886,23 +14085,30 @@ impl BreakerManager {
     /// Generate a recovery choreography plan for all open/half-open stages.
     /// Returns a list of recovery steps ordered by pipeline position.
     pub fn plan_recovery(&self) -> Vec<RecoveryStep> {
-        let mut stages: Vec<LatencyStage> = self.states.iter()
+        let mut stages: Vec<LatencyStage> = self
+            .states
+            .iter()
             .filter(|(_, s)| s.state != BreakerState::Closed)
             .map(|(stage, _)| *stage)
             .collect();
         // Sort by pipeline order.
         stages.sort_by_key(|s| {
-            LatencyStage::PIPELINE_STAGES.iter().position(|p| p == s).unwrap_or(usize::MAX)
+            LatencyStage::PIPELINE_STAGES
+                .iter()
+                .position(|p| p == s)
+                .unwrap_or(usize::MAX)
         });
-        stages.iter().enumerate().map(|(i, stage)| {
-            RecoveryStep {
+        stages
+            .iter()
+            .enumerate()
+            .map(|(i, stage)| RecoveryStep {
                 stage: *stage,
                 step_number: i as u32,
                 action: format!("recover-{}", stage),
                 requires_prior_success: i > 0,
                 timeout_us: self.config.open_duration_us,
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     /// Execute a recovery plan by transitioning open breakers to half-open
@@ -13931,8 +14137,14 @@ impl BreakerManager {
     /// Availability ratio: fraction of stages with closed breakers (0.0..=1.0).
     pub fn availability(&self) -> f64 {
         let total = self.states.len() as f64;
-        if total == 0.0 { return 1.0; }
-        let closed = self.states.values().filter(|s| s.state == BreakerState::Closed).count() as f64;
+        if total == 0.0 {
+            return 1.0;
+        }
+        let closed = self
+            .states
+            .values()
+            .filter(|s| s.state == BreakerState::Closed)
+            .count() as f64;
         closed / total
     }
 
@@ -13987,14 +14199,16 @@ impl fmt::Display for CompletionReason {
         match self {
             Self::Success => write!(f, "success"),
             Self::Timeout => write!(f, "timeout"),
-            Self::UpstreamFailure { stage, detail } => write!(f, "upstream-failure({stage}: {detail})"),
+            Self::UpstreamFailure { stage, detail } => {
+                write!(f, "upstream-failure({stage}: {detail})")
+            }
             Self::Cancelled { reason } => write!(f, "cancelled({reason})"),
         }
     }
 }
 
 /// Immediate-ack token: a lightweight receipt returned to the user on the fast path.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AckToken {
     /// Unique correlation ID linking ack to deferred completion.
     pub correlation_id: u64,
@@ -14007,7 +14221,7 @@ pub struct AckToken {
 }
 
 /// Deferred-completion result: delivered after slow-path processing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeferredResult {
     /// Correlation ID matching the AckToken.
     pub correlation_id: u64,
@@ -14022,7 +14236,7 @@ pub struct DeferredResult {
 }
 
 /// Configuration for the ack/completion protocol.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AckProtocolConfig {
     /// Max time to wait for immediate ack before downgrading (μs).
     pub ack_deadline_us: u64,
@@ -14037,10 +14251,10 @@ pub struct AckProtocolConfig {
 impl Default for AckProtocolConfig {
     fn default() -> Self {
         Self {
-            ack_deadline_us: 50_000,        // 50ms — must feel instant.
+            ack_deadline_us: 50_000,           // 50ms — must feel instant.
             completion_deadline_us: 5_000_000, // 5s — user patience limit.
             show_progress: true,
-            progress_interval_us: 500_000,  // 500ms between updates.
+            progress_interval_us: 500_000, // 500ms between updates.
         }
     }
 }
@@ -14059,7 +14273,7 @@ pub struct ProgressUpdate {
 }
 
 /// Snapshot of the ack protocol manager.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AckProtocolSnapshot {
     /// Total ack tokens issued.
     pub total_acks: u64,
@@ -14072,7 +14286,7 @@ pub struct AckProtocolSnapshot {
 }
 
 /// Degradation level for the protocol.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AckProtocolDegradation {
     /// All requests completing within deadlines.
     Healthy,
@@ -14087,13 +14301,15 @@ impl fmt::Display for AckProtocolDegradation {
         match self {
             Self::Healthy => write!(f, "healthy"),
             Self::AckSlow { slow_count } => write!(f, "ack-slow({slow_count})"),
-            Self::CompletionTimeout { timeout_count } => write!(f, "completion-timeout({timeout_count})"),
+            Self::CompletionTimeout { timeout_count } => {
+                write!(f, "completion-timeout({timeout_count})")
+            }
         }
     }
 }
 
 /// Log entry for ack protocol events.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AckProtocolLogEntry {
     /// Timestamp.
     pub timestamp_us: u64,
@@ -14134,7 +14350,12 @@ impl AckProtocolManager {
     }
 
     /// Issue an immediate ack. Returns a token for the caller.
-    pub fn issue_ack(&mut self, stage: LatencyStage, summary: String, timestamp_us: u64) -> AckToken {
+    pub fn issue_ack(
+        &mut self,
+        stage: LatencyStage,
+        summary: String,
+        timestamp_us: u64,
+    ) -> AckToken {
         let cid = self.next_correlation_id;
         self.next_correlation_id += 1;
         let token = AckToken {
@@ -14149,7 +14370,12 @@ impl AckProtocolManager {
     }
 
     /// Complete a deferred operation. Returns the result with latency info.
-    pub fn complete(&mut self, correlation_id: u64, reason: CompletionReason, timestamp_us: u64) -> Option<DeferredResult> {
+    pub fn complete(
+        &mut self,
+        correlation_id: u64,
+        reason: CompletionReason,
+        timestamp_us: u64,
+    ) -> Option<DeferredResult> {
         let token = self.pending.remove(&correlation_id)?;
         let deferred_latency_us = timestamp_us.saturating_sub(token.acked_at_us);
         let is_timeout = matches!(reason, CompletionReason::Timeout);
@@ -14177,7 +14403,9 @@ impl AckProtocolManager {
     /// Check for timed-out pending operations and complete them.
     pub fn sweep_timeouts(&mut self, current_us: u64) -> Vec<DeferredResult> {
         let deadline = self.config.completion_deadline_us;
-        let expired: Vec<u64> = self.pending.iter()
+        let expired: Vec<u64> = self
+            .pending
+            .iter()
             .filter(|(_, token)| current_us.saturating_sub(token.acked_at_us) >= deadline)
             .map(|(cid, _)| *cid)
             .collect();
@@ -14208,17 +14436,32 @@ impl AckProtocolManager {
     /// Detect degradation.
     pub fn detect_degradation(&self) -> AckProtocolDegradation {
         if self.total_timeouts > 0 {
-            AckProtocolDegradation::CompletionTimeout { timeout_count: self.total_timeouts }
+            AckProtocolDegradation::CompletionTimeout {
+                timeout_count: self.total_timeouts,
+            }
         } else if self.slow_ack_count > 0 {
-            AckProtocolDegradation::AckSlow { slow_count: self.slow_ack_count }
+            AckProtocolDegradation::AckSlow {
+                slow_count: self.slow_ack_count,
+            }
         } else {
             AckProtocolDegradation::Healthy
         }
     }
 
     /// Create a log entry.
-    pub fn log_entry(&self, phase: AckPhase, correlation_id: u64, event: String, timestamp_us: u64) -> AckProtocolLogEntry {
-        AckProtocolLogEntry { timestamp_us, phase, correlation_id, event }
+    pub fn log_entry(
+        &self,
+        phase: AckPhase,
+        correlation_id: u64,
+        event: String,
+        timestamp_us: u64,
+    ) -> AckProtocolLogEntry {
+        AckProtocolLogEntry {
+            timestamp_us,
+            phase,
+            correlation_id,
+            event,
+        }
     }
 
     /// Reset counters.
@@ -14239,29 +14482,43 @@ impl AckProtocolManager {
     // ── F3 Impl: Bridge methods ──
 
     /// Total acks issued.
-    pub fn total_acks(&self) -> u64 { self.total_acks }
+    pub fn total_acks(&self) -> u64 {
+        self.total_acks
+    }
 
     /// Total completions (success + timeout + cancel).
-    pub fn total_completions(&self) -> u64 { self.total_completions }
+    pub fn total_completions(&self) -> u64 {
+        self.total_completions
+    }
 
     /// Total timeouts.
-    pub fn total_timeouts(&self) -> u64 { self.total_timeouts }
+    pub fn total_timeouts(&self) -> u64 {
+        self.total_timeouts
+    }
 
     /// Total cancellations.
-    pub fn total_cancellations(&self) -> u64 { self.total_cancellations }
+    pub fn total_cancellations(&self) -> u64 {
+        self.total_cancellations
+    }
 
     /// Total slow acks recorded.
-    pub fn slow_ack_count(&self) -> u64 { self.slow_ack_count }
+    pub fn slow_ack_count(&self) -> u64 {
+        self.slow_ack_count
+    }
 
     /// Completion rate: total_completions / total_acks.
     pub fn completion_rate(&self) -> f64 {
-        if self.total_acks == 0 { return 1.0; }
+        if self.total_acks == 0 {
+            return 1.0;
+        }
         self.total_completions as f64 / self.total_acks as f64
     }
 
     /// Timeout rate: total_timeouts / total_completions.
     pub fn timeout_rate(&self) -> f64 {
-        if self.total_completions == 0 { return 0.0; }
+        if self.total_completions == 0 {
+            return 0.0;
+        }
         self.total_timeouts as f64 / self.total_completions as f64
     }
 
@@ -14283,10 +14540,11 @@ impl AckProtocolManager {
         timestamp_us: u64,
         explanation: String,
     ) -> Option<DeferredResult> {
-        self.complete(correlation_id, reason, timestamp_us).map(|mut r| {
-            r.explanation = Some(explanation);
-            r
-        })
+        self.complete(correlation_id, reason, timestamp_us)
+            .map(|mut r| {
+                r.explanation = Some(explanation);
+                r
+            })
     }
 
     /// Issue an ack and immediately check if it was slow.
@@ -14310,8 +14568,16 @@ impl AckProtocolManager {
     }
 
     /// Generate a progress update for a pending operation.
-    pub fn make_progress(&self, correlation_id: u64, fraction: f64, message: String, timestamp_us: u64) -> Option<ProgressUpdate> {
-        if !self.pending.contains_key(&correlation_id) { return None; }
+    pub fn make_progress(
+        &self,
+        correlation_id: u64,
+        fraction: f64,
+        message: String,
+        timestamp_us: u64,
+    ) -> Option<ProgressUpdate> {
+        if !self.pending.contains_key(&correlation_id) {
+            return None;
+        }
         Some(ProgressUpdate {
             correlation_id,
             timestamp_us,
@@ -14368,7 +14634,7 @@ impl fmt::Display for ScenarioVerdict {
 }
 
 /// A single scenario in the validation matrix.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixScenario {
     /// Unique scenario ID.
     pub scenario_id: String,
@@ -14385,7 +14651,7 @@ pub struct MatrixScenario {
 }
 
 /// Result of running a scenario.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioResult {
     /// Scenario ID.
     pub scenario_id: String,
@@ -14413,7 +14679,7 @@ pub struct PromotionGate {
 }
 
 /// Snapshot of the validation matrix.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixSnapshot {
     /// Total scenarios.
     pub total_scenarios: u64,
@@ -14425,7 +14691,7 @@ pub struct MatrixSnapshot {
 }
 
 /// Degradation state for the matrix.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatrixDegradation {
     /// All required scenarios passing.
     Healthy,
@@ -14440,13 +14706,15 @@ impl fmt::Display for MatrixDegradation {
         match self {
             Self::Healthy => write!(f, "healthy"),
             Self::FlakyDetected { flaky_count } => write!(f, "flaky({flaky_count})"),
-            Self::GateFailure { failed_scenarios } => write!(f, "gate-failure({})", failed_scenarios.len()),
+            Self::GateFailure { failed_scenarios } => {
+                write!(f, "gate-failure({})", failed_scenarios.len())
+            }
         }
     }
 }
 
 /// Log entry for matrix events.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixLogEntry {
     /// Timestamp.
     pub timestamp_us: u64,
@@ -14490,12 +14758,18 @@ impl ValidationMatrix {
 
     /// Get all results for a scenario.
     pub fn results_for(&self, scenario_id: &str) -> Vec<&ScenarioResult> {
-        self.results.iter().filter(|r| r.scenario_id == scenario_id).collect()
+        self.results
+            .iter()
+            .filter(|r| r.scenario_id == scenario_id)
+            .collect()
     }
 
     /// Latest result for a scenario.
     pub fn latest_result(&self, scenario_id: &str) -> Option<&ScenarioResult> {
-        self.results.iter().rev().find(|r| r.scenario_id == scenario_id)
+        self.results
+            .iter()
+            .rev()
+            .find(|r| r.scenario_id == scenario_id)
     }
 
     /// Check if a promotion gate passes.
@@ -14513,11 +14787,23 @@ impl ValidationMatrix {
         }
         // Check pass rate.
         let total = self.results.len() as f64;
-        if total == 0.0 { return false; }
-        let passes = self.results.iter().filter(|r| r.verdict == ScenarioVerdict::Pass).count() as f64;
-        if passes / total < gate.min_pass_rate { return false; }
+        if total == 0.0 {
+            return false;
+        }
+        let passes = self
+            .results
+            .iter()
+            .filter(|r| r.verdict == ScenarioVerdict::Pass)
+            .count() as f64;
+        if passes / total < gate.min_pass_rate {
+            return false;
+        }
         // Check flaky count.
-        let flaky = self.results.iter().filter(|r| r.verdict == ScenarioVerdict::Flaky).count() as u32;
+        let flaky = self
+            .results
+            .iter()
+            .filter(|r| r.verdict == ScenarioVerdict::Flaky)
+            .count() as u32;
         flaky <= gate.max_flaky_count
     }
 
@@ -14533,10 +14819,26 @@ impl ValidationMatrix {
 
     /// Get a snapshot.
     pub fn snapshot(&self) -> MatrixSnapshot {
-        let pass_count = self.results.iter().filter(|r| r.verdict == ScenarioVerdict::Pass).count() as u64;
-        let fail_count = self.results.iter().filter(|r| r.verdict == ScenarioVerdict::Fail).count() as u64;
-        let skip_count = self.results.iter().filter(|r| r.verdict == ScenarioVerdict::Skip).count() as u64;
-        let flaky_count = self.results.iter().filter(|r| r.verdict == ScenarioVerdict::Flaky).count() as u64;
+        let pass_count = self
+            .results
+            .iter()
+            .filter(|r| r.verdict == ScenarioVerdict::Pass)
+            .count() as u64;
+        let fail_count = self
+            .results
+            .iter()
+            .filter(|r| r.verdict == ScenarioVerdict::Fail)
+            .count() as u64;
+        let skip_count = self
+            .results
+            .iter()
+            .filter(|r| r.verdict == ScenarioVerdict::Skip)
+            .count() as u64;
+        let flaky_count = self
+            .results
+            .iter()
+            .filter(|r| r.verdict == ScenarioVerdict::Flaky)
+            .count() as u64;
         MatrixSnapshot {
             total_scenarios: self.scenarios.len() as u64,
             pass_count,
@@ -14548,17 +14850,25 @@ impl ValidationMatrix {
 
     /// Detect degradation.
     pub fn detect_degradation(&self) -> MatrixDegradation {
-        let flaky_count = self.results.iter().filter(|r| r.verdict == ScenarioVerdict::Flaky).count() as u64;
-        let failed_required: Vec<String> = self.scenarios.iter()
+        let flaky_count = self
+            .results
+            .iter()
+            .filter(|r| r.verdict == ScenarioVerdict::Flaky)
+            .count() as u64;
+        let failed_required: Vec<String> = self
+            .scenarios
+            .iter()
             .filter(|s| s.required_for_promotion)
             .filter(|s| {
                 self.latest_result(&s.scenario_id)
-                    .map_or(true, |r| r.verdict != ScenarioVerdict::Pass)
+                    .is_none_or(|r| r.verdict != ScenarioVerdict::Pass)
             })
             .map(|s| s.scenario_id.clone())
             .collect();
         if !failed_required.is_empty() {
-            MatrixDegradation::GateFailure { failed_scenarios: failed_required }
+            MatrixDegradation::GateFailure {
+                failed_scenarios: failed_required,
+            }
         } else if flaky_count > 0 {
             MatrixDegradation::FlakyDetected { flaky_count }
         } else {
@@ -14567,13 +14877,25 @@ impl ValidationMatrix {
     }
 
     /// Create a log entry.
-    pub fn log_entry(&self, scenario_id: String, event: String, timestamp_us: u64) -> MatrixLogEntry {
-        MatrixLogEntry { timestamp_us, scenario_id, event }
+    pub fn log_entry(
+        &self,
+        scenario_id: String,
+        event: String,
+        timestamp_us: u64,
+    ) -> MatrixLogEntry {
+        MatrixLogEntry {
+            timestamp_us,
+            scenario_id,
+            event,
+        }
     }
 
     /// Scenarios by category.
     pub fn scenarios_by_category(&self, category: ScenarioCategory) -> Vec<&MatrixScenario> {
-        self.scenarios.iter().filter(|s| s.category == category).collect()
+        self.scenarios
+            .iter()
+            .filter(|s| s.category == category)
+            .collect()
     }
 
     /// Reset all results.
@@ -14596,32 +14918,49 @@ impl ValidationMatrix {
     /// Pass rate across all results (0.0..=1.0).
     pub fn pass_rate(&self) -> f64 {
         let total = self.results.len() as f64;
-        if total == 0.0 { return 1.0; }
-        let passes = self.results.iter().filter(|r| r.verdict == ScenarioVerdict::Pass).count() as f64;
+        if total == 0.0 {
+            return 1.0;
+        }
+        let passes = self
+            .results
+            .iter()
+            .filter(|r| r.verdict == ScenarioVerdict::Pass)
+            .count() as f64;
         passes / total
     }
 
     /// Flaky rate across all results (0.0..=1.0).
     pub fn flaky_rate(&self) -> f64 {
         let total = self.results.len() as f64;
-        if total == 0.0 { return 0.0; }
-        let flaky = self.results.iter().filter(|r| r.verdict == ScenarioVerdict::Flaky).count() as f64;
+        if total == 0.0 {
+            return 0.0;
+        }
+        let flaky = self
+            .results
+            .iter()
+            .filter(|r| r.verdict == ScenarioVerdict::Flaky)
+            .count() as f64;
         flaky / total
     }
 
     /// Mean duration across all pass results (μs).
     pub fn mean_pass_duration_us(&self) -> f64 {
-        let passes: Vec<u64> = self.results.iter()
+        let passes: Vec<u64> = self
+            .results
+            .iter()
             .filter(|r| r.verdict == ScenarioVerdict::Pass)
             .map(|r| r.duration_us)
             .collect();
-        if passes.is_empty() { return 0.0; }
+        if passes.is_empty() {
+            return 0.0;
+        }
         passes.iter().sum::<u64>() as f64 / passes.len() as f64
     }
 
     /// Check all gates; returns list of gate names that pass.
     pub fn passing_gates(&self) -> Vec<String> {
-        self.gates.iter()
+        self.gates
+            .iter()
             .filter(|g| self.check_gate(&g.name))
             .map(|g| g.name.clone())
             .collect()
@@ -14629,7 +14968,8 @@ impl ValidationMatrix {
 
     /// Check all gates; returns list of gate names that fail.
     pub fn failing_gates(&self) -> Vec<String> {
-        self.gates.iter()
+        self.gates
+            .iter()
             .filter(|g| !self.check_gate(&g.name))
             .map(|g| g.name.clone())
             .collect()
@@ -14637,11 +14977,12 @@ impl ValidationMatrix {
 
     /// Get required scenarios that don't have a passing result.
     pub fn missing_required(&self) -> Vec<String> {
-        self.scenarios.iter()
+        self.scenarios
+            .iter()
             .filter(|s| s.required_for_promotion)
             .filter(|s| {
                 self.latest_result(&s.scenario_id)
-                    .map_or(true, |r| r.verdict != ScenarioVerdict::Pass)
+                    .is_none_or(|r| r.verdict != ScenarioVerdict::Pass)
             })
             .map(|s| s.scenario_id.clone())
             .collect()
@@ -14649,7 +14990,10 @@ impl ValidationMatrix {
 
     /// All artifacts across all results.
     pub fn all_artifacts(&self) -> Vec<String> {
-        self.results.iter().flat_map(|r| r.artifacts.clone()).collect()
+        self.results
+            .iter()
+            .flat_map(|r| r.artifacts.clone())
+            .collect()
     }
 
     /// Map to InvariantDomain.
@@ -14770,7 +15114,9 @@ impl fmt::Display for SLOVerdict {
         match self {
             Self::Met { measured, target } => write!(f, "met({measured:.1}/{target:.1})"),
             Self::Breached { measured, target } => write!(f, "breached({measured:.1}/{target:.1})"),
-            Self::InsufficientData { samples, required } => write!(f, "insufficient({samples}/{required})"),
+            Self::InsufficientData { samples, required } => {
+                write!(f, "insufficient({samples}/{required})")
+            }
         }
     }
 }
@@ -14787,7 +15133,7 @@ pub struct QoEGuardrailSnapshot {
 }
 
 /// Degradation state for the guardrail.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QoEDegradation {
     /// All SLOs met.
     Healthy,
@@ -14808,7 +15154,7 @@ impl fmt::Display for QoEDegradation {
 }
 
 /// Log entry for QoE events.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QoELogEntry {
     /// Timestamp.
     pub timestamp_us: u64,
@@ -14850,10 +15196,18 @@ impl QoEGuardrail {
     pub fn evaluate_slo(&self, slo: &QoESLO) -> SLOVerdict {
         let window = match self.windows.get(&slo.metric) {
             Some(w) => w,
-            None => return SLOVerdict::InsufficientData { samples: 0, required: self.config.min_samples },
+            None => {
+                return SLOVerdict::InsufficientData {
+                    samples: 0,
+                    required: self.config.min_samples,
+                };
+            }
         };
         if window.len() < self.config.min_samples {
-            return SLOVerdict::InsufficientData { samples: window.len(), required: self.config.min_samples };
+            return SLOVerdict::InsufficientData {
+                samples: window.len(),
+                required: self.config.min_samples,
+            };
         }
         let mut sorted = window.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -14866,21 +15220,32 @@ impl QoEGuardrail {
             _ => measured <= slo.target,
         };
         if is_met {
-            SLOVerdict::Met { measured, target: slo.target }
+            SLOVerdict::Met {
+                measured,
+                target: slo.target,
+            }
         } else {
-            SLOVerdict::Breached { measured, target: slo.target }
+            SLOVerdict::Breached {
+                measured,
+                target: slo.target,
+            }
         }
     }
 
     /// Evaluate all SLOs.
     pub fn evaluate_all(&self) -> Vec<(QoEMetric, SLOVerdict)> {
-        self.config.slos.iter().map(|slo| (slo.metric, self.evaluate_slo(slo))).collect()
+        self.config
+            .slos
+            .iter()
+            .map(|slo| (slo.metric, self.evaluate_slo(slo)))
+            .collect()
     }
 
     /// Get a snapshot.
     pub fn snapshot(&self) -> QoEGuardrailSnapshot {
         let verdicts = self.evaluate_all();
-        let breach_count = verdicts.iter()
+        let breach_count = verdicts
+            .iter()
             .filter(|(_, v)| matches!(v, SLOVerdict::Breached { .. }))
             .count() as u64;
         QoEGuardrailSnapshot {
@@ -14894,10 +15259,13 @@ impl QoEGuardrail {
     pub fn detect_degradation(&self) -> QoEDegradation {
         let total_samples: usize = self.windows.values().map(|w| w.len()).sum();
         if total_samples < self.config.min_samples {
-            return QoEDegradation::WarmingUp { samples: total_samples };
+            return QoEDegradation::WarmingUp {
+                samples: total_samples,
+            };
         }
         let verdicts = self.evaluate_all();
-        let breach_count = verdicts.iter()
+        let breach_count = verdicts
+            .iter()
             .filter(|(_, v)| matches!(v, SLOVerdict::Breached { .. }))
             .count() as u64;
         if breach_count > 0 {
@@ -14909,7 +15277,11 @@ impl QoEGuardrail {
 
     /// Create a log entry.
     pub fn log_entry(&self, metric: QoEMetric, event: String, timestamp_us: u64) -> QoELogEntry {
-        QoELogEntry { timestamp_us, metric, event }
+        QoELogEntry {
+            timestamp_us,
+            metric,
+            event,
+        }
     }
 
     /// Reset all windows.
@@ -14947,14 +15319,16 @@ impl QoEGuardrail {
 
     /// Number of SLOs currently met.
     pub fn met_count(&self) -> usize {
-        self.evaluate_all().iter()
+        self.evaluate_all()
+            .iter()
             .filter(|(_, v)| matches!(v, SLOVerdict::Met { .. }))
             .count()
     }
 
     /// Number of SLOs currently breached.
     pub fn breach_count(&self) -> usize {
-        self.evaluate_all().iter()
+        self.evaluate_all()
+            .iter()
             .filter(|(_, v)| matches!(v, SLOVerdict::Breached { .. }))
             .count()
     }
@@ -14962,11 +15336,15 @@ impl QoEGuardrail {
     /// SLO compliance rate (met / evaluable).
     pub fn compliance_rate(&self) -> f64 {
         let verdicts = self.evaluate_all();
-        let evaluable = verdicts.iter()
+        let evaluable = verdicts
+            .iter()
             .filter(|(_, v)| !matches!(v, SLOVerdict::InsufficientData { .. }))
             .count();
-        if evaluable == 0 { return 1.0; }
-        let met = verdicts.iter()
+        if evaluable == 0 {
+            return 1.0;
+        }
+        let met = verdicts
+            .iter()
             .filter(|(_, v)| matches!(v, SLOVerdict::Met { .. }))
             .count();
         met as f64 / evaluable as f64
@@ -14986,7 +15364,9 @@ impl QoEGuardrail {
     /// Get the current percentile value for a metric (None if insufficient data).
     pub fn current_percentile(&self, metric: QoEMetric, percentile: f64) -> Option<f64> {
         let window = self.windows.get(&metric)?;
-        if window.len() < self.config.min_samples { return None; }
+        if window.len() < self.config.min_samples {
+            return None;
+        }
         let mut sorted = window.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let idx = ((percentile * sorted.len() as f64) as usize).min(sorted.len() - 1);
@@ -14995,7 +15375,9 @@ impl QoEGuardrail {
 
     /// Whether all SLOs are met (or insufficient data).
     pub fn all_slos_met(&self) -> bool {
-        self.evaluate_all().iter().all(|(_, v)| !matches!(v, SLOVerdict::Breached { .. }))
+        self.evaluate_all()
+            .iter()
+            .all(|(_, v)| !matches!(v, SLOVerdict::Breached { .. }))
     }
 }
 
@@ -25456,9 +25838,11 @@ mod tests {
 
     #[test]
     fn test_golden_artifact_new() {
-        let trace = make_golden_trace(&[
-            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
-        ]);
+        let trace = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
         let ga = GoldenArtifact::new("test".to_string(), trace.clone(), "desc".to_string(), 0);
         assert_eq!(ga.artifact_id, "test");
         assert_eq!(ga.version, 1);
@@ -25468,13 +25852,17 @@ mod tests {
 
     #[test]
     fn test_golden_artifact_update() {
-        let t1 = make_golden_trace(&[
-            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
-        ]);
+        let t1 = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
         let mut ga = GoldenArtifact::new("test".to_string(), t1, "v1".to_string(), 0);
-        let t2 = make_golden_trace(&[
-            (20, TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition),
-        ]);
+        let t2 = make_golden_trace(&[(
+            20,
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+        )]);
         ga.update(t2.clone(), 100);
         assert_eq!(ga.version, 2);
         assert_eq!(ga.checksum, t2.digest());
@@ -25483,9 +25871,11 @@ mod tests {
 
     #[test]
     fn test_golden_artifact_serde() {
-        let trace = make_golden_trace(&[
-            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
-        ]);
+        let trace = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
         let ga = GoldenArtifact::new("test".to_string(), trace, "desc".to_string(), 0);
         let json = serde_json::to_string(&ga).unwrap();
         let back: GoldenArtifact = serde_json::from_str(&json).unwrap();
@@ -25494,9 +25884,11 @@ mod tests {
 
     #[test]
     fn test_golden_artifact_display() {
-        let trace = make_golden_trace(&[
-            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
-        ]);
+        let trace = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
         let ga = GoldenArtifact::new("my-opt".to_string(), trace, "desc".to_string(), 0);
         let s = ga.to_string();
         assert!(s.contains("my-opt"));
@@ -25509,10 +25901,15 @@ mod tests {
         assert!(!ProofGateVerdict::Equivalent.is_fail());
         assert!(ProofGateVerdict::IsomorphicEquivalent { reordered_count: 1 }.is_pass());
         let drift = ProofGateVerdict::SemanticDrift {
-            first_divergence_idx: 0, mismatches: vec![], summary: "x".to_string(),
+            first_divergence_idx: 0,
+            mismatches: vec![],
+            summary: "x".to_string(),
         };
         assert!(drift.is_fail());
-        let chk = ProofGateVerdict::ChecksumFailure { expected: 1, actual: 2 };
+        let chk = ProofGateVerdict::ChecksumFailure {
+            expected: 1,
+            actual: 2,
+        };
         assert!(chk.is_fail());
     }
 
@@ -25522,7 +25919,9 @@ mod tests {
         let iso = ProofGateVerdict::IsomorphicEquivalent { reordered_count: 3 };
         assert!(iso.to_string().contains("isomorphic"));
         let drift = ProofGateVerdict::SemanticDrift {
-            first_divergence_idx: 5, mismatches: vec![], summary: "oops".to_string(),
+            first_divergence_idx: 5,
+            mismatches: vec![],
+            summary: "oops".to_string(),
         };
         assert!(drift.to_string().contains("FAIL"));
     }
@@ -25533,9 +25932,14 @@ mod tests {
             ProofGateVerdict::Equivalent,
             ProofGateVerdict::IsomorphicEquivalent { reordered_count: 2 },
             ProofGateVerdict::SemanticDrift {
-                first_divergence_idx: 0, mismatches: vec![], summary: "x".to_string(),
+                first_divergence_idx: 0,
+                mismatches: vec![],
+                summary: "x".to_string(),
             },
-            ProofGateVerdict::ChecksumFailure { expected: 1, actual: 2 },
+            ProofGateVerdict::ChecksumFailure {
+                expected: 1,
+                actual: 2,
+            },
         ];
         for v in verdicts {
             let json = serde_json::to_string(&v).unwrap();
@@ -25586,9 +25990,11 @@ mod tests {
     #[test]
     fn test_proof_gate_register_and_get() {
         let mut gate = ProofGate::new(ProofGateConfig::default());
-        let trace = make_golden_trace(&[
-            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
-        ]);
+        let trace = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
         let ga = GoldenArtifact::new("opt-1".to_string(), trace, "desc".to_string(), 0);
         gate.register_golden(ga);
         assert_eq!(gate.artifact_count(), 1);
@@ -25599,14 +26005,28 @@ mod tests {
     #[test]
     fn test_proof_gate_register_replaces() {
         let mut gate = ProofGate::new(ProofGateConfig::default());
-        let t1 = make_golden_trace(&[
-            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
-        ]);
-        let t2 = make_golden_trace(&[
-            (20, TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition),
-        ]);
-        gate.register_golden(GoldenArtifact::new("x".to_string(), t1, "v1".to_string(), 0));
-        gate.register_golden(GoldenArtifact::new("x".to_string(), t2, "v2".to_string(), 100));
+        let t1 = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
+        let t2 = make_golden_trace(&[(
+            20,
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+        )]);
+        gate.register_golden(GoldenArtifact::new(
+            "x".to_string(),
+            t1,
+            "v1".to_string(),
+            0,
+        ));
+        gate.register_golden(GoldenArtifact::new(
+            "x".to_string(),
+            t2,
+            "v2".to_string(),
+            100,
+        ));
         assert_eq!(gate.artifact_count(), 1);
         assert_eq!(gate.get_golden("x").unwrap().description, "v2");
     }
@@ -25614,10 +26034,17 @@ mod tests {
     #[test]
     fn test_proof_gate_check_equivalent() {
         let mut gate = ProofGate::new(ProofGateConfig::default());
-        let trace = make_golden_trace(&[
-            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
-        ]);
-        gate.register_golden(GoldenArtifact::new("opt-1".to_string(), trace.clone(), "d".to_string(), 0));
+        let trace = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
+        gate.register_golden(GoldenArtifact::new(
+            "opt-1".to_string(),
+            trace.clone(),
+            "d".to_string(),
+            0,
+        ));
         let summary = gate.check("opt-1", &trace, 100);
         assert_eq!(summary.verdict, ProofGateVerdict::Equivalent);
         assert_eq!(gate.snapshot().passes, 1);
@@ -25626,13 +26053,22 @@ mod tests {
     #[test]
     fn test_proof_gate_check_divergent() {
         let mut gate = ProofGate::new(ProofGateConfig::default());
-        let golden = make_golden_trace(&[
-            (10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition),
-        ]);
-        gate.register_golden(GoldenArtifact::new("opt-1".to_string(), golden, "d".to_string(), 0));
-        let candidate = make_golden_trace(&[
-            (10, TraceAction::EpochAdvance { new_epoch: 99 }, InvariantDomain::Composition),
-        ]);
+        let golden = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
+        gate.register_golden(GoldenArtifact::new(
+            "opt-1".to_string(),
+            golden,
+            "d".to_string(),
+            0,
+        ));
+        let candidate = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 99 },
+            InvariantDomain::Composition,
+        )]);
         let summary = gate.check("opt-1", &candidate, 100);
         assert!(summary.verdict.is_fail());
         assert_eq!(gate.snapshot().failures, 1);
@@ -25649,8 +26085,17 @@ mod tests {
     #[test]
     fn test_proof_gate_remove_golden() {
         let mut gate = ProofGate::new(ProofGateConfig::default());
-        let trace = make_golden_trace(&[(10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition)]);
-        gate.register_golden(GoldenArtifact::new("x".to_string(), trace, "d".to_string(), 0));
+        let trace = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
+        gate.register_golden(GoldenArtifact::new(
+            "x".to_string(),
+            trace,
+            "d".to_string(),
+            0,
+        ));
         assert!(gate.remove_golden("x"));
         assert_eq!(gate.artifact_count(), 0);
         assert!(!gate.remove_golden("x"));
@@ -25659,8 +26104,17 @@ mod tests {
     #[test]
     fn test_proof_gate_artifact_ids() {
         let mut gate = ProofGate::new(ProofGateConfig::default());
-        let t = make_golden_trace(&[(10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition)]);
-        gate.register_golden(GoldenArtifact::new("a".to_string(), t.clone(), "d".to_string(), 0));
+        let t = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
+        gate.register_golden(GoldenArtifact::new(
+            "a".to_string(),
+            t.clone(),
+            "d".to_string(),
+            0,
+        ));
         gate.register_golden(GoldenArtifact::new("b".to_string(), t, "d".to_string(), 0));
         let ids = gate.artifact_ids();
         assert!(ids.contains(&"a".to_string()));
@@ -25670,8 +26124,17 @@ mod tests {
     #[test]
     fn test_proof_gate_reset_counters() {
         let mut gate = ProofGate::new(ProofGateConfig::default());
-        let trace = make_golden_trace(&[(10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition)]);
-        gate.register_golden(GoldenArtifact::new("x".to_string(), trace.clone(), "d".to_string(), 0));
+        let trace = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
+        gate.register_golden(GoldenArtifact::new(
+            "x".to_string(),
+            trace.clone(),
+            "d".to_string(),
+            0,
+        ));
         let _ = gate.check("x", &trace, 0);
         gate.reset_counters();
         let snap = gate.snapshot();
@@ -25748,7 +26211,10 @@ mod tests {
 
     #[test]
     fn test_proof_gate_config_accessor() {
-        let cfg = ProofGateConfig { allow_isomorphic: false, ..Default::default() };
+        let cfg = ProofGateConfig {
+            allow_isomorphic: false,
+            ..Default::default()
+        };
         let gate = ProofGate::new(cfg.clone());
         assert_eq!(*gate.config(), cfg);
     }
@@ -25758,9 +26224,12 @@ mod tests {
     #[test]
     fn test_check_from_mc_trace() {
         let mut gate = ProofGate::new(ProofGateConfig::default());
-        let steps = vec![
-            TraceStep { step: 0, action: TraceAction::EpochAdvance { new_epoch: 1 }, check_results: vec![], timestamp_us: 10 },
-        ];
+        let steps = vec![TraceStep {
+            step: 0,
+            action: TraceAction::EpochAdvance { new_epoch: 1 },
+            check_results: vec![],
+            timestamp_us: 10,
+        }];
         gate.register_golden_from_mc("mc-opt".to_string(), &steps, 42, "desc".to_string(), 0);
         let summary = gate.check_from_mc_trace("mc-opt", &steps, 42, 100);
         assert!(summary.verdict.is_pass());
@@ -25769,9 +26238,12 @@ mod tests {
     #[test]
     fn test_register_golden_from_mc() {
         let mut gate = ProofGate::new(ProofGateConfig::default());
-        let steps = vec![
-            TraceStep { step: 0, action: TraceAction::EpochAdvance { new_epoch: 5 }, check_results: vec![], timestamp_us: 100 },
-        ];
+        let steps = vec![TraceStep {
+            step: 0,
+            action: TraceAction::EpochAdvance { new_epoch: 5 },
+            check_results: vec![],
+            timestamp_us: 100,
+        }];
         gate.register_golden_from_mc("mc-1".to_string(), &steps, 99, "mc golden".to_string(), 0);
         assert_eq!(gate.artifact_count(), 1);
         let ga = gate.get_golden("mc-1").unwrap();
@@ -25782,9 +26254,22 @@ mod tests {
     #[test]
     fn test_approve_drift() {
         let mut gate = ProofGate::new(ProofGateConfig::default());
-        let t1 = make_golden_trace(&[(10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition)]);
-        gate.register_golden(GoldenArtifact::new("x".to_string(), t1, "v1".to_string(), 0));
-        let t2 = make_golden_trace(&[(20, TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition)]);
+        let t1 = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
+        gate.register_golden(GoldenArtifact::new(
+            "x".to_string(),
+            t1,
+            "v1".to_string(),
+            0,
+        ));
+        let t2 = make_golden_trace(&[(
+            20,
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+        )]);
         assert!(gate.approve_drift("x", &t2, 100));
         assert_eq!(gate.get_golden("x").unwrap().version, 2);
         assert!(!gate.approve_drift("nonexistent", &t2, 100));
@@ -25794,36 +26279,62 @@ mod tests {
     fn test_failing_passing_artifacts() {
         let summaries = vec![
             ProofSummary {
-                artifact_id: "a".to_string(), golden_version: 1,
+                artifact_id: "a".to_string(),
+                golden_version: 1,
                 verdict: ProofGateVerdict::Equivalent,
-                candidate_entries: 1, golden_entries: 1, check_duration_us: 0, timestamp_us: 0,
+                candidate_entries: 1,
+                golden_entries: 1,
+                check_duration_us: 0,
+                timestamp_us: 0,
             },
             ProofSummary {
-                artifact_id: "b".to_string(), golden_version: 1,
+                artifact_id: "b".to_string(),
+                golden_version: 1,
                 verdict: ProofGateVerdict::SemanticDrift {
-                    first_divergence_idx: 0, mismatches: vec![], summary: "x".to_string(),
+                    first_divergence_idx: 0,
+                    mismatches: vec![],
+                    summary: "x".to_string(),
                 },
-                candidate_entries: 1, golden_entries: 1, check_duration_us: 0, timestamp_us: 0,
+                candidate_entries: 1,
+                golden_entries: 1,
+                check_duration_us: 0,
+                timestamp_us: 0,
             },
         ];
-        assert_eq!(ProofGate::failing_artifacts(&summaries), vec!["b".to_string()]);
-        assert_eq!(ProofGate::passing_artifacts(&summaries), vec!["a".to_string()]);
+        assert_eq!(
+            ProofGate::failing_artifacts(&summaries),
+            vec!["b".to_string()]
+        );
+        assert_eq!(
+            ProofGate::passing_artifacts(&summaries),
+            vec!["a".to_string()]
+        );
     }
 
     #[test]
     fn test_pass_rate() {
         let summaries = vec![
             ProofSummary {
-                artifact_id: "a".to_string(), golden_version: 1,
+                artifact_id: "a".to_string(),
+                golden_version: 1,
                 verdict: ProofGateVerdict::Equivalent,
-                candidate_entries: 1, golden_entries: 1, check_duration_us: 0, timestamp_us: 0,
+                candidate_entries: 1,
+                golden_entries: 1,
+                check_duration_us: 0,
+                timestamp_us: 0,
             },
             ProofSummary {
-                artifact_id: "b".to_string(), golden_version: 1,
+                artifact_id: "b".to_string(),
+                golden_version: 1,
                 verdict: ProofGateVerdict::SemanticDrift {
-                    first_divergence_idx: 0, mismatches: vec![], summary: "x".to_string(),
+                    first_divergence_idx: 0,
+                    mismatches: vec![],
+                    summary: "x".to_string(),
                 },
-                candidate_entries: 1, golden_entries: 1, check_duration_us: 0, timestamp_us: 0,
+                candidate_entries: 1,
+                golden_entries: 1,
+                check_duration_us: 0,
+                timestamp_us: 0,
             },
         ];
         let rate = ProofGate::pass_rate(&summaries);
@@ -25834,8 +26345,17 @@ mod tests {
     #[test]
     fn test_total_counters() {
         let mut gate = ProofGate::new(ProofGateConfig::default());
-        let trace = make_golden_trace(&[(10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition)]);
-        gate.register_golden(GoldenArtifact::new("x".to_string(), trace.clone(), "d".to_string(), 0));
+        let trace = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
+        gate.register_golden(GoldenArtifact::new(
+            "x".to_string(),
+            trace.clone(),
+            "d".to_string(),
+            0,
+        ));
         let _ = gate.check("x", &trace, 0);
         assert_eq!(gate.total_checks(), 1);
         assert_eq!(gate.total_passes(), 1);
@@ -25845,10 +26365,28 @@ mod tests {
     #[test]
     fn test_check_all() {
         let mut gate = ProofGate::new(ProofGateConfig::default());
-        let t1 = make_golden_trace(&[(10, TraceAction::EpochAdvance { new_epoch: 1 }, InvariantDomain::Composition)]);
-        let t2 = make_golden_trace(&[(20, TraceAction::EpochAdvance { new_epoch: 2 }, InvariantDomain::Composition)]);
-        gate.register_golden(GoldenArtifact::new("a".to_string(), t1.clone(), "d".to_string(), 0));
-        gate.register_golden(GoldenArtifact::new("b".to_string(), t2.clone(), "d".to_string(), 0));
+        let t1 = make_golden_trace(&[(
+            10,
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            InvariantDomain::Composition,
+        )]);
+        let t2 = make_golden_trace(&[(
+            20,
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            InvariantDomain::Composition,
+        )]);
+        gate.register_golden(GoldenArtifact::new(
+            "a".to_string(),
+            t1.clone(),
+            "d".to_string(),
+            0,
+        ));
+        gate.register_golden(GoldenArtifact::new(
+            "b".to_string(),
+            t2.clone(),
+            "d".to_string(),
+            0,
+        ));
         let mut candidates = std::collections::HashMap::new();
         candidates.insert("a".to_string(), t1);
         candidates.insert("b".to_string(), t2);
@@ -25895,7 +26433,13 @@ mod tests {
 
     #[test]
     fn test_domain_health_serde() {
-        for h in [DomainHealth::Healthy, DomainHealth::Degraded, DomainHealth::Crashed, DomainHealth::Restarting, DomainHealth::Isolated] {
+        for h in [
+            DomainHealth::Healthy,
+            DomainHealth::Degraded,
+            DomainHealth::Crashed,
+            DomainHealth::Restarting,
+            DomainHealth::Isolated,
+        ] {
             let json = serde_json::to_string(&h).unwrap();
             let back: DomainHealth = serde_json::from_str(&json).unwrap();
             assert_eq!(h, back);
@@ -25950,8 +26494,16 @@ mod tests {
     fn test_record_fault_transitions_to_crashed() {
         let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
         mgr.record_fault(FaultDomain::Scheduler, "test fault".to_string(), 100);
-        assert_eq!(mgr.domain_health(FaultDomain::Scheduler), DomainHealth::Crashed);
-        assert_eq!(mgr.domain_state(FaultDomain::Scheduler).unwrap().total_faults, 1);
+        assert_eq!(
+            mgr.domain_health(FaultDomain::Scheduler),
+            DomainHealth::Crashed
+        );
+        assert_eq!(
+            mgr.domain_state(FaultDomain::Scheduler)
+                .unwrap()
+                .total_faults,
+            1
+        );
     }
 
     #[test]
@@ -25961,7 +26513,10 @@ mod tests {
         for i in 0..4 {
             mgr.record_fault(FaultDomain::Scheduler, format!("fault {i}"), (i + 1) * 100);
         }
-        assert_eq!(mgr.domain_health(FaultDomain::Scheduler), DomainHealth::Isolated);
+        assert_eq!(
+            mgr.domain_health(FaultDomain::Scheduler),
+            DomainHealth::Isolated
+        );
         assert!(mgr.has_isolated_domains());
     }
 
@@ -25970,7 +26525,10 @@ mod tests {
         let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
         mgr.record_fault(FaultDomain::Budget, "test".to_string(), 100);
         assert!(mgr.attempt_restart(FaultDomain::Budget, 200_000));
-        assert_eq!(mgr.domain_health(FaultDomain::Budget), DomainHealth::Restarting);
+        assert_eq!(
+            mgr.domain_health(FaultDomain::Budget),
+            DomainHealth::Restarting
+        );
     }
 
     #[test]
@@ -25990,7 +26548,12 @@ mod tests {
         mgr.attempt_restart(FaultDomain::Io, 200_000);
         mgr.restart_succeeded(FaultDomain::Io);
         assert_eq!(mgr.domain_health(FaultDomain::Io), DomainHealth::Healthy);
-        assert_eq!(mgr.domain_state(FaultDomain::Io).unwrap().consecutive_failures, 0);
+        assert_eq!(
+            mgr.domain_state(FaultDomain::Io)
+                .unwrap()
+                .consecutive_failures,
+            0
+        );
     }
 
     #[test]
@@ -26000,14 +26563,22 @@ mod tests {
         mgr.attempt_restart(FaultDomain::Io, 200_000);
         mgr.restart_failed(FaultDomain::Io, 200_001);
         assert_eq!(mgr.domain_health(FaultDomain::Io), DomainHealth::Crashed);
-        assert_eq!(mgr.domain_state(FaultDomain::Io).unwrap().consecutive_failures, 2);
+        assert_eq!(
+            mgr.domain_state(FaultDomain::Io)
+                .unwrap()
+                .consecutive_failures,
+            2
+        );
     }
 
     #[test]
     fn test_mark_degraded() {
         let mut mgr = FaultIsolationManager::new(FaultIsolationConfig::default());
         mgr.mark_degraded(FaultDomain::Storage);
-        assert_eq!(mgr.domain_health(FaultDomain::Storage), DomainHealth::Degraded);
+        assert_eq!(
+            mgr.domain_health(FaultDomain::Storage),
+            DomainHealth::Degraded
+        );
     }
 
     #[test]
@@ -26016,9 +26587,15 @@ mod tests {
         for i in 0..4 {
             mgr.record_fault(FaultDomain::Recovery, format!("f{i}"), i * 100);
         }
-        assert_eq!(mgr.domain_health(FaultDomain::Recovery), DomainHealth::Isolated);
+        assert_eq!(
+            mgr.domain_health(FaultDomain::Recovery),
+            DomainHealth::Isolated
+        );
         mgr.un_isolate(FaultDomain::Recovery);
-        assert_eq!(mgr.domain_health(FaultDomain::Recovery), DomainHealth::Crashed);
+        assert_eq!(
+            mgr.domain_health(FaultDomain::Recovery),
+            DomainHealth::Crashed
+        );
     }
 
     #[test]
@@ -26070,7 +26647,9 @@ mod tests {
         assert_eq!(FaultIsolationDegradation::Healthy.to_string(), "healthy");
         let pd = FaultIsolationDegradation::PartialDegradation { degraded_count: 2 };
         assert!(pd.to_string().contains("partial-degradation"));
-        let di = FaultIsolationDegradation::DomainIsolated { isolated_domains: vec![FaultDomain::Io] };
+        let di = FaultIsolationDegradation::DomainIsolated {
+            isolated_domains: vec![FaultDomain::Io],
+        };
         assert!(di.to_string().contains("io"));
     }
 
@@ -26079,7 +26658,9 @@ mod tests {
         let variants: Vec<FaultIsolationDegradation> = vec![
             FaultIsolationDegradation::Healthy,
             FaultIsolationDegradation::PartialDegradation { degraded_count: 2 },
-            FaultIsolationDegradation::DomainIsolated { isolated_domains: vec![FaultDomain::Scheduler] },
+            FaultIsolationDegradation::DomainIsolated {
+                isolated_domains: vec![FaultDomain::Scheduler],
+            },
         ];
         for v in variants {
             let json = serde_json::to_string(&v).unwrap();
@@ -26166,16 +26747,34 @@ mod tests {
 
     #[test]
     fn test_to_invariant_domain() {
-        assert_eq!(FaultIsolationManager::to_invariant_domain(FaultDomain::Scheduler), InvariantDomain::Scheduler);
-        assert_eq!(FaultIsolationManager::to_invariant_domain(FaultDomain::Budget), InvariantDomain::Budget);
-        assert_eq!(FaultIsolationManager::to_invariant_domain(FaultDomain::Recovery), InvariantDomain::Recovery);
-        assert_eq!(FaultIsolationManager::to_invariant_domain(FaultDomain::Io), InvariantDomain::Composition);
-        assert_eq!(FaultIsolationManager::to_invariant_domain(FaultDomain::Storage), InvariantDomain::Composition);
+        assert_eq!(
+            FaultIsolationManager::to_invariant_domain(FaultDomain::Scheduler),
+            InvariantDomain::Scheduler
+        );
+        assert_eq!(
+            FaultIsolationManager::to_invariant_domain(FaultDomain::Budget),
+            InvariantDomain::Budget
+        );
+        assert_eq!(
+            FaultIsolationManager::to_invariant_domain(FaultDomain::Recovery),
+            InvariantDomain::Recovery
+        );
+        assert_eq!(
+            FaultIsolationManager::to_invariant_domain(FaultDomain::Io),
+            InvariantDomain::Composition
+        );
+        assert_eq!(
+            FaultIsolationManager::to_invariant_domain(FaultDomain::Storage),
+            InvariantDomain::Composition
+        );
     }
 
     #[test]
     fn test_config_accessor_fault() {
-        let cfg = FaultIsolationConfig { auto_isolate: false, ..Default::default() };
+        let cfg = FaultIsolationConfig {
+            auto_isolate: false,
+            ..Default::default()
+        };
         let mgr = FaultIsolationManager::new(cfg.clone());
         assert_eq!(*mgr.config(), cfg);
     }
@@ -26223,9 +26822,11 @@ mod tests {
 
     #[test]
     fn test_blast_radius_custom_graph() {
-        let bra = BlastRadiusAnalyzer::new(vec![
-            DomainDependency { source: FaultDomain::Storage, target: FaultDomain::Io, cascade_weight: 90 },
-        ]);
+        let bra = BlastRadiusAnalyzer::new(vec![DomainDependency {
+            source: FaultDomain::Storage,
+            target: FaultDomain::Io,
+            cascade_weight: 90,
+        }]);
         let report = bra.analyze(FaultDomain::Storage);
         assert_eq!(report.direct_risk, vec![FaultDomain::Io]);
     }
@@ -26243,7 +26844,9 @@ mod tests {
         let mut bra = BlastRadiusAnalyzer::new(vec![]);
         assert_eq!(bra.edges().len(), 0);
         bra.add_edge(DomainDependency {
-            source: FaultDomain::Budget, target: FaultDomain::Recovery, cascade_weight: 50,
+            source: FaultDomain::Budget,
+            target: FaultDomain::Recovery,
+            cascade_weight: 50,
         });
         assert_eq!(bra.edges().len(), 1);
         let report = bra.analyze(FaultDomain::Budget);
@@ -26266,7 +26869,9 @@ mod tests {
     #[test]
     fn test_domain_dependency_serde() {
         let dep = DomainDependency {
-            source: FaultDomain::Io, target: FaultDomain::Storage, cascade_weight: 80,
+            source: FaultDomain::Io,
+            target: FaultDomain::Storage,
+            cascade_weight: 80,
         };
         let json = serde_json::to_string(&dep).unwrap();
         let back: DomainDependency = serde_json::from_str(&json).unwrap();
@@ -26327,7 +26932,10 @@ mod tests {
         let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
         mgr.mark_degraded(FaultDomain::Recovery, 500);
         assert_eq!(mgr.log_count(), 1);
-        assert_eq!(mgr.transition_log()[0].reason_code, FaultReasonCode::ManualDegraded);
+        assert_eq!(
+            mgr.transition_log()[0].reason_code,
+            FaultReasonCode::ManualDegraded
+        );
     }
 
     #[test]
@@ -26360,7 +26968,11 @@ mod tests {
         let mut mgr = InstrumentedFaultManager::new(FaultIsolationConfig::default());
         mgr.record_fault(FaultDomain::Scheduler, "a".to_string(), 100);
         mgr.record_fault(FaultDomain::Budget, "b".to_string(), 200);
-        let ids: Vec<u64> = mgr.transition_log().iter().map(|e| e.correlation_id).collect();
+        let ids: Vec<u64> = mgr
+            .transition_log()
+            .iter()
+            .map(|e| e.correlation_id)
+            .collect();
         assert_ne!(ids[0], ids[1]);
     }
 
@@ -26396,11 +27008,23 @@ mod tests {
     fn test_fault_reason_code_display() {
         assert_eq!(FaultReasonCode::FaultRecorded.to_string(), "fault-recorded");
         assert_eq!(FaultReasonCode::AutoIsolated.to_string(), "auto-isolated");
-        assert_eq!(FaultReasonCode::RestartAttempted.to_string(), "restart-attempted");
-        assert_eq!(FaultReasonCode::RestartSucceeded.to_string(), "restart-succeeded");
+        assert_eq!(
+            FaultReasonCode::RestartAttempted.to_string(),
+            "restart-attempted"
+        );
+        assert_eq!(
+            FaultReasonCode::RestartSucceeded.to_string(),
+            "restart-succeeded"
+        );
         assert_eq!(FaultReasonCode::RestartFailed.to_string(), "restart-failed");
-        assert_eq!(FaultReasonCode::ManualDegraded.to_string(), "manual-degraded");
-        assert_eq!(FaultReasonCode::ManualUnIsolate.to_string(), "manual-un-isolate");
+        assert_eq!(
+            FaultReasonCode::ManualDegraded.to_string(),
+            "manual-degraded"
+        );
+        assert_eq!(
+            FaultReasonCode::ManualUnIsolate.to_string(),
+            "manual-un-isolate"
+        );
         assert_eq!(FaultReasonCode::Reset.to_string(), "reset");
         assert_eq!(FaultReasonCode::Replay.to_string(), "replay");
     }
@@ -26408,10 +27032,14 @@ mod tests {
     #[test]
     fn test_fault_reason_code_serde() {
         for code in [
-            FaultReasonCode::FaultRecorded, FaultReasonCode::AutoIsolated,
-            FaultReasonCode::RestartAttempted, FaultReasonCode::RestartSucceeded,
-            FaultReasonCode::RestartFailed, FaultReasonCode::ManualDegraded,
-            FaultReasonCode::ManualUnIsolate, FaultReasonCode::Reset,
+            FaultReasonCode::FaultRecorded,
+            FaultReasonCode::AutoIsolated,
+            FaultReasonCode::RestartAttempted,
+            FaultReasonCode::RestartSucceeded,
+            FaultReasonCode::RestartFailed,
+            FaultReasonCode::ManualDegraded,
+            FaultReasonCode::ManualUnIsolate,
+            FaultReasonCode::Reset,
             FaultReasonCode::Replay,
         ] {
             let json = serde_json::to_string(&code).unwrap();
@@ -26434,10 +27062,30 @@ mod tests {
 
         // Replay.
         let events = vec![
-            ReplayableEvent { domain: FaultDomain::Io, timestamp_us: 100, action: ReplayAction::RecordFault, description: "disk err".to_string() },
-            ReplayableEvent { domain: FaultDomain::Io, timestamp_us: 200_000, action: ReplayAction::AttemptRestart, description: String::new() },
-            ReplayableEvent { domain: FaultDomain::Io, timestamp_us: 300_000, action: ReplayAction::RestartSucceeded, description: String::new() },
-            ReplayableEvent { domain: FaultDomain::Scheduler, timestamp_us: 400_000, action: ReplayAction::RecordFault, description: "oom".to_string() },
+            ReplayableEvent {
+                domain: FaultDomain::Io,
+                timestamp_us: 100,
+                action: ReplayAction::RecordFault,
+                description: "disk err".to_string(),
+            },
+            ReplayableEvent {
+                domain: FaultDomain::Io,
+                timestamp_us: 200_000,
+                action: ReplayAction::AttemptRestart,
+                description: String::new(),
+            },
+            ReplayableEvent {
+                domain: FaultDomain::Io,
+                timestamp_us: 300_000,
+                action: ReplayAction::RestartSucceeded,
+                description: String::new(),
+            },
+            ReplayableEvent {
+                domain: FaultDomain::Scheduler,
+                timestamp_us: 400_000,
+                action: ReplayAction::RecordFault,
+                description: "oom".to_string(),
+            },
         ];
         let replayed = InstrumentedFaultManager::replay(cfg, &events);
 
@@ -26453,7 +27101,10 @@ mod tests {
     fn test_replay_action_display() {
         assert_eq!(ReplayAction::RecordFault.to_string(), "record-fault");
         assert_eq!(ReplayAction::AttemptRestart.to_string(), "attempt-restart");
-        assert_eq!(ReplayAction::RestartSucceeded.to_string(), "restart-succeeded");
+        assert_eq!(
+            ReplayAction::RestartSucceeded.to_string(),
+            "restart-succeeded"
+        );
         assert_eq!(ReplayAction::RestartFailed.to_string(), "restart-failed");
         assert_eq!(ReplayAction::MarkDegraded.to_string(), "mark-degraded");
         assert_eq!(ReplayAction::UnIsolate.to_string(), "un-isolate");
@@ -26462,9 +27113,12 @@ mod tests {
     #[test]
     fn test_replay_action_serde() {
         for action in [
-            ReplayAction::RecordFault, ReplayAction::AttemptRestart,
-            ReplayAction::RestartSucceeded, ReplayAction::RestartFailed,
-            ReplayAction::MarkDegraded, ReplayAction::UnIsolate,
+            ReplayAction::RecordFault,
+            ReplayAction::AttemptRestart,
+            ReplayAction::RestartSucceeded,
+            ReplayAction::RestartFailed,
+            ReplayAction::MarkDegraded,
+            ReplayAction::UnIsolate,
         ] {
             let json = serde_json::to_string(&action).unwrap();
             let back: ReplayAction = serde_json::from_str(&json).unwrap();
@@ -26523,7 +27177,11 @@ mod tests {
 
     #[test]
     fn test_breaker_state_serde() {
-        for state in [BreakerState::Closed, BreakerState::Open, BreakerState::HalfOpen] {
+        for state in [
+            BreakerState::Closed,
+            BreakerState::Open,
+            BreakerState::HalfOpen,
+        ] {
             let json = serde_json::to_string(&state).unwrap();
             let back: BreakerState = serde_json::from_str(&json).unwrap();
             assert_eq!(back, state);
@@ -26580,13 +27238,18 @@ mod tests {
 
     #[test]
     fn test_choreography_outcome_display() {
-        assert_eq!(ChoreographyOutcome::FullRecovery.to_string(), "full-recovery");
+        assert_eq!(
+            ChoreographyOutcome::FullRecovery.to_string(),
+            "full-recovery"
+        );
         let partial = ChoreographyOutcome::PartialRecovery {
             recovered: vec![LatencyStage::PtyCapture],
             failed: vec![LatencyStage::StorageWrite, LatencyStage::EventEmission],
         };
         assert_eq!(partial.to_string(), "partial(1 ok, 2 failed)");
-        let aborted = ChoreographyOutcome::Aborted { reason: "timeout".to_string() };
+        let aborted = ChoreographyOutcome::Aborted {
+            reason: "timeout".to_string(),
+        };
         assert_eq!(aborted.to_string(), "aborted: timeout");
     }
 
@@ -26598,7 +27261,9 @@ mod tests {
                 recovered: vec![LatencyStage::PtyCapture],
                 failed: vec![LatencyStage::StorageWrite],
             },
-            ChoreographyOutcome::Aborted { reason: "cascade".to_string() },
+            ChoreographyOutcome::Aborted {
+                reason: "cascade".to_string(),
+            },
         ];
         for o in outcomes {
             let json = serde_json::to_string(&o).unwrap();
@@ -26624,7 +27289,10 @@ mod tests {
         for i in 0..4 {
             mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
         }
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Closed);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::Closed
+        );
         assert!(mgr.all_closed());
     }
 
@@ -26634,7 +27302,10 @@ mod tests {
         for i in 0..5 {
             mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
         }
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Open);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::Open
+        );
         assert!(!mgr.all_closed());
         assert_eq!(mgr.open_count(), 1);
     }
@@ -26657,7 +27328,10 @@ mod tests {
         }
         // After open_duration (1_000_000 us), should transition to half-open.
         assert!(mgr.allow_request(LatencyStage::PtyCapture, 1_000_200));
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::HalfOpen);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::HalfOpen
+        );
     }
 
     #[test]
@@ -26686,7 +27360,10 @@ mod tests {
         // Record enough successes to close (threshold = 2).
         mgr.record_success(LatencyStage::PtyCapture);
         mgr.record_success(LatencyStage::PtyCapture);
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Closed);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::Closed
+        );
     }
 
     #[test]
@@ -26696,9 +27373,15 @@ mod tests {
             mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
         }
         mgr.allow_request(LatencyStage::PtyCapture, 1_100_000);
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::HalfOpen);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::HalfOpen
+        );
         mgr.record_failure(LatencyStage::PtyCapture, 1_200_000);
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Open);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::Open
+        );
     }
 
     #[test]
@@ -26711,7 +27394,10 @@ mod tests {
         for i in 0..4 {
             mgr.record_failure(LatencyStage::PtyCapture, 200 + i);
         }
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Closed);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::Closed
+        );
     }
 
     #[test]
@@ -26720,8 +27406,14 @@ mod tests {
         for i in 0..5 {
             mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
         }
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Open);
-        assert_eq!(mgr.breaker_state(LatencyStage::StorageWrite), BreakerState::Closed);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::Open
+        );
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::StorageWrite),
+            BreakerState::Closed
+        );
         assert_eq!(mgr.open_count(), 1);
     }
 
@@ -26759,27 +27451,43 @@ mod tests {
             mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
         }
         let deg = mgr.detect_degradation();
-        assert_eq!(deg, BreakerManagerDegradation::BreakerTripped { open_count: 1 });
+        assert_eq!(
+            deg,
+            BreakerManagerDegradation::BreakerTripped { open_count: 1 }
+        );
     }
 
     #[test]
     fn test_breaker_manager_degradation_cascade_risk() {
         let mut mgr = BreakerManager::new(StageBreakerConfig::default());
-        let stages = [LatencyStage::PtyCapture, LatencyStage::StorageWrite, LatencyStage::EventEmission];
+        let stages = [
+            LatencyStage::PtyCapture,
+            LatencyStage::StorageWrite,
+            LatencyStage::EventEmission,
+        ];
         for stage in stages {
             for i in 0..5 {
                 mgr.record_failure(stage, 100 + i);
             }
         }
         let deg = mgr.detect_degradation();
-        assert_eq!(deg, BreakerManagerDegradation::CascadeRisk { open_count: 3 });
+        assert_eq!(
+            deg,
+            BreakerManagerDegradation::CascadeRisk { open_count: 3 }
+        );
     }
 
     #[test]
     fn test_breaker_manager_degradation_display() {
         assert_eq!(BreakerManagerDegradation::Healthy.to_string(), "healthy");
-        assert_eq!(BreakerManagerDegradation::BreakerTripped { open_count: 2 }.to_string(), "tripped(2)");
-        assert_eq!(BreakerManagerDegradation::CascadeRisk { open_count: 4 }.to_string(), "cascade-risk(4)");
+        assert_eq!(
+            BreakerManagerDegradation::BreakerTripped { open_count: 2 }.to_string(),
+            "tripped(2)"
+        );
+        assert_eq!(
+            BreakerManagerDegradation::CascadeRisk { open_count: 4 }.to_string(),
+            "cascade-risk(4)"
+        );
     }
 
     #[test]
@@ -26863,23 +27571,36 @@ mod tests {
         };
         let mut mgr = BreakerManager::new(cfg);
         mgr.record_failure(LatencyStage::DeltaExtraction, 100);
-        assert_eq!(mgr.breaker_state(LatencyStage::DeltaExtraction), BreakerState::Closed);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::DeltaExtraction),
+            BreakerState::Closed
+        );
         mgr.record_failure(LatencyStage::DeltaExtraction, 101);
-        assert_eq!(mgr.breaker_state(LatencyStage::DeltaExtraction), BreakerState::Open);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::DeltaExtraction),
+            BreakerState::Open
+        );
     }
 
     #[test]
     fn test_breaker_total_trips_accumulates() {
         let mut mgr = BreakerManager::new(StageBreakerConfig::default());
         // Trip PtyCapture.
-        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 100 + i); }
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
         // Recover it.
         mgr.allow_request(LatencyStage::PtyCapture, 1_200_000);
         mgr.record_success(LatencyStage::PtyCapture);
         mgr.record_success(LatencyStage::PtyCapture);
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Closed);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::Closed
+        );
         // Trip it again.
-        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 2_000_000 + i); }
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 2_000_000 + i);
+        }
         let snap = mgr.snapshot();
         assert_eq!(snap.total_trips, 2);
         assert_eq!(snap.total_recoveries, 1);
@@ -26896,11 +27617,19 @@ mod tests {
     #[test]
     fn test_open_failure_is_noop() {
         let mut mgr = BreakerManager::new(StageBreakerConfig::default());
-        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 100 + i); }
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Open);
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::Open
+        );
         // Further failures while open are no-op.
         mgr.record_failure(LatencyStage::PtyCapture, 200);
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Open);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::Open
+        );
     }
 
     // ── F2 Impl: Bridge method tests ──
@@ -26909,16 +27638,22 @@ mod tests {
     fn test_breaker_total_trips_method() {
         let mut mgr = BreakerManager::new(StageBreakerConfig::default());
         assert_eq!(mgr.total_trips(), 0);
-        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 100 + i); }
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
         assert_eq!(mgr.total_trips(), 1);
-        for i in 0..5 { mgr.record_failure(LatencyStage::StorageWrite, 200 + i); }
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::StorageWrite, 200 + i);
+        }
         assert_eq!(mgr.total_trips(), 2);
     }
 
     #[test]
     fn test_breaker_total_recoveries_method() {
         let mut mgr = BreakerManager::new(StageBreakerConfig::default());
-        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 100 + i); }
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
         mgr.allow_request(LatencyStage::PtyCapture, 1_200_000);
         mgr.record_success(LatencyStage::PtyCapture);
         mgr.record_success(LatencyStage::PtyCapture);
@@ -26937,7 +27672,9 @@ mod tests {
     fn test_breaker_open_stages() {
         let mut mgr = BreakerManager::new(StageBreakerConfig::default());
         assert!(mgr.open_stages().is_empty());
-        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 100 + i); }
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
         let open = mgr.open_stages();
         assert_eq!(open.len(), 1);
         assert!(open.contains(&LatencyStage::PtyCapture));
@@ -26946,7 +27683,9 @@ mod tests {
     #[test]
     fn test_breaker_half_open_stages() {
         let mut mgr = BreakerManager::new(StageBreakerConfig::default());
-        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 100 + i); }
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
         mgr.allow_request(LatencyStage::PtyCapture, 1_200_000);
         let half = mgr.half_open_stages();
         assert_eq!(half.len(), 1);
@@ -26969,8 +27708,12 @@ mod tests {
     fn test_breaker_plan_recovery_ordered_by_pipeline() {
         let mut mgr = BreakerManager::new(StageBreakerConfig::default());
         // Trip StorageWrite and PtyCapture (out of pipeline order).
-        for i in 0..5 { mgr.record_failure(LatencyStage::StorageWrite, 100 + i); }
-        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 200 + i); }
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::StorageWrite, 100 + i);
+        }
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 200 + i);
+        }
         let plan = mgr.plan_recovery();
         assert_eq!(plan.len(), 2);
         // PtyCapture comes before StorageWrite in pipeline.
@@ -26983,18 +27726,26 @@ mod tests {
     #[test]
     fn test_breaker_initiate_recovery() {
         let mut mgr = BreakerManager::new(StageBreakerConfig::default());
-        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 100 + i); }
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
         // Not enough time passed yet.
         assert_eq!(mgr.initiate_recovery(500_000), 0);
         // Enough time passed.
         let transitioned = mgr.initiate_recovery(1_200_000);
         assert_eq!(transitioned, 1);
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::HalfOpen);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::HalfOpen
+        );
     }
 
     #[test]
     fn test_breaker_to_invariant_domain() {
-        assert_eq!(BreakerManager::to_invariant_domain(), InvariantDomain::Recovery);
+        assert_eq!(
+            BreakerManager::to_invariant_domain(),
+            InvariantDomain::Recovery
+        );
     }
 
     #[test]
@@ -27006,7 +27757,9 @@ mod tests {
     #[test]
     fn test_breaker_availability_some_open() {
         let mut mgr = BreakerManager::new(StageBreakerConfig::default());
-        for i in 0..5 { mgr.record_failure(LatencyStage::PtyCapture, 100 + i); }
+        for i in 0..5 {
+            mgr.record_failure(LatencyStage::PtyCapture, 100 + i);
+        }
         // 7/8 closed.
         assert!((mgr.availability() - 7.0 / 8.0).abs() < 0.01);
     }
@@ -27015,7 +27768,10 @@ mod tests {
     fn test_breaker_record_failures_batch() {
         let mut mgr = BreakerManager::new(StageBreakerConfig::default());
         mgr.record_failures_batch(LatencyStage::PtyCapture, 5, 1000);
-        assert_eq!(mgr.breaker_state(LatencyStage::PtyCapture), BreakerState::Open);
+        assert_eq!(
+            mgr.breaker_state(LatencyStage::PtyCapture),
+            BreakerState::Open
+        );
     }
 
     #[test]
@@ -27031,7 +27787,10 @@ mod tests {
     #[test]
     fn test_ack_phase_display() {
         assert_eq!(AckPhase::ImmediateAck.to_string(), "immediate-ack");
-        assert_eq!(AckPhase::DeferredCompletion.to_string(), "deferred-completion");
+        assert_eq!(
+            AckPhase::DeferredCompletion.to_string(),
+            "deferred-completion"
+        );
     }
 
     #[test]
@@ -27052,7 +27811,9 @@ mod tests {
             detail: "WAL full".to_string(),
         };
         assert!(up.to_string().contains("upstream-failure"));
-        let cancel = CompletionReason::Cancelled { reason: "user".to_string() };
+        let cancel = CompletionReason::Cancelled {
+            reason: "user".to_string(),
+        };
         assert!(cancel.to_string().contains("cancelled"));
     }
 
@@ -27065,7 +27826,9 @@ mod tests {
                 stage: LatencyStage::PatternDetection,
                 detail: "OOM".to_string(),
             },
-            CompletionReason::Cancelled { reason: "test".to_string() },
+            CompletionReason::Cancelled {
+                reason: "test".to_string(),
+            },
         ];
         for r in reasons {
             let json = serde_json::to_string(&r).unwrap();
@@ -27220,7 +27983,10 @@ mod tests {
     fn test_ack_protocol_degradation_slow_ack() {
         let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
         mgr.record_slow_ack();
-        assert_eq!(mgr.detect_degradation(), AckProtocolDegradation::AckSlow { slow_count: 1 });
+        assert_eq!(
+            mgr.detect_degradation(),
+            AckProtocolDegradation::AckSlow { slow_count: 1 }
+        );
     }
 
     #[test]
@@ -27229,14 +27995,23 @@ mod tests {
         mgr.issue_ack(LatencyStage::PtyCapture, "x".to_string(), 1000);
         mgr.sweep_timeouts(6_100_000);
         let deg = mgr.detect_degradation();
-        assert_eq!(deg, AckProtocolDegradation::CompletionTimeout { timeout_count: 1 });
+        assert_eq!(
+            deg,
+            AckProtocolDegradation::CompletionTimeout { timeout_count: 1 }
+        );
     }
 
     #[test]
     fn test_ack_protocol_degradation_display() {
         assert_eq!(AckProtocolDegradation::Healthy.to_string(), "healthy");
-        assert_eq!(AckProtocolDegradation::AckSlow { slow_count: 3 }.to_string(), "ack-slow(3)");
-        assert_eq!(AckProtocolDegradation::CompletionTimeout { timeout_count: 2 }.to_string(), "completion-timeout(2)");
+        assert_eq!(
+            AckProtocolDegradation::AckSlow { slow_count: 3 }.to_string(),
+            "ack-slow(3)"
+        );
+        assert_eq!(
+            AckProtocolDegradation::CompletionTimeout { timeout_count: 2 }.to_string(),
+            "completion-timeout(2)"
+        );
     }
 
     #[test]
@@ -27290,7 +28065,10 @@ mod tests {
 
     #[test]
     fn test_ack_protocol_config_accessor() {
-        let cfg = AckProtocolConfig { ack_deadline_us: 100, ..Default::default() };
+        let cfg = AckProtocolConfig {
+            ack_deadline_us: 100,
+            ..Default::default()
+        };
         let mgr = AckProtocolManager::new(cfg.clone());
         assert_eq!(*mgr.config(), cfg);
     }
@@ -27308,7 +28086,13 @@ mod tests {
     fn test_ack_cancel_completes() {
         let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
         let token = mgr.issue_ack(LatencyStage::PtyCapture, "x".to_string(), 1000);
-        let result = mgr.complete(token.correlation_id, CompletionReason::Cancelled { reason: "user".to_string() }, 2000);
+        let result = mgr.complete(
+            token.correlation_id,
+            CompletionReason::Cancelled {
+                reason: "user".to_string(),
+            },
+            2000,
+        );
         assert!(result.is_some());
         assert_eq!(mgr.pending_count(), 0);
         assert_eq!(mgr.snapshot().total_completions, 1);
@@ -27344,7 +28128,13 @@ mod tests {
     fn test_ack_total_cancellations() {
         let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
         mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
-        mgr.complete(1, CompletionReason::Cancelled { reason: "x".to_string() }, 200);
+        mgr.complete(
+            1,
+            CompletionReason::Cancelled {
+                reason: "x".to_string(),
+            },
+            200,
+        );
         assert_eq!(mgr.total_cancellations(), 1);
     }
 
@@ -27406,12 +28196,18 @@ mod tests {
             "Pattern found".to_string(),
         );
         assert!(result.is_some());
-        assert_eq!(result.unwrap().explanation, Some("Pattern found".to_string()));
+        assert_eq!(
+            result.unwrap().explanation,
+            Some("Pattern found".to_string())
+        );
     }
 
     #[test]
     fn test_ack_issue_checked_slow() {
-        let cfg = AckProtocolConfig { ack_deadline_us: 100, ..Default::default() };
+        let cfg = AckProtocolConfig {
+            ack_deadline_us: 100,
+            ..Default::default()
+        };
         let mut mgr = AckProtocolManager::new(cfg);
         // Ack took 200μs but deadline is 100μs → slow.
         mgr.issue_ack_checked(LatencyStage::PtyCapture, "a".to_string(), 1000, 1201);
@@ -27420,7 +28216,10 @@ mod tests {
 
     #[test]
     fn test_ack_issue_checked_fast() {
-        let cfg = AckProtocolConfig { ack_deadline_us: 100, ..Default::default() };
+        let cfg = AckProtocolConfig {
+            ack_deadline_us: 100,
+            ..Default::default()
+        };
         let mut mgr = AckProtocolManager::new(cfg);
         // Ack took 50μs, deadline is 100μs → fast.
         mgr.issue_ack_checked(LatencyStage::PtyCapture, "a".to_string(), 1000, 1050);
@@ -27429,7 +28228,10 @@ mod tests {
 
     #[test]
     fn test_ack_to_invariant_domain() {
-        assert_eq!(AckProtocolManager::to_invariant_domain(), InvariantDomain::Composition);
+        assert_eq!(
+            AckProtocolManager::to_invariant_domain(),
+            InvariantDomain::Composition
+        );
     }
 
     #[test]
@@ -27448,9 +28250,13 @@ mod tests {
     fn test_ack_make_progress_clamps_fraction() {
         let mut mgr = AckProtocolManager::new(AckProtocolConfig::default());
         let token = mgr.issue_ack(LatencyStage::PtyCapture, "a".to_string(), 100);
-        let p = mgr.make_progress(token.correlation_id, 2.0, "over".to_string(), 500).unwrap();
+        let p = mgr
+            .make_progress(token.correlation_id, 2.0, "over".to_string(), 500)
+            .unwrap();
         assert!((p.fraction - 1.0).abs() < f64::EPSILON);
-        let p2 = mgr.make_progress(token.correlation_id, -0.5, "under".to_string(), 500).unwrap();
+        let p2 = mgr
+            .make_progress(token.correlation_id, -0.5, "under".to_string(), 500)
+            .unwrap();
         assert!((p2.fraction - 0.0).abs() < f64::EPSILON);
     }
 
@@ -27466,7 +28272,12 @@ mod tests {
 
     #[test]
     fn test_scenario_category_serde() {
-        for cat in [ScenarioCategory::E2E, ScenarioCategory::Chaos, ScenarioCategory::Soak, ScenarioCategory::Performance] {
+        for cat in [
+            ScenarioCategory::E2E,
+            ScenarioCategory::Chaos,
+            ScenarioCategory::Soak,
+            ScenarioCategory::Performance,
+        ] {
             let json = serde_json::to_string(&cat).unwrap();
             let back: ScenarioCategory = serde_json::from_str(&json).unwrap();
             assert_eq!(back, cat);
@@ -27483,7 +28294,12 @@ mod tests {
 
     #[test]
     fn test_scenario_verdict_serde() {
-        for v in [ScenarioVerdict::Pass, ScenarioVerdict::Fail, ScenarioVerdict::Skip, ScenarioVerdict::Flaky] {
+        for v in [
+            ScenarioVerdict::Pass,
+            ScenarioVerdict::Fail,
+            ScenarioVerdict::Skip,
+            ScenarioVerdict::Flaky,
+        ] {
             let json = serde_json::to_string(&v).unwrap();
             let back: ScenarioVerdict = serde_json::from_str(&json).unwrap();
             assert_eq!(back, v);
@@ -27708,8 +28524,13 @@ mod tests {
     #[test]
     fn test_validation_matrix_degradation_display() {
         assert_eq!(MatrixDegradation::Healthy.to_string(), "healthy");
-        assert_eq!(MatrixDegradation::FlakyDetected { flaky_count: 3 }.to_string(), "flaky(3)");
-        let gf = MatrixDegradation::GateFailure { failed_scenarios: vec!["a".to_string(), "b".to_string()] };
+        assert_eq!(
+            MatrixDegradation::FlakyDetected { flaky_count: 3 }.to_string(),
+            "flaky(3)"
+        );
+        let gf = MatrixDegradation::GateFailure {
+            failed_scenarios: vec!["a".to_string(), "b".to_string()],
+        };
         assert_eq!(gf.to_string(), "gate-failure(2)");
     }
 
@@ -27718,7 +28539,9 @@ mod tests {
         let cases = vec![
             MatrixDegradation::Healthy,
             MatrixDegradation::FlakyDetected { flaky_count: 2 },
-            MatrixDegradation::GateFailure { failed_scenarios: vec!["x".to_string()] },
+            MatrixDegradation::GateFailure {
+                failed_scenarios: vec!["x".to_string()],
+            },
         ];
         for deg in cases {
             let json = serde_json::to_string(&deg).unwrap();
@@ -27767,8 +28590,14 @@ mod tests {
             required_for_promotion: false,
         });
         assert_eq!(matrix.scenarios_by_category(ScenarioCategory::E2E).len(), 1);
-        assert_eq!(matrix.scenarios_by_category(ScenarioCategory::Chaos).len(), 1);
-        assert_eq!(matrix.scenarios_by_category(ScenarioCategory::Soak).len(), 0);
+        assert_eq!(
+            matrix.scenarios_by_category(ScenarioCategory::Chaos).len(),
+            1
+        );
+        assert_eq!(
+            matrix.scenarios_by_category(ScenarioCategory::Soak).len(),
+            0
+        );
     }
 
     #[test]
@@ -27832,12 +28661,18 @@ mod tests {
     fn test_matrix_pass_rate() {
         let mut matrix = ValidationMatrix::new();
         matrix.record_result(ScenarioResult {
-            scenario_id: "s1".to_string(), verdict: ScenarioVerdict::Pass,
-            duration_us: 100, failure_message: None, artifacts: vec![],
+            scenario_id: "s1".to_string(),
+            verdict: ScenarioVerdict::Pass,
+            duration_us: 100,
+            failure_message: None,
+            artifacts: vec![],
         });
         matrix.record_result(ScenarioResult {
-            scenario_id: "s2".to_string(), verdict: ScenarioVerdict::Fail,
-            duration_us: 200, failure_message: None, artifacts: vec![],
+            scenario_id: "s2".to_string(),
+            verdict: ScenarioVerdict::Fail,
+            duration_us: 200,
+            failure_message: None,
+            artifacts: vec![],
         });
         assert!((matrix.pass_rate() - 0.5).abs() < 0.01);
     }
@@ -27846,12 +28681,18 @@ mod tests {
     fn test_matrix_flaky_rate() {
         let mut matrix = ValidationMatrix::new();
         matrix.record_result(ScenarioResult {
-            scenario_id: "s1".to_string(), verdict: ScenarioVerdict::Flaky,
-            duration_us: 100, failure_message: None, artifacts: vec![],
+            scenario_id: "s1".to_string(),
+            verdict: ScenarioVerdict::Flaky,
+            duration_us: 100,
+            failure_message: None,
+            artifacts: vec![],
         });
         matrix.record_result(ScenarioResult {
-            scenario_id: "s2".to_string(), verdict: ScenarioVerdict::Pass,
-            duration_us: 200, failure_message: None, artifacts: vec![],
+            scenario_id: "s2".to_string(),
+            verdict: ScenarioVerdict::Pass,
+            duration_us: 200,
+            failure_message: None,
+            artifacts: vec![],
         });
         assert!((matrix.flaky_rate() - 0.5).abs() < 0.01);
     }
@@ -27860,12 +28701,18 @@ mod tests {
     fn test_matrix_mean_pass_duration() {
         let mut matrix = ValidationMatrix::new();
         matrix.record_result(ScenarioResult {
-            scenario_id: "s1".to_string(), verdict: ScenarioVerdict::Pass,
-            duration_us: 100, failure_message: None, artifacts: vec![],
+            scenario_id: "s1".to_string(),
+            verdict: ScenarioVerdict::Pass,
+            duration_us: 100,
+            failure_message: None,
+            artifacts: vec![],
         });
         matrix.record_result(ScenarioResult {
-            scenario_id: "s2".to_string(), verdict: ScenarioVerdict::Pass,
-            duration_us: 300, failure_message: None, artifacts: vec![],
+            scenario_id: "s2".to_string(),
+            verdict: ScenarioVerdict::Pass,
+            duration_us: 300,
+            failure_message: None,
+            artifacts: vec![],
         });
         assert!((matrix.mean_pass_duration_us() - 200.0).abs() < 0.01);
     }
@@ -27880,8 +28727,11 @@ mod tests {
             max_flaky_count: 10,
         });
         matrix.record_result(ScenarioResult {
-            scenario_id: "s1".to_string(), verdict: ScenarioVerdict::Pass,
-            duration_us: 100, failure_message: None, artifacts: vec![],
+            scenario_id: "s1".to_string(),
+            verdict: ScenarioVerdict::Pass,
+            duration_us: 100,
+            failure_message: None,
+            artifacts: vec![],
         });
         assert_eq!(matrix.passing_gates(), vec!["canary".to_string()]);
         assert!(matrix.failing_gates().is_empty());
@@ -27900,8 +28750,11 @@ mod tests {
         });
         assert_eq!(matrix.missing_required(), vec!["req1".to_string()]);
         matrix.record_result(ScenarioResult {
-            scenario_id: "req1".to_string(), verdict: ScenarioVerdict::Pass,
-            duration_us: 100, failure_message: None, artifacts: vec![],
+            scenario_id: "req1".to_string(),
+            verdict: ScenarioVerdict::Pass,
+            duration_us: 100,
+            failure_message: None,
+            artifacts: vec![],
         });
         assert!(matrix.missing_required().is_empty());
     }
@@ -27910,13 +28763,17 @@ mod tests {
     fn test_matrix_all_artifacts() {
         let mut matrix = ValidationMatrix::new();
         matrix.record_result(ScenarioResult {
-            scenario_id: "s1".to_string(), verdict: ScenarioVerdict::Pass,
-            duration_us: 100, failure_message: None,
+            scenario_id: "s1".to_string(),
+            verdict: ScenarioVerdict::Pass,
+            duration_us: 100,
+            failure_message: None,
             artifacts: vec!["a.json".to_string()],
         });
         matrix.record_result(ScenarioResult {
-            scenario_id: "s2".to_string(), verdict: ScenarioVerdict::Pass,
-            duration_us: 200, failure_message: None,
+            scenario_id: "s2".to_string(),
+            verdict: ScenarioVerdict::Pass,
+            duration_us: 200,
+            failure_message: None,
             artifacts: vec!["b.json".to_string(), "c.json".to_string()],
         });
         assert_eq!(matrix.all_artifacts().len(), 3);
@@ -27924,7 +28781,10 @@ mod tests {
 
     #[test]
     fn test_matrix_to_invariant_domain() {
-        assert_eq!(ValidationMatrix::to_invariant_domain(), InvariantDomain::Composition);
+        assert_eq!(
+            ValidationMatrix::to_invariant_domain(),
+            InvariantDomain::Composition
+        );
     }
 
     // ── F5: Input-to-Paint QoE Guardrail Lane ──
@@ -27939,7 +28799,12 @@ mod tests {
 
     #[test]
     fn test_qoe_metric_serde() {
-        for m in [QoEMetric::InputToPaint, QoEMetric::FrameJitter, QoEMetric::Smoothness, QoEMetric::KeystrokeEcho] {
+        for m in [
+            QoEMetric::InputToPaint,
+            QoEMetric::FrameJitter,
+            QoEMetric::Smoothness,
+            QoEMetric::KeystrokeEcho,
+        ] {
             let json = serde_json::to_string(&m).unwrap();
             let back: QoEMetric = serde_json::from_str(&json).unwrap();
             assert_eq!(back, m);
@@ -27990,17 +28855,29 @@ mod tests {
     #[test]
     fn test_qoe_guardrail_record() {
         let mut guard = QoEGuardrail::new(QoEGuardrailConfig::default());
-        guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10000.0, timestamp_us: 1 });
+        guard.record(QoEMeasurement {
+            metric: QoEMetric::InputToPaint,
+            value: 10000.0,
+            timestamp_us: 1,
+        });
         assert_eq!(guard.total_measurements(), 1);
         assert_eq!(guard.window_len(QoEMetric::InputToPaint), 1);
     }
 
     #[test]
     fn test_qoe_guardrail_window_eviction() {
-        let cfg = QoEGuardrailConfig { window_size: 3, min_samples: 1, ..Default::default() };
+        let cfg = QoEGuardrailConfig {
+            window_size: 3,
+            min_samples: 1,
+            ..Default::default()
+        };
         let mut guard = QoEGuardrail::new(cfg);
         for i in 0..5 {
-            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: i as f64, timestamp_us: i });
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: i as f64,
+                timestamp_us: i,
+            });
         }
         assert_eq!(guard.window_len(QoEMetric::InputToPaint), 3);
     }
@@ -28028,7 +28905,11 @@ mod tests {
         let mut guard = QoEGuardrail::new(cfg);
         // Add 10 samples all under the target.
         for i in 0..10 {
-            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10_000.0, timestamp_us: i });
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: 10_000.0,
+                timestamp_us: i,
+            });
         }
         let verdict = guard.evaluate_slo(&guard.config().slos[0].clone());
         assert!(matches!(verdict, SLOVerdict::Met { .. }));
@@ -28049,7 +28930,11 @@ mod tests {
         let mut guard = QoEGuardrail::new(cfg);
         // Add samples above target.
         for i in 0..10 {
-            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 20_000.0, timestamp_us: i });
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: 20_000.0,
+                timestamp_us: i,
+            });
         }
         let verdict = guard.evaluate_slo(&guard.config().slos[0].clone());
         assert!(matches!(verdict, SLOVerdict::Breached { .. }));
@@ -28069,7 +28954,11 @@ mod tests {
         };
         let mut guard = QoEGuardrail::new(cfg);
         for i in 0..10 {
-            guard.record(QoEMeasurement { metric: QoEMetric::Smoothness, value: 0.95, timestamp_us: i });
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::Smoothness,
+                value: 0.95,
+                timestamp_us: i,
+            });
         }
         let verdict = guard.evaluate_slo(&guard.config().slos[0].clone());
         assert!(matches!(verdict, SLOVerdict::Met { .. }));
@@ -28077,9 +28966,16 @@ mod tests {
 
     #[test]
     fn test_qoe_snapshot() {
-        let cfg = QoEGuardrailConfig { min_samples: 1, ..Default::default() };
+        let cfg = QoEGuardrailConfig {
+            min_samples: 1,
+            ..Default::default()
+        };
         let mut guard = QoEGuardrail::new(cfg);
-        guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10000.0, timestamp_us: 1 });
+        guard.record(QoEMeasurement {
+            metric: QoEMetric::InputToPaint,
+            value: 10000.0,
+            timestamp_us: 1,
+        });
         let snap = guard.snapshot();
         assert_eq!(snap.total_measurements, 1);
     }
@@ -28087,7 +28983,13 @@ mod tests {
     #[test]
     fn test_qoe_snapshot_serde() {
         let snap = QoEGuardrailSnapshot {
-            verdicts: vec![(QoEMetric::InputToPaint, SLOVerdict::Met { measured: 10.0, target: 20.0 })],
+            verdicts: vec![(
+                QoEMetric::InputToPaint,
+                SLOVerdict::Met {
+                    measured: 10.0,
+                    target: 20.0,
+                },
+            )],
             total_measurements: 100,
             breach_count: 0,
         };
@@ -28117,7 +29019,11 @@ mod tests {
         };
         let mut guard = QoEGuardrail::new(cfg);
         for i in 0..10 {
-            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10000.0, timestamp_us: i });
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: 10000.0,
+                timestamp_us: i,
+            });
         }
         assert_eq!(guard.detect_degradation(), QoEDegradation::Healthy);
     }
@@ -28136,7 +29042,11 @@ mod tests {
         };
         let mut guard = QoEGuardrail::new(cfg);
         for i in 0..10 {
-            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 20000.0, timestamp_us: i });
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: 20000.0,
+                timestamp_us: i,
+            });
         }
         let deg = guard.detect_degradation();
         assert!(matches!(deg, QoEDegradation::SLOBreach { .. }));
@@ -28145,8 +29055,14 @@ mod tests {
     #[test]
     fn test_qoe_degradation_display() {
         assert_eq!(QoEDegradation::Healthy.to_string(), "healthy");
-        assert_eq!(QoEDegradation::SLOBreach { breach_count: 2 }.to_string(), "slo-breach(2)");
-        assert_eq!(QoEDegradation::WarmingUp { samples: 5 }.to_string(), "warming-up(5)");
+        assert_eq!(
+            QoEDegradation::SLOBreach { breach_count: 2 }.to_string(),
+            "slo-breach(2)"
+        );
+        assert_eq!(
+            QoEDegradation::WarmingUp { samples: 5 }.to_string(),
+            "warming-up(5)"
+        );
     }
 
     #[test]
@@ -28165,17 +29081,47 @@ mod tests {
 
     #[test]
     fn test_qoe_slo_verdict_display() {
-        assert_eq!(SLOVerdict::Met { measured: 10.0, target: 20.0 }.to_string(), "met(10.0/20.0)");
-        assert_eq!(SLOVerdict::Breached { measured: 30.0, target: 20.0 }.to_string(), "breached(30.0/20.0)");
-        assert_eq!(SLOVerdict::InsufficientData { samples: 5, required: 30 }.to_string(), "insufficient(5/30)");
+        assert_eq!(
+            SLOVerdict::Met {
+                measured: 10.0,
+                target: 20.0
+            }
+            .to_string(),
+            "met(10.0/20.0)"
+        );
+        assert_eq!(
+            SLOVerdict::Breached {
+                measured: 30.0,
+                target: 20.0
+            }
+            .to_string(),
+            "breached(30.0/20.0)"
+        );
+        assert_eq!(
+            SLOVerdict::InsufficientData {
+                samples: 5,
+                required: 30
+            }
+            .to_string(),
+            "insufficient(5/30)"
+        );
     }
 
     #[test]
     fn test_qoe_slo_verdict_serde() {
         let cases = vec![
-            SLOVerdict::Met { measured: 10.0, target: 20.0 },
-            SLOVerdict::Breached { measured: 30.0, target: 20.0 },
-            SLOVerdict::InsufficientData { samples: 5, required: 30 },
+            SLOVerdict::Met {
+                measured: 10.0,
+                target: 20.0,
+            },
+            SLOVerdict::Breached {
+                measured: 30.0,
+                target: 20.0,
+            },
+            SLOVerdict::InsufficientData {
+                samples: 5,
+                required: 30,
+            },
         ];
         for v in cases {
             let json = serde_json::to_string(&v).unwrap();
@@ -28207,7 +29153,11 @@ mod tests {
     #[test]
     fn test_qoe_reset() {
         let mut guard = QoEGuardrail::new(QoEGuardrailConfig::default());
-        guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10000.0, timestamp_us: 1 });
+        guard.record(QoEMeasurement {
+            metric: QoEMetric::InputToPaint,
+            value: 10000.0,
+            timestamp_us: 1,
+        });
         guard.reset();
         assert_eq!(guard.total_measurements(), 0);
         assert_eq!(guard.window_len(QoEMetric::InputToPaint), 0);
@@ -28215,14 +29165,20 @@ mod tests {
 
     #[test]
     fn test_qoe_config_accessor() {
-        let cfg = QoEGuardrailConfig { min_samples: 42, ..Default::default() };
+        let cfg = QoEGuardrailConfig {
+            min_samples: 42,
+            ..Default::default()
+        };
         let guard = QoEGuardrail::new(cfg.clone());
         assert_eq!(*guard.config(), cfg);
     }
 
     #[test]
     fn test_qoe_to_invariant_domain() {
-        assert_eq!(QoEGuardrail::to_invariant_domain(), InvariantDomain::Composition);
+        assert_eq!(
+            QoEGuardrail::to_invariant_domain(),
+            InvariantDomain::Composition
+        );
     }
 
     // ── F5 Impl: Bridge method tests ──
@@ -28237,16 +29193,34 @@ mod tests {
     fn test_qoe_met_and_breach_count() {
         let cfg = QoEGuardrailConfig {
             slos: vec![
-                QoESLO { metric: QoEMetric::InputToPaint, target: 20_000.0, percentile: 0.95, description: "x".to_string() },
-                QoESLO { metric: QoEMetric::FrameJitter, target: 100.0, percentile: 0.95, description: "y".to_string() },
+                QoESLO {
+                    metric: QoEMetric::InputToPaint,
+                    target: 20_000.0,
+                    percentile: 0.95,
+                    description: "x".to_string(),
+                },
+                QoESLO {
+                    metric: QoEMetric::FrameJitter,
+                    target: 100.0,
+                    percentile: 0.95,
+                    description: "y".to_string(),
+                },
             ],
             window_size: 100,
             min_samples: 5,
         };
         let mut guard = QoEGuardrail::new(cfg);
         for i in 0..10 {
-            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10_000.0, timestamp_us: i });
-            guard.record(QoEMeasurement { metric: QoEMetric::FrameJitter, value: 5_000.0, timestamp_us: i });
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: 10_000.0,
+                timestamp_us: i,
+            });
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::FrameJitter,
+                value: 5_000.0,
+                timestamp_us: i,
+            });
         }
         assert_eq!(guard.met_count(), 1); // InputToPaint met.
         assert_eq!(guard.breach_count(), 1); // FrameJitter breached.
@@ -28256,23 +29230,44 @@ mod tests {
     fn test_qoe_compliance_rate() {
         let cfg = QoEGuardrailConfig {
             slos: vec![
-                QoESLO { metric: QoEMetric::InputToPaint, target: 20_000.0, percentile: 0.95, description: "x".to_string() },
-                QoESLO { metric: QoEMetric::FrameJitter, target: 100.0, percentile: 0.95, description: "y".to_string() },
+                QoESLO {
+                    metric: QoEMetric::InputToPaint,
+                    target: 20_000.0,
+                    percentile: 0.95,
+                    description: "x".to_string(),
+                },
+                QoESLO {
+                    metric: QoEMetric::FrameJitter,
+                    target: 100.0,
+                    percentile: 0.95,
+                    description: "y".to_string(),
+                },
             ],
             window_size: 100,
             min_samples: 5,
         };
         let mut guard = QoEGuardrail::new(cfg);
         for i in 0..10 {
-            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10_000.0, timestamp_us: i });
-            guard.record(QoEMeasurement { metric: QoEMetric::FrameJitter, value: 5_000.0, timestamp_us: i });
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: 10_000.0,
+                timestamp_us: i,
+            });
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::FrameJitter,
+                value: 5_000.0,
+                timestamp_us: i,
+            });
         }
         assert!((guard.compliance_rate() - 0.5).abs() < 0.01);
     }
 
     #[test]
     fn test_qoe_record_batch() {
-        let cfg = QoEGuardrailConfig { min_samples: 1, ..Default::default() };
+        let cfg = QoEGuardrailConfig {
+            min_samples: 1,
+            ..Default::default()
+        };
         let mut guard = QoEGuardrail::new(cfg);
         guard.record_batch(QoEMetric::InputToPaint, &[100.0, 200.0, 300.0], 1000);
         assert_eq!(guard.total_measurements(), 3);
@@ -28281,10 +29276,18 @@ mod tests {
 
     #[test]
     fn test_qoe_current_percentile() {
-        let cfg = QoEGuardrailConfig { min_samples: 5, window_size: 100, ..Default::default() };
+        let cfg = QoEGuardrailConfig {
+            min_samples: 5,
+            window_size: 100,
+            ..Default::default()
+        };
         let mut guard = QoEGuardrail::new(cfg);
         // Not enough data.
-        assert!(guard.current_percentile(QoEMetric::InputToPaint, 0.50).is_none());
+        assert!(
+            guard
+                .current_percentile(QoEMetric::InputToPaint, 0.50)
+                .is_none()
+        );
         for i in 0..10 {
             guard.record(QoEMeasurement {
                 metric: QoEMetric::InputToPaint,
@@ -28292,7 +29295,9 @@ mod tests {
                 timestamp_us: i,
             });
         }
-        let p50 = guard.current_percentile(QoEMetric::InputToPaint, 0.50).unwrap();
+        let p50 = guard
+            .current_percentile(QoEMetric::InputToPaint, 0.50)
+            .unwrap();
         assert!(p50 > 0.0);
     }
 
@@ -28312,7 +29317,11 @@ mod tests {
         // Insufficient data — no breach → all_slos_met.
         assert!(guard.all_slos_met());
         for i in 0..10 {
-            guard.record(QoEMeasurement { metric: QoEMetric::InputToPaint, value: 10_000.0, timestamp_us: i });
+            guard.record(QoEMeasurement {
+                metric: QoEMetric::InputToPaint,
+                value: 10_000.0,
+                timestamp_us: i,
+            });
         }
         assert!(guard.all_slos_met());
     }

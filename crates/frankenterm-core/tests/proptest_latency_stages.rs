@@ -2236,7 +2236,7 @@ proptest! {
 
         let count = num_waiters.min(waiter_priorities.len());
         let mut max_pri = Priority::Background;
-        let mut max_id = String::new();
+        let mut _max_id = String::new();
 
         for i in 0..count {
             let pri = priorities[waiter_priorities[i] as usize];
@@ -2244,7 +2244,7 @@ proptest! {
             tracker.acquire(Resource::PatternLock, &wid, pri, (i as u64 + 1) * 100);
             if pri >= max_pri {
                 max_pri = pri;
-                max_id = wid;
+                _max_id = wid;
             }
         }
 

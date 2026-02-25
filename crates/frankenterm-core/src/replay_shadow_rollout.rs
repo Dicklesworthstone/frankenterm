@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::replay_ci_gate::{GateId, GateReport, GateStatus, ALL_GATES};
+use crate::replay_ci_gate::{GateId, GateReport, GateStatus};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -122,7 +122,7 @@ impl RolloutConfig {
 
 // ── Enforcement Decision ─────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementDecision {
     pub gate: GateId,
     pub gate_status: GateStatus,
@@ -147,8 +147,8 @@ pub fn evaluate_enforcement(
     report: &GateReport,
     kill_switch_env: Option<&str>,
 ) -> EnforcementDecision {
-    let kill_switch_active = config.kill_switch
-        || RolloutConfig::is_enforcement_disabled_by_env(kill_switch_env);
+    let kill_switch_active =
+        config.kill_switch || RolloutConfig::is_enforcement_disabled_by_env(kill_switch_env);
 
     if kill_switch_active {
         return EnforcementDecision {
@@ -171,7 +171,10 @@ pub fn evaluate_enforcement(
     };
 
     let reason = if !enforced {
-        format!("{} in shadow mode — results informational only", report.gate.display_name())
+        format!(
+            "{} in shadow mode — results informational only",
+            report.gate.display_name()
+        )
     } else if pr_blocked {
         format!("{} failed — PR blocked", report.gate.display_name())
     } else {
@@ -190,7 +193,7 @@ pub fn evaluate_enforcement(
 
 // ── Flaky Detection ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlakyTestRecord {
     pub check_name: String,
     pub gate: GateId,
@@ -249,7 +252,7 @@ pub fn calculate_flaky_rate(
 
 // ── Rollback Trigger ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RollbackTrigger {
     pub triggered: bool,
     pub reasons: Vec<String>,
@@ -292,7 +295,7 @@ pub fn evaluate_rollback_triggers(
 
 // ── Rollback Drill ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrillResult {
     pub drill_type: DrillType,
     pub executed_at: String,
@@ -308,7 +311,7 @@ pub enum DrillType {
     Recovery,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrillStep {
     pub name: String,
     pub passed: bool,
@@ -394,8 +397,14 @@ pub fn weekly_digest(metrics: &RolloutMetrics) -> String {
     }
     lines.push(String::new());
 
-    lines.push(format!("### Flaky Rate: {:.1}%", metrics.flaky_rate * 100.0));
-    lines.push(format!("### Artifacts in Library: {}", metrics.artifact_count));
+    lines.push(format!(
+        "### Flaky Rate: {:.1}%",
+        metrics.flaky_rate * 100.0
+    ));
+    lines.push(format!(
+        "### Artifacts in Library: {}",
+        metrics.artifact_count
+    ));
 
     lines.join("\n")
 }
@@ -405,33 +414,47 @@ pub fn weekly_digest(metrics: &RolloutMetrics) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replay_ci_gate::{GateCheck, ALL_GATES};
+    use crate::replay_ci_gate::{ALL_GATES, GateCheck};
 
     fn make_pass_report(gate: GateId) -> GateReport {
-        GateReport::new(gate, vec![GateCheck {
-            name: "ok".into(),
-            passed: true,
-            message: "pass".into(),
-            duration_ms: None,
-            artifact_path: None,
-        }], 100, "2026-01-01T00:00:00Z".into())
+        GateReport::new(
+            gate,
+            vec![GateCheck {
+                name: "ok".into(),
+                passed: true,
+                message: "pass".into(),
+                duration_ms: None,
+                artifact_path: None,
+            }],
+            100,
+            "2026-01-01T00:00:00Z".into(),
+        )
     }
 
     fn make_fail_report(gate: GateId) -> GateReport {
-        GateReport::new(gate, vec![GateCheck {
-            name: "bad".into(),
-            passed: false,
-            message: "fail".into(),
-            duration_ms: None,
-            artifact_path: None,
-        }], 200, "2026-01-01T00:00:00Z".into())
+        GateReport::new(
+            gate,
+            vec![GateCheck {
+                name: "bad".into(),
+                passed: false,
+                message: "fail".into(),
+                duration_ms: None,
+                artifact_path: None,
+            }],
+            200,
+            "2026-01-01T00:00:00Z".into(),
+        )
     }
 
     // ── Rollout Stage ────────────────────────────────────────────────────
 
     #[test]
     fn stage_str_roundtrip() {
-        for stage in &[RolloutStage::Shadow, RolloutStage::Partial, RolloutStage::Full] {
+        for stage in &[
+            RolloutStage::Shadow,
+            RolloutStage::Partial,
+            RolloutStage::Full,
+        ] {
             let s = stage.as_str();
             let parsed = RolloutStage::from_str_stage(s);
             assert_eq!(parsed, Some(*stage));
@@ -510,7 +533,10 @@ mod tests {
 
     #[test]
     fn shadow_mode_fail_not_blocked() {
-        let config = RolloutConfig { stage: RolloutStage::Shadow, ..Default::default() };
+        let config = RolloutConfig {
+            stage: RolloutStage::Shadow,
+            ..Default::default()
+        };
         let report = make_fail_report(GateId::Smoke);
         let decision = evaluate_enforcement(&config, &report, None);
         assert!(!decision.pr_blocked);
@@ -520,7 +546,10 @@ mod tests {
 
     #[test]
     fn enforce_mode_fail_blocked() {
-        let config = RolloutConfig { stage: RolloutStage::Full, ..Default::default() };
+        let config = RolloutConfig {
+            stage: RolloutStage::Full,
+            ..Default::default()
+        };
         let report = make_fail_report(GateId::Smoke);
         let decision = evaluate_enforcement(&config, &report, None);
         assert!(decision.pr_blocked);
@@ -530,7 +559,10 @@ mod tests {
 
     #[test]
     fn enforce_mode_pass_not_blocked() {
-        let config = RolloutConfig { stage: RolloutStage::Full, ..Default::default() };
+        let config = RolloutConfig {
+            stage: RolloutStage::Full,
+            ..Default::default()
+        };
         let report = make_pass_report(GateId::Smoke);
         let decision = evaluate_enforcement(&config, &report, None);
         assert!(!decision.pr_blocked);
@@ -539,7 +571,11 @@ mod tests {
 
     #[test]
     fn kill_switch_overrides_enforcement() {
-        let config = RolloutConfig { stage: RolloutStage::Full, kill_switch: true, ..Default::default() };
+        let config = RolloutConfig {
+            stage: RolloutStage::Full,
+            kill_switch: true,
+            ..Default::default()
+        };
         let report = make_fail_report(GateId::Smoke);
         let decision = evaluate_enforcement(&config, &report, None);
         assert!(!decision.pr_blocked);
@@ -549,7 +585,10 @@ mod tests {
 
     #[test]
     fn kill_switch_env_overrides() {
-        let config = RolloutConfig { stage: RolloutStage::Full, ..Default::default() };
+        let config = RolloutConfig {
+            stage: RolloutStage::Full,
+            ..Default::default()
+        };
         let report = make_fail_report(GateId::Smoke);
         let decision = evaluate_enforcement(&config, &report, Some("false"));
         assert!(!decision.pr_blocked);
@@ -558,7 +597,10 @@ mod tests {
 
     #[test]
     fn partial_stage_gate3_shadow() {
-        let config = RolloutConfig { stage: RolloutStage::Partial, ..Default::default() };
+        let config = RolloutConfig {
+            stage: RolloutStage::Partial,
+            ..Default::default()
+        };
         let report = make_fail_report(GateId::Regression);
         let decision = evaluate_enforcement(&config, &report, None);
         assert!(!decision.pr_blocked); // Gate 3 is shadow in partial
@@ -568,7 +610,10 @@ mod tests {
 
     #[test]
     fn partial_stage_gate1_enforced() {
-        let config = RolloutConfig { stage: RolloutStage::Partial, ..Default::default() };
+        let config = RolloutConfig {
+            stage: RolloutStage::Partial,
+            ..Default::default()
+        };
         let report = make_fail_report(GateId::Smoke);
         let decision = evaluate_enforcement(&config, &report, None);
         assert!(decision.pr_blocked);
@@ -577,7 +622,10 @@ mod tests {
 
     #[test]
     fn enforcement_decision_serde_roundtrip() {
-        let config = RolloutConfig { stage: RolloutStage::Full, ..Default::default() };
+        let config = RolloutConfig {
+            stage: RolloutStage::Full,
+            ..Default::default()
+        };
         let report = make_fail_report(GateId::Smoke);
         let decision = evaluate_enforcement(&config, &report, None);
         let json = serde_json::to_string(&decision).unwrap();
@@ -623,9 +671,7 @@ mod tests {
     fn rollback_no_triggers() {
         let config = RolloutConfig::default();
         let flaky = calculate_flaky_rate(100, 1, &config, vec![]);
-        let durations = BTreeMap::from([
-            ("smoke".into(), (25u64, 30u64)),
-        ]);
+        let durations = BTreeMap::from([("smoke".into(), (25u64, 30u64))]);
         let trigger = evaluate_rollback_triggers(&flaky, &durations, &config);
         assert!(!trigger.triggered);
         assert!(trigger.reasons.is_empty());
@@ -657,9 +703,7 @@ mod tests {
     fn rollback_both_triggers() {
         let config = RolloutConfig::default();
         let flaky = calculate_flaky_rate(100, 10, &config, vec![]);
-        let durations = BTreeMap::from([
-            ("smoke".into(), (70u64, 30u64)),
-        ]);
+        let durations = BTreeMap::from([("smoke".into(), (70u64, 30u64))]);
         let trigger = evaluate_rollback_triggers(&flaky, &durations, &config);
         assert!(trigger.triggered);
         assert_eq!(trigger.reasons.len(), 2);
@@ -760,7 +804,11 @@ mod tests {
 
     #[test]
     fn alert_level_serde() {
-        for level in &[AlertLevel::Normal, AlertLevel::Warning, AlertLevel::Critical] {
+        for level in &[
+            AlertLevel::Normal,
+            AlertLevel::Warning,
+            AlertLevel::Critical,
+        ] {
             let json = serde_json::to_string(level).unwrap();
             let restored: AlertLevel = serde_json::from_str(&json).unwrap();
             assert_eq!(&restored, level);

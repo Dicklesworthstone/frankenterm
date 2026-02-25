@@ -6,19 +6,14 @@
 use std::collections::BTreeMap;
 
 use frankenterm_core::replay_counterfactual::{
-    OverridePackageLoader, OverrideApplicator, LookupResult,
-    OverrideManifest,
+    LookupResult, OverrideApplicator, OverrideManifest, OverridePackageLoader,
 };
-use frankenterm_core::replay_fault_injection::{
-    FaultInjector, FaultPresets, SimEvent,
+use frankenterm_core::replay_fault_injection::{FaultInjector, FaultPresets, SimEvent};
+use frankenterm_core::replay_guardrails::{
+    CheckResult, ConcurrencyGate, GuardrailReport, ResourceLimits, ResourceTracker, SimulationGuard,
 };
 use frankenterm_core::replay_scenario_matrix::{
-    MatrixConfig, ScenarioMatrixRunner, DiffSummary,
-    ArtifactEntry, OverrideEntry, RunnerConfig,
-};
-use frankenterm_core::replay_guardrails::{
-    ResourceLimits, ResourceTracker, CheckResult, SimulationGuard,
-    ConcurrencyGate, GuardrailReport,
+    ArtifactEntry, DiffSummary, MatrixConfig, OverrideEntry, RunnerConfig, ScenarioMatrixRunner,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -71,12 +66,10 @@ fn sample_matrix_config() -> MatrixConfig {
                 label: "trace-b".into(),
             },
         ],
-        overrides: vec![
-            OverrideEntry {
-                path: "overrides/1.toml".into(),
-                label: "override-1".into(),
-            },
-        ],
+        overrides: vec![OverrideEntry {
+            path: "overrides/1.toml".into(),
+            label: "override-1".into(),
+        }],
         config: RunnerConfig::default(),
     }
 }
@@ -153,7 +146,10 @@ fn scenario_override_substitution_tracking() {
     let _ = applicator.lookup_pattern("warning_pattern", Some("another_hash"));
 
     let subs = applicator.substitutions();
-    assert!(subs.len() >= 2, "Should track substitutions for looked-up patterns");
+    assert!(
+        subs.len() >= 2,
+        "Should track substitutions for looked-up patterns"
+    );
 }
 
 // ── Scenario 2: Fault-only (pane_death fault, graceful degradation) ─────────
@@ -166,7 +162,10 @@ fn scenario_fault_only_pane_death_graceful() {
     // Process events before pane death timestamp
     let pre_death = make_event("pane-42", "output", 3000, 1, "normal output");
     let result = injector.process(pre_death);
-    assert!(!result.is_empty(), "Events before death should pass through");
+    assert!(
+        !result.is_empty(),
+        "Events before death should pass through"
+    );
 
     // Process events after pane death timestamp
     let post_death = make_event("pane-42", "output", 6000, 2, "post-death output");
@@ -201,7 +200,10 @@ fn scenario_fault_clock_skew_effects() {
 
     let processed = injector.process_batch(events);
     // Clock skew may modify timestamps or inject delays
-    assert!(!processed.is_empty(), "Some events should survive clock skew");
+    assert!(
+        !processed.is_empty(),
+        "Some events should survive clock skew"
+    );
 
     let log = injector.into_log();
     let by_type = log.count_by_type();
@@ -231,10 +233,13 @@ fn scenario_combined_override_and_fault() {
     // Step 4: Verify override applicator works in conjunction
     let overridden = applicator.lookup_pattern("error_pattern", None);
     let is_replace = matches!(overridden, LookupResult::Replace { .. });
-    assert!(is_replace, "Override lookup should still work alongside fault injection");
+    assert!(
+        is_replace,
+        "Override lookup should still work alongside fault injection"
+    );
 
     // Step 5: Both systems can operate independently
-    let fault_log = injector.into_log();
+    let _fault_log = injector.into_log();
     let all_ids = pkg.all_ids();
     assert!(
         !all_ids.is_empty(),
@@ -275,7 +280,10 @@ fn scenario_matrix_baseline_identical() {
     let baseline = mock_decision_generator("trace-a", None).unwrap();
     let candidate = mock_decision_generator("trace-a", None).unwrap();
     let diff = DiffSummary::compute(&baseline, &candidate);
-    assert!(diff.is_identical(), "Same generator with same args should be identical");
+    assert!(
+        diff.is_identical(),
+        "Same generator with same args should be identical"
+    );
     assert_eq!(diff.divergence_count(), 0);
 }
 
@@ -284,7 +292,10 @@ fn scenario_matrix_divergence_detected() {
     let baseline = mock_decision_generator("trace-a", None).unwrap();
     let candidate = mock_decision_generator("trace-a", Some("override-x")).unwrap();
     let diff = DiffSummary::compute(&baseline, &candidate);
-    assert!(!diff.is_identical(), "Override should produce different decisions");
+    assert!(
+        !diff.is_identical(),
+        "Override should produce different decisions"
+    );
     assert!(diff.divergence_count() > 0);
 }
 
@@ -388,7 +399,10 @@ fn scenario_matrix_with_guardrails() {
     });
 
     let is_halted = tracker.is_halted();
-    assert!(!is_halted, "Guardrails should not trigger for normal matrix");
+    assert!(
+        !is_halted,
+        "Guardrails should not trigger for normal matrix"
+    );
 
     let report = GuardrailReport::from_tracker(&tracker, true);
     assert!(report.is_safe());

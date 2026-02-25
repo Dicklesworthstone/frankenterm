@@ -160,7 +160,7 @@ impl RateLimitTracker {
             rule_id,
             retry_after_text,
             Instant::now(),
-        )
+        );
     }
 
     /// Record a rate limit event with an explicit timestamp (for testing).

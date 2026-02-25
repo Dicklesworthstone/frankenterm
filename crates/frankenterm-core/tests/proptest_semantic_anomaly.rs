@@ -48,8 +48,8 @@
 //! 43. dot_product_simd: matches naive for 384d vectors (embedding dimension isomorphism)
 //! 44. ConformalAnomalyDetector: FDR on fixture embeddings stays within alpha bound
 
-use proptest::prelude::*;
 use proptest::collection::vec as arb_vec;
+use proptest::prelude::*;
 
 use frankenterm_core::semantic_anomaly::{
     ConformalAnomalyConfig, ConformalAnomalyDetector, ConformalAnomalySnapshot, ConformalShock,
@@ -66,7 +66,7 @@ fn arb_f32_finite() -> impl Strategy<Value = f32> {
     -1e6_f32..1e6
 }
 
-fn arb_vector(dim: usize) -> impl Strategy<Value = Vec<f32>> {
+fn _arb_vector(dim: usize) -> impl Strategy<Value = Vec<f32>> {
     arb_vec(arb_f32_finite(), dim..=dim)
 }
 
@@ -575,11 +575,11 @@ proptest! {
     ) {
         let config = ConformalAnomalyConfig::default();
         let mut det = ConformalAnomalyDetector::new(config);
-        let v1: Vec<f32> = (0..dim1).map(|i| (i as f32 + 1.0)).collect();
+        let v1: Vec<f32> = (0..dim1).map(|i| i as f32 + 1.0).collect();
         for _ in 0..10 {
             det.observe(&v1);
         }
-        let v2: Vec<f32> = (0..dim2).map(|i| (i as f32 + 1.0)).collect();
+        let v2: Vec<f32> = (0..dim2).map(|i| i as f32 + 1.0).collect();
         let result = det.observe(&v2);
         if dim1 != dim2 {
             // Dimension change resets → no anomaly.

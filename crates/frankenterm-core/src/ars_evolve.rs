@@ -34,7 +34,7 @@ use crate::ars_fst::ReflexId;
 // =============================================================================
 
 /// A versioned reflex record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReflexVersion {
     /// Unique reflex ID.
     pub reflex_id: ReflexId,
@@ -121,7 +121,7 @@ pub struct EvolutionRequest {
 }
 
 /// Result of an evolution attempt.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvolutionResult {
     /// Successfully evolved.
     Evolved {

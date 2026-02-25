@@ -16,11 +16,10 @@
 //! - Missing input treated as failure
 
 use frankenterm_core::plan::{
-    execute_compensation_phase, execute_commit_phase, MissionActorRole,
-    MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction,
-    TxCompensation, TxCompensationOutcome, TxCompensationReport,
-    TxCompensationStepInput, TxCompensationStepOutcome, TxCompensationStepResult,
-    TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxReceipt, TxStep, TxStepId,
+    MissionActorRole, MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction,
+    TxCompensation, TxCompensationOutcome, TxCompensationReport, TxCompensationStepInput,
+    TxCompensationStepOutcome, TxCompensationStepResult, TxId, TxIntent, TxOutcome, TxPlan,
+    TxPlanId, TxStep, TxStepId, execute_commit_phase, execute_compensation_phase,
 };
 use proptest::prelude::*;
 
@@ -144,15 +143,26 @@ fn get_commit_report(num_steps: usize) -> frankenterm_core::plan::TxCommitReport
 }
 
 /// Get a commit report where first `fail_at` step fails (partial commit).
-fn get_partial_commit_report(num_steps: usize, fail_at: usize) -> frankenterm_core::plan::TxCommitReport {
+fn get_partial_commit_report(
+    num_steps: usize,
+    fail_at: usize,
+) -> frankenterm_core::plan::TxCommitReport {
     let mut contract = make_contract_with_compensations(num_steps);
     contract.lifecycle_state = MissionTxState::Prepared;
     let commit_inputs: Vec<_> = (1..=num_steps)
         .map(|i| frankenterm_core::plan::TxCommitStepInput {
             step_id: TxStepId(format!("s{i}")),
             success: i != fail_at,
-            reason_code: if i == fail_at { "err".into() } else { "ok".into() },
-            error_code: if i == fail_at { Some("FTX9999".into()) } else { None },
+            reason_code: if i == fail_at {
+                "err".into()
+            } else {
+                "ok".into()
+            },
+            error_code: if i == fail_at {
+                Some("FTX9999".into())
+            } else {
+                None
+            },
             completed_at_ms: (i as i64 + 1) * 1000,
         })
         .collect();
@@ -183,8 +193,16 @@ fn comp_inputs_with_failure_at(num_steps: usize, fail_at: usize) -> Vec<TxCompen
         .map(|i| TxCompensationStepInput {
             for_step_id: TxStepId(format!("s{i}")),
             success: i != fail_at,
-            reason_code: if i == fail_at { "undo_error".into() } else { "undone".into() },
-            error_code: if i == fail_at { Some("FTX2099".into()) } else { None },
+            reason_code: if i == fail_at {
+                "undo_error".into()
+            } else {
+                "undone".into()
+            },
+            error_code: if i == fail_at {
+                Some("FTX2099".into())
+            } else {
+                None
+            },
             completed_at_ms: (i as i64 + 10) * 1000,
         })
         .collect()

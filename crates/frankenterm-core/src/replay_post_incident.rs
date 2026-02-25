@@ -59,7 +59,7 @@ pub const ALL_STEPS: [PipelineStep; 5] = [
 
 // ── Pipeline Input ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostIncidentInput {
     pub incident_id: String,
     pub recording_path: String,
@@ -93,7 +93,7 @@ pub fn validate_input(input: &PostIncidentInput) -> Result<(), String> {
 
 // ── Pipeline Step Result ─────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepResult {
     pub step: PipelineStep,
     pub success: bool,
@@ -107,7 +107,7 @@ pub struct StepResult {
 
 // ── Pipeline Result ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PipelineResult {
     pub incident_id: String,
     pub success: bool,
@@ -124,18 +124,12 @@ impl PipelineResult {
     pub fn from_steps(incident_id: String, steps: Vec<StepResult>) -> Self {
         let success = steps.iter().all(|s| s.success);
         let total_duration_ms = steps.iter().map(|s| s.duration_ms).sum();
-        let artifact_path = steps
-            .iter()
-            .rev()
-            .find_map(|s| s.artifact_path.clone());
+        let artifact_path = steps.iter().rev().find_map(|s| s.artifact_path.clone());
         let bead_id = steps.iter().rev().find_map(|s| s.bead_id.clone());
         let error = if success {
             None
         } else {
-            steps
-                .iter()
-                .find(|s| !s.success)
-                .map(|s| s.message.clone())
+            steps.iter().find(|s| !s.success).map(|s| s.message.clone())
         };
 
         Self {
@@ -173,7 +167,11 @@ pub fn execute_pipeline(input: &PostIncidentInput) -> PipelineResult {
     let artifact_path = format!(
         "evidence/incidents/{}/{}",
         input.incident_id,
-        input.recording_path.rsplit('/').next().unwrap_or(&input.recording_path)
+        input
+            .recording_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&input.recording_path)
     );
     let bead_id = format!("incident-{}", input.incident_id);
 
@@ -225,7 +223,7 @@ pub fn execute_pipeline(input: &PostIncidentInput) -> PipelineResult {
 
 // ── Incident Corpus ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncidentCorpusEntry {
     pub incident_id: String,
     pub artifact_path: Option<String>,
@@ -242,7 +240,7 @@ pub enum IncidentCoverageStatus {
     Missing,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncidentCorpus {
     pub version: String,
     pub entries: BTreeMap<String, IncidentCorpusEntry>,
@@ -507,10 +505,7 @@ mod tests {
     fn corpus_register_and_query() {
         let mut corpus = IncidentCorpus::new();
         corpus.register("INC-001", "/path/artifact.ftreplay", "bead-001");
-        assert_eq!(
-            corpus.coverage("INC-001"),
-            IncidentCoverageStatus::Covered
-        );
+        assert_eq!(corpus.coverage("INC-001"), IncidentCoverageStatus::Covered);
         assert_eq!(corpus.covered_count(), 1);
     }
 
@@ -555,15 +550,9 @@ mod tests {
     fn corpus_register_overwrites_gap() {
         let mut corpus = IncidentCorpus::new();
         corpus.register_gap("INC-001");
-        assert_eq!(
-            corpus.coverage("INC-001"),
-            IncidentCoverageStatus::Missing
-        );
+        assert_eq!(corpus.coverage("INC-001"), IncidentCoverageStatus::Missing);
         corpus.register("INC-001", "/a.ftreplay", "b-001");
-        assert_eq!(
-            corpus.coverage("INC-001"),
-            IncidentCoverageStatus::Covered
-        );
+        assert_eq!(corpus.coverage("INC-001"), IncidentCoverageStatus::Covered);
     }
 
     #[test]

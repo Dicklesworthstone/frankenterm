@@ -52,13 +52,9 @@ pub enum RootCause {
         override_id: String,
     },
     /// Decision was added without a baseline counterpart.
-    NewDecision {
-        rule_id: String,
-    },
+    NewDecision { rule_id: String },
     /// Decision was removed without a candidate counterpart.
-    DroppedDecision {
-        rule_id: String,
-    },
+    DroppedDecision { rule_id: String },
     /// Timing shift (same logic, different scheduling).
     TimingShift {
         baseline_ms: u64,
@@ -249,7 +245,8 @@ impl DecisionDiff {
         let mut position = 0u64;
 
         // Track which candidate nodes we've matched.
-        let mut matched_cand: std::collections::BTreeSet<MatchKey> = std::collections::BTreeSet::new();
+        let mut matched_cand: std::collections::BTreeSet<MatchKey> =
+            std::collections::BTreeSet::new();
 
         // Pass 1: Iterate baseline nodes, find matches in candidate.
         for node in &base_nodes {
@@ -282,27 +279,27 @@ impl DecisionDiff {
                 let relaxed_key = (node.pane_id, node.rule_id.clone());
                 let found_shifted = if let Some(cand_list) = cand_relaxed.get(&relaxed_key) {
                     cand_list.iter().find(|cn| {
-                        let delta = if cn.timestamp_ms >= node.timestamp_ms {
-                            cn.timestamp_ms - node.timestamp_ms
-                        } else {
-                            node.timestamp_ms - cn.timestamp_ms
-                        };
+                        let delta = cn.timestamp_ms.abs_diff(node.timestamp_ms);
                         delta <= config.time_tolerance_ms
                             && delta > 0
-                            && !matched_cand.contains(&(cn.timestamp_ms, cn.pane_id, cn.rule_id.clone()))
+                            && !matched_cand.contains(&(
+                                cn.timestamp_ms,
+                                cn.pane_id,
+                                cn.rule_id.clone(),
+                            ))
                     })
                 } else {
                     None
                 };
 
                 if let Some(shifted_node) = found_shifted {
-                    let shifted_key = (shifted_node.timestamp_ms, shifted_node.pane_id, shifted_node.rule_id.clone());
+                    let shifted_key = (
+                        shifted_node.timestamp_ms,
+                        shifted_node.pane_id,
+                        shifted_node.rule_id.clone(),
+                    );
                     matched_cand.insert(shifted_key);
-                    let delta = if shifted_node.timestamp_ms >= node.timestamp_ms {
-                        shifted_node.timestamp_ms - node.timestamp_ms
-                    } else {
-                        node.timestamp_ms - shifted_node.timestamp_ms
-                    };
+                    let delta = shifted_node.timestamp_ms.abs_diff(node.timestamp_ms);
                     divergences.push(Divergence {
                         position,
                         divergence_type: DivergenceType::Shifted,
@@ -376,9 +373,7 @@ impl DecisionDiff {
             }
             EquivalenceLevel::L1 => {
                 // Same decisions: no added, removed, or modified.
-                self.summary.added == 0
-                    && self.summary.removed == 0
-                    && self.summary.modified == 0
+                self.summary.added == 0 && self.summary.removed == 0 && self.summary.modified == 0
             }
             EquivalenceLevel::L2 => {
                 // Exact match: no divergences at all.
@@ -478,9 +473,14 @@ mod tests {
 
     #[test]
     fn diff_detects_added() {
-        let base_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
-        ];
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
         let cand_events = vec![
             make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
             make_event(DecisionType::AlertFired, "a1", 200, 1, "def_a", "out_a"),
@@ -501,9 +501,14 @@ mod tests {
             make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
             make_event(DecisionType::AlertFired, "a1", 200, 1, "def_a", "out_a"),
         ];
-        let cand_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
-        ];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
         let base = DecisionGraph::from_decisions(&base_events);
         let cand = DecisionGraph::from_decisions(&cand_events);
         let diff = DecisionDiff::diff(&base, &cand, &config());
@@ -515,12 +520,22 @@ mod tests {
 
     #[test]
     fn diff_detects_modified() {
-        let base_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
-        ];
-        let cand_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out_DIFFERENT"),
-        ];
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out_DIFFERENT",
+        )];
         let base = DecisionGraph::from_decisions(&base_events);
         let cand = DecisionGraph::from_decisions(&cand_events);
         let diff = DecisionDiff::diff(&base, &cand, &config());
@@ -533,12 +548,22 @@ mod tests {
 
     #[test]
     fn diff_detects_shifted() {
-        let base_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
-        ];
-        let cand_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 150, 1, "def1", "out1"),
-        ];
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            150,
+            1,
+            "def1",
+            "out1",
+        )];
         let base = DecisionGraph::from_decisions(&base_events);
         let cand = DecisionGraph::from_decisions(&cand_events);
         let diff = DecisionDiff::diff(&base, &cand, &config());
@@ -549,12 +574,22 @@ mod tests {
 
     #[test]
     fn shifted_beyond_tolerance_is_removed_added() {
-        let base_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
-        ];
-        let cand_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 300, 1, "def1", "out1"),
-        ];
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            300,
+            1,
+            "def1",
+            "out1",
+        )];
         let base = DecisionGraph::from_decisions(&base_events);
         let cand = DecisionGraph::from_decisions(&cand_events);
         let diff = DecisionDiff::diff(&base, &cand, &config());
@@ -568,12 +603,22 @@ mod tests {
 
     #[test]
     fn root_cause_definition_change() {
-        let base_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def_v1", "out1"),
-        ];
-        let cand_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def_v2", "out2"),
-        ];
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def_v1",
+            "out1",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def_v2",
+            "out2",
+        )];
         let base = DecisionGraph::from_decisions(&base_events);
         let cand = DecisionGraph::from_decisions(&cand_events);
         let diff = DecisionDiff::diff(&base, &cand, &config());
@@ -589,12 +634,22 @@ mod tests {
 
     #[test]
     fn root_cause_input_divergence() {
-        let base_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
-        ];
-        let mut cand_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out_different"),
-        ];
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
+        let mut cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out_different",
+        )];
         // Same definition hash but different input hash → input divergence.
         cand_events[0].input_hash = "in_different".into();
         let base = DecisionGraph::from_decisions(&base_events);
@@ -611,12 +666,22 @@ mod tests {
 
     #[test]
     fn l1_true_when_only_timing_differs() {
-        let base_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
-        ];
-        let cand_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 150, 1, "def1", "out1"),
-        ];
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            150,
+            1,
+            "def1",
+            "out1",
+        )];
         let base = DecisionGraph::from_decisions(&base_events);
         let cand = DecisionGraph::from_decisions(&cand_events);
         let diff = DecisionDiff::diff(&base, &cand, &config());
@@ -625,12 +690,22 @@ mod tests {
 
     #[test]
     fn l0_true_when_structure_matches() {
-        let base_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
-        ];
-        let cand_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out_different"),
-        ];
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out_different",
+        )];
         let base = DecisionGraph::from_decisions(&base_events);
         let cand = DecisionGraph::from_decisions(&cand_events);
         let diff = DecisionDiff::diff(&base, &cand, &config());
@@ -667,12 +742,22 @@ mod tests {
 
     #[test]
     fn no_attribution_config() {
-        let base_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def_v1", "out1"),
-        ];
-        let cand_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def_v2", "out2"),
-        ];
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def_v1",
+            "out1",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def_v2",
+            "out2",
+        )];
         let base = DecisionGraph::from_decisions(&base_events);
         let cand = DecisionGraph::from_decisions(&cand_events);
         let cfg = DiffConfig {
@@ -688,12 +773,22 @@ mod tests {
 
     #[test]
     fn custom_tolerance() {
-        let base_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
-        ];
-        let cand_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 250, 1, "def1", "out1"),
-        ];
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            250,
+            1,
+            "def1",
+            "out1",
+        )];
         let base = DecisionGraph::from_decisions(&base_events);
         let cand = DecisionGraph::from_decisions(&cand_events);
         // Default tolerance (100ms): 150ms shift → removed + added.
@@ -712,12 +807,22 @@ mod tests {
 
     #[test]
     fn diff_json_roundtrip() {
-        let base_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
-        ];
-        let cand_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out2"),
-        ];
+        let base_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
+        let cand_events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out2",
+        )];
         let base = DecisionGraph::from_decisions(&base_events);
         let cand = DecisionGraph::from_decisions(&cand_events);
         let diff = DecisionDiff::diff(&base, &cand, &config());
@@ -730,9 +835,14 @@ mod tests {
 
     #[test]
     fn empty_divergence_list() {
-        let events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def1", "out1"),
-        ];
+        let events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            "def1",
+            "out1",
+        )];
         let base = DecisionGraph::from_decisions(&events);
         let cand = DecisionGraph::from_decisions(&events);
         let diff = DecisionDiff::diff(&base, &cand, &config());
@@ -837,8 +947,22 @@ mod tests {
             make_event(DecisionType::WorkflowStep, "w1", 200, 1, "def_v1", "out2"),
         ];
         let cand_events = vec![
-            make_event(DecisionType::PatternMatch, "r1", 100, 1, "def_v2", "out_mod"),
-            make_event(DecisionType::WorkflowStep, "w1", 200, 1, "def_v2", "out_mod2"),
+            make_event(
+                DecisionType::PatternMatch,
+                "r1",
+                100,
+                1,
+                "def_v2",
+                "out_mod",
+            ),
+            make_event(
+                DecisionType::WorkflowStep,
+                "w1",
+                200,
+                1,
+                "def_v2",
+                "out_mod2",
+            ),
         ];
         let base = DecisionGraph::from_decisions(&base_events);
         let cand = DecisionGraph::from_decisions(&cand_events);
@@ -862,10 +986,28 @@ mod tests {
     #[test]
     fn large_diff_completes() {
         let base_events: Vec<DecisionEvent> = (0..500)
-            .map(|i| make_event(DecisionType::PatternMatch, &format!("r_{}", i), i * 10, i % 5, "def", "out"))
+            .map(|i| {
+                make_event(
+                    DecisionType::PatternMatch,
+                    &format!("r_{}", i),
+                    i * 10,
+                    i % 5,
+                    "def",
+                    "out",
+                )
+            })
             .collect();
         let cand_events: Vec<DecisionEvent> = (0..500)
-            .map(|i| make_event(DecisionType::PatternMatch, &format!("r_{}", i), i * 10, i % 5, "def", "out_mod"))
+            .map(|i| {
+                make_event(
+                    DecisionType::PatternMatch,
+                    &format!("r_{}", i),
+                    i * 10,
+                    i % 5,
+                    "def",
+                    "out_mod",
+                )
+            })
             .collect();
         let base = DecisionGraph::from_decisions(&base_events);
         let cand = DecisionGraph::from_decisions(&cand_events);

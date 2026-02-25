@@ -185,7 +185,9 @@ fn quantile_normal(p: f64) -> f64 {
     let d1 = 1.432_788;
     let d2 = 0.189_269;
     let d3 = 0.001_308;
-    let val = t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t);
+    let val = t
+        - (c2 * t).mul_add(t, c0 + c1 * t)
+            / (d3 * t * t).mul_add(t, (d2 * t).mul_add(t, 1.0 + d1 * t));
     if p < 0.5 { -val } else { val }
 }
 
@@ -369,10 +371,8 @@ pub struct PacBayesBackpressure {
 impl PacBayesBackpressure {
     /// Create a new controller with the given configuration.
     pub fn new(config: PacBayesConfig) -> Self {
-        let prior = GaussianPosterior::new(
-            config.prior_threshold_mean,
-            config.prior_threshold_variance,
-        );
+        let prior =
+            GaussianPosterior::new(config.prior_threshold_mean, config.prior_threshold_variance);
         Self {
             prior,
             panes: HashMap::new(),
@@ -405,7 +405,8 @@ impl PacBayesBackpressure {
 
     /// Process a queue observation and return throttle actions.
     pub fn observe(&mut self, obs: &QueueObservation) -> PacBayesThrottleActions {
-        let state = self.panes
+        let state = self
+            .panes
             .entry(obs.pane_id)
             .or_insert_with(|| PaneState::new(&self.config));
 
@@ -413,8 +414,10 @@ impl PacBayesBackpressure {
         state.smoothed_ratio = if state.observation_count == 0 {
             obs.fill_ratio
         } else {
-            self.config.ema_alpha * obs.fill_ratio
-                + (1.0 - self.config.ema_alpha) * state.smoothed_ratio
+            self.config.ema_alpha.mul_add(
+                obs.fill_ratio,
+                (1.0 - self.config.ema_alpha) * state.smoothed_ratio,
+            )
         };
 
         state.observation_count += 1;
@@ -433,8 +436,8 @@ impl PacBayesBackpressure {
         // a frame drop occurred (or didn't). We update toward the observed
         // threshold boundary.
         if state.observation_count > self.config.warmup_observations {
-            let obs_variance = self.config.prior_threshold_variance
-                * (1.0 / self.config.learning_rate);
+            let obs_variance =
+                self.config.prior_threshold_variance * (1.0 / self.config.learning_rate);
 
             if obs.frame_dropped {
                 // Frame drop → threshold should be lower (throttle earlier)
@@ -448,9 +451,7 @@ impl PacBayesBackpressure {
 
         // Compute severity from smoothed ratio and posterior threshold
         let threshold = state.posterior.mean;
-        let severity_raw = sigmoid(
-            self.config.steepness * (state.smoothed_ratio - threshold),
-        );
+        let severity_raw = sigmoid(self.config.steepness * (state.smoothed_ratio - threshold));
         let mut severity = severity_raw.min(self.config.max_severity);
 
         // Starvation guard: reduce throttling if external causes dominate
@@ -476,10 +477,10 @@ impl PacBayesBackpressure {
         // Derive throttle actions from severity
         let actions = PacBayesThrottleActions {
             severity,
-            poll_multiplier: 1.0 + 3.0 * severity,
+            poll_multiplier: 3.0f64.mul_add(severity, 1.0),
             pane_skip_fraction: 0.5 * severity * severity,
             detection_skip_fraction: 0.25 * severity,
-            buffer_limit_factor: 1.0 - 0.8 * severity,
+            buffer_limit_factor: 0.8f64.mul_add(-severity, 1.0),
             starvation_guard_active,
             risk_bound,
             kl_divergence: kl,
@@ -532,7 +533,8 @@ impl PacBayesBackpressure {
             return 0.0;
         }
         // Aggregate: max risk across all panes
-        self.panes.values()
+        self.panes
+            .values()
             .map(|state| {
                 let kl = state.posterior.kl_divergence(&self.prior);
                 let n = state.observation_count.max(1) as f64;
@@ -551,8 +553,10 @@ impl PacBayesBackpressure {
             global_drop_rate: self.global_drop_rate(),
             global_risk_bound: self.global_risk_bound(),
             pane_count: self.panes.len(),
-            pane_snapshots: self.panes.iter().map(|(&id, state)| {
-                PaneSnapshot {
+            pane_snapshots: self
+                .panes
+                .iter()
+                .map(|(&id, state)| PaneSnapshot {
                     pane_id: id,
                     observations: state.observation_count,
                     frame_drops: state.frame_drops,
@@ -561,8 +565,8 @@ impl PacBayesBackpressure {
                     threshold_mean: state.posterior.mean,
                     threshold_variance: state.posterior.variance,
                     throttled: state.throttled,
-                }
-            }).collect(),
+                })
+                .collect(),
         }
     }
 
@@ -734,7 +738,10 @@ mod tests {
         let lower = p.lower_bound(0.05);
         assert!(upper > p.mean);
         assert!(lower < p.mean);
-        assert!((upper - p.mean - (p.mean - lower)).abs() < 1e-6, "symmetric bounds");
+        assert!(
+            (upper - p.mean - (p.mean - lower)).abs() < 1e-6,
+            "symmetric bounds"
+        );
     }
 
     #[test]
@@ -1007,7 +1014,10 @@ mod tests {
         }
 
         let adapted = ctrl.pane_threshold(1).unwrap();
-        assert!(adapted > 0.3, "threshold should increase: adapted={adapted}");
+        assert!(
+            adapted > 0.3,
+            "threshold should increase: adapted={adapted}"
+        );
     }
 
     #[test]

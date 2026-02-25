@@ -117,7 +117,7 @@ impl GateStatus {
 
 // ── Gate Check ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateCheck {
     pub name: String,
     pub passed: bool,
@@ -130,7 +130,7 @@ pub struct GateCheck {
 
 // ── Gate Report ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateReport {
     pub version: String,
     pub format: String,
@@ -156,7 +156,12 @@ impl GateReport {
     }
 
     #[must_use]
-    pub fn new(gate: GateId, checks: Vec<GateCheck>, duration_ms: u64, evaluated_at: String) -> Self {
+    pub fn new(
+        gate: GateId,
+        checks: Vec<GateCheck>,
+        duration_ms: u64,
+        evaluated_at: String,
+    ) -> Self {
         let pass_count = checks.iter().filter(|c| c.passed).count();
         let fail_count = checks.iter().filter(|c| !c.passed).count();
         let total_count = checks.len();
@@ -201,7 +206,7 @@ impl GateReport {
 
 // ── Waiver ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Waiver {
     pub gate: GateId,
     pub check_name: String,
@@ -279,7 +284,10 @@ fn parse_single_waiver(block: &str) -> Option<Waiver> {
     let gate = GateId::from_str_id(gate_str)?;
     let check_name = fields.get("check").cloned().unwrap_or_else(|| "*".into());
     let reason = fields.get("reason").cloned()?;
-    let author = fields.get("author").cloned().unwrap_or_else(|| "unknown".into());
+    let author = fields
+        .get("author")
+        .cloned()
+        .unwrap_or_else(|| "unknown".into());
     let expires_at = fields.get("expires").cloned();
 
     Some(Waiver {
@@ -294,7 +302,7 @@ fn parse_single_waiver(block: &str) -> Option<Waiver> {
 
 // ── Evidence Bundle ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceBundle {
     pub version: String,
     pub generated_at: String,
@@ -367,7 +375,11 @@ pub fn evaluate_gate1_smoke(
         checks.push(GateCheck {
             name: name.clone(),
             passed: *passed,
-            message: format!("Smoke test {}: {}", name, if *passed { "passed" } else { "failed" }),
+            message: format!(
+                "Smoke test {}: {}",
+                name,
+                if *passed { "passed" } else { "failed" }
+            ),
             duration_ms: None,
             artifact_path: None,
         });
@@ -378,7 +390,7 @@ pub fn evaluate_gate1_smoke(
 
 // ── Gate 2: Test Suite Checks ────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestSuiteResults {
     pub unit_tests_passed: usize,
     pub unit_tests_total: usize,
@@ -429,14 +441,17 @@ pub fn evaluate_gate2_test_suite(
         passed: results.proptest_passed,
         message: format!(
             "Property tests: {}",
-            if results.proptest_passed { "all passed" } else { "failures detected" }
+            if results.proptest_passed {
+                "all passed"
+            } else {
+                "failures detected"
+            }
         ),
         duration_ms: None,
         artifact_path: None,
     });
 
-    let integration_all_pass =
-        results.integration_tests_passed == results.integration_tests_total;
+    let integration_all_pass = results.integration_tests_passed == results.integration_tests_total;
     checks.push(GateCheck {
         name: "integration_tests".into(),
         passed: integration_all_pass,
@@ -453,7 +468,7 @@ pub fn evaluate_gate2_test_suite(
 
 // ── Gate 3: Regression Checks ────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegressionResults {
     pub e2e_passed: bool,
     pub e2e_scenario_count: usize,
@@ -479,7 +494,11 @@ pub fn evaluate_gate3_regression(
         message: format!(
             "E2E scenarios: {} total, {}",
             results.e2e_scenario_count,
-            if results.e2e_passed { "all passed" } else { "failures detected" }
+            if results.e2e_passed {
+                "all passed"
+            } else {
+                "failures detected"
+            }
         ),
         duration_ms: None,
         artifact_path: None,
@@ -491,7 +510,11 @@ pub fn evaluate_gate3_regression(
         message: format!(
             "Regression suite: {} divergences, {}",
             results.regression_divergence_count,
-            if results.regression_suite_passed { "within budget" } else { "budget exceeded" }
+            if results.regression_suite_passed {
+                "within budget"
+            } else {
+                "budget exceeded"
+            }
         ),
         duration_ms: None,
         artifact_path: None,
@@ -753,7 +776,12 @@ mod tests {
             duration_ms: Some(50),
             artifact_path: Some("/path".into()),
         }];
-        let report = GateReport::new(GateId::TestSuite, checks, 500, "2026-01-01T00:00:00Z".into());
+        let report = GateReport::new(
+            GateId::TestSuite,
+            checks,
+            500,
+            "2026-01-01T00:00:00Z".into(),
+        );
         let json = serde_json::to_string(&report).unwrap();
         let restored: GateReport = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, report);
@@ -794,7 +822,10 @@ More text."#;
         assert_eq!(waivers[0].check_name, "schema_validation");
         assert_eq!(waivers[0].reason, "Known issue #123");
         assert_eq!(waivers[0].author, "dev@example.com");
-        assert_eq!(waivers[0].expires_at.as_deref(), Some("2026-03-01T00:00:00Z"));
+        assert_eq!(
+            waivers[0].expires_at.as_deref(),
+            Some("2026-03-01T00:00:00Z")
+        );
     }
 
     #[test]
@@ -1199,8 +1230,12 @@ reason: something
 
     #[test]
     fn path_trigger_matches_replay_source() {
-        assert!(matches_replay_path("crates/frankenterm-core/src/replay_mcp.rs"));
-        assert!(matches_replay_path("crates/frankenterm-core/src/replay_guide.rs"));
+        assert!(matches_replay_path(
+            "crates/frankenterm-core/src/replay_mcp.rs"
+        ));
+        assert!(matches_replay_path(
+            "crates/frankenterm-core/src/replay_guide.rs"
+        ));
     }
 
     #[test]
@@ -1224,7 +1259,9 @@ reason: something
 
     #[test]
     fn path_trigger_matches_gate_scripts() {
-        assert!(matches_replay_path("scripts/check_replay_performance_gates.sh"));
+        assert!(matches_replay_path(
+            "scripts/check_replay_performance_gates.sh"
+        ));
     }
 
     #[test]
@@ -1234,7 +1271,9 @@ reason: something
 
     #[test]
     fn path_trigger_excludes_non_replay() {
-        assert!(!matches_replay_path("crates/frankenterm-core/src/storage.rs"));
+        assert!(!matches_replay_path(
+            "crates/frankenterm-core/src/storage.rs"
+        ));
         assert!(!matches_replay_path("src/main.rs"));
         assert!(!matches_replay_path("Cargo.toml"));
     }
@@ -1277,9 +1316,7 @@ reason: something
     #[test]
     fn schema_gate_field_required() {
         let schema = gate_tool_schema();
-        let required = schema["input_schema"]["required"]
-            .as_array()
-            .unwrap();
+        let required = schema["input_schema"]["required"].as_array().unwrap();
         let has_gate = required.iter().any(|v| v.as_str() == Some("gate"));
         assert!(has_gate);
     }

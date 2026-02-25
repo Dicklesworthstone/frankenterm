@@ -747,7 +747,7 @@ impl StepAction {
 // ============================================================================
 
 /// Condition to wait for.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WaitCondition {
     /// Wait for a pattern rule to match
@@ -2148,7 +2148,7 @@ pub struct TxIntent {
 }
 
 /// One transaction precondition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TxPrecondition {
     PromptActive {
@@ -4787,7 +4787,7 @@ impl IntentLedger {
             .iter()
             .rev()
             .find_map(|e| match &e.kind {
-                LedgerEntryKind::StateTransition { to, .. } => Some(to.clone()),
+                LedgerEntryKind::StateTransition { to, .. } => Some(*to),
                 _ => None,
             })
             .unwrap_or_default()
@@ -4801,9 +4801,9 @@ impl IntentLedger {
                 LedgerEntryKind::StateTransition { from, to, kind } => Some(StateTimelineEntry {
                     seq: e.seq,
                     timestamp_ms: e.created_at_ms,
-                    from: from.clone(),
-                    to: to.clone(),
-                    kind: kind.clone(),
+                    from: *from,
+                    to: *to,
+                    kind: *kind,
                     correlation: e.correlation.clone(),
                 }),
                 _ => None,
@@ -6383,9 +6383,8 @@ impl MissionJournal {
             clean: if self.entries.is_empty() {
                 true
             } else {
-                self.last_checkpoint_seq.map_or(false, |cp_seq| {
-                    self.entries.last().map_or(false, |e| e.seq == cp_seq)
-                })
+                self.last_checkpoint_seq
+                    .is_some_and(|cp_seq| self.entries.last().is_some_and(|e| e.seq == cp_seq))
             },
         }
     }

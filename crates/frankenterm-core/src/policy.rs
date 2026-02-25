@@ -1569,7 +1569,7 @@ pub fn is_command_candidate(text: &str) -> bool {
 
     // Helper to check if a token matches any known command, handling paths
     let is_match = |token: &str| {
-        let clean_token = token.replace('"', "").replace('\'', "");
+        let clean_token = token.replace(['"', '\''], "");
         let lower = clean_token.to_ascii_lowercase();
 
         // Always treat path-like tokens as candidates (e.g. ./script.sh, /bin/destroy)
@@ -1623,7 +1623,7 @@ fn has_trauma_bypass_prefix(text: &str) -> bool {
     }
 
     for token in trimmed.split_whitespace() {
-        let cleaned = token.trim_end_matches(|ch| matches!(ch, ';' | '&' | '|'));
+        let cleaned = token.trim_end_matches([';', '&', '|']);
         let Some((key, value)) = cleaned.split_once('=') else {
             break;
         };

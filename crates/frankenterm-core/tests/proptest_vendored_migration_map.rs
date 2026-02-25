@@ -10,8 +10,8 @@
 //! - Dependency graph acyclicity
 
 use frankenterm_core::vendored_migration_map::{
-    build_canonical_map, Criticality, MigrationDifficulty, MigrationWave, RuntimePrimitive,
-    VendoredCrateId, VendoredMigrationMap,
+    Criticality, MigrationDifficulty, MigrationWave, RuntimePrimitive, VendoredCrateId,
+    VendoredMigrationMap, build_canonical_map,
 };
 use proptest::prelude::*;
 
@@ -58,7 +58,7 @@ fn arb_runtime_primitive() -> impl Strategy<Value = RuntimePrimitive> {
     ]
 }
 
-fn arb_crate_id() -> impl Strategy<Value = VendoredCrateId> {
+fn _arb_crate_id() -> impl Strategy<Value = VendoredCrateId> {
     "[a-z][a-z0-9_-]{1,15}".prop_map(VendoredCrateId::new)
 }
 

@@ -8,9 +8,7 @@
 //! - Config serde roundtrip
 //! - Scan summary consistency
 
-use frankenterm_core::scope_tree::{
-    register_standard_scopes, well_known, ScopeId, ScopeState, ScopeTier, ScopeTree,
-};
+use frankenterm_core::scope_tree::{ScopeId, ScopeState, ScopeTier, ScopeTree};
 use frankenterm_core::scope_watchdog::{
     AlertKind, AlertSeverity, ScanSummary, ScopeWatchdog, WatchdogConfig,
 };
@@ -271,8 +269,14 @@ fn multiple_detectors_fire_independently() {
 
     // Create stuck cancellation
     let stuck = ScopeId("daemon:stuck".into());
-    tree.register(stuck.clone(), ScopeTier::Daemon, &ScopeId::root(), "stuck", 1000)
-        .unwrap();
+    tree.register(
+        stuck.clone(),
+        ScopeTier::Daemon,
+        &ScopeId::root(),
+        "stuck",
+        1000,
+    )
+    .unwrap();
     tree.start(&stuck, 1100).unwrap();
     tree.request_shutdown(&stuck, 2000).unwrap();
 
@@ -293,8 +297,14 @@ fn multiple_detectors_fire_independently() {
 
     // Create stale scope
     let stale = ScopeId("daemon:stale".into());
-    tree.register(stale.clone(), ScopeTier::Daemon, &ScopeId::root(), "stale", 1000)
-        .unwrap();
+    tree.register(
+        stale.clone(),
+        ScopeTier::Daemon,
+        &ScopeId::root(),
+        "stale",
+        1000,
+    )
+    .unwrap();
     // Don't start it
 
     let mut watchdog = ScopeWatchdog::with_config(config);
@@ -328,7 +338,11 @@ fn alert_display_variants() {
             elapsed_ms: 5000,
         },
         AlertKind::DeadlockRisk {
-            cycle: vec![ScopeId("a".into()), ScopeId("b".into()), ScopeId("a".into())],
+            cycle: vec![
+                ScopeId("a".into()),
+                ScopeId("b".into()),
+                ScopeId("a".into()),
+            ],
         },
         AlertKind::ScopeLeak {
             tier: ScopeTier::Worker,
@@ -349,7 +363,11 @@ fn alert_display_variants() {
 
     for kind in kinds {
         let display = kind.to_string();
-        assert!(!display.is_empty(), "display should be non-empty for {:?}", kind);
+        assert!(
+            !display.is_empty(),
+            "display should be non-empty for {:?}",
+            kind
+        );
     }
 }
 

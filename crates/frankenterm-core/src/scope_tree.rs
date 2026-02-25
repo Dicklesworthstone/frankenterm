@@ -230,7 +230,7 @@ impl ScopeNode {
     pub fn has_live_children(&self, tree: &ScopeTree) -> bool {
         self.children.iter().any(|cid| {
             tree.get(cid)
-                .map_or(false, |child| !child.state.is_terminal())
+                .is_some_and(|child| !child.state.is_terminal())
         })
     }
 
@@ -499,11 +499,7 @@ impl ScopeTree {
             }
             node.children
                 .iter()
-                .filter(|cid| {
-                    self.nodes
-                        .get(*cid)
-                        .map_or(false, |c| !c.state.is_terminal())
-                })
+                .filter(|cid| self.nodes.get(*cid).is_some_and(|c| !c.state.is_terminal()))
                 .count()
         };
 

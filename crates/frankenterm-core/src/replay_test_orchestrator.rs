@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::replay_ci_gate::{GateId, GateReport, GateStatus, ALL_GATES};
+use crate::replay_ci_gate::{ALL_GATES, GateId, GateReport, GateStatus};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -24,7 +24,7 @@ pub const EVIDENCE_DIR: &str = "evidence";
 
 // ── Orchestrator Config ──────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestratorConfig {
     /// Whether to stop at the first gate failure.
     pub fail_fast: bool,
@@ -46,7 +46,7 @@ impl Default for OrchestratorConfig {
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
             gate_filter: None,
             format: OrchestratorFormat::Human,
-        retention_days: DEFAULT_RETENTION_DAYS,
+            retention_days: DEFAULT_RETENTION_DAYS,
         }
     }
 }
@@ -80,7 +80,7 @@ pub enum OrchestratorFormat {
 
 // ── Orchestrator Result ──────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestratorResult {
     pub gate_results: BTreeMap<String, GateRunResult>,
     pub gates_run: usize,
@@ -100,7 +100,7 @@ impl OrchestratorResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateRunResult {
     pub gate: GateId,
     pub status: GateStatus,
@@ -151,16 +151,26 @@ pub fn orchestrate(config: &OrchestratorConfig, reports: &[GateReport]) -> Orche
         }
     }
 
-    let gates_passed = gate_results.values().filter(|r| {
-        r.status == GateStatus::Pass || r.status == GateStatus::Waived
-    }).count();
-    let gates_failed = gate_results.values().filter(|r| r.status == GateStatus::Fail).count();
+    let gates_passed = gate_results
+        .values()
+        .filter(|r| r.status == GateStatus::Pass || r.status == GateStatus::Waived)
+        .count();
+    let gates_failed = gate_results
+        .values()
+        .filter(|r| r.status == GateStatus::Fail)
+        .count();
 
     let overall_status = if gates_failed > 0 {
         GateStatus::Fail
-    } else if gate_results.values().any(|r| r.status == GateStatus::Waived) {
+    } else if gate_results
+        .values()
+        .any(|r| r.status == GateStatus::Waived)
+    {
         GateStatus::Waived
-    } else if gate_results.values().any(|r| r.status == GateStatus::Pending) {
+    } else if gate_results
+        .values()
+        .any(|r| r.status == GateStatus::Pending)
+    {
         GateStatus::Pending
     } else {
         GateStatus::Pass
@@ -180,7 +190,7 @@ pub fn orchestrate(config: &OrchestratorConfig, reports: &[GateReport]) -> Orche
 
 // ── Evidence Manifest ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceManifest {
     pub version: String,
     pub generated_at: String,
@@ -189,7 +199,7 @@ pub struct EvidenceManifest {
     pub retention_days: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub path: String,
     pub size_bytes: u64,
@@ -231,13 +241,16 @@ impl EvidenceManifest {
     /// Count files of a given type.
     #[must_use]
     pub fn count_by_type(&self, file_type: ManifestFileType) -> usize {
-        self.files.iter().filter(|e| e.file_type == file_type).count()
+        self.files
+            .iter()
+            .filter(|e| e.file_type == file_type)
+            .count()
     }
 }
 
 // ── Log Retention ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetentionPolicy {
     /// Gate reports retention (days).
     pub gate_reports_days: u64,
@@ -297,14 +310,14 @@ pub fn evaluate_retention(
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetentionCandidate {
     pub path: String,
     pub age_days: u64,
     pub file_type: ManifestFileType,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PruneDecision {
     pub path: String,
     pub age_days: u64,
@@ -321,7 +334,7 @@ pub fn prune_count(decisions: &[PruneDecision]) -> usize {
 
 // ── Summary Report ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SummaryReport {
     pub gates: BTreeMap<String, GateSummary>,
     pub overall: GateStatus,
@@ -329,7 +342,7 @@ pub struct SummaryReport {
     pub generated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateSummary {
     pub pass: usize,
     pub fail: usize,
@@ -348,7 +361,9 @@ impl SummaryReport {
                 GateSummary {
                     pass: run.pass_count,
                     fail: run.fail_count,
-                    skip: run.total_count.saturating_sub(run.pass_count + run.fail_count),
+                    skip: run
+                        .total_count
+                        .saturating_sub(run.pass_count + run.fail_count),
                     duration_ms: run.duration_ms,
                 },
             );
@@ -413,27 +428,33 @@ mod tests {
     use crate::replay_ci_gate::GateCheck;
 
     fn make_pass_report(gate: GateId) -> GateReport {
-        GateReport::new(gate, vec![
-            GateCheck {
+        GateReport::new(
+            gate,
+            vec![GateCheck {
                 name: "ok".into(),
                 passed: true,
                 message: "pass".into(),
                 duration_ms: Some(10),
                 artifact_path: None,
-            },
-        ], 100, "2026-01-01T00:00:00Z".into())
+            }],
+            100,
+            "2026-01-01T00:00:00Z".into(),
+        )
     }
 
     fn make_fail_report(gate: GateId) -> GateReport {
-        GateReport::new(gate, vec![
-            GateCheck {
+        GateReport::new(
+            gate,
+            vec![GateCheck {
                 name: "bad".into(),
                 passed: false,
                 message: "fail".into(),
                 duration_ms: None,
                 artifact_path: None,
-            },
-        ], 200, "2026-01-01T00:00:00Z".into())
+            }],
+            200,
+            "2026-01-01T00:00:00Z".into(),
+        )
     }
 
     // ── Orchestrator Config ──────────────────────────────────────────────
@@ -490,7 +511,10 @@ mod tests {
 
     #[test]
     fn orchestrate_gate1_fail_fast() {
-        let config = OrchestratorConfig { fail_fast: true, ..Default::default() };
+        let config = OrchestratorConfig {
+            fail_fast: true,
+            ..Default::default()
+        };
         let reports = vec![
             make_fail_report(GateId::Smoke),
             make_pass_report(GateId::TestSuite),
@@ -504,7 +528,10 @@ mod tests {
 
     #[test]
     fn orchestrate_no_fail_fast_continues() {
-        let config = OrchestratorConfig { fail_fast: false, ..Default::default() };
+        let config = OrchestratorConfig {
+            fail_fast: false,
+            ..Default::default()
+        };
         let reports = vec![
             make_fail_report(GateId::Smoke),
             make_pass_report(GateId::TestSuite),
@@ -518,7 +545,10 @@ mod tests {
 
     #[test]
     fn orchestrate_gate2_fail_fast() {
-        let config = OrchestratorConfig { fail_fast: true, ..Default::default() };
+        let config = OrchestratorConfig {
+            fail_fast: true,
+            ..Default::default()
+        };
         let reports = vec![
             make_pass_report(GateId::Smoke),
             make_fail_report(GateId::TestSuite),
@@ -534,9 +564,7 @@ mod tests {
     #[test]
     fn orchestrate_single_gate_filter() {
         let config = OrchestratorConfig::for_gate(GateId::Regression);
-        let reports = vec![
-            make_pass_report(GateId::Regression),
-        ];
+        let reports = vec![make_pass_report(GateId::Regression)];
         let result = orchestrate(&config, &reports);
         assert_eq!(result.gates_run, 1);
         assert_eq!(result.overall_status, GateStatus::Pass);
@@ -554,7 +582,7 @@ mod tests {
     fn orchestrate_duration_accumulates() {
         let config = OrchestratorConfig::default();
         let reports = vec![
-            make_pass_report(GateId::Smoke),     // 100ms
+            make_pass_report(GateId::Smoke),      // 100ms
             make_pass_report(GateId::TestSuite),  // 100ms
             make_pass_report(GateId::Regression), // 100ms
         ];
@@ -740,9 +768,9 @@ mod tests {
             },
         ];
         let decisions = evaluate_retention(&files, &policy, 0);
-        assert!(decisions[0].prune);   // gate: 40 > 30
-        assert!(!decisions[1].prune);  // regression: 40 <= 60
-        assert!(decisions[2].prune);   // output: 20 > 14
+        assert!(decisions[0].prune); // gate: 40 > 30
+        assert!(!decisions[1].prune); // regression: 40 <= 60
+        assert!(decisions[2].prune); // output: 20 > 14
     }
 
     #[test]
@@ -805,7 +833,10 @@ mod tests {
 
     #[test]
     fn summary_totals() {
-        let config = OrchestratorConfig { fail_fast: false, ..Default::default() };
+        let config = OrchestratorConfig {
+            fail_fast: false,
+            ..Default::default()
+        };
         let reports = vec![
             make_pass_report(GateId::Smoke),
             make_fail_report(GateId::TestSuite),

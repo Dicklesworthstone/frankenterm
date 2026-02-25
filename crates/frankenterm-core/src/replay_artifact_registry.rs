@@ -94,7 +94,7 @@ pub enum ArtifactStatus {
 // ---------------------------------------------------------------------------
 
 /// A single artifact registered in the manifest.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactEntry {
     /// Relative path to the artifact file.
     pub path: String,
@@ -127,7 +127,7 @@ pub struct ArtifactEntry {
 // ---------------------------------------------------------------------------
 
 /// Detailed inspection output for a single artifact.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactDetail {
     /// The manifest entry.
     pub entry: ArtifactEntry,
@@ -150,7 +150,7 @@ pub struct ArtifactDetail {
 // ---------------------------------------------------------------------------
 
 /// The on-disk manifest tracking all registered artifacts.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactManifest {
     /// Schema version for forward compatibility.
     pub schema_version: String,
@@ -257,14 +257,25 @@ impl ArtifactManifest {
 // ---------------------------------------------------------------------------
 
 /// Errors found during manifest validation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ManifestValidationError {
-    DuplicatePath { path: String },
-    InvalidChecksum { path: String, reason: String },
+    DuplicatePath {
+        path: String,
+    },
+    InvalidChecksum {
+        path: String,
+        reason: String,
+    },
     EmptyPath,
-    MissingFile { path: String },
-    ChecksumMismatch { path: String, expected: String, actual: String },
+    MissingFile {
+        path: String,
+    },
+    ChecksumMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +319,7 @@ impl Default for PruneOptions {
 }
 
 /// Result of a prune operation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PruneResult {
     /// Paths that were (or would be) pruned.
     pub pruned_paths: Vec<String>,
@@ -680,8 +691,7 @@ impl ArtifactRegistry {
     /// Render artifact listing as JSON.
     pub fn render_json(&self, filter: &ListFilter) -> Result<String, String> {
         let entries: Vec<&ArtifactEntry> = self.list(filter);
-        serde_json::to_string_pretty(&entries)
-            .map_err(|e| format!("JSON serialize error: {e}"))
+        serde_json::to_string_pretty(&entries).map_err(|e| format!("JSON serialize error: {e}"))
     }
 }
 
@@ -900,7 +910,11 @@ mod tests {
         m.artifacts.push(make_entry("dup.ftreplay", "d1", content));
         m.artifacts.push(make_entry("dup.ftreplay", "d2", content));
         let errors = m.validate();
-        assert!(errors.iter().any(|e| matches!(e, ManifestValidationError::DuplicatePath { .. })));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ManifestValidationError::DuplicatePath { .. }))
+        );
     }
 
     #[test]
@@ -910,7 +924,11 @@ mod tests {
         entry.sha256 = "short".into();
         m.artifacts.push(entry);
         let errors = m.validate();
-        assert!(errors.iter().any(|e| matches!(e, ManifestValidationError::InvalidChecksum { .. })));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ManifestValidationError::InvalidChecksum { .. }))
+        );
     }
 
     #[test]
@@ -919,7 +937,11 @@ mod tests {
         let entry = make_entry("", "empty", b"x");
         m.artifacts.push(entry);
         let errors = m.validate();
-        assert!(errors.iter().any(|e| matches!(e, ManifestValidationError::EmptyPath)));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ManifestValidationError::EmptyPath))
+        );
     }
 
     // ── Sensitivity tier tests ───────────────────────────────────────────
@@ -932,9 +954,18 @@ mod tests {
 
     #[test]
     fn tier_from_str() {
-        assert_eq!(ArtifactSensitivityTier::from_str_arg("T1"), Some(ArtifactSensitivityTier::T1));
-        assert_eq!(ArtifactSensitivityTier::from_str_arg("t2"), Some(ArtifactSensitivityTier::T2));
-        assert_eq!(ArtifactSensitivityTier::from_str_arg("T3"), Some(ArtifactSensitivityTier::T3));
+        assert_eq!(
+            ArtifactSensitivityTier::from_str_arg("T1"),
+            Some(ArtifactSensitivityTier::T1)
+        );
+        assert_eq!(
+            ArtifactSensitivityTier::from_str_arg("t2"),
+            Some(ArtifactSensitivityTier::T2)
+        );
+        assert_eq!(
+            ArtifactSensitivityTier::from_str_arg("T3"),
+            Some(ArtifactSensitivityTier::T3)
+        );
         assert_eq!(ArtifactSensitivityTier::from_str_arg("T4"), None);
     }
 
@@ -947,7 +978,11 @@ mod tests {
 
     #[test]
     fn tier_serde_roundtrip() {
-        for tier in [ArtifactSensitivityTier::T1, ArtifactSensitivityTier::T2, ArtifactSensitivityTier::T3] {
+        for tier in [
+            ArtifactSensitivityTier::T1,
+            ArtifactSensitivityTier::T2,
+            ArtifactSensitivityTier::T3,
+        ] {
             let json = serde_json::to_string(&tier).unwrap();
             let restored: ArtifactSensitivityTier = serde_json::from_str(&json).unwrap();
             assert_eq!(restored, tier);
@@ -1092,8 +1127,13 @@ mod tests {
         let fs = MockFs::new();
         fs.add_file(PathBuf::from("/base/new.ftreplay"), content.to_vec());
         let mut reg = setup_registry(vec![], fs);
-        reg.add("new.ftreplay", "new-label", ArtifactSensitivityTier::T1, 2000)
-            .unwrap();
+        reg.add(
+            "new.ftreplay",
+            "new-label",
+            ArtifactSensitivityTier::T1,
+            2000,
+        )
+        .unwrap();
         assert_eq!(reg.manifest().artifacts.len(), 1);
         assert_eq!(reg.manifest().artifacts[0].path, "new.ftreplay");
         assert_eq!(reg.manifest().artifacts[0].label, "new-label");
@@ -1141,10 +1181,18 @@ mod tests {
             {"decision_type": "pattern_match", "rule_id": "r3"}
         ]"#;
         let fs = MockFs::new();
-        fs.add_file(PathBuf::from("/base/events.ftreplay"), events.as_bytes().to_vec());
+        fs.add_file(
+            PathBuf::from("/base/events.ftreplay"),
+            events.as_bytes().to_vec(),
+        );
         let mut reg = setup_registry(vec![], fs);
-        reg.add("events.ftreplay", "events", ArtifactSensitivityTier::T1, 3000)
-            .unwrap();
+        reg.add(
+            "events.ftreplay",
+            "events",
+            ArtifactSensitivityTier::T1,
+            3000,
+        )
+        .unwrap();
         assert_eq!(reg.manifest().artifacts[0].event_count, 3);
         assert_eq!(reg.manifest().artifacts[0].decision_count, 2); // pattern_match + workflow_step
     }
@@ -1301,7 +1349,11 @@ mod tests {
         let fs = MockFs::new();
         let reg = setup_registry(vec![entry], fs);
         let errors = reg.validate();
-        assert!(errors.iter().any(|e| matches!(e, ManifestValidationError::MissingFile { .. })));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ManifestValidationError::MissingFile { .. }))
+        );
     }
 
     #[test]
@@ -1309,10 +1361,17 @@ mod tests {
         let content = b"original";
         let entry = make_entry("bad_hash.ftreplay", "bad", content);
         let fs = MockFs::new();
-        fs.add_file(PathBuf::from("/base/bad_hash.ftreplay"), b"tampered".to_vec());
+        fs.add_file(
+            PathBuf::from("/base/bad_hash.ftreplay"),
+            b"tampered".to_vec(),
+        );
         let reg = setup_registry(vec![entry], fs);
         let errors = reg.validate();
-        assert!(errors.iter().any(|e| matches!(e, ManifestValidationError::ChecksumMismatch { .. })));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ManifestValidationError::ChecksumMismatch { .. }))
+        );
     }
 
     #[test]

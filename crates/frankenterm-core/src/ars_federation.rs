@@ -31,7 +31,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::ars_blast_radius::MaturityTier;
-use crate::ars_evidence::EvidenceVerdict;
 use crate::ars_evolve::VersionStatus;
 use crate::ars_fst::ReflexId;
 use crate::ars_serialize::{EvidenceSummary, ReflexRecord, ReflexStore};
@@ -83,7 +82,7 @@ impl ReflexExport {
             version: record.version,
             trigger_key_hex: hex_encode(&record.trigger_key),
             commands: record.commands.clone(),
-            status: record.status.clone(),
+            status: record.status,
             tier: record.tier,
             successes: record.successes,
             failures: record.failures,
@@ -540,7 +539,7 @@ impl FederationEngine {
 }
 
 /// Result of an import attempt.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImportResult {
     /// Successfully validated for import.
     Imported {
@@ -558,7 +557,7 @@ pub enum ImportResult {
 }
 
 /// Federation statistics.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FederationStats {
     pub total_exports: u64,
     pub total_imports: u64,

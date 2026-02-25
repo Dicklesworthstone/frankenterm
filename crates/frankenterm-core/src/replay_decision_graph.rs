@@ -204,8 +204,14 @@ impl DecisionGraph {
                         to_node: node_id,
                         edge_type: EdgeType::TriggeredBy,
                     };
-                    forward.entry(trigger).or_default().push((node_id, EdgeType::TriggeredBy));
-                    reverse.entry(node_id).or_default().push((trigger, EdgeType::TriggeredBy));
+                    forward
+                        .entry(trigger)
+                        .or_default()
+                        .push((node_id, EdgeType::TriggeredBy));
+                    reverse
+                        .entry(node_id)
+                        .or_default()
+                        .push((trigger, EdgeType::TriggeredBy));
                     edges.push(edge);
                 }
             }
@@ -218,8 +224,14 @@ impl DecisionGraph {
                         to_node: node_id,
                         edge_type: EdgeType::OverriddenBy,
                     };
-                    forward.entry(overridden).or_default().push((node_id, EdgeType::OverriddenBy));
-                    reverse.entry(node_id).or_default().push((overridden, EdgeType::OverriddenBy));
+                    forward
+                        .entry(overridden)
+                        .or_default()
+                        .push((node_id, EdgeType::OverriddenBy));
+                    reverse
+                        .entry(node_id)
+                        .or_default()
+                        .push((overridden, EdgeType::OverriddenBy));
                     edges.push(edge);
                 }
             }
@@ -235,8 +247,14 @@ impl DecisionGraph {
                                 to_node: node_id,
                                 edge_type: EdgeType::PrecededBy,
                             };
-                            forward.entry(prev_id).or_default().push((node_id, EdgeType::PrecededBy));
-                            reverse.entry(node_id).or_default().push((prev_id, EdgeType::PrecededBy));
+                            forward
+                                .entry(prev_id)
+                                .or_default()
+                                .push((node_id, EdgeType::PrecededBy));
+                            reverse
+                                .entry(node_id)
+                                .or_default()
+                                .push((prev_id, EdgeType::PrecededBy));
                             edges.push(edge);
                             break;
                         }
@@ -305,7 +323,7 @@ impl DecisionGraph {
             .filter(|n| {
                 self.reverse
                     .get(&n.node_id)
-                    .map_or(true, |preds| preds.is_empty())
+                    .is_none_or(|preds| preds.is_empty())
             })
             .collect()
     }
@@ -520,7 +538,14 @@ mod tests {
             // 4: alert on pane 2 triggered by 3.
             make_event(DecisionType::AlertFired, "alert_1", 250, 2, Some(3), None),
             // 5: override applied, overrides node 2.
-            make_event(DecisionType::OverrideApplied, "ovr_1", 350, 1, None, Some(2)),
+            make_event(
+                DecisionType::OverrideApplied,
+                "ovr_1",
+                350,
+                1,
+                None,
+                Some(2),
+            ),
         ]
     }
 
@@ -539,7 +564,14 @@ mod tests {
 
     #[test]
     fn build_single() {
-        let events = vec![make_event(DecisionType::PatternMatch, "r1", 100, 1, None, None)];
+        let events = vec![make_event(
+            DecisionType::PatternMatch,
+            "r1",
+            100,
+            1,
+            None,
+            None,
+        )];
         let graph = DecisionGraph::from_decisions(&events);
         assert_eq!(graph.node_count(), 1);
         assert_eq!(graph.edge_count(), 0);
@@ -590,7 +622,10 @@ mod tests {
         let chain = graph.causal_chain(2);
         let chain_ids: Vec<u64> = chain.iter().map(|n| n.node_id).collect();
         assert!(chain_ids.contains(&0), "chain should include root ancestor");
-        assert!(chain_ids.contains(&1), "chain should include direct trigger");
+        assert!(
+            chain_ids.contains(&1),
+            "chain should include direct trigger"
+        );
     }
 
     // ── Effects ────────────────────────────────────────────────────────
@@ -672,8 +707,16 @@ mod tests {
         }
         let graph2 = DecisionGraph::from_decisions(&events);
 
-        let can1: Vec<(u64, u64, &str)> = graph1.nodes_canonical().iter().map(|n| n.sort_key()).collect();
-        let can2: Vec<(u64, u64, &str)> = graph2.nodes_canonical().iter().map(|n| n.sort_key()).collect();
+        let can1: Vec<(u64, u64, &str)> = graph1
+            .nodes_canonical()
+            .iter()
+            .map(|n| n.sort_key())
+            .collect();
+        let can2: Vec<(u64, u64, &str)> = graph2
+            .nodes_canonical()
+            .iter()
+            .map(|n| n.sort_key())
+            .collect();
         assert_eq!(can1, can2);
     }
 
@@ -767,7 +810,10 @@ mod tests {
         // Node 4 is last in pane 2, so it may have no effects.
         // (Actually check — it might not have forward edges.)
         let fx_ids: BTreeSet<u64> = fx.iter().map(|n| n.node_id).collect();
-        assert!(!fx_ids.contains(&3), "leaf shouldn't point back to ancestor");
+        assert!(
+            !fx_ids.contains(&3),
+            "leaf shouldn't point back to ancestor"
+        );
     }
 
     // ── Edge types ─────────────────────────────────────────────────────

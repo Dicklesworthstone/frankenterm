@@ -32,7 +32,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-
 // ---------------------------------------------------------------------------
 // Error codes
 // ---------------------------------------------------------------------------
@@ -124,7 +123,7 @@ pub struct InspectRequest {
 }
 
 /// Response data for `replay.inspect`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectData {
     /// Path inspected.
     pub artifact_path: String,
@@ -185,7 +184,7 @@ fn default_suite_dir() -> String {
 }
 
 /// Response data for `replay.diff`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffData {
     /// Whether the diff passed the regression gate.
     pub passed: bool,
@@ -217,7 +216,7 @@ pub struct RegressionSuiteRequest {
 }
 
 /// Response data for `replay.regression_suite`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegressionSuiteData {
     /// Whether all artifacts passed.
     pub passed: bool,
@@ -234,7 +233,7 @@ pub struct RegressionSuiteData {
 }
 
 /// Per-artifact result in a regression suite.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactResultData {
     /// Artifact path.
     pub artifact_path: String,
@@ -286,7 +285,7 @@ pub struct ArtifactListRequest {
 }
 
 /// Response data for `replay.artifact.list`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactListData {
     /// Number of artifacts returned.
     pub count: u64,
@@ -295,7 +294,7 @@ pub struct ArtifactListData {
 }
 
 /// Summary of a single artifact in listing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactSummary {
     pub path: String,
     pub label: String,
@@ -317,7 +316,7 @@ pub struct ArtifactInspectRequest {
 }
 
 /// Response data for `replay.artifact.inspect`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactInspectData {
     pub path: String,
     pub label: String,
@@ -356,7 +355,7 @@ fn default_tier_str() -> String {
 }
 
 /// Response data for `replay.artifact.add`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactAddData {
     pub path: String,
     pub sha256: String,
@@ -376,7 +375,7 @@ pub struct ArtifactRetireRequest {
 }
 
 /// Response data for `replay.artifact.retire`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRetireData {
     pub path: String,
     pub reason: String,
@@ -401,7 +400,7 @@ fn default_max_age_days() -> u64 {
 }
 
 /// Response data for `replay.artifact.prune`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactPruneData {
     pub pruned_count: u64,
     pub bytes_freed: u64,
@@ -447,15 +446,24 @@ mod tests {
         let commands = [
             ("replay.inspect", ReplayRobotCommand::Inspect),
             ("replay.diff", ReplayRobotCommand::Diff),
-            ("replay.regression_suite", ReplayRobotCommand::RegressionSuite),
+            (
+                "replay.regression_suite",
+                ReplayRobotCommand::RegressionSuite,
+            ),
             ("replay.artifact.list", ReplayRobotCommand::ArtifactList),
-            ("replay.artifact.inspect", ReplayRobotCommand::ArtifactInspect),
+            (
+                "replay.artifact.inspect",
+                ReplayRobotCommand::ArtifactInspect,
+            ),
             ("replay.artifact.add", ReplayRobotCommand::ArtifactAdd),
             ("replay.artifact.retire", ReplayRobotCommand::ArtifactRetire),
             ("replay.artifact.prune", ReplayRobotCommand::ArtifactPrune),
         ];
         for (s, expected) in &commands {
-            assert_eq!(ReplayRobotCommand::from_str_command(s), Some(expected.clone()));
+            assert_eq!(
+                ReplayRobotCommand::from_str_command(s),
+                Some(expected.clone())
+            );
         }
     }
 
@@ -617,14 +625,12 @@ mod tests {
             passed_count: 3,
             failed_count: 0,
             errored_count: 0,
-            results: vec![
-                ArtifactResultData {
-                    artifact_path: "a.ftreplay".into(),
-                    passed: true,
-                    gate_result_summary: "Pass".into(),
-                    error: None,
-                },
-            ],
+            results: vec![ArtifactResultData {
+                artifact_path: "a.ftreplay".into(),
+                passed: true,
+                gate_result_summary: "Pass".into(),
+                error: None,
+            }],
         };
         let json = serde_json::to_string(&data).unwrap();
         let restored: RegressionSuiteData = serde_json::from_str(&json).unwrap();
@@ -739,7 +745,10 @@ mod tests {
             REPLAY_ERR_SCHEMA_MISMATCH,
         ];
         for code in &codes {
-            assert!(code.starts_with("replay."), "code should start with 'replay.': {code}");
+            assert!(
+                code.starts_with("replay."),
+                "code should start with 'replay.': {code}"
+            );
         }
     }
 

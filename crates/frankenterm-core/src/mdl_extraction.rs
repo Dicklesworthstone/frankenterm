@@ -66,7 +66,7 @@ impl Default for MdlConfig {
 /// A discrete command block delimited by OSC 133 markers.
 ///
 /// Represents one shell command from prompt → execution → completion.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandBlock {
     /// Sequential index within the recovery window.
     pub index: u32,
@@ -193,7 +193,7 @@ fn estimate_compressed_len(data: &[u8], _level: u32) -> usize {
 
     // Model: compressed ≈ data_len * (base_ratio + uniqueness_factor)
     // base_ratio ~0.1 for highly repetitive, ~0.9 for random
-    let base_ratio = 0.1 + 0.8 * uniqueness_ratio;
+    let base_ratio = 0.8f64.mul_add(uniqueness_ratio, 0.1);
     let estimated = (data.len() as f64 * base_ratio).ceil() as usize;
 
     // Never compress to more than original.

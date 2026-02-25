@@ -7,8 +7,8 @@
 //! - [`WatchdogConfig`] — Stall detection and force-termination policy.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // ============================================================================
 // SimulationGuard — thread-local simulation flag
@@ -28,7 +28,10 @@ impl SimulationGuard {
     #[must_use]
     pub fn enter() -> Self {
         SIMULATION_ACTIVE.with(|f| {
-            assert!(!f.get(), "SimulationGuard::enter called while already in simulation mode");
+            assert!(
+                !f.get(),
+                "SimulationGuard::enter called while already in simulation mode"
+            );
             f.set(true);
         });
         Self { _private: () }
@@ -44,14 +47,13 @@ impl SimulationGuard {
     ///
     /// Panics with a clear message if simulation mode is active.
     pub fn assert_not_simulating(operation: &str) {
-        if Self::is_active() {
-            panic!(
-                "SIMULATION SAFETY VIOLATION: attempted live operation '{}' \
-                 during counterfactual simulation. This indicates a barrier \
-                 leak — all side effects must go through SideEffectBarrier.",
-                operation
-            );
-        }
+        assert!(
+            !Self::is_active(),
+            "SIMULATION SAFETY VIOLATION: attempted live operation '{}' \
+             during counterfactual simulation. This indicates a barrier \
+             leak — all side effects must go through SideEffectBarrier.",
+            operation
+        );
     }
 }
 
@@ -134,7 +136,10 @@ impl std::fmt::Display for LimitViolation {
                 elapsed_ms,
             } => write!(f, "max wall clock exceeded: {elapsed_ms}ms/{limit_ms}ms"),
             Self::MemoryWarning { threshold, current } => {
-                write!(f, "memory warning: {current} events (threshold {threshold})")
+                write!(
+                    f,
+                    "memory warning: {current} events (threshold {threshold})"
+                )
             }
             Self::MaxConcurrent { limit, current } => {
                 write!(f, "max concurrent exceeded: {current}/{limit}")
@@ -320,7 +325,7 @@ pub struct ConcurrencyToken<'a> {
     gate: &'a ConcurrencyGate,
 }
 
-impl<'a> Drop for ConcurrencyToken<'a> {
+impl Drop for ConcurrencyToken<'_> {
     fn drop(&mut self) {
         self.gate.current.fetch_sub(1, Ordering::Relaxed);
     }
@@ -520,7 +525,10 @@ watchdog_timeout_ms = 5000
         assert_eq!(tracker.record_event(500), CheckResult::Ok);
         // Exceed limit.
         let result = tracker.record_event(1500);
-        let is_halt = matches!(result, CheckResult::Halt(LimitViolation::MaxWallClock { .. }));
+        let is_halt = matches!(
+            result,
+            CheckResult::Halt(LimitViolation::MaxWallClock { .. })
+        );
         assert!(is_halt);
     }
 
@@ -538,7 +546,10 @@ watchdog_timeout_ms = 5000
         }
         // 5th event triggers warning.
         let result = tracker.record_event(4);
-        let is_warning = matches!(result, CheckResult::Warning(LimitViolation::MemoryWarning { .. }));
+        let is_warning = matches!(
+            result,
+            CheckResult::Warning(LimitViolation::MemoryWarning { .. })
+        );
         assert!(is_warning);
         // Subsequent events don't re-warn.
         assert_eq!(tracker.record_event(5), CheckResult::Ok);
@@ -559,7 +570,10 @@ watchdog_timeout_ms = 5000
         assert_eq!(tracker.check_watchdog(200), CheckResult::Ok);
         // Check at 1200ms: stalled.
         let result = tracker.check_watchdog(1200);
-        let is_halt = matches!(result, CheckResult::Halt(LimitViolation::WatchdogTimeout { .. }));
+        let is_halt = matches!(
+            result,
+            CheckResult::Halt(LimitViolation::WatchdogTimeout { .. })
+        );
         assert!(is_halt);
     }
 
@@ -599,10 +613,7 @@ watchdog_timeout_ms = 5000
         let _t1 = gate.try_acquire().unwrap();
         let result = gate.try_acquire();
         assert!(result.is_err());
-        let is_concurrent = matches!(
-            result.unwrap_err(),
-            LimitViolation::MaxConcurrent { .. }
-        );
+        let is_concurrent = matches!(result.unwrap_err(), LimitViolation::MaxConcurrent { .. });
         assert!(is_concurrent);
     }
 

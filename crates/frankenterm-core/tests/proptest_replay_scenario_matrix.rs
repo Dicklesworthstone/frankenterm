@@ -46,25 +46,25 @@ fn arb_decisions(max_len: usize) -> impl Strategy<Value = Vec<String>> {
 }
 
 fn arb_diff_summary() -> impl Strategy<Value = DiffSummary> {
-    (0u64..100, 0u64..100, 0u64..100, 0u64..100).prop_map(|(unchanged, added, removed, modified)| {
-        DiffSummary {
+    (0u64..100, 0u64..100, 0u64..100, 0u64..100).prop_map(
+        |(unchanged, added, removed, modified)| DiffSummary {
             total_decisions: unchanged + added + removed + modified,
             unchanged,
             added,
             removed,
             modified,
-        }
-    })
+        },
+    )
 }
 
-fn arb_artifact() -> impl Strategy<Value = ArtifactEntry> {
+fn _arb_artifact() -> impl Strategy<Value = ArtifactEntry> {
     arb_label().prop_map(|label| ArtifactEntry {
         path: format!("{}.ftreplay", label),
         label,
     })
 }
 
-fn arb_override_entry() -> impl Strategy<Value = OverrideEntry> {
+fn _arb_override_entry() -> impl Strategy<Value = OverrideEntry> {
     arb_label().prop_map(|label| OverrideEntry {
         path: format!("{}.ftoverride", label),
         label,

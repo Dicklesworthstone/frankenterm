@@ -132,7 +132,7 @@ impl DurationStats {
         let mut sorted = positive.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = if count % 2 == 0 {
-            (sorted[count / 2 - 1] + sorted[count / 2]) / 2.0
+            f64::midpoint(sorted[count / 2 - 1], sorted[count / 2])
         } else {
             sorted[count / 2]
         };
@@ -196,7 +196,7 @@ impl DurationStats {
             return self.mean_ms;
         }
         let z = standard_normal_quantile(p);
-        (self.ln_mu + self.ln_sigma * z).exp()
+        self.ln_sigma.mul_add(z, self.ln_mu).exp()
     }
 }
 
@@ -339,7 +339,9 @@ impl TimeoutCalculator {
     pub fn expected_loss(&self, stats: &DurationStats, t_ms: f64) -> f64 {
         let p_hang = stats.survival(t_ms);
         let p_premature = stats.cdf(t_ms);
-        self.config.cost_hang * p_hang + self.config.cost_premature_kill * p_premature
+        self.config
+            .cost_hang
+            .mul_add(p_hang, self.config.cost_premature_kill * p_premature)
     }
 
     /// Find the optimal timeout that minimizes expected loss.
@@ -390,7 +392,7 @@ impl TimeoutCalculator {
             }
         }
 
-        let optimal = (a + b) / 2.0;
+        let optimal = f64::midpoint(a, b);
         let loss = self.expected_loss(stats, optimal);
 
         trace!(optimal_ms = optimal, loss, "Golden section converged");
@@ -516,14 +518,19 @@ fn standard_normal_cdf(x: f64) -> f64 {
     let sign = if x >= 0.0 { 1.0 } else { -1.0 };
     let abs_x = x.abs();
 
-    let t = 1.0 / (1.0 + 0.231_641_9 * abs_x);
+    let t = 1.0 / 0.231_641_9f64.mul_add(abs_x, 1.0);
     let t2 = t * t;
     let t3 = t2 * t;
     let t4 = t3 * t;
     let t5 = t4 * t;
 
-    let poly = 0.319_381_530 * t - 0.356_563_782 * t2 + 1.781_477_937 * t3 - 1.821_255_978 * t4
-        + 1.330_274_429 * t5;
+    let poly = 1.330_274_429f64.mul_add(
+        t5,
+        1.821_255_978f64.mul_add(
+            -t4,
+            1.781_477_937f64.mul_add(t3, 0.319_381_530f64.mul_add(t, -(0.356_563_782 * t2))),
+        ),
+    );
 
     let pdf = (-abs_x * abs_x / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt();
     let cdf_positive = 1.0 - pdf * poly;
@@ -549,7 +556,7 @@ fn standard_normal_quantile(p: f64) -> f64 {
     let mut hi = 8.0f64;
 
     for _ in 0..100 {
-        let mid = (lo + hi) / 2.0;
+        let mid = f64::midpoint(lo, hi);
         let cdf_mid = standard_normal_cdf(mid);
         if cdf_mid < p {
             lo = mid;
@@ -561,7 +568,7 @@ fn standard_normal_quantile(p: f64) -> f64 {
         }
     }
 
-    (lo + hi) / 2.0
+    f64::midpoint(lo, hi)
 }
 
 // =============================================================================

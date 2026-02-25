@@ -19,9 +19,8 @@
 //! - Needs_compaction respects configured limit
 
 use frankenterm_core::plan::{
-    AssignmentId, Mission, MissionId, MissionJournal, MissionJournalEntry,
-    MissionJournalEntryKind, MissionJournalReplayError, MissionJournalReplayReport,
-    MissionJournalState, MissionKillSwitchLevel, MissionLifecycleState,
+    AssignmentId, Mission, MissionId, MissionJournal, MissionJournalEntry, MissionJournalEntryKind,
+    MissionJournalReplayReport, MissionJournalState, MissionKillSwitchLevel, MissionLifecycleState,
     MissionLifecycleTransitionKind, MissionOwnership,
 };
 use proptest::prelude::*;
@@ -70,21 +69,30 @@ fn arb_non_empty_string() -> impl Strategy<Value = String> {
 
 fn arb_entry_kind() -> impl Strategy<Value = MissionJournalEntryKind> {
     prop_oneof![
-        (arb_lifecycle_state(), arb_lifecycle_state(), arb_transition_kind()).prop_map(
-            |(from, to, tk)| MissionJournalEntryKind::LifecycleTransition {
-                from,
-                to,
-                transition_kind: tk,
-            }
-        ),
+        (
+            arb_lifecycle_state(),
+            arb_lifecycle_state(),
+            arb_transition_kind()
+        )
+            .prop_map(
+                |(from, to, tk)| MissionJournalEntryKind::LifecycleTransition {
+                    from,
+                    to,
+                    transition_kind: tk,
+                }
+            ),
         (arb_kill_switch_level(), arb_kill_switch_level()).prop_map(|(from, to)| {
             MissionJournalEntryKind::KillSwitchChange {
                 level_from: from,
                 level_to: to,
             }
         }),
-        (arb_non_empty_string(), any::<bool>(), arb_non_empty_string()).prop_map(
-            |(aid, has_before, after)| {
+        (
+            arb_non_empty_string(),
+            any::<bool>(),
+            arb_non_empty_string()
+        )
+            .prop_map(|(aid, has_before, after)| {
                 MissionJournalEntryKind::AssignmentOutcome {
                     assignment_id: AssignmentId(aid),
                     outcome_before: if has_before {
@@ -94,8 +102,7 @@ fn arb_entry_kind() -> impl Strategy<Value = MissionJournalEntryKind> {
                     },
                     outcome_after: after,
                 }
-            }
-        ),
+            }),
         (arb_non_empty_string(), arb_lifecycle_state(), 0usize..10).prop_map(
             |(hash, state, count)| MissionJournalEntryKind::Checkpoint {
                 mission_hash: hash,
@@ -133,11 +140,7 @@ fn arb_journal_entry() -> impl Strategy<Value = MissionJournalEntry> {
                 mission_version: 1,
                 initiated_by: by,
                 reason_code: reason,
-                error_code: if has_err {
-                    Some("ERR001".into())
-                } else {
-                    None
-                },
+                error_code: if has_err { Some("ERR001".into()) } else { None },
             },
         )
 }

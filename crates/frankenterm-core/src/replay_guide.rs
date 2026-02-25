@@ -83,8 +83,16 @@ impl GuideWorkflow {
     pub fn step_descriptions(&self) -> Vec<GuideStepInfo> {
         match self {
             Self::Investigate => vec![
-                GuideStepInfo::new(0, "select_artifact", "Select artifact from registry or recent captures"),
-                GuideStepInfo::new(1, "replay_verbose", "Replay with verbose provenance logging"),
+                GuideStepInfo::new(
+                    0,
+                    "select_artifact",
+                    "Select artifact from registry or recent captures",
+                ),
+                GuideStepInfo::new(
+                    1,
+                    "replay_verbose",
+                    "Replay with verbose provenance logging",
+                ),
                 GuideStepInfo::new(2, "highlight_anomalies", "Highlight anomalous decisions"),
                 GuideStepInfo::new(3, "suggest_remediation", "Present remediation suggestions"),
             ],
@@ -92,7 +100,11 @@ impl GuideWorkflow {
                 GuideStepInfo::new(0, "select_baseline", "Select baseline artifact(s)"),
                 GuideStepInfo::new(1, "load_overrides", "Create or load override package"),
                 GuideStepInfo::new(2, "run_diff", "Run baseline + candidate replay with diff"),
-                GuideStepInfo::new(3, "show_report", "Show decision-diff report with risk scoring"),
+                GuideStepInfo::new(
+                    3,
+                    "show_report",
+                    "Show decision-diff report with risk scoring",
+                ),
                 GuideStepInfo::new(4, "suggest_next", "Suggest next steps"),
             ],
             Self::RegressionCheck => vec![
@@ -186,7 +198,7 @@ fn default_tolerance() -> u64 {
 }
 
 /// Output from a single guide step.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuideStepOutput {
     /// Which workflow produced this.
     pub workflow: GuideWorkflow,
@@ -342,7 +354,7 @@ pub struct GuideStepRequest {
 }
 
 /// Robot response for guide start.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuideStartData {
     /// Workflow that was started.
     pub workflow: GuideWorkflow,
@@ -355,7 +367,7 @@ pub struct GuideStartData {
 }
 
 /// Robot response listing available workflows.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuideListData {
     /// Available workflows.
     pub workflows: Vec<GuideWorkflowInfo>,
@@ -439,11 +451,7 @@ pub fn execute_step(input: &GuideStepInput) -> GuideStepOutput {
 
     let total_steps = input.workflow.step_count();
     let has_next = input.step + 1 < total_steps;
-    let next_step = if has_next {
-        Some(input.step + 1)
-    } else {
-        None
-    };
+    let next_step = if has_next { Some(input.step + 1) } else { None };
 
     if input.step >= total_steps {
         return GuideStepOutput {
@@ -462,9 +470,13 @@ pub fn execute_step(input: &GuideStepInput) -> GuideStepOutput {
     }
 
     match input.workflow {
-        GuideWorkflow::Investigate => execute_investigate_step(input, step_info, has_next, next_step),
+        GuideWorkflow::Investigate => {
+            execute_investigate_step(input, step_info, has_next, next_step)
+        }
         GuideWorkflow::TestRule => execute_test_rule_step(input, step_info, has_next, next_step),
-        GuideWorkflow::RegressionCheck => execute_regression_check_step(input, step_info, has_next, next_step),
+        GuideWorkflow::RegressionCheck => {
+            execute_regression_check_step(input, step_info, has_next, next_step)
+        }
     }
 }
 
@@ -643,8 +655,8 @@ fn execute_test_rule_step(
     match input.step {
         0 => {
             // Step 0: Select baseline artifact(s)
-            let has_baseline = input.context.baseline_path.is_some()
-                || !input.context.artifact_paths.is_empty();
+            let has_baseline =
+                input.context.baseline_path.is_some() || !input.context.artifact_paths.is_empty();
             if has_baseline {
                 let path = input
                     .context
@@ -718,11 +730,11 @@ fn execute_test_rule_step(
         }
         2 => {
             // Step 2: Run baseline + candidate replay with diff
-            let baseline = input
+            let baseline = input.context.baseline_path.as_deref().or(input
                 .context
-                .baseline_path
-                .as_deref()
-                .or(input.context.artifact_paths.first().map(|s| s.as_str()));
+                .artifact_paths
+                .first()
+                .map(|s| s.as_str()));
             let candidate = input.context.candidate_path.as_deref();
 
             if baseline.is_none() || candidate.is_none() {
@@ -1314,7 +1326,11 @@ mod tests {
         assert_eq!(output.status, GuideStepStatus::Complete);
         assert!(!output.has_next);
         let suggestions = output.data["suggestions"].as_array().unwrap();
-        assert!(suggestions.iter().any(|s| s.as_str().unwrap().contains("safe to merge")));
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("safe to merge"))
+        );
     }
 
     #[test]
@@ -1329,7 +1345,11 @@ mod tests {
         };
         let output = execute_step(&input);
         let suggestions = output.data["suggestions"].as_array().unwrap();
-        assert!(suggestions.iter().any(|s| s.as_str().unwrap().contains("reverting")));
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("reverting"))
+        );
     }
 
     // ── Regression-check workflow ───────────────────────────────────
@@ -1518,7 +1538,7 @@ mod tests {
 
     #[test]
     fn investigate_full_traversal() {
-        let mut ctx = GuideContext {
+        let ctx = GuideContext {
             artifact_paths: vec!["incident.ftreplay".into()],
             ..Default::default()
         };

@@ -152,7 +152,7 @@ pub struct DetectedParam {
 // =============================================================================
 
 /// A template variable replacing a detected parameter.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateVar {
     /// Variable name, e.g., `file_0`, `line_1`.
     pub name: String,
@@ -171,7 +171,7 @@ pub struct TemplateVar {
 // =============================================================================
 
 /// A command with parameters replaced by template variables.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneralizedCommand {
     /// Original command text.
     pub original: String,
@@ -313,7 +313,7 @@ fn kl_bernoulli(q: f64, p: f64) -> f64 {
     if q <= 0.0 || q >= 1.0 || p <= 0.0 || p >= 1.0 {
         return 0.0;
     }
-    q * (q / p).ln() + (1.0 - q) * ((1.0 - q) / (1.0 - p)).ln()
+    q.mul_add((q / p).ln(), (1.0 - q) * ((1.0 - q) / (1.0 - p)).ln())
 }
 
 // =============================================================================
@@ -1084,7 +1084,7 @@ fn validate_against_charset(value: &str, charset: &ParsedCharset) -> bool {
 // =============================================================================
 
 /// Aggregate statistics for generalization across multiple sessions.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneralizationStats {
     /// Total sessions processed.
     pub total_sessions: u64,

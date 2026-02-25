@@ -16,30 +16,32 @@ fn arb_fill_ratio() -> impl Strategy<Value = f64> {
 }
 
 fn arb_positive_variance() -> impl Strategy<Value = f64> {
-    (0.001..=10.0_f64)
+    0.001..=10.0_f64
 }
 
 fn arb_mean() -> impl Strategy<Value = f64> {
-    (-5.0..=5.0_f64)
+    -5.0..=5.0_f64
 }
 
 fn arb_delta() -> impl Strategy<Value = f64> {
-    (0.001..=0.5_f64)
+    0.001..=0.5_f64
 }
 
 fn arb_starvation_cost() -> impl Strategy<Value = f64> {
-    (0.01..=0.99_f64)
+    0.01..=0.99_f64
 }
 
 fn arb_observation() -> impl Strategy<Value = QueueObservation> {
-    (any::<u64>(), arb_fill_ratio(), any::<bool>()).prop_map(|(pane_id, fill_ratio, frame_dropped)| {
-        QueueObservation {
-            pane_id: pane_id % 100, // Keep pane IDs bounded
-            fill_ratio,
-            frame_dropped,
-            external_cause: None,
-        }
-    })
+    (any::<u64>(), arb_fill_ratio(), any::<bool>()).prop_map(
+        |(pane_id, fill_ratio, frame_dropped)| {
+            QueueObservation {
+                pane_id: pane_id % 100, // Keep pane IDs bounded
+                fill_ratio,
+                frame_dropped,
+                external_cause: None,
+            }
+        },
+    )
 }
 
 fn arb_external_evidence() -> impl Strategy<Value = ExternalCauseEvidence> {
@@ -59,18 +61,20 @@ fn arb_config() -> impl Strategy<Value = PacBayesConfig> {
     (
         arb_delta(),
         arb_starvation_cost(),
-        arb_fill_ratio(),     // prior_threshold_mean
+        arb_fill_ratio(),        // prior_threshold_mean
         arb_positive_variance(), // prior_threshold_variance
-        0..=50_usize,         // warmup_observations
+        0..=50_usize,            // warmup_observations
     )
-        .prop_map(|(delta, starvation_cost, prior_mean, prior_var, warmup)| PacBayesConfig {
-            delta,
-            starvation_cost,
-            prior_threshold_mean: prior_mean,
-            prior_threshold_variance: prior_var,
-            warmup_observations: warmup,
-            ..Default::default()
-        })
+        .prop_map(
+            |(delta, starvation_cost, prior_mean, prior_var, warmup)| PacBayesConfig {
+                delta,
+                starvation_cost,
+                prior_threshold_mean: prior_mean,
+                prior_threshold_variance: prior_var,
+                warmup_observations: warmup,
+                ..Default::default()
+            },
+        )
 }
 
 // ── Gaussian Posterior Properties ──────────────────────────────────────

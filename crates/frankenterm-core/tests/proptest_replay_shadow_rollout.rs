@@ -25,29 +25,41 @@
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
-use frankenterm_core::replay_ci_gate::{
-    GateCheck, GateId, GateReport, GateStatus, ALL_GATES,
-};
+use frankenterm_core::replay_ci_gate::{ALL_GATES, GateCheck, GateId, GateReport};
 use frankenterm_core::replay_shadow_rollout::{
-    RolloutStage, RolloutConfig, EnforcementMode,
-    evaluate_enforcement, calculate_flaky_rate, evaluate_rollback_triggers,
-    evaluate_rollback_drill, weekly_digest,
-    AlertLevel, RolloutMetrics, DrillResult, FlakyRateMetrics,
-    RollbackTrigger, EnforcementDecision,
+    AlertLevel, DrillResult, EnforcementDecision, EnforcementMode, FlakyRateMetrics,
+    RollbackTrigger, RolloutConfig, RolloutMetrics, RolloutStage, calculate_flaky_rate,
+    evaluate_enforcement, evaluate_rollback_drill, evaluate_rollback_triggers, weekly_digest,
 };
 
-fn pass_report(gate: GateId) -> GateReport {
-    GateReport::new(gate, vec![GateCheck {
-        name: "ok".into(), passed: true, message: "p".into(),
-        duration_ms: None, artifact_path: None,
-    }], 100, "2026-01-01T00:00:00Z".into())
+fn _pass_report(gate: GateId) -> GateReport {
+    GateReport::new(
+        gate,
+        vec![GateCheck {
+            name: "ok".into(),
+            passed: true,
+            message: "p".into(),
+            duration_ms: None,
+            artifact_path: None,
+        }],
+        100,
+        "2026-01-01T00:00:00Z".into(),
+    )
 }
 
 fn fail_report(gate: GateId) -> GateReport {
-    GateReport::new(gate, vec![GateCheck {
-        name: "bad".into(), passed: false, message: "f".into(),
-        duration_ms: None, artifact_path: None,
-    }], 200, "2026-01-01T00:00:00Z".into())
+    GateReport::new(
+        gate,
+        vec![GateCheck {
+            name: "bad".into(),
+            passed: false,
+            message: "f".into(),
+            duration_ms: None,
+            artifact_path: None,
+        }],
+        200,
+        "2026-01-01T00:00:00Z".into(),
+    )
 }
 
 proptest! {

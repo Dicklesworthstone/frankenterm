@@ -240,7 +240,7 @@ impl EvidenceSection {
         Self {
             entry_count: digest.entry_count,
             is_complete: digest.is_complete,
-            verdict: digest.overall_verdict.clone(),
+            verdict: digest.overall_verdict,
             categories: digest
                 .categories_present
                 .iter()
@@ -261,7 +261,7 @@ impl EvidenceSection {
 }
 
 /// Timeline event for the card.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimelineEvent {
     /// Timestamp (ms).
     pub timestamp_ms: u64,

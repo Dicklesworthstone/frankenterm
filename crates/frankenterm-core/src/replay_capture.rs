@@ -1193,14 +1193,12 @@ mod tests {
             seq,
             content: content.to_string(),
             kind: crate::ingest::CapturedSegmentKind::Delta,
-            captured_at: 1700000000000,
+            captured_at: epoch_ms_now() as i64,
         }
     }
 
     fn make_segment_recent(pane_id: u64, content: &str, seq: u64) -> CapturedSegment {
-        let mut segment = make_segment(pane_id, content, seq);
-        segment.captured_at = epoch_ms_now() as i64;
-        segment
+        make_segment(pane_id, content, seq)
     }
 
     fn make_gap_segment(pane_id: u64, reason: &str, seq: u64) -> CapturedSegment {
@@ -1211,7 +1209,7 @@ mod tests {
             kind: crate::ingest::CapturedSegmentKind::Gap {
                 reason: reason.to_string(),
             },
-            captured_at: 1700000000000,
+            captured_at: epoch_ms_now() as i64,
         }
     }
 
@@ -1749,7 +1747,7 @@ mod tests {
             gap_reason: None,
             encoding: RecorderTextEncoding::Utf8,
             redaction: RecorderRedactionLevel::None,
-            occurred_at_ms: 1700000000000,
+            occurred_at_ms: epoch_ms_now(),
             sequence: 0,
             global_sequence: 0,
         };
@@ -1774,7 +1772,7 @@ mod tests {
             source: RecorderEventSource::RobotMode,
             ingress_kind: RecorderIngressKind::SendText,
             redaction: RecorderRedactionLevel::None,
-            occurred_at_ms: 1_700_000_000_000,
+            occurred_at_ms: epoch_ms_now(),
             outcome: IngressOutcome::Denied {
                 reason: "policy gate".to_string(),
             },
@@ -2045,7 +2043,7 @@ mod tests {
             serde_json::json!({"severity":"high"}),
             Some("segment:1".to_string()),
             Some(0.95),
-            1_700_000_123_000,
+            epoch_ms_now(),
         );
 
         adapter.capture_decision(RecorderEventSource::WeztermMux, None, decision);

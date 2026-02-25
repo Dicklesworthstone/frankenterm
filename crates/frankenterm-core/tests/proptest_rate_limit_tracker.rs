@@ -43,7 +43,7 @@ fn arb_pane_id() -> impl Strategy<Value = u64> {
 }
 
 /// Strategy for rule IDs.
-fn arb_rule_id() -> impl Strategy<Value = String> {
+fn _arb_rule_id() -> impl Strategy<Value = String> {
     prop_oneof![
         Just("codex.rate_limit.detected".to_string()),
         Just("claude_code.rate_limit.detected".to_string()),
@@ -52,7 +52,7 @@ fn arb_rule_id() -> impl Strategy<Value = String> {
 }
 
 /// Strategy for time offsets (in seconds from a base instant).
-fn arb_time_offset_secs() -> impl Strategy<Value = u64> {
+fn _arb_time_offset_secs() -> impl Strategy<Value = u64> {
     0u64..7200
 }
 

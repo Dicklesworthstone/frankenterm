@@ -140,10 +140,14 @@ fn likelihood_ratio(
     collapse_std: f64,
 ) -> f64 {
     // Gaussian log-density: -0.5 * ((x - μ) / σ)² - ln(σ)
-    let log_h0 = -0.5 * ((h - baseline_mean) / baseline_std).powi(2)
-        - baseline_std.ln();
-    let log_h1 = -0.5 * ((h - collapse_mean) / collapse_std).powi(2)
-        - collapse_std.ln();
+    let log_h0 = (-0.5f64).mul_add(
+        ((h - baseline_mean) / baseline_std).powi(2),
+        -baseline_std.ln(),
+    );
+    let log_h1 = (-0.5f64).mul_add(
+        ((h - collapse_mean) / collapse_std).powi(2),
+        -collapse_std.ln(),
+    );
 
     let log_lr = log_h1 - log_h0;
 
@@ -457,7 +461,8 @@ impl EntropyAnomalyDetector {
             config.signature_bloom_capacity,
             config.signature_bloom_fp_rate,
         );
-        let baseline_mean = (config.baseline_entropy_low + config.baseline_entropy_high) / 2.0;
+        let baseline_mean =
+            f64::midpoint(config.baseline_entropy_low, config.baseline_entropy_high);
         Self {
             config,
             pane_states: std::collections::HashMap::new(),
@@ -553,7 +558,7 @@ impl EntropyAnomalyDetector {
             self.baseline_mean += delta / n;
             if n > 1.0 {
                 let delta2 = entropy - self.baseline_mean;
-                self.baseline_variance += (delta * delta2 - self.baseline_variance) / n;
+                self.baseline_variance += delta.mul_add(delta2, -self.baseline_variance) / n;
             }
         }
 
@@ -609,8 +614,10 @@ impl EntropyAnomalyDetector {
     /// Reset all pane states and baseline statistics.
     pub fn reset(&mut self) {
         self.pane_states.clear();
-        self.baseline_mean =
-            (self.config.baseline_entropy_low + self.config.baseline_entropy_high) / 2.0;
+        self.baseline_mean = f64::midpoint(
+            self.config.baseline_entropy_low,
+            self.config.baseline_entropy_high,
+        );
         self.baseline_variance = 2.0;
         self.baseline_n = 0;
     }
@@ -900,8 +907,7 @@ mod tests {
             assert!(
                 !decision.should_block,
                 "Progress bar should not trigger block (e_value={}, error_density={})",
-                decision.e_value,
-                decision.error_density
+                decision.e_value, decision.error_density
             );
         }
     }
@@ -938,7 +944,11 @@ mod tests {
                 break;
             }
         }
-        assert!(blocked, "Repeated errors should eventually trigger block (entropy={})", actual_entropy);
+        assert!(
+            blocked,
+            "Repeated errors should eventually trigger block (entropy={})",
+            actual_entropy
+        );
     }
 
     #[test]
@@ -1140,7 +1150,8 @@ mod tests {
 
     #[test]
     fn e2e_normal_then_collapse_transition() {
-        let error_loop = b"ERROR: connection refused\nERROR: connection refused\nERROR: connection refused\n";
+        let error_loop =
+            b"ERROR: connection refused\nERROR: connection refused\nERROR: connection refused\n";
         let error_entropy = crate::entropy_accounting::compute_entropy(error_loop);
 
         let config = EntropyAnomalyConfig {

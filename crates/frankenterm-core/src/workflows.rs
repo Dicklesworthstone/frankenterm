@@ -1732,10 +1732,9 @@ impl Workflow for DescriptorWorkflow {
                 } => {
                     let mut actual_text = test_text;
                     if actual_text.contains("${trigger}") {
-                        let trigger_str = ctx_clone.trigger().map_or_else(
-                            || String::new(),
-                            |val| serde_json::to_string(val).unwrap_or_default(),
-                        );
+                        let trigger_str = ctx_clone.trigger().map_or_else(String::new, |val| {
+                            serde_json::to_string(val).unwrap_or_default()
+                        });
                         actual_text = actual_text.replace("${trigger}", &trigger_str);
                     }
                     let matches = match matcher {

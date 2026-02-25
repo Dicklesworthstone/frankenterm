@@ -17,10 +17,9 @@
 //! - Step results ordering matches plan ordinal
 
 use frankenterm_core::plan::{
-    execute_commit_phase, MissionActorRole, MissionKillSwitchLevel, MissionTxContract,
-    MissionTxState, StepAction, TxCommitOutcome, TxCommitReport, TxCommitStepInput,
-    TxCommitStepOutcome, TxCommitStepResult, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId,
-    TxReceipt, TxStep, TxStepId,
+    MissionActorRole, MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction,
+    TxCommitOutcome, TxCommitReport, TxCommitStepInput, TxCommitStepOutcome, TxCommitStepResult,
+    TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxStep, TxStepId, execute_commit_phase,
 };
 use proptest::prelude::*;
 

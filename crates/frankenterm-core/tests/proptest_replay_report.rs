@@ -55,7 +55,7 @@ fn arb_meta() -> impl Strategy<Value = ReportMeta> {
         })
 }
 
-fn arb_decision_type() -> impl Strategy<Value = DecisionType> {
+fn _arb_decision_type() -> impl Strategy<Value = DecisionType> {
     prop_oneof![
         Just(DecisionType::PatternMatch),
         Just(DecisionType::WorkflowStep),

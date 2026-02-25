@@ -3,10 +3,10 @@
 //! Verifies invariants of PaneMergeResolver, MergeEvent, MergeConfig,
 //! ClockAnomalyAnnotation, and merge determinism.
 
-use frankenterm_core::event_id::{RecorderMergeKey, StreamKind};
+use frankenterm_core::event_id::StreamKind;
 use frankenterm_core::replay_merge::{
-    make_merge_event, ClockAnomalyAnnotation, MergeConfig, MergeEvent, MergeEventPayload,
-    MergeStats, PaneMergeResolver,
+    ClockAnomalyAnnotation, MergeConfig, MergeEvent, MergeStats, PaneMergeResolver,
+    make_merge_event,
 };
 use proptest::prelude::*;
 
@@ -26,10 +26,9 @@ fn arb_merge_event(
     ts_range: std::ops::Range<u64>,
     pane_id: u64,
 ) -> impl Strategy<Value = MergeEvent> {
-    (ts_range, arb_stream_kind(), 0..1000_u64, "[a-z0-9]{4,12}")
-        .prop_map(move |(ts, sk, seq, eid)| {
-            make_merge_event(ts, pane_id, sk, seq, &eid, "test", false)
-        })
+    (ts_range, arb_stream_kind(), 0..1000_u64, "[a-z0-9]{4,12}").prop_map(
+        move |(ts, sk, seq, eid)| make_merge_event(ts, pane_id, sk, seq, &eid, "test", false),
+    )
 }
 
 /// Generate a sorted stream of events for a single pane.

@@ -63,7 +63,7 @@ impl Default for ReplayConfig {
 // =============================================================================
 
 /// A historical incident to replay against.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoricalIncident {
     /// Unique incident ID.
     pub incident_id: String,
@@ -328,7 +328,7 @@ impl ReplayHarness {
         let output_sim = text_similarity(&incident.output_before, &incident.output_after);
 
         // Score combines command match and output characteristics.
-        let match_score = cmd_similarity * 0.7 + output_sim * 0.3;
+        let match_score = cmd_similarity.mul_add(0.7, output_sim * 0.3);
 
         if match_score >= 0.5 {
             ReplayVerdict::Pass {

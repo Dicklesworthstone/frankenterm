@@ -53,6 +53,7 @@ impl FailureMode {
 
 /// A step in the triage decision tree.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct TriageStep {
     /// What to check in the logs.
     instruction: String,
@@ -246,6 +247,7 @@ struct LogDatabase {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct LogEntry {
     level: LogLevel,
     fields: HashMap<String, String>,
@@ -405,6 +407,7 @@ fn evaluate_explainability(
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ExplainabilityResult {
     failure_mode: FailureMode,
     steps_total: usize,

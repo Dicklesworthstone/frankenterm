@@ -155,8 +155,7 @@ impl ArsSecretScanner {
 
         let automaton = AhoCorasick::new(&patterns).expect("valid Aho-Corasick patterns");
 
-        let pattern_names: Vec<(&'static str, &'static str)> =
-            BUILTIN_PATTERNS.iter().copied().collect();
+        let pattern_names: Vec<(&'static str, &'static str)> = BUILTIN_PATTERNS.to_vec();
 
         Self {
             config,

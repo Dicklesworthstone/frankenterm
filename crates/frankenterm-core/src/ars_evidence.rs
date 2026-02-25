@@ -31,7 +31,7 @@ use tracing::debug;
 // =============================================================================
 
 /// Configuration for evidence ledger generation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EvidenceConfig {
     /// Minimum number of evidence entries required for a valid ledger.
@@ -177,7 +177,7 @@ impl From<bool> for EvidenceValue {
 // =============================================================================
 
 /// Final digest of a complete evidence ledger.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerDigest {
     /// SHA-256 hash of the final entry (root of the hash chain).
     pub root_hash: String,
@@ -436,7 +436,7 @@ impl EvidenceLedger {
 }
 
 /// Result of chain verification.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainVerification {
     /// Whether the entire chain is valid.
     pub is_valid: bool,

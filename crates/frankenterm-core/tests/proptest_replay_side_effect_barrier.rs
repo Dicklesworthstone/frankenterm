@@ -5,8 +5,8 @@
 
 use frankenterm_core::policy::ActionKind;
 use frankenterm_core::replay_side_effect_barrier::{
-    CounterfactualBarrier, EffectOutcome, EffectRequest, EffectType, LiveBarrier, OverrideRule,
-    ReplayBarrier, SideEffectBarrier, SideEffectEntry, SideEffectLog,
+    CounterfactualBarrier, EffectRequest, EffectType, LiveBarrier, OverrideRule, ReplayBarrier,
+    SideEffectBarrier, SideEffectEntry, SideEffectLog,
 };
 use proptest::prelude::*;
 use std::collections::HashMap;

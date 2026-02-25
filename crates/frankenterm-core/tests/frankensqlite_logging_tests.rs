@@ -3,7 +3,7 @@
 //! Verifies that critical recorder/migration/rollback code paths emit structured
 //! tracing fields needed for observability and incident triage.
 
-use frankenterm_core::recorder_migration::{MigrationConfig, MigrationEngine, MigrationManifest};
+use frankenterm_core::recorder_migration::{MigrationConfig, MigrationEngine};
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, AppendResponse,
     CheckpointCommitOutcome, CheckpointConsumerId, CursorRecord, DurabilityLevel, EventCursorError,
@@ -32,6 +32,7 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CapturedEvent {
     level: Level,
     target: String,

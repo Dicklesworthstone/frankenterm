@@ -155,7 +155,7 @@ pub struct DriftSnapshot {
 }
 
 /// Compact evidence summary for persistence.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceSummary {
     pub entry_count: usize,
     pub is_complete: bool,
@@ -411,7 +411,7 @@ impl PruneEngine {
 }
 
 /// Pruning statistics.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PruneStats {
     pub total_prune_runs: u64,
     pub total_pruned: u64,
@@ -465,13 +465,13 @@ impl ReflexStore {
             reflex_id: record.reflex_id,
             cluster_id: record.cluster_id.clone(),
             version: record.version,
-            status: record.status.clone(),
+            status: record.status,
             tier: record.tier,
             successes: record.successes,
             failures: record.failures,
             e_value: record.drift_state.e_value,
             is_drifted: record.drift_state.drift_count > 0,
-            evidence_verdict: record.evidence_summary.overall_verdict.clone(),
+            evidence_verdict: record.evidence_summary.overall_verdict,
             created_at_ms: record.created_at_ms,
             updated_at_ms: record.updated_at_ms,
         };
@@ -581,9 +581,7 @@ impl ReflexStore {
 
     /// Serialize a single record to JSON string.
     pub fn serialize_record(&self, id: ReflexId) -> Option<Result<String, serde_json::Error>> {
-        self.records
-            .get(&id)
-            .map(|r| serde_json::to_string_pretty(r))
+        self.records.get(&id).map(serde_json::to_string_pretty)
     }
 
     /// Serialize blacklist to JSON string.
@@ -601,8 +599,7 @@ impl ReflexStore {
             .entries
             .values()
             .filter(|e| {
-                status.as_ref().map_or(true, |s| e.status == *s)
-                    && tier.map_or(true, |t| e.tier == t)
+                status.as_ref().is_none_or(|s| e.status == *s) && tier.is_none_or(|t| e.tier == t)
             })
             .collect()
     }

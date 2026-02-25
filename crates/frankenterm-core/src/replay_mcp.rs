@@ -49,7 +49,7 @@ pub const ALL_REPLAY_TOOLS: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 /// Metadata for a single replay MCP tool.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayToolSchema {
     /// Tool name (e.g., "wa.replay.inspect").
     pub name: String,
@@ -265,7 +265,7 @@ pub fn artifact_retire_schema() -> ReplayToolSchema {
 // ---------------------------------------------------------------------------
 
 /// Outcome of dispatching a replay MCP tool call.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DispatchResult {
     /// Successful execution.
@@ -301,7 +301,11 @@ impl DispatchResult {
     }
 
     /// Create an error result with a hint.
-    pub fn error_with_hint(code: &str, message: impl Into<String>, hint: impl Into<String>) -> Self {
+    pub fn error_with_hint(
+        code: &str,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
         Self::Error {
             code: code.to_string(),
             message: message.into(),
@@ -345,9 +349,7 @@ pub fn validate_optional_str(args: &serde_json::Value, field: &str) -> Option<St
 
 /// Validate an optional integer with a default.
 pub fn validate_optional_u64(args: &serde_json::Value, field: &str, default: u64) -> u64 {
-    args.get(field)
-        .and_then(|v| v.as_u64())
-        .unwrap_or(default)
+    args.get(field).and_then(|v| v.as_u64()).unwrap_or(default)
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +468,11 @@ mod tests {
     fn schema_has_type_object() {
         for schema in all_tool_schemas() {
             let ty = schema.input_schema["type"].as_str().unwrap();
-            assert_eq!(ty, "object", "schema {} should have type=object", schema.name);
+            assert_eq!(
+                ty, "object",
+                "schema {} should have type=object",
+                schema.name
+            );
         }
     }
 
@@ -484,7 +490,11 @@ mod tests {
     #[test]
     fn all_schemas_have_tags() {
         for schema in all_tool_schemas() {
-            assert!(!schema.tags.is_empty(), "schema {} should have tags", schema.name);
+            assert!(
+                !schema.tags.is_empty(),
+                "schema {} should have tags",
+                schema.name
+            );
             assert!(
                 schema.tags.contains(&"replay".to_string()),
                 "schema {} should be tagged 'replay'",
@@ -570,7 +580,10 @@ mod tests {
     #[test]
     fn validate_optional_str_present() {
         let args = serde_json::json!({"budget": "budget.toml"});
-        assert_eq!(validate_optional_str(&args, "budget"), Some("budget.toml".into()));
+        assert_eq!(
+            validate_optional_str(&args, "budget"),
+            Some("budget.toml".into())
+        );
     }
 
     #[test]

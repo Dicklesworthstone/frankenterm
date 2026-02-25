@@ -141,6 +141,7 @@ impl BeadTier {
 
 /// Simulated gate execution result.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct GateResult {
     tier: GateTier,
     passed: bool,
@@ -488,6 +489,7 @@ fn test_wave_readiness_returns_all_bead_tiers() {
 
 /// Gate report JSON structure.
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 struct GateReport {
     timestamp: String,
     script: String,
@@ -499,6 +501,7 @@ struct GateReport {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 struct GateEntry {
     tier: String,
     name: String,

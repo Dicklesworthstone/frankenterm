@@ -20,7 +20,9 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_decision_diff::{Divergence, DivergenceNode, DivergenceType, RootCause};
+use frankenterm_core::replay_decision_diff::{
+    Divergence, DivergenceNode, DivergenceType, RootCause,
+};
 use frankenterm_core::replay_remediation::{
     EffortEstimate, RemediationEngine, Suggestion, SuggestionAction,
 };
@@ -86,7 +88,7 @@ fn arb_root_cause() -> impl Strategy<Value = RootCause> {
     ]
 }
 
-fn arb_divergence_type() -> impl Strategy<Value = DivergenceType> {
+fn _arb_divergence_type() -> impl Strategy<Value = DivergenceType> {
     prop_oneof![
         Just(DivergenceType::Added),
         Just(DivergenceType::Removed),

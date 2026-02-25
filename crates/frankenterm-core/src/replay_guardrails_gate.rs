@@ -110,7 +110,7 @@ impl ExpectedDivergenceAnnotation {
 // ============================================================================
 
 /// A specific budget violation causing gate failure.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Violation {
     /// Which budget dimension was exceeded.
     pub budget_dimension: String,
@@ -287,10 +287,7 @@ impl GateEvaluator {
             let usage = effective_critical as f64 / self.budget.max_critical as f64;
             if usage >= WARN_THRESHOLD {
                 warnings.push(Warning {
-                    message: format!(
-                        "Critical divergences at {:.0}% of budget",
-                        usage * 100.0
-                    ),
+                    message: format!("Critical divergences at {:.0}% of budget", usage * 100.0),
                     budget_dimension: "max_critical".into(),
                     usage_percent: usage * 100.0,
                 });
@@ -330,10 +327,7 @@ impl GateEvaluator {
             let usage = effective_medium as f64 / self.budget.max_medium as f64;
             if usage >= WARN_THRESHOLD {
                 warnings.push(Warning {
-                    message: format!(
-                        "Medium divergences at {:.0}% of budget",
-                        usage * 100.0
-                    ),
+                    message: format!("Medium divergences at {:.0}% of budget", usage * 100.0),
                     budget_dimension: "max_medium".into(),
                     usage_percent: usage * 100.0,
                 });
@@ -342,8 +336,7 @@ impl GateEvaluator {
 
         // Check skip budget.
         if ctx.total_artifacts > 0 {
-            let skip_pct =
-                (ctx.skipped_artifacts as f64 / ctx.total_artifacts as f64) * 100.0;
+            let skip_pct = (ctx.skipped_artifacts as f64 / ctx.total_artifacts as f64) * 100.0;
             if skip_pct > self.budget.skip_budget_percent {
                 violations.push(Violation {
                     budget_dimension: "skip_budget_percent".into(),
@@ -356,10 +349,7 @@ impl GateEvaluator {
                 let usage = skip_pct / self.budget.skip_budget_percent;
                 if usage >= WARN_THRESHOLD {
                     warnings.push(Warning {
-                        message: format!(
-                            "Skipped artifacts at {:.0}% of budget",
-                            usage * 100.0
-                        ),
+                        message: format!("Skipped artifacts at {:.0}% of budget", usage * 100.0),
                         budget_dimension: "skip_budget_percent".into(),
                         usage_percent: usage * 100.0,
                     });
@@ -380,10 +370,7 @@ impl GateEvaluator {
             let usage = ctx.replay_duration_ms as f64 / self.budget.time_budget_ms as f64;
             if usage >= WARN_THRESHOLD {
                 warnings.push(Warning {
-                    message: format!(
-                        "Replay duration at {:.0}% of budget",
-                        usage * 100.0
-                    ),
+                    message: format!("Replay duration at {:.0}% of budget", usage * 100.0),
                     budget_dimension: "time_budget_ms".into(),
                     usage_percent: usage * 100.0,
                 });
@@ -557,7 +544,10 @@ mod tests {
         };
         let result = eval.evaluate(&empty_report(), &ctx);
         assert!(result.is_fail());
-        assert_eq!(result.violations()[0].budget_dimension, "skip_budget_percent");
+        assert_eq!(
+            result.violations()[0].budget_dimension,
+            "skip_budget_percent"
+        );
     }
 
     // ── Skip budget within limit ──────────────────────────────────────
@@ -740,10 +730,7 @@ time_budget_ms = 3600000
     #[test]
     fn multiple_violations() {
         let eval = GateEvaluator::with_defaults();
-        let divs = vec![
-            make_div("Critical", "r1", 0),
-            make_div("High", "r2", 1),
-        ];
+        let divs = vec![make_div("Critical", "r1", 0), make_div("High", "r2", 1)];
         let report = report_with_divs(divs);
         let ctx = EvaluationContext {
             total_artifacts: 100,
@@ -770,7 +757,11 @@ time_budget_ms = 3600000
         let result = eval.evaluate_simple(&report);
         let violation = &result.violations()[0];
         assert!(violation.contributing_rule_ids.contains(&"pol_auth".into()));
-        assert!(violation.contributing_rule_ids.contains(&"pol_rate_limit".into()));
+        assert!(
+            violation
+                .contributing_rule_ids
+                .contains(&"pol_rate_limit".into())
+        );
     }
 
     // ── GateResult serde roundtrip ────────────────────────────────────
