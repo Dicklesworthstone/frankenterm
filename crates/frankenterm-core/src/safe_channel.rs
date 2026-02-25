@@ -213,6 +213,10 @@ struct SafeChannelShared<T> {
 /// Panics if `config.capacity == 0`.
 pub fn safe_channel<T: Send>(config: SafeChannelConfig) -> (SafeSender<T>, SafeReceiver<T>) {
     assert!(config.capacity > 0, "channel capacity must be > 0");
+    assert!(
+        config.max_reservations > 0,
+        "max_reservations must be > 0"
+    );
     let shared = Arc::new(SafeChannelShared {
         state: Mutex::new(ChannelState::new(config.capacity)),
         not_empty: Condvar::new(),
@@ -332,6 +336,7 @@ impl<T: Send> SafeSender<T> {
         // Wake all waiters so they see the closed state
         self.shared.not_empty.notify_all();
         self.shared.not_full.notify_all();
+        self.shared.reservation_released.notify_all();
     }
 
     /// Current queue length (excludes reserved items).
@@ -409,7 +414,8 @@ impl<T: Send> SafeReceiver<T> {
     pub fn reserve(&self) -> Result<Reservation<T>, SafeChannelError> {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if state.active_reservations < self.shared.config.max_reservations {
+            let reservation_full = state.active_reservations >= self.shared.config.max_reservations;
+            if !reservation_full {
                 if let Some(item) = state.queue.pop_front() {
                     let rid =
                         self.shared.global_res_counter.fetch_add(1, Ordering::Relaxed);
@@ -427,11 +433,17 @@ impl<T: Send> SafeReceiver<T> {
             if state.closed && state.queue.is_empty() {
                 return Err(SafeChannelError::Closed);
             }
-            state = self
-                .shared
-                .not_empty
-                .wait(state)
-                .unwrap_or_else(|e| e.into_inner());
+            state = if reservation_full {
+                self.shared
+                    .reservation_released
+                    .wait(state)
+                    .unwrap_or_else(|e| e.into_inner())
+            } else {
+                self.shared
+                    .not_empty
+                    .wait(state)
+                    .unwrap_or_else(|e| e.into_inner())
+            };
         }
     }
 
@@ -443,7 +455,8 @@ impl<T: Send> SafeReceiver<T> {
         let poll = Duration::from_millis(self.shared.config.cancellation_poll_ms);
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if state.active_reservations < self.shared.config.max_reservations {
+            let reservation_full = state.active_reservations >= self.shared.config.max_reservations;
+            if !reservation_full {
                 if let Some(item) = state.queue.pop_front() {
                     let rid =
                         self.shared.global_res_counter.fetch_add(1, Ordering::Relaxed);
@@ -469,11 +482,17 @@ impl<T: Send> SafeReceiver<T> {
                         .unwrap_or_else(|| "unknown".into()),
                 });
             }
-            let result = self
-                .shared
-                .not_empty
-                .wait_timeout(state, poll)
-                .unwrap_or_else(|e| e.into_inner());
+            let result = if reservation_full {
+                self.shared
+                    .reservation_released
+                    .wait_timeout(state, poll)
+                    .unwrap_or_else(|e| e.into_inner())
+            } else {
+                self.shared
+                    .not_empty
+                    .wait_timeout(state, poll)
+                    .unwrap_or_else(|e| e.into_inner())
+            };
             state = result.0;
         }
     }
@@ -614,6 +633,7 @@ mod tests {
     use super::*;
     use crate::cancellation::ShutdownReason;
     use crate::scope_tree::ScopeId;
+    use std::sync::mpsc;
     use std::thread;
 
     fn default_config() -> SafeChannelConfig {
@@ -779,6 +799,45 @@ mod tests {
         _r1.commit();
         let _r3 = rx.try_reserve().unwrap();
         assert_eq!(*_r3.peek(), 3);
+    }
+
+    #[test]
+    fn blocking_reserve_wakes_on_reservation_release() {
+        let (tx, rx) = safe_channel::<u32>(SafeChannelConfig {
+            capacity: 2,
+            max_reservations: 1,
+            cancellation_aware: true,
+            cancellation_poll_ms: 10,
+        });
+        tx.try_send(10).unwrap();
+        tx.try_send(20).unwrap();
+
+        let first = rx.reserve().unwrap();
+        let rx2 = rx.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let result = rx2.reserve().map(|res| res.commit());
+            let _ = done_tx.send(result);
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "second reserve should block while reservation capacity is saturated"
+        );
+
+        first.commit();
+        let second = match done_rx.recv_timeout(Duration::from_millis(300)) {
+            Ok(result) => result,
+            Err(err) => {
+                tx.close();
+                panic!("second reserve did not wake after reservation release: {err}");
+            }
+        };
+        assert_eq!(second.unwrap(), 20);
+
+        tx.close();
+        handle.join().unwrap();
     }
 
     #[test]
@@ -1064,6 +1123,17 @@ mod tests {
         assert_eq!(config.max_reservations, 64);
         assert!(config.cancellation_aware);
         assert_eq!(config.cancellation_poll_ms, 50);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_reservations must be > 0")]
+    fn rejects_zero_max_reservations() {
+        let _ = safe_channel::<u32>(SafeChannelConfig {
+            capacity: 1,
+            max_reservations: 0,
+            cancellation_aware: true,
+            cancellation_poll_ms: 10,
+        });
     }
 
     // ── Stress tests ──────────────────────────────────────────────────────
