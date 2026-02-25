@@ -473,7 +473,7 @@ impl Aggregator {
 
         session.last_seq = envelope.seq;
         session.messages_received += 1;
-        session.last_seen_ms = envelope.sent_at_ms;
+        session.last_seen_ms = session.last_seen_ms.max(envelope.sent_at_ms);
         self.total_accepted += 1;
 
         Ok(IngestResult::Accepted(envelope.payload))
@@ -1401,6 +1401,39 @@ mod tests {
             WireProtocolError::TooManyAgents { max: 1, sender: _ }
         ));
         assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
+        assert_eq!(agg.agent_last_seq("agent-b"), None);
+        assert_eq!(agg.total_rejected(), 1);
+    }
+
+    #[test]
+    fn aggregator_accepted_envelope_does_not_regress_last_seen_for_stale_pruning() {
+        let mut agg = Aggregator::with_stale_after(1, 50);
+
+        let mut first = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        first.sent_at_ms = 100;
+        assert!(matches!(
+            agg.ingest_envelope(first).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+
+        // Simulate sender clock regression on a new accepted sequence.
+        let mut regressed = WireEnvelope::new(2, "agent-a", WirePayload::Gap(sample_gap()));
+        regressed.sent_at_ms = 90;
+        assert!(matches!(
+            agg.ingest_envelope(regressed).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+
+        let mut second = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
+        second.sent_at_ms = 149;
+        let err = agg
+            .ingest_envelope(second)
+            .expect_err("accepted seq with regressed timestamp must not make sender-a look stale");
+        assert!(matches!(
+            err,
+            WireProtocolError::TooManyAgents { max: 1, sender: _ }
+        ));
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(2));
         assert_eq!(agg.agent_last_seq("agent-b"), None);
         assert_eq!(agg.total_rejected(), 1);
     }
