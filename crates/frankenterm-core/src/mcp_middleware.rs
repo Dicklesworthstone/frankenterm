@@ -1,6 +1,23 @@
 //! Middleware wrappers for MCP tool handling.
 
-use super::*;
+mod mcp_middleware_framework {
+    pub(crate) use fastmcp::{
+        Content as FrameworkContent, McpContext as FrameworkMcpContext,
+        McpError as FrameworkMcpError, McpResult as FrameworkMcpResult, Tool as FrameworkTool,
+        ToolHandler as FrameworkToolHandler,
+    };
+}
+
+use super::{
+    MCP_ERR_INVALID_ARGS, McpEnvelope, elapsed_ms, envelope_to_content, record_mcp_audit_sync,
+};
+use mcp_middleware_framework::{
+    FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
+    FrameworkMcpResult as McpResult, FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
+};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum McpOutputFormat {

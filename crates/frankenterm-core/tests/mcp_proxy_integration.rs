@@ -1,8 +1,16 @@
 #![cfg(all(feature = "mcp", feature = "mcp-client"))]
 
-use fastmcp::testing::TestClient;
+mod mcp_test_framework {
+    pub(crate) use fastmcp::Content as FrameworkContent;
+    pub(crate) use fastmcp::memory::create_memory_transport_pair as framework_create_memory_transport_pair;
+    pub(crate) use fastmcp::testing::TestClient as FrameworkTestClient;
+}
+
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
+use mcp_test_framework::{
+    FrameworkContent, FrameworkTestClient, framework_create_memory_transport_pair,
+};
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -208,12 +216,12 @@ fn proxy_routes_calls_to_remote_tools() {
     let config = make_proxy_config(&discovery_path, "mock");
     let server = build_server_with_db(&config, None).expect("build proxy-enabled server");
 
-    let (client_transport, server_transport) = fastmcp::memory::create_memory_transport_pair();
+    let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
         let _ = server.run_transport(server_transport);
     });
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = FrameworkTestClient::new(client_transport);
     client.initialize().expect("initialize in-memory client");
 
     let reply = client
@@ -223,7 +231,7 @@ fn proxy_routes_calls_to_remote_tools() {
     eprintln!("Proxied tool reply: {reply:?}");
     assert!(matches!(
         reply.first(),
-        Some(fastmcp::Content::Text { text }) if text == "proxy-route-check"
+        Some(FrameworkContent::Text { text }) if text == "proxy-route-check"
     ));
 }
 

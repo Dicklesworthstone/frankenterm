@@ -11,16 +11,24 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod mcp_framework {
-    pub mod prelude {
-        pub use fastmcp::prelude::*;
-    }
-
-    pub use fastmcp::StdioTransport;
-    pub use fastmcp::{ResourceHandler, ResourceTemplate, ToolHandler};
+    pub(crate) use fastmcp::{
+        Content as FrameworkContent, McpContext as FrameworkMcpContext,
+        McpError as FrameworkMcpError, McpResult as FrameworkMcpResult,
+        Resource as FrameworkResource, ResourceContent as FrameworkResourceContent,
+        ResourceHandler as FrameworkResourceHandler, ResourceTemplate as FrameworkResourceTemplate,
+        Server as FrameworkServer, StdioTransport as FrameworkStdioTransport,
+        Tool as FrameworkTool, ToolHandler as FrameworkToolHandler,
+    };
 }
 
-use mcp_framework::prelude::*;
-use mcp_framework::{ResourceHandler, ResourceTemplate, StdioTransport, ToolHandler};
+use mcp_framework::{
+    FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
+    FrameworkMcpResult as McpResult, FrameworkResource as Resource,
+    FrameworkResourceContent as ResourceContent, FrameworkResourceHandler as ResourceHandler,
+    FrameworkResourceTemplate as ResourceTemplate, FrameworkServer as Server,
+    FrameworkStdioTransport as StdioTransport, FrameworkTool as Tool,
+    FrameworkToolHandler as ToolHandler,
+};
 
 use crate::Result;
 use crate::accounts::AccountRecord;

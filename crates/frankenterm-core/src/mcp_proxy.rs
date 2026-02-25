@@ -5,20 +5,24 @@
 //! - local tools keep existing names (`wa.*`),
 //! - remote tools are mounted under `<proxy_prefix>/<server>/<tool>`.
 
+mod mcp_proxy_framework {
+    pub(crate) use fastmcp::ServerBuilder as FrameworkServerBuilder;
+}
+
 use super::*;
 use crate::config::McpClientConfig;
 use crate::mcp_client::{ExternalServerConfig, FtMcpClient, discover_servers};
-use fastmcp::ServerBuilder;
+use mcp_proxy_framework::FrameworkServerBuilder;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 const LOG_TARGET: &str = "ft::mcp_proxy";
 
 pub(super) fn compose_proxy_tools(
-    mut builder: ServerBuilder,
+    mut builder: FrameworkServerBuilder,
     config: &Config,
     db_path: Option<Arc<PathBuf>>,
-) -> Result<ServerBuilder> {
+) -> Result<FrameworkServerBuilder> {
     let settings = &config.mcp_client;
     if !settings.proxy_enabled {
         return Ok(builder);

@@ -3,7 +3,26 @@
 //! This stays as a thin extraction-only layer to reduce `mcp.rs` size while
 //! preserving behavior and registration order.
 
-use super::*;
+mod mcp_bridge_framework {
+    pub(crate) use fastmcp::{
+        Server as FrameworkServer, StdioTransport as FrameworkStdioTransport,
+    };
+}
+
+use super::{
+    AuditedToolHandler, Config, FormatAwareToolHandler, Result,
+    WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
+    WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool,
+    WaEventsResource, WaEventsTemplateResource, WaEventsTool, WaEventsTriageTool,
+    WaEventsUnhandledTemplateResource, WaGetTextTool, WaPanesResource, WaReleaseTool,
+    WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
+    WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
+    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaWaitForTool, WaWorkflowRunTool,
+    WaWorkflowsResource,
+};
+use mcp_bridge_framework::{FrameworkServer as Server, FrameworkStdioTransport as StdioTransport};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Build the MCP server with tools that have robot parity.
 pub fn build_server(config: &Config) -> Result<Server> {

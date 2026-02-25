@@ -5,9 +5,22 @@
 //! - deterministic server selection,
 //! - outbound tool invocation with mapped errors.
 
+mod mcp_client_framework {
+    pub(crate) use fastmcp::mcp_config::{
+        ConfigLoader as FrameworkConfigLoader, ServerConfig as FrameworkServerConfig,
+    };
+    pub(crate) use fastmcp::{
+        Client as FrameworkClient, ClientBuilder as FrameworkClientBuilder,
+        Content as FrameworkContent, McpError as FrameworkMcpError,
+        McpErrorCode as FrameworkMcpErrorCode, Tool as FrameworkTool,
+    };
+}
+
 use crate::config::{Config, McpClientConfig};
-use fastmcp::mcp_config::{ConfigLoader, ServerConfig as FastServerConfig};
-use fastmcp::{Client, ClientBuilder, Content, McpError, McpErrorCode, Tool};
+use mcp_client_framework::{
+    FrameworkClient, FrameworkClientBuilder, FrameworkConfigLoader, FrameworkContent,
+    FrameworkMcpError, FrameworkMcpErrorCode, FrameworkServerConfig, FrameworkTool,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -44,7 +57,7 @@ pub struct ExternalServerConfig {
 }
 
 impl ExternalServerConfig {
-    fn from_discovered(name: String, cfg: FastServerConfig) -> Self {
+    fn from_discovered(name: String, cfg: FrameworkServerConfig) -> Self {
         Self {
             name,
             command: cfg.command,
@@ -89,7 +102,7 @@ pub type McpClientResult<T> = std::result::Result<T, McpClientError>;
 
 /// Outbound MCP client wrapper.
 pub struct FtMcpClient {
-    client: Client,
+    client: FrameworkClient,
     server: ExternalServerConfig,
 }
 
@@ -107,7 +120,7 @@ impl FtMcpClient {
             return Err(server_disabled_error(&server.name));
         }
 
-        let mut builder = ClientBuilder::new()
+        let mut builder = FrameworkClientBuilder::new()
             .client_info("frankenterm-mcp-client", env!("CARGO_PKG_VERSION"))
             .timeout_ms(settings.timeout_ms)
             .max_retries(settings.max_retries)
@@ -154,7 +167,7 @@ impl FtMcpClient {
     }
 
     /// List tools from the connected server.
-    pub fn list_tools(&mut self) -> McpClientResult<Vec<Tool>> {
+    pub fn list_tools(&mut self) -> McpClientResult<Vec<FrameworkTool>> {
         let start = Instant::now();
         match self.client.list_tools() {
             Ok(tools) => {
@@ -188,7 +201,7 @@ impl FtMcpClient {
         &mut self,
         name: &str,
         arguments: serde_json::Value,
-    ) -> McpClientResult<Vec<Content>> {
+    ) -> McpClientResult<Vec<FrameworkContent>> {
         let start = Instant::now();
         match self.client.call_tool(name, arguments) {
             Ok(content) => {
@@ -227,7 +240,7 @@ impl FtMcpClient {
 
     /// Consume wrapper and return the raw fastmcp client.
     #[must_use]
-    pub fn into_client(self) -> Client {
+    pub fn into_client(self) -> FrameworkClient {
         self.client
     }
 }
@@ -332,9 +345,9 @@ pub fn select_server(
         })
 }
 
-fn build_loader(settings: &McpClientConfig) -> ConfigLoader {
+fn build_loader(settings: &McpClientConfig) -> FrameworkConfigLoader {
     let mut loader = if settings.include_default_paths {
-        ConfigLoader::new()
+        FrameworkConfigLoader::new()
     } else {
         // include_default_paths=false must avoid any implicit config locations.
         // At this point discovery_paths is guaranteed non-empty by discover_servers.
@@ -342,7 +355,7 @@ fn build_loader(settings: &McpClientConfig) -> ConfigLoader {
         let first = paths
             .next()
             .expect("discovery_paths must be non-empty when default paths are disabled");
-        let mut loader = ConfigLoader::from_path(first.clone());
+        let mut loader = FrameworkConfigLoader::from_path(first.clone());
         for path in paths {
             loader = loader.with_path(path.clone());
         }
@@ -385,25 +398,25 @@ fn server_disabled_error(server: &str) -> McpClientError {
     .with_hint("Enable the server entry in its mcpServers config before connecting.")
 }
 
-fn map_mcp_error(server: &str, err: McpError) -> McpClientError {
+fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
     let base = format!("server '{server}': {}", err.message);
     let message_lower = err.message.to_ascii_lowercase();
 
     match err.code {
-        McpErrorCode::MethodNotFound => McpClientError::new(ERR_METHOD_NOT_FOUND, base)
+        FrameworkMcpErrorCode::MethodNotFound => McpClientError::new(ERR_METHOD_NOT_FOUND, base)
             .with_hint("Verify method compatibility between FrankenTerm and the external server."),
-        McpErrorCode::InvalidParams => McpClientError::new(ERR_INVALID_PARAMS, base)
+        FrameworkMcpErrorCode::InvalidParams => McpClientError::new(ERR_INVALID_PARAMS, base)
             .with_hint("Check tool arguments and request schema."),
-        McpErrorCode::ToolExecutionError => McpClientError::new(ERR_TOOL_EXECUTION, base)
+        FrameworkMcpErrorCode::ToolExecutionError => McpClientError::new(ERR_TOOL_EXECUTION, base)
             .with_hint("Inspect remote tool logs and retry with validated arguments."),
-        McpErrorCode::RequestCancelled => McpClientError::new(ERR_REQUEST_CANCELLED, base)
+        FrameworkMcpErrorCode::RequestCancelled => McpClientError::new(ERR_REQUEST_CANCELLED, base)
             .with_hint("The request was cancelled; retry or increase timeout settings."),
-        McpErrorCode::InternalError if message_lower.contains("timed out") => {
+        FrameworkMcpErrorCode::InternalError if message_lower.contains("timed out") => {
             McpClientError::new(ERR_TIMEOUT, base).with_hint(
                 "Increase mcp_client.timeout_ms or inspect remote server responsiveness.",
             )
         }
-        McpErrorCode::InternalError
+        FrameworkMcpErrorCode::InternalError
             if message_lower.contains("failed to spawn")
                 || message_lower.contains("spawn subprocess") =>
         {
@@ -411,13 +424,13 @@ fn map_mcp_error(server: &str, err: McpError) -> McpClientError {
                 "Verify command path, execute permissions, and environment requirements.",
             )
         }
-        McpErrorCode::ParseError
-        | McpErrorCode::InvalidRequest
-        | McpErrorCode::InternalError
-        | McpErrorCode::ResourceNotFound
-        | McpErrorCode::ResourceForbidden
-        | McpErrorCode::PromptNotFound
-        | McpErrorCode::Custom(_) => McpClientError::new(ERR_PROTOCOL, base),
+        FrameworkMcpErrorCode::ParseError
+        | FrameworkMcpErrorCode::InvalidRequest
+        | FrameworkMcpErrorCode::InternalError
+        | FrameworkMcpErrorCode::ResourceNotFound
+        | FrameworkMcpErrorCode::ResourceForbidden
+        | FrameworkMcpErrorCode::PromptNotFound
+        | FrameworkMcpErrorCode::Custom(_) => McpClientError::new(ERR_PROTOCOL, base),
     }
 }
 
@@ -433,7 +446,7 @@ mod tests {
 
     #[test]
     fn map_mcp_error_method_not_found() {
-        let err = map_mcp_error("mock", McpError::method_not_found("tools/list"));
+        let err = map_mcp_error("mock", FrameworkMcpError::method_not_found("tools/list"));
         assert_eq!(err.code, ERR_METHOD_NOT_FOUND);
         assert!(err.message.contains("server 'mock'"));
         assert!(err.hint.is_some());
@@ -441,7 +454,7 @@ mod tests {
 
     #[test]
     fn map_mcp_error_tool_execution() {
-        let err = map_mcp_error("mock", McpError::tool_error("boom"));
+        let err = map_mcp_error("mock", FrameworkMcpError::tool_error("boom"));
         assert_eq!(err.code, ERR_TOOL_EXECUTION);
         assert!(err.message.contains("boom"));
     }
@@ -450,7 +463,7 @@ mod tests {
     fn map_mcp_error_spawn_failure() {
         let err = map_mcp_error(
             "mock",
-            McpError::internal_error("Failed to spawn subprocess: No such file"),
+            FrameworkMcpError::internal_error("Failed to spawn subprocess: No such file"),
         );
         assert_eq!(err.code, ERR_SPAWN);
         assert!(err.hint.is_some());
@@ -607,7 +620,7 @@ mod tests {
             .expect("call tool");
         assert!(matches!(
             output.first(),
-            Some(Content::Text { text }) if text == "hello"
+            Some(FrameworkContent::Text { text }) if text == "hello"
         ));
 
         let captured = events.lock().expect("lock logs").clone();
