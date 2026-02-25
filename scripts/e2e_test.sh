@@ -506,6 +506,7 @@ SCENARIO_REGISTRY=(
     "ft_1i2ge_8_6|Validate compensation planner and automatic rollback engine|false|cargo,jq,rch|Protects compensation barrier semantics reverse ordering and rollback state contracts"
     "ft_1i2ge_8_7|Validate durable idempotency, dedupe, and resume invariants|false|cargo,jq,rch|Protects restart-safe idempotency keys dedup guards double-execution blocking and resume reconstruction"
     "ft_1i2ge_8_10|Validate unit/property/concurrency correctness suite for tx semantics|false|cargo,jq,rch|Protects state machine transitions concurrency determinism reason codes and pipeline integrity"
+    "ft_e34d9_10_3_2_cancellation|Validate two-phase cancellation and shutdown protocol rollout|false|cargo,jq,rch|Protects cancellation propagation shutdown lifecycle finalizer ordering and grace period semantics"
     "ft_e34d9_10_1_2_doctrine_pack|Validate asupersync runtime doctrine contract/invariants + failure injection|false|jq,python3|Protects doctrine semantics, anti-pattern gates, and user-facing guarantees"
     "ft_e34d9_10_2_1_runtime_bootstrap|Validate unified runtime bootstrap contract for CLI/watch/web/robot + failure injection|false|jq,python3|Protects runtime bootstrap lifecycle parity and configuration parsing contract"
     "ft_e34d9_10_2_2_cx_outcome_contract|Validate Cx/Outcome wait-boundary adapter propagation + failure/recovery contract|false|jq,python3|Protects explicit Cx propagation and reason-coded Outcome boundary mapping"
@@ -11288,6 +11289,47 @@ run_scenario_ft_1i2ge_8_10() {
     return 0
 }
 
+run_scenario_ft_e34d9_10_3_2_cancellation() {
+    local scenario_dir="$1"
+    local case_name="ft_e34d9_10_3_2_cancellation"
+    local script_path="$PROJECT_ROOT/tests/e2e/test_ft_e34d9_10_3_2_cancellation.sh"
+    local scenario_stdout="$scenario_dir/${case_name}.stdout.log"
+    local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
+    local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_3_2_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+
+    log_info "[$case_name] Step 1: running two-phase cancellation/shutdown e2e harness"
+    set +e
+    timeout "$TIMEOUT" bash "$script_path" >"$scenario_stdout" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ "$rc" -eq 124 ]]; then
+        log_fail "[$case_name] harness timed out after ${TIMEOUT}s"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log_fail "[$case_name] harness failed (exit=$rc)"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return "$rc"
+    fi
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/ft_e34d9_10_3_2_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    while IFS= read -r log_path; do
+        if [[ -z "$log_path" ]]; then
+            continue
+        fi
+        if [[ ! -f "$before_snapshot" ]] || ! grep -Fxq "$log_path" "$before_snapshot"; then
+            cp -f "$log_path" "$scenario_dir/" || true
+        fi
+    done < "$after_snapshot"
+
+    log_pass "[$case_name] two-phase cancellation/shutdown e2e completed"
+    return 0
+}
+
 run_scenario_ft_e34d9_10_1_2_doctrine_pack() {
     local scenario_dir="$1"
     local case_name="ft_e34d9_10_1_2_doctrine_pack"
@@ -11849,6 +11891,9 @@ dispatch_scenario() {
             ;;
         ft_1i2ge_8_10)
             run_scenario_ft_1i2ge_8_10 "$scenario_dir" || result=$?
+            ;;
+        ft_e34d9_10_3_2_cancellation)
+            run_scenario_ft_e34d9_10_3_2_cancellation "$scenario_dir" || result=$?
             ;;
         ft_e34d9_10_1_2_doctrine_pack)
             run_scenario_ft_e34d9_10_1_2_doctrine_pack "$scenario_dir" || result=$?
