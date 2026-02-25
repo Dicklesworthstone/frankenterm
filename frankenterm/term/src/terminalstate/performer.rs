@@ -827,6 +827,16 @@ impl<'a> Performer<'a> {
                 }
                 ITermProprietary::File(image) => self.set_image(*image),
                 ITermProprietary::SetUserVar { name, value } => {
+                    // Cap user_vars to prevent unbounded growth from
+                    // long-running sessions emitting many SetUserVar sequences.
+                    if self.user_vars.len() >= super::MAX_USER_VARS
+                        && !self.user_vars.contains_key(&*name)
+                    {
+                        // Evict an arbitrary entry to make room
+                        if let Some(oldest_key) = self.user_vars.keys().next().cloned() {
+                            self.user_vars.remove(&oldest_key);
+                        }
+                    }
                     self.user_vars.insert(name.clone(), value.clone());
                     if let Some(handler) = self.alert_handler.as_mut() {
                         handler.alert(Alert::SetUserVar { name, value });
@@ -836,6 +846,16 @@ impl<'a> Performer<'a> {
                     self.unicode_version.version = n;
                 }
                 ITermProprietary::UnicodeVersion(ITermUnicodeVersionOp::Push(label)) => {
+                    // Cap stack depth to prevent unbounded growth from
+                    // unbalanced Push operations in long-running sessions.
+                    if self.unicode_version_stack.len() >= super::MAX_UNICODE_VERSION_STACK_DEPTH {
+                        log::warn!(
+                            "unicode version stack depth limit ({}) reached, \
+                             dropping oldest entry",
+                            super::MAX_UNICODE_VERSION_STACK_DEPTH
+                        );
+                        self.unicode_version_stack.remove(0);
+                    }
                     let vers = self.unicode_version.clone();
                     self.unicode_version_stack
                         .push(UnicodeVersionStackEntry { vers, label });

@@ -205,7 +205,15 @@ impl Line {
     }
 
     pub fn resize(&mut self, width: usize, seqno: SequenceNo) {
-        self.coerce_vec_storage().resize_with(width, Cell::blank);
+        let cells = self.coerce_vec_storage();
+        let old_cap = cells.capacity();
+        cells.resize_with(width, Cell::blank);
+        // Reclaim excess capacity when shrinking to a smaller width.
+        // Without this, lines that were once wide retain their old
+        // allocation, causing fragmentation across thousands of lines.
+        if width < old_cap / 2 {
+            cells.shrink_to_fit();
+        }
         self.update_last_change_seqno(seqno);
         self.invalidate_zones();
     }

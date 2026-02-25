@@ -75,6 +75,14 @@ impl TerminalState {
                 }
 
                 SixelData::DefineColorMapRGB { color_number, rgb } => {
+                    if color_map.len() >= super::MAX_COLOR_MAP_ENTRIES
+                        && !color_map.contains_key(color_number)
+                    {
+                        // Evict an arbitrary entry to stay within bounds
+                        if let Some(&key) = color_map.keys().next() {
+                            color_map.remove(&key);
+                        }
+                    }
                     color_map.insert(*color_number, *rgb);
                 }
 
@@ -99,6 +107,13 @@ impl TerminalState {
                         1.,
                     );
                     let [r, g, b, _] = c.to_rgba8();
+                    if color_map.len() >= super::MAX_COLOR_MAP_ENTRIES
+                        && !color_map.contains_key(color_number)
+                    {
+                        if let Some(&key) = color_map.keys().next() {
+                            color_map.remove(&key);
+                        }
+                    }
                     color_map.insert(*color_number, RgbColor::new_8bpc(r, g, b));
                 }
 

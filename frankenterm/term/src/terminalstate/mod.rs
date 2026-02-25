@@ -400,6 +400,19 @@ struct UnicodeVersionStackEntry {
     label: Option<String>,
 }
 
+/// Maximum number of user variables that can be stored.
+/// Prevents unbounded growth from iTerm2 SetUserVar escape sequences.
+const MAX_USER_VARS: usize = 512;
+
+/// Maximum depth of the unicode version stack.
+/// Prevents unbounded growth from unbalanced Push operations.
+const MAX_UNICODE_VERSION_STACK_DEPTH: usize = 64;
+
+/// Maximum entries in the sixel color register map.
+/// The VT340 had 256 color registers; we allow more but cap to prevent
+/// unbounded accumulation over long-running sessions.
+const MAX_COLOR_MAP_ENTRIES: usize = 4096;
+
 fn default_color_map() -> HashMap<u16, RgbColor> {
     let mut color_map = HashMap::new();
     // Match colors to the VT340 color table:

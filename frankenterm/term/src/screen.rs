@@ -2148,6 +2148,10 @@ impl Screen {
                 self.stable_row_index_offset += 1;
             }
         }
+        // Reclaim memory from the VecDeque after bulk removal.
+        // Without this, the ring buffer retains capacity for the
+        // evicted scrollback lines indefinitely.
+        self.lines.shrink_to_fit();
     }
 
     /// ```text
