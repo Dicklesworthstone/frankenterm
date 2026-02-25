@@ -436,7 +436,12 @@ fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        Config, ERR_METHOD_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SPAWN, ERR_TOOL_EXECUTION,
+        ExternalServerConfig, FrameworkContent, FrameworkMcpError, FtMcpClient, LOG_TARGET,
+        McpClientConfig, discover_servers, map_mcp_error, select_server,
+    };
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
     use tracing::field::{Field, Visit};

@@ -464,8 +464,12 @@ impl ToolHandler for RemoteProxyToolHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        Config, ExternalServerConfig, McpClientConfig, Server, Tool, compose_proxy_tools,
+        filter_remote_tools, insert_route_prefix, sanitize_prefix_segment, select_proxy_servers,
+    };
     use std::collections::HashMap;
+    use std::collections::HashSet;
 
     fn make_server(name: &str, disabled: bool) -> ExternalServerConfig {
         ExternalServerConfig {
