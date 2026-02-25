@@ -29,6 +29,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt;
 
 /// Current schema version for action plans.
@@ -1506,6 +1507,7 @@ pub enum MissionFailureCode {
     ApprovalRequired,
     ApprovalDenied,
     ApprovalExpired,
+    KillSwitchActivated,
 }
 
 /// Whether a failure terminates the current assignment path.
@@ -1555,7 +1557,7 @@ pub struct MissionFailureContract {
 }
 
 impl MissionFailureCode {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::PolicyDenied,
         Self::ReservationConflict,
         Self::RateLimited,
@@ -1564,11 +1566,12 @@ impl MissionFailureCode {
         Self::ApprovalRequired,
         Self::ApprovalDenied,
         Self::ApprovalExpired,
+        Self::KillSwitchActivated,
     ];
 
     /// Return all canonical mission failure codes.
     #[must_use]
-    pub const fn all() -> [Self; 8] {
+    pub const fn all() -> [Self; 9] {
         Self::ALL
     }
 
@@ -1584,6 +1587,7 @@ impl MissionFailureCode {
             "approval_required" => Some(Self::ApprovalRequired),
             "approval_denied" => Some(Self::ApprovalDenied),
             "approval_expired" => Some(Self::ApprovalExpired),
+            "kill_switch_activated" => Some(Self::KillSwitchActivated),
             _ => None,
         }
     }
@@ -1600,6 +1604,7 @@ impl MissionFailureCode {
             "FTM1006" => Some(Self::ApprovalRequired),
             "FTM1007" => Some(Self::ApprovalDenied),
             "FTM1008" => Some(Self::ApprovalExpired),
+            "FTM1009" => Some(Self::KillSwitchActivated),
             _ => None,
         }
     }
@@ -1674,6 +1679,14 @@ impl MissionFailureCode {
                 retryability: MissionFailureRetryability::AfterApprovalRefresh,
                 human_hint: "Approval token expired. Request a fresh approval to continue.",
                 machine_hint: "renew_approval_then_retry",
+            },
+            Self::KillSwitchActivated => MissionFailureContract {
+                reason_code: "kill_switch_activated",
+                error_code: "FTM1009",
+                terminality: MissionFailureTerminality::Terminal,
+                retryability: MissionFailureRetryability::Never,
+                human_hint: "Global kill-switch is active. All mission dispatch is halted until operator deactivates.",
+                machine_hint: "halt_all_dispatch_await_operator_deactivation",
             },
         }
     }
@@ -2484,6 +2497,1779 @@ impl MissionTxContract {
         }
 
         Ok(())
+    }
+}
+
+// ============================================================================
+// Prepare-Phase Coordinator
+// ============================================================================
+
+/// Per-step readiness outcome from prepare-phase evaluation.
+///
+/// Each step in a `TxPlan` is evaluated against safety gates:
+/// policy preflight, reservation feasibility, approval requirements,
+/// kill-switch state, and precondition satisfaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxPrepareStepReadiness {
+    /// Step is ready for commit-phase execution.
+    Ready,
+    /// Step is denied by a safety gate; transaction must abort.
+    Denied {
+        reason_code: String,
+        error_code: String,
+    },
+    /// Step requires further action before readiness (e.g., approval refresh).
+    Deferred {
+        reason_code: String,
+        retry_hint: String,
+    },
+}
+
+impl TxPrepareStepReadiness {
+    /// Whether this step passed all safety gates.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Whether this step was denied (terminal for the transaction).
+    #[must_use]
+    pub fn is_denied(&self) -> bool {
+        matches!(self, Self::Denied { .. })
+    }
+
+    /// Whether this step was deferred (can be retried after action).
+    #[must_use]
+    pub fn is_deferred(&self) -> bool {
+        matches!(self, Self::Deferred { .. })
+    }
+}
+
+/// Per-step prepare receipt emitted by the prepare-phase coordinator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxPrepareStepReceipt {
+    /// The step being evaluated.
+    pub step_id: TxStepId,
+    /// Step ordinal in the plan.
+    pub ordinal: u32,
+    /// Readiness outcome after safety-gate evaluation.
+    pub readiness: TxPrepareStepReadiness,
+    /// Which safety gate produced the outcome.
+    pub decision_path: String,
+    /// Epoch-millis when the evaluation completed.
+    pub evaluated_at_ms: i64,
+}
+
+/// Aggregate outcome of prepare-phase evaluation for a transaction plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxPrepareOutcome {
+    /// All steps ready — transaction may proceed to commit phase.
+    AllReady,
+    /// One or more steps denied — transaction must abort.
+    Denied,
+    /// One or more steps deferred, none denied — can retry after action.
+    Deferred,
+}
+
+impl TxPrepareOutcome {
+    /// Whether commit phase is eligible to proceed.
+    #[must_use]
+    pub const fn commit_eligible(&self) -> bool {
+        matches!(self, Self::AllReady)
+    }
+}
+
+impl fmt::Display for TxPrepareOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllReady => f.write_str("all_ready"),
+            Self::Denied => f.write_str("denied"),
+            Self::Deferred => f.write_str("deferred"),
+        }
+    }
+}
+
+/// Complete prepare-phase report for one transaction plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxPrepareReport {
+    /// Transaction ID being prepared.
+    pub tx_id: TxId,
+    /// Plan ID being prepared.
+    pub plan_id: TxPlanId,
+    /// Aggregate outcome.
+    pub outcome: TxPrepareOutcome,
+    /// Per-step readiness receipts, in plan order.
+    pub step_receipts: Vec<TxPrepareStepReceipt>,
+    /// Overall decision path for structured logging.
+    pub decision_path: String,
+    /// Structured reason code summarizing the outcome.
+    pub reason_code: String,
+    /// Error code when outcome is Denied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Epoch-millis when the prepare phase completed.
+    pub completed_at_ms: i64,
+}
+
+impl TxPrepareReport {
+    /// Count of steps in each readiness state.
+    #[must_use]
+    pub fn readiness_counts(&self) -> (usize, usize, usize) {
+        let ready = self.step_receipts.iter().filter(|r| r.readiness.is_ready()).count();
+        let denied = self.step_receipts.iter().filter(|r| r.readiness.is_denied()).count();
+        let deferred = self.step_receipts.iter().filter(|r| r.readiness.is_deferred()).count();
+        (ready, denied, deferred)
+    }
+
+    /// Deterministic canonical string form for audit hashing.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        let step_parts: Vec<String> = self
+            .step_receipts
+            .iter()
+            .map(|r| {
+                let readiness = match &r.readiness {
+                    TxPrepareStepReadiness::Ready => "ready".to_string(),
+                    TxPrepareStepReadiness::Denied { reason_code, error_code } => {
+                        format!("denied({reason_code},{error_code})")
+                    }
+                    TxPrepareStepReadiness::Deferred { reason_code, retry_hint } => {
+                        format!("deferred({reason_code},{retry_hint})")
+                    }
+                };
+                format!("{}:{}:{}", r.step_id.0, r.ordinal, readiness)
+            })
+            .collect();
+        format!(
+            "tx={},plan={},outcome={},steps=[{}],completed_at_ms={}",
+            self.tx_id.0,
+            self.plan_id.0,
+            self.outcome,
+            step_parts.join(";"),
+            self.completed_at_ms,
+        )
+    }
+}
+
+/// Input for evaluate_prepare_phase: per-step gate results from external checks.
+///
+/// The caller is responsible for running policy preflight, reservation feasibility,
+/// and approval checks externally. This struct carries the results into the
+/// prepare-phase evaluator for aggregation and readiness determination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxPrepareGateInput {
+    /// Step being evaluated.
+    pub step_id: TxStepId,
+    /// Whether the policy preflight passed for this step.
+    pub policy_passed: bool,
+    /// Reason code from policy check (if denied).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_reason_code: Option<String>,
+    /// Whether reservations for this step's targets are available.
+    pub reservation_available: bool,
+    /// Reason code from reservation check (if conflicted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reservation_reason_code: Option<String>,
+    /// Whether approval is satisfied for this step (NotRequired or Approved).
+    pub approval_satisfied: bool,
+    /// Reason code from approval check (if pending/expired/denied).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_reason_code: Option<String>,
+    /// Whether the target pane/resource is live and reachable.
+    pub target_liveness: bool,
+    /// Reason code from liveness check (if unreachable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liveness_reason_code: Option<String>,
+}
+
+/// Evaluate the prepare phase for a transaction plan.
+///
+/// This pure function evaluates all safety gates and returns a prepare report.
+/// It does NOT mutate the mission or transaction — the caller is responsible
+/// for applying the report (recording receipts, transitioning state).
+///
+/// Decision logic:
+/// 1. If kill-switch is active → all steps denied (early abort).
+/// 2. For each step: evaluate policy → reservation → approval → liveness.
+/// 3. First denied gate short-circuits the step to `Denied`.
+/// 4. First deferred gate (with no denials) marks step `Deferred`.
+/// 5. All gates pass → step `Ready`.
+/// 6. Aggregate: any denied → `Denied`; any deferred → `Deferred`; all ready → `AllReady`.
+pub fn evaluate_prepare_phase(
+    tx_id: &TxId,
+    plan: &TxPlan,
+    gate_inputs: &[TxPrepareGateInput],
+    kill_switch_level: MissionKillSwitchLevel,
+    evaluated_at_ms: i64,
+) -> Result<TxPrepareReport, MissionTxValidationError> {
+    if plan.steps.is_empty() {
+        return Err(MissionTxValidationError::EmptyPlanSteps);
+    }
+
+    // Build step-id → gate-input lookup
+    let gate_map: std::collections::HashMap<&str, &TxPrepareGateInput> = gate_inputs
+        .iter()
+        .map(|g| (g.step_id.0.as_str(), g))
+        .collect();
+
+    let mut step_receipts = Vec::with_capacity(plan.steps.len());
+    let mut any_denied = false;
+    let mut any_deferred = false;
+
+    // Kill-switch check: if active, deny all steps immediately.
+    if kill_switch_level.blocks_dispatch() {
+        for step in &plan.steps {
+            step_receipts.push(TxPrepareStepReceipt {
+                step_id: step.step_id.clone(),
+                ordinal: step.ordinal,
+                readiness: TxPrepareStepReadiness::Denied {
+                    reason_code: MissionFailureCode::KillSwitchActivated
+                        .reason_code()
+                        .to_string(),
+                    error_code: MissionFailureCode::KillSwitchActivated
+                        .error_code()
+                        .to_string(),
+                },
+                decision_path: "prepare_kill_switch_active".to_string(),
+                evaluated_at_ms,
+            });
+        }
+        return Ok(TxPrepareReport {
+            tx_id: tx_id.clone(),
+            plan_id: plan.plan_id.clone(),
+            outcome: TxPrepareOutcome::Denied,
+            step_receipts,
+            decision_path: "prepare_abort_kill_switch".to_string(),
+            reason_code: MissionFailureCode::KillSwitchActivated
+                .reason_code()
+                .to_string(),
+            error_code: Some(
+                MissionFailureCode::KillSwitchActivated
+                    .error_code()
+                    .to_string(),
+            ),
+            completed_at_ms: evaluated_at_ms,
+        });
+    }
+
+    // Evaluate each step against its gate inputs.
+    for step in &plan.steps {
+        let gate = gate_map.get(step.step_id.0.as_str());
+
+        let (readiness, decision_path) = match gate {
+            None => {
+                // No gate input for this step — treat as deferred (missing data).
+                any_deferred = true;
+                (
+                    TxPrepareStepReadiness::Deferred {
+                        reason_code: "gate_input_missing".to_string(),
+                        retry_hint: "provide_gate_input_for_step".to_string(),
+                    },
+                    "prepare_gate_missing".to_string(),
+                )
+            }
+            Some(gate) => {
+                // Check gates in priority order: policy → reservation → approval → liveness
+                if !gate.policy_passed {
+                    any_denied = true;
+                    (
+                        TxPrepareStepReadiness::Denied {
+                            reason_code: gate
+                                .policy_reason_code
+                                .clone()
+                                .unwrap_or_else(|| "policy_denied".to_string()),
+                            error_code: MissionFailureCode::PolicyDenied
+                                .error_code()
+                                .to_string(),
+                        },
+                        "prepare_policy_denied".to_string(),
+                    )
+                } else if !gate.reservation_available {
+                    // Reservation conflict is deferrable (can wait for release)
+                    any_deferred = true;
+                    (
+                        TxPrepareStepReadiness::Deferred {
+                            reason_code: gate
+                                .reservation_reason_code
+                                .clone()
+                                .unwrap_or_else(|| "reservation_conflict".to_string()),
+                            retry_hint: "refresh_reservations_then_retry".to_string(),
+                        },
+                        "prepare_reservation_conflict".to_string(),
+                    )
+                } else if !gate.approval_satisfied {
+                    let approval_reason = gate
+                        .approval_reason_code
+                        .as_deref()
+                        .unwrap_or("approval_required");
+
+                    if approval_reason == "approval_denied" {
+                        any_denied = true;
+                        (
+                            TxPrepareStepReadiness::Denied {
+                                reason_code: "approval_denied".to_string(),
+                                error_code: MissionFailureCode::ApprovalDenied
+                                    .error_code()
+                                    .to_string(),
+                            },
+                            "prepare_approval_denied".to_string(),
+                        )
+                    } else {
+                        any_deferred = true;
+                        (
+                            TxPrepareStepReadiness::Deferred {
+                                reason_code: approval_reason.to_string(),
+                                retry_hint: "request_approval_and_pause".to_string(),
+                            },
+                            "prepare_approval_pending".to_string(),
+                        )
+                    }
+                } else if !gate.target_liveness {
+                    any_deferred = true;
+                    (
+                        TxPrepareStepReadiness::Deferred {
+                            reason_code: gate
+                                .liveness_reason_code
+                                .clone()
+                                .unwrap_or_else(|| "target_unreachable".to_string()),
+                            retry_hint: "refresh_runtime_state_then_retry".to_string(),
+                        },
+                        "prepare_target_unreachable".to_string(),
+                    )
+                } else {
+                    // All gates passed
+                    (
+                        TxPrepareStepReadiness::Ready,
+                        "prepare_all_gates_passed".to_string(),
+                    )
+                }
+            }
+        };
+
+        step_receipts.push(TxPrepareStepReceipt {
+            step_id: step.step_id.clone(),
+            ordinal: step.ordinal,
+            readiness,
+            decision_path,
+            evaluated_at_ms,
+        });
+    }
+
+    let outcome = if any_denied {
+        TxPrepareOutcome::Denied
+    } else if any_deferred {
+        TxPrepareOutcome::Deferred
+    } else {
+        TxPrepareOutcome::AllReady
+    };
+
+    let (reason_code, error_code, decision_path) = match outcome {
+        TxPrepareOutcome::AllReady => (
+            "prepare_succeeded".to_string(),
+            None,
+            "prepare_all_steps_ready".to_string(),
+        ),
+        TxPrepareOutcome::Denied => {
+            // Find first denied step's reason
+            let first_denied = step_receipts
+                .iter()
+                .find(|r| r.readiness.is_denied());
+            let (reason, error) = match first_denied.map(|r| &r.readiness) {
+                Some(TxPrepareStepReadiness::Denied { reason_code, error_code }) => {
+                    (reason_code.clone(), error_code.clone())
+                }
+                _ => ("prepare_denied".to_string(), "FTX2003".to_string()),
+            };
+            (reason, Some(error), "prepare_denied_abort".to_string())
+        }
+        TxPrepareOutcome::Deferred => {
+            let first_deferred = step_receipts
+                .iter()
+                .find(|r| r.readiness.is_deferred());
+            let reason = match first_deferred.map(|r| &r.readiness) {
+                Some(TxPrepareStepReadiness::Deferred { reason_code, .. }) => reason_code.clone(),
+                _ => "prepare_deferred".to_string(),
+            };
+            (reason, None, "prepare_deferred_retry".to_string())
+        }
+    };
+
+    Ok(TxPrepareReport {
+        tx_id: tx_id.clone(),
+        plan_id: plan.plan_id.clone(),
+        outcome,
+        step_receipts,
+        decision_path,
+        reason_code,
+        error_code,
+        completed_at_ms: evaluated_at_ms,
+    })
+}
+
+// ── H5: Commit-Phase Executor ───────────────────────────────────────────────
+
+/// Per-step result from the commit phase executor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxCommitStepResult {
+    /// Step that was executed.
+    pub step_id: TxStepId,
+    /// Step ordinal for ordering verification.
+    pub ordinal: u32,
+    /// Outcome of executing this step.
+    pub outcome: TxCommitStepOutcome,
+    /// Decision path describing the execution flow.
+    pub decision_path: String,
+    /// Timestamp when execution completed for this step.
+    pub completed_at_ms: i64,
+}
+
+/// Outcome of a single commit-phase step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TxCommitStepOutcome {
+    /// Step executed successfully.
+    Committed {
+        reason_code: String,
+    },
+    /// Step execution failed.
+    Failed {
+        reason_code: String,
+        error_code: String,
+    },
+    /// Step was skipped due to prior failure (barrier halt).
+    Skipped {
+        reason_code: String,
+    },
+    /// Step was skipped due to kill-switch activation.
+    Blocked {
+        reason_code: String,
+        error_code: String,
+    },
+}
+
+impl TxCommitStepOutcome {
+    /// True if this outcome represents a successful commit.
+    #[must_use]
+    pub fn is_committed(&self) -> bool {
+        matches!(self, Self::Committed { .. })
+    }
+
+    /// True if this outcome represents a failure.
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+
+    /// True if this step was skipped.
+    #[must_use]
+    pub fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped { .. })
+    }
+
+    /// Short tag name for logging.
+    #[must_use]
+    pub fn tag_name(&self) -> &str {
+        match self {
+            Self::Committed { .. } => "committed",
+            Self::Failed { .. } => "failed",
+            Self::Skipped { .. } => "skipped",
+            Self::Blocked { .. } => "blocked",
+        }
+    }
+}
+
+/// Aggregate commit-phase report covering all steps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxCommitReport {
+    /// Transaction ID.
+    pub tx_id: TxId,
+    /// Plan ID.
+    pub plan_id: TxPlanId,
+    /// Overall commit outcome.
+    pub outcome: TxCommitOutcome,
+    /// Per-step results in ordinal order.
+    pub step_results: Vec<TxCommitStepResult>,
+    /// Index of the first failed step (None if all committed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_boundary: Option<u32>,
+    /// Total steps committed successfully.
+    pub committed_count: usize,
+    /// Total steps that failed.
+    pub failed_count: usize,
+    /// Total steps skipped (after barrier).
+    pub skipped_count: usize,
+    /// Decision path for the overall outcome.
+    pub decision_path: String,
+    /// Reason code for the overall outcome.
+    pub reason_code: String,
+    /// Error code (only for failures).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Timestamp when commit phase completed.
+    pub completed_at_ms: i64,
+    /// Receipts emitted during the commit phase.
+    pub receipts: Vec<TxReceipt>,
+}
+
+impl TxCommitReport {
+    /// True if all steps committed successfully.
+    #[must_use]
+    pub fn is_fully_committed(&self) -> bool {
+        matches!(self.outcome, TxCommitOutcome::FullyCommitted)
+    }
+
+    /// True if any step failed (partial or complete failure).
+    #[must_use]
+    pub fn has_failures(&self) -> bool {
+        self.failed_count > 0
+    }
+
+    /// Canonical string for deterministic hashing.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "tx_id={}|plan_id={}|outcome={}|committed={}|failed={}|skipped={}|boundary={}|reason={}|err={}",
+            self.tx_id.0,
+            self.plan_id.0,
+            self.outcome.tag_name(),
+            self.committed_count,
+            self.failed_count,
+            self.skipped_count,
+            self.failure_boundary.map_or_else(|| "none".to_string(), |v| v.to_string()),
+            self.reason_code,
+            self.error_code.as_deref().unwrap_or("none"),
+        )
+    }
+}
+
+/// Overall commit phase outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxCommitOutcome {
+    /// All steps committed. Transition: Committing → Committed.
+    FullyCommitted,
+    /// Some steps committed, then a failure. Transition: Committing → Compensating.
+    PartialFailure,
+    /// First step failed immediately. Transition: Committing → Failed.
+    ImmediateFailure,
+    /// Blocked by kill-switch before any steps. Transition: Committing → Failed.
+    KillSwitchBlocked,
+    /// Blocked by pause command. Commit suspended.
+    PauseSuspended,
+}
+
+impl TxCommitOutcome {
+    /// Short tag name for canonical string.
+    #[must_use]
+    pub fn tag_name(&self) -> &str {
+        match self {
+            Self::FullyCommitted => "fully_committed",
+            Self::PartialFailure => "partial_failure",
+            Self::ImmediateFailure => "immediate_failure",
+            Self::KillSwitchBlocked => "kill_switch_blocked",
+            Self::PauseSuspended => "pause_suspended",
+        }
+    }
+
+    /// The MissionTxState this outcome transitions to.
+    #[must_use]
+    pub fn target_tx_state(&self) -> MissionTxState {
+        match self {
+            Self::FullyCommitted => MissionTxState::Committed,
+            Self::PartialFailure => MissionTxState::Compensating,
+            Self::ImmediateFailure => MissionTxState::Failed,
+            Self::KillSwitchBlocked => MissionTxState::Failed,
+            Self::PauseSuspended => MissionTxState::Committing, // stays in committing
+        }
+    }
+}
+
+/// Input describing one step's execution result (provided by dispatcher).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxCommitStepInput {
+    /// Step ID being reported.
+    pub step_id: TxStepId,
+    /// Whether the step succeeded.
+    pub success: bool,
+    /// Reason code for the outcome.
+    pub reason_code: String,
+    /// Error code (only when success=false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Timestamp when this step completed.
+    pub completed_at_ms: i64,
+}
+
+/// Execute the commit phase for a transaction plan.
+///
+/// Steps are processed in ordinal order with barrier semantics:
+/// - Kill-switch check before any step
+/// - On first failure, all remaining steps are skipped
+/// - Emits monotonic receipts for CommitStarted, per-step, and terminal state
+///
+/// # Errors
+/// Returns `MissionTxValidationError` if the plan has no steps or the
+/// contract is in a non-prepared state.
+pub fn execute_commit_phase(
+    contract: &MissionTxContract,
+    step_inputs: &[TxCommitStepInput],
+    kill_switch_level: MissionKillSwitchLevel,
+    is_paused: bool,
+    executed_at_ms: i64,
+) -> Result<TxCommitReport, MissionTxValidationError> {
+    // Validate preconditions
+    if contract.lifecycle_state != MissionTxState::Prepared
+        && contract.lifecycle_state != MissionTxState::Committing
+    {
+        return Err(MissionTxValidationError::IllegalLifecycleTransition {
+            from: contract.lifecycle_state,
+            to: MissionTxState::Committing,
+            kind: MissionTxTransitionKind::CommitStarted,
+        });
+    }
+
+    if contract.plan.steps.is_empty() {
+        return Err(MissionTxValidationError::EmptyPlanSteps);
+    }
+
+    let mut receipts = Vec::new();
+    let mut receipt_seq = contract
+        .receipts
+        .last()
+        .map_or(1, |r| r.seq + 1);
+
+    // Emit CommitStarted receipt
+    receipts.push(TxReceipt {
+        seq: receipt_seq,
+        state: MissionTxState::Committing,
+        emitted_at_ms: executed_at_ms,
+        reason_code: Some("commit_phase_started".into()),
+        error_code: None,
+    });
+    receipt_seq += 1;
+
+    // Kill-switch pre-check
+    if kill_switch_level.blocks_dispatch() {
+        let step_results: Vec<TxCommitStepResult> = contract
+            .plan
+            .steps
+            .iter()
+            .map(|step| TxCommitStepResult {
+                step_id: step.step_id.clone(),
+                ordinal: step.ordinal,
+                outcome: TxCommitStepOutcome::Blocked {
+                    reason_code: "kill_switch_active".into(),
+                    error_code: "FTX3001".into(),
+                },
+                decision_path: "commit_abort_kill_switch".into(),
+                completed_at_ms: executed_at_ms,
+            })
+            .collect();
+
+        receipts.push(TxReceipt {
+            seq: receipt_seq,
+            state: MissionTxState::Failed,
+            emitted_at_ms: executed_at_ms,
+            reason_code: Some("kill_switch_blocked_commit".into()),
+            error_code: Some("FTX3001".into()),
+        });
+
+        return Ok(TxCommitReport {
+            tx_id: contract.intent.tx_id.clone(),
+            plan_id: contract.plan.plan_id.clone(),
+            outcome: TxCommitOutcome::KillSwitchBlocked,
+            step_results,
+            failure_boundary: Some(1),
+            committed_count: 0,
+            failed_count: 0,
+            skipped_count: contract.plan.steps.len(),
+            decision_path: "commit_abort_kill_switch".into(),
+            reason_code: "kill_switch_active".into(),
+            error_code: Some("FTX3001".into()),
+            completed_at_ms: executed_at_ms,
+            receipts,
+        });
+    }
+
+    // Pause check
+    if is_paused {
+        let step_results: Vec<TxCommitStepResult> = contract
+            .plan
+            .steps
+            .iter()
+            .map(|step| TxCommitStepResult {
+                step_id: step.step_id.clone(),
+                ordinal: step.ordinal,
+                outcome: TxCommitStepOutcome::Skipped {
+                    reason_code: "mission_paused".into(),
+                },
+                decision_path: "commit_suspended_paused".into(),
+                completed_at_ms: executed_at_ms,
+            })
+            .collect();
+
+        return Ok(TxCommitReport {
+            tx_id: contract.intent.tx_id.clone(),
+            plan_id: contract.plan.plan_id.clone(),
+            outcome: TxCommitOutcome::PauseSuspended,
+            step_results,
+            failure_boundary: None,
+            committed_count: 0,
+            failed_count: 0,
+            skipped_count: contract.plan.steps.len(),
+            decision_path: "commit_suspended_paused".into(),
+            reason_code: "mission_paused".into(),
+            error_code: None,
+            completed_at_ms: executed_at_ms,
+            receipts,
+        });
+    }
+
+    // Build step input lookup by step_id
+    let input_map: std::collections::HashMap<&str, &TxCommitStepInput> = step_inputs
+        .iter()
+        .map(|si| (si.step_id.0.as_str(), si))
+        .collect();
+
+    let mut step_results = Vec::with_capacity(contract.plan.steps.len());
+    let mut committed_count = 0usize;
+    let mut failed_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut failure_boundary: Option<u32> = None;
+    let mut barrier_tripped = false;
+
+    // Execute steps in ordinal order
+    for step in &contract.plan.steps {
+        if barrier_tripped {
+            step_results.push(TxCommitStepResult {
+                step_id: step.step_id.clone(),
+                ordinal: step.ordinal,
+                outcome: TxCommitStepOutcome::Skipped {
+                    reason_code: "barrier_halt".into(),
+                },
+                decision_path: "commit_step_skipped_barrier".into(),
+                completed_at_ms: executed_at_ms,
+            });
+            skipped_count += 1;
+            continue;
+        }
+
+        match input_map.get(step.step_id.0.as_str()) {
+            Some(input) if input.success => {
+                step_results.push(TxCommitStepResult {
+                    step_id: step.step_id.clone(),
+                    ordinal: step.ordinal,
+                    outcome: TxCommitStepOutcome::Committed {
+                        reason_code: input.reason_code.clone(),
+                    },
+                    decision_path: "commit_step_succeeded".into(),
+                    completed_at_ms: input.completed_at_ms,
+                });
+                committed_count += 1;
+            }
+            Some(input) => {
+                // Step failed — trip the barrier
+                step_results.push(TxCommitStepResult {
+                    step_id: step.step_id.clone(),
+                    ordinal: step.ordinal,
+                    outcome: TxCommitStepOutcome::Failed {
+                        reason_code: input.reason_code.clone(),
+                        error_code: input
+                            .error_code
+                            .clone()
+                            .unwrap_or_else(|| "FTX3002".into()),
+                    },
+                    decision_path: "commit_step_failed".into(),
+                    completed_at_ms: input.completed_at_ms,
+                });
+                failed_count += 1;
+                failure_boundary = Some(step.ordinal);
+                barrier_tripped = true;
+            }
+            None => {
+                // No input provided — treat as failure (missing result)
+                step_results.push(TxCommitStepResult {
+                    step_id: step.step_id.clone(),
+                    ordinal: step.ordinal,
+                    outcome: TxCommitStepOutcome::Failed {
+                        reason_code: "step_input_missing".into(),
+                        error_code: "FTX3003".into(),
+                    },
+                    decision_path: "commit_step_no_input".into(),
+                    completed_at_ms: executed_at_ms,
+                });
+                failed_count += 1;
+                failure_boundary = Some(step.ordinal);
+                barrier_tripped = true;
+            }
+        }
+    }
+
+    // Determine overall outcome
+    let (outcome, terminal_state, reason_code, error_code, decision_path) =
+        if failed_count == 0 {
+            (
+                TxCommitOutcome::FullyCommitted,
+                MissionTxState::Committed,
+                "all_steps_committed".to_string(),
+                None,
+                "commit_succeeded".to_string(),
+            )
+        } else if committed_count == 0 {
+            (
+                TxCommitOutcome::ImmediateFailure,
+                MissionTxState::Failed,
+                "first_step_failed".to_string(),
+                Some("FTX3004".to_string()),
+                "commit_immediate_failure".to_string(),
+            )
+        } else {
+            (
+                TxCommitOutcome::PartialFailure,
+                MissionTxState::Compensating,
+                format!(
+                    "partial_failure_at_ordinal_{}",
+                    failure_boundary.unwrap_or(0)
+                ),
+                Some("FTX3005".to_string()),
+                "commit_partial_failure".to_string(),
+            )
+        };
+
+    // Emit terminal receipt
+    receipts.push(TxReceipt {
+        seq: receipt_seq,
+        state: terminal_state,
+        emitted_at_ms: executed_at_ms,
+        reason_code: Some(reason_code.clone()),
+        error_code: error_code.clone(),
+    });
+
+    Ok(TxCommitReport {
+        tx_id: contract.intent.tx_id.clone(),
+        plan_id: contract.plan.plan_id.clone(),
+        outcome,
+        step_results,
+        failure_boundary,
+        committed_count,
+        failed_count,
+        skipped_count,
+        decision_path,
+        reason_code,
+        error_code,
+        completed_at_ms: executed_at_ms,
+        receipts,
+    })
+}
+
+// ── H6: Compensation Planner and Automatic Rollback Engine ──────────────────
+
+/// Per-step compensation result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxCompensationStepResult {
+    /// Forward step being compensated.
+    pub for_step_id: TxStepId,
+    /// Ordinal of the forward step (used for reverse ordering).
+    pub forward_ordinal: u32,
+    /// Compensation outcome.
+    pub outcome: TxCompensationStepOutcome,
+    /// Decision path.
+    pub decision_path: String,
+    /// Timestamp.
+    pub completed_at_ms: i64,
+}
+
+/// Outcome of a single compensation step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TxCompensationStepOutcome {
+    /// Compensation succeeded (forward step undone).
+    Compensated { reason_code: String },
+    /// Compensation failed (residual risk).
+    Failed { reason_code: String, error_code: String },
+    /// No compensation defined for this step.
+    NoCompensation { reason_code: String },
+    /// Skipped due to prior compensation failure.
+    Skipped { reason_code: String },
+}
+
+impl TxCompensationStepOutcome {
+    #[must_use]
+    pub fn is_compensated(&self) -> bool {
+        matches!(self, Self::Compensated { .. })
+    }
+
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+
+    #[must_use]
+    pub fn tag_name(&self) -> &str {
+        match self {
+            Self::Compensated { .. } => "compensated",
+            Self::Failed { .. } => "failed",
+            Self::NoCompensation { .. } => "no_compensation",
+            Self::Skipped { .. } => "skipped",
+        }
+    }
+}
+
+/// Aggregate compensation report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxCompensationReport {
+    pub tx_id: TxId,
+    pub plan_id: TxPlanId,
+    /// Overall compensation outcome.
+    pub outcome: TxCompensationOutcome,
+    /// Per-step results in reverse ordinal order (highest first).
+    pub step_results: Vec<TxCompensationStepResult>,
+    /// Steps that were successfully compensated.
+    pub compensated_count: usize,
+    /// Steps where compensation failed (residual risk).
+    pub failed_count: usize,
+    /// Steps without a defined compensation action.
+    pub no_compensation_count: usize,
+    /// Steps skipped due to earlier compensation failure.
+    pub skipped_count: usize,
+    /// Decision path.
+    pub decision_path: String,
+    /// Reason code.
+    pub reason_code: String,
+    /// Error code (only for failures).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Timestamp.
+    pub completed_at_ms: i64,
+    /// Receipts emitted during compensation.
+    pub receipts: Vec<TxReceipt>,
+}
+
+impl TxCompensationReport {
+    /// True if all compensations succeeded (clean rollback).
+    #[must_use]
+    pub fn is_fully_rolled_back(&self) -> bool {
+        matches!(self.outcome, TxCompensationOutcome::FullyRolledBack)
+    }
+
+    /// True if any compensation failed.
+    #[must_use]
+    pub fn has_residual_risk(&self) -> bool {
+        self.failed_count > 0
+    }
+
+    /// Canonical string for deterministic hashing.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "tx_id={}|plan_id={}|outcome={}|compensated={}|failed={}|no_comp={}|skipped={}|reason={}|err={}",
+            self.tx_id.0,
+            self.plan_id.0,
+            self.outcome.tag_name(),
+            self.compensated_count,
+            self.failed_count,
+            self.no_compensation_count,
+            self.skipped_count,
+            self.reason_code,
+            self.error_code.as_deref().unwrap_or("none"),
+        )
+    }
+}
+
+/// Overall compensation outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxCompensationOutcome {
+    /// All compensations succeeded → Compensating → RolledBack.
+    FullyRolledBack,
+    /// At least one compensation failed → Compensating → Failed.
+    CompensationFailed,
+    /// No steps needed compensation (e.g., ImmediateFailure).
+    NothingToCompensate,
+}
+
+impl TxCompensationOutcome {
+    #[must_use]
+    pub fn tag_name(&self) -> &str {
+        match self {
+            Self::FullyRolledBack => "fully_rolled_back",
+            Self::CompensationFailed => "compensation_failed",
+            Self::NothingToCompensate => "nothing_to_compensate",
+        }
+    }
+
+    /// Target transaction state after compensation.
+    #[must_use]
+    pub fn target_tx_state(&self) -> MissionTxState {
+        match self {
+            Self::FullyRolledBack => MissionTxState::RolledBack,
+            Self::CompensationFailed => MissionTxState::Failed,
+            Self::NothingToCompensate => MissionTxState::Failed,
+        }
+    }
+}
+
+/// Input describing one step's compensation result (provided by dispatcher).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxCompensationStepInput {
+    /// Forward step ID being compensated.
+    pub for_step_id: TxStepId,
+    /// Whether the compensation succeeded.
+    pub success: bool,
+    /// Reason code.
+    pub reason_code: String,
+    /// Error code (only when success=false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Timestamp.
+    pub completed_at_ms: i64,
+}
+
+/// Execute the compensation phase for a partial-failure commit.
+///
+/// Compensations are processed in **reverse ordinal order** (highest ordinal first)
+/// for steps that were committed successfully before the failure boundary.
+///
+/// # Arguments
+/// * `contract` — Transaction contract (must be in Compensating state)
+/// * `commit_report` — The commit report showing which steps committed
+/// * `comp_inputs` — Per-step compensation results from dispatcher
+/// * `executed_at_ms` — Current timestamp
+///
+/// # Errors
+/// Returns `MissionTxValidationError` if contract is not in Compensating state.
+pub fn execute_compensation_phase(
+    contract: &MissionTxContract,
+    commit_report: &TxCommitReport,
+    comp_inputs: &[TxCompensationStepInput],
+    executed_at_ms: i64,
+) -> Result<TxCompensationReport, MissionTxValidationError> {
+    // Validate precondition
+    if contract.lifecycle_state != MissionTxState::Compensating {
+        return Err(MissionTxValidationError::IllegalLifecycleTransition {
+            from: contract.lifecycle_state,
+            to: MissionTxState::RolledBack,
+            kind: MissionTxTransitionKind::CompensationSucceeded,
+        });
+    }
+
+    let mut receipts = Vec::new();
+    let mut receipt_seq = contract
+        .receipts
+        .last()
+        .map_or(1, |r| r.seq + 1);
+
+    // Emit CompensationStarted receipt
+    receipts.push(TxReceipt {
+        seq: receipt_seq,
+        state: MissionTxState::Compensating,
+        emitted_at_ms: executed_at_ms,
+        reason_code: Some("compensation_started".into()),
+        error_code: None,
+    });
+    receipt_seq += 1;
+
+    // Build compensation lookup: for_step_id → TxCompensation
+    let comp_map: std::collections::HashMap<&str, &TxCompensation> = contract
+        .plan
+        .compensations
+        .iter()
+        .map(|c| (c.for_step_id.0.as_str(), c))
+        .collect();
+
+    // Build input lookup: for_step_id → TxCompensationStepInput
+    let input_map: std::collections::HashMap<&str, &TxCompensationStepInput> = comp_inputs
+        .iter()
+        .map(|ci| (ci.for_step_id.0.as_str(), ci))
+        .collect();
+
+    // Identify committed steps that need compensation (reverse ordinal order)
+    let mut steps_to_compensate: Vec<&TxCommitStepResult> = commit_report
+        .step_results
+        .iter()
+        .filter(|sr| sr.outcome.is_committed())
+        .collect();
+    steps_to_compensate.sort_by(|a, b| b.ordinal.cmp(&a.ordinal));
+
+    // If nothing to compensate
+    if steps_to_compensate.is_empty() {
+        receipts.push(TxReceipt {
+            seq: receipt_seq,
+            state: MissionTxState::Failed,
+            emitted_at_ms: executed_at_ms,
+            reason_code: Some("nothing_to_compensate".into()),
+            error_code: Some("FTX2008".into()),
+        });
+
+        return Ok(TxCompensationReport {
+            tx_id: contract.intent.tx_id.clone(),
+            plan_id: contract.plan.plan_id.clone(),
+            outcome: TxCompensationOutcome::NothingToCompensate,
+            step_results: Vec::new(),
+            compensated_count: 0,
+            failed_count: 0,
+            no_compensation_count: 0,
+            skipped_count: 0,
+            decision_path: "compensation_nothing_to_compensate".into(),
+            reason_code: "nothing_to_compensate".into(),
+            error_code: Some("FTX2008".into()),
+            completed_at_ms: executed_at_ms,
+            receipts,
+        });
+    }
+
+    let mut step_results = Vec::with_capacity(steps_to_compensate.len());
+    let mut compensated_count = 0usize;
+    let mut failed_count = 0usize;
+    let mut no_compensation_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut barrier_tripped = false;
+
+    // Execute compensations in reverse ordinal order
+    for committed_step in &steps_to_compensate {
+        let step_id = &committed_step.step_id;
+
+        if barrier_tripped {
+            step_results.push(TxCompensationStepResult {
+                for_step_id: step_id.clone(),
+                forward_ordinal: committed_step.ordinal,
+                outcome: TxCompensationStepOutcome::Skipped {
+                    reason_code: "prior_compensation_failed".into(),
+                },
+                decision_path: "compensation_skipped_barrier".into(),
+                completed_at_ms: executed_at_ms,
+            });
+            skipped_count += 1;
+            continue;
+        }
+
+        // Check if compensation is defined
+        if !comp_map.contains_key(step_id.0.as_str()) {
+            step_results.push(TxCompensationStepResult {
+                for_step_id: step_id.clone(),
+                forward_ordinal: committed_step.ordinal,
+                outcome: TxCompensationStepOutcome::NoCompensation {
+                    reason_code: "no_compensation_defined".into(),
+                },
+                decision_path: "compensation_not_defined".into(),
+                completed_at_ms: executed_at_ms,
+            });
+            no_compensation_count += 1;
+            // No compensation ≠ failure; continue with next step
+            continue;
+        }
+
+        // Execute compensation
+        match input_map.get(step_id.0.as_str()) {
+            Some(input) if input.success => {
+                step_results.push(TxCompensationStepResult {
+                    for_step_id: step_id.clone(),
+                    forward_ordinal: committed_step.ordinal,
+                    outcome: TxCompensationStepOutcome::Compensated {
+                        reason_code: input.reason_code.clone(),
+                    },
+                    decision_path: "compensation_succeeded".into(),
+                    completed_at_ms: input.completed_at_ms,
+                });
+                compensated_count += 1;
+            }
+            Some(input) => {
+                step_results.push(TxCompensationStepResult {
+                    for_step_id: step_id.clone(),
+                    forward_ordinal: committed_step.ordinal,
+                    outcome: TxCompensationStepOutcome::Failed {
+                        reason_code: input.reason_code.clone(),
+                        error_code: input
+                            .error_code
+                            .clone()
+                            .unwrap_or_else(|| "FTX2008".into()),
+                    },
+                    decision_path: "compensation_failed".into(),
+                    completed_at_ms: input.completed_at_ms,
+                });
+                failed_count += 1;
+                barrier_tripped = true;
+            }
+            None => {
+                // Missing input for step with defined compensation
+                step_results.push(TxCompensationStepResult {
+                    for_step_id: step_id.clone(),
+                    forward_ordinal: committed_step.ordinal,
+                    outcome: TxCompensationStepOutcome::Failed {
+                        reason_code: "compensation_input_missing".into(),
+                        error_code: "FTX2010".into(),
+                    },
+                    decision_path: "compensation_no_input".into(),
+                    completed_at_ms: executed_at_ms,
+                });
+                failed_count += 1;
+                barrier_tripped = true;
+            }
+        }
+    }
+
+    // Determine overall outcome
+    let (outcome, terminal_state, reason_code, error_code, decision_path) =
+        if failed_count > 0 {
+            (
+                TxCompensationOutcome::CompensationFailed,
+                MissionTxState::Failed,
+                "compensation_incomplete".to_string(),
+                Some("FTX2008".to_string()),
+                "compensation_failed".to_string(),
+            )
+        } else {
+            (
+                TxCompensationOutcome::FullyRolledBack,
+                MissionTxState::RolledBack,
+                "all_compensations_succeeded".to_string(),
+                None,
+                "compensation_succeeded".to_string(),
+            )
+        };
+
+    // Emit terminal receipt
+    receipts.push(TxReceipt {
+        seq: receipt_seq,
+        state: terminal_state,
+        emitted_at_ms: executed_at_ms,
+        reason_code: Some(reason_code.clone()),
+        error_code: error_code.clone(),
+    });
+
+    Ok(TxCompensationReport {
+        tx_id: contract.intent.tx_id.clone(),
+        plan_id: contract.plan.plan_id.clone(),
+        outcome,
+        step_results,
+        compensated_count,
+        failed_count,
+        no_compensation_count,
+        skipped_count,
+        decision_path,
+        reason_code,
+        error_code,
+        completed_at_ms: executed_at_ms,
+        receipts,
+    })
+}
+
+// ── H7: Durable Idempotency, Dedupe, and Resume ────────────────────────────
+
+/// Record of a transaction execution attempt for idempotency tracking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxExecutionRecord {
+    /// Transaction ID this record tracks.
+    pub tx_id: TxId,
+    /// Plan ID that was executed.
+    pub plan_id: TxPlanId,
+    /// Current lifecycle state of the transaction.
+    pub lifecycle_state: MissionTxState,
+    /// Correlation ID from the original intent.
+    pub correlation_id: String,
+    /// Content-addressed idempotency key for the full tx.
+    pub tx_idempotency_key: String,
+    /// Per-step execution records.
+    pub step_records: Vec<TxStepExecutionRecord>,
+    /// Commit report if commit phase was executed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_report_hash: Option<String>,
+    /// Compensation report if compensation phase was executed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compensation_report_hash: Option<String>,
+    /// When the record was created or last updated.
+    pub updated_at_ms: i64,
+}
+
+impl TxExecutionRecord {
+    /// Compute idempotency key from contract content.
+    #[must_use]
+    pub fn compute_tx_key(contract: &MissionTxContract) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        contract.intent.tx_id.0.hash(&mut hasher);
+        contract.plan.plan_id.0.hash(&mut hasher);
+        contract.intent.correlation_id.hash(&mut hasher);
+        for step in &contract.plan.steps {
+            step.step_id.0.hash(&mut hasher);
+            step.ordinal.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+        format!("txkey:{hash:016x}")
+    }
+
+    /// True if the transaction reached a terminal state.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.lifecycle_state,
+            MissionTxState::Committed | MissionTxState::RolledBack | MissionTxState::Failed
+        )
+    }
+
+    /// True if this is an exact duplicate of a prior completed execution.
+    #[must_use]
+    pub fn is_duplicate_of(&self, other_key: &str) -> bool {
+        self.tx_idempotency_key == other_key && self.is_terminal()
+    }
+
+    /// Canonical string for deterministic hashing.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "tx_id={}|plan_id={}|state={}|corr={}|key={}|steps={}|updated={}",
+            self.tx_id.0,
+            self.plan_id.0,
+            self.lifecycle_state,
+            self.correlation_id,
+            self.tx_idempotency_key,
+            self.step_records.len(),
+            self.updated_at_ms,
+        )
+    }
+}
+
+/// Per-step execution record for idempotency and dedupe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxStepExecutionRecord {
+    /// Step that was executed.
+    pub step_id: TxStepId,
+    /// Step ordinal.
+    pub ordinal: u32,
+    /// The phase this step was last executed in.
+    pub phase: TxPhase,
+    /// Whether the step execution succeeded.
+    pub succeeded: bool,
+    /// Idempotency key for this specific step execution.
+    pub step_idempotency_key: String,
+    /// Number of times this step was attempted.
+    pub attempt_count: u32,
+    /// Timestamp of last attempt.
+    pub last_attempted_at_ms: i64,
+}
+
+impl TxStepExecutionRecord {
+    /// Compute step-level idempotency key.
+    #[must_use]
+    pub fn compute_step_key(tx_id: &TxId, step_id: &TxStepId, phase: &TxPhase) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        tx_id.0.hash(&mut hasher);
+        step_id.0.hash(&mut hasher);
+        phase.tag_name().hash(&mut hasher);
+        let hash = hasher.finish();
+        format!("stepkey:{hash:016x}")
+    }
+
+    /// True if this step has already succeeded in this phase.
+    #[must_use]
+    pub fn is_already_succeeded(&self, phase: &TxPhase) -> bool {
+        self.phase == *phase && self.succeeded
+    }
+
+    /// Canonical string for deterministic hashing.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "step_id={}|ordinal={}|phase={}|ok={}|key={}|attempts={}",
+            self.step_id.0,
+            self.ordinal,
+            self.phase.tag_name(),
+            self.succeeded,
+            self.step_idempotency_key,
+            self.attempt_count,
+        )
+    }
+}
+
+/// Transaction execution phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxPhase {
+    /// Prepare phase (pre-flight validation).
+    Prepare,
+    /// Commit phase (forward execution).
+    Commit,
+    /// Compensation phase (rollback execution).
+    Compensate,
+}
+
+impl TxPhase {
+    /// Tag name for serialization and display.
+    #[must_use]
+    pub fn tag_name(&self) -> &str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::Commit => "commit",
+            Self::Compensate => "compensate",
+        }
+    }
+}
+
+/// Result of idempotency validation before executing a tx phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxIdempotencyCheckResult {
+    /// Transaction ID checked.
+    pub tx_id: TxId,
+    /// Phase being requested.
+    pub requested_phase: TxPhase,
+    /// The idempotency key that was checked.
+    pub tx_idempotency_key: String,
+    /// Verdict from the idempotency check.
+    pub verdict: TxIdempotencyVerdict,
+    /// Decision path describing the check flow.
+    pub decision_path: String,
+    /// Reason code.
+    pub reason_code: String,
+    /// Error code if blocked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+impl TxIdempotencyCheckResult {
+    /// True if the phase should proceed.
+    #[must_use]
+    pub fn should_proceed(&self) -> bool {
+        matches!(
+            self.verdict,
+            TxIdempotencyVerdict::Fresh | TxIdempotencyVerdict::Resumable { .. }
+        )
+    }
+
+    /// True if this is an exact duplicate of a completed execution.
+    #[must_use]
+    pub fn is_exact_duplicate(&self) -> bool {
+        matches!(self.verdict, TxIdempotencyVerdict::ExactDuplicate)
+    }
+
+    /// Canonical string for deterministic hashing.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "tx_id={}|phase={}|key={}|verdict={}|reason={}|err={}",
+            self.tx_id.0,
+            self.requested_phase.tag_name(),
+            self.tx_idempotency_key,
+            self.verdict.tag_name(),
+            self.reason_code,
+            self.error_code.as_deref().unwrap_or("none"),
+        )
+    }
+}
+
+/// Verdict from idempotency check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TxIdempotencyVerdict {
+    /// No prior execution found — safe to proceed.
+    Fresh,
+    /// Prior execution exists but is resumable (non-terminal state).
+    Resumable {
+        /// The state to resume from.
+        resume_from_state: MissionTxState,
+        /// Steps already completed in the prior attempt.
+        completed_steps: Vec<TxStepId>,
+    },
+    /// Prior execution completed identically — return cached result.
+    ExactDuplicate,
+    /// Prior execution completed with different outcome — conflict.
+    ConflictingPrior {
+        /// Prior state.
+        prior_state: MissionTxState,
+        /// Error describing the conflict.
+        conflict_reason: String,
+    },
+    /// Double-commit or double-compensation guard triggered.
+    DoubleExecutionBlocked {
+        /// Which phase was already completed.
+        already_completed_phase: TxPhase,
+    },
+}
+
+impl TxIdempotencyVerdict {
+    /// Tag name for the verdict.
+    #[must_use]
+    pub fn tag_name(&self) -> &str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Resumable { .. } => "resumable",
+            Self::ExactDuplicate => "exact_duplicate",
+            Self::ConflictingPrior { .. } => "conflicting_prior",
+            Self::DoubleExecutionBlocked { .. } => "double_execution_blocked",
+        }
+    }
+}
+
+/// Reconstructed resume state from receipt chain and reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxResumeState {
+    /// Transaction ID.
+    pub tx_id: TxId,
+    /// Current lifecycle state derived from receipts.
+    pub derived_state: MissionTxState,
+    /// Last receipt sequence number seen.
+    pub last_receipt_seq: u64,
+    /// Steps that have already been committed (in ordinal order).
+    pub committed_step_ids: Vec<TxStepId>,
+    /// Steps that have already been compensated (in reverse ordinal order).
+    pub compensated_step_ids: Vec<TxStepId>,
+    /// Steps remaining for the current phase.
+    pub pending_step_ids: Vec<TxStepId>,
+    /// Whether the commit phase completed.
+    pub commit_phase_completed: bool,
+    /// Whether the compensation phase completed.
+    pub compensation_phase_completed: bool,
+    /// Decision path describing how state was reconstructed.
+    pub decision_path: String,
+    /// Timestamp of reconstruction.
+    pub reconstructed_at_ms: i64,
+}
+
+impl TxResumeState {
+    /// True if there are pending steps to execute.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        !self.pending_step_ids.is_empty()
+    }
+
+    /// True if both phases are done (terminal).
+    #[must_use]
+    pub fn is_fully_resolved(&self) -> bool {
+        matches!(
+            self.derived_state,
+            MissionTxState::Committed | MissionTxState::RolledBack | MissionTxState::Failed
+        )
+    }
+
+    /// Canonical string for deterministic hashing.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "tx_id={}|state={}|last_seq={}|committed={}|compensated={}|pending={}|commit_done={}|comp_done={}",
+            self.tx_id.0,
+            self.derived_state,
+            self.last_receipt_seq,
+            self.committed_step_ids.len(),
+            self.compensated_step_ids.len(),
+            self.pending_step_ids.len(),
+            self.commit_phase_completed,
+            self.compensation_phase_completed,
+        )
+    }
+}
+
+/// Validate idempotency before executing a transaction phase.
+///
+/// Checks the execution record ledger for prior attempts and returns a verdict.
+pub fn validate_tx_idempotency(
+    contract: &MissionTxContract,
+    requested_phase: TxPhase,
+    prior_record: Option<&TxExecutionRecord>,
+) -> TxIdempotencyCheckResult {
+    let tx_key = TxExecutionRecord::compute_tx_key(contract);
+
+    // No prior record → fresh execution
+    let record = match prior_record {
+        None => {
+            return TxIdempotencyCheckResult {
+                tx_id: contract.intent.tx_id.clone(),
+                requested_phase,
+                tx_idempotency_key: tx_key,
+                verdict: TxIdempotencyVerdict::Fresh,
+                decision_path: "idempotency_no_prior".into(),
+                reason_code: "fresh_execution".into(),
+                error_code: None,
+            };
+        }
+        Some(r) => r,
+    };
+
+    // Check double-execution guard
+    match requested_phase {
+        TxPhase::Commit if record.commit_report_hash.is_some() && record.is_terminal() => {
+            return TxIdempotencyCheckResult {
+                tx_id: contract.intent.tx_id.clone(),
+                requested_phase,
+                tx_idempotency_key: tx_key,
+                verdict: TxIdempotencyVerdict::DoubleExecutionBlocked {
+                    already_completed_phase: TxPhase::Commit,
+                },
+                decision_path: "idempotency_double_commit_blocked".into(),
+                reason_code: "commit_already_completed".into(),
+                error_code: Some("FTX3001".into()),
+            };
+        }
+        TxPhase::Compensate
+            if record.compensation_report_hash.is_some() && record.is_terminal() =>
+        {
+            return TxIdempotencyCheckResult {
+                tx_id: contract.intent.tx_id.clone(),
+                requested_phase,
+                tx_idempotency_key: tx_key,
+                verdict: TxIdempotencyVerdict::DoubleExecutionBlocked {
+                    already_completed_phase: TxPhase::Compensate,
+                },
+                decision_path: "idempotency_double_compensate_blocked".into(),
+                reason_code: "compensation_already_completed".into(),
+                error_code: Some("FTX3002".into()),
+            };
+        }
+        _ => {}
+    }
+
+    // Exact duplicate check (terminal + same key)
+    if record.is_duplicate_of(&tx_key) {
+        return TxIdempotencyCheckResult {
+            tx_id: contract.intent.tx_id.clone(),
+            requested_phase,
+            tx_idempotency_key: tx_key,
+            verdict: TxIdempotencyVerdict::ExactDuplicate,
+            decision_path: "idempotency_exact_duplicate".into(),
+            reason_code: "exact_duplicate_detected".into(),
+            error_code: None,
+        };
+    }
+
+    // Terminal state with different key → conflict
+    if record.is_terminal() && record.tx_idempotency_key != tx_key {
+        return TxIdempotencyCheckResult {
+            tx_id: contract.intent.tx_id.clone(),
+            requested_phase,
+            tx_idempotency_key: tx_key,
+            verdict: TxIdempotencyVerdict::ConflictingPrior {
+                prior_state: record.lifecycle_state,
+                conflict_reason: format!(
+                    "prior key {} != current key",
+                    record.tx_idempotency_key
+                ),
+            },
+            decision_path: "idempotency_conflicting_prior".into(),
+            reason_code: "key_mismatch_on_terminal".into(),
+            error_code: Some("FTX3003".into()),
+        };
+    }
+
+    // Non-terminal with matching key → resumable
+    let completed_steps: Vec<TxStepId> = record
+        .step_records
+        .iter()
+        .filter(|sr| sr.succeeded && sr.phase == requested_phase)
+        .map(|sr| sr.step_id.clone())
+        .collect();
+
+    TxIdempotencyCheckResult {
+        tx_id: contract.intent.tx_id.clone(),
+        requested_phase,
+        tx_idempotency_key: tx_key,
+        verdict: TxIdempotencyVerdict::Resumable {
+            resume_from_state: record.lifecycle_state,
+            completed_steps,
+        },
+        decision_path: "idempotency_resumable".into(),
+        reason_code: "prior_non_terminal_resumable".into(),
+        error_code: None,
+    }
+}
+
+/// Reconstruct transaction resume state from contract receipts and optional reports.
+///
+/// Used after crash/restart to determine what work was already done and what remains.
+pub fn reconstruct_tx_resume_state(
+    contract: &MissionTxContract,
+    commit_report: Option<&TxCommitReport>,
+    compensation_report: Option<&TxCompensationReport>,
+    reconstructed_at_ms: i64,
+) -> TxResumeState {
+    let all_step_ids: Vec<TxStepId> = contract
+        .plan
+        .steps
+        .iter()
+        .map(|s| s.step_id.clone())
+        .collect();
+
+    let last_receipt_seq = contract.receipts.last().map_or(0, |r| r.seq);
+
+    // Derive state from receipts (last receipt wins)
+    let derived_state = contract
+        .receipts
+        .last()
+        .map_or(contract.lifecycle_state, |r| r.state);
+
+    // Extract committed step IDs from commit report
+    let committed_step_ids: Vec<TxStepId> = commit_report
+        .map(|cr| {
+            cr.step_results
+                .iter()
+                .filter(|sr| sr.outcome.is_committed())
+                .map(|sr| sr.step_id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Extract compensated step IDs from compensation report
+    let compensated_step_ids: Vec<TxStepId> = compensation_report
+        .map(|cr| {
+            cr.step_results
+                .iter()
+                .filter(|sr| sr.outcome.is_compensated())
+                .map(|sr| sr.for_step_id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let commit_phase_completed = commit_report.is_some();
+    let compensation_phase_completed = compensation_report.is_some();
+
+    // Determine pending steps based on current state
+    let pending_step_ids = match derived_state {
+        MissionTxState::Prepared | MissionTxState::Committing => {
+            // Steps not yet committed
+            let committed_set: std::collections::HashSet<&str> =
+                committed_step_ids.iter().map(|id| id.0.as_str()).collect();
+            all_step_ids
+                .iter()
+                .filter(|id| !committed_set.contains(id.0.as_str()))
+                .cloned()
+                .collect()
+        }
+        MissionTxState::Compensating => {
+            // Committed steps not yet compensated
+            let compensated_set: std::collections::HashSet<&str> =
+                compensated_step_ids.iter().map(|id| id.0.as_str()).collect();
+            committed_step_ids
+                .iter()
+                .filter(|id| !compensated_set.contains(id.0.as_str()))
+                .cloned()
+                .collect()
+        }
+        _ => Vec::new(), // Terminal or early states have no pending work
+    };
+
+    let decision_path = if commit_phase_completed && compensation_phase_completed {
+        "resume_both_phases_completed".into()
+    } else if commit_phase_completed {
+        "resume_commit_completed".into()
+    } else if !committed_step_ids.is_empty() {
+        "resume_partial_commit".into()
+    } else {
+        "resume_no_progress".into()
+    };
+
+    TxResumeState {
+        tx_id: contract.intent.tx_id.clone(),
+        derived_state,
+        last_receipt_seq,
+        committed_step_ids,
+        compensated_step_ids,
+        pending_step_ids,
+        commit_phase_completed,
+        compensation_phase_completed,
+        decision_path,
+        reconstructed_at_ms,
     }
 }
 
@@ -3558,6 +5344,608 @@ pub struct MissionDispatchExecution {
     pub outcome: Outcome,
 }
 
+// ============================================================================
+// Mission Dispatch Idempotency and Deduplication
+// ============================================================================
+
+/// Content-addressed idempotency key for mission dispatch deduplication.
+///
+/// Computed from the stable identity of an assignment and its dispatch mechanism,
+/// ensuring that retries and restarts of the same logical dispatch action are
+/// recognized as duplicates and suppressed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MissionDispatchIdempotencyKey(pub String);
+
+impl MissionDispatchIdempotencyKey {
+    /// Compute an idempotency key from assignment and mechanism identity.
+    ///
+    /// The key is content-addressed: same (mission_id, assignment_id, mechanism)
+    /// always produces the same key, regardless of wall-clock time or retry count.
+    #[must_use]
+    pub fn compute(
+        mission_id: &MissionId,
+        assignment_id: &AssignmentId,
+        mechanism: &MissionDispatchMechanism,
+    ) -> Self {
+        let mechanism_json = serde_json::to_string(mechanism).unwrap_or_default();
+        let canonical = format!(
+            "dispatch:mission={}|assignment={}|mechanism={}",
+            mission_id.0, assignment_id.0, mechanism_json
+        );
+        let hash = sha256_hex(&canonical);
+        Self(format!("dispatch:{}", &hash[..16]))
+    }
+
+    /// Return the raw key string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for MissionDispatchIdempotencyKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Durable record of a dispatched action, used for duplicate-dispatch prevention.
+///
+/// When a dispatch is executed, a deduplication record is persisted. Subsequent
+/// dispatch attempts with the same idempotency key are recognized as duplicates
+/// and return the cached outcome without re-execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionDispatchDeduplicationRecord {
+    pub idempotency_key: MissionDispatchIdempotencyKey,
+    pub assignment_id: AssignmentId,
+    pub correlation_id: String,
+    pub dispatched_at_ms: i64,
+    pub outcome: Outcome,
+    /// Mechanism fingerprint for cross-check on retry.
+    pub mechanism_hash: String,
+}
+
+impl MissionDispatchDeduplicationRecord {
+    /// Deterministic string form for auditing.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "key={},assignment={},correlation={},dispatched_at_ms={},mechanism_hash={},outcome={}",
+            self.idempotency_key.0,
+            self.assignment_id.0,
+            self.correlation_id,
+            self.dispatched_at_ms,
+            self.mechanism_hash,
+            self.outcome.canonical_string(),
+        )
+    }
+}
+
+/// Result of dispatch deduplication evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionDispatchDeduplicationResult {
+    pub idempotency_key: MissionDispatchIdempotencyKey,
+    pub is_duplicate: bool,
+    pub decision_path: String,
+    pub reason_code: String,
+    /// Present when `is_duplicate` is true — the cached execution to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_record: Option<MissionDispatchDeduplicationRecord>,
+}
+
+/// Persistent deduplication state for a mission's dispatch history.
+///
+/// Tracks recently dispatched actions by idempotency key so retries/restarts
+/// are detected and suppressed. The state is serializable for crash-recovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionDispatchDeduplicationState {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub records: Vec<MissionDispatchDeduplicationRecord>,
+}
+
+impl MissionDispatchDeduplicationState {
+    /// Check if state has no recorded dispatches.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Find a dedup record by idempotency key.
+    #[must_use]
+    pub fn find_by_key(
+        &self,
+        key: &MissionDispatchIdempotencyKey,
+    ) -> Option<&MissionDispatchDeduplicationRecord> {
+        self.records
+            .iter()
+            .find(|record| record.idempotency_key == *key)
+    }
+
+    /// Record a new dispatch execution. Overwrites any existing record with the
+    /// same idempotency key (last-write-wins for crash recovery).
+    pub fn record_dispatch(&mut self, record: MissionDispatchDeduplicationRecord) {
+        if let Some(existing) = self
+            .records
+            .iter_mut()
+            .find(|r| r.idempotency_key == record.idempotency_key)
+        {
+            *existing = record;
+        } else {
+            self.records.push(record);
+        }
+    }
+
+    /// Evict records older than `cutoff_ms` to bound memory growth.
+    pub fn evict_before(&mut self, cutoff_ms: i64) {
+        self.records
+            .retain(|record| record.dispatched_at_ms >= cutoff_ms);
+    }
+
+    /// Deterministic string form for mission canonical hash.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        let entries: Vec<String> = self.records.iter().map(|r| r.canonical_string()).collect();
+        format!("dedup_records=[{}]", entries.join(";"))
+    }
+}
+
+// ============================================================================
+// Global Kill-Switch and Safe-Mode Degradation
+// ============================================================================
+
+/// Operating level for the global mission kill-switch.
+///
+/// Three levels of protection:
+/// - `Off`: normal operation, all dispatches proceed per policy.
+/// - `SafeMode`: read-only/monitoring allowed, new dispatches blocked.
+/// - `HardStop`: all mission activity halted, in-flight work cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionKillSwitchLevel {
+    #[default]
+    Off,
+    SafeMode,
+    HardStop,
+}
+
+impl MissionKillSwitchLevel {
+    /// Whether this level blocks new dispatch execution.
+    #[must_use]
+    pub const fn blocks_dispatch(&self) -> bool {
+        matches!(self, Self::SafeMode | Self::HardStop)
+    }
+
+    /// Whether this level cancels in-flight missions.
+    #[must_use]
+    pub const fn cancels_in_flight(&self) -> bool {
+        matches!(self, Self::HardStop)
+    }
+
+    /// Whether read-only/monitoring operations are permitted.
+    #[must_use]
+    pub const fn allows_read_only(&self) -> bool {
+        matches!(self, Self::Off | Self::SafeMode)
+    }
+}
+
+impl fmt::Display for MissionKillSwitchLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Off => f.write_str("off"),
+            Self::SafeMode => f.write_str("safe_mode"),
+            Self::HardStop => f.write_str("hard_stop"),
+        }
+    }
+}
+
+/// Record of a kill-switch activation event for audit trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionKillSwitchActivation {
+    /// The level at which the kill-switch was set.
+    pub level: MissionKillSwitchLevel,
+    /// Who activated the kill-switch (operator/system/agent).
+    pub activated_by: String,
+    /// Structured reason code for the activation trigger.
+    pub reason_code: String,
+    /// Machine-parseable error code, if trigger is error-driven.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Epoch-millis when the kill-switch was activated.
+    pub activated_at_ms: i64,
+    /// Optional epoch-millis after which the kill-switch auto-expires.
+    /// If `None`, manual deactivation is required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+    /// Optional correlation ID linking to the triggering event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+}
+
+impl MissionKillSwitchActivation {
+    /// Deterministic string form for audit hashing.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "level={},activated_by={},reason_code={},error_code={},activated_at_ms={},expires_at_ms={},correlation_id={}",
+            self.level,
+            self.activated_by,
+            self.reason_code,
+            self.error_code.as_deref().unwrap_or("none"),
+            self.activated_at_ms,
+            self.expires_at_ms.map_or_else(|| "none".to_string(), |ms| ms.to_string()),
+            self.correlation_id.as_deref().unwrap_or("none"),
+        )
+    }
+
+    /// Check whether this activation has expired at a given evaluation time.
+    #[must_use]
+    pub fn is_expired_at(&self, evaluated_at_ms: i64) -> bool {
+        self.expires_at_ms
+            .is_some_and(|expires_at_ms| evaluated_at_ms >= expires_at_ms)
+    }
+}
+
+/// Persistent kill-switch state for a mission.
+///
+/// Tracks activation history and current level. The state is serializable
+/// for crash-recovery and deterministic replay.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionKillSwitchState {
+    /// Current effective kill-switch level.
+    #[serde(default)]
+    pub level: MissionKillSwitchLevel,
+    /// The activation record for the current level (None when `level == Off`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_activation: Option<MissionKillSwitchActivation>,
+    /// Ordered history of activation events for audit trail.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activation_history: Vec<MissionKillSwitchActivation>,
+}
+
+impl MissionKillSwitchState {
+    /// Check if the kill-switch is in its default (off) state.
+    #[must_use]
+    pub fn is_off(&self) -> bool {
+        self.level == MissionKillSwitchLevel::Off && self.current_activation.is_none()
+    }
+
+    /// Activate the kill-switch at the specified level.
+    ///
+    /// Records the activation and pushes it to the audit history.
+    /// If the kill-switch is already active, escalation replaces the current
+    /// activation (last-write-wins with full audit trail).
+    pub fn activate(&mut self, activation: MissionKillSwitchActivation) {
+        self.level = activation.level;
+        self.activation_history.push(activation.clone());
+        self.current_activation = Some(activation);
+    }
+
+    /// Deactivate the kill-switch, returning to normal operation.
+    ///
+    /// Records a deactivation event in the audit history.
+    pub fn deactivate(&mut self, deactivated_by: &str, reason_code: &str, deactivated_at_ms: i64) {
+        let deactivation = MissionKillSwitchActivation {
+            level: MissionKillSwitchLevel::Off,
+            activated_by: deactivated_by.to_string(),
+            reason_code: reason_code.to_string(),
+            error_code: None,
+            activated_at_ms: deactivated_at_ms,
+            expires_at_ms: None,
+            correlation_id: None,
+        };
+        self.activation_history.push(deactivation);
+        self.level = MissionKillSwitchLevel::Off;
+        self.current_activation = None;
+    }
+
+    /// Evaluate the effective kill-switch state, accounting for TTL expiry.
+    ///
+    /// If the current activation has expired, the level is automatically
+    /// downgraded to Off (lazy expiry on read).
+    pub fn evaluate_effective_level(&mut self, evaluated_at_ms: i64) -> MissionKillSwitchLevel {
+        if let Some(activation) = &self.current_activation {
+            if activation.is_expired_at(evaluated_at_ms) {
+                // Auto-expire: record synthetic deactivation
+                self.deactivate("system", "kill_switch_ttl_expired", evaluated_at_ms);
+                return MissionKillSwitchLevel::Off;
+            }
+        }
+        self.level
+    }
+
+    /// Evict activation history older than `cutoff_ms` to bound memory growth.
+    pub fn evict_history_before(&mut self, cutoff_ms: i64) {
+        self.activation_history
+            .retain(|activation| activation.activated_at_ms >= cutoff_ms);
+    }
+
+    /// Deterministic canonical string form for mission hashing.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        let history_entries: Vec<String> = self
+            .activation_history
+            .iter()
+            .map(|a| a.canonical_string())
+            .collect();
+        format!(
+            "kill_switch_level={},current={},history=[{}]",
+            self.level,
+            self.current_activation
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |a| a.canonical_string()),
+            history_entries.join(";"),
+        )
+    }
+}
+
+/// Result of evaluating the kill-switch before a dispatch or lifecycle operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionKillSwitchDecision {
+    /// The effective kill-switch level at evaluation time.
+    pub effective_level: MissionKillSwitchLevel,
+    /// Whether the requested operation is blocked.
+    pub blocked: bool,
+    /// Structured decision path for audit/debugging.
+    pub decision_path: String,
+    /// Structured reason code.
+    pub reason_code: String,
+    /// Error code when blocked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// The activation record driving the decision (None when Off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activation: Option<MissionKillSwitchActivation>,
+}
+
+// ========================================================================
+// Pause/Resume/Abort Control and Checkpoint Recovery (C5)
+// ========================================================================
+
+/// Command to control mission execution flow (pause, resume, or abort).
+///
+/// Each variant captures the operator/system identity, reason, and timing
+/// needed for audit-grade traceability of execution flow changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "action")]
+pub enum MissionControlCommand {
+    Pause {
+        requested_by: String,
+        reason_code: String,
+        requested_at_ms: i64,
+        correlation_id: Option<String>,
+    },
+    Resume {
+        requested_by: String,
+        reason_code: String,
+        requested_at_ms: i64,
+        correlation_id: Option<String>,
+    },
+    Abort {
+        requested_by: String,
+        reason_code: String,
+        error_code: Option<String>,
+        requested_at_ms: i64,
+        correlation_id: Option<String>,
+    },
+}
+
+impl MissionControlCommand {
+    /// Returns the action name for display and logging.
+    #[must_use]
+    pub fn action_name(&self) -> &str {
+        match self {
+            Self::Pause { .. } => "pause",
+            Self::Resume { .. } => "resume",
+            Self::Abort { .. } => "abort",
+        }
+    }
+
+    /// Returns the identity of who requested this command.
+    #[must_use]
+    pub fn requested_by(&self) -> &str {
+        match self {
+            Self::Pause { requested_by, .. }
+            | Self::Resume { requested_by, .. }
+            | Self::Abort { requested_by, .. } => requested_by,
+        }
+    }
+
+    /// Returns the timestamp of when this command was issued.
+    #[must_use]
+    pub fn requested_at_ms(&self) -> i64 {
+        match self {
+            Self::Pause { requested_at_ms, .. }
+            | Self::Resume { requested_at_ms, .. }
+            | Self::Abort { requested_at_ms, .. } => *requested_at_ms,
+        }
+    }
+
+    /// Returns the reason code for this command.
+    #[must_use]
+    pub fn reason_code(&self) -> &str {
+        match self {
+            Self::Pause { reason_code, .. }
+            | Self::Resume { reason_code, .. }
+            | Self::Abort { reason_code, .. } => reason_code,
+        }
+    }
+
+    /// Deterministic canonical string representation.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        match self {
+            Self::Pause {
+                requested_by,
+                reason_code,
+                requested_at_ms,
+                correlation_id,
+            } => format!(
+                "action=pause|requested_by={}|reason_code={}|requested_at_ms={}|correlation_id={}",
+                requested_by,
+                reason_code,
+                requested_at_ms,
+                correlation_id.as_deref().unwrap_or("none")
+            ),
+            Self::Resume {
+                requested_by,
+                reason_code,
+                requested_at_ms,
+                correlation_id,
+            } => format!(
+                "action=resume|requested_by={}|reason_code={}|requested_at_ms={}|correlation_id={}",
+                requested_by,
+                reason_code,
+                requested_at_ms,
+                correlation_id.as_deref().unwrap_or("none")
+            ),
+            Self::Abort {
+                requested_by,
+                reason_code,
+                error_code,
+                requested_at_ms,
+                correlation_id,
+            } => format!(
+                "action=abort|requested_by={}|reason_code={}|error_code={}|requested_at_ms={}|correlation_id={}",
+                requested_by,
+                reason_code,
+                error_code.as_deref().unwrap_or("none"),
+                requested_at_ms,
+                correlation_id.as_deref().unwrap_or("none")
+            ),
+        }
+    }
+}
+
+/// Per-assignment state snapshot captured in a pause checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssignmentCheckpointEntry {
+    pub assignment_id: AssignmentId,
+    pub outcome_summary: Option<String>,
+    pub approval_state_summary: String,
+}
+
+/// Checkpoint captured at mission pause time for deterministic recovery.
+///
+/// Contains the lifecycle state at the moment of pause, the operator identity,
+/// and a snapshot of each assignment's outcome/approval state — sufficient to
+/// resume execution without data loss.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionCheckpoint {
+    pub checkpoint_id: String,
+    pub paused_from_state: MissionLifecycleState,
+    pub paused_by: String,
+    pub reason_code: String,
+    pub paused_at_ms: i64,
+    pub resumed_at_ms: Option<i64>,
+    pub resumed_by: Option<String>,
+    pub assignment_entries: Vec<AssignmentCheckpointEntry>,
+    pub correlation_id: Option<String>,
+}
+
+impl MissionCheckpoint {
+    /// Deterministic canonical string for checkpoint.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        let mut parts = vec![
+            format!("checkpoint_id={}", self.checkpoint_id),
+            format!("paused_from_state={}", self.paused_from_state),
+            format!("paused_by={}", self.paused_by),
+            format!("reason_code={}", self.reason_code),
+            format!("paused_at_ms={}", self.paused_at_ms),
+            format!(
+                "resumed_at_ms={}",
+                self.resumed_at_ms
+                    .map_or_else(|| "none".to_string(), |v| v.to_string())
+            ),
+            format!(
+                "resumed_by={}",
+                self.resumed_by.as_deref().unwrap_or("none")
+            ),
+        ];
+        for (i, entry) in self.assignment_entries.iter().enumerate() {
+            parts.push(format!(
+                "assignment[{}]={}/{}",
+                i, entry.assignment_id.0, entry.approval_state_summary
+            ));
+        }
+        parts.join("|")
+    }
+
+    /// Duration of this pause in milliseconds, or None if still paused.
+    #[must_use]
+    pub fn pause_duration_ms(&self) -> Option<i64> {
+        self.resumed_at_ms.map(|r| r - self.paused_at_ms)
+    }
+}
+
+/// Tracking state for mission pause/resume/abort history.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionPauseResumeState {
+    pub current_checkpoint: Option<MissionCheckpoint>,
+    pub checkpoint_history: Vec<MissionCheckpoint>,
+    pub total_pause_count: u32,
+    pub total_resume_count: u32,
+    pub total_abort_count: u32,
+    pub cumulative_pause_duration_ms: i64,
+}
+
+impl MissionPauseResumeState {
+    /// Returns true when a checkpoint is active (mission is paused).
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.current_checkpoint.is_some()
+    }
+
+    /// Returns true when no pause/resume/abort activity has occurred.
+    #[must_use]
+    pub fn is_pristine(&self) -> bool {
+        self.current_checkpoint.is_none()
+            && self.checkpoint_history.is_empty()
+            && self.total_pause_count == 0
+            && self.total_resume_count == 0
+            && self.total_abort_count == 0
+    }
+
+    /// Deterministic canonical string for stable serialization.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        let mut parts = vec![
+            format!("paused={}", self.is_paused()),
+            format!("total_pause_count={}", self.total_pause_count),
+            format!("total_resume_count={}", self.total_resume_count),
+            format!("total_abort_count={}", self.total_abort_count),
+            format!(
+                "cumulative_pause_duration_ms={}",
+                self.cumulative_pause_duration_ms
+            ),
+            format!("history_len={}", self.checkpoint_history.len()),
+        ];
+        if let Some(cp) = &self.current_checkpoint {
+            parts.push(format!("current={}", cp.canonical_string()));
+        }
+        parts.join("|")
+    }
+
+    /// Evict checkpoint history entries with paused_at_ms before cutoff.
+    pub fn evict_history_before(&mut self, cutoff_ms: i64) {
+        self.checkpoint_history
+            .retain(|cp| cp.paused_at_ms >= cutoff_ms);
+    }
+}
+
+/// Result of a pause/resume/abort control operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionControlDecision {
+    pub action: String,
+    pub lifecycle_from: MissionLifecycleState,
+    pub lifecycle_to: MissionLifecycleState,
+    pub decision_path: String,
+    pub reason_code: String,
+    pub error_code: Option<String>,
+    pub checkpoint_id: Option<String>,
+    pub decided_at_ms: i64,
+}
+
 /// Durable approval-path transition record for idempotent continuation/audit trails.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionApprovalTransitionRecord {
@@ -3629,6 +6017,617 @@ pub struct MissionAssignmentReconciliationReport {
     pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drift: Option<MissionAssignmentStateDrift>,
+}
+
+// ── C8: Crash-Consistent Mission Journal ────────────────────────────────────
+
+/// Individual entry in the mission deterministic journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionJournalEntry {
+    /// Monotonically increasing sequence number (per mission).
+    pub seq: u64,
+    /// Timestamp in milliseconds since epoch.
+    pub timestamp_ms: i64,
+    /// Correlation ID linking to the originating operation.
+    pub correlation_id: String,
+    /// Content-addressed entry hash for tamper detection.
+    pub entry_hash: String,
+    /// Kind of journal entry.
+    pub kind: MissionJournalEntryKind,
+    /// Mission schema version at time of entry.
+    pub mission_version: u32,
+    /// Originating actor.
+    pub initiated_by: String,
+    /// Reason code for audit trail.
+    pub reason_code: String,
+    /// Optional error code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+impl MissionJournalEntry {
+    /// Deterministic canonical string for stable hashing.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "seq={}|ts={}|cid={}|hash={}|kind={}|v={}|by={}|reason={}|err={}",
+            self.seq,
+            self.timestamp_ms,
+            self.correlation_id,
+            self.entry_hash,
+            self.kind.tag_name(),
+            self.mission_version,
+            self.initiated_by,
+            self.reason_code,
+            self.error_code.as_deref().unwrap_or("none"),
+        )
+    }
+}
+
+/// Kinds of journal entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MissionJournalEntryKind {
+    /// Lifecycle state transition.
+    LifecycleTransition {
+        from: MissionLifecycleState,
+        to: MissionLifecycleState,
+        transition_kind: MissionLifecycleTransitionKind,
+    },
+    /// Control command applied (pause/resume/abort).
+    ControlCommand {
+        command: MissionControlCommand,
+        decision: MissionControlDecision,
+    },
+    /// Kill-switch activation or deactivation.
+    KillSwitchChange {
+        level_from: MissionKillSwitchLevel,
+        level_to: MissionKillSwitchLevel,
+    },
+    /// Assignment outcome finalized.
+    AssignmentOutcome {
+        assignment_id: AssignmentId,
+        outcome_before: Option<String>,
+        outcome_after: String,
+    },
+    /// Checkpoint marker (snapshot point for recovery).
+    Checkpoint {
+        mission_hash: String,
+        lifecycle_state: MissionLifecycleState,
+        assignment_count: usize,
+    },
+    /// Recovery marker (indicates restart/replay boundary).
+    RecoveryMarker {
+        recovered_through_seq: u64,
+        recovery_reason: String,
+    },
+}
+
+impl MissionJournalEntryKind {
+    /// Short tag name for canonical string encoding.
+    #[must_use]
+    pub fn tag_name(&self) -> &str {
+        match self {
+            Self::LifecycleTransition { .. } => "lifecycle_transition",
+            Self::ControlCommand { .. } => "control_command",
+            Self::KillSwitchChange { .. } => "kill_switch_change",
+            Self::AssignmentOutcome { .. } => "assignment_outcome",
+            Self::Checkpoint { .. } => "checkpoint",
+            Self::RecoveryMarker { .. } => "recovery_marker",
+        }
+    }
+}
+
+/// Lightweight journal metadata persisted on Mission for recovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionJournalState {
+    /// Total entries appended to the journal.
+    pub entry_count: u64,
+    /// Sequence number of the last entry.
+    pub last_seq: u64,
+    /// Hash of the last appended entry for chain verification.
+    pub last_entry_hash: String,
+    /// Sequence number of the most recent checkpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_seq: Option<u64>,
+    /// Mission hash at last checkpoint for crash detection.
+    pub last_checkpoint_hash: String,
+    /// Whether the journal is in a clean (checkpointed) state.
+    pub clean: bool,
+}
+
+impl MissionJournalState {
+    /// True when no entries have been recorded.
+    #[must_use]
+    pub fn is_pristine(&self) -> bool {
+        self.entry_count == 0
+    }
+
+    /// Deterministic canonical string.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "entry_count={}|last_seq={}|last_hash={}|cp_seq={}|cp_hash={}|clean={}",
+            self.entry_count,
+            self.last_seq,
+            self.last_entry_hash,
+            self.last_checkpoint_seq
+                .map_or_else(|| "none".to_string(), |v| v.to_string()),
+            self.last_checkpoint_hash,
+            self.clean,
+        )
+    }
+}
+
+/// In-memory mission journal engine for crash-consistent recovery.
+#[derive(Debug, Clone)]
+pub struct MissionJournal {
+    /// Mission ID this journal belongs to.
+    pub mission_id: MissionId,
+    /// Append-only journal entries.
+    entries: Vec<MissionJournalEntry>,
+    /// Next sequence number.
+    next_seq: u64,
+    /// Last checkpoint sequence.
+    last_checkpoint_seq: Option<u64>,
+    /// Correlation ID dedup index.
+    correlation_index: std::collections::HashMap<String, u64>,
+    /// Maximum entries before compaction warning.
+    max_entries: usize,
+}
+
+impl MissionJournal {
+    /// Create a new empty journal.
+    #[must_use]
+    pub fn new(mission_id: MissionId) -> Self {
+        Self {
+            mission_id,
+            entries: Vec::new(),
+            next_seq: 1,
+            last_checkpoint_seq: None,
+            correlation_index: std::collections::HashMap::new(),
+            max_entries: 10_000,
+        }
+    }
+
+    /// Create with a custom entry limit.
+    #[must_use]
+    pub fn with_max_entries(mut self, max: usize) -> Self {
+        self.max_entries = max;
+        self
+    }
+
+    /// Append a journal entry. Returns the assigned sequence number.
+    pub fn append(
+        &mut self,
+        kind: MissionJournalEntryKind,
+        correlation_id: impl Into<String>,
+        initiated_by: impl Into<String>,
+        reason_code: impl Into<String>,
+        error_code: Option<String>,
+        timestamp_ms: i64,
+    ) -> Result<u64, MissionJournalError> {
+        let cid = correlation_id.into();
+
+        // Idempotency check via correlation index
+        if let Some(&prior_seq) = self.correlation_index.get(&cid) {
+            return Err(MissionJournalError::DuplicateCorrelation {
+                correlation_id: cid,
+                prior_seq,
+            });
+        }
+
+        let seq = self.next_seq;
+        let entry_hash = format!(
+            "j:{}:{}:{}",
+            seq,
+            timestamp_ms,
+            &cid,
+        );
+
+        let entry = MissionJournalEntry {
+            seq,
+            timestamp_ms,
+            correlation_id: cid.clone(),
+            entry_hash,
+            kind,
+            mission_version: MISSION_SCHEMA_VERSION,
+            initiated_by: initiated_by.into(),
+            reason_code: reason_code.into(),
+            error_code,
+        };
+
+        self.entries.push(entry);
+        self.correlation_index.insert(cid, seq);
+        self.next_seq = seq + 1;
+        Ok(seq)
+    }
+
+    /// Place a checkpoint marker.
+    pub fn checkpoint(
+        &mut self,
+        mission: &Mission,
+        timestamp_ms: i64,
+    ) -> Result<u64, MissionJournalError> {
+        let mission_hash = mission.compute_hash();
+        let cid = format!("checkpoint:{}:{}", self.mission_id.0, self.next_seq);
+        let kind = MissionJournalEntryKind::Checkpoint {
+            mission_hash,
+            lifecycle_state: mission.lifecycle_state,
+            assignment_count: mission.assignments.len(),
+        };
+        let seq = self.append(kind, cid, "system", "checkpoint", None, timestamp_ms)?;
+        self.last_checkpoint_seq = Some(seq);
+        Ok(seq)
+    }
+
+    /// Place a recovery marker after replaying journal entries.
+    pub fn recovery_marker(
+        &mut self,
+        recovered_through_seq: u64,
+        reason: impl Into<String>,
+        timestamp_ms: i64,
+    ) -> Result<u64, MissionJournalError> {
+        let cid = format!("recovery:{}:{}", self.mission_id.0, self.next_seq);
+        let kind = MissionJournalEntryKind::RecoveryMarker {
+            recovered_through_seq,
+            recovery_reason: reason.into(),
+        };
+        self.append(kind, cid, "system", "recovery", None, timestamp_ms)
+    }
+
+    /// Number of journal entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True if the journal has no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Current next sequence number.
+    #[must_use]
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Last checkpoint sequence number.
+    #[must_use]
+    pub fn last_checkpoint_seq(&self) -> Option<u64> {
+        self.last_checkpoint_seq
+    }
+
+    /// Check if a correlation ID has already been recorded.
+    #[must_use]
+    pub fn has_correlation(&self, correlation_id: &str) -> bool {
+        self.correlation_index.contains_key(correlation_id)
+    }
+
+    /// Get entries since a given sequence number (inclusive).
+    #[must_use]
+    pub fn entries_since(&self, since_seq: u64) -> &[MissionJournalEntry] {
+        if since_seq == 0 || self.entries.is_empty() {
+            return &self.entries;
+        }
+        // Entries are stored in order; find the index where seq >= since_seq.
+        let start = self
+            .entries
+            .iter()
+            .position(|e| e.seq >= since_seq)
+            .unwrap_or(self.entries.len());
+        &self.entries[start..]
+    }
+
+    /// Get all journal entries.
+    #[must_use]
+    pub fn entries(&self) -> &[MissionJournalEntry] {
+        &self.entries
+    }
+
+    /// Compact entries up to (not including) a given sequence number.
+    /// Returns the number of entries removed.
+    pub fn compact_before(&mut self, before_seq: u64) -> usize {
+        let original_len = self.entries.len();
+        let keep_from = self
+            .entries
+            .iter()
+            .position(|e| e.seq >= before_seq)
+            .unwrap_or(self.entries.len());
+        // Remove compacted entries from correlation index
+        for entry in &self.entries[..keep_from] {
+            self.correlation_index.remove(&entry.correlation_id);
+        }
+        self.entries.drain(..keep_from);
+        original_len - self.entries.len()
+    }
+
+    /// Whether compaction is recommended (entry count exceeds limit).
+    #[must_use]
+    pub fn needs_compaction(&self) -> bool {
+        self.entries.len() > self.max_entries
+    }
+
+    /// Snapshot journal metadata for embedding in Mission.
+    #[must_use]
+    pub fn snapshot_state(&self) -> MissionJournalState {
+        let last_entry = self.entries.last();
+        MissionJournalState {
+            entry_count: self.entries.len() as u64,
+            last_seq: last_entry.map_or(0, |e| e.seq),
+            last_entry_hash: last_entry
+                .map_or_else(String::new, |e| e.entry_hash.clone()),
+            last_checkpoint_seq: self.last_checkpoint_seq,
+            last_checkpoint_hash: self
+                .entries
+                .iter()
+                .rev()
+                .find_map(|e| match &e.kind {
+                    MissionJournalEntryKind::Checkpoint { mission_hash, .. } => {
+                        Some(mission_hash.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            clean: self.last_checkpoint_seq.map_or(true, |cp_seq| {
+                self.entries.last().map_or(true, |e| e.seq == cp_seq)
+            }),
+        }
+    }
+
+    /// Replay journal entries from the last checkpoint to reconstruct state deltas.
+    #[must_use]
+    pub fn replay_from_checkpoint(&self) -> MissionJournalReplayReport {
+        let start_seq = self.last_checkpoint_seq.unwrap_or(0);
+        let entries = self.entries_since(start_seq);
+
+        let mut report = MissionJournalReplayReport {
+            start_seq,
+            entries_scanned: 0,
+            lifecycle_transitions: 0,
+            control_commands: 0,
+            kill_switch_changes: 0,
+            assignment_outcomes: 0,
+            checkpoints_found: 0,
+            recovery_markers: 0,
+            errors: Vec::new(),
+        };
+
+        let mut prev_seq: Option<u64> = None;
+
+        for entry in entries {
+            report.entries_scanned += 1;
+
+            // Check monotonic sequence ordering
+            if let Some(ps) = prev_seq {
+                if entry.seq <= ps {
+                    report.errors.push(MissionJournalReplayError {
+                        seq: entry.seq,
+                        error_code: "SEQ_REGRESSION".into(),
+                        message: format!(
+                            "sequence {} is not greater than previous {}",
+                            entry.seq, ps,
+                        ),
+                    });
+                }
+            }
+            prev_seq = Some(entry.seq);
+
+            match &entry.kind {
+                MissionJournalEntryKind::LifecycleTransition { .. } => {
+                    report.lifecycle_transitions += 1;
+                }
+                MissionJournalEntryKind::ControlCommand { .. } => {
+                    report.control_commands += 1;
+                }
+                MissionJournalEntryKind::KillSwitchChange { .. } => {
+                    report.kill_switch_changes += 1;
+                }
+                MissionJournalEntryKind::AssignmentOutcome { .. } => {
+                    report.assignment_outcomes += 1;
+                }
+                MissionJournalEntryKind::Checkpoint { .. } => {
+                    report.checkpoints_found += 1;
+                }
+                MissionJournalEntryKind::RecoveryMarker { .. } => {
+                    report.recovery_markers += 1;
+                }
+            }
+        }
+
+        report
+    }
+}
+
+/// Replay report summarizing journal recovery scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionJournalReplayReport {
+    pub start_seq: u64,
+    pub entries_scanned: usize,
+    pub lifecycle_transitions: usize,
+    pub control_commands: usize,
+    pub kill_switch_changes: usize,
+    pub assignment_outcomes: usize,
+    pub checkpoints_found: usize,
+    pub recovery_markers: usize,
+    pub errors: Vec<MissionJournalReplayError>,
+}
+
+impl MissionJournalReplayReport {
+    /// True if replay encountered no errors.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    /// Total entry counts across all categories.
+    #[must_use]
+    pub fn total_entries(&self) -> usize {
+        self.lifecycle_transitions
+            + self.control_commands
+            + self.kill_switch_changes
+            + self.assignment_outcomes
+            + self.checkpoints_found
+            + self.recovery_markers
+    }
+}
+
+/// One error discovered during journal replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionJournalReplayError {
+    pub seq: u64,
+    pub error_code: String,
+    pub message: String,
+}
+
+/// Errors from journal operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissionJournalError {
+    /// Duplicate correlation ID (idempotency guard).
+    DuplicateCorrelation {
+        correlation_id: String,
+        prior_seq: u64,
+    },
+    /// Validation or invariant violation.
+    ValidationFailed {
+        reason: String,
+    },
+}
+
+impl fmt::Display for MissionJournalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateCorrelation {
+                correlation_id,
+                prior_seq,
+            } => write!(
+                f,
+                "duplicate correlation_id '{}' (prior seq={})",
+                correlation_id, prior_seq,
+            ),
+            Self::ValidationFailed { reason } => {
+                write!(f, "journal validation failed: {}", reason)
+            }
+        }
+    }
+}
+
+/// Trigger class used by adaptive mission replanning policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionReplanTriggerKind {
+    Completion,
+    Blocked,
+    Failed,
+    RateLimited,
+    OperatorOverride,
+}
+
+impl fmt::Display for MissionReplanTriggerKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Completion => f.write_str("completion"),
+            Self::Blocked => f.write_str("blocked"),
+            Self::Failed => f.write_str("failed"),
+            Self::RateLimited => f.write_str("rate_limited"),
+            Self::OperatorOverride => f.write_str("operator_override"),
+        }
+    }
+}
+
+/// One replan trigger event emitted by mission runtime integration points.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionReplanTrigger {
+    pub kind: MissionReplanTriggerKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<AssignmentId>,
+    pub observed_at_ms: i64,
+    pub correlation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
+/// Deterministic backoff policy for adaptive replanning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionReplanBackoffPolicy {
+    pub min_backoff_ms: i64,
+    pub max_backoff_ms: i64,
+    pub burst_window_ms: i64,
+}
+
+impl Default for MissionReplanBackoffPolicy {
+    fn default() -> Self {
+        Self {
+            min_backoff_ms: 500,
+            max_backoff_ms: 60_000,
+            burst_window_ms: 30_000,
+        }
+    }
+}
+
+/// Durable mission replan guard state to prevent tight replan loops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MissionReplanState {
+    pub consecutive_replan_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_trigger_kind: Option<MissionReplanTriggerKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_observed_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_eligible_replan_at_ms: Option<i64>,
+}
+
+impl MissionReplanState {
+    /// Returns true when state has no persisted adaptive-replan history.
+    #[must_use]
+    pub fn is_pristine(&self) -> bool {
+        self.consecutive_replan_count == 0
+            && self.last_trigger_kind.is_none()
+            && self.last_correlation_id.is_none()
+            && self.last_observed_at_ms.is_none()
+            && self.next_eligible_replan_at_ms.is_none()
+    }
+
+    /// Deterministic string form used by mission canonical hash.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "count={},kind={},correlation={},last_observed_at_ms={},next_eligible_replan_at_ms={}",
+            self.consecutive_replan_count,
+            self.last_trigger_kind
+                .map_or_else(|| "none".to_string(), |kind| kind.to_string()),
+            self.last_correlation_id.as_deref().unwrap_or("none"),
+            self.last_observed_at_ms
+                .map_or_else(|| "none".to_string(), |value| value.to_string()),
+            self.next_eligible_replan_at_ms
+                .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        )
+    }
+}
+
+/// Result of adaptive replanning trigger evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionReplanDecision {
+    pub trigger_kind: MissionReplanTriggerKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<AssignmentId>,
+    pub observed_at_ms: i64,
+    pub correlation_id: String,
+    pub apply_replan: bool,
+    pub decision_path: String,
+    pub reason_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    pub attempt: u32,
+    pub backoff_ms: i64,
+    pub scheduled_at_ms: i64,
+    pub next_eligible_replan_at_ms: i64,
+    pub lifecycle_from: MissionLifecycleState,
+    pub lifecycle_to: MissionLifecycleState,
 }
 
 /// Active reservation lease snapshot used for mission-time conflict checks.
@@ -3877,6 +6876,7 @@ pub enum MissionLifecycleState {
     Dispatching,
     AwaitingApproval,
     Running,
+    Paused,
     RetryPending,
     Blocked,
     Completed,
@@ -3885,12 +6885,13 @@ pub enum MissionLifecycleState {
 }
 
 impl MissionLifecycleState {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Planning,
         Self::Planned,
         Self::Dispatching,
         Self::AwaitingApproval,
         Self::Running,
+        Self::Paused,
         Self::RetryPending,
         Self::Blocked,
         Self::Completed,
@@ -3900,7 +6901,7 @@ impl MissionLifecycleState {
 
     /// Return all lifecycle states.
     #[must_use]
-    pub const fn all() -> [Self; 10] {
+    pub const fn all() -> [Self; 11] {
         Self::ALL
     }
 
@@ -3919,6 +6920,7 @@ impl fmt::Display for MissionLifecycleState {
             Self::Dispatching => f.write_str("dispatching"),
             Self::AwaitingApproval => f.write_str("awaiting_approval"),
             Self::Running => f.write_str("running"),
+            Self::Paused => f.write_str("paused"),
             Self::RetryPending => f.write_str("retry_pending"),
             Self::Blocked => f.write_str("blocked"),
             Self::Completed => f.write_str("completed"),
@@ -3945,6 +6947,9 @@ pub enum MissionLifecycleTransitionKind {
     ExecutionSucceeded,
     ExecutionFailed,
     MissionCancelled,
+    PauseRequested,
+    ResumeRequested,
+    AbortRequested,
 }
 
 impl fmt::Display for MissionLifecycleTransitionKind {
@@ -3963,12 +6968,15 @@ impl fmt::Display for MissionLifecycleTransitionKind {
             Self::ExecutionSucceeded => f.write_str("execution_succeeded"),
             Self::ExecutionFailed => f.write_str("execution_failed"),
             Self::MissionCancelled => f.write_str("mission_cancelled"),
+            Self::PauseRequested => f.write_str("pause_requested"),
+            Self::ResumeRequested => f.write_str("resume_requested"),
+            Self::AbortRequested => f.write_str("abort_requested"),
         }
     }
 }
 
 impl MissionLifecycleTransitionKind {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 16] = [
         Self::PlanFinalized,
         Self::DispatchStarted,
         Self::ApprovalRequested,
@@ -3982,11 +6990,14 @@ impl MissionLifecycleTransitionKind {
         Self::ExecutionSucceeded,
         Self::ExecutionFailed,
         Self::MissionCancelled,
+        Self::PauseRequested,
+        Self::ResumeRequested,
+        Self::AbortRequested,
     ];
 
     /// Return all lifecycle transition kinds.
     #[must_use]
-    pub const fn all() -> [Self; 13] {
+    pub const fn all() -> [Self; 16] {
         Self::ALL
     }
 }
@@ -3999,7 +7010,7 @@ pub struct MissionLifecycleTransitionRule {
     pub kind: MissionLifecycleTransitionKind,
 }
 
-const MISSION_LIFECYCLE_TRANSITION_RULES: [MissionLifecycleTransitionRule; 29] = [
+const MISSION_LIFECYCLE_TRANSITION_RULES: [MissionLifecycleTransitionRule; 49] = [
     MissionLifecycleTransitionRule {
         from: MissionLifecycleState::Planning,
         to: MissionLifecycleState::Planned,
@@ -4145,6 +7156,110 @@ const MISSION_LIFECYCLE_TRANSITION_RULES: [MissionLifecycleTransitionRule; 29] =
         to: MissionLifecycleState::Cancelled,
         kind: MissionLifecycleTransitionKind::MissionCancelled,
     },
+    // C5: Pause from active states
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Running,
+        to: MissionLifecycleState::Paused,
+        kind: MissionLifecycleTransitionKind::PauseRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Dispatching,
+        to: MissionLifecycleState::Paused,
+        kind: MissionLifecycleTransitionKind::PauseRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::AwaitingApproval,
+        to: MissionLifecycleState::Paused,
+        kind: MissionLifecycleTransitionKind::PauseRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Blocked,
+        to: MissionLifecycleState::Paused,
+        kind: MissionLifecycleTransitionKind::PauseRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::RetryPending,
+        to: MissionLifecycleState::Paused,
+        kind: MissionLifecycleTransitionKind::PauseRequested,
+    },
+    // C5: Resume from paused back to prior state
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Paused,
+        to: MissionLifecycleState::Running,
+        kind: MissionLifecycleTransitionKind::ResumeRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Paused,
+        to: MissionLifecycleState::Dispatching,
+        kind: MissionLifecycleTransitionKind::ResumeRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Paused,
+        to: MissionLifecycleState::AwaitingApproval,
+        kind: MissionLifecycleTransitionKind::ResumeRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Paused,
+        to: MissionLifecycleState::Blocked,
+        kind: MissionLifecycleTransitionKind::ResumeRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Paused,
+        to: MissionLifecycleState::RetryPending,
+        kind: MissionLifecycleTransitionKind::ResumeRequested,
+    },
+    // C5: Abort from any non-terminal state
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Planning,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::AbortRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Planned,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::AbortRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Dispatching,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::AbortRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::AwaitingApproval,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::AbortRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Running,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::AbortRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Paused,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::AbortRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::RetryPending,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::AbortRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Blocked,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::AbortRequested,
+    },
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Failed,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::AbortRequested,
+    },
+    // C5: Cancel from paused (regular cancellation, not abort)
+    MissionLifecycleTransitionRule {
+        from: MissionLifecycleState::Paused,
+        to: MissionLifecycleState::Cancelled,
+        kind: MissionLifecycleTransitionKind::MissionCancelled,
+    },
 ];
 
 /// Returns canonical mission lifecycle transition table.
@@ -4184,6 +7299,16 @@ pub struct Mission {
     pub candidates: Vec<CandidateAction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assignments: Vec<Assignment>,
+    #[serde(default, skip_serializing_if = "MissionReplanState::is_pristine")]
+    pub replan_state: MissionReplanState,
+    #[serde(default, skip_serializing_if = "MissionDispatchDeduplicationState::is_empty")]
+    pub dispatch_dedup_state: MissionDispatchDeduplicationState,
+    #[serde(default, skip_serializing_if = "MissionKillSwitchState::is_off")]
+    pub kill_switch: MissionKillSwitchState,
+    #[serde(default, skip_serializing_if = "MissionPauseResumeState::is_pristine")]
+    pub pause_resume_state: MissionPauseResumeState,
+    #[serde(default, skip_serializing_if = "MissionJournalState::is_pristine")]
+    pub journal_state: MissionJournalState,
 }
 
 impl Mission {
@@ -4208,6 +7333,11 @@ impl Mission {
             updated_at_ms: None,
             candidates: Vec::new(),
             assignments: Vec::new(),
+            replan_state: MissionReplanState::default(),
+            dispatch_dedup_state: MissionDispatchDeduplicationState::default(),
+            kill_switch: MissionKillSwitchState::default(),
+            pause_resume_state: MissionPauseResumeState::default(),
+            journal_state: MissionJournalState::default(),
         }
     }
 
@@ -4259,6 +7389,36 @@ impl Mission {
         assignment_parts.sort();
         for (index, assignment) in assignment_parts.iter().enumerate() {
             parts.push(format!("assignment[{index}]={assignment}"));
+        }
+        if !self.replan_state.is_pristine() {
+            parts.push(format!(
+                "replan_state={}",
+                self.replan_state.canonical_string()
+            ));
+        }
+        if !self.dispatch_dedup_state.is_empty() {
+            parts.push(format!(
+                "dispatch_dedup_state={}",
+                self.dispatch_dedup_state.canonical_string()
+            ));
+        }
+        if !self.kill_switch.is_off() {
+            parts.push(format!(
+                "kill_switch={}",
+                self.kill_switch.canonical_string()
+            ));
+        }
+        if !self.pause_resume_state.is_pristine() {
+            parts.push(format!(
+                "pause_resume_state={}",
+                self.pause_resume_state.canonical_string()
+            ));
+        }
+        if !self.journal_state.is_pristine() {
+            parts.push(format!(
+                "journal_state={}",
+                self.journal_state.canonical_string()
+            ));
         }
 
         parts.join("|")
@@ -4440,6 +7600,37 @@ impl Mission {
                 )?;
             }
             Self::validate_assignment_failure_contract(assignment)?;
+        }
+        Self::validate_optional_non_empty_field(
+            "mission.replan_state.last_correlation_id",
+            self.replan_state.last_correlation_id.as_deref(),
+        )?;
+        if let Some(last_observed_at_ms) = self.replan_state.last_observed_at_ms {
+            Self::validate_timestamp_order(
+                "mission.replan_state.last_observed_at_ms",
+                self.created_at_ms,
+                last_observed_at_ms,
+            )?;
+        }
+        if let Some(next_eligible_replan_at_ms) = self.replan_state.next_eligible_replan_at_ms {
+            let baseline = self
+                .replan_state
+                .last_observed_at_ms
+                .unwrap_or(self.created_at_ms);
+            Self::validate_timestamp_order(
+                "mission.replan_state.next_eligible_replan_at_ms",
+                baseline,
+                next_eligible_replan_at_ms,
+            )?;
+        }
+        if self.replan_state.consecutive_replan_count > 0
+            && self.replan_state.last_observed_at_ms.is_none()
+        {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "mission.replan_state.consecutive_replan_count".to_string(),
+                message: "consecutive_replan_count requires last_observed_at_ms to be present"
+                    .to_string(),
+            });
         }
         Self::validate_lifecycle_outcome_coherence(self.lifecycle_state, &self.assignments)?;
 
@@ -4907,6 +8098,184 @@ impl Mission {
         })
     }
 
+    /// Evaluate one adaptive replanning trigger and apply deterministic backoff/loop guards.
+    ///
+    /// This contract is deterministic under bursty trigger streams:
+    /// - duplicate `correlation_id` values are ignored,
+    /// - triggers inside active backoff windows are rejected with `replan_backoff_active`,
+    /// - accepted triggers update durable `replan_state` and optionally move lifecycle to
+    ///   `retry_pending` via `retry_scheduled`.
+    pub fn evaluate_adaptive_replan(
+        &mut self,
+        trigger: &MissionReplanTrigger,
+        policy: &MissionReplanBackoffPolicy,
+    ) -> Result<MissionReplanDecision, MissionValidationError> {
+        Self::validate_non_empty_field("replan_trigger.correlation_id", &trigger.correlation_id)?;
+        Self::validate_optional_non_empty_field(
+            "replan_trigger.reason_code",
+            trigger.reason_code.as_deref(),
+        )?;
+        Self::validate_replan_backoff_policy(policy)?;
+        if let Some(assignment_id) = &trigger.assignment_id {
+            self.find_assignment_by_id(assignment_id).ok_or_else(|| {
+                MissionValidationError::UnknownAssignmentReference(assignment_id.clone())
+            })?;
+        }
+
+        if trigger.kind == MissionReplanTriggerKind::RateLimited {
+            if let Some(reason_code) = trigger.reason_code.as_deref() {
+                let normalized = MissionFailureCode::from_reason_code(reason_code).ok_or_else(|| {
+                    MissionValidationError::InvalidFieldValue {
+                        field_path: "replan_trigger.reason_code".to_string(),
+                        message: format!(
+                            "rate_limited trigger requires canonical mission failure code, got '{}'",
+                            reason_code
+                        ),
+                    }
+                })?;
+                if normalized != MissionFailureCode::RateLimited {
+                    return Err(MissionValidationError::InvalidFieldValue {
+                        field_path: "replan_trigger.reason_code".to_string(),
+                        message: format!(
+                            "rate_limited trigger must use '{}', got '{}'",
+                            MissionFailureCode::RateLimited.reason_code(),
+                            reason_code
+                        ),
+                    });
+                }
+            }
+        }
+
+        let lifecycle_from = self.lifecycle_state;
+        let mut lifecycle_to = lifecycle_from;
+        let last_correlation_id = self.replan_state.last_correlation_id.as_deref();
+        let current_next_eligible = self
+            .replan_state
+            .next_eligible_replan_at_ms
+            .unwrap_or(trigger.observed_at_ms);
+        let current_attempt = self.replan_state.consecutive_replan_count;
+
+        if last_correlation_id == Some(trigger.correlation_id.as_str()) {
+            return Ok(MissionReplanDecision {
+                trigger_kind: trigger.kind,
+                assignment_id: trigger.assignment_id.clone(),
+                observed_at_ms: trigger.observed_at_ms,
+                correlation_id: trigger.correlation_id.clone(),
+                apply_replan: false,
+                decision_path: "dedupe_guard".to_string(),
+                reason_code: "replan_duplicate_trigger".to_string(),
+                error_code: None,
+                attempt: current_attempt,
+                backoff_ms: (current_next_eligible - trigger.observed_at_ms).max(0),
+                scheduled_at_ms: current_next_eligible,
+                next_eligible_replan_at_ms: current_next_eligible,
+                lifecycle_from,
+                lifecycle_to,
+            });
+        }
+
+        if trigger.observed_at_ms < current_next_eligible {
+            self.replan_state.last_trigger_kind = Some(trigger.kind);
+            self.replan_state.last_correlation_id = Some(trigger.correlation_id.clone());
+            self.replan_state.last_observed_at_ms = Some(trigger.observed_at_ms);
+
+            return Ok(MissionReplanDecision {
+                trigger_kind: trigger.kind,
+                assignment_id: trigger.assignment_id.clone(),
+                observed_at_ms: trigger.observed_at_ms,
+                correlation_id: trigger.correlation_id.clone(),
+                apply_replan: false,
+                decision_path: "backoff_guard".to_string(),
+                reason_code: "replan_backoff_active".to_string(),
+                error_code: Some("FTM2001".to_string()),
+                attempt: current_attempt.max(1),
+                backoff_ms: current_next_eligible - trigger.observed_at_ms,
+                scheduled_at_ms: current_next_eligible,
+                next_eligible_replan_at_ms: current_next_eligible,
+                lifecycle_from,
+                lifecycle_to,
+            });
+        }
+
+        let attempt = if let Some(last_observed_at_ms) = self.replan_state.last_observed_at_ms {
+            let delta_ms = trigger.observed_at_ms.saturating_sub(last_observed_at_ms);
+            if delta_ms >= 0 && delta_ms <= policy.burst_window_ms {
+                self.replan_state.consecutive_replan_count.saturating_add(1)
+            } else {
+                1
+            }
+        } else {
+            1
+        };
+
+        let base_backoff_ms = match trigger.kind {
+            MissionReplanTriggerKind::Completion | MissionReplanTriggerKind::OperatorOverride => 0,
+            MissionReplanTriggerKind::Blocked | MissionReplanTriggerKind::Failed => {
+                policy.min_backoff_ms
+            }
+            MissionReplanTriggerKind::RateLimited => policy.min_backoff_ms.saturating_mul(2),
+        };
+        let shift = attempt.saturating_sub(1).min(20);
+        let growth = 1_i64 << shift;
+        let backoff_ms = if base_backoff_ms == 0 {
+            0
+        } else {
+            base_backoff_ms
+                .saturating_mul(growth)
+                .min(policy.max_backoff_ms)
+        };
+
+        let scheduled_at_ms = trigger.observed_at_ms.saturating_add(backoff_ms);
+        let next_eligible_replan_at_ms =
+            scheduled_at_ms.saturating_add(backoff_ms.max(policy.min_backoff_ms));
+
+        if !matches!(trigger.kind, MissionReplanTriggerKind::Completion)
+            && mission_lifecycle_can_transition(
+                lifecycle_from,
+                MissionLifecycleState::RetryPending,
+                MissionLifecycleTransitionKind::RetryScheduled,
+            )
+        {
+            self.transition_lifecycle(
+                MissionLifecycleState::RetryPending,
+                MissionLifecycleTransitionKind::RetryScheduled,
+                scheduled_at_ms,
+            )?;
+            lifecycle_to = MissionLifecycleState::RetryPending;
+        }
+
+        let (reason_code, error_code) = Self::replan_reason_code_for_trigger(trigger.kind);
+        self.replan_state.consecutive_replan_count = attempt;
+        self.replan_state.last_trigger_kind = Some(trigger.kind);
+        self.replan_state.last_correlation_id = Some(trigger.correlation_id.clone());
+        self.replan_state.last_observed_at_ms = Some(trigger.observed_at_ms);
+        self.replan_state.next_eligible_replan_at_ms = Some(next_eligible_replan_at_ms);
+        if self
+            .updated_at_ms
+            .map(|current| current < trigger.observed_at_ms)
+            .unwrap_or(true)
+        {
+            self.updated_at_ms = Some(trigger.observed_at_ms);
+        }
+
+        Ok(MissionReplanDecision {
+            trigger_kind: trigger.kind,
+            assignment_id: trigger.assignment_id.clone(),
+            observed_at_ms: trigger.observed_at_ms,
+            correlation_id: trigger.correlation_id.clone(),
+            apply_replan: true,
+            decision_path: "adaptive_replan_scheduled".to_string(),
+            reason_code: reason_code.to_string(),
+            error_code: error_code.map(str::to_string),
+            attempt,
+            backoff_ms,
+            scheduled_at_ms,
+            next_eligible_replan_at_ms,
+            lifecycle_from,
+            lifecycle_to,
+        })
+    }
+
     /// Evaluate policy preflight checks for mission candidate actions.
     ///
     /// This pipeline supports both:
@@ -5178,6 +8547,638 @@ impl Mission {
             mechanism,
             outcome,
         })
+    }
+
+    /// Evaluate whether a dispatch attempt is a duplicate using content-addressed
+    /// idempotency keys. Returns a dedup result indicating whether the dispatch
+    /// should proceed or return a cached outcome.
+    ///
+    /// Deduplication semantics:
+    /// - identical (mission_id, assignment_id, mechanism) → duplicate,
+    /// - mechanism hash mismatch on same key → stale/conflict (not a duplicate),
+    /// - no prior record → fresh dispatch (proceed).
+    pub fn evaluate_dispatch_deduplication(
+        &self,
+        assignment_id: &AssignmentId,
+        correlation_id: &str,
+    ) -> Result<MissionDispatchDeduplicationResult, MissionValidationError> {
+        Self::validate_non_empty_field("correlation_id", correlation_id)?;
+
+        let (_, mechanism) = self.dispatch_context_for_assignment(assignment_id)?;
+        let idempotency_key =
+            MissionDispatchIdempotencyKey::compute(&self.mission_id, assignment_id, &mechanism);
+        let mechanism_hash = {
+            let mechanism_json = serde_json::to_string(&mechanism).unwrap_or_default();
+            sha256_hex(&mechanism_json)[..16].to_string()
+        };
+
+        match self.dispatch_dedup_state.find_by_key(&idempotency_key) {
+            Some(existing) => {
+                if existing.mechanism_hash != mechanism_hash {
+                    // Same key but different mechanism — stale record from a prior
+                    // version of the assignment. Allow re-dispatch.
+                    Ok(MissionDispatchDeduplicationResult {
+                        idempotency_key,
+                        is_duplicate: false,
+                        decision_path: "dedup_mechanism_hash_mismatch".to_string(),
+                        reason_code: "dispatch_mechanism_changed".to_string(),
+                        cached_record: None,
+                    })
+                } else {
+                    // Exact match — this is a duplicate dispatch.
+                    Ok(MissionDispatchDeduplicationResult {
+                        idempotency_key,
+                        is_duplicate: true,
+                        decision_path: "dedup_exact_match".to_string(),
+                        reason_code: "dispatch_duplicate".to_string(),
+                        cached_record: Some(existing.clone()),
+                    })
+                }
+            }
+            None => Ok(MissionDispatchDeduplicationResult {
+                idempotency_key,
+                is_duplicate: false,
+                decision_path: "dedup_no_prior_record".to_string(),
+                reason_code: "dispatch_fresh".to_string(),
+                cached_record: None,
+            }),
+        }
+    }
+
+    /// Execute a live dispatch with integrated deduplication.
+    ///
+    /// 1. Checks dedup state for prior execution of the same logical action.
+    /// 2. If duplicate: returns cached outcome without re-execution.
+    /// 3. If fresh: executes the dispatch, records the result, returns execution.
+    pub fn dispatch_assignment_live_idempotent(
+        &mut self,
+        assignment_id: &AssignmentId,
+        correlation_id: &str,
+        response: MissionDispatchLiveResponse,
+        dispatched_at_ms: i64,
+    ) -> Result<(MissionDispatchExecution, MissionDispatchDeduplicationResult), MissionValidationError>
+    {
+        let dedup_result = self.evaluate_dispatch_deduplication(assignment_id, correlation_id)?;
+
+        if dedup_result.is_duplicate {
+            // Return cached outcome as a synthetic execution.
+            let cached = dedup_result
+                .cached_record
+                .as_ref()
+                .expect("cached_record must be present when is_duplicate=true");
+            let (target, mechanism) = self.dispatch_context_for_assignment(assignment_id)?;
+            let execution = MissionDispatchExecution {
+                mode: MissionDispatchMode::Live,
+                target,
+                mechanism,
+                outcome: cached.outcome.clone(),
+            };
+            return Ok((execution, dedup_result));
+        }
+
+        // Fresh dispatch — execute and record.
+        let execution = self.dispatch_assignment_live(assignment_id, response)?;
+
+        let mechanism_hash = {
+            let mechanism_json =
+                serde_json::to_string(&execution.mechanism).unwrap_or_default();
+            sha256_hex(&mechanism_json)[..16].to_string()
+        };
+
+        let record = MissionDispatchDeduplicationRecord {
+            idempotency_key: dedup_result.idempotency_key.clone(),
+            assignment_id: assignment_id.clone(),
+            correlation_id: correlation_id.to_string(),
+            dispatched_at_ms,
+            outcome: execution.outcome.clone(),
+            mechanism_hash,
+        };
+        self.dispatch_dedup_state.record_dispatch(record);
+
+        Ok((execution, dedup_result))
+    }
+
+    // ========================================================================
+    // Kill-Switch and Safe-Mode Operations
+    // ========================================================================
+
+    /// Evaluate whether the kill-switch blocks a dispatch or lifecycle operation.
+    ///
+    /// This method is the central policy gate: every dispatch path should call it
+    /// before proceeding. It evaluates the current kill-switch level (with TTL
+    /// expiry) and returns a structured decision.
+    pub fn evaluate_kill_switch(
+        &mut self,
+        evaluated_at_ms: i64,
+    ) -> MissionKillSwitchDecision {
+        let effective_level = self.kill_switch.evaluate_effective_level(evaluated_at_ms);
+
+        match effective_level {
+            MissionKillSwitchLevel::Off => MissionKillSwitchDecision {
+                effective_level,
+                blocked: false,
+                decision_path: "kill_switch_off".to_string(),
+                reason_code: "dispatch_allowed".to_string(),
+                error_code: None,
+                activation: None,
+            },
+            MissionKillSwitchLevel::SafeMode => MissionKillSwitchDecision {
+                effective_level,
+                blocked: true,
+                decision_path: "kill_switch_safe_mode".to_string(),
+                reason_code: MissionFailureCode::KillSwitchActivated
+                    .reason_code()
+                    .to_string(),
+                error_code: Some(
+                    MissionFailureCode::KillSwitchActivated
+                        .error_code()
+                        .to_string(),
+                ),
+                activation: self.kill_switch.current_activation.clone(),
+            },
+            MissionKillSwitchLevel::HardStop => MissionKillSwitchDecision {
+                effective_level,
+                blocked: true,
+                decision_path: "kill_switch_hard_stop".to_string(),
+                reason_code: MissionFailureCode::KillSwitchActivated
+                    .reason_code()
+                    .to_string(),
+                error_code: Some(
+                    MissionFailureCode::KillSwitchActivated
+                        .error_code()
+                        .to_string(),
+                ),
+                activation: self.kill_switch.current_activation.clone(),
+            },
+        }
+    }
+
+    /// Activate the global kill-switch at the specified level.
+    ///
+    /// Records the activation in the mission's kill-switch state and returns
+    /// the decision that will apply to subsequent dispatches.
+    pub fn activate_kill_switch(
+        &mut self,
+        level: MissionKillSwitchLevel,
+        activated_by: impl Into<String>,
+        reason_code: impl Into<String>,
+        activated_at_ms: i64,
+        expires_at_ms: Option<i64>,
+        correlation_id: Option<String>,
+    ) -> Result<MissionKillSwitchDecision, MissionValidationError> {
+        if level == MissionKillSwitchLevel::Off {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "kill_switch.level".to_string(),
+                message: "cannot activate kill-switch at level Off; use deactivate_kill_switch instead".to_string(),
+            });
+        }
+
+        let activated_by = activated_by.into();
+        let reason_code_str = reason_code.into();
+
+        if activated_by.trim().is_empty() {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "kill_switch.activated_by".to_string(),
+                message: "activated_by must not be empty".to_string(),
+            });
+        }
+        if reason_code_str.trim().is_empty() {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "kill_switch.reason_code".to_string(),
+                message: "reason_code must not be empty".to_string(),
+            });
+        }
+
+        if let Some(expires) = expires_at_ms {
+            if expires <= activated_at_ms {
+                return Err(MissionValidationError::InvalidFieldValue {
+                    field_path: "kill_switch.expires_at_ms".to_string(),
+                    message: "expires_at_ms must be after activated_at_ms".to_string(),
+                });
+            }
+        }
+
+        let activation = MissionKillSwitchActivation {
+            level,
+            activated_by,
+            reason_code: reason_code_str,
+            error_code: Some(
+                MissionFailureCode::KillSwitchActivated
+                    .error_code()
+                    .to_string(),
+            ),
+            activated_at_ms,
+            expires_at_ms,
+            correlation_id,
+        };
+
+        self.kill_switch.activate(activation);
+
+        Ok(self.evaluate_kill_switch(activated_at_ms))
+    }
+
+    /// Deactivate the global kill-switch, returning to normal operation.
+    pub fn deactivate_kill_switch(
+        &mut self,
+        deactivated_by: impl Into<String>,
+        reason_code: impl Into<String>,
+        deactivated_at_ms: i64,
+    ) -> Result<MissionKillSwitchDecision, MissionValidationError> {
+        let deactivated_by = deactivated_by.into();
+        let reason_code_str = reason_code.into();
+
+        if deactivated_by.trim().is_empty() {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "kill_switch.deactivated_by".to_string(),
+                message: "deactivated_by must not be empty".to_string(),
+            });
+        }
+        if reason_code_str.trim().is_empty() {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "kill_switch.reason_code".to_string(),
+                message: "reason_code must not be empty".to_string(),
+            });
+        }
+
+        self.kill_switch
+            .deactivate(&deactivated_by, &reason_code_str, deactivated_at_ms);
+
+        Ok(self.evaluate_kill_switch(deactivated_at_ms))
+    }
+
+    /// Cancel all in-flight (non-terminal) assignments due to kill-switch activation.
+    ///
+    /// Returns the number of assignments cancelled. Each cancelled assignment
+    /// gets an `Outcome::Cancelled` with the kill-switch reason code.
+    pub fn cancel_in_flight_for_kill_switch(
+        &mut self,
+        cancelled_at_ms: i64,
+    ) -> usize {
+        let mut cancelled_count = 0;
+        for assignment in &mut self.assignments {
+            // Skip assignments that already have a terminal outcome
+            if assignment.outcome.is_some() {
+                continue;
+            }
+            assignment.outcome = Some(Outcome::Cancelled {
+                reason_code: MissionFailureCode::KillSwitchActivated
+                    .reason_code()
+                    .to_string(),
+                completed_at_ms: cancelled_at_ms,
+            });
+            cancelled_count += 1;
+        }
+        cancelled_count
+    }
+
+    // ========================================================================
+    // Pause/Resume/Abort Control Operations (C5)
+    // ========================================================================
+
+    /// Returns true if the mission can be paused from its current state.
+    #[must_use]
+    pub fn can_pause(&self) -> bool {
+        matches!(
+            self.lifecycle_state,
+            MissionLifecycleState::Running
+                | MissionLifecycleState::Dispatching
+                | MissionLifecycleState::AwaitingApproval
+                | MissionLifecycleState::Blocked
+                | MissionLifecycleState::RetryPending
+        )
+    }
+
+    /// Returns true if the mission can be resumed (must be Paused).
+    #[must_use]
+    pub fn can_resume(&self) -> bool {
+        self.lifecycle_state == MissionLifecycleState::Paused
+    }
+
+    /// Returns true if the mission can be aborted (any non-terminal state).
+    #[must_use]
+    pub fn can_abort(&self) -> bool {
+        !self.lifecycle_state.is_terminal()
+    }
+
+    /// Pause the mission, capturing a checkpoint of current state.
+    ///
+    /// Transitions from any active state to Paused, recording the prior state
+    /// in a checkpoint for deterministic resume. Each assignment's outcome and
+    /// approval state is snapshotted.
+    pub fn pause_mission(
+        &mut self,
+        requested_by: impl Into<String>,
+        reason_code: impl Into<String>,
+        requested_at_ms: i64,
+        correlation_id: Option<String>,
+    ) -> Result<MissionControlDecision, MissionValidationError> {
+        let requested_by = requested_by.into();
+        let reason_code = reason_code.into();
+
+        if requested_by.trim().is_empty() {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "pause.requested_by".to_string(),
+                message: "requested_by must not be empty".to_string(),
+            });
+        }
+        if reason_code.trim().is_empty() {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "pause.reason_code".to_string(),
+                message: "reason_code must not be empty".to_string(),
+            });
+        }
+
+        let lifecycle_from = self.lifecycle_state;
+        if !self.can_pause() {
+            return Err(MissionValidationError::InvalidLifecycleTransition {
+                from: lifecycle_from,
+                to: MissionLifecycleState::Paused,
+                kind: MissionLifecycleTransitionKind::PauseRequested,
+            });
+        }
+
+        let assignment_entries: Vec<AssignmentCheckpointEntry> = self
+            .assignments
+            .iter()
+            .map(|a| AssignmentCheckpointEntry {
+                assignment_id: a.assignment_id.clone(),
+                outcome_summary: a.outcome.as_ref().map(|o| match o {
+                    Outcome::Success { .. } => "success".to_string(),
+                    Outcome::Failed { .. } => "failed".to_string(),
+                    Outcome::Cancelled { .. } => "cancelled".to_string(),
+                }),
+                approval_state_summary: a.approval_state.canonical_string(),
+            })
+            .collect();
+
+        let checkpoint_id = format!("cp-{}-{}", self.mission_id.0, requested_at_ms);
+
+        let checkpoint = MissionCheckpoint {
+            checkpoint_id: checkpoint_id.clone(),
+            paused_from_state: lifecycle_from,
+            paused_by: requested_by.clone(),
+            reason_code: reason_code.clone(),
+            paused_at_ms: requested_at_ms,
+            resumed_at_ms: None,
+            resumed_by: None,
+            assignment_entries,
+            correlation_id: correlation_id.clone(),
+        };
+
+        self.lifecycle_state = MissionLifecycleState::Paused;
+        self.updated_at_ms = Some(requested_at_ms);
+        self.pause_resume_state.current_checkpoint = Some(checkpoint);
+        self.pause_resume_state.total_pause_count += 1;
+
+        Ok(MissionControlDecision {
+            action: "pause".to_string(),
+            lifecycle_from,
+            lifecycle_to: MissionLifecycleState::Paused,
+            decision_path: format!("pause_mission->{}->paused", lifecycle_from),
+            reason_code,
+            error_code: None,
+            checkpoint_id: Some(checkpoint_id),
+            decided_at_ms: requested_at_ms,
+        })
+    }
+
+    /// Resume the mission from a paused state, restoring the prior lifecycle state.
+    ///
+    /// The checkpoint is finalized with resume timing and moved to history.
+    /// Cumulative pause duration is updated for SLO tracking.
+    pub fn resume_mission(
+        &mut self,
+        requested_by: impl Into<String>,
+        reason_code: impl Into<String>,
+        requested_at_ms: i64,
+        _correlation_id: Option<String>,
+    ) -> Result<MissionControlDecision, MissionValidationError> {
+        let requested_by = requested_by.into();
+        let reason_code = reason_code.into();
+
+        if requested_by.trim().is_empty() {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "resume.requested_by".to_string(),
+                message: "requested_by must not be empty".to_string(),
+            });
+        }
+
+        let lifecycle_from = self.lifecycle_state;
+        if !self.can_resume() {
+            return Err(MissionValidationError::InvalidLifecycleTransition {
+                from: lifecycle_from,
+                to: lifecycle_from,
+                kind: MissionLifecycleTransitionKind::ResumeRequested,
+            });
+        }
+
+        let mut checkpoint = self
+            .pause_resume_state
+            .current_checkpoint
+            .take()
+            .expect("can_resume() guarantees checkpoint exists");
+
+        let resume_to = checkpoint.paused_from_state;
+        checkpoint.resumed_at_ms = Some(requested_at_ms);
+        checkpoint.resumed_by = Some(requested_by.clone());
+
+        let pause_duration = requested_at_ms - checkpoint.paused_at_ms;
+        if pause_duration > 0 {
+            self.pause_resume_state.cumulative_pause_duration_ms += pause_duration;
+        }
+
+        self.pause_resume_state.checkpoint_history.push(checkpoint);
+        self.pause_resume_state.total_resume_count += 1;
+
+        self.lifecycle_state = resume_to;
+        self.updated_at_ms = Some(requested_at_ms);
+
+        Ok(MissionControlDecision {
+            action: "resume".to_string(),
+            lifecycle_from,
+            lifecycle_to: resume_to,
+            decision_path: format!("resume_mission->paused->{}", resume_to),
+            reason_code,
+            error_code: None,
+            checkpoint_id: None,
+            decided_at_ms: requested_at_ms,
+        })
+    }
+
+    /// Abort the mission, cancelling all in-flight assignments.
+    ///
+    /// Can be called from any non-terminal state. All assignments without
+    /// a terminal outcome are cancelled. If paused, the checkpoint is finalized.
+    pub fn abort_mission(
+        &mut self,
+        requested_by: impl Into<String>,
+        reason_code: impl Into<String>,
+        error_code: Option<String>,
+        requested_at_ms: i64,
+        _correlation_id: Option<String>,
+    ) -> Result<MissionControlDecision, MissionValidationError> {
+        let requested_by = requested_by.into();
+        let reason_code = reason_code.into();
+
+        if requested_by.trim().is_empty() {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "abort.requested_by".to_string(),
+                message: "requested_by must not be empty".to_string(),
+            });
+        }
+
+        let lifecycle_from = self.lifecycle_state;
+        if !self.can_abort() {
+            return Err(MissionValidationError::InvalidLifecycleTransition {
+                from: lifecycle_from,
+                to: MissionLifecycleState::Cancelled,
+                kind: MissionLifecycleTransitionKind::AbortRequested,
+            });
+        }
+
+        if let Some(mut checkpoint) = self.pause_resume_state.current_checkpoint.take() {
+            checkpoint.resumed_at_ms = Some(requested_at_ms);
+            checkpoint.resumed_by = Some(requested_by.clone());
+            let pause_duration = requested_at_ms - checkpoint.paused_at_ms;
+            if pause_duration > 0 {
+                self.pause_resume_state.cumulative_pause_duration_ms += pause_duration;
+            }
+            self.pause_resume_state.checkpoint_history.push(checkpoint);
+        }
+
+        let abort_reason = format!("abort:{}", reason_code);
+        for assignment in &mut self.assignments {
+            if assignment.outcome.is_some() {
+                continue;
+            }
+            assignment.outcome = Some(Outcome::Cancelled {
+                reason_code: abort_reason.clone(),
+                completed_at_ms: requested_at_ms,
+            });
+        }
+
+        self.pause_resume_state.total_abort_count += 1;
+        self.lifecycle_state = MissionLifecycleState::Cancelled;
+        self.updated_at_ms = Some(requested_at_ms);
+
+        Ok(MissionControlDecision {
+            action: "abort".to_string(),
+            lifecycle_from,
+            lifecycle_to: MissionLifecycleState::Cancelled,
+            decision_path: format!("abort_mission->{}->cancelled", lifecycle_from),
+            reason_code,
+            error_code,
+            checkpoint_id: None,
+            decided_at_ms: requested_at_ms,
+        })
+    }
+
+    // ── C8: Journal integration helpers ─────────────────────────────────────
+
+    /// Create a new journal for this mission.
+    #[must_use]
+    pub fn create_journal(&self) -> MissionJournal {
+        MissionJournal::new(self.mission_id.clone())
+    }
+
+    /// Sync journal metadata into the mission's embedded journal_state.
+    pub fn sync_journal_state(&mut self, journal: &MissionJournal) {
+        self.journal_state = journal.snapshot_state();
+    }
+
+    /// Record a lifecycle transition in the provided journal.
+    pub fn journal_lifecycle_transition(
+        journal: &mut MissionJournal,
+        from: MissionLifecycleState,
+        to: MissionLifecycleState,
+        transition_kind: MissionLifecycleTransitionKind,
+        correlation_id: &str,
+        initiated_by: &str,
+        timestamp_ms: i64,
+    ) -> Result<u64, MissionJournalError> {
+        let kind = MissionJournalEntryKind::LifecycleTransition {
+            from,
+            to,
+            transition_kind,
+        };
+        journal.append(
+            kind,
+            correlation_id,
+            initiated_by,
+            format!("{}->{}:{}", from, to, transition_kind),
+            None,
+            timestamp_ms,
+        )
+    }
+
+    /// Record a control command decision in the provided journal.
+    pub fn journal_control_command(
+        journal: &mut MissionJournal,
+        command: &MissionControlCommand,
+        decision: &MissionControlDecision,
+        correlation_id: &str,
+        timestamp_ms: i64,
+    ) -> Result<u64, MissionJournalError> {
+        let kind = MissionJournalEntryKind::ControlCommand {
+            command: command.clone(),
+            decision: decision.clone(),
+        };
+        journal.append(
+            kind,
+            correlation_id,
+            command.requested_by(),
+            command.reason_code(),
+            decision.error_code.clone(),
+            timestamp_ms,
+        )
+    }
+
+    /// Record a kill-switch level change in the provided journal.
+    pub fn journal_kill_switch_change(
+        journal: &mut MissionJournal,
+        level_from: MissionKillSwitchLevel,
+        level_to: MissionKillSwitchLevel,
+        correlation_id: &str,
+        initiated_by: &str,
+        timestamp_ms: i64,
+    ) -> Result<u64, MissionJournalError> {
+        let kind = MissionJournalEntryKind::KillSwitchChange {
+            level_from,
+            level_to,
+        };
+        journal.append(
+            kind,
+            correlation_id,
+            initiated_by,
+            format!("kill_switch:{}->{}",level_from, level_to),
+            None,
+            timestamp_ms,
+        )
+    }
+
+    /// Record an assignment outcome change in the provided journal.
+    pub fn journal_assignment_outcome(
+        journal: &mut MissionJournal,
+        assignment_id: &AssignmentId,
+        outcome_before: Option<&str>,
+        outcome_after: &str,
+        correlation_id: &str,
+        initiated_by: &str,
+        timestamp_ms: i64,
+    ) -> Result<u64, MissionJournalError> {
+        let kind = MissionJournalEntryKind::AssignmentOutcome {
+            assignment_id: assignment_id.clone(),
+            outcome_before: outcome_before.map(String::from),
+            outcome_after: outcome_after.to_string(),
+        };
+        journal.append(
+            kind,
+            correlation_id,
+            initiated_by,
+            "assignment_outcome",
+            None,
+            timestamp_ms,
+        )
     }
 
     /// Evaluate reservation feasibility + ownership before dispatch-time execution.
@@ -5693,6 +9694,45 @@ impl Mission {
         }
     }
 
+    fn validate_replan_backoff_policy(
+        policy: &MissionReplanBackoffPolicy,
+    ) -> Result<(), MissionValidationError> {
+        if policy.min_backoff_ms <= 0 {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "replan_policy.min_backoff_ms".to_string(),
+                message: "min_backoff_ms must be > 0".to_string(),
+            });
+        }
+        if policy.max_backoff_ms < policy.min_backoff_ms {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "replan_policy.max_backoff_ms".to_string(),
+                message: "max_backoff_ms must be >= min_backoff_ms".to_string(),
+            });
+        }
+        if policy.burst_window_ms < 0 {
+            return Err(MissionValidationError::InvalidFieldValue {
+                field_path: "replan_policy.burst_window_ms".to_string(),
+                message: "burst_window_ms must be >= 0".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn replan_reason_code_for_trigger(
+        trigger_kind: MissionReplanTriggerKind,
+    ) -> (&'static str, Option<&'static str>) {
+        match trigger_kind {
+            MissionReplanTriggerKind::Completion => ("replan_completion_signal", None),
+            MissionReplanTriggerKind::Blocked => ("replan_block_signal", None),
+            MissionReplanTriggerKind::Failed => ("replan_failure_signal", None),
+            MissionReplanTriggerKind::RateLimited => (
+                MissionFailureCode::RateLimited.reason_code(),
+                Some(MissionFailureCode::RateLimited.error_code()),
+            ),
+            MissionReplanTriggerKind::OperatorOverride => ("replan_operator_override", None),
+        }
+    }
+
     fn normalize_non_empty_unique(
         field_path: impl AsRef<str>,
         values: &[String],
@@ -5760,7 +9800,11 @@ impl Mission {
             }
             state
                 if has_pending_approval
-                    && !matches!(state, MissionLifecycleState::AwaitingApproval) =>
+                    && !matches!(
+                        state,
+                        MissionLifecycleState::AwaitingApproval
+                            | MissionLifecycleState::Paused
+                    ) =>
             {
                 Err(MissionValidationError::PendingApprovalOutsideAwaitingState { state })
             }
@@ -9422,6 +13466,314 @@ mod tests {
         ));
     }
 
+    // ========================================================================
+    // Dispatch Idempotency and Deduplication (ft-1i2ge.3.6)
+    // ========================================================================
+
+    #[test]
+    fn mission_dispatch_idempotency_key_is_deterministic_for_same_inputs() {
+        let mission_id = MissionId("mission:abc".to_string());
+        let assignment_id = AssignmentId("assignment:a".to_string());
+        let mechanism = MissionDispatchMechanism::RobotSend {
+            pane_id: 0,
+            text: "/compact".to_string(),
+            paste_mode: None,
+        };
+
+        let key1 = MissionDispatchIdempotencyKey::compute(&mission_id, &assignment_id, &mechanism);
+        let key2 = MissionDispatchIdempotencyKey::compute(&mission_id, &assignment_id, &mechanism);
+        assert_eq!(key1, key2, "same inputs must produce same idempotency key");
+        assert!(key1.as_str().starts_with("dispatch:"), "key must have dispatch: prefix");
+    }
+
+    #[test]
+    fn mission_dispatch_idempotency_key_differs_for_different_mechanisms() {
+        let mission_id = MissionId("mission:abc".to_string());
+        let assignment_id = AssignmentId("assignment:a".to_string());
+        let mech_a = MissionDispatchMechanism::RobotSend {
+            pane_id: 0,
+            text: "/compact".to_string(),
+            paste_mode: None,
+        };
+        let mech_b = MissionDispatchMechanism::RobotSend {
+            pane_id: 0,
+            text: "/retry".to_string(),
+            paste_mode: None,
+        };
+
+        let key_a = MissionDispatchIdempotencyKey::compute(&mission_id, &assignment_id, &mech_a);
+        let key_b = MissionDispatchIdempotencyKey::compute(&mission_id, &assignment_id, &mech_b);
+        assert_ne!(key_a, key_b, "different mechanisms must produce different keys");
+    }
+
+    #[test]
+    fn mission_dispatch_idempotency_key_differs_for_different_assignments() {
+        let mission_id = MissionId("mission:abc".to_string());
+        let mechanism = MissionDispatchMechanism::RobotSend {
+            pane_id: 0,
+            text: "/compact".to_string(),
+            paste_mode: None,
+        };
+
+        let key_a = MissionDispatchIdempotencyKey::compute(
+            &mission_id,
+            &AssignmentId("assignment:a".to_string()),
+            &mechanism,
+        );
+        let key_b = MissionDispatchIdempotencyKey::compute(
+            &mission_id,
+            &AssignmentId("assignment:b".to_string()),
+            &mechanism,
+        );
+        assert_ne!(key_a, key_b, "different assignments must produce different keys");
+    }
+
+    #[test]
+    fn mission_dispatch_dedup_state_records_and_finds_by_key() {
+        let mut state = MissionDispatchDeduplicationState::default();
+        assert!(state.is_empty());
+
+        let key = MissionDispatchIdempotencyKey("dispatch:abc123".to_string());
+        let record = MissionDispatchDeduplicationRecord {
+            idempotency_key: key.clone(),
+            assignment_id: AssignmentId("assignment:a".to_string()),
+            correlation_id: "corr-1".to_string(),
+            dispatched_at_ms: 1_000,
+            outcome: Outcome::Success {
+                reason_code: "dispatch_executed".to_string(),
+                completed_at_ms: 1_000,
+            },
+            mechanism_hash: "deadbeef".to_string(),
+        };
+
+        state.record_dispatch(record.clone());
+        assert!(!state.is_empty());
+        assert_eq!(state.find_by_key(&key), Some(&record));
+        assert!(
+            state
+                .find_by_key(&MissionDispatchIdempotencyKey("dispatch:other".to_string()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mission_dispatch_dedup_state_overwrites_on_same_key() {
+        let mut state = MissionDispatchDeduplicationState::default();
+        let key = MissionDispatchIdempotencyKey("dispatch:abc123".to_string());
+
+        let record1 = MissionDispatchDeduplicationRecord {
+            idempotency_key: key.clone(),
+            assignment_id: AssignmentId("assignment:a".to_string()),
+            correlation_id: "corr-1".to_string(),
+            dispatched_at_ms: 1_000,
+            outcome: Outcome::Success {
+                reason_code: "dispatch_executed".to_string(),
+                completed_at_ms: 1_000,
+            },
+            mechanism_hash: "deadbeef".to_string(),
+        };
+        let record2 = MissionDispatchDeduplicationRecord {
+            idempotency_key: key.clone(),
+            assignment_id: AssignmentId("assignment:a".to_string()),
+            correlation_id: "corr-2".to_string(),
+            dispatched_at_ms: 2_000,
+            outcome: Outcome::Failed {
+                reason_code: MissionFailureCode::DispatchError.reason_code().to_string(),
+                error_code: MissionFailureCode::DispatchError.error_code().to_string(),
+                completed_at_ms: 2_000,
+            },
+            mechanism_hash: "deadbeef".to_string(),
+        };
+
+        state.record_dispatch(record1);
+        state.record_dispatch(record2.clone());
+        assert_eq!(state.records.len(), 1, "overwrite, not append");
+        assert_eq!(state.find_by_key(&key), Some(&record2));
+    }
+
+    #[test]
+    fn mission_dispatch_dedup_state_evicts_before_cutoff() {
+        let mut state = MissionDispatchDeduplicationState::default();
+        let key_old = MissionDispatchIdempotencyKey("dispatch:old".to_string());
+        let key_new = MissionDispatchIdempotencyKey("dispatch:new".to_string());
+
+        state.record_dispatch(MissionDispatchDeduplicationRecord {
+            idempotency_key: key_old.clone(),
+            assignment_id: AssignmentId("assignment:a".to_string()),
+            correlation_id: "corr-old".to_string(),
+            dispatched_at_ms: 500,
+            outcome: Outcome::Success {
+                reason_code: "ok".to_string(),
+                completed_at_ms: 500,
+            },
+            mechanism_hash: "hash1".to_string(),
+        });
+        state.record_dispatch(MissionDispatchDeduplicationRecord {
+            idempotency_key: key_new.clone(),
+            assignment_id: AssignmentId("assignment:b".to_string()),
+            correlation_id: "corr-new".to_string(),
+            dispatched_at_ms: 2_000,
+            outcome: Outcome::Success {
+                reason_code: "ok".to_string(),
+                completed_at_ms: 2_000,
+            },
+            mechanism_hash: "hash2".to_string(),
+        });
+
+        assert_eq!(state.records.len(), 2);
+        state.evict_before(1_000);
+        assert_eq!(state.records.len(), 1);
+        assert!(state.find_by_key(&key_old).is_none());
+        assert!(state.find_by_key(&key_new).is_some());
+    }
+
+    #[test]
+    fn mission_dispatch_dedup_evaluate_fresh_dispatch_returns_not_duplicate() {
+        let mission = sample_mission();
+        let result = mission
+            .evaluate_dispatch_deduplication(
+                &AssignmentId("assignment:a".to_string()),
+                "corr-fresh-1",
+            )
+            .unwrap();
+
+        assert!(!result.is_duplicate);
+        assert_eq!(result.decision_path, "dedup_no_prior_record");
+        assert_eq!(result.reason_code, "dispatch_fresh");
+        assert!(result.cached_record.is_none());
+    }
+
+    #[test]
+    fn mission_dispatch_dedup_evaluate_rejects_empty_correlation_id() {
+        let mission = sample_mission();
+        let err = mission
+            .evaluate_dispatch_deduplication(&AssignmentId("assignment:a".to_string()), "")
+            .unwrap_err();
+        assert!(
+            matches!(err, MissionValidationError::InvalidFieldValue { .. }),
+            "empty correlation_id must be rejected"
+        );
+    }
+
+    #[test]
+    fn mission_dispatch_idempotent_first_call_executes_and_records() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Dispatching;
+        mission.assignments[0].outcome = None;
+
+        let (execution, dedup) = mission
+            .dispatch_assignment_live_idempotent(
+                &AssignmentId("assignment:a".to_string()),
+                "corr-idem-1",
+                MissionDispatchLiveResponse::Delivered {
+                    reason_code: Some("dispatch_executed".to_string()),
+                    completed_at_ms: 1_704_000_100_000,
+                },
+                1_704_000_100_000,
+            )
+            .unwrap();
+
+        assert!(!dedup.is_duplicate, "first call must not be a duplicate");
+        assert_eq!(dedup.reason_code, "dispatch_fresh");
+        assert!(matches!(execution.outcome, Outcome::Success { .. }));
+        assert!(!mission.dispatch_dedup_state.is_empty(), "must record dispatch");
+    }
+
+    #[test]
+    fn mission_dispatch_idempotent_second_call_returns_cached_outcome() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Dispatching;
+        mission.assignments[0].outcome = None;
+
+        // First dispatch
+        let (first_exec, first_dedup) = mission
+            .dispatch_assignment_live_idempotent(
+                &AssignmentId("assignment:a".to_string()),
+                "corr-idem-2a",
+                MissionDispatchLiveResponse::Delivered {
+                    reason_code: Some("dispatch_executed".to_string()),
+                    completed_at_ms: 1_704_000_100_000,
+                },
+                1_704_000_100_000,
+            )
+            .unwrap();
+        assert!(!first_dedup.is_duplicate);
+
+        // Second dispatch (duplicate) — same assignment, same mechanism
+        let (second_exec, second_dedup) = mission
+            .dispatch_assignment_live_idempotent(
+                &AssignmentId("assignment:a".to_string()),
+                "corr-idem-2b",
+                MissionDispatchLiveResponse::Delivered {
+                    reason_code: Some("should_not_be_used".to_string()),
+                    completed_at_ms: 1_704_000_200_000,
+                },
+                1_704_000_200_000,
+            )
+            .unwrap();
+
+        assert!(second_dedup.is_duplicate, "second call must detect duplicate");
+        assert_eq!(second_dedup.decision_path, "dedup_exact_match");
+        assert_eq!(second_dedup.reason_code, "dispatch_duplicate");
+        // Cached outcome should match the first execution, not the second response
+        assert_eq!(first_exec.outcome, second_exec.outcome);
+    }
+
+    #[test]
+    fn mission_dispatch_dedup_serde_roundtrip_preserves_state() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Dispatching;
+        mission.assignments[0].outcome = None;
+
+        // Execute a dispatch to populate dedup state
+        let _result = mission.dispatch_assignment_live_idempotent(
+            &AssignmentId("assignment:a".to_string()),
+            "corr-serde-1",
+            MissionDispatchLiveResponse::Delivered {
+                reason_code: Some("dispatch_executed".to_string()),
+                completed_at_ms: 1_704_000_100_000,
+            },
+            1_704_000_100_000,
+        );
+
+        // Serialize and deserialize the mission
+        let json = serde_json::to_string(&mission).unwrap();
+        let restored: Mission = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            mission.dispatch_dedup_state.records.len(),
+            restored.dispatch_dedup_state.records.len(),
+            "dedup state must survive serde roundtrip"
+        );
+        assert_eq!(
+            mission.dispatch_dedup_state.records[0].idempotency_key,
+            restored.dispatch_dedup_state.records[0].idempotency_key,
+        );
+    }
+
+    #[test]
+    fn mission_dispatch_dedup_canonical_string_is_deterministic() {
+        let state = MissionDispatchDeduplicationState {
+            records: vec![MissionDispatchDeduplicationRecord {
+                idempotency_key: MissionDispatchIdempotencyKey("dispatch:test".to_string()),
+                assignment_id: AssignmentId("assignment:x".to_string()),
+                correlation_id: "corr-canon".to_string(),
+                dispatched_at_ms: 42_000,
+                outcome: Outcome::Success {
+                    reason_code: "ok".to_string(),
+                    completed_at_ms: 42_000,
+                },
+                mechanism_hash: "abcd1234".to_string(),
+            }],
+        };
+
+        let s1 = state.canonical_string();
+        let s2 = state.canonical_string();
+        assert_eq!(s1, s2, "canonical_string must be deterministic");
+        assert!(s1.contains("dedup_records="), "must include records prefix");
+        assert!(s1.contains("dispatch:test"), "must include key");
+    }
+
     #[test]
     fn mission_reconcile_assignment_signal_applies_success_and_completes() {
         let mut mission = sample_mission();
@@ -9582,6 +13934,222 @@ mod tests {
         assert!(matches!(
             err,
             MissionValidationError::UnknownFailureReasonCode { .. }
+        ));
+    }
+
+    #[test]
+    fn mission_adaptive_replan_schedules_retry_pending_from_failed_state() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Failed;
+        mission.assignments[0].outcome = Some(Outcome::Failed {
+            reason_code: MissionFailureCode::DispatchError.reason_code().to_string(),
+            error_code: MissionFailureCode::DispatchError.error_code().to_string(),
+            completed_at_ms: 1_704_000_030_000,
+        });
+
+        let trigger = MissionReplanTrigger {
+            kind: MissionReplanTriggerKind::Failed,
+            assignment_id: Some(AssignmentId("assignment:a".to_string())),
+            observed_at_ms: 1_704_000_030_100,
+            correlation_id: "corr-c4-failure-1".to_string(),
+            reason_code: Some(MissionFailureCode::DispatchError.reason_code().to_string()),
+        };
+        let decision = mission
+            .evaluate_adaptive_replan(&trigger, &MissionReplanBackoffPolicy::default())
+            .unwrap();
+
+        assert!(decision.apply_replan);
+        assert_eq!(decision.decision_path, "adaptive_replan_scheduled");
+        assert_eq!(decision.reason_code, "replan_failure_signal");
+        assert_eq!(decision.backoff_ms, 500);
+        assert_eq!(decision.attempt, 1);
+        assert_eq!(decision.lifecycle_from, MissionLifecycleState::Failed);
+        assert_eq!(decision.lifecycle_to, MissionLifecycleState::RetryPending);
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::RetryPending);
+        assert_eq!(mission.replan_state.consecutive_replan_count, 1);
+        assert_eq!(
+            mission.replan_state.last_trigger_kind,
+            Some(MissionReplanTriggerKind::Failed)
+        );
+        assert!(mission.validate().is_ok());
+    }
+
+    #[test]
+    fn mission_adaptive_replan_backoff_blocks_tight_loop() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Failed;
+        mission.assignments[0].outcome = Some(Outcome::Failed {
+            reason_code: MissionFailureCode::DispatchError.reason_code().to_string(),
+            error_code: MissionFailureCode::DispatchError.error_code().to_string(),
+            completed_at_ms: 1_704_000_031_000,
+        });
+
+        let first = mission
+            .evaluate_adaptive_replan(
+                &MissionReplanTrigger {
+                    kind: MissionReplanTriggerKind::Failed,
+                    assignment_id: Some(AssignmentId("assignment:a".to_string())),
+                    observed_at_ms: 1_704_000_031_100,
+                    correlation_id: "corr-c4-loop-1".to_string(),
+                    reason_code: Some(MissionFailureCode::DispatchError.reason_code().to_string()),
+                },
+                &MissionReplanBackoffPolicy::default(),
+            )
+            .unwrap();
+        let second = mission
+            .evaluate_adaptive_replan(
+                &MissionReplanTrigger {
+                    kind: MissionReplanTriggerKind::Failed,
+                    assignment_id: Some(AssignmentId("assignment:a".to_string())),
+                    observed_at_ms: first.next_eligible_replan_at_ms - 1,
+                    correlation_id: "corr-c4-loop-2".to_string(),
+                    reason_code: Some(MissionFailureCode::DispatchError.reason_code().to_string()),
+                },
+                &MissionReplanBackoffPolicy::default(),
+            )
+            .unwrap();
+
+        assert!(!second.apply_replan);
+        assert_eq!(second.decision_path, "backoff_guard");
+        assert_eq!(second.reason_code, "replan_backoff_active");
+        assert_eq!(second.error_code.as_deref(), Some("FTM2001"));
+        assert_eq!(second.backoff_ms, 1);
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::RetryPending);
+    }
+
+    #[test]
+    fn mission_adaptive_replan_deduplicates_correlation_ids() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Failed;
+
+        let trigger = MissionReplanTrigger {
+            kind: MissionReplanTriggerKind::Blocked,
+            assignment_id: Some(AssignmentId("assignment:a".to_string())),
+            observed_at_ms: 1_704_000_032_100,
+            correlation_id: "corr-c4-dedupe".to_string(),
+            reason_code: None,
+        };
+
+        let first = mission
+            .evaluate_adaptive_replan(&trigger, &MissionReplanBackoffPolicy::default())
+            .unwrap();
+        let second = mission
+            .evaluate_adaptive_replan(
+                &MissionReplanTrigger {
+                    observed_at_ms: first.next_eligible_replan_at_ms + 5_000,
+                    ..trigger.clone()
+                },
+                &MissionReplanBackoffPolicy::default(),
+            )
+            .unwrap();
+
+        assert!(first.apply_replan);
+        assert!(!second.apply_replan);
+        assert_eq!(second.decision_path, "dedupe_guard");
+        assert_eq!(second.reason_code, "replan_duplicate_trigger");
+        assert_eq!(second.error_code, None);
+        assert_eq!(second.lifecycle_to, mission.lifecycle_state);
+    }
+
+    #[test]
+    fn mission_adaptive_replan_is_deterministic_under_bursty_streams() {
+        let mut first = sample_mission();
+        first.lifecycle_state = MissionLifecycleState::Failed;
+        first.assignments[0].outcome = Some(Outcome::Failed {
+            reason_code: MissionFailureCode::DispatchError.reason_code().to_string(),
+            error_code: MissionFailureCode::DispatchError.error_code().to_string(),
+            completed_at_ms: 1_704_000_033_000,
+        });
+        let mut second = first.clone();
+        let policy = MissionReplanBackoffPolicy::default();
+
+        let triggers = vec![
+            MissionReplanTrigger {
+                kind: MissionReplanTriggerKind::Failed,
+                assignment_id: Some(AssignmentId("assignment:a".to_string())),
+                observed_at_ms: 1_704_000_033_100,
+                correlation_id: "corr-c4-burst-1".to_string(),
+                reason_code: Some(MissionFailureCode::DispatchError.reason_code().to_string()),
+            },
+            MissionReplanTrigger {
+                kind: MissionReplanTriggerKind::Blocked,
+                assignment_id: Some(AssignmentId("assignment:a".to_string())),
+                observed_at_ms: 1_704_000_033_400,
+                correlation_id: "corr-c4-burst-2".to_string(),
+                reason_code: None,
+            },
+            MissionReplanTrigger {
+                kind: MissionReplanTriggerKind::RateLimited,
+                assignment_id: Some(AssignmentId("assignment:a".to_string())),
+                observed_at_ms: 1_704_000_034_300,
+                correlation_id: "corr-c4-burst-3".to_string(),
+                reason_code: Some(MissionFailureCode::RateLimited.reason_code().to_string()),
+            },
+            MissionReplanTrigger {
+                kind: MissionReplanTriggerKind::OperatorOverride,
+                assignment_id: None,
+                observed_at_ms: 1_704_000_100_000,
+                correlation_id: "corr-c4-burst-4".to_string(),
+                reason_code: None,
+            },
+            MissionReplanTrigger {
+                kind: MissionReplanTriggerKind::Completion,
+                assignment_id: Some(AssignmentId("assignment:a".to_string())),
+                observed_at_ms: 1_704_000_101_000,
+                correlation_id: "corr-c4-burst-5".to_string(),
+                reason_code: None,
+            },
+        ];
+
+        let first_decisions = triggers
+            .iter()
+            .map(|trigger| first.evaluate_adaptive_replan(trigger, &policy).unwrap())
+            .collect::<Vec<_>>();
+        let second_decisions = triggers
+            .iter()
+            .map(|trigger| second.evaluate_adaptive_replan(trigger, &policy).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_decisions, second_decisions);
+        assert_eq!(first.replan_state, second.replan_state);
+    }
+
+    #[test]
+    fn mission_adaptive_replan_rate_limited_trigger_rejects_mismatched_reason_code() {
+        let mut mission = sample_mission();
+        mission.lifecycle_state = MissionLifecycleState::Running;
+
+        let err = mission
+            .evaluate_adaptive_replan(
+                &MissionReplanTrigger {
+                    kind: MissionReplanTriggerKind::RateLimited,
+                    assignment_id: Some(AssignmentId("assignment:a".to_string())),
+                    observed_at_ms: 1_704_000_034_800,
+                    correlation_id: "corr-c4-bad-rate-code".to_string(),
+                    reason_code: Some(MissionFailureCode::DispatchError.reason_code().to_string()),
+                },
+                &MissionReplanBackoffPolicy::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            MissionValidationError::InvalidFieldValue { ref field_path, .. }
+                if field_path == "replan_trigger.reason_code"
+        ));
+    }
+
+    #[test]
+    fn mission_validate_rejects_replan_state_count_without_timestamp() {
+        let mut mission = sample_mission();
+        mission.replan_state.consecutive_replan_count = 2;
+        mission.replan_state.last_observed_at_ms = None;
+
+        let err = mission.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            MissionValidationError::InvalidFieldValue { ref field_path, .. }
+                if field_path == "mission.replan_state.consecutive_replan_count"
         ));
     }
 
@@ -11170,5 +15738,4088 @@ mod tests {
                 ledger.entries()[i - 1].entry_hash,
             );
         }
+    }
+
+    // ====================================================================
+    // Kill-Switch and Safe-Mode Tests
+    // ====================================================================
+
+    #[test]
+    fn mission_kill_switch_level_defaults_to_off() {
+        let state = MissionKillSwitchState::default();
+        assert!(state.is_off());
+        assert_eq!(state.level, MissionKillSwitchLevel::Off);
+        assert!(state.current_activation.is_none());
+        assert!(state.activation_history.is_empty());
+    }
+
+    #[test]
+    fn mission_kill_switch_level_blocks_dispatch() {
+        assert!(!MissionKillSwitchLevel::Off.blocks_dispatch());
+        assert!(MissionKillSwitchLevel::SafeMode.blocks_dispatch());
+        assert!(MissionKillSwitchLevel::HardStop.blocks_dispatch());
+    }
+
+    #[test]
+    fn mission_kill_switch_level_cancels_in_flight() {
+        assert!(!MissionKillSwitchLevel::Off.cancels_in_flight());
+        assert!(!MissionKillSwitchLevel::SafeMode.cancels_in_flight());
+        assert!(MissionKillSwitchLevel::HardStop.cancels_in_flight());
+    }
+
+    #[test]
+    fn mission_kill_switch_level_allows_read_only() {
+        assert!(MissionKillSwitchLevel::Off.allows_read_only());
+        assert!(MissionKillSwitchLevel::SafeMode.allows_read_only());
+        assert!(!MissionKillSwitchLevel::HardStop.allows_read_only());
+    }
+
+    #[test]
+    fn mission_kill_switch_activate_records_and_sets_level() {
+        let mut state = MissionKillSwitchState::default();
+        state.activate(MissionKillSwitchActivation {
+            level: MissionKillSwitchLevel::SafeMode,
+            activated_by: "operator-1".to_string(),
+            reason_code: "runaway_agent".to_string(),
+            error_code: Some("FTM1009".to_string()),
+            activated_at_ms: 1_000_000,
+            expires_at_ms: None,
+            correlation_id: Some("corr-1".to_string()),
+        });
+
+        assert_eq!(state.level, MissionKillSwitchLevel::SafeMode);
+        assert!(!state.is_off());
+        assert_eq!(state.activation_history.len(), 1);
+        assert_eq!(
+            state.current_activation.as_ref().unwrap().activated_by,
+            "operator-1"
+        );
+    }
+
+    #[test]
+    fn mission_kill_switch_deactivate_returns_to_off() {
+        let mut state = MissionKillSwitchState::default();
+        state.activate(MissionKillSwitchActivation {
+            level: MissionKillSwitchLevel::HardStop,
+            activated_by: "system".to_string(),
+            reason_code: "emergency".to_string(),
+            error_code: None,
+            activated_at_ms: 1_000_000,
+            expires_at_ms: None,
+            correlation_id: None,
+        });
+        assert_eq!(state.level, MissionKillSwitchLevel::HardStop);
+
+        state.deactivate("operator-1", "incident_resolved", 2_000_000);
+        assert!(state.is_off());
+        assert!(state.current_activation.is_none());
+        // History should have 2 entries: activation + deactivation
+        assert_eq!(state.activation_history.len(), 2);
+    }
+
+    #[test]
+    fn mission_kill_switch_ttl_expiry_auto_deactivates() {
+        let mut state = MissionKillSwitchState::default();
+        state.activate(MissionKillSwitchActivation {
+            level: MissionKillSwitchLevel::SafeMode,
+            activated_by: "operator-1".to_string(),
+            reason_code: "temporary_hold".to_string(),
+            error_code: None,
+            activated_at_ms: 1_000_000,
+            expires_at_ms: Some(2_000_000),
+            correlation_id: None,
+        });
+
+        // Before expiry: still active
+        let level = state.evaluate_effective_level(1_500_000);
+        assert_eq!(level, MissionKillSwitchLevel::SafeMode);
+
+        // At/after expiry: auto-deactivated
+        let level = state.evaluate_effective_level(2_000_000);
+        assert_eq!(level, MissionKillSwitchLevel::Off);
+        assert!(state.is_off());
+        // History: activation + auto-deactivation
+        assert_eq!(state.activation_history.len(), 2);
+    }
+
+    #[test]
+    fn mission_kill_switch_escalation_overwrites_level() {
+        let mut state = MissionKillSwitchState::default();
+        state.activate(MissionKillSwitchActivation {
+            level: MissionKillSwitchLevel::SafeMode,
+            activated_by: "operator-1".to_string(),
+            reason_code: "caution".to_string(),
+            error_code: None,
+            activated_at_ms: 1_000_000,
+            expires_at_ms: None,
+            correlation_id: None,
+        });
+        assert_eq!(state.level, MissionKillSwitchLevel::SafeMode);
+
+        // Escalate to hard stop
+        state.activate(MissionKillSwitchActivation {
+            level: MissionKillSwitchLevel::HardStop,
+            activated_by: "operator-1".to_string(),
+            reason_code: "situation_worsened".to_string(),
+            error_code: None,
+            activated_at_ms: 1_500_000,
+            expires_at_ms: None,
+            correlation_id: None,
+        });
+        assert_eq!(state.level, MissionKillSwitchLevel::HardStop);
+        assert_eq!(state.activation_history.len(), 2);
+    }
+
+    #[test]
+    fn mission_kill_switch_evict_history_bounds_memory() {
+        let mut state = MissionKillSwitchState::default();
+        for i in 0..10 {
+            state.activate(MissionKillSwitchActivation {
+                level: MissionKillSwitchLevel::SafeMode,
+                activated_by: "system".to_string(),
+                reason_code: format!("trigger_{i}"),
+                error_code: None,
+                activated_at_ms: (i + 1) * 1000,
+                expires_at_ms: None,
+                correlation_id: None,
+            });
+        }
+        assert_eq!(state.activation_history.len(), 10);
+
+        state.evict_history_before(6000);
+        assert_eq!(state.activation_history.len(), 5);
+        assert_eq!(state.activation_history[0].activated_at_ms, 6000);
+    }
+
+    #[test]
+    fn mission_evaluate_kill_switch_off_allows_dispatch() {
+        let mut mission = sample_mission();
+        let decision = mission.evaluate_kill_switch(1_704_000_001_000);
+        assert!(!decision.blocked);
+        assert_eq!(decision.effective_level, MissionKillSwitchLevel::Off);
+        assert_eq!(decision.decision_path, "kill_switch_off");
+    }
+
+    #[test]
+    fn mission_activate_kill_switch_blocks_dispatch() {
+        let mut mission = sample_mission();
+        let decision = mission
+            .activate_kill_switch(
+                MissionKillSwitchLevel::SafeMode,
+                "operator-human",
+                "runaway_detected",
+                1_704_000_001_000,
+                None,
+                Some("corr-ks-1".to_string()),
+            )
+            .unwrap();
+
+        assert!(decision.blocked);
+        assert_eq!(decision.effective_level, MissionKillSwitchLevel::SafeMode);
+        assert_eq!(decision.decision_path, "kill_switch_safe_mode");
+        assert_eq!(decision.reason_code, "kill_switch_activated");
+        assert_eq!(decision.error_code.as_deref(), Some("FTM1009"));
+    }
+
+    #[test]
+    fn mission_activate_kill_switch_rejects_level_off() {
+        let mut mission = sample_mission();
+        let result = mission.activate_kill_switch(
+            MissionKillSwitchLevel::Off,
+            "operator",
+            "test",
+            1_000_000,
+            None,
+            None,
+        );
+        let is_err = result.is_err();
+        assert!(is_err);
+    }
+
+    #[test]
+    fn mission_activate_kill_switch_rejects_empty_activated_by() {
+        let mut mission = sample_mission();
+        let result = mission.activate_kill_switch(
+            MissionKillSwitchLevel::SafeMode,
+            "  ",
+            "reason",
+            1_000_000,
+            None,
+            None,
+        );
+        let is_err = result.is_err();
+        assert!(is_err);
+    }
+
+    #[test]
+    fn mission_activate_kill_switch_rejects_expired_before_activated() {
+        let mut mission = sample_mission();
+        let result = mission.activate_kill_switch(
+            MissionKillSwitchLevel::SafeMode,
+            "operator",
+            "reason",
+            2_000_000,
+            Some(1_000_000), // expires before activation
+            None,
+        );
+        let is_err = result.is_err();
+        assert!(is_err);
+    }
+
+    #[test]
+    fn mission_deactivate_kill_switch_restores_dispatch() {
+        let mut mission = sample_mission();
+        mission
+            .activate_kill_switch(
+                MissionKillSwitchLevel::HardStop,
+                "operator",
+                "emergency",
+                1_000_000,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let decision = mission
+            .deactivate_kill_switch("operator", "all_clear", 2_000_000)
+            .unwrap();
+
+        assert!(!decision.blocked);
+        assert_eq!(decision.effective_level, MissionKillSwitchLevel::Off);
+        assert!(mission.kill_switch.is_off());
+    }
+
+    #[test]
+    fn mission_cancel_in_flight_for_kill_switch() {
+        let mut mission = Mission::new(
+            MissionId("mission:ks-test".to_string()),
+            "Kill-switch cancel test",
+            "ws-test",
+            MissionOwnership {
+                planner: "p".to_string(),
+                dispatcher: "d".to_string(),
+                operator: "o".to_string(),
+            },
+            1_000_000,
+        );
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("c1".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::SendText {
+                pane_id: 1,
+                text: "test".to_string(),
+                paste_mode: None,
+            },
+            rationale: "test".to_string(),
+            score: None,
+            created_at_ms: 1_000_100,
+        });
+        // Assignment with no outcome (in-flight)
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("a1".to_string()),
+            candidate_id: CandidateActionId("c1".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "agent-1".to_string(),
+            reservation_intent: None,
+            approval_state: ApprovalState::NotRequired,
+            outcome: None,
+            escalation: None,
+            created_at_ms: 1_000_200,
+            updated_at_ms: None,
+        });
+        // Assignment already completed (should NOT be cancelled)
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("a2".to_string()),
+            candidate_id: CandidateActionId("c1".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "agent-2".to_string(),
+            reservation_intent: None,
+            approval_state: ApprovalState::NotRequired,
+            outcome: Some(Outcome::Success {
+                reason_code: "done".to_string(),
+                completed_at_ms: 1_000_500,
+            }),
+            escalation: None,
+            created_at_ms: 1_000_300,
+            updated_at_ms: Some(1_000_500),
+        });
+
+        let cancelled = mission.cancel_in_flight_for_kill_switch(2_000_000);
+        assert_eq!(cancelled, 1);
+
+        // a1 should be cancelled
+        let a1_outcome = mission
+            .find_assignment_by_id(&AssignmentId("a1".to_string()))
+            .unwrap()
+            .outcome
+            .as_ref()
+            .unwrap();
+        let is_cancelled = matches!(a1_outcome, Outcome::Cancelled { .. });
+        assert!(is_cancelled);
+
+        // a2 should still be Success
+        let a2_outcome = mission
+            .find_assignment_by_id(&AssignmentId("a2".to_string()))
+            .unwrap()
+            .outcome
+            .as_ref()
+            .unwrap();
+        let is_success = matches!(a2_outcome, Outcome::Success { .. });
+        assert!(is_success);
+    }
+
+    #[test]
+    fn mission_kill_switch_serde_roundtrip() {
+        let mut state = MissionKillSwitchState::default();
+        state.activate(MissionKillSwitchActivation {
+            level: MissionKillSwitchLevel::SafeMode,
+            activated_by: "operator".to_string(),
+            reason_code: "test".to_string(),
+            error_code: Some("FTM1009".to_string()),
+            activated_at_ms: 1_000_000,
+            expires_at_ms: Some(2_000_000),
+            correlation_id: Some("corr-1".to_string()),
+        });
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: MissionKillSwitchState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(state, restored);
+        assert_eq!(restored.level, MissionKillSwitchLevel::SafeMode);
+        assert_eq!(
+            restored.current_activation.as_ref().unwrap().activated_by,
+            "operator"
+        );
+    }
+
+    #[test]
+    fn mission_kill_switch_canonical_string_is_deterministic() {
+        let mut state = MissionKillSwitchState::default();
+        state.activate(MissionKillSwitchActivation {
+            level: MissionKillSwitchLevel::HardStop,
+            activated_by: "system".to_string(),
+            reason_code: "chaos_monkey".to_string(),
+            error_code: None,
+            activated_at_ms: 1_000_000,
+            expires_at_ms: None,
+            correlation_id: None,
+        });
+
+        let s1 = state.canonical_string();
+        let s2 = state.canonical_string();
+        assert_eq!(s1, s2);
+        assert!(s1.contains("kill_switch_level=hard_stop"));
+        assert!(s1.contains("chaos_monkey"));
+    }
+
+    #[test]
+    fn mission_kill_switch_failure_code_roundtrip() {
+        let code = MissionFailureCode::KillSwitchActivated;
+        assert_eq!(code.reason_code(), "kill_switch_activated");
+        assert_eq!(code.error_code(), "FTM1009");
+        assert!(code.terminality().is_terminal());
+        assert!(!code.retryability().is_retryable());
+
+        // Roundtrip through from_reason_code
+        let from_reason = MissionFailureCode::from_reason_code("kill_switch_activated");
+        assert_eq!(from_reason, Some(MissionFailureCode::KillSwitchActivated));
+
+        // Roundtrip through from_error_code
+        let from_error = MissionFailureCode::from_error_code("FTM1009");
+        assert_eq!(from_error, Some(MissionFailureCode::KillSwitchActivated));
+    }
+
+    #[test]
+    fn mission_kill_switch_canonical_string_included_in_mission_hash() {
+        let mut m1 = sample_mission();
+        let hash_before = m1.compute_hash();
+
+        m1.kill_switch.activate(MissionKillSwitchActivation {
+            level: MissionKillSwitchLevel::SafeMode,
+            activated_by: "operator".to_string(),
+            reason_code: "test".to_string(),
+            error_code: None,
+            activated_at_ms: 9_000_000,
+            expires_at_ms: None,
+            correlation_id: None,
+        });
+
+        let hash_after = m1.compute_hash();
+        assert_ne!(hash_before, hash_after);
+    }
+
+    #[test]
+    fn mission_kill_switch_activation_expiry_check() {
+        let activation = MissionKillSwitchActivation {
+            level: MissionKillSwitchLevel::SafeMode,
+            activated_by: "op".to_string(),
+            reason_code: "test".to_string(),
+            error_code: None,
+            activated_at_ms: 1_000_000,
+            expires_at_ms: Some(2_000_000),
+            correlation_id: None,
+        };
+
+        assert!(!activation.is_expired_at(1_000_000));
+        assert!(!activation.is_expired_at(1_999_999));
+        assert!(activation.is_expired_at(2_000_000));
+        assert!(activation.is_expired_at(3_000_000));
+
+        // No expiry = never expires
+        let no_expiry = MissionKillSwitchActivation {
+            expires_at_ms: None,
+            ..activation
+        };
+        assert!(!no_expiry.is_expired_at(i64::MAX));
+    }
+
+    // ====================================================================
+    // Prepare-Phase Coordinator Tests
+    // ====================================================================
+
+    fn sample_tx_plan() -> TxPlan {
+        TxPlan {
+            plan_id: TxPlanId("plan:prepare-test".to_string()),
+            tx_id: TxId("tx:prepare-test".to_string()),
+            steps: vec![
+                TxStep {
+                    step_id: TxStepId("s1".to_string()),
+                    ordinal: 1,
+                    action: StepAction::SendText {
+                        pane_id: 1,
+                        text: "/retry".to_string(),
+                        paste_mode: None,
+                    },
+                },
+                TxStep {
+                    step_id: TxStepId("s2".to_string()),
+                    ordinal: 2,
+                    action: StepAction::AcquireLock {
+                        lock_name: "deploy.lock".to_string(),
+                        timeout_ms: Some(5000),
+                    },
+                },
+                TxStep {
+                    step_id: TxStepId("s3".to_string()),
+                    ordinal: 3,
+                    action: StepAction::SendText {
+                        pane_id: 2,
+                        text: "deploy".to_string(),
+                        paste_mode: Some(true),
+                    },
+                },
+            ],
+            preconditions: vec![],
+            compensations: vec![],
+        }
+    }
+
+    fn all_passing_gate(step_id: &str) -> TxPrepareGateInput {
+        TxPrepareGateInput {
+            step_id: TxStepId(step_id.to_string()),
+            policy_passed: true,
+            policy_reason_code: None,
+            reservation_available: true,
+            reservation_reason_code: None,
+            approval_satisfied: true,
+            approval_reason_code: None,
+            target_liveness: true,
+            liveness_reason_code: None,
+        }
+    }
+
+    #[test]
+    fn prepare_all_steps_ready_when_all_gates_pass() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        let gates = vec![
+            all_passing_gate("s1"),
+            all_passing_gate("s2"),
+            all_passing_gate("s3"),
+        ];
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, TxPrepareOutcome::AllReady);
+        assert!(report.outcome.commit_eligible());
+        assert_eq!(report.step_receipts.len(), 3);
+        for receipt in &report.step_receipts {
+            assert!(receipt.readiness.is_ready());
+        }
+        assert_eq!(report.reason_code, "prepare_succeeded");
+        assert!(report.error_code.is_none());
+    }
+
+    #[test]
+    fn prepare_denied_when_policy_fails() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        let mut gates = vec![
+            all_passing_gate("s1"),
+            all_passing_gate("s2"),
+            all_passing_gate("s3"),
+        ];
+        gates[1].policy_passed = false;
+        gates[1].policy_reason_code = Some("policy_denied".to_string());
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, TxPrepareOutcome::Denied);
+        assert!(!report.outcome.commit_eligible());
+        assert!(report.step_receipts[1].readiness.is_denied());
+        assert_eq!(report.reason_code, "policy_denied");
+    }
+
+    #[test]
+    fn prepare_deferred_when_reservation_conflicts() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        let mut gates = vec![
+            all_passing_gate("s1"),
+            all_passing_gate("s2"),
+            all_passing_gate("s3"),
+        ];
+        gates[0].reservation_available = false;
+        gates[0].reservation_reason_code = Some("reservation_conflict".to_string());
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, TxPrepareOutcome::Deferred);
+        assert!(!report.outcome.commit_eligible());
+        assert!(report.step_receipts[0].readiness.is_deferred());
+    }
+
+    #[test]
+    fn prepare_deferred_when_approval_pending() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        let mut gates = vec![
+            all_passing_gate("s1"),
+            all_passing_gate("s2"),
+            all_passing_gate("s3"),
+        ];
+        gates[2].approval_satisfied = false;
+        gates[2].approval_reason_code = Some("approval_required".to_string());
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, TxPrepareOutcome::Deferred);
+        assert!(report.step_receipts[2].readiness.is_deferred());
+    }
+
+    #[test]
+    fn prepare_denied_when_approval_denied() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        let mut gates = vec![
+            all_passing_gate("s1"),
+            all_passing_gate("s2"),
+            all_passing_gate("s3"),
+        ];
+        gates[2].approval_satisfied = false;
+        gates[2].approval_reason_code = Some("approval_denied".to_string());
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, TxPrepareOutcome::Denied);
+        assert!(report.step_receipts[2].readiness.is_denied());
+    }
+
+    #[test]
+    fn prepare_deferred_when_target_unreachable() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        let mut gates = vec![
+            all_passing_gate("s1"),
+            all_passing_gate("s2"),
+            all_passing_gate("s3"),
+        ];
+        gates[0].target_liveness = false;
+        gates[0].liveness_reason_code = Some("pane_not_found".to_string());
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, TxPrepareOutcome::Deferred);
+        assert!(report.step_receipts[0].readiness.is_deferred());
+    }
+
+    #[test]
+    fn prepare_denied_by_kill_switch_safe_mode() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        let gates = vec![
+            all_passing_gate("s1"),
+            all_passing_gate("s2"),
+            all_passing_gate("s3"),
+        ];
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::SafeMode,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, TxPrepareOutcome::Denied);
+        assert_eq!(report.reason_code, "kill_switch_activated");
+        assert_eq!(report.error_code.as_deref(), Some("FTM1009"));
+        for receipt in &report.step_receipts {
+            assert!(receipt.readiness.is_denied());
+        }
+    }
+
+    #[test]
+    fn prepare_denied_by_kill_switch_hard_stop() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        let gates = vec![];
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::HardStop,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, TxPrepareOutcome::Denied);
+        assert_eq!(report.step_receipts.len(), 3);
+    }
+
+    #[test]
+    fn prepare_deferred_when_gate_input_missing() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        // Only provide gates for s1 and s3, missing s2
+        let gates = vec![all_passing_gate("s1"), all_passing_gate("s3")];
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, TxPrepareOutcome::Deferred);
+        assert!(report.step_receipts[0].readiness.is_ready());
+        assert!(report.step_receipts[1].readiness.is_deferred()); // s2 missing
+        assert!(report.step_receipts[2].readiness.is_ready());
+    }
+
+    #[test]
+    fn prepare_denied_trumps_deferred() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        let mut gates = vec![
+            all_passing_gate("s1"),
+            all_passing_gate("s2"),
+            all_passing_gate("s3"),
+        ];
+        // s1 is deferred (reservation conflict)
+        gates[0].reservation_available = false;
+        // s3 is denied (policy)
+        gates[2].policy_passed = false;
+        gates[2].policy_reason_code = Some("policy_denied".to_string());
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        )
+        .unwrap();
+
+        // Denied trumps deferred
+        assert_eq!(report.outcome, TxPrepareOutcome::Denied);
+    }
+
+    #[test]
+    fn prepare_empty_plan_returns_error() {
+        let plan = TxPlan {
+            plan_id: TxPlanId("plan:empty".to_string()),
+            tx_id: TxId("tx:empty".to_string()),
+            steps: vec![],
+            preconditions: vec![],
+            compensations: vec![],
+        };
+        let tx_id = TxId("tx:empty".to_string());
+        let result = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &[],
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        );
+        let is_err = result.is_err();
+        assert!(is_err);
+    }
+
+    #[test]
+    fn prepare_readiness_counts_correct() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        let mut gates = vec![
+            all_passing_gate("s1"),
+            all_passing_gate("s2"),
+            all_passing_gate("s3"),
+        ];
+        // s2: reservation conflict (deferred)
+        gates[1].reservation_available = false;
+        // s3: policy denied
+        gates[2].policy_passed = false;
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        )
+        .unwrap();
+
+        let (ready, denied, deferred) = report.readiness_counts();
+        assert_eq!(ready, 1);
+        assert_eq!(denied, 1);
+        assert_eq!(deferred, 1);
+    }
+
+    #[test]
+    fn prepare_report_serde_roundtrip() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        let gates = vec![
+            all_passing_gate("s1"),
+            all_passing_gate("s2"),
+            all_passing_gate("s3"),
+        ];
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&report).unwrap();
+        let restored: TxPrepareReport = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(report.outcome, restored.outcome);
+        assert_eq!(report.step_receipts.len(), restored.step_receipts.len());
+        assert_eq!(report.reason_code, restored.reason_code);
+    }
+
+    #[test]
+    fn prepare_canonical_string_is_deterministic() {
+        let plan = sample_tx_plan();
+        let tx_id = TxId("tx:prepare-test".to_string());
+        let gates = vec![
+            all_passing_gate("s1"),
+            all_passing_gate("s2"),
+            all_passing_gate("s3"),
+        ];
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        )
+        .unwrap();
+
+        let s1 = report.canonical_string();
+        let s2 = report.canonical_string();
+        assert_eq!(s1, s2);
+        assert!(s1.contains("tx=tx:prepare-test"));
+        assert!(s1.contains("outcome=all_ready"));
+    }
+
+    #[test]
+    fn prepare_gate_priority_policy_before_reservation() {
+        let plan = TxPlan {
+            plan_id: TxPlanId("plan:priority".to_string()),
+            tx_id: TxId("tx:priority".to_string()),
+            steps: vec![TxStep {
+                step_id: TxStepId("s1".to_string()),
+                ordinal: 1,
+                action: StepAction::SendText {
+                    pane_id: 1,
+                    text: "test".to_string(),
+                    paste_mode: None,
+                },
+            }],
+            preconditions: vec![],
+            compensations: vec![],
+        };
+        let tx_id = TxId("tx:priority".to_string());
+
+        // Both policy denied AND reservation conflict — policy should win (denied > deferred)
+        let gates = vec![TxPrepareGateInput {
+            step_id: TxStepId("s1".to_string()),
+            policy_passed: false,
+            policy_reason_code: Some("policy_denied".to_string()),
+            reservation_available: false,
+            reservation_reason_code: Some("reservation_conflict".to_string()),
+            approval_satisfied: true,
+            approval_reason_code: None,
+            target_liveness: true,
+            liveness_reason_code: None,
+        }];
+
+        let report = evaluate_prepare_phase(
+            &tx_id,
+            &plan,
+            &gates,
+            MissionKillSwitchLevel::Off,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(report.outcome, TxPrepareOutcome::Denied);
+        assert!(report.step_receipts[0].readiness.is_denied());
+        // Should be policy-denied, not reservation-conflict
+        assert_eq!(
+            report.step_receipts[0].decision_path,
+            "prepare_policy_denied"
+        );
+    }
+
+    #[test]
+    fn prepare_step_readiness_methods() {
+        let ready = TxPrepareStepReadiness::Ready;
+        assert!(ready.is_ready());
+        assert!(!ready.is_denied());
+        assert!(!ready.is_deferred());
+
+        let denied = TxPrepareStepReadiness::Denied {
+            reason_code: "test".to_string(),
+            error_code: "ERR".to_string(),
+        };
+        assert!(!denied.is_ready());
+        assert!(denied.is_denied());
+        assert!(!denied.is_deferred());
+
+        let deferred = TxPrepareStepReadiness::Deferred {
+            reason_code: "test".to_string(),
+            retry_hint: "hint".to_string(),
+        };
+        assert!(!deferred.is_ready());
+        assert!(!deferred.is_denied());
+        assert!(deferred.is_deferred());
+    }
+
+    #[test]
+    fn prepare_outcome_commit_eligibility() {
+        assert!(TxPrepareOutcome::AllReady.commit_eligible());
+        assert!(!TxPrepareOutcome::Denied.commit_eligible());
+        assert!(!TxPrepareOutcome::Deferred.commit_eligible());
+    }
+
+    // ========================================================================
+    // C5: Pause/Resume/Abort Control Tests
+    // ========================================================================
+
+    #[test]
+    fn pause_from_running_creates_checkpoint() {
+        let mut mission = Mission::new(
+            MissionId("m-pause-run".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Running;
+
+        let decision = mission
+            .pause_mission("operator-1", "manual_pause", 2000, None)
+            .unwrap();
+
+        assert_eq!(decision.action, "pause");
+        assert_eq!(decision.lifecycle_from, MissionLifecycleState::Running);
+        assert_eq!(decision.lifecycle_to, MissionLifecycleState::Paused);
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Paused);
+        assert!(mission.pause_resume_state.is_paused());
+        assert_eq!(mission.pause_resume_state.total_pause_count, 1);
+
+        let cp = mission
+            .pause_resume_state
+            .current_checkpoint
+            .as_ref()
+            .unwrap();
+        assert_eq!(cp.paused_from_state, MissionLifecycleState::Running);
+        assert_eq!(cp.paused_by, "operator-1");
+        assert_eq!(cp.paused_at_ms, 2000);
+        assert!(cp.resumed_at_ms.is_none());
+    }
+
+    #[test]
+    fn pause_from_dispatching_creates_checkpoint() {
+        let mut mission = Mission::new(
+            MissionId("m-pause-disp".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Dispatching;
+
+        let decision = mission
+            .pause_mission(
+                "system",
+                "resource_pressure",
+                2000,
+                Some("corr-1".into()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            decision.lifecycle_from,
+            MissionLifecycleState::Dispatching
+        );
+        let cp = mission
+            .pause_resume_state
+            .current_checkpoint
+            .as_ref()
+            .unwrap();
+        assert_eq!(cp.paused_from_state, MissionLifecycleState::Dispatching);
+        assert_eq!(cp.correlation_id.as_deref(), Some("corr-1"));
+    }
+
+    #[test]
+    fn pause_from_awaiting_approval_creates_checkpoint() {
+        let mut mission = Mission::new(
+            MissionId("m-pause-approval".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::AwaitingApproval;
+
+        let decision = mission
+            .pause_mission("operator-1", "manual_pause", 2000, None)
+            .unwrap();
+
+        assert_eq!(
+            decision.lifecycle_from,
+            MissionLifecycleState::AwaitingApproval
+        );
+        let cp = mission
+            .pause_resume_state
+            .current_checkpoint
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            cp.paused_from_state,
+            MissionLifecycleState::AwaitingApproval
+        );
+    }
+
+    #[test]
+    fn pause_from_blocked_creates_checkpoint() {
+        let mut mission = Mission::new(
+            MissionId("m-pause-blocked".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Blocked;
+
+        let decision = mission
+            .pause_mission("operator-1", "investigation", 2000, None)
+            .unwrap();
+
+        assert_eq!(decision.lifecycle_from, MissionLifecycleState::Blocked);
+    }
+
+    #[test]
+    fn pause_from_retry_pending_creates_checkpoint() {
+        let mut mission = Mission::new(
+            MissionId("m-pause-retry".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::RetryPending;
+
+        let decision = mission
+            .pause_mission("operator-1", "cooldown", 2000, None)
+            .unwrap();
+
+        assert_eq!(
+            decision.lifecycle_from,
+            MissionLifecycleState::RetryPending
+        );
+    }
+
+    #[test]
+    fn pause_rejects_terminal_states() {
+        for terminal in [
+            MissionLifecycleState::Completed,
+            MissionLifecycleState::Failed,
+            MissionLifecycleState::Cancelled,
+        ] {
+            let mut mission = Mission::new(
+                MissionId("m-pause-term".into()),
+                "test",
+                "ws-1",
+                MissionOwnership::solo("agent-1"),
+                1000,
+            );
+            mission.lifecycle_state = terminal;
+
+            let result = mission.pause_mission("op", "reason", 2000, None);
+            assert!(
+                result.is_err(),
+                "should reject pause from {}",
+                terminal
+            );
+        }
+    }
+
+    #[test]
+    fn pause_rejects_already_paused() {
+        let mut mission = Mission::new(
+            MissionId("m-pause-twice".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission
+            .pause_mission("op", "first_pause", 2000, None)
+            .unwrap();
+
+        let result = mission.pause_mission("op", "second_pause", 3000, None);
+        assert!(result.is_err(), "should reject pause when already paused");
+    }
+
+    #[test]
+    fn pause_rejects_planning_state() {
+        let mut mission = Mission::new(
+            MissionId("m-pause-planning".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+
+        let result = mission.pause_mission("op", "reason", 2000, None);
+        assert!(result.is_err(), "should reject pause from Planning");
+    }
+
+    #[test]
+    fn pause_rejects_empty_requested_by() {
+        let mut mission = Mission::new(
+            MissionId("m-pause-empty".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Running;
+
+        let result = mission.pause_mission("", "reason", 2000, None);
+        assert!(result.is_err());
+
+        let result = mission.pause_mission("  ", "reason", 2000, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resume_restores_paused_from_state() {
+        let mut mission = Mission::new(
+            MissionId("m-resume".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission
+            .pause_mission("op", "manual", 2000, None)
+            .unwrap();
+
+        let decision = mission
+            .resume_mission("op", "ready_to_continue", 5000, None)
+            .unwrap();
+
+        assert_eq!(decision.action, "resume");
+        assert_eq!(decision.lifecycle_from, MissionLifecycleState::Paused);
+        assert_eq!(decision.lifecycle_to, MissionLifecycleState::Running);
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Running);
+        assert!(!mission.pause_resume_state.is_paused());
+        assert_eq!(mission.pause_resume_state.total_resume_count, 1);
+    }
+
+    #[test]
+    fn resume_rejects_not_paused() {
+        let mut mission = Mission::new(
+            MissionId("m-resume-not-paused".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Running;
+
+        let result = mission.resume_mission("op", "reason", 2000, None);
+        assert!(result.is_err(), "should reject resume when not paused");
+    }
+
+    #[test]
+    fn resume_records_duration() {
+        let mut mission = Mission::new(
+            MissionId("m-duration".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission
+            .pause_mission("op", "manual", 2000, None)
+            .unwrap();
+        mission
+            .resume_mission("op", "ready", 5000, None)
+            .unwrap();
+
+        assert_eq!(
+            mission.pause_resume_state.cumulative_pause_duration_ms,
+            3000
+        );
+
+        let history = &mission.pause_resume_state.checkpoint_history;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].resumed_at_ms, Some(5000));
+        assert_eq!(history[0].pause_duration_ms(), Some(3000));
+    }
+
+    #[test]
+    fn resume_cumulative_duration_tracking() {
+        let mut mission = Mission::new(
+            MissionId("m-cumul".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Running;
+
+        // First pause/resume: 1000ms
+        mission
+            .pause_mission("op", "pause1", 2000, None)
+            .unwrap();
+        mission
+            .resume_mission("op", "resume1", 3000, None)
+            .unwrap();
+
+        // Second pause/resume: 2000ms
+        mission
+            .pause_mission("op", "pause2", 4000, None)
+            .unwrap();
+        mission
+            .resume_mission("op", "resume2", 6000, None)
+            .unwrap();
+
+        assert_eq!(
+            mission.pause_resume_state.cumulative_pause_duration_ms,
+            3000
+        );
+        assert_eq!(mission.pause_resume_state.total_pause_count, 2);
+        assert_eq!(mission.pause_resume_state.total_resume_count, 2);
+        assert_eq!(
+            mission.pause_resume_state.checkpoint_history.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn abort_from_running_cancels_all_assignments() {
+        let mut mission = Mission::new(
+            MissionId("m-abort-run".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateId("c1".into()),
+            mechanism: DispatchMechanism::AgentMail {
+                target_agent: "agent-1".into(),
+            },
+            rationale: "test".into(),
+            score: None,
+            labels: Vec::new(),
+            created_at_ms: 1000,
+        });
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("a1".into()),
+            candidate_id: CandidateId("c1".into()),
+            assignee: "agent-1".into(),
+            assigned_at_ms: 1000,
+            updated_at_ms: None,
+            approval_state: ApprovalState::NotRequired,
+            outcome: None,
+            reservation_intent: None,
+        });
+
+        let decision = mission
+            .abort_mission(
+                "operator",
+                "emergency_stop",
+                Some("FTM9999".into()),
+                5000,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(decision.action, "abort");
+        assert_eq!(decision.lifecycle_from, MissionLifecycleState::Running);
+        assert_eq!(
+            decision.lifecycle_to,
+            MissionLifecycleState::Cancelled
+        );
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Cancelled);
+        assert_eq!(mission.pause_resume_state.total_abort_count, 1);
+
+        let outcome = mission.assignments[0].outcome.as_ref().unwrap();
+        let is_cancelled = matches!(outcome, Outcome::Cancelled { .. });
+        assert!(is_cancelled);
+    }
+
+    #[test]
+    fn abort_from_paused_cancels() {
+        let mut mission = Mission::new(
+            MissionId("m-abort-paused".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission
+            .pause_mission("op", "pause", 2000, None)
+            .unwrap();
+
+        let _decision = mission
+            .abort_mission("op", "abort_while_paused", None, 5000, None)
+            .unwrap();
+
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Cancelled);
+        assert!(!mission.pause_resume_state.is_paused());
+        assert_eq!(
+            mission.pause_resume_state.checkpoint_history.len(),
+            1
+        );
+        let cp = &mission.pause_resume_state.checkpoint_history[0];
+        assert_eq!(cp.resumed_at_ms, Some(5000));
+        assert_eq!(
+            mission.pause_resume_state.cumulative_pause_duration_ms,
+            3000
+        );
+    }
+
+    #[test]
+    fn abort_from_planning_cancels() {
+        let mut mission = Mission::new(
+            MissionId("m-abort-planning".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+
+        let decision = mission
+            .abort_mission("op", "cancel_before_start", None, 2000, None)
+            .unwrap();
+
+        assert_eq!(decision.lifecycle_from, MissionLifecycleState::Planning);
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Cancelled);
+    }
+
+    #[test]
+    fn abort_rejects_terminal_states() {
+        for terminal in [
+            MissionLifecycleState::Completed,
+            MissionLifecycleState::Failed,
+            MissionLifecycleState::Cancelled,
+        ] {
+            let mut mission = Mission::new(
+                MissionId("m-abort-term".into()),
+                "test",
+                "ws-1",
+                MissionOwnership::solo("agent-1"),
+                1000,
+            );
+            mission.lifecycle_state = terminal;
+
+            let result =
+                mission.abort_mission("op", "reason", None, 2000, None);
+            assert!(
+                result.is_err(),
+                "should reject abort from {}",
+                terminal
+            );
+        }
+    }
+
+    #[test]
+    fn abort_rejects_empty_requested_by() {
+        let mut mission = Mission::new(
+            MissionId("m-abort-empty".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Running;
+
+        let result =
+            mission.abort_mission("", "reason", None, 2000, None);
+        assert!(result.is_err());
+
+        let result =
+            mission.abort_mission("  ", "reason", None, 2000, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn can_pause_guards_correct_states() {
+        let pausable = [
+            MissionLifecycleState::Running,
+            MissionLifecycleState::Dispatching,
+            MissionLifecycleState::AwaitingApproval,
+            MissionLifecycleState::Blocked,
+            MissionLifecycleState::RetryPending,
+        ];
+        let not_pausable = [
+            MissionLifecycleState::Planning,
+            MissionLifecycleState::Planned,
+            MissionLifecycleState::Paused,
+            MissionLifecycleState::Completed,
+            MissionLifecycleState::Failed,
+            MissionLifecycleState::Cancelled,
+        ];
+
+        for state in pausable {
+            let mut mission = Mission::new(
+                MissionId("m-guard".into()),
+                "test",
+                "ws-1",
+                MissionOwnership::solo("agent-1"),
+                1000,
+            );
+            mission.lifecycle_state = state;
+            assert!(
+                mission.can_pause(),
+                "should be pausable from {}",
+                state
+            );
+        }
+        for state in not_pausable {
+            let mut mission = Mission::new(
+                MissionId("m-guard".into()),
+                "test",
+                "ws-1",
+                MissionOwnership::solo("agent-1"),
+                1000,
+            );
+            mission.lifecycle_state = state;
+            assert!(
+                !mission.can_pause(),
+                "should NOT be pausable from {}",
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn can_resume_only_when_paused() {
+        for state in MissionLifecycleState::all() {
+            let mut mission = Mission::new(
+                MissionId("m-resume-guard".into()),
+                "test",
+                "ws-1",
+                MissionOwnership::solo("agent-1"),
+                1000,
+            );
+            mission.lifecycle_state = state;
+            if state == MissionLifecycleState::Paused {
+                assert!(mission.can_resume());
+            } else {
+                assert!(!mission.can_resume());
+            }
+        }
+    }
+
+    #[test]
+    fn can_abort_all_non_terminal() {
+        for state in MissionLifecycleState::all() {
+            let mut mission = Mission::new(
+                MissionId("m-abort-guard".into()),
+                "test",
+                "ws-1",
+                MissionOwnership::solo("agent-1"),
+                1000,
+            );
+            mission.lifecycle_state = state;
+            if state.is_terminal() {
+                assert!(!mission.can_abort());
+            } else {
+                assert!(mission.can_abort());
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_captures_assignment_state() {
+        let mut mission = Mission::new(
+            MissionId("m-cp-assign".into()),
+            "test",
+            "ws-1",
+            MissionOwnership::solo("agent-1"),
+            1000,
+        );
+        mission.lifecycle_state = MissionLifecycleState::Running;
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateId("c1".into()),
+            mechanism: DispatchMechanism::AgentMail {
+                target_agent: "agent-1".into(),
+            },
+            rationale: "test".into(),
+            score: None,
+            labels: Vec::new(),
+            created_at_ms: 1000,
+        });
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("a1".into()),
+            candidate_id: CandidateId("c1".into()),
+            assignee: "agent-1".into(),
+            assigned_at_ms: 1000,
+            updated_at_ms: None,
+            approval_state: ApprovalState::Pending {
+                requested_by: "op".into(),
+                requested_at_ms: 1500,
+            },
+            outcome: None,
+            reservation_intent: None,
+        });
+
+        mission
+            .pause_mission("op", "investigate", 2000, None)
+            .unwrap();
+
+        let cp = mission
+            .pause_resume_state
+            .current_checkpoint
+            .as_ref()
+            .unwrap();
+        assert_eq!(cp.assignment_entries.len(), 1);
+        assert_eq!(cp.assignment_entries[0].assignment_id.0, "a1");
+        assert!(cp.assignment_entries[0].outcome_summary.is_none());
+        assert!(cp.assignment_entries[0]
+            .approval_state_summary
+            .contains("pending"));
+    }
+
+    #[test]
+    fn checkpoint_history_bounded_by_eviction() {
+        let mut state = MissionPauseResumeState::default();
+        for i in 0..5 {
+            state.checkpoint_history.push(MissionCheckpoint {
+                checkpoint_id: format!("cp-{i}"),
+                paused_from_state: MissionLifecycleState::Running,
+                paused_by: "op".into(),
+                reason_code: "test".into(),
+                paused_at_ms: (i as i64) * 1000,
+                resumed_at_ms: Some((i as i64) * 1000 + 500),
+                resumed_by: Some("op".into()),
+                assignment_entries: Vec::new(),
+                correlation_id: None,
+            });
+        }
+
+        assert_eq!(state.checkpoint_history.len(), 5);
+        state.evict_history_before(2000);
+        assert_eq!(state.checkpoint_history.len(), 3);
+    }
+
+    #[test]
+    fn pause_resume_state_serde_roundtrip() {
+        let mut state = MissionPauseResumeState::default();
+        state.total_pause_count = 3;
+        state.total_resume_count = 2;
+        state.total_abort_count = 1;
+        state.cumulative_pause_duration_ms = 15000;
+        state.checkpoint_history.push(MissionCheckpoint {
+            checkpoint_id: "cp-test".into(),
+            paused_from_state: MissionLifecycleState::Running,
+            paused_by: "operator".into(),
+            reason_code: "manual".into(),
+            paused_at_ms: 1000,
+            resumed_at_ms: Some(6000),
+            resumed_by: Some("operator".into()),
+            assignment_entries: vec![AssignmentCheckpointEntry {
+                assignment_id: AssignmentId("a1".into()),
+                outcome_summary: None,
+                approval_state_summary: "not_required".into(),
+            }],
+            correlation_id: Some("corr-1".into()),
+        });
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: MissionPauseResumeState =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(state, restored);
+    }
+
+    #[test]
+    fn pause_resume_canonical_string_deterministic() {
+        let state = MissionPauseResumeState {
+            current_checkpoint: None,
+            checkpoint_history: Vec::new(),
+            total_pause_count: 2,
+            total_resume_count: 1,
+            total_abort_count: 0,
+            cumulative_pause_duration_ms: 5000,
+        };
+
+        let s1 = state.canonical_string();
+        let s2 = state.canonical_string();
+        assert_eq!(s1, s2);
+        assert!(s1.contains("total_pause_count=2"));
+        assert!(s1.contains("cumulative_pause_duration_ms=5000"));
+    }
+
+    #[test]
+    fn mission_control_command_serde_roundtrip() {
+        let commands = vec![
+            MissionControlCommand::Pause {
+                requested_by: "op-1".into(),
+                reason_code: "manual".into(),
+                requested_at_ms: 1000,
+                correlation_id: Some("c-1".into()),
+            },
+            MissionControlCommand::Resume {
+                requested_by: "op-2".into(),
+                reason_code: "ready".into(),
+                requested_at_ms: 2000,
+                correlation_id: None,
+            },
+            MissionControlCommand::Abort {
+                requested_by: "system".into(),
+                reason_code: "timeout".into(),
+                error_code: Some("FTM9999".into()),
+                requested_at_ms: 3000,
+                correlation_id: None,
+            },
+        ];
+
+        for cmd in &commands {
+            let json = serde_json::to_string(cmd).unwrap();
+            let restored: MissionControlCommand =
+                serde_json::from_str(&json).unwrap();
+            assert_eq!(cmd, &restored);
+            assert_eq!(
+                cmd.canonical_string(),
+                restored.canonical_string()
+            );
+        }
+    }
+
+    // ── C8: Journal unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn journal_new_is_empty() {
+        let journal = MissionJournal::new(MissionId("m-j1".into()));
+        assert!(journal.is_empty());
+        assert_eq!(journal.len(), 0);
+        assert_eq!(journal.next_seq(), 1);
+        assert!(journal.last_checkpoint_seq().is_none());
+    }
+
+    #[test]
+    fn journal_append_increments_seq() {
+        let mut journal = MissionJournal::new(MissionId("m-j2".into()));
+        let kind = MissionJournalEntryKind::LifecycleTransition {
+            from: MissionLifecycleState::Planning,
+            to: MissionLifecycleState::Planned,
+            transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
+        };
+        let seq1 = journal
+            .append(kind.clone(), "c1", "op", "test", None, 1000)
+            .unwrap();
+        assert_eq!(seq1, 1);
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal.next_seq(), 2);
+
+        let kind2 = MissionJournalEntryKind::LifecycleTransition {
+            from: MissionLifecycleState::Planned,
+            to: MissionLifecycleState::Dispatching,
+            transition_kind: MissionLifecycleTransitionKind::DispatchStarted,
+        };
+        let seq2 = journal
+            .append(kind2, "c2", "op", "dispatch", None, 2000)
+            .unwrap();
+        assert_eq!(seq2, 2);
+        assert_eq!(journal.len(), 2);
+    }
+
+    #[test]
+    fn journal_duplicate_correlation_rejected() {
+        let mut journal = MissionJournal::new(MissionId("m-j3".into()));
+        let kind = MissionJournalEntryKind::LifecycleTransition {
+            from: MissionLifecycleState::Planning,
+            to: MissionLifecycleState::Planned,
+            transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
+        };
+        journal
+            .append(kind.clone(), "dup-1", "op", "test", None, 1000)
+            .unwrap();
+
+        let result = journal.append(kind, "dup-1", "op", "test", None, 2000);
+        assert!(result.is_err());
+        let is_dup = matches!(
+            result.unwrap_err(),
+            MissionJournalError::DuplicateCorrelation { prior_seq: 1, .. }
+        );
+        assert!(is_dup);
+    }
+
+    #[test]
+    fn journal_has_correlation() {
+        let mut journal = MissionJournal::new(MissionId("m-j4".into()));
+        assert!(!journal.has_correlation("c1"));
+
+        let kind = MissionJournalEntryKind::LifecycleTransition {
+            from: MissionLifecycleState::Planning,
+            to: MissionLifecycleState::Planned,
+            transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
+        };
+        journal.append(kind, "c1", "op", "test", None, 1000).unwrap();
+        assert!(journal.has_correlation("c1"));
+        assert!(!journal.has_correlation("c2"));
+    }
+
+    #[test]
+    fn journal_checkpoint_records_mission_state() {
+        let mission = Mission::new(
+            MissionId("m-j5".into()),
+            "checkpoint test",
+            "ws-j5",
+            MissionOwnership::solo("agent-j5"),
+            1000,
+        );
+        let mut journal = MissionJournal::new(MissionId("m-j5".into()));
+        let seq = journal.checkpoint(&mission, 2000).unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(journal.last_checkpoint_seq(), Some(1));
+
+        let entry = &journal.entries()[0];
+        let is_checkpoint = matches!(
+            &entry.kind,
+            MissionJournalEntryKind::Checkpoint {
+                lifecycle_state: MissionLifecycleState::Planning,
+                assignment_count: 0,
+                ..
+            }
+        );
+        assert!(is_checkpoint);
+    }
+
+    #[test]
+    fn journal_recovery_marker() {
+        let mut journal = MissionJournal::new(MissionId("m-j6".into()));
+        let seq = journal
+            .recovery_marker(0, "cold_start", 1000)
+            .unwrap();
+        assert_eq!(seq, 1);
+
+        let entry = &journal.entries()[0];
+        let is_recovery = matches!(
+            &entry.kind,
+            MissionJournalEntryKind::RecoveryMarker {
+                recovered_through_seq: 0,
+                ..
+            }
+        );
+        assert!(is_recovery);
+    }
+
+    #[test]
+    fn journal_entries_since_returns_subset() {
+        let mut journal = MissionJournal::new(MissionId("m-j7".into()));
+        for i in 1..=5 {
+            let kind = MissionJournalEntryKind::LifecycleTransition {
+                from: MissionLifecycleState::Planning,
+                to: MissionLifecycleState::Planned,
+                transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
+            };
+            journal
+                .append(kind, format!("c{i}"), "op", "test", None, i * 1000)
+                .unwrap();
+        }
+        assert_eq!(journal.entries_since(3).len(), 3);
+        assert_eq!(journal.entries_since(1).len(), 5);
+        assert_eq!(journal.entries_since(6).len(), 0);
+        assert_eq!(journal.entries_since(0).len(), 5);
+    }
+
+    #[test]
+    fn journal_compact_before_removes_entries() {
+        let mut journal = MissionJournal::new(MissionId("m-j8".into()));
+        for i in 1..=5 {
+            let kind = MissionJournalEntryKind::LifecycleTransition {
+                from: MissionLifecycleState::Planning,
+                to: MissionLifecycleState::Planned,
+                transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
+            };
+            journal
+                .append(kind, format!("c{i}"), "op", "test", None, i * 1000)
+                .unwrap();
+        }
+
+        let removed = journal.compact_before(3);
+        assert_eq!(removed, 2);
+        assert_eq!(journal.len(), 3);
+        assert_eq!(journal.entries()[0].seq, 3);
+
+        // Compacted correlation IDs are removed from index
+        assert!(!journal.has_correlation("c1"));
+        assert!(!journal.has_correlation("c2"));
+        assert!(journal.has_correlation("c3"));
+    }
+
+    #[test]
+    fn journal_needs_compaction_respects_limit() {
+        let mut journal = MissionJournal::new(MissionId("m-j9".into()))
+            .with_max_entries(3);
+        assert!(!journal.needs_compaction());
+
+        for i in 1..=4 {
+            let kind = MissionJournalEntryKind::RecoveryMarker {
+                recovered_through_seq: 0,
+                recovery_reason: "test".into(),
+            };
+            journal
+                .append(kind, format!("c{i}"), "op", "test", None, i * 1000)
+                .unwrap();
+        }
+        assert!(journal.needs_compaction());
+    }
+
+    #[test]
+    fn journal_snapshot_state_captures_metadata() {
+        let mut journal = MissionJournal::new(MissionId("m-j10".into()));
+        let state = journal.snapshot_state();
+        assert!(state.is_pristine());
+        assert_eq!(state.entry_count, 0);
+        assert!(state.clean);
+
+        let kind = MissionJournalEntryKind::LifecycleTransition {
+            from: MissionLifecycleState::Planning,
+            to: MissionLifecycleState::Planned,
+            transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
+        };
+        journal.append(kind, "c1", "op", "test", None, 1000).unwrap();
+
+        let state = journal.snapshot_state();
+        assert!(!state.is_pristine());
+        assert_eq!(state.entry_count, 1);
+        assert_eq!(state.last_seq, 1);
+        assert!(!state.clean); // No checkpoint placed yet
+    }
+
+    #[test]
+    fn journal_snapshot_clean_after_checkpoint() {
+        let mission = Mission::new(
+            MissionId("m-j11".into()),
+            "clean test",
+            "ws-j11",
+            MissionOwnership::solo("agent-j11"),
+            1000,
+        );
+        let mut journal = MissionJournal::new(MissionId("m-j11".into()));
+        journal.checkpoint(&mission, 2000).unwrap();
+
+        let state = journal.snapshot_state();
+        assert!(state.clean);
+        assert!(state.last_checkpoint_seq.is_some());
+        assert!(!state.last_checkpoint_hash.is_empty());
+    }
+
+    #[test]
+    fn journal_replay_from_checkpoint_reports_counts() {
+        let mut journal = MissionJournal::new(MissionId("m-j12".into()));
+        let mission = Mission::new(
+            MissionId("m-j12".into()),
+            "replay test",
+            "ws-j12",
+            MissionOwnership::solo("agent-j12"),
+            1000,
+        );
+
+        // Append various entry types
+        journal
+            .append(
+                MissionJournalEntryKind::LifecycleTransition {
+                    from: MissionLifecycleState::Planning,
+                    to: MissionLifecycleState::Planned,
+                    transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
+                },
+                "c1",
+                "op",
+                "test",
+                None,
+                1000,
+            )
+            .unwrap();
+        journal.checkpoint(&mission, 2000).unwrap();
+        journal
+            .append(
+                MissionJournalEntryKind::KillSwitchChange {
+                    level_from: MissionKillSwitchLevel::Off,
+                    level_to: MissionKillSwitchLevel::SafeMode,
+                },
+                "c3",
+                "op",
+                "safety",
+                None,
+                3000,
+            )
+            .unwrap();
+        journal
+            .append(
+                MissionJournalEntryKind::AssignmentOutcome {
+                    assignment_id: AssignmentId("a1".into()),
+                    outcome_before: None,
+                    outcome_after: "success".into(),
+                },
+                "c4",
+                "dispatcher",
+                "outcome",
+                None,
+                4000,
+            )
+            .unwrap();
+
+        let report = journal.replay_from_checkpoint();
+        assert!(report.is_clean());
+        // Replay from checkpoint (seq=2): sees checkpoint + kill_switch + assignment = 3 entries
+        assert_eq!(report.entries_scanned, 3);
+        assert_eq!(report.checkpoints_found, 1);
+        assert_eq!(report.kill_switch_changes, 1);
+        assert_eq!(report.assignment_outcomes, 1);
+        assert_eq!(report.total_entries(), 3);
+    }
+
+    #[test]
+    fn journal_replay_detects_seq_regression() {
+        let mut journal = MissionJournal::new(MissionId("m-j13".into()));
+        // Manually push entries with non-monotonic seq
+        journal.entries.push(MissionJournalEntry {
+            seq: 5,
+            timestamp_ms: 1000,
+            correlation_id: "c1".into(),
+            entry_hash: "h1".into(),
+            kind: MissionJournalEntryKind::RecoveryMarker {
+                recovered_through_seq: 0,
+                recovery_reason: "test".into(),
+            },
+            mission_version: 1,
+            initiated_by: "op".into(),
+            reason_code: "test".into(),
+            error_code: None,
+        });
+        journal.entries.push(MissionJournalEntry {
+            seq: 3, // regression!
+            timestamp_ms: 2000,
+            correlation_id: "c2".into(),
+            entry_hash: "h2".into(),
+            kind: MissionJournalEntryKind::RecoveryMarker {
+                recovered_through_seq: 0,
+                recovery_reason: "test".into(),
+            },
+            mission_version: 1,
+            initiated_by: "op".into(),
+            reason_code: "test".into(),
+            error_code: None,
+        });
+
+        let report = journal.replay_from_checkpoint();
+        assert!(!report.is_clean());
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].error_code, "SEQ_REGRESSION");
+    }
+
+    #[test]
+    fn journal_entry_kind_tag_names() {
+        let lt = MissionJournalEntryKind::LifecycleTransition {
+            from: MissionLifecycleState::Planning,
+            to: MissionLifecycleState::Planned,
+            transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
+        };
+        assert_eq!(lt.tag_name(), "lifecycle_transition");
+
+        let ks = MissionJournalEntryKind::KillSwitchChange {
+            level_from: MissionKillSwitchLevel::Off,
+            level_to: MissionKillSwitchLevel::SafeMode,
+        };
+        assert_eq!(ks.tag_name(), "kill_switch_change");
+
+        let cp = MissionJournalEntryKind::Checkpoint {
+            mission_hash: "test".into(),
+            lifecycle_state: MissionLifecycleState::Running,
+            assignment_count: 0,
+        };
+        assert_eq!(cp.tag_name(), "checkpoint");
+
+        let rm = MissionJournalEntryKind::RecoveryMarker {
+            recovered_through_seq: 0,
+            recovery_reason: "cold_start".into(),
+        };
+        assert_eq!(rm.tag_name(), "recovery_marker");
+
+        let ao = MissionJournalEntryKind::AssignmentOutcome {
+            assignment_id: AssignmentId("a".into()),
+            outcome_before: None,
+            outcome_after: "success".into(),
+        };
+        assert_eq!(ao.tag_name(), "assignment_outcome");
+    }
+
+    #[test]
+    fn journal_state_serde_roundtrip() {
+        let state = MissionJournalState {
+            entry_count: 42,
+            last_seq: 42,
+            last_entry_hash: "j:42:1000:c42".into(),
+            last_checkpoint_seq: Some(40),
+            last_checkpoint_hash: "sha256:abcdef".into(),
+            clean: false,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: MissionJournalState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, restored);
+    }
+
+    #[test]
+    fn journal_state_canonical_string_deterministic() {
+        let state = MissionJournalState {
+            entry_count: 10,
+            last_seq: 10,
+            last_entry_hash: "h10".into(),
+            last_checkpoint_seq: Some(5),
+            last_checkpoint_hash: "cp5".into(),
+            clean: true,
+        };
+        let s1 = state.canonical_string();
+        let s2 = state.canonical_string();
+        assert_eq!(s1, s2);
+        assert!(s1.contains("entry_count=10"));
+        assert!(s1.contains("clean=true"));
+    }
+
+    #[test]
+    fn journal_entry_serde_roundtrip() {
+        let entry = MissionJournalEntry {
+            seq: 1,
+            timestamp_ms: 5000,
+            correlation_id: "c-serde".into(),
+            entry_hash: "j:1:5000:c-serde".into(),
+            kind: MissionJournalEntryKind::LifecycleTransition {
+                from: MissionLifecycleState::Running,
+                to: MissionLifecycleState::Paused,
+                transition_kind: MissionLifecycleTransitionKind::PauseRequested,
+            },
+            mission_version: 1,
+            initiated_by: "op".into(),
+            reason_code: "manual_pause".into(),
+            error_code: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let restored: MissionJournalEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, restored);
+    }
+
+    #[test]
+    fn journal_entry_canonical_string_deterministic() {
+        let entry = MissionJournalEntry {
+            seq: 7,
+            timestamp_ms: 9000,
+            correlation_id: "c-canon".into(),
+            entry_hash: "j:7:9000:c-canon".into(),
+            kind: MissionJournalEntryKind::KillSwitchChange {
+                level_from: MissionKillSwitchLevel::Off,
+                level_to: MissionKillSwitchLevel::HardStop,
+            },
+            mission_version: 1,
+            initiated_by: "system".into(),
+            reason_code: "emergency".into(),
+            error_code: Some("FTM9999".into()),
+        };
+        let s1 = entry.canonical_string();
+        let s2 = entry.canonical_string();
+        assert_eq!(s1, s2);
+        assert!(s1.contains("seq=7"));
+        assert!(s1.contains("err=FTM9999"));
+    }
+
+    #[test]
+    fn mission_create_journal_uses_mission_id() {
+        let mission = Mission::new(
+            MissionId("m-cj".into()),
+            "journal create test",
+            "ws-cj",
+            MissionOwnership::solo("agent-cj"),
+            1000,
+        );
+        let journal = mission.create_journal();
+        assert_eq!(journal.mission_id.0, "m-cj");
+        assert!(journal.is_empty());
+    }
+
+    #[test]
+    fn mission_sync_journal_state() {
+        let mut mission = Mission::new(
+            MissionId("m-sj".into()),
+            "sync test",
+            "ws-sj",
+            MissionOwnership::solo("agent-sj"),
+            1000,
+        );
+        assert!(mission.journal_state.is_pristine());
+
+        let mut journal = mission.create_journal();
+        journal
+            .append(
+                MissionJournalEntryKind::LifecycleTransition {
+                    from: MissionLifecycleState::Planning,
+                    to: MissionLifecycleState::Planned,
+                    transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
+                },
+                "c1",
+                "op",
+                "test",
+                None,
+                2000,
+            )
+            .unwrap();
+
+        mission.sync_journal_state(&journal);
+        assert!(!mission.journal_state.is_pristine());
+        assert_eq!(mission.journal_state.entry_count, 1);
+        assert_eq!(mission.journal_state.last_seq, 1);
+    }
+
+    #[test]
+    fn journal_lifecycle_transition_helper() {
+        let mut journal = MissionJournal::new(MissionId("m-lt".into()));
+        let seq = Mission::journal_lifecycle_transition(
+            &mut journal,
+            MissionLifecycleState::Planning,
+            MissionLifecycleState::Planned,
+            MissionLifecycleTransitionKind::PlanFinalized,
+            "lt-1",
+            "planner",
+            3000,
+        )
+        .unwrap();
+        assert_eq!(seq, 1);
+        let entry = &journal.entries()[0];
+        let is_lt = matches!(
+            &entry.kind,
+            MissionJournalEntryKind::LifecycleTransition {
+                from: MissionLifecycleState::Planning,
+                to: MissionLifecycleState::Planned,
+                ..
+            }
+        );
+        assert!(is_lt);
+    }
+
+    #[test]
+    fn journal_kill_switch_change_helper() {
+        let mut journal = MissionJournal::new(MissionId("m-ks".into()));
+        let seq = Mission::journal_kill_switch_change(
+            &mut journal,
+            MissionKillSwitchLevel::Off,
+            MissionKillSwitchLevel::SafeMode,
+            "ks-1",
+            "safety",
+            4000,
+        )
+        .unwrap();
+        assert_eq!(seq, 1);
+        let entry = &journal.entries()[0];
+        let is_ks = matches!(
+            &entry.kind,
+            MissionJournalEntryKind::KillSwitchChange {
+                level_from: MissionKillSwitchLevel::Off,
+                level_to: MissionKillSwitchLevel::SafeMode,
+            }
+        );
+        assert!(is_ks);
+    }
+
+    #[test]
+    fn journal_assignment_outcome_helper() {
+        let mut journal = MissionJournal::new(MissionId("m-ao".into()));
+        let seq = Mission::journal_assignment_outcome(
+            &mut journal,
+            &AssignmentId("a1".into()),
+            None,
+            "success",
+            "ao-1",
+            "dispatcher",
+            5000,
+        )
+        .unwrap();
+        assert_eq!(seq, 1);
+        let entry = &journal.entries()[0];
+        let is_ao = matches!(
+            &entry.kind,
+            MissionJournalEntryKind::AssignmentOutcome {
+                outcome_before: None,
+                ..
+            }
+        );
+        assert!(is_ao);
+    }
+
+    #[test]
+    fn journal_control_command_helper() {
+        let mut journal = MissionJournal::new(MissionId("m-cc".into()));
+        let cmd = MissionControlCommand::Pause {
+            requested_by: "op".into(),
+            reason_code: "manual".into(),
+            requested_at_ms: 6000,
+            correlation_id: Some("cc-1".into()),
+        };
+        let decision = MissionControlDecision {
+            action: "pause".into(),
+            lifecycle_from: MissionLifecycleState::Running,
+            lifecycle_to: MissionLifecycleState::Paused,
+            decision_path: "pause_mission->running->paused".into(),
+            reason_code: "manual".into(),
+            error_code: None,
+            checkpoint_id: Some("cp-1".into()),
+            decided_at_ms: 6000,
+        };
+        let seq = Mission::journal_control_command(
+            &mut journal,
+            &cmd,
+            &decision,
+            "cc-1",
+            6000,
+        )
+        .unwrap();
+        assert_eq!(seq, 1);
+        let entry = &journal.entries()[0];
+        let is_cc = matches!(&entry.kind, MissionJournalEntryKind::ControlCommand { .. });
+        assert!(is_cc);
+    }
+
+    #[test]
+    fn journal_multiple_checkpoints_track_last() {
+        let mission = Mission::new(
+            MissionId("m-mc".into()),
+            "multi checkpoint",
+            "ws-mc",
+            MissionOwnership::solo("agent-mc"),
+            1000,
+        );
+        let mut journal = MissionJournal::new(MissionId("m-mc".into()));
+
+        journal.checkpoint(&mission, 1000).unwrap();
+        assert_eq!(journal.last_checkpoint_seq(), Some(1));
+
+        journal
+            .append(
+                MissionJournalEntryKind::LifecycleTransition {
+                    from: MissionLifecycleState::Planning,
+                    to: MissionLifecycleState::Planned,
+                    transition_kind: MissionLifecycleTransitionKind::PlanFinalized,
+                },
+                "c-between",
+                "op",
+                "test",
+                None,
+                2000,
+            )
+            .unwrap();
+
+        journal.checkpoint(&mission, 3000).unwrap();
+        assert_eq!(journal.last_checkpoint_seq(), Some(3));
+
+        // Replay from last checkpoint should only see 1 entry (the checkpoint itself)
+        let report = journal.replay_from_checkpoint();
+        assert_eq!(report.entries_scanned, 1);
+        assert_eq!(report.checkpoints_found, 1);
+    }
+
+    #[test]
+    fn journal_compact_preserves_post_checkpoint_entries() {
+        let mission = Mission::new(
+            MissionId("m-cpre".into()),
+            "compact test",
+            "ws-cpre",
+            MissionOwnership::solo("agent-cpre"),
+            1000,
+        );
+        let mut journal = MissionJournal::new(MissionId("m-cpre".into()));
+
+        // 3 entries, then checkpoint, then 2 more
+        for i in 1..=3 {
+            journal
+                .append(
+                    MissionJournalEntryKind::RecoveryMarker {
+                        recovered_through_seq: 0,
+                        recovery_reason: "setup".into(),
+                    },
+                    format!("pre-{i}"),
+                    "op",
+                    "test",
+                    None,
+                    i * 1000,
+                )
+                .unwrap();
+        }
+        journal.checkpoint(&mission, 4000).unwrap();
+        for i in 1..=2 {
+            journal
+                .append(
+                    MissionJournalEntryKind::RecoveryMarker {
+                        recovered_through_seq: 0,
+                        recovery_reason: "post".into(),
+                    },
+                    format!("post-{i}"),
+                    "op",
+                    "test",
+                    None,
+                    (4 + i) * 1000,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(journal.len(), 6);
+        // Compact everything before checkpoint (seq=4)
+        let removed = journal.compact_before(4);
+        assert_eq!(removed, 3);
+        assert_eq!(journal.len(), 3); // checkpoint + 2 post entries
+    }
+
+    #[test]
+    fn journal_error_display() {
+        let err = MissionJournalError::DuplicateCorrelation {
+            correlation_id: "dup-test".into(),
+            prior_seq: 42,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("dup-test"));
+        assert!(msg.contains("42"));
+
+        let err2 = MissionJournalError::ValidationFailed {
+            reason: "bad state".into(),
+        };
+        let msg2 = format!("{}", err2);
+        assert!(msg2.contains("bad state"));
+    }
+
+    #[test]
+    fn journal_replay_report_total_entries() {
+        let report = MissionJournalReplayReport {
+            start_seq: 0,
+            entries_scanned: 10,
+            lifecycle_transitions: 3,
+            control_commands: 2,
+            kill_switch_changes: 1,
+            assignment_outcomes: 2,
+            checkpoints_found: 1,
+            recovery_markers: 1,
+            errors: Vec::new(),
+        };
+        assert_eq!(report.total_entries(), 10);
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn journal_replay_report_with_errors() {
+        let report = MissionJournalReplayReport {
+            start_seq: 5,
+            entries_scanned: 2,
+            lifecycle_transitions: 1,
+            control_commands: 0,
+            kill_switch_changes: 0,
+            assignment_outcomes: 1,
+            checkpoints_found: 0,
+            recovery_markers: 0,
+            errors: vec![MissionJournalReplayError {
+                seq: 6,
+                error_code: "TEST_ERR".into(),
+                message: "test error".into(),
+            }],
+        };
+        assert!(!report.is_clean());
+        assert_eq!(report.errors.len(), 1);
+    }
+
+    #[test]
+    fn journal_mission_canonical_string_includes_journal() {
+        let mut mission = Mission::new(
+            MissionId("m-can".into()),
+            "canonical test",
+            "ws-can",
+            MissionOwnership::solo("agent-can"),
+            1000,
+        );
+        let canonical_before = mission.canonical_string();
+        assert!(!canonical_before.contains("journal_state="));
+
+        mission.journal_state = MissionJournalState {
+            entry_count: 5,
+            last_seq: 5,
+            last_entry_hash: "h5".into(),
+            last_checkpoint_seq: Some(3),
+            last_checkpoint_hash: "cp3".into(),
+            clean: false,
+        };
+        let canonical_after = mission.canonical_string();
+        assert!(canonical_after.contains("journal_state="));
+        assert!(canonical_after.contains("entry_count=5"));
+    }
+
+    #[test]
+    fn journal_entry_all_kinds_serde_roundtrip() {
+        let kinds = vec![
+            MissionJournalEntryKind::LifecycleTransition {
+                from: MissionLifecycleState::Running,
+                to: MissionLifecycleState::Paused,
+                transition_kind: MissionLifecycleTransitionKind::PauseRequested,
+            },
+            MissionJournalEntryKind::KillSwitchChange {
+                level_from: MissionKillSwitchLevel::Off,
+                level_to: MissionKillSwitchLevel::HardStop,
+            },
+            MissionJournalEntryKind::AssignmentOutcome {
+                assignment_id: AssignmentId("a1".into()),
+                outcome_before: Some("pending".into()),
+                outcome_after: "success".into(),
+            },
+            MissionJournalEntryKind::Checkpoint {
+                mission_hash: "sha256:abc".into(),
+                lifecycle_state: MissionLifecycleState::Running,
+                assignment_count: 3,
+            },
+            MissionJournalEntryKind::RecoveryMarker {
+                recovered_through_seq: 10,
+                recovery_reason: "restart".into(),
+            },
+        ];
+
+        for (i, kind) in kinds.iter().enumerate() {
+            let entry = MissionJournalEntry {
+                seq: (i + 1) as u64,
+                timestamp_ms: (i as i64 + 1) * 1000,
+                correlation_id: format!("kind-{i}"),
+                entry_hash: format!("h-{i}"),
+                kind: kind.clone(),
+                mission_version: 1,
+                initiated_by: "test".into(),
+                reason_code: "serde".into(),
+                error_code: None,
+            };
+            let json = serde_json::to_string(&entry).unwrap();
+            let restored: MissionJournalEntry =
+                serde_json::from_str(&json).unwrap();
+            assert_eq!(entry, restored);
+        }
+    }
+
+    #[test]
+    fn journal_control_command_entry_serde_roundtrip() {
+        let kind = MissionJournalEntryKind::ControlCommand {
+            command: MissionControlCommand::Abort {
+                requested_by: "op".into(),
+                reason_code: "timeout".into(),
+                error_code: Some("FTM001".into()),
+                requested_at_ms: 9000,
+                correlation_id: None,
+            },
+            decision: MissionControlDecision {
+                action: "abort".into(),
+                lifecycle_from: MissionLifecycleState::Running,
+                lifecycle_to: MissionLifecycleState::Cancelled,
+                decision_path: "abort".into(),
+                reason_code: "timeout".into(),
+                error_code: Some("FTM001".into()),
+                checkpoint_id: None,
+                decided_at_ms: 9000,
+            },
+        };
+        let entry = MissionJournalEntry {
+            seq: 1,
+            timestamp_ms: 9000,
+            correlation_id: "cc-serde".into(),
+            entry_hash: "h-cc".into(),
+            kind,
+            mission_version: 1,
+            initiated_by: "op".into(),
+            reason_code: "timeout".into(),
+            error_code: Some("FTM001".into()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let restored: MissionJournalEntry =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, restored);
+    }
+
+    #[test]
+    fn journal_replay_report_serde_roundtrip() {
+        let report = MissionJournalReplayReport {
+            start_seq: 5,
+            entries_scanned: 20,
+            lifecycle_transitions: 8,
+            control_commands: 3,
+            kill_switch_changes: 1,
+            assignment_outcomes: 5,
+            checkpoints_found: 2,
+            recovery_markers: 1,
+            errors: vec![MissionJournalReplayError {
+                seq: 12,
+                error_code: "SEQ_REGRESSION".into(),
+                message: "non-monotonic".into(),
+            }],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let restored: MissionJournalReplayReport =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(report, restored);
+    }
+
+    // ── H5: Commit-phase executor tests ─────────────────────────────────────
+
+    fn make_commit_contract(num_steps: usize) -> MissionTxContract {
+        let steps: Vec<TxStep> = (1..=num_steps)
+            .map(|i| TxStep {
+                step_id: TxStepId(format!("s{i}")),
+                ordinal: i as u32,
+                action: StepAction::SendText {
+                    pane_id: i as u64,
+                    text: format!("step-{i}"),
+                    paste_mode: None,
+                },
+            })
+            .collect();
+
+        MissionTxContract {
+            tx_version: 1,
+            intent: TxIntent {
+                tx_id: TxId("tx:commit-test".into()),
+                requested_by: MissionActorRole::Dispatcher,
+                summary: "commit test".into(),
+                correlation_id: "ct-1".into(),
+                created_at_ms: 1000,
+            },
+            plan: TxPlan {
+                plan_id: TxPlanId("plan:commit-test".into()),
+                tx_id: TxId("tx:commit-test".into()),
+                steps,
+                preconditions: vec![],
+                compensations: vec![],
+            },
+            lifecycle_state: MissionTxState::Prepared,
+            outcome: TxOutcome::Pending,
+            receipts: vec![],
+        }
+    }
+
+    fn success_input(step_id: &str, ts: i64) -> TxCommitStepInput {
+        TxCommitStepInput {
+            step_id: TxStepId(step_id.into()),
+            success: true,
+            reason_code: "ok".into(),
+            error_code: None,
+            completed_at_ms: ts,
+        }
+    }
+
+    fn failure_input(step_id: &str, ts: i64) -> TxCommitStepInput {
+        TxCommitStepInput {
+            step_id: TxStepId(step_id.into()),
+            success: false,
+            reason_code: "exec_error".into(),
+            error_code: Some("FTX9999".into()),
+            completed_at_ms: ts,
+        }
+    }
+
+    #[test]
+    fn commit_all_steps_succeed() {
+        let contract = make_commit_contract(3);
+        let inputs = vec![
+            success_input("s1", 2000),
+            success_input("s2", 3000),
+            success_input("s3", 4000),
+        ];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        )
+        .unwrap();
+
+        assert!(report.is_fully_committed());
+        assert!(!report.has_failures());
+        assert_eq!(report.committed_count, 3);
+        assert_eq!(report.failed_count, 0);
+        assert_eq!(report.skipped_count, 0);
+        assert!(report.failure_boundary.is_none());
+        assert_eq!(
+            report.outcome.target_tx_state(),
+            MissionTxState::Committed
+        );
+        assert_eq!(report.receipts.len(), 2); // start + terminal
+    }
+
+    #[test]
+    fn commit_first_step_fails_immediate_failure() {
+        let contract = make_commit_contract(3);
+        let inputs = vec![failure_input("s1", 2000)];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        )
+        .unwrap();
+
+        let is_immediate = matches!(
+            report.outcome,
+            TxCommitOutcome::ImmediateFailure
+        );
+        assert!(is_immediate);
+        assert_eq!(report.committed_count, 0);
+        assert_eq!(report.failed_count, 1);
+        assert_eq!(report.skipped_count, 2);
+        assert_eq!(report.failure_boundary, Some(1));
+        assert_eq!(
+            report.outcome.target_tx_state(),
+            MissionTxState::Failed
+        );
+    }
+
+    #[test]
+    fn commit_partial_failure_trips_barrier() {
+        let contract = make_commit_contract(3);
+        let inputs = vec![
+            success_input("s1", 2000),
+            failure_input("s2", 3000),
+        ];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        )
+        .unwrap();
+
+        let is_partial = matches!(
+            report.outcome,
+            TxCommitOutcome::PartialFailure
+        );
+        assert!(is_partial);
+        assert_eq!(report.committed_count, 1);
+        assert_eq!(report.failed_count, 1);
+        assert_eq!(report.skipped_count, 1);
+        assert_eq!(report.failure_boundary, Some(2));
+        assert_eq!(
+            report.outcome.target_tx_state(),
+            MissionTxState::Compensating
+        );
+
+        // Step 3 should be skipped
+        let s3 = &report.step_results[2];
+        assert!(s3.outcome.is_skipped());
+    }
+
+    #[test]
+    fn commit_kill_switch_blocks_all_steps() {
+        let contract = make_commit_contract(3);
+        let inputs = vec![
+            success_input("s1", 2000),
+            success_input("s2", 3000),
+            success_input("s3", 4000),
+        ];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::SafeMode,
+            false,
+            5000,
+        )
+        .unwrap();
+
+        let is_blocked = matches!(
+            report.outcome,
+            TxCommitOutcome::KillSwitchBlocked
+        );
+        assert!(is_blocked);
+        assert_eq!(report.committed_count, 0);
+        assert_eq!(report.skipped_count, 3);
+    }
+
+    #[test]
+    fn commit_kill_switch_hard_stop_blocks() {
+        let contract = make_commit_contract(2);
+        let inputs = vec![
+            success_input("s1", 2000),
+            success_input("s2", 3000),
+        ];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::HardStop,
+            false,
+            5000,
+        )
+        .unwrap();
+
+        let is_blocked = matches!(
+            report.outcome,
+            TxCommitOutcome::KillSwitchBlocked
+        );
+        assert!(is_blocked);
+    }
+
+    #[test]
+    fn commit_paused_suspends_execution() {
+        let contract = make_commit_contract(3);
+        let inputs = vec![
+            success_input("s1", 2000),
+            success_input("s2", 3000),
+            success_input("s3", 4000),
+        ];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            true, // paused
+            5000,
+        )
+        .unwrap();
+
+        let is_paused = matches!(
+            report.outcome,
+            TxCommitOutcome::PauseSuspended
+        );
+        assert!(is_paused);
+        assert_eq!(report.committed_count, 0);
+        assert_eq!(report.skipped_count, 3);
+        assert_eq!(
+            report.outcome.target_tx_state(),
+            MissionTxState::Committing
+        );
+    }
+
+    #[test]
+    fn commit_missing_step_input_treated_as_failure() {
+        let contract = make_commit_contract(3);
+        let inputs = vec![
+            success_input("s1", 2000),
+            // s2 missing — no input
+            success_input("s3", 4000),
+        ];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        )
+        .unwrap();
+
+        assert!(report.has_failures());
+        assert_eq!(report.committed_count, 1);
+        assert_eq!(report.failed_count, 1);
+        assert_eq!(report.skipped_count, 1);
+        assert_eq!(report.failure_boundary, Some(2));
+
+        // s2 should be failed with "step_input_missing"
+        let s2 = &report.step_results[1];
+        let is_missing_fail = matches!(
+            &s2.outcome,
+            TxCommitStepOutcome::Failed { error_code, .. }
+            if error_code == "FTX3003"
+        );
+        assert!(is_missing_fail);
+    }
+
+    #[test]
+    fn commit_rejects_non_prepared_state() {
+        let mut contract = make_commit_contract(1);
+        contract.lifecycle_state = MissionTxState::Draft;
+        let result = execute_commit_phase(
+            &contract,
+            &[],
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn commit_allows_committing_state_resume() {
+        let mut contract = make_commit_contract(1);
+        contract.lifecycle_state = MissionTxState::Committing;
+        let inputs = vec![success_input("s1", 2000)];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        )
+        .unwrap();
+        assert!(report.is_fully_committed());
+    }
+
+    #[test]
+    fn commit_rejects_empty_plan() {
+        let mut contract = make_commit_contract(0);
+        // Fix: empty steps with Prepared state
+        contract.lifecycle_state = MissionTxState::Prepared;
+        let result = execute_commit_phase(
+            &contract,
+            &[],
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn commit_step_outcome_tag_names() {
+        let committed = TxCommitStepOutcome::Committed {
+            reason_code: "ok".into(),
+        };
+        assert_eq!(committed.tag_name(), "committed");
+        assert!(committed.is_committed());
+
+        let failed = TxCommitStepOutcome::Failed {
+            reason_code: "err".into(),
+            error_code: "E1".into(),
+        };
+        assert_eq!(failed.tag_name(), "failed");
+        assert!(failed.is_failed());
+
+        let skipped = TxCommitStepOutcome::Skipped {
+            reason_code: "barrier".into(),
+        };
+        assert_eq!(skipped.tag_name(), "skipped");
+        assert!(skipped.is_skipped());
+
+        let blocked = TxCommitStepOutcome::Blocked {
+            reason_code: "ks".into(),
+            error_code: "E2".into(),
+        };
+        assert_eq!(blocked.tag_name(), "blocked");
+    }
+
+    #[test]
+    fn commit_outcome_target_states() {
+        assert_eq!(
+            TxCommitOutcome::FullyCommitted.target_tx_state(),
+            MissionTxState::Committed
+        );
+        assert_eq!(
+            TxCommitOutcome::PartialFailure.target_tx_state(),
+            MissionTxState::Compensating
+        );
+        assert_eq!(
+            TxCommitOutcome::ImmediateFailure.target_tx_state(),
+            MissionTxState::Failed
+        );
+        assert_eq!(
+            TxCommitOutcome::KillSwitchBlocked.target_tx_state(),
+            MissionTxState::Failed
+        );
+        assert_eq!(
+            TxCommitOutcome::PauseSuspended.target_tx_state(),
+            MissionTxState::Committing
+        );
+    }
+
+    #[test]
+    fn commit_report_canonical_string_deterministic() {
+        let contract = make_commit_contract(2);
+        let inputs = vec![
+            success_input("s1", 2000),
+            success_input("s2", 3000),
+        ];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        )
+        .unwrap();
+
+        let s1 = report.canonical_string();
+        let s2 = report.canonical_string();
+        assert_eq!(s1, s2);
+        assert!(s1.contains("fully_committed"));
+    }
+
+    #[test]
+    fn commit_report_serde_roundtrip() {
+        let contract = make_commit_contract(2);
+        let inputs = vec![
+            success_input("s1", 2000),
+            failure_input("s2", 3000),
+        ];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&report).unwrap();
+        let restored: TxCommitReport =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(report, restored);
+    }
+
+    #[test]
+    fn commit_step_result_serde_roundtrip() {
+        let result = TxCommitStepResult {
+            step_id: TxStepId("s1".into()),
+            ordinal: 1,
+            outcome: TxCommitStepOutcome::Committed {
+                reason_code: "ok".into(),
+            },
+            decision_path: "commit_step_succeeded".into(),
+            completed_at_ms: 5000,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let restored: TxCommitStepResult =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(result, restored);
+    }
+
+    #[test]
+    fn commit_step_input_serde_roundtrip() {
+        let input = TxCommitStepInput {
+            step_id: TxStepId("s1".into()),
+            success: false,
+            reason_code: "timeout".into(),
+            error_code: Some("FTX9001".into()),
+            completed_at_ms: 9000,
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        let restored: TxCommitStepInput =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(input, restored);
+    }
+
+    #[test]
+    fn commit_receipts_have_monotonic_seq() {
+        let contract = make_commit_contract(3);
+        let inputs = vec![
+            success_input("s1", 2000),
+            success_input("s2", 3000),
+            success_input("s3", 4000),
+        ];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        )
+        .unwrap();
+
+        let mut prev_seq = 0u64;
+        for receipt in &report.receipts {
+            assert!(
+                receipt.seq > prev_seq,
+                "receipt seq {} must be > prev {}",
+                receipt.seq,
+                prev_seq,
+            );
+            prev_seq = receipt.seq;
+        }
+    }
+
+    #[test]
+    fn commit_receipts_continue_from_prior() {
+        let mut contract = make_commit_contract(1);
+        contract.receipts.push(TxReceipt {
+            seq: 5,
+            state: MissionTxState::Prepared,
+            emitted_at_ms: 1000,
+            reason_code: Some("prepared".into()),
+            error_code: None,
+        });
+
+        let inputs = vec![success_input("s1", 2000)];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        )
+        .unwrap();
+
+        // Should start from seq 6 (prior last was 5)
+        assert_eq!(report.receipts[0].seq, 6);
+    }
+
+    #[test]
+    fn commit_step_results_in_ordinal_order() {
+        let contract = make_commit_contract(4);
+        let inputs = vec![
+            success_input("s1", 2000),
+            success_input("s2", 3000),
+            success_input("s3", 4000),
+            success_input("s4", 5000),
+        ];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            6000,
+        )
+        .unwrap();
+
+        for (i, result) in report.step_results.iter().enumerate() {
+            assert_eq!(result.ordinal, (i + 1) as u32);
+        }
+    }
+
+    #[test]
+    fn commit_single_step_success() {
+        let contract = make_commit_contract(1);
+        let inputs = vec![success_input("s1", 2000)];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        )
+        .unwrap();
+
+        assert!(report.is_fully_committed());
+        assert_eq!(report.committed_count, 1);
+    }
+
+    #[test]
+    fn commit_single_step_failure() {
+        let contract = make_commit_contract(1);
+        let inputs = vec![failure_input("s1", 2000)];
+        let report = execute_commit_phase(
+            &contract,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            5000,
+        )
+        .unwrap();
+
+        let is_immediate = matches!(
+            report.outcome,
+            TxCommitOutcome::ImmediateFailure
+        );
+        assert!(is_immediate);
+        assert_eq!(report.failed_count, 1);
+    }
+
+    #[test]
+    fn commit_outcome_tag_names() {
+        assert_eq!(TxCommitOutcome::FullyCommitted.tag_name(), "fully_committed");
+        assert_eq!(TxCommitOutcome::PartialFailure.tag_name(), "partial_failure");
+        assert_eq!(TxCommitOutcome::ImmediateFailure.tag_name(), "immediate_failure");
+        assert_eq!(TxCommitOutcome::KillSwitchBlocked.tag_name(), "kill_switch_blocked");
+        assert_eq!(TxCommitOutcome::PauseSuspended.tag_name(), "pause_suspended");
+    }
+
+    // ── H6: Compensation/rollback engine tests ──────────────────────────────
+
+    fn make_compensable_commit_report(
+        num_committed: usize,
+        failure_at: u32,
+    ) -> TxCommitReport {
+        let mut step_results = Vec::new();
+        for i in 1..=num_committed {
+            step_results.push(TxCommitStepResult {
+                step_id: TxStepId(format!("s{i}")),
+                ordinal: i as u32,
+                outcome: TxCommitStepOutcome::Committed {
+                    reason_code: "ok".into(),
+                },
+                decision_path: "commit_step_succeeded".into(),
+                completed_at_ms: (i as i64 + 1) * 1000,
+            });
+        }
+        // Add the failed step
+        step_results.push(TxCommitStepResult {
+            step_id: TxStepId(format!("s{}", failure_at)),
+            ordinal: failure_at,
+            outcome: TxCommitStepOutcome::Failed {
+                reason_code: "exec_error".into(),
+                error_code: "FTX9999".into(),
+            },
+            decision_path: "commit_step_failed".into(),
+            completed_at_ms: 10_000,
+        });
+
+        TxCommitReport {
+            tx_id: TxId("tx:comp-test".into()),
+            plan_id: TxPlanId("plan:comp-test".into()),
+            outcome: TxCommitOutcome::PartialFailure,
+            step_results,
+            failure_boundary: Some(failure_at),
+            committed_count: num_committed,
+            failed_count: 1,
+            skipped_count: 0,
+            decision_path: "commit_partial_failure".into(),
+            reason_code: "partial".into(),
+            error_code: Some("FTX3005".into()),
+            completed_at_ms: 10_000,
+            receipts: vec![],
+        }
+    }
+
+    fn make_compensable_contract(
+        num_steps: usize,
+        compensations: Vec<TxCompensation>,
+    ) -> MissionTxContract {
+        let steps: Vec<TxStep> = (1..=num_steps)
+            .map(|i| TxStep {
+                step_id: TxStepId(format!("s{i}")),
+                ordinal: i as u32,
+                action: StepAction::SendText {
+                    pane_id: i as u64,
+                    text: format!("step-{i}"),
+                    paste_mode: None,
+                },
+            })
+            .collect();
+
+        MissionTxContract {
+            tx_version: 1,
+            intent: TxIntent {
+                tx_id: TxId("tx:comp-test".into()),
+                requested_by: MissionActorRole::Dispatcher,
+                summary: "comp test".into(),
+                correlation_id: "comp-1".into(),
+                created_at_ms: 1000,
+            },
+            plan: TxPlan {
+                plan_id: TxPlanId("plan:comp-test".into()),
+                tx_id: TxId("tx:comp-test".into()),
+                steps,
+                preconditions: vec![],
+                compensations,
+            },
+            lifecycle_state: MissionTxState::Compensating,
+            outcome: TxOutcome::Pending,
+            receipts: vec![],
+        }
+    }
+
+    fn comp_success_input(step_id: &str, ts: i64) -> TxCompensationStepInput {
+        TxCompensationStepInput {
+            for_step_id: TxStepId(step_id.into()),
+            success: true,
+            reason_code: "rolled_back".into(),
+            error_code: None,
+            completed_at_ms: ts,
+        }
+    }
+
+    fn comp_failure_input(step_id: &str, ts: i64) -> TxCompensationStepInput {
+        TxCompensationStepInput {
+            for_step_id: TxStepId(step_id.into()),
+            success: false,
+            reason_code: "comp_error".into(),
+            error_code: Some("FTX2008".into()),
+            completed_at_ms: ts,
+        }
+    }
+
+    #[test]
+    fn compensation_all_steps_rolled_back() {
+        let compensations = vec![
+            TxCompensation {
+                for_step_id: TxStepId("s1".into()),
+                action: StepAction::ReleaseLock {
+                    lock_name: "test".into(),
+                },
+            },
+            TxCompensation {
+                for_step_id: TxStepId("s2".into()),
+                action: StepAction::ReleaseLock {
+                    lock_name: "test2".into(),
+                },
+            },
+        ];
+        let contract = make_compensable_contract(3, compensations);
+        let commit_report = make_compensable_commit_report(2, 3);
+        let inputs = vec![
+            comp_success_input("s2", 11_000),
+            comp_success_input("s1", 12_000),
+        ];
+
+        let report = execute_compensation_phase(
+            &contract,
+            &commit_report,
+            &inputs,
+            15_000,
+        )
+        .unwrap();
+
+        assert!(report.is_fully_rolled_back());
+        assert!(!report.has_residual_risk());
+        assert_eq!(report.compensated_count, 2);
+        assert_eq!(report.failed_count, 0);
+        assert_eq!(
+            report.outcome.target_tx_state(),
+            MissionTxState::RolledBack,
+        );
+    }
+
+    #[test]
+    fn compensation_failure_trips_barrier() {
+        let compensations = vec![
+            TxCompensation {
+                for_step_id: TxStepId("s1".into()),
+                action: StepAction::ReleaseLock {
+                    lock_name: "test".into(),
+                },
+            },
+            TxCompensation {
+                for_step_id: TxStepId("s2".into()),
+                action: StepAction::ReleaseLock {
+                    lock_name: "test2".into(),
+                },
+            },
+        ];
+        let contract = make_compensable_contract(3, compensations);
+        let commit_report = make_compensable_commit_report(2, 3);
+        let inputs = vec![
+            comp_failure_input("s2", 11_000), // s2 first (reverse order) — fails
+            comp_success_input("s1", 12_000), // s1 skipped due to barrier
+        ];
+
+        let report = execute_compensation_phase(
+            &contract,
+            &commit_report,
+            &inputs,
+            15_000,
+        )
+        .unwrap();
+
+        assert!(report.has_residual_risk());
+        assert_eq!(report.failed_count, 1);
+        assert_eq!(report.skipped_count, 1);
+        assert_eq!(
+            report.outcome.target_tx_state(),
+            MissionTxState::Failed,
+        );
+    }
+
+    #[test]
+    fn compensation_no_defined_compensations() {
+        let contract = make_compensable_contract(3, vec![]); // no compensations defined
+        let commit_report = make_compensable_commit_report(2, 3);
+
+        let report = execute_compensation_phase(
+            &contract,
+            &commit_report,
+            &[],
+            15_000,
+        )
+        .unwrap();
+
+        // All committed steps have no compensation
+        assert_eq!(report.no_compensation_count, 2);
+        assert!(report.is_fully_rolled_back()); // No failures = success
+    }
+
+    #[test]
+    fn compensation_nothing_to_compensate() {
+        let contract = make_compensable_contract(1, vec![]);
+        // Commit report with only a failed step (nothing committed)
+        let commit_report = TxCommitReport {
+            tx_id: TxId("tx:comp-test".into()),
+            plan_id: TxPlanId("plan:comp-test".into()),
+            outcome: TxCommitOutcome::ImmediateFailure,
+            step_results: vec![TxCommitStepResult {
+                step_id: TxStepId("s1".into()),
+                ordinal: 1,
+                outcome: TxCommitStepOutcome::Failed {
+                    reason_code: "err".into(),
+                    error_code: "E1".into(),
+                },
+                decision_path: "failed".into(),
+                completed_at_ms: 2000,
+            }],
+            failure_boundary: Some(1),
+            committed_count: 0,
+            failed_count: 1,
+            skipped_count: 0,
+            decision_path: "immediate".into(),
+            reason_code: "first_fail".into(),
+            error_code: Some("E1".into()),
+            completed_at_ms: 2000,
+            receipts: vec![],
+        };
+
+        let report = execute_compensation_phase(
+            &contract,
+            &commit_report,
+            &[],
+            15_000,
+        )
+        .unwrap();
+
+        let is_nothing = matches!(
+            report.outcome,
+            TxCompensationOutcome::NothingToCompensate
+        );
+        assert!(is_nothing);
+    }
+
+    #[test]
+    fn compensation_rejects_non_compensating_state() {
+        let mut contract = make_compensable_contract(1, vec![]);
+        contract.lifecycle_state = MissionTxState::Committed;
+        let commit_report = make_compensable_commit_report(0, 1);
+
+        let result = execute_compensation_phase(
+            &contract,
+            &commit_report,
+            &[],
+            15_000,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn compensation_reverse_ordinal_order() {
+        let compensations = vec![
+            TxCompensation {
+                for_step_id: TxStepId("s1".into()),
+                action: StepAction::ReleaseLock {
+                    lock_name: "l1".into(),
+                },
+            },
+            TxCompensation {
+                for_step_id: TxStepId("s2".into()),
+                action: StepAction::ReleaseLock {
+                    lock_name: "l2".into(),
+                },
+            },
+            TxCompensation {
+                for_step_id: TxStepId("s3".into()),
+                action: StepAction::ReleaseLock {
+                    lock_name: "l3".into(),
+                },
+            },
+        ];
+        let contract = make_compensable_contract(4, compensations);
+        let commit_report = make_compensable_commit_report(3, 4);
+        let inputs = vec![
+            comp_success_input("s1", 11_000),
+            comp_success_input("s2", 12_000),
+            comp_success_input("s3", 13_000),
+        ];
+
+        let report = execute_compensation_phase(
+            &contract,
+            &commit_report,
+            &inputs,
+            15_000,
+        )
+        .unwrap();
+
+        // Results should be in reverse ordinal order (s3, s2, s1)
+        assert_eq!(report.step_results[0].forward_ordinal, 3);
+        assert_eq!(report.step_results[1].forward_ordinal, 2);
+        assert_eq!(report.step_results[2].forward_ordinal, 1);
+    }
+
+    #[test]
+    fn compensation_missing_input_treated_as_failure() {
+        let compensations = vec![TxCompensation {
+            for_step_id: TxStepId("s1".into()),
+            action: StepAction::ReleaseLock {
+                lock_name: "l1".into(),
+            },
+        }];
+        let contract = make_compensable_contract(2, compensations);
+        let commit_report = make_compensable_commit_report(1, 2);
+        // No inputs provided for s1
+
+        let report = execute_compensation_phase(
+            &contract,
+            &commit_report,
+            &[],
+            15_000,
+        )
+        .unwrap();
+
+        assert_eq!(report.failed_count, 1);
+        assert!(report.has_residual_risk());
+    }
+
+    #[test]
+    fn compensation_step_outcome_tag_names() {
+        let compensated = TxCompensationStepOutcome::Compensated {
+            reason_code: "ok".into(),
+        };
+        assert_eq!(compensated.tag_name(), "compensated");
+        assert!(compensated.is_compensated());
+
+        let failed = TxCompensationStepOutcome::Failed {
+            reason_code: "err".into(),
+            error_code: "E1".into(),
+        };
+        assert_eq!(failed.tag_name(), "failed");
+        assert!(failed.is_failed());
+
+        let no_comp = TxCompensationStepOutcome::NoCompensation {
+            reason_code: "none".into(),
+        };
+        assert_eq!(no_comp.tag_name(), "no_compensation");
+
+        let skipped = TxCompensationStepOutcome::Skipped {
+            reason_code: "barrier".into(),
+        };
+        assert_eq!(skipped.tag_name(), "skipped");
+    }
+
+    #[test]
+    fn compensation_outcome_target_states() {
+        assert_eq!(
+            TxCompensationOutcome::FullyRolledBack.target_tx_state(),
+            MissionTxState::RolledBack,
+        );
+        assert_eq!(
+            TxCompensationOutcome::CompensationFailed.target_tx_state(),
+            MissionTxState::Failed,
+        );
+        assert_eq!(
+            TxCompensationOutcome::NothingToCompensate.target_tx_state(),
+            MissionTxState::Failed,
+        );
+    }
+
+    #[test]
+    fn compensation_report_canonical_string_deterministic() {
+        let compensations = vec![TxCompensation {
+            for_step_id: TxStepId("s1".into()),
+            action: StepAction::ReleaseLock {
+                lock_name: "l1".into(),
+            },
+        }];
+        let contract = make_compensable_contract(2, compensations);
+        let commit_report = make_compensable_commit_report(1, 2);
+        let inputs = vec![comp_success_input("s1", 11_000)];
+
+        let report = execute_compensation_phase(
+            &contract,
+            &commit_report,
+            &inputs,
+            15_000,
+        )
+        .unwrap();
+
+        let s1 = report.canonical_string();
+        let s2 = report.canonical_string();
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn compensation_report_serde_roundtrip() {
+        let compensations = vec![TxCompensation {
+            for_step_id: TxStepId("s1".into()),
+            action: StepAction::ReleaseLock {
+                lock_name: "l1".into(),
+            },
+        }];
+        let contract = make_compensable_contract(2, compensations);
+        let commit_report = make_compensable_commit_report(1, 2);
+        let inputs = vec![comp_success_input("s1", 11_000)];
+
+        let report = execute_compensation_phase(
+            &contract,
+            &commit_report,
+            &inputs,
+            15_000,
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&report).unwrap();
+        let restored: TxCompensationReport =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(report, restored);
+    }
+
+    #[test]
+    fn compensation_step_input_serde_roundtrip() {
+        let input = TxCompensationStepInput {
+            for_step_id: TxStepId("s1".into()),
+            success: false,
+            reason_code: "comp_timeout".into(),
+            error_code: Some("FTX2008".into()),
+            completed_at_ms: 9000,
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        let restored: TxCompensationStepInput =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(input, restored);
+    }
+
+    #[test]
+    fn compensation_receipts_monotonic_seq() {
+        let compensations = vec![TxCompensation {
+            for_step_id: TxStepId("s1".into()),
+            action: StepAction::ReleaseLock {
+                lock_name: "l1".into(),
+            },
+        }];
+        let contract = make_compensable_contract(2, compensations);
+        let commit_report = make_compensable_commit_report(1, 2);
+        let inputs = vec![comp_success_input("s1", 11_000)];
+
+        let report = execute_compensation_phase(
+            &contract,
+            &commit_report,
+            &inputs,
+            15_000,
+        )
+        .unwrap();
+
+        let mut prev = 0u64;
+        for receipt in &report.receipts {
+            assert!(receipt.seq > prev);
+            prev = receipt.seq;
+        }
+    }
+
+    #[test]
+    fn compensation_outcome_tag_names() {
+        assert_eq!(
+            TxCompensationOutcome::FullyRolledBack.tag_name(),
+            "fully_rolled_back"
+        );
+        assert_eq!(
+            TxCompensationOutcome::CompensationFailed.tag_name(),
+            "compensation_failed"
+        );
+        assert_eq!(
+            TxCompensationOutcome::NothingToCompensate.tag_name(),
+            "nothing_to_compensate"
+        );
+    }
+
+    // ── H7: Durable Idempotency, Dedupe, and Resume Tests ──────────────────
+
+    fn make_h7_contract(num_steps: usize) -> MissionTxContract {
+        let steps: Vec<TxStep> = (1..=num_steps)
+            .map(|i| TxStep {
+                step_id: TxStepId(format!("s{i}")),
+                ordinal: i as u32,
+                action: StepAction::SendText {
+                    pane_id: i as u64,
+                    text: format!("step-{i}"),
+                    paste_mode: None,
+                },
+            })
+            .collect();
+
+        let compensations: Vec<TxCompensation> = (1..=num_steps)
+            .map(|i| TxCompensation {
+                for_step_id: TxStepId(format!("s{i}")),
+                action: StepAction::SendText {
+                    pane_id: i as u64,
+                    text: format!("undo-{i}"),
+                    paste_mode: None,
+                },
+            })
+            .collect();
+
+        MissionTxContract {
+            tx_version: 1,
+            intent: TxIntent {
+                tx_id: TxId("tx:h7".into()),
+                requested_by: MissionActorRole::Dispatcher,
+                summary: "h7-test".into(),
+                correlation_id: "h7-corr-1".into(),
+                created_at_ms: 1000,
+            },
+            plan: TxPlan {
+                plan_id: TxPlanId("plan:h7".into()),
+                tx_id: TxId("tx:h7".into()),
+                steps,
+                preconditions: vec![],
+                compensations,
+            },
+            lifecycle_state: MissionTxState::Prepared,
+            outcome: TxOutcome::Pending,
+            receipts: vec![],
+        }
+    }
+
+    fn make_h7_execution_record(
+        contract: &MissionTxContract,
+        state: MissionTxState,
+        commit_hash: Option<&str>,
+        comp_hash: Option<&str>,
+    ) -> TxExecutionRecord {
+        TxExecutionRecord {
+            tx_id: contract.intent.tx_id.clone(),
+            plan_id: contract.plan.plan_id.clone(),
+            lifecycle_state: state,
+            correlation_id: contract.intent.correlation_id.clone(),
+            tx_idempotency_key: TxExecutionRecord::compute_tx_key(contract),
+            step_records: vec![],
+            commit_report_hash: commit_hash.map(|s| s.to_string()),
+            compensation_report_hash: comp_hash.map(|s| s.to_string()),
+            updated_at_ms: 5000,
+        }
+    }
+
+    #[test]
+    fn idempotency_fresh_when_no_prior_record() {
+        let contract = make_h7_contract(3);
+        let result = validate_tx_idempotency(&contract, TxPhase::Commit, None);
+        assert!(result.should_proceed());
+        assert!(matches!(result.verdict, TxIdempotencyVerdict::Fresh));
+        assert_eq!(result.reason_code, "fresh_execution");
+    }
+
+    #[test]
+    fn idempotency_exact_duplicate_on_terminal_same_key() {
+        let contract = make_h7_contract(3);
+        let record = make_h7_execution_record(
+            &contract,
+            MissionTxState::Committed,
+            Some("hash1"),
+            None,
+        );
+        // Requesting prepare (not commit) to avoid double-execution guard
+        let result = validate_tx_idempotency(&contract, TxPhase::Prepare, Some(&record));
+        assert!(result.is_exact_duplicate());
+        assert!(!result.should_proceed());
+    }
+
+    #[test]
+    fn idempotency_double_commit_blocked() {
+        let contract = make_h7_contract(3);
+        let record = make_h7_execution_record(
+            &contract,
+            MissionTxState::Committed,
+            Some("hash1"),
+            None,
+        );
+        let result = validate_tx_idempotency(&contract, TxPhase::Commit, Some(&record));
+        assert!(!result.should_proceed());
+        let is_blocked = matches!(
+            result.verdict,
+            TxIdempotencyVerdict::DoubleExecutionBlocked { .. }
+        );
+        assert!(is_blocked);
+        assert_eq!(result.error_code, Some("FTX3001".into()));
+    }
+
+    #[test]
+    fn idempotency_double_compensation_blocked() {
+        let contract = make_h7_contract(3);
+        let record = make_h7_execution_record(
+            &contract,
+            MissionTxState::RolledBack,
+            Some("hash1"),
+            Some("hash2"),
+        );
+        let result = validate_tx_idempotency(&contract, TxPhase::Compensate, Some(&record));
+        assert!(!result.should_proceed());
+        let is_blocked = matches!(
+            result.verdict,
+            TxIdempotencyVerdict::DoubleExecutionBlocked { .. }
+        );
+        assert!(is_blocked);
+        assert_eq!(result.error_code, Some("FTX3002".into()));
+    }
+
+    #[test]
+    fn idempotency_conflicting_prior_different_key() {
+        let contract = make_h7_contract(3);
+        let mut record = make_h7_execution_record(
+            &contract,
+            MissionTxState::Committed,
+            None,
+            None,
+        );
+        record.tx_idempotency_key = "txkey:different_key_here".into();
+        let result = validate_tx_idempotency(&contract, TxPhase::Prepare, Some(&record));
+        assert!(!result.should_proceed());
+        let is_conflict = matches!(
+            result.verdict,
+            TxIdempotencyVerdict::ConflictingPrior { .. }
+        );
+        assert!(is_conflict);
+        assert_eq!(result.error_code, Some("FTX3003".into()));
+    }
+
+    #[test]
+    fn idempotency_resumable_on_non_terminal() {
+        let contract = make_h7_contract(3);
+        let mut record = make_h7_execution_record(
+            &contract,
+            MissionTxState::Committing,
+            None,
+            None,
+        );
+        record.step_records.push(TxStepExecutionRecord {
+            step_id: TxStepId("s1".into()),
+            ordinal: 1,
+            phase: TxPhase::Commit,
+            succeeded: true,
+            step_idempotency_key: "stepkey:abc".into(),
+            attempt_count: 1,
+            last_attempted_at_ms: 2000,
+        });
+        let result = validate_tx_idempotency(&contract, TxPhase::Commit, Some(&record));
+        assert!(result.should_proceed());
+        match &result.verdict {
+            TxIdempotencyVerdict::Resumable {
+                resume_from_state,
+                completed_steps,
+            } => {
+                assert_eq!(*resume_from_state, MissionTxState::Committing);
+                assert_eq!(completed_steps.len(), 1);
+                assert_eq!(completed_steps[0].0, "s1");
+            }
+            other => panic!("expected Resumable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn idempotency_tx_key_deterministic() {
+        let contract = make_h7_contract(3);
+        let k1 = TxExecutionRecord::compute_tx_key(&contract);
+        let k2 = TxExecutionRecord::compute_tx_key(&contract);
+        assert_eq!(k1, k2);
+        assert!(k1.starts_with("txkey:"));
+    }
+
+    #[test]
+    fn idempotency_tx_key_differs_for_different_contracts() {
+        let c1 = make_h7_contract(3);
+        let c2 = make_h7_contract(5);
+        let k1 = TxExecutionRecord::compute_tx_key(&c1);
+        let k2 = TxExecutionRecord::compute_tx_key(&c2);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn step_key_deterministic() {
+        let tx_id = TxId("tx:h7".into());
+        let step_id = TxStepId("s1".into());
+        let k1 = TxStepExecutionRecord::compute_step_key(&tx_id, &step_id, &TxPhase::Commit);
+        let k2 = TxStepExecutionRecord::compute_step_key(&tx_id, &step_id, &TxPhase::Commit);
+        assert_eq!(k1, k2);
+        assert!(k1.starts_with("stepkey:"));
+    }
+
+    #[test]
+    fn step_key_differs_by_phase() {
+        let tx_id = TxId("tx:h7".into());
+        let step_id = TxStepId("s1".into());
+        let k_commit =
+            TxStepExecutionRecord::compute_step_key(&tx_id, &step_id, &TxPhase::Commit);
+        let k_comp =
+            TxStepExecutionRecord::compute_step_key(&tx_id, &step_id, &TxPhase::Compensate);
+        assert_ne!(k_commit, k_comp);
+    }
+
+    #[test]
+    fn tx_phase_tag_names() {
+        assert_eq!(TxPhase::Prepare.tag_name(), "prepare");
+        assert_eq!(TxPhase::Commit.tag_name(), "commit");
+        assert_eq!(TxPhase::Compensate.tag_name(), "compensate");
+    }
+
+    #[test]
+    fn execution_record_is_terminal() {
+        let contract = make_h7_contract(3);
+        let committed = make_h7_execution_record(
+            &contract,
+            MissionTxState::Committed,
+            None,
+            None,
+        );
+        let committing = make_h7_execution_record(
+            &contract,
+            MissionTxState::Committing,
+            None,
+            None,
+        );
+        assert!(committed.is_terminal());
+        assert!(!committing.is_terminal());
+    }
+
+    #[test]
+    fn execution_record_serde_roundtrip() {
+        let contract = make_h7_contract(3);
+        let record = make_h7_execution_record(
+            &contract,
+            MissionTxState::Committed,
+            Some("hash1"),
+            None,
+        );
+        let json = serde_json::to_string(&record).unwrap();
+        let restored: TxExecutionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record, restored);
+    }
+
+    #[test]
+    fn step_execution_record_serde_roundtrip() {
+        let record = TxStepExecutionRecord {
+            step_id: TxStepId("s1".into()),
+            ordinal: 1,
+            phase: TxPhase::Commit,
+            succeeded: true,
+            step_idempotency_key: "stepkey:abc".into(),
+            attempt_count: 2,
+            last_attempted_at_ms: 3000,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let restored: TxStepExecutionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record, restored);
+    }
+
+    #[test]
+    fn idempotency_check_result_serde_roundtrip() {
+        let contract = make_h7_contract(3);
+        let result = validate_tx_idempotency(&contract, TxPhase::Commit, None);
+        let json = serde_json::to_string(&result).unwrap();
+        let restored: TxIdempotencyCheckResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(result, restored);
+    }
+
+    #[test]
+    fn idempotency_verdict_tag_names() {
+        assert_eq!(TxIdempotencyVerdict::Fresh.tag_name(), "fresh");
+        assert_eq!(TxIdempotencyVerdict::ExactDuplicate.tag_name(), "exact_duplicate");
+        assert_eq!(
+            TxIdempotencyVerdict::Resumable {
+                resume_from_state: MissionTxState::Committing,
+                completed_steps: vec![],
+            }
+            .tag_name(),
+            "resumable"
+        );
+        assert_eq!(
+            TxIdempotencyVerdict::ConflictingPrior {
+                prior_state: MissionTxState::Committed,
+                conflict_reason: "test".into(),
+            }
+            .tag_name(),
+            "conflicting_prior"
+        );
+        assert_eq!(
+            TxIdempotencyVerdict::DoubleExecutionBlocked {
+                already_completed_phase: TxPhase::Commit,
+            }
+            .tag_name(),
+            "double_execution_blocked"
+        );
+    }
+
+    #[test]
+    fn resume_state_from_empty_contract() {
+        let contract = make_h7_contract(3);
+        let resume = reconstruct_tx_resume_state(&contract, None, None, 10_000);
+        assert_eq!(resume.derived_state, MissionTxState::Prepared);
+        assert_eq!(resume.last_receipt_seq, 0);
+        assert!(resume.committed_step_ids.is_empty());
+        assert!(resume.compensated_step_ids.is_empty());
+        // Prepared state with no commit → all steps pending
+        assert_eq!(resume.pending_step_ids.len(), 3);
+        assert!(!resume.commit_phase_completed);
+        assert!(!resume.compensation_phase_completed);
+    }
+
+    #[test]
+    fn resume_state_with_full_commit() {
+        let mut contract = make_h7_contract(3);
+        contract.lifecycle_state = MissionTxState::Prepared;
+        let commit_inputs: Vec<TxCommitStepInput> = (1..=3)
+            .map(|i| TxCommitStepInput {
+                step_id: TxStepId(format!("s{i}")),
+                success: true,
+                reason_code: "ok".into(),
+                error_code: None,
+                completed_at_ms: (i as i64 + 1) * 1000,
+            })
+            .collect();
+        let commit_report = execute_commit_phase(
+            &contract,
+            &commit_inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            10_000,
+        )
+        .unwrap();
+
+        let resume =
+            reconstruct_tx_resume_state(&contract, Some(&commit_report), None, 15_000);
+        assert_eq!(resume.committed_step_ids.len(), 3);
+        assert!(resume.commit_phase_completed);
+        assert!(!resume.compensation_phase_completed);
+        // Derived state from contract receipts (empty) → Prepared
+        assert!(resume.pending_step_ids.is_empty() || resume.derived_state == MissionTxState::Prepared);
+    }
+
+    #[test]
+    fn resume_state_with_partial_commit() {
+        let mut contract = make_h7_contract(3);
+        contract.lifecycle_state = MissionTxState::Prepared;
+        let commit_inputs: Vec<TxCommitStepInput> = (1..=3)
+            .map(|i| TxCommitStepInput {
+                step_id: TxStepId(format!("s{i}")),
+                success: i != 2,
+                reason_code: if i == 2 { "err".into() } else { "ok".into() },
+                error_code: if i == 2 { Some("FTX9999".into()) } else { None },
+                completed_at_ms: (i as i64 + 1) * 1000,
+            })
+            .collect();
+        let commit_report = execute_commit_phase(
+            &contract,
+            &commit_inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            10_000,
+        )
+        .unwrap();
+
+        let resume =
+            reconstruct_tx_resume_state(&contract, Some(&commit_report), None, 15_000);
+        // Step 1 committed, step 2 failed, step 3 skipped
+        assert_eq!(resume.committed_step_ids.len(), 1);
+        assert_eq!(resume.committed_step_ids[0].0, "s1");
+        assert!(resume.commit_phase_completed);
+    }
+
+    #[test]
+    fn resume_state_is_fully_resolved_on_terminal() {
+        let mut contract = make_h7_contract(3);
+        contract.receipts.push(TxReceipt {
+            seq: 1,
+            state: MissionTxState::Committed,
+            emitted_at_ms: 5000,
+            reason_code: Some("all_committed".into()),
+            error_code: None,
+        });
+        let resume = reconstruct_tx_resume_state(&contract, None, None, 10_000);
+        assert!(resume.is_fully_resolved());
+        assert_eq!(resume.derived_state, MissionTxState::Committed);
+        assert!(resume.pending_step_ids.is_empty());
+    }
+
+    #[test]
+    fn resume_state_canonical_string_deterministic() {
+        let contract = make_h7_contract(3);
+        let resume = reconstruct_tx_resume_state(&contract, None, None, 10_000);
+        let s1 = resume.canonical_string();
+        let s2 = resume.canonical_string();
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn execution_record_canonical_string_deterministic() {
+        let contract = make_h7_contract(3);
+        let record = make_h7_execution_record(
+            &contract,
+            MissionTxState::Committed,
+            Some("hash1"),
+            None,
+        );
+        let s1 = record.canonical_string();
+        let s2 = record.canonical_string();
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn step_execution_record_canonical_string_deterministic() {
+        let record = TxStepExecutionRecord {
+            step_id: TxStepId("s1".into()),
+            ordinal: 1,
+            phase: TxPhase::Commit,
+            succeeded: true,
+            step_idempotency_key: "stepkey:abc".into(),
+            attempt_count: 1,
+            last_attempted_at_ms: 2000,
+        };
+        let s1 = record.canonical_string();
+        let s2 = record.canonical_string();
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn idempotency_check_canonical_string_deterministic() {
+        let contract = make_h7_contract(3);
+        let result = validate_tx_idempotency(&contract, TxPhase::Commit, None);
+        let s1 = result.canonical_string();
+        let s2 = result.canonical_string();
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn step_record_already_succeeded_checks_phase() {
+        let record = TxStepExecutionRecord {
+            step_id: TxStepId("s1".into()),
+            ordinal: 1,
+            phase: TxPhase::Commit,
+            succeeded: true,
+            step_idempotency_key: "stepkey:abc".into(),
+            attempt_count: 1,
+            last_attempted_at_ms: 2000,
+        };
+        assert!(record.is_already_succeeded(&TxPhase::Commit));
+        assert!(!record.is_already_succeeded(&TxPhase::Compensate));
+    }
+
+    #[test]
+    fn resume_state_serde_roundtrip() {
+        let contract = make_h7_contract(3);
+        let resume = reconstruct_tx_resume_state(&contract, None, None, 10_000);
+        let json = serde_json::to_string(&resume).unwrap();
+        let restored: TxResumeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(resume, restored);
+    }
+
+    #[test]
+    fn tx_phase_serde_roundtrip() {
+        for phase in &[TxPhase::Prepare, TxPhase::Commit, TxPhase::Compensate] {
+            let json = serde_json::to_string(phase).unwrap();
+            let restored: TxPhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(*phase, restored);
+        }
+    }
+
+    #[test]
+    fn idempotency_verdict_serde_roundtrip() {
+        let verdicts = vec![
+            TxIdempotencyVerdict::Fresh,
+            TxIdempotencyVerdict::ExactDuplicate,
+            TxIdempotencyVerdict::Resumable {
+                resume_from_state: MissionTxState::Committing,
+                completed_steps: vec![TxStepId("s1".into())],
+            },
+            TxIdempotencyVerdict::ConflictingPrior {
+                prior_state: MissionTxState::Committed,
+                conflict_reason: "mismatch".into(),
+            },
+            TxIdempotencyVerdict::DoubleExecutionBlocked {
+                already_completed_phase: TxPhase::Commit,
+            },
+        ];
+        for v in &verdicts {
+            let json = serde_json::to_string(v).unwrap();
+            let restored: TxIdempotencyVerdict = serde_json::from_str(&json).unwrap();
+            assert_eq!(*v, restored);
+        }
+    }
+
+    #[test]
+    fn resume_state_has_pending_work() {
+        let contract = make_h7_contract(3);
+        let resume = reconstruct_tx_resume_state(&contract, None, None, 10_000);
+        assert!(resume.has_pending_work());
+
+        let mut terminal_contract = make_h7_contract(3);
+        terminal_contract.receipts.push(TxReceipt {
+            seq: 1,
+            state: MissionTxState::Committed,
+            emitted_at_ms: 5000,
+            reason_code: None,
+            error_code: None,
+        });
+        let resume2 =
+            reconstruct_tx_resume_state(&terminal_contract, None, None, 10_000);
+        assert!(!resume2.has_pending_work());
     }
 }
