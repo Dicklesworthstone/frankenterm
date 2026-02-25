@@ -297,6 +297,7 @@ impl ReplayHarness {
     }
 
     /// Replay a single incident.
+    #[allow(clippy::unused_self)]
     fn replay_incident(
         &self,
         proposed_commands: &[String],

@@ -469,7 +469,7 @@ impl Generalizer {
 
             // Sort by byte offset descending so replacements don't shift positions.
             let mut sorted_detections = cmd_detections.clone();
-            sorted_detections.sort_by(|a, b| b.byte_offset.cmp(&a.byte_offset));
+            sorted_detections.sort_by_key(|a| std::cmp::Reverse(a.byte_offset));
 
             for param in sorted_detections {
                 let counter = var_counters.entry(param.kind).or_insert(0);
@@ -701,6 +701,7 @@ impl Generalizer {
     }
 
     /// Deduplicate overlapping parameter detections, keeping highest confidence.
+    #[allow(clippy::unused_self)]
     fn deduplicate_params(&self, mut params: Vec<DetectedParam>) -> Vec<DetectedParam> {
         if params.len() <= 1 {
             return params;

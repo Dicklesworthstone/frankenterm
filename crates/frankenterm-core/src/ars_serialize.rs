@@ -215,7 +215,7 @@ impl Default for PruneConfig {
             e_value_collapse_threshold: 0.01,
             max_consecutive_failures: 10,
             min_replay_pass_rate: 0.3,
-            min_age_ms: 3600_000, // 1 hour
+            min_age_ms: 3_600_000, // 1 hour
             auto_blacklist: true,
             max_deprecated_keep: 100,
         }

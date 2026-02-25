@@ -369,7 +369,7 @@ impl FstCompiler {
                         // a has higher priority, overwrite b.
                         b.reflex_id = a.reflex_id;
                         b.priority = a.priority;
-                        b.cluster_id = a.cluster_id.clone();
+                        b.cluster_id.clone_from(&a.cluster_id);
                     }
                     true
                 } else {

@@ -440,52 +440,62 @@ impl EvidenceCardBuilder {
         }
     }
 
+    #[must_use]
     pub fn version(mut self, v: u32) -> Self {
         self.version = v;
         self
     }
 
+    #[must_use]
     pub fn cluster(mut self, c: &str) -> Self {
         self.cluster_id = c.to_string();
         self
     }
 
+    #[must_use]
     pub fn maturity(mut self, m: MaturityTier) -> Self {
         self.maturity = m;
         self
     }
 
+    #[must_use]
     pub fn status(mut self, s: VersionStatus) -> Self {
         self.status = s;
         self
     }
 
+    #[must_use]
     pub fn executions(mut self, successes: u64, failures: u64) -> Self {
         self.successes = successes;
         self.failures = failures;
         self
     }
 
+    #[must_use]
     pub fn drift(mut self, d: DriftSection) -> Self {
         self.drift = Some(d);
         self
     }
 
+    #[must_use]
     pub fn replay(mut self, r: ReplaySection) -> Self {
         self.replay = Some(r);
         self
     }
 
+    #[must_use]
     pub fn blast_radius(mut self, b: BlastSection) -> Self {
         self.blast_radius = Some(b);
         self
     }
 
+    #[must_use]
     pub fn evidence(mut self, e: EvidenceSection) -> Self {
         self.evidence = Some(e);
         self
     }
 
+    #[must_use]
     pub fn timeline_event(mut self, ts: u64, label: &str, kind: TimelineKind) -> Self {
         self.timeline.push(TimelineEvent {
             timestamp_ms: ts,
@@ -495,6 +505,7 @@ impl EvidenceCardBuilder {
         self
     }
 
+    #[must_use]
     pub fn generated_at(mut self, ts: u64) -> Self {
         self.generated_at_ms = ts;
         self
@@ -519,7 +530,7 @@ impl EvidenceCardBuilder {
                 observed_rate: 0.0,
                 observations: 0,
             }),
-            replay: self.replay.unwrap_or(ReplaySection {
+            replay: self.replay.unwrap_or_else(|| ReplaySection {
                 pass_rate: 0.0,
                 incidents: 0,
                 validated: false,
@@ -530,7 +541,7 @@ impl EvidenceCardBuilder {
                 tier: self.maturity,
                 deny_reason: None,
             }),
-            evidence: self.evidence.unwrap_or(EvidenceSection {
+            evidence: self.evidence.unwrap_or_else(|| EvidenceSection {
                 entry_count: 0,
                 is_complete: false,
                 verdict: EvidenceVerdict::Neutral,

@@ -44,7 +44,7 @@ use super::chunking::{ChunkDirection, ChunkOverlap, ChunkSourceOffset, SemanticC
 /// This is a lightweight struct mirroring `frankensearch::IndexableDocument`
 /// so the adapter works without depending on frankensearch types at the
 /// type level (the feature gate only controls downstream usage).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkDocument {
     /// Document ID (maps from `SemanticChunk::chunk_id`).
     pub id: String,
@@ -97,7 +97,10 @@ pub fn chunk_to_document(chunk: &SemanticChunk) -> ChunkDocument {
     if let Some(ref sid) = chunk.session_id {
         metadata.insert(KEY_SESSION_ID.to_string(), sid.clone());
     }
-    metadata.insert(KEY_DIRECTION.to_string(), direction_to_str(chunk.direction).to_string());
+    metadata.insert(
+        KEY_DIRECTION.to_string(),
+        direction_to_str(chunk.direction).to_string(),
+    );
     metadata.insert(KEY_POLICY_VERSION.to_string(), chunk.policy_version.clone());
 
     // Counts
@@ -162,7 +165,9 @@ pub fn extract_session_id(metadata: &HashMap<String, String>) -> Option<String> 
 
 /// Extract the chunk direction from document metadata.
 pub fn extract_direction(metadata: &HashMap<String, String>) -> Option<ChunkDirection> {
-    metadata.get(KEY_DIRECTION).and_then(|v| str_to_direction(v))
+    metadata
+        .get(KEY_DIRECTION)
+        .and_then(|v| str_to_direction(v))
 }
 
 /// Extract the policy version from document metadata.
@@ -197,7 +202,10 @@ pub fn extract_event_ids(metadata: &HashMap<String, String>) -> Vec<String> {
 
 /// Count how many `ft.` prefixed keys exist in the metadata.
 pub fn terminal_metadata_count(metadata: &HashMap<String, String>) -> usize {
-    metadata.keys().filter(|k| k.starts_with(METADATA_PREFIX)).count()
+    metadata
+        .keys()
+        .filter(|k| k.starts_with(METADATA_PREFIX))
+        .count()
 }
 
 // ── Reconstruction: ChunkDocument → partial SemanticChunk ───────────────
@@ -214,8 +222,8 @@ pub fn document_to_partial_chunk(doc: &ChunkDocument) -> Option<SemanticChunk> {
     let pane_id = extract_pane_id(&doc.metadata)?;
     let direction = extract_direction(&doc.metadata)?;
     let session_id = extract_session_id(&doc.metadata);
-    let policy_version = extract_policy_version(&doc.metadata)
-        .unwrap_or_else(|| "unknown".to_string());
+    let policy_version =
+        extract_policy_version(&doc.metadata).unwrap_or_else(|| "unknown".to_string());
 
     let start_offset = extract_start_offset(&doc.metadata).unwrap_or(ChunkSourceOffset {
         segment_id: 0,
@@ -362,10 +370,7 @@ fn pack_offset(metadata: &mut HashMap<String, String>, prefix: &str, offset: &Ch
         format!("ft.{prefix}_segment_id"),
         offset.segment_id.to_string(),
     );
-    metadata.insert(
-        format!("ft.{prefix}_ordinal"),
-        offset.ordinal.to_string(),
-    );
+    metadata.insert(format!("ft.{prefix}_ordinal"), offset.ordinal.to_string());
     metadata.insert(
         format!("ft.{prefix}_byte_offset"),
         offset.byte_offset.to_string(),
@@ -411,8 +416,8 @@ fn extract_title(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::chunking::RECORDER_CHUNKING_POLICY_V1;
+    use super::*;
 
     fn sample_chunk() -> SemanticChunk {
         SemanticChunk {
@@ -567,10 +572,7 @@ mod tests {
     #[test]
     fn chunk_to_doc_content_hash_in_metadata() {
         let doc = chunk_to_document(&sample_chunk());
-        assert_eq!(
-            doc.metadata.get(KEY_CONTENT_HASH).unwrap(),
-            "abc123def456"
-        );
+        assert_eq!(doc.metadata.get(KEY_CONTENT_HASH).unwrap(), "abc123def456");
     }
 
     #[test]
@@ -680,7 +682,10 @@ mod tests {
     #[test]
     fn extract_session_id_works() {
         let doc = chunk_to_document(&sample_chunk());
-        assert_eq!(extract_session_id(&doc.metadata), Some("sess-abc".to_string()));
+        assert_eq!(
+            extract_session_id(&doc.metadata),
+            Some("sess-abc".to_string())
+        );
     }
 
     #[test]
