@@ -3754,6 +3754,14 @@ impl Config {
                 )
                 .into());
             }
+            let max_shards = crate::sharding::MAX_SHARD_ID + 1;
+            if self.vendored.sharding.socket_paths.len() > max_shards {
+                return Err(crate::error::ConfigError::ValidationError(format!(
+                    "vendored.sharding supports at most {max_shards} socket_paths ({} shard-id bits)",
+                    crate::sharding::SHARD_ID_BITS
+                ))
+                .into());
+            }
 
             if self
                 .vendored
@@ -4470,6 +4478,18 @@ disabled_rules = ["codex.usage_warning"]
             "/tmp/wa-shard-1.sock".to_string(),
         ];
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_sharding_rejects_socket_paths_over_encoding_capacity() {
+        let mut config = Config::default();
+        config.vendored.sharding.enabled = true;
+        let max = crate::sharding::MAX_SHARD_ID + 1;
+        config.vendored.sharding.socket_paths = (0..=max)
+            .map(|idx| format!("/tmp/wa-shard-{idx}.sock"))
+            .collect();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("supports at most"));
     }
 
     #[test]

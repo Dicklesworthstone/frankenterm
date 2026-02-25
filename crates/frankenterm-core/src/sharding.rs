@@ -29,6 +29,9 @@ pub const SHARD_ID_BITS: u32 = 16;
 /// Mask for local pane id bits in encoded pane ids.
 pub const LOCAL_PANE_ID_MASK: u64 = (1u64 << (64 - SHARD_ID_BITS)) - 1;
 
+/// Maximum shard id representable in encoded pane ids.
+pub const MAX_SHARD_ID: usize = ((1u64 << SHARD_ID_BITS) - 1) as usize;
+
 /// Identifier for a mux shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ShardId(pub usize);
@@ -42,6 +45,12 @@ impl std::fmt::Display for ShardId {
 /// Encode `(shard_id, local_pane_id)` into a globally unique pane id.
 #[must_use]
 pub fn encode_sharded_pane_id(shard_id: ShardId, local_pane_id: u64) -> u64 {
+    assert!(
+        shard_id.0 <= MAX_SHARD_ID,
+        "shard id {} exceeds {}-bit encoded capacity (max={MAX_SHARD_ID})",
+        shard_id.0,
+        SHARD_ID_BITS
+    );
     ((shard_id.0 as u64) << (64 - SHARD_ID_BITS)) | (local_pane_id & LOCAL_PANE_ID_MASK)
 }
 
@@ -400,6 +409,12 @@ impl ShardedWeztermClient {
             return Err(crate::Error::Wezterm(WeztermError::CommandFailed(
                 "duplicate shard id in backend configuration".to_string(),
             )));
+        }
+        if let Some(invalid) = ids.iter().find(|id| id.0 > MAX_SHARD_ID) {
+            return Err(crate::Error::Wezterm(WeztermError::CommandFailed(format!(
+                "shard id {} exceeds {}-bit encoded pane id capacity (max {})",
+                invalid.0, SHARD_ID_BITS, MAX_SHARD_ID
+            ))));
         }
 
         strategy.validate_shards(&unique)?;
@@ -1121,6 +1136,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "exceeds 16-bit encoded capacity")]
+    fn encode_shard_overflow_panics() {
+        let _ = encode_sharded_pane_id(ShardId(MAX_SHARD_ID + 1), 42);
+    }
+
+    #[test]
     fn encode_local_overflow_masked() {
         let shard = ShardId(1);
         // Pass a value larger than LOCAL_PANE_ID_MASK; high bits should be masked.
@@ -1649,6 +1670,26 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate shard id")
+        );
+    }
+
+    #[test]
+    fn client_new_rejects_shard_id_overflow() {
+        let mock = Arc::new(MockWezterm::new()) as WeztermHandle;
+        let result = ShardedWeztermClient::new(
+            vec![ShardBackend::new(
+                ShardId(MAX_SHARD_ID + 1),
+                "overflow",
+                mock,
+            )],
+            AssignmentStrategy::RoundRobin,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds 16-bit encoded pane id capacity")
         );
     }
 
