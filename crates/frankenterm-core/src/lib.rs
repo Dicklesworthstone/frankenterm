@@ -395,6 +395,7 @@ pub mod rulesets;
 pub mod runtime;
 pub mod runtime_compat;
 pub mod scope_tree;
+pub mod scope_watchdog;
 pub mod screen_state;
 pub mod scrollback_eviction;
 pub mod search;
