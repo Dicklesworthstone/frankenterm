@@ -221,6 +221,11 @@ harness = false
 required-features = ["vendored"]
 
 [[bench]]
+name = "wa_agent_streaming"
+harness = false
+required-features = ["distributed"]
+
+[[bench]]
 name = "shard_routing"
 harness = false
 
