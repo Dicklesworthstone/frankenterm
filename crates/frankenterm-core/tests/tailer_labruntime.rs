@@ -298,6 +298,109 @@ fn dpor_tailer_event_delivery_under_concurrent_load() {
 }
 
 #[test]
+fn dpor_tailer_requeues_after_join_without_stale_capture_state() {
+    let config = ExplorationTestConfig::new("tailer_requeue_after_join", 8)
+        .base_seed(1217)
+        .worker_count(3)
+        .max_steps_per_run(120_000);
+
+    let report = run_exploration_test(config, |runtime| {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(CountingYieldSource::new(
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+            Arc::clone(&calls),
+            6,
+        ));
+
+        let (tx, rx) = mpsc::channel(64);
+        let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
+        let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let mut panes = HashMap::new();
+        for pane_id in 1..=4_u64 {
+            panes.insert(pane_id, make_pane(pane_id));
+        }
+
+        let task_source = Arc::clone(&source);
+        let task_cursors = Arc::clone(&cursors);
+        let task_registry = Arc::clone(&registry);
+        let task_shutdown = Arc::clone(&shutdown);
+
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+        let (task_id, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let _keep_rx_alive = rx;
+                let tailer_config = TailerConfig {
+                    min_interval: Duration::ZERO,
+                    max_interval: Duration::from_millis(1),
+                    max_concurrent: 2,
+                    send_timeout: Duration::from_millis(250),
+                    capture_timeout: Duration::from_millis(250),
+                    ..Default::default()
+                };
+
+                {
+                    let mut guard = task_cursors.write().await;
+                    for pane_id in 1..=4_u64 {
+                        guard.insert(pane_id, PaneCursor::new(pane_id));
+                    }
+                }
+
+                let mut supervisor = TailerSupervisor::new(
+                    tailer_config,
+                    tx,
+                    task_cursors,
+                    task_registry,
+                    task_shutdown,
+                    task_source,
+                );
+                supervisor.sync_tailers(&panes);
+
+                let mut first_round = TailerPollTaskSet::new();
+                supervisor.spawn_ready(&mut first_round);
+                tracing::info!(spawned = first_round.len(), "tailer round one spawn");
+                assert_eq!(first_round.len(), 2);
+
+                while let Some((pane_id, outcome)) = first_round.join_next().await {
+                    tracing::debug!(pane_id, ?outcome, "tailer round one completed");
+                    supervisor.handle_poll_result(pane_id, outcome);
+                }
+
+                // A second spawn immediately after joins should still schedule
+                // the full permit count (i.e. no stale `capturing_panes` state).
+                let mut second_round = TailerPollTaskSet::new();
+                supervisor.spawn_ready(&mut second_round);
+                tracing::info!(spawned = second_round.len(), "tailer round two spawn");
+                assert_eq!(second_round.len(), 2);
+
+                while let Some((pane_id, outcome)) = second_round.join_next().await {
+                    tracing::debug!(pane_id, ?outcome, "tailer round two completed");
+                    supervisor.handle_poll_result(pane_id, outcome);
+                }
+
+                assert_eq!(supervisor.metrics().events_sent, 2);
+                assert_eq!(supervisor.metrics().no_change_captures, 2);
+                assert_eq!(supervisor.metrics().capture_timeouts, 0);
+            })
+            .expect("create tailer task");
+
+        schedule_task(runtime, task_id);
+        runtime.run_until_quiescent();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(max_active.load(Ordering::SeqCst) <= 2);
+    });
+
+    assert!(report.passed());
+}
+
+#[test]
 fn lab_tailer_shutdown_prevents_follow_up_spawns() {
     let report = run_lab_test(
         LabTestConfig::new(909, "tailer_shutdown_prevents_follow_up_spawns")
