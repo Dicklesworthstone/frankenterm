@@ -79,6 +79,8 @@ const NATIVE_OUTPUT_COALESCE_WINDOW_MS: u64 = 50;
 const NATIVE_OUTPUT_COALESCE_MAX_DELAY_MS: u64 = 200;
 #[cfg(feature = "native-wezterm")]
 const NATIVE_OUTPUT_COALESCE_MAX_BYTES: usize = 256 * 1024;
+#[cfg(feature = "native-wezterm")]
+const NATIVE_CAPTURE_EVENT_SEND_TIMEOUT_MS: u64 = 10;
 
 #[cfg(feature = "native-wezterm")]
 #[derive(Debug)]
@@ -2128,7 +2130,7 @@ impl ObservationRuntime {
                 }
 
                 let flush_wait = next_flush.saturating_duration_since(now);
-                match timeout(flush_wait, event_rx.recv()).await {
+                match timeout(flush_wait, mpsc_recv_option(&mut event_rx)).await {
                     Ok(maybe_event) => {
                         let Some(event) = maybe_event else {
                             break;
@@ -2611,10 +2613,10 @@ async fn handle_native_event(
                 }
             }
 
-            if let Some(segment) = gap_segment {
-                if capture_tx.try_send(CaptureEvent { segment }).is_err() {
-                    debug!(pane_id, "Native event queue full; dropping gap");
-                }
+            if let Some(segment) = gap_segment
+                && !enqueue_native_capture_event(capture_tx, CaptureEvent { segment }).await
+            {
+                debug!(pane_id, "Native event queue full or closed; dropping gap");
             }
         }
         NativeEvent::UserVarChanged {
@@ -2699,9 +2701,10 @@ async fn handle_native_event(
             }
         }
         NativeEvent::PaneDestroyed { pane_id, .. } => {
-            let mut cursors_guard = cursors.write().await;
-            cursors_guard.remove(&pane_id);
-            drop(cursors_guard);
+            {
+                let mut cursors_guard = cursors.write().await;
+                cursors_guard.remove(&pane_id);
+            }
 
             let mut contexts = detection_contexts.write().await;
             contexts.remove(&pane_id);
@@ -2730,14 +2733,48 @@ async fn emit_native_output_delta(
     };
 
     if let Some(segment) = segment {
-        if capture_tx.try_send(CaptureEvent { segment }).is_err() {
-            debug!(pane_id, "Native event queue full; dropping output");
+        if !enqueue_native_capture_event(capture_tx, CaptureEvent { segment }).await {
+            debug!(
+                pane_id,
+                "Native event queue full or closed; dropping output"
+            );
         }
     } else {
         debug!(
             pane_id,
             "Native output received before cursor initialized; dropping"
         );
+    }
+}
+
+#[cfg(feature = "native-wezterm")]
+async fn enqueue_native_capture_event(
+    capture_tx: &mpsc::Sender<CaptureEvent>,
+    event: CaptureEvent,
+) -> bool {
+    let send_timeout = Duration::from_millis(NATIVE_CAPTURE_EVENT_SEND_TIMEOUT_MS);
+
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let reserve_cx = crate::cx::for_testing();
+        match timeout(send_timeout, capture_tx.reserve(&reserve_cx)).await {
+            Ok(Ok(permit)) => {
+                permit.send(event);
+                true
+            }
+            Ok(Err(_)) | Err(_) => false,
+        }
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        match timeout(send_timeout, capture_tx.reserve()).await {
+            Ok(Ok(permit)) => {
+                permit.send(event);
+                true
+            }
+            Ok(Err(_)) | Err(_) => false,
+        }
     }
 }
 
@@ -4077,6 +4114,58 @@ mod tests {
         let drained = c.drain_due(200);
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].pane_id, 7);
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn enqueue_native_capture_event_succeeds_with_available_capacity() {
+        run_async_test(async {
+            let (tx, mut rx) = mpsc::channel::<CaptureEvent>(1);
+            let event = CaptureEvent {
+                segment: crate::ingest::CapturedSegment {
+                    pane_id: 7,
+                    seq: 0,
+                    content: "native payload".to_string(),
+                    kind: crate::ingest::CapturedSegmentKind::Delta,
+                    captured_at: epoch_ms(),
+                },
+            };
+
+            assert!(enqueue_native_capture_event(&tx, event).await);
+            let received = recv_mpsc(&mut rx).await;
+            assert_eq!(received.segment.pane_id, 7);
+            assert_eq!(received.segment.content, "native payload");
+        });
+    }
+
+    #[cfg(feature = "native-wezterm")]
+    #[test]
+    fn enqueue_native_capture_event_returns_false_when_channel_is_full() {
+        run_async_test(async {
+            let (tx, _rx) = mpsc::channel::<CaptureEvent>(1);
+
+            let first = CaptureEvent {
+                segment: crate::ingest::CapturedSegment {
+                    pane_id: 11,
+                    seq: 0,
+                    content: "first".to_string(),
+                    kind: crate::ingest::CapturedSegmentKind::Delta,
+                    captured_at: epoch_ms(),
+                },
+            };
+            let second = CaptureEvent {
+                segment: crate::ingest::CapturedSegment {
+                    pane_id: 11,
+                    seq: 1,
+                    content: "second".to_string(),
+                    kind: crate::ingest::CapturedSegmentKind::Delta,
+                    captured_at: epoch_ms(),
+                },
+            };
+
+            assert!(enqueue_native_capture_event(&tx, first).await);
+            assert!(!enqueue_native_capture_event(&tx, second).await);
+        });
     }
 
     #[test]
