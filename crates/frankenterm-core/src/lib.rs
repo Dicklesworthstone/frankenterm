@@ -298,6 +298,8 @@ pub mod session_retention;
 pub mod session_store;
 pub mod session_topology;
 pub mod setup;
+#[cfg(feature = "subprocess-bridge")]
+pub mod shadow_mode_evaluator;
 pub mod sharded_counter;
 pub mod sharding;
 pub mod shortest_path;
