@@ -118,7 +118,7 @@ emit_log \
   "none" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "steps=6"
+  "steps=8"
 
 if ! command -v rch >/dev/null 2>&1; then
   emit_log \
@@ -178,6 +178,22 @@ run_step \
   cargo test -p frankenterm-core --lib stateful_fast_path_matches_scalar_for_random_bytes_and_state -- --nocapture
 
 run_step \
+  "bocpd_chunk_escape_state" \
+  "bocpd_chunked_scan_state_carry" \
+  "bocpd_chunk_observe_preserves_escape_carry" \
+  env TMPDIR=/tmp rch exec -- \
+  env CARGO_TARGET_DIR="${TARGET_DIR}" \
+  cargo test -p frankenterm-core --lib pane_bocpd_observe_text_chunk_preserves_escape_state_across_chunks -- --nocapture
+
+run_step \
+  "bocpd_manager_chunk_auto_register" \
+  "bocpd_manager_chunked_auto_register" \
+  "bocpd_manager_observe_text_chunk_works" \
+  env TMPDIR=/tmp rch exec -- \
+  env CARGO_TARGET_DIR="${TARGET_DIR}" \
+  cargo test -p frankenterm-core --lib manager_observe_text_chunk_auto_registers_and_uses_scan_carry -- --nocapture
+
+run_step \
   "dense_logs_benchmark" \
   "criterion_dense_logs_throughput" \
   "benchmark_collected" \
@@ -193,7 +209,7 @@ emit_log \
   "all_steps_passed" \
   "none" \
   "$(basename "${LOG_FILE}")" \
-  "steps=6"
+  "steps=8"
 
 echo "Scenario: ${SCENARIO_ID}"
 echo "Logs: tests/e2e/logs/$(basename "${LOG_FILE}")"

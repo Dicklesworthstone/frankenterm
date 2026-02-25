@@ -354,10 +354,24 @@ impl OutputFeatures {
     /// Compute features from a chunk of output text and elapsed time.
     #[must_use]
     pub fn compute(text: &str, elapsed: std::time::Duration) -> Self {
+        let mut scan_state = crate::simd_scan::OutputScanState::default();
+        Self::compute_with_scan_state(text, elapsed, &mut scan_state)
+    }
+
+    /// Compute features from a chunk while preserving SIMD scan carry state.
+    ///
+    /// This is intended for streaming/chunked callers that may split ANSI
+    /// escapes or UTF-8 code points across chunk boundaries.
+    #[must_use]
+    pub fn compute_with_scan_state(
+        text: &str,
+        elapsed: std::time::Duration,
+        scan_state: &mut crate::simd_scan::OutputScanState,
+    ) -> Self {
         let elapsed_secs = elapsed.as_secs_f64().max(0.001);
         let bytes = text.as_bytes();
         let byte_count = bytes.len();
-        let scan = crate::simd_scan::scan_newlines_and_ansi(bytes);
+        let scan = crate::simd_scan::scan_newlines_and_ansi_with_state(bytes, scan_state);
         let line_count = scan.logical_line_count(bytes);
 
         // Output and byte rates
@@ -411,6 +425,8 @@ pub struct PaneBocpd {
     pub change_points: Vec<PaneChangePoint>,
     /// Last feature vector.
     pub last_features: Option<OutputFeatures>,
+    /// Cross-chunk state for SIMD scan fidelity on boundary splits.
+    scan_state: crate::simd_scan::OutputScanState,
 }
 
 /// A change-point event tied to a specific pane.
@@ -437,6 +453,7 @@ impl PaneBocpd {
             pane_id,
             change_points: Vec::new(),
             last_features: None,
+            scan_state: crate::simd_scan::OutputScanState::default(),
         }
     }
 
@@ -463,6 +480,17 @@ impl PaneBocpd {
         }
 
         None
+    }
+
+    /// Compute features from chunk text with boundary-aware scan state and
+    /// feed the BOCPD model.
+    pub fn observe_text_chunk(
+        &mut self,
+        text: &str,
+        elapsed: std::time::Duration,
+    ) -> Option<PaneChangePoint> {
+        let features = OutputFeatures::compute_with_scan_state(text, elapsed, &mut self.scan_state);
+        self.observe(features)
     }
 
     /// Number of detected change-points.
@@ -514,6 +542,26 @@ impl BocpdManager {
             .or_insert_with(|| PaneBocpd::new(pane_id, self.config.clone()));
 
         let result = pane.observe(features);
+        if result.is_some() {
+            self.total_change_points += 1;
+        }
+        result
+    }
+
+    /// Compute and observe chunk text for a pane with boundary-aware scan
+    /// state, creating the pane tracker on first use.
+    pub fn observe_text_chunk(
+        &mut self,
+        pane_id: u64,
+        text: &str,
+        elapsed: std::time::Duration,
+    ) -> Option<PaneChangePoint> {
+        let pane = self
+            .panes
+            .entry(pane_id)
+            .or_insert_with(|| PaneBocpd::new(pane_id, self.config.clone()));
+
+        let result = pane.observe_text_chunk(text, elapsed);
         if result.is_some() {
             self.total_change_points += 1;
         }
@@ -914,6 +962,40 @@ mod tests {
         let text = "\x1b[31mred\x1b[0m normal \x1b[32mgreen\x1b[0m";
         let features = OutputFeatures::compute(text, std::time::Duration::from_secs(1));
         assert!(features.ansi_density > 0.0, "should detect ANSI sequences");
+    }
+
+    #[test]
+    fn features_compute_with_state_matches_single_chunk_compute() {
+        let text = "\x1b[31mred\x1b[0m normal";
+        let mut state = crate::simd_scan::OutputScanState::default();
+
+        let stateful = OutputFeatures::compute_with_scan_state(
+            text,
+            std::time::Duration::from_secs(1),
+            &mut state,
+        );
+        let stateless = OutputFeatures::compute(text, std::time::Duration::from_secs(1));
+
+        assert!(
+            (stateful.output_rate - stateless.output_rate).abs() < 1e-10,
+            "output_rate mismatch"
+        );
+        assert!(
+            (stateful.byte_rate - stateless.byte_rate).abs() < 1e-10,
+            "byte_rate mismatch"
+        );
+        assert!(
+            (stateful.entropy - stateless.entropy).abs() < 1e-10,
+            "entropy mismatch"
+        );
+        assert!(
+            (stateful.unique_line_ratio - stateless.unique_line_ratio).abs() < 1e-10,
+            "unique_line_ratio mismatch"
+        );
+        assert!(
+            (stateful.ansi_density - stateless.ansi_density).abs() < 1e-10,
+            "ansi_density mismatch"
+        );
     }
 
     #[test]
@@ -1481,6 +1563,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pane_bocpd_observe_text_chunk_preserves_escape_state_across_chunks() {
+        let mut pane = PaneBocpd::new(1, BocpdConfig::default());
+
+        let _ = pane.observe_text_chunk("\x1b[31", std::time::Duration::from_secs(1));
+        assert!(
+            pane.scan_state.in_escape,
+            "expected open escape carry after first chunk"
+        );
+
+        let _ = pane.observe_text_chunk("mred\x1b[0m", std::time::Duration::from_secs(1));
+        let last = pane
+            .last_features
+            .as_ref()
+            .expect("last_features should be set");
+        let expected_density = 5.0 / 8.0;
+        assert!(
+            (last.ansi_density - expected_density).abs() < 1e-10,
+            "ansi_density={} expected={}",
+            last.ansi_density,
+            expected_density
+        );
+        assert!(
+            !pane.scan_state.in_escape,
+            "escape state should close after second chunk"
+        );
+    }
+
     // -- BocpdManager edge cases ----------------------------------------------
 
     #[test]
@@ -1543,6 +1653,26 @@ mod tests {
         assert!(
             mgr.total_change_points() >= before,
             "total_change_points should not decrease"
+        );
+    }
+
+    #[test]
+    fn manager_observe_text_chunk_auto_registers_and_uses_scan_carry() {
+        let mut mgr = BocpdManager::new(BocpdConfig::default());
+
+        let _ = mgr.observe_text_chunk(7, "\x1b[31", std::time::Duration::from_secs(1));
+        let _ = mgr.observe_text_chunk(7, "m", std::time::Duration::from_secs(1));
+
+        assert_eq!(mgr.pane_count(), 1, "pane should auto-register");
+        let pane = mgr.panes.get(&7).expect("pane should exist");
+        let last = pane
+            .last_features
+            .as_ref()
+            .expect("last_features should be set");
+        assert!(
+            (last.ansi_density - 1.0).abs() < 1e-10,
+            "expected carried ANSI density in second chunk, got {}",
+            last.ansi_density
         );
     }
 
