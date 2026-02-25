@@ -16,6 +16,12 @@ default = ["lua"]
 lua = ["dep:luahelper", "dep:mlua"]
 no-lua = []
 distro-defaults = []
+async-smol = ["frankenterm-ssh/async-smol"]
+async-asupersync = [
+    "async-smol",
+    "promise/async-asupersync",
+    "frankenterm-ssh/async-asupersync",
+]
 
 [dependencies]
 anyhow.workspace = true

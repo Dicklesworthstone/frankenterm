@@ -48,6 +48,8 @@
 #![allow(clippy::useless_conversion)]
 #![allow(clippy::useless_format)]
 #![allow(clippy::wildcard_in_or_patterns)]
+#[cfg(not(any(feature = "async-smol", feature = "async-asupersync")))]
+compile_error!("mux requires either feature \"async-smol\" or \"async-asupersync\"");
 
 use crate::client::{ClientId, ClientInfo};
 use crate::pane::{CachePolicy, Pane, PaneId};

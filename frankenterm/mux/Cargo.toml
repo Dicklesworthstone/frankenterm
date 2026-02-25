@@ -8,9 +8,15 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["lua"]
+default = ["lua", "async-smol"]
 lua = ["dep:luahelper", "dep:mlua", "config/lua", "procinfo/lua"]
 no-lua = ["config/no-lua"]
+async-smol = ["config/async-smol", "frankenterm-ssh/async-smol"]
+async-asupersync = [
+    "config/async-asupersync",
+    "promise/async-asupersync",
+    "frankenterm-ssh/async-asupersync",
+]
 
 [dependencies]
 anyhow.workspace = true
@@ -43,7 +49,6 @@ rangeset.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 serial2.workspace = true
 shell-words.workspace = true
-smol.workspace = true
 terminfo.workspace = true
 termwiz.workspace = true
 textwrap.workspace = true

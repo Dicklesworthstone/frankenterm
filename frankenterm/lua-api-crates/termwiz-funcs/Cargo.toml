@@ -7,8 +7,10 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["lua"]
+default = ["lua", "async-smol"]
 lua = ["dep:luahelper", "dep:mlua", "config/lua"]
+async-smol = ["config/async-smol"]
+async-asupersync = ["config/async-asupersync"]
 
 [dependencies]
 anyhow.workspace = true

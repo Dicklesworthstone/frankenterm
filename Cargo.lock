@@ -5589,7 +5589,6 @@ dependencies = [
  "serde_json",
  "serial2",
  "shell-words",
- "smol",
  "terminfo",
  "termwiz 0.24.0",
  "textwrap",

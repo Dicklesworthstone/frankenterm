@@ -21,12 +21,12 @@ use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use procinfo::LocalProcessInfo;
 use rangeset::RangeSet;
-use smol::channel::{bounded, Receiver, TryRecvError};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
+use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::escape::csi::{Sgr, CSI};
@@ -1135,11 +1135,11 @@ fn split_child(
     let pid = process.process_id();
     let signaller = process.clone_killer();
 
-    let (tx, rx) = bounded(1);
+    let (tx, rx) = sync_channel(1);
 
     std::thread::spawn(move || {
         let status = process.wait();
-        tx.try_send(status).ok();
+        tx.send(status).ok();
         promise::spawn::spawn_into_main_thread(async move {
             let mux = Mux::get();
             mux.prune_dead_windows();
