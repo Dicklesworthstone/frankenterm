@@ -14,7 +14,8 @@ use super::{
     WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
     WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool,
     WaEventsResource, WaEventsTemplateResource, WaEventsTool, WaEventsTriageTool,
-    WaEventsUnhandledTemplateResource, WaGetTextTool, WaPanesResource, WaReleaseTool,
+    WaEventsUnhandledTemplateResource, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
+    WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaPanesResource, WaReleaseTool,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
     WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
@@ -63,6 +64,21 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
         .tool(FormatAwareToolHandler::new(WaTxShowTool::new(Arc::clone(
             &config,
         ))))
+        .tool(FormatAwareToolHandler::new(WaMissionStateTool::new(
+            Arc::clone(&config),
+        )))
+        .tool(FormatAwareToolHandler::new(WaMissionExplainTool::new(
+            Arc::clone(&config),
+        )))
+        .tool(FormatAwareToolHandler::new(WaMissionPauseTool::new(
+            Arc::clone(&config),
+        )))
+        .tool(FormatAwareToolHandler::new(WaMissionResumeTool::new(
+            Arc::clone(&config),
+        )))
+        .tool(FormatAwareToolHandler::new(WaMissionAbortTool::new(
+            Arc::clone(&config),
+        )))
         .resource(WaPanesResource::new(config.ingest.panes.clone()))
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
         .resource(WaRulesResource)

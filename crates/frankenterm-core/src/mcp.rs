@@ -104,9 +104,10 @@ use mcp_resources::{
 };
 use mcp_tools::{
     WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
-    WaEventsTool, WaGetTextTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
-    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
-    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
+    WaEventsTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool, WaMissionPauseTool,
+    WaMissionResumeTool, WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool,
+    WaRulesListTool, WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool,
+    WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
 };
 
 const MCP_VERSION: &str = "v1";
@@ -502,6 +503,152 @@ struct McpTxShowData {
     legal_transitions: Vec<McpTxTransitionInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     contract: Option<crate::plan::MissionTxContract>,
+}
+
+// ── Mission MCP params/data types ────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize)]
+struct MissionStateParams {
+    #[serde(default)]
+    mission_file: Option<String>,
+    #[serde(default)]
+    mission_state: Option<String>,
+    #[serde(default)]
+    run_state: Option<String>,
+    #[serde(default)]
+    agent_state: Option<String>,
+    #[serde(default)]
+    action_state: Option<String>,
+    #[serde(default)]
+    assignment_id: Option<String>,
+    #[serde(default)]
+    assignee: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MissionExplainParams {
+    #[serde(default)]
+    mission_file: Option<String>,
+    #[serde(default)]
+    assignment_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MissionPauseParams {
+    #[serde(default)]
+    mission_file: Option<String>,
+    reason: Option<String>,
+    #[serde(default = "mcp_default_requested_by")]
+    requested_by: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MissionResumeParams {
+    #[serde(default)]
+    mission_file: Option<String>,
+    #[serde(default = "mcp_default_requested_by")]
+    requested_by: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MissionAbortParams {
+    #[serde(default)]
+    mission_file: Option<String>,
+    reason: Option<String>,
+    #[serde(default = "mcp_default_requested_by")]
+    requested_by: String,
+    #[serde(default)]
+    error_code: Option<String>,
+}
+
+fn mcp_default_requested_by() -> String {
+    "mcp-agent".to_string()
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpMissionTransitionInfo {
+    kind: String,
+    from: String,
+    to: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpMissionAssignmentCounters {
+    pending_approval: usize,
+    approved: usize,
+    denied: usize,
+    expired: usize,
+    succeeded: usize,
+    failed: usize,
+    cancelled: usize,
+    unresolved: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpMissionAssignmentData {
+    assignment_id: String,
+    candidate_id: String,
+    assignee: String,
+    run_state: String,
+    agent_state: String,
+    action_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpMissionStateData {
+    mission_file: String,
+    mission_id: String,
+    title: String,
+    mission_hash: String,
+    lifecycle_state: String,
+    candidate_count: usize,
+    assignment_count: usize,
+    matched_assignment_count: usize,
+    returned_assignment_count: usize,
+    assignment_counters: McpMissionAssignmentCounters,
+    available_transitions: Vec<McpMissionTransitionInfo>,
+    assignments: Vec<McpMissionAssignmentData>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpMissionExplainData {
+    mission_file: String,
+    mission_id: String,
+    title: String,
+    lifecycle_state: String,
+    available_transitions: Vec<McpMissionTransitionInfo>,
+    failure_catalog: Vec<McpMissionFailureCatalogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignment_context: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpMissionFailureCatalogEntry {
+    code: String,
+    reason_code: String,
+    error_code: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpMissionControlData {
+    command: String,
+    mission_file: String,
+    mission_id: String,
+    lifecycle_from: String,
+    lifecycle_to: String,
+    decision_path: String,
+    reason_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint_id: Option<String>,
+    mission_hash: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1723,6 +1870,261 @@ fn mcp_tx_transition_info(state: crate::plan::MissionTxState) -> Vec<McpTxTransi
             to: rule.to.to_string(),
         })
         .collect()
+}
+
+// ── Mission (non-tx) file resolution and loading ─────────────────────────
+
+fn mcp_default_mission_file_path(
+    config: &Config,
+) -> std::result::Result<PathBuf, McpToolError> {
+    let layout = config.workspace_layout(None).map_err(McpToolError::from_error)?;
+    Ok(layout.ft_dir.join("mission").join("active.json"))
+}
+
+fn mcp_resolve_mission_file_path(
+    config: &Config,
+    mission_file: Option<&str>,
+) -> std::result::Result<PathBuf, McpToolError> {
+    match mission_file {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => mcp_default_mission_file_path(config),
+    }
+}
+
+fn mcp_load_mission_from_path(
+    path: &Path,
+) -> std::result::Result<crate::plan::Mission, McpToolError> {
+    let raw = std::fs::read_to_string(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            McpToolError::new(
+                "robot.mission_not_found",
+                format!("Mission file not found: {}", path.display()),
+                Some(
+                    "Pass mission_file or create .ft/mission/active.json.".to_string(),
+                ),
+            )
+        } else {
+            McpToolError::new(
+                "robot.mission_read_failed",
+                format!("Failed to read mission file {}: {err}", path.display()),
+                None,
+            )
+        }
+    })?;
+
+    let mission: crate::plan::Mission =
+        serde_json::from_str(&raw).map_err(|err| {
+            McpToolError::new(
+                "robot.mission_invalid_json",
+                format!("Invalid mission JSON in {}: {err}", path.display()),
+                Some("Ensure the file matches the Mission schema.".to_string()),
+            )
+        })?;
+
+    mission.validate().map_err(|err| {
+        McpToolError::new(
+            "robot.mission_validation_failed",
+            format!("Mission validation failed: {err}"),
+            Some("Use wa.mission_explain to inspect legal transitions.".to_string()),
+        )
+    })?;
+
+    Ok(mission)
+}
+
+fn mcp_save_mission_to_path(
+    path: &Path,
+    mission: &crate::plan::Mission,
+) -> std::result::Result<(), McpToolError> {
+    let json = serde_json::to_string_pretty(mission).map_err(|err| {
+        McpToolError::new(
+            "robot.mission_serialize_failed",
+            format!("Failed to serialize mission: {err}"),
+            None,
+        )
+    })?;
+
+    std::fs::write(path, json).map_err(|err| {
+        McpToolError::new(
+            "robot.mission_write_failed",
+            format!("Failed to write mission file {}: {err}", path.display()),
+            None,
+        )
+    })
+}
+
+fn mcp_mission_lifecycle_transitions(
+    state: crate::plan::MissionLifecycleState,
+) -> Vec<McpMissionTransitionInfo> {
+    crate::plan::mission_lifecycle_transition_table()
+        .iter()
+        .filter(|rule| rule.from == state)
+        .map(|rule| McpMissionTransitionInfo {
+            kind: rule.kind.to_string(),
+            from: rule.from.to_string(),
+            to: rule.to.to_string(),
+        })
+        .collect()
+}
+
+fn mcp_mission_failure_catalog() -> Vec<McpMissionFailureCatalogEntry> {
+    vec![
+        McpMissionFailureCatalogEntry {
+            code: "PolicyDenied".to_string(),
+            reason_code: "policy_denied".to_string(),
+            error_code: "mission.failure.policy_denied".to_string(),
+        },
+        McpMissionFailureCatalogEntry {
+            code: "ApprovalDenied".to_string(),
+            reason_code: "approval_denied".to_string(),
+            error_code: "mission.failure.approval_denied".to_string(),
+        },
+        McpMissionFailureCatalogEntry {
+            code: "ApprovalExpired".to_string(),
+            reason_code: "approval_expired".to_string(),
+            error_code: "mission.failure.approval_expired".to_string(),
+        },
+        McpMissionFailureCatalogEntry {
+            code: "DispatchFailed".to_string(),
+            reason_code: "dispatch_failed".to_string(),
+            error_code: "mission.failure.dispatch_failed".to_string(),
+        },
+        McpMissionFailureCatalogEntry {
+            code: "ExecutionFailed".to_string(),
+            reason_code: "execution_failed".to_string(),
+            error_code: "mission.failure.execution_failed".to_string(),
+        },
+        McpMissionFailureCatalogEntry {
+            code: "Timeout".to_string(),
+            reason_code: "timeout".to_string(),
+            error_code: "mission.failure.timeout".to_string(),
+        },
+        McpMissionFailureCatalogEntry {
+            code: "KillSwitchActivated".to_string(),
+            reason_code: "kill_switch".to_string(),
+            error_code: "mission.failure.kill_switch".to_string(),
+        },
+    ]
+}
+
+/// Build assignment data from a Mission, with optional filtering.
+fn mcp_build_mission_assignments(
+    mission: &crate::plan::Mission,
+    filters: &MissionStateParams,
+) -> (Vec<McpMissionAssignmentData>, McpMissionAssignmentCounters, usize) {
+    use crate::plan::{ApprovalState, Outcome};
+
+    let mut counters = McpMissionAssignmentCounters {
+        pending_approval: 0,
+        approved: 0,
+        denied: 0,
+        expired: 0,
+        succeeded: 0,
+        failed: 0,
+        cancelled: 0,
+        unresolved: 0,
+    };
+
+    let limit = filters.limit.unwrap_or(100);
+
+    let mut matched = Vec::new();
+    for assignment in &mission.assignments {
+        // Compute derived states
+        let run_state = match &assignment.outcome {
+            Some(Outcome::Success { .. }) => "succeeded",
+            Some(Outcome::Failed { .. }) => "failed",
+            Some(Outcome::Cancelled { .. }) => "cancelled",
+            None => "pending",
+        };
+
+        let agent_state = match &assignment.approval_state {
+            ApprovalState::NotRequired => "not_required",
+            ApprovalState::Pending { .. } => "pending",
+            ApprovalState::Approved { .. } => "approved",
+            ApprovalState::Denied { .. } => "denied",
+            ApprovalState::Expired { .. } => "expired",
+        };
+
+        let action_state = if run_state != "pending" {
+            "completed"
+        } else if matches!(
+            assignment.approval_state,
+            ApprovalState::Pending { .. }
+                | ApprovalState::Denied { .. }
+                | ApprovalState::Expired { .. }
+        ) {
+            "blocked"
+        } else {
+            "ready"
+        };
+
+        // Update counters
+        match &assignment.approval_state {
+            ApprovalState::Pending { .. } => counters.pending_approval += 1,
+            ApprovalState::Approved { .. } | ApprovalState::NotRequired => counters.approved += 1,
+            ApprovalState::Denied { .. } => counters.denied += 1,
+            ApprovalState::Expired { .. } => counters.expired += 1,
+        }
+        match &assignment.outcome {
+            Some(Outcome::Success { .. }) => counters.succeeded += 1,
+            Some(Outcome::Failed { .. }) => counters.failed += 1,
+            Some(Outcome::Cancelled { .. }) => counters.cancelled += 1,
+            None => counters.unresolved += 1,
+        }
+
+        // Apply filters
+        if let Some(ref f) = filters.run_state {
+            if run_state != f.as_str() {
+                continue;
+            }
+        }
+        if let Some(ref f) = filters.agent_state {
+            if agent_state != f.as_str() {
+                continue;
+            }
+        }
+        if let Some(ref f) = filters.action_state {
+            if action_state != f.as_str() {
+                continue;
+            }
+        }
+        if let Some(ref f) = filters.assignment_id {
+            if assignment.assignment_id.0 != *f {
+                continue;
+            }
+        }
+        if let Some(ref f) = filters.assignee {
+            if assignment.assignee != *f {
+                continue;
+            }
+        }
+
+        let reason_code = assignment.outcome.as_ref().and_then(|o| match o {
+            Outcome::Failed { reason_code, .. } => Some(reason_code.clone()),
+            Outcome::Cancelled { reason_code, .. } => Some(reason_code.clone()),
+            _ => None,
+        });
+        let error_code = assignment.outcome.as_ref().and_then(|o| match o {
+            Outcome::Failed { error_code, .. } => Some(error_code.clone()),
+            _ => None,
+        });
+
+        matched.push(McpMissionAssignmentData {
+            assignment_id: assignment.assignment_id.0.clone(),
+            candidate_id: assignment.candidate_id.0.clone(),
+            assignee: assignment.assignee.clone(),
+            run_state: run_state.to_string(),
+            agent_state: agent_state.to_string(),
+            action_state: action_state.to_string(),
+            reason_code,
+            error_code,
+        });
+    }
+
+    let matched_count = matched.len();
+    matched.truncate(limit);
+
+    (matched, counters, matched_count)
 }
 
 fn mcp_build_tx_prepare_gate_inputs(

@@ -2982,3 +2982,650 @@ impl ToolHandler for WaAccountsRefreshTool {
         }
     }
 }
+
+// ── Mission MCP tools (ft-1i2ge.5.3) ────────────────────────────────────
+
+// wa.mission_state tool
+pub(super) struct WaMissionStateTool {
+    config: Arc<Config>,
+}
+
+impl WaMissionStateTool {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ToolHandler for WaMissionStateTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.mission_state".to_string(),
+            description: Some(
+                "Query mission lifecycle state, assignments, and counters with optional filtering (robot parity)"
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mission_file": { "type": "string", "description": "Optional path to mission JSON (default: .ft/mission/active.json)" },
+                    "mission_state": { "type": "string", "description": "Filter by lifecycle state (e.g., running, paused, completed)" },
+                    "run_state": { "type": "string", "description": "Filter assignments by run state (pending, succeeded, failed, cancelled)" },
+                    "agent_state": { "type": "string", "description": "Filter by agent approval state (not_required, pending, approved, denied, expired)" },
+                    "action_state": { "type": "string", "description": "Filter by action state (ready, blocked, completed)" },
+                    "assignment_id": { "type": "string", "description": "Filter to specific assignment ID" },
+                    "assignee": { "type": "string", "description": "Filter by assignee name" },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Max assignments to return (default: 100)" }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "robot".to_string(),
+                "mission".to_string(),
+            ],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: MissionStateParams = if arguments.is_null() {
+            MissionStateParams::default()
+        } else {
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid params: {err}"),
+                        Some("Expected object with optional mission_file, filters".to_string()),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        };
+
+        let mission_path = match mcp_resolve_mission_file_path(
+            self.config.as_ref(),
+            params.mission_file.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let mission = match mcp_load_mission_from_path(&mission_path) {
+            Ok(m) => m,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        // Check mission_state filter
+        if let Some(ref filter_state) = params.mission_state {
+            let current = mission.lifecycle_state.to_string();
+            if current.to_ascii_lowercase() != filter_state.to_ascii_lowercase() {
+                let data = McpMissionStateData {
+                    mission_file: mission_path.display().to_string(),
+                    mission_id: mission.mission_id.0.clone(),
+                    title: mission.title.clone(),
+                    mission_hash: mission.compute_hash(),
+                    lifecycle_state: current,
+                    candidate_count: mission.candidates.len(),
+                    assignment_count: mission.assignments.len(),
+                    matched_assignment_count: 0,
+                    returned_assignment_count: 0,
+                    assignment_counters: McpMissionAssignmentCounters {
+                        pending_approval: 0,
+                        approved: 0,
+                        denied: 0,
+                        expired: 0,
+                        succeeded: 0,
+                        failed: 0,
+                        cancelled: 0,
+                        unresolved: 0,
+                    },
+                    available_transitions: mcp_mission_lifecycle_transitions(
+                        mission.lifecycle_state,
+                    ),
+                    assignments: Vec::new(),
+                };
+                let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        }
+
+        let (assignments, counters, matched_count) =
+            mcp_build_mission_assignments(&mission, &params);
+        let returned_count = assignments.len();
+
+        let data = McpMissionStateData {
+            mission_file: mission_path.display().to_string(),
+            mission_id: mission.mission_id.0.clone(),
+            title: mission.title.clone(),
+            mission_hash: mission.compute_hash(),
+            lifecycle_state: mission.lifecycle_state.to_string(),
+            candidate_count: mission.candidates.len(),
+            assignment_count: mission.assignments.len(),
+            matched_assignment_count: matched_count,
+            returned_assignment_count: returned_count,
+            assignment_counters: counters,
+            available_transitions: mcp_mission_lifecycle_transitions(mission.lifecycle_state),
+            assignments,
+        };
+
+        let envelope = McpEnvelope::success(data, elapsed_ms(start));
+        envelope_to_content(envelope)
+    }
+}
+
+// wa.mission_explain tool
+pub(super) struct WaMissionExplainTool {
+    config: Arc<Config>,
+}
+
+impl WaMissionExplainTool {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ToolHandler for WaMissionExplainTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.mission_explain".to_string(),
+            description: Some(
+                "Show legal lifecycle transitions, failure catalog, and optional assignment context (robot parity)"
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mission_file": { "type": "string", "description": "Optional path to mission JSON (default: .ft/mission/active.json)" },
+                    "assignment_id": { "type": "string", "description": "Optional assignment ID for dispatch context details" }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "robot".to_string(),
+                "mission".to_string(),
+            ],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: MissionExplainParams = if arguments.is_null() {
+            MissionExplainParams::default()
+        } else {
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid params: {err}"),
+                        Some("Expected object with optional mission_file".to_string()),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        };
+
+        let mission_path = match mcp_resolve_mission_file_path(
+            self.config.as_ref(),
+            params.mission_file.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let mission = match mcp_load_mission_from_path(&mission_path) {
+            Ok(m) => m,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        // Build assignment context if requested
+        let assignment_context = if let Some(ref aid) = params.assignment_id {
+            let found = mission.assignments.iter().find(|a| a.assignment_id.0 == *aid);
+            found.map(|a| {
+                serde_json::json!({
+                    "assignment_id": a.assignment_id.0,
+                    "candidate_id": a.candidate_id.0,
+                    "assignee": a.assignee,
+                    "approval_state": a.approval_state.canonical_string(),
+                    "outcome": a.outcome.as_ref().map(|o| match o {
+                        crate::plan::Outcome::Success { .. } => "success",
+                        crate::plan::Outcome::Failed { .. } => "failed",
+                        crate::plan::Outcome::Cancelled { .. } => "cancelled",
+                    }),
+                })
+            })
+        } else {
+            None
+        };
+
+        let data = McpMissionExplainData {
+            mission_file: mission_path.display().to_string(),
+            mission_id: mission.mission_id.0.clone(),
+            title: mission.title.clone(),
+            lifecycle_state: mission.lifecycle_state.to_string(),
+            available_transitions: mcp_mission_lifecycle_transitions(mission.lifecycle_state),
+            failure_catalog: mcp_mission_failure_catalog(),
+            assignment_context,
+        };
+
+        let envelope = McpEnvelope::success(data, elapsed_ms(start));
+        envelope_to_content(envelope)
+    }
+}
+
+// wa.mission_pause tool
+pub(super) struct WaMissionPauseTool {
+    config: Arc<Config>,
+}
+
+impl WaMissionPauseTool {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ToolHandler for WaMissionPauseTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.mission_pause".to_string(),
+            description: Some(
+                "Pause an active mission, creating a checkpoint (robot parity)".to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mission_file": { "type": "string", "description": "Optional path to mission JSON (default: .ft/mission/active.json)" },
+                    "reason": { "type": "string", "description": "Reason code for the pause (required)" },
+                    "requested_by": { "type": "string", "description": "Who requested the pause (default: mcp-agent)" }
+                },
+                "required": ["reason"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "robot".to_string(),
+                "mission".to_string(),
+            ],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: MissionPauseParams = match serde_json::from_value(arguments) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    Some("Expected object with reason (required)".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let reason = match &params.reason {
+            Some(r) if !r.trim().is_empty() => r.clone(),
+            _ => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    "reason is required and must not be empty".to_string(),
+                    Some("Provide a reason code for the pause.".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let mission_path = match mcp_resolve_mission_file_path(
+            self.config.as_ref(),
+            params.mission_file.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let mut mission = match mcp_load_mission_from_path(&mission_path) {
+            Ok(m) => m,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let requested_at_ms = i64::try_from(now_ms()).unwrap_or(0);
+        let decision = match mission.pause_mission(
+            &params.requested_by,
+            &reason,
+            requested_at_ms,
+            None,
+        ) {
+            Ok(d) => d,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Cannot pause mission: {err}"),
+                    Some("Use wa.mission_explain to see valid transitions.".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        if let Err(err) = mcp_save_mission_to_path(&mission_path, &mission) {
+            let envelope =
+                McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+            return envelope_to_content(envelope);
+        }
+
+        let data = McpMissionControlData {
+            command: "pause".to_string(),
+            mission_file: mission_path.display().to_string(),
+            mission_id: mission.mission_id.0.clone(),
+            lifecycle_from: decision.lifecycle_from.to_string(),
+            lifecycle_to: decision.lifecycle_to.to_string(),
+            decision_path: decision.decision_path,
+            reason_code: decision.reason_code,
+            error_code: decision.error_code,
+            checkpoint_id: decision.checkpoint_id,
+            mission_hash: mission.compute_hash(),
+        };
+
+        let envelope = McpEnvelope::success(data, elapsed_ms(start));
+        envelope_to_content(envelope)
+    }
+}
+
+// wa.mission_resume tool
+pub(super) struct WaMissionResumeTool {
+    config: Arc<Config>,
+}
+
+impl WaMissionResumeTool {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ToolHandler for WaMissionResumeTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.mission_resume".to_string(),
+            description: Some(
+                "Resume a paused mission, restoring prior lifecycle state (robot parity)"
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mission_file": { "type": "string", "description": "Optional path to mission JSON (default: .ft/mission/active.json)" },
+                    "requested_by": { "type": "string", "description": "Who requested the resume (default: mcp-agent)" }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "robot".to_string(),
+                "mission".to_string(),
+            ],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: MissionResumeParams = if arguments.is_null() {
+            MissionResumeParams::default()
+        } else {
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid params: {err}"),
+                        Some("Expected object with optional mission_file".to_string()),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        };
+
+        let mission_path = match mcp_resolve_mission_file_path(
+            self.config.as_ref(),
+            params.mission_file.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let mut mission = match mcp_load_mission_from_path(&mission_path) {
+            Ok(m) => m,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let requested_at_ms = i64::try_from(now_ms()).unwrap_or(0);
+        let decision = match mission.resume_mission(
+            &params.requested_by,
+            "mcp_resume",
+            requested_at_ms,
+            None,
+        ) {
+            Ok(d) => d,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Cannot resume mission: {err}"),
+                    Some("Use wa.mission_explain to see valid transitions.".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        if let Err(err) = mcp_save_mission_to_path(&mission_path, &mission) {
+            let envelope =
+                McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+            return envelope_to_content(envelope);
+        }
+
+        let data = McpMissionControlData {
+            command: "resume".to_string(),
+            mission_file: mission_path.display().to_string(),
+            mission_id: mission.mission_id.0.clone(),
+            lifecycle_from: decision.lifecycle_from.to_string(),
+            lifecycle_to: decision.lifecycle_to.to_string(),
+            decision_path: decision.decision_path,
+            reason_code: decision.reason_code,
+            error_code: decision.error_code,
+            checkpoint_id: decision.checkpoint_id,
+            mission_hash: mission.compute_hash(),
+        };
+
+        let envelope = McpEnvelope::success(data, elapsed_ms(start));
+        envelope_to_content(envelope)
+    }
+}
+
+// wa.mission_abort tool
+pub(super) struct WaMissionAbortTool {
+    config: Arc<Config>,
+}
+
+impl WaMissionAbortTool {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ToolHandler for WaMissionAbortTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.mission_abort".to_string(),
+            description: Some(
+                "Abort a mission, cancelling all in-flight assignments (robot parity)".to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mission_file": { "type": "string", "description": "Optional path to mission JSON (default: .ft/mission/active.json)" },
+                    "reason": { "type": "string", "description": "Reason code for the abort (required)" },
+                    "requested_by": { "type": "string", "description": "Who requested the abort (default: mcp-agent)" },
+                    "error_code": { "type": "string", "description": "Optional error code for the abort" }
+                },
+                "required": ["reason"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "robot".to_string(),
+                "mission".to_string(),
+            ],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: MissionAbortParams = match serde_json::from_value(arguments) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    Some("Expected object with reason (required)".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let reason = match &params.reason {
+            Some(r) if !r.trim().is_empty() => r.clone(),
+            _ => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    "reason is required and must not be empty".to_string(),
+                    Some("Provide a reason code for the abort.".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let mission_path = match mcp_resolve_mission_file_path(
+            self.config.as_ref(),
+            params.mission_file.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let mut mission = match mcp_load_mission_from_path(&mission_path) {
+            Ok(m) => m,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let requested_at_ms = i64::try_from(now_ms()).unwrap_or(0);
+        let decision = match mission.abort_mission(
+            &params.requested_by,
+            &reason,
+            params.error_code.clone(),
+            requested_at_ms,
+            None,
+        ) {
+            Ok(d) => d,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Cannot abort mission: {err}"),
+                    Some("Use wa.mission_explain to see valid transitions.".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        if let Err(err) = mcp_save_mission_to_path(&mission_path, &mission) {
+            let envelope =
+                McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+            return envelope_to_content(envelope);
+        }
+
+        let data = McpMissionControlData {
+            command: "abort".to_string(),
+            mission_file: mission_path.display().to_string(),
+            mission_id: mission.mission_id.0.clone(),
+            lifecycle_from: decision.lifecycle_from.to_string(),
+            lifecycle_to: decision.lifecycle_to.to_string(),
+            decision_path: decision.decision_path,
+            reason_code: decision.reason_code,
+            error_code: decision.error_code,
+            checkpoint_id: decision.checkpoint_id,
+            mission_hash: mission.compute_hash(),
+        };
+
+        let envelope = McpEnvelope::success(data, elapsed_ms(start));
+        envelope_to_content(envelope)
+    }
+}
