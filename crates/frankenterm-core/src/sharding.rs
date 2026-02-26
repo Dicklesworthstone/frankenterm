@@ -269,6 +269,10 @@ pub fn assign_pane_with_strategy(
 }
 
 fn deterministic_fallback_shard(shard_ids: &[ShardId], seed: u64) -> ShardId {
+    if shard_ids.is_empty() {
+        return ShardId(0);
+    }
+
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     seed.hash(&mut hasher);
     let idx = (hasher.finish() as usize) % shard_ids.len();
@@ -489,8 +493,11 @@ impl ShardedWeztermClient {
     }
 
     fn next_round_robin_shard(&self) -> ShardId {
-        let idx = self.round_robin_cursor.fetch_add(1, Ordering::Relaxed) % self.backends.len();
-        self.backends[idx].id
+        let backend_count = self.backends.len().max(1);
+        let idx = self.round_robin_cursor.fetch_add(1, Ordering::Relaxed) % backend_count;
+        self.backends
+            .get(idx)
+            .map_or(ShardId(0), |backend| backend.id)
     }
 
     fn choose_spawn_shard(
@@ -1800,6 +1807,11 @@ mod tests {
         let b = deterministic_fallback_shard(&shards, 42);
         assert_eq!(a, b);
         assert!(shards.contains(&a));
+    }
+
+    #[test]
+    fn deterministic_fallback_empty_shards_returns_zero_shard() {
+        assert_eq!(deterministic_fallback_shard(&[], 42), ShardId(0));
     }
 
     #[test]

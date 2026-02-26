@@ -614,7 +614,9 @@ pub fn build_canonical_map() -> VendoredMigrationMap {
             depends_on: vec![],
             depended_by: vec![],
             affected_workflows: vec!["pty-spawn".into()],
-            notes: "smol + futures only in dev-dependencies for tests. No production async surface.".into(),
+            notes:
+                "smol + futures only in dev-dependencies for tests. No production async surface."
+                    .into(),
         },
     );
 
@@ -650,11 +652,7 @@ impl VendoredMigrationMap {
 
     /// List crates in a specific migration wave, ordered by difficulty.
     pub fn wave_crates(&self, wave: MigrationWave) -> Vec<&VendoredCrateEntry> {
-        let mut crates: Vec<_> = self
-            .entries
-            .values()
-            .filter(|e| e.wave == wave)
-            .collect();
+        let mut crates: Vec<_> = self.entries.values().filter(|e| e.wave == wave).collect();
         crates.sort_by_key(|e| e.difficulty.score());
         crates
     }
