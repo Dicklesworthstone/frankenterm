@@ -13,6 +13,7 @@ pub mod facade;
 mod hash_embedder;
 mod hybrid_search;
 mod indexing;
+pub mod indexing_pipeline;
 pub mod lexical_backend_bridge;
 pub mod migration_controller;
 pub mod orchestrator;
@@ -54,6 +55,10 @@ pub use hash_embedder::HashEmbedder;
 pub use hybrid_search::{
     FusedResult, FusionBackend, HybridSearchService, SearchMode, TwoTierMetrics, blend_two_tier,
     kendall_tau, rrf_fuse,
+};
+pub use indexing_pipeline::{
+    ContentIndexingPipeline, PaneWatermark, PipelineConfig, PipelineSkipReason, PipelineState,
+    PipelineStatus, PipelineTickReport,
 };
 pub use indexing::{
     CassContentHashProvider, CommandBlockExtractionConfig, IndexFlushReason, IndexableDocument,
