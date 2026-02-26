@@ -340,6 +340,10 @@ harness = false
 name = "byte_compression"
 harness = false
 
+[[bench]]
+name = "pattern_trigger"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"

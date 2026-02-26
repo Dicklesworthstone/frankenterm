@@ -402,6 +402,7 @@ pub mod runtime;
 pub mod runtime_compat;
 pub mod runtime_health;
 pub mod runtime_telemetry;
+pub mod scan_pipeline;
 pub mod scope_tree;
 pub mod scope_watchdog;
 pub mod screen_state;
