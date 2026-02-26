@@ -15,33 +15,25 @@
 use std::collections::{BTreeSet, HashMap};
 
 use frankenterm_core::replay_cli::{
-    DiffRunner, InspectResult, ReplayExitCode, ReplayOutputMode,
-    RegressionSuiteResult, ArtifactResult,
-};
-use frankenterm_core::replay_mcp::{
-    DispatchResult, ReplayToolSchema, ALL_REPLAY_TOOLS,
-    all_tool_schemas, schema_for,
-    validate_optional_str, validate_optional_u64, validate_required_str,
-    TOOL_REPLAY_INSPECT, TOOL_REPLAY_DIFF, TOOL_REPLAY_REGRESSION,
-    TOOL_REPLAY_ARTIFACT_LIST, TOOL_REPLAY_ARTIFACT_ADD, TOOL_REPLAY_ARTIFACT_RETIRE,
-};
-use frankenterm_core::replay_robot::{
-    ReplayRobotCommand,
-    InspectRequest, InspectData,
-    DiffRequest, DiffData,
-    RegressionSuiteRequest, RegressionSuiteData,
-    ArtifactListData, ArtifactSummary,
-    ArtifactAddRequest, ArtifactAddData,
-    ArtifactRetireData,
-    ArtifactPruneRequest, ArtifactPruneData,
-    REPLAY_ERR_FILE_NOT_FOUND, REPLAY_ERR_PARSE_ERROR,
-    REPLAY_ERR_INTEGRITY_ERROR, REPLAY_ERR_DUPLICATE,
-    REPLAY_ERR_NOT_FOUND, REPLAY_ERR_ALREADY_RETIRED,
-    REPLAY_ERR_SCHEMA_MISMATCH,
+    ArtifactResult, DiffRunner, InspectResult, RegressionSuiteResult, ReplayExitCode,
+    ReplayOutputMode,
 };
 use frankenterm_core::replay_decision_diff::DiffConfig;
 use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionType};
+use frankenterm_core::replay_mcp::{
+    ALL_REPLAY_TOOLS, DispatchResult, ReplayToolSchema, TOOL_REPLAY_ARTIFACT_ADD,
+    TOOL_REPLAY_ARTIFACT_LIST, TOOL_REPLAY_ARTIFACT_RETIRE, TOOL_REPLAY_DIFF, TOOL_REPLAY_INSPECT,
+    TOOL_REPLAY_REGRESSION, all_tool_schemas, schema_for, validate_optional_str,
+    validate_optional_u64, validate_required_str,
+};
 use frankenterm_core::replay_report::ReportMeta;
+use frankenterm_core::replay_robot::{
+    ArtifactAddData, ArtifactAddRequest, ArtifactListData, ArtifactPruneData, ArtifactPruneRequest,
+    ArtifactRetireData, ArtifactSummary, DiffData, DiffRequest, InspectData, InspectRequest,
+    REPLAY_ERR_ALREADY_RETIRED, REPLAY_ERR_DUPLICATE, REPLAY_ERR_FILE_NOT_FOUND,
+    REPLAY_ERR_INTEGRITY_ERROR, REPLAY_ERR_NOT_FOUND, REPLAY_ERR_PARSE_ERROR,
+    REPLAY_ERR_SCHEMA_MISMATCH, RegressionSuiteData, RegressionSuiteRequest, ReplayRobotCommand,
+};
 
 // ============================================================================
 // Helpers
@@ -76,7 +68,11 @@ fn schema_property_names(schema: &ReplayToolSchema) -> BTreeSet<String> {
 fn schema_required_fields(schema: &ReplayToolSchema) -> BTreeSet<String> {
     schema.input_schema["required"]
         .as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -152,14 +148,11 @@ fn ic03_tool_count_matches_schema_count() {
 /// (ArtifactInspect and ArtifactPrune are robot-only; no MCP equivalent yet.)
 #[test]
 fn ic04_robot_only_commands_are_known() {
-    let known_robot_only: BTreeSet<&str> = [
-        "replay.artifact.inspect",
-        "replay.artifact.prune",
-    ]
-    .into_iter()
-    .collect();
+    let known_robot_only: BTreeSet<&str> = ["replay.artifact.inspect", "replay.artifact.prune"]
+        .into_iter()
+        .collect();
 
-    let mcp_covered: BTreeSet<&str> = mcp_to_robot_mapping().values().cloned().collect();
+    let mcp_covered: BTreeSet<&str> = mcp_to_robot_mapping().values().copied().collect();
 
     // Check all 8 robot commands
     let all_robot_cmds: Vec<ReplayRobotCommand> = vec![
@@ -207,7 +200,10 @@ fn ic06_inspect_schema_matches_request() {
     let required = schema_required_fields(&schema);
 
     // InspectRequest has: trace (String)
-    assert!(props.contains("trace"), "missing 'trace' property in inspect schema");
+    assert!(
+        props.contains("trace"),
+        "missing 'trace' property in inspect schema"
+    );
     assert!(required.contains("trace"), "trace should be required");
 }
 
@@ -225,8 +221,14 @@ fn ic07_diff_schema_matches_request() {
     assert!(props.contains("budget"), "missing 'budget'");
 
     assert!(required.contains("baseline"), "baseline should be required");
-    assert!(required.contains("candidate"), "candidate should be required");
-    assert!(!required.contains("tolerance_ms"), "tolerance_ms should be optional");
+    assert!(
+        required.contains("candidate"),
+        "candidate should be required"
+    );
+    assert!(
+        !required.contains("tolerance_ms"),
+        "tolerance_ms should be optional"
+    );
     assert!(!required.contains("budget"), "budget should be optional");
 }
 
@@ -351,7 +353,12 @@ fn ic14_error_codes_work_in_dispatch() {
 #[test]
 fn ic15_dispatch_error_preserves_fields() {
     let result = DispatchResult::error(REPLAY_ERR_NOT_FOUND, "artifact xyz not registered");
-    if let DispatchResult::Error { code, message, hint } = &result {
+    if let DispatchResult::Error {
+        code,
+        message,
+        hint,
+    } = &result
+    {
         assert_eq!(code, REPLAY_ERR_NOT_FOUND);
         assert_eq!(message, "artifact xyz not registered");
         assert!(hint.is_none());
@@ -368,7 +375,12 @@ fn ic16_dispatch_error_hint_preserved() {
         "file missing",
         "check path exists",
     );
-    if let DispatchResult::Error { code, message, hint } = &result {
+    if let DispatchResult::Error {
+        code,
+        message,
+        hint,
+    } = &result
+    {
         assert_eq!(code, REPLAY_ERR_FILE_NOT_FOUND);
         assert_eq!(message, "file missing");
         assert_eq!(hint.as_deref(), Some("check path exists"));
@@ -380,7 +392,7 @@ fn ic16_dispatch_error_hint_preserved() {
 /// IC-17: Error codes are unique (no accidental duplicates).
 #[test]
 fn ic17_error_codes_unique() {
-    let codes = vec![
+    let codes = [
         REPLAY_ERR_FILE_NOT_FOUND,
         REPLAY_ERR_PARSE_ERROR,
         REPLAY_ERR_INTEGRITY_ERROR,
@@ -438,7 +450,10 @@ fn ic19_diff_tolerance_default_aligned() {
     });
     let req: DiffRequest = serde_json::from_value(robot_json).unwrap();
 
-    assert_eq!(req.tolerance_ms, schema_default, "tolerance_ms default mismatch");
+    assert_eq!(
+        req.tolerance_ms, schema_default,
+        "tolerance_ms default mismatch"
+    );
     assert_eq!(req.tolerance_ms, 100, "tolerance_ms should default to 100");
 }
 
@@ -542,7 +557,10 @@ fn ic26_inspect_data_through_dispatch() {
     assert_eq!(restored, dispatch);
 
     // Extract data back
-    if let DispatchResult::Ok { data: restored_data } = restored {
+    if let DispatchResult::Ok {
+        data: restored_data,
+    } = restored
+    {
         let restored_inspect: InspectData = serde_json::from_value(restored_data).unwrap();
         assert_eq!(restored_inspect, data);
     } else {
@@ -708,20 +726,14 @@ fn ic35_smoke_inspect_minimal() {
 #[test]
 fn ic36_smoke_diff_identical() {
     let runner = DiffRunner::new();
-    let events = vec![
-        make_event("r1", 100, 1),
-        make_event("r2", 200, 1),
-    ];
+    let events = vec![make_event("r1", 100, 1), make_event("r2", 200, 1)];
     let result = runner.run(&events, &events, &DiffConfig::default());
 
     assert_eq!(result.exit_code, ReplayExitCode::Pass);
 
     // Verify robot formatting produces valid JSON
-    let robot_output = runner.format_result(
-        &result,
-        ReplayOutputMode::Robot,
-        &ReportMeta::default(),
-    );
+    let robot_output =
+        runner.format_result(&result, ReplayOutputMode::Robot, &ReportMeta::default());
     let parsed: serde_json::Value = serde_json::from_str(&robot_output).unwrap();
     assert!(parsed.is_object());
 }
@@ -814,13 +826,12 @@ fn ic41_diff_output_equivalence() {
     let result = runner.run(&events, &events, &DiffConfig::default());
 
     // CLI robot-mode output
-    let robot_str = runner.format_result(
-        &result,
-        ReplayOutputMode::Robot,
-        &ReportMeta::default(),
-    );
+    let robot_str = runner.format_result(&result, ReplayOutputMode::Robot, &ReportMeta::default());
     let cli_json: serde_json::Value = serde_json::from_str(&robot_str).unwrap();
-    assert!(cli_json.is_object(), "CLI robot output should be valid JSON object");
+    assert!(
+        cli_json.is_object(),
+        "CLI robot output should be valid JSON object"
+    );
 
     // Robot envelope would wrap DiffData
     let diff_data = DiffData {

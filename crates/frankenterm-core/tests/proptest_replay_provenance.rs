@@ -290,8 +290,8 @@ proptest! {
         let jsonl = emitter.to_jsonl();
         let restored = ReplayProvenanceEmitter::from_jsonl(&jsonl).unwrap();
         prop_assert_eq!(restored.len(), n);
-        for i in 0..n {
-            let eid = restored[i].event_id.clone();
+        for (i, entry) in restored.iter().enumerate().take(n) {
+            let eid = entry.event_id.clone();
             prop_assert_eq!(eid, format!("e{i}"));
         }
     }
@@ -485,8 +485,8 @@ proptest! {
             });
         }
         let entries = trail.entries();
-        for i in 0..entries.len() {
-            prop_assert_eq!(entries[i].ordinal, i as u64);
+        for (i, entry) in entries.iter().enumerate() {
+            prop_assert_eq!(entry.ordinal, i as u64);
         }
     }
 

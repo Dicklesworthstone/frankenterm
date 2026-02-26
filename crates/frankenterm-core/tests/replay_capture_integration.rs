@@ -206,7 +206,7 @@ fn replay_capture_streaming_reader_handles_small_pipeline_fixture() {
     let reader = ArtifactReader::default();
     let mut stream = reader.stream_events(&artifact_path).expect("stream");
     let mut count = 0usize;
-    while let Some(event) = stream.next() {
+    for event in &mut stream {
         let _ = event.expect("stream item");
         count += 1;
     }
@@ -261,7 +261,7 @@ fn replay_capture_streaming_reader_handles_large_pipeline_fixture() {
     let mut stream = ArtifactReader::default()
         .stream_events(&artifact_path)
         .expect("stream events");
-    while let Some(event) = stream.next() {
+    for event in &mut stream {
         let _ = event.expect("stream item");
         count += 1;
     }

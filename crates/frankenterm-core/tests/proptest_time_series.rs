@@ -69,7 +69,7 @@ proptest! {
     #[test]
     fn is_empty_iff_len_zero(config in arb_config(), points in arb_points(50)) {
         let ts = build_ts(config, &points);
-        let len_zero = ts.len() == 0;
+        let len_zero = ts.is_empty();
         prop_assert_eq!(ts.is_empty(), len_zero);
     }
 

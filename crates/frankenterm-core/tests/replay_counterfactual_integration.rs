@@ -16,6 +16,8 @@ use frankenterm_core::replay_scenario_matrix::{
     ArtifactEntry, DiffSummary, MatrixConfig, OverrideEntry, RunnerConfig, ScenarioMatrixRunner,
 };
 
+type DecisionGenerator = Box<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync>;
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn sample_override_toml() -> &'static str {
@@ -255,7 +257,7 @@ fn scenario_matrix_sweep_collects_all_results() {
     let expected_scenarios = config.scenario_count();
     assert!(expected_scenarios > 0);
 
-    let generator: Box<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync> =
+    let generator: DecisionGenerator =
         Box::new(|artifact: &str, ov: Option<&str>| mock_decision_generator(artifact, ov));
 
     let runner = ScenarioMatrixRunner::new(config, generator);
@@ -271,8 +273,8 @@ fn scenario_matrix_sweep_collects_all_results() {
 
     // Verify JSON output is valid
     let json = result.to_json();
-    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert!(parsed.is_object());
+    let json_val: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(json_val.is_object());
 }
 
 #[test]
@@ -390,7 +392,7 @@ fn scenario_matrix_with_guardrails() {
     let tracker = ResourceTracker::new(limits, 0);
 
     let config = sample_matrix_config();
-    let generator: Box<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync> =
+    let generator: DecisionGenerator =
         Box::new(|artifact: &str, ov: Option<&str>| mock_decision_generator(artifact, ov));
 
     let runner = ScenarioMatrixRunner::new(config, generator);
@@ -473,7 +475,7 @@ fn integration_diff_summary_serde() {
 #[test]
 fn integration_matrix_result_json() {
     let config = sample_matrix_config();
-    let generator: Box<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync> =
+    let generator: DecisionGenerator =
         Box::new(|artifact: &str, ov: Option<&str>| mock_decision_generator(artifact, ov));
     let runner = ScenarioMatrixRunner::new(config, generator);
     let result = runner.run(|_| {});

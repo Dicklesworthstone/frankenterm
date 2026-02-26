@@ -144,7 +144,7 @@ impl TestEventLogger {
 
     /// The auto-generated scenario_id: `{bead_id_sanitized}:{scenario_name}`.
     pub fn scenario_id(&self) -> String {
-        let sanitized = self.bead_id.replace('.', "_").replace('-', "_");
+        let sanitized = self.bead_id.replace(['.', '-'], "_");
         format!("{sanitized}:{}", self.scenario_name)
     }
 

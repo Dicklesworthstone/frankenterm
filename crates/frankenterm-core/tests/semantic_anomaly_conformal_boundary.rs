@@ -35,7 +35,7 @@ fn deterministic_embed(data: &[u8]) -> Vec<f32> {
     // Normalize to unit vector.
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > f32::EPSILON {
-        for x in v.iter_mut() {
+        for x in &mut v {
             *x /= norm;
         }
     }
@@ -169,7 +169,7 @@ fn gated_detector_orthogonal_shock() {
     // Fill calibration with normal output.
     for i in 0u64..30 {
         let segment = normal_terminal_output(i);
-        let obs = detector.observe(&segment, |seg| deterministic_embed(seg));
+        let obs = detector.observe(&segment, deterministic_embed);
         // Just check it doesn't panic.
         match obs {
             GatedObservation::Skipped(_) => {}
@@ -179,7 +179,7 @@ fn gated_detector_orthogonal_shock() {
 
     // Inject orthogonal payload.
     let anomalous = orthogonal_payload();
-    let obs = detector.observe(&anomalous, |seg| deterministic_embed(seg));
+    let obs = detector.observe(&anomalous, deterministic_embed);
 
     match obs {
         GatedObservation::Processed {

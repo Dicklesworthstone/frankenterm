@@ -212,7 +212,7 @@ proptest! {
         let sig = "E0308".to_string();
 
         for i in 0..count {
-            state.record_command_result(1000 * (i as u64 + 1), "cargo test", &[sig.clone()]);
+            state.record_command_result(1000 * (i as u64 + 1), "cargo test", std::slice::from_ref(&sig));
         }
 
         let observed = state.signature_count(&sig, 1000 * (count as u64 + 1));
@@ -301,10 +301,10 @@ proptest! {
         let mut state = TraumaState::new();
         // Record sig_a multiple times
         for i in 0..5 {
-            state.record_command_result(1000 * (i + 1), "cmd", &[sig_a.clone()]);
+            state.record_command_result(1000 * (i + 1), "cmd", std::slice::from_ref(&sig_a));
         }
         // Record sig_b once
-        let decision = state.record_command_result(6000, "cmd2", &[sig_b.clone()]);
+        let decision = state.record_command_result(6000, "cmd2", std::slice::from_ref(&sig_b));
         // sig_b hasn't been seen enough to be recurring (unless sig_a == sig_b)
         if sig_a != sig_b {
             let has_sig_b_recurring = decision.recurring_signatures.contains(&sig_b);

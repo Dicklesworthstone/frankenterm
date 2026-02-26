@@ -290,7 +290,7 @@ fn file_artifact_written_as_jsonl() {
     let path = logger.flush().unwrap();
     assert!(path.exists(), "Artifact file should exist");
     assert!(
-        path.extension().map_or(false, |ext| ext == "jsonl"),
+        path.extension().is_some_and(|ext| ext == "jsonl"),
         "Artifact should have .jsonl extension"
     );
 
@@ -366,7 +366,7 @@ fn reason_codes_cover_runtime_taxonomy() {
         (ReasonCode::ScheduleDivergence, "schedule_divergence"),
     ];
     for (code, expected_str) in codes {
-        let json = serde_json::to_value(&code).unwrap();
+        let json = serde_json::to_value(code).unwrap();
         assert_eq!(
             json.as_str().unwrap(),
             expected_str,
@@ -390,7 +390,7 @@ fn error_codes_cover_failure_taxonomy() {
         (ErrorCode::LivenessViolation, "liveness_violation"),
     ];
     for (code, expected_str) in codes {
-        let json = serde_json::to_value(&code).unwrap();
+        let json = serde_json::to_value(code).unwrap();
         assert_eq!(
             json.as_str().unwrap(),
             expected_str,

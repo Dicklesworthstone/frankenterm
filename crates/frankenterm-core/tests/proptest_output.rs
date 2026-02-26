@@ -117,7 +117,7 @@ proptest! {
         match fmt {
             OutputFormat::Plain => prop_assert_eq!(eff1, EffectiveFormat::Plain),
             OutputFormat::Json => prop_assert_eq!(eff1, EffectiveFormat::Json),
-            OutputFormat::Auto | OutputFormat::Text => {}
+            OutputFormat::Auto => {}
         }
     }
 
@@ -374,9 +374,9 @@ proptest! {
         let cols: Vec<Column> = (0..n_cols).map(|i| Column::new(format!("H{}", i))).collect();
         let table = Table::new(cols).with_format(OutputFormat::Plain);
         let output = table.render();
-        let lines: Vec<&str> = output.lines().collect();
+        let line_count = output.lines().count();
         // Should have exactly 1 line (header only, no data)
-        prop_assert_eq!(lines.len(), 1, "empty table should render header only");
+        prop_assert_eq!(line_count, 1, "empty table should render header only");
     }
 
     // 27. Table with min_width: rendered column is at least min_width wide

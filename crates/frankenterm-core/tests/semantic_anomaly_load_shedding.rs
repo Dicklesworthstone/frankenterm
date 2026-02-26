@@ -26,7 +26,7 @@ fn mock_embed(data: &[u8]) -> Vec<f32> {
     }
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > f32::EPSILON {
-        for x in v.iter_mut() {
+        for x in &mut v {
             *x /= norm;
         }
     }

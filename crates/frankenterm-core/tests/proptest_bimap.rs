@@ -144,7 +144,7 @@ proptest! {
     // 13. is_empty consistent with len
     #[test]
     fn is_empty_consistent(bm in arb_bimap()) {
-        let len_zero = bm.len() == 0;
+        let len_zero = bm.is_empty();
         prop_assert_eq!(bm.is_empty(), len_zero);
     }
 

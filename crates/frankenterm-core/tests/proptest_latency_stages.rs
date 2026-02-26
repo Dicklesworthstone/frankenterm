@@ -947,7 +947,7 @@ proptest! {
         start in 1_u64..1_000_000,
         regress in 1_u64..1_000_000,
     ) {
-        let end = start.checked_sub(regress).unwrap_or(0);
+        let end = start.saturating_sub(regress);
         let probe = FastProbe::begin(stage, start);
         let elapsed = probe.elapsed_us(end);
         prop_assert!((elapsed - 0.0).abs() < 1e-10);

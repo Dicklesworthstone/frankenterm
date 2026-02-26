@@ -439,8 +439,8 @@ proptest! {
         if n == 0 {
             prop_assert!(jsonl.is_empty());
         } else {
-            let lines: Vec<&str> = jsonl.lines().collect();
-            prop_assert_eq!(lines.len(), n);
+            let line_count = jsonl.lines().count();
+            prop_assert_eq!(line_count, n);
         }
     }
 

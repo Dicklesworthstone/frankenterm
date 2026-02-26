@@ -133,8 +133,8 @@ proptest! {
             });
         }
         let entries = log.entries();
-        for i in 0..entries.len() {
-            prop_assert_eq!(entries[i].index, i);
+        for (i, entry) in entries.iter().enumerate() {
+            prop_assert_eq!(entry.index, i);
         }
     }
 

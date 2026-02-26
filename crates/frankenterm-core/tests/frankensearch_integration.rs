@@ -381,7 +381,7 @@ fn integration_index_dedup_with_cass() {
     // We need to compute the hash the same way the index does. Use a known string.
     // Since we can't easily replicate the exact hash, test with empty cass set first.
     let doc = make_doc("Unique content not in cass", 1000, Some(0));
-    let r1 = index.ingest_documents(&[doc.clone()], 2000, false, Some(&cass_hashes)).unwrap();
+    let r1 = index.ingest_documents(std::slice::from_ref(&doc), 2000, false, Some(&cass_hashes)).unwrap();
     assert_eq!(r1.accepted_docs, 1);
     assert_eq!(r1.skipped_cass_docs, 0);
 
@@ -582,6 +582,7 @@ fn integration_concurrent_rrf_fusion() {
         (6, 0.2),
     ]);
 
+    #[allow(clippy::needless_collect)] // collect is needed to spawn all threads before joining
     let handles: Vec<_> = (0..10)
         .map(|_| {
             let lex = Arc::clone(&lexical);
