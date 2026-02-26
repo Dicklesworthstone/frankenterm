@@ -198,7 +198,7 @@ pub fn build_generation_plan(
             let (file_exists, existing_content) = file_state(&template.filename);
             let section_exists = existing_content
                 .as_deref()
-                .map_or(false, |c| c.contains(SECTION_START_MARKER));
+                .is_some_and(|c| c.contains(SECTION_START_MARKER));
 
             let action = if !file_exists {
                 ConfigAction::Create
@@ -244,7 +244,10 @@ pub fn build_generation_plan(
 ///
 /// Returns the full merged content.
 pub fn merge_into_existing(existing: &str, new_section: &str) -> String {
-    let fenced = format!("{}\n{}\n{}", SECTION_START_MARKER, new_section, SECTION_END_MARKER);
+    let fenced = format!(
+        "{}\n{}\n{}",
+        SECTION_START_MARKER, new_section, SECTION_END_MARKER
+    );
 
     if let Some(start_idx) = existing.find(SECTION_START_MARKER) {
         if let Some(end_marker_start) = existing[start_idx..].find(SECTION_END_MARKER) {
@@ -272,7 +275,10 @@ pub fn merge_into_existing(existing: &str, new_section: &str) -> String {
 
 /// Check whether the existing content already contains an up-to-date section.
 pub fn section_is_current(existing: &str, new_section: &str) -> bool {
-    let fenced = format!("{}\n{}\n{}", SECTION_START_MARKER, new_section, SECTION_END_MARKER);
+    let fenced = format!(
+        "{}\n{}\n{}",
+        SECTION_START_MARKER, new_section, SECTION_END_MARKER
+    );
     existing.contains(&fenced)
 }
 
@@ -322,7 +328,7 @@ All commands output JSON by default. Add `--format toon` for token-optimized out
 
 fn claude_md_template(_slug: &str, _display: &str) -> String {
     format!(
-        r#"# FrankenTerm Integration
+        r"# FrankenTerm Integration
 
 This project uses FrankenTerm (`ft`) as its terminal orchestration platform.
 
@@ -333,14 +339,14 @@ This project uses FrankenTerm (`ft`) as its terminal orchestration platform.
 - Use `ft robot search` to find relevant terminal output from other agents.
 - Use `ft robot panes list` to discover other running agents and their panes.
 - Use `ft robot agents running` to see which agents are currently active.
-- Prefer `ft robot` commands over raw tmux/wezterm commands for automation."#,
+- Prefer `ft robot` commands over raw tmux/wezterm commands for automation.",
         robot_mode_reference()
     )
 }
 
 fn agents_md_template(slug: &str, display: &str) -> String {
     format!(
-        r#"# FrankenTerm Integration for {display}
+        r"# FrankenTerm Integration for {display}
 
 This project uses FrankenTerm (`ft`) as its terminal orchestration platform.
 Agent: {slug}
@@ -352,7 +358,7 @@ Agent: {slug}
 - Use `ft robot search` to find relevant terminal output across all panes.
 - Use `ft robot panes list` to discover other running agents.
 - Use `ft robot agents running` to see which agents are currently active.
-- Prefer structured `ft robot` JSON commands over raw terminal parsing."#,
+- Prefer structured `ft robot` JSON commands over raw terminal parsing.",
         display = display,
         slug = slug,
         ref_section = robot_mode_reference(),
@@ -361,7 +367,7 @@ Agent: {slug}
 
 fn cursor_rules_template(_slug: &str, _display: &str) -> String {
     format!(
-        r#"# FrankenTerm Integration
+        r"# FrankenTerm Integration
 
 This project uses FrankenTerm (`ft`) for terminal orchestration.
 
@@ -372,14 +378,14 @@ This project uses FrankenTerm (`ft`) for terminal orchestration.
 - When you need terminal output from other agents, use `ft robot search`.
 - When you need to interact with other panes, use `ft robot panes send-text`.
 - When checking system state, use `ft robot status`.
-- All `ft robot` commands return structured JSON."#,
+- All `ft robot` commands return structured JSON.",
         robot_mode_reference()
     )
 }
 
 fn conventions_md_template(_slug: &str, _display: &str) -> String {
     format!(
-        r#"# FrankenTerm Integration
+        r"# FrankenTerm Integration
 
 This project uses FrankenTerm (`ft`) for terminal orchestration.
 
@@ -389,14 +395,14 @@ This project uses FrankenTerm (`ft`) for terminal orchestration.
 
 - Use `ft robot` commands for automation instead of raw terminal commands.
 - Check `ft robot agents running` before spawning new agent sessions.
-- Search terminal history with `ft robot search` for context."#,
+- Search terminal history with `ft robot search` for context.",
         robot_mode_reference()
     )
 }
 
 fn copilot_instructions_template(_slug: &str, _display: &str) -> String {
     format!(
-        r#"# FrankenTerm Integration
+        r"# FrankenTerm Integration
 
 This project uses FrankenTerm (`ft`) for terminal orchestration.
 
@@ -406,7 +412,7 @@ This project uses FrankenTerm (`ft`) for terminal orchestration.
 
 - Use `ft robot` JSON API for terminal automation.
 - Use `ft robot search` to find terminal output across agent sessions.
-- Use `ft robot panes list` for pane discovery."#,
+- Use `ft robot panes list` for pane discovery.",
         robot_mode_reference()
     )
 }
@@ -519,7 +525,10 @@ mod tests {
 
     #[test]
     fn filename_cursor_rules() {
-        assert_eq!(AgentConfigKind::CursorRules.project_filename(), ".cursorrules");
+        assert_eq!(
+            AgentConfigKind::CursorRules.project_filename(),
+            ".cursorrules"
+        );
     }
 
     #[test]
@@ -668,7 +677,10 @@ mod tests {
     #[test]
     fn merge_preserves_content_before_markers() {
         let prefix = "# Important\n\nDo not remove this.\n";
-        let existing = format!("{}{}\nold\n{}\n", prefix, SECTION_START_MARKER, SECTION_END_MARKER);
+        let existing = format!(
+            "{}{}\nold\n{}\n",
+            prefix, SECTION_START_MARKER, SECTION_END_MARKER
+        );
         let result = merge_into_existing(&existing, "updated");
         assert!(result.starts_with(prefix));
     }

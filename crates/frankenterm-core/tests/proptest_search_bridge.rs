@@ -3,6 +3,7 @@
 //! Covers: BridgeCancellationToken state machine, SearchBridgeRequest builder
 //! chain composition, update_best_results phase selection, map_search_error
 //! priority, and concurrent cancellation safety.
+#![cfg(feature = "frankensearch")]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

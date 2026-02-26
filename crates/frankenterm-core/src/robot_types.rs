@@ -615,10 +615,7 @@ pub enum SearchStreamPhase {
     Quality { result_count: usize },
     /// Search complete.
     #[serde(rename = "phase_done")]
-    Done {
-        total_results: usize,
-        total_us: u64,
-    },
+    Done { total_results: usize, total_us: u64 },
 }
 
 /// Indexing pipeline status for `ft robot search-index pipeline`.
@@ -964,7 +961,8 @@ impl From<&crate::agent_correlator::AgentInventory> for AgentInventoryData {
                 configured_count,
                 installed_but_idle_count,
             },
-            filesystem_detection_available: crate::agent_correlator::filesystem_detection_available(),
+            filesystem_detection_available: crate::agent_correlator::filesystem_detection_available(
+            ),
         }
     }
 }
@@ -3580,10 +3578,7 @@ mod tests {
         assert_eq!(parsed.watermarks.len(), 2);
         assert_eq!(parsed.watermarks[0].pane_id, 1);
         assert_eq!(parsed.watermarks[0].total_docs_indexed, 42);
-        assert_eq!(
-            parsed.watermarks[0].session_id.as_deref(),
-            Some("sess-a")
-        );
+        assert_eq!(parsed.watermarks[0].session_id.as_deref(), Some("sess-a"));
         assert_eq!(parsed.total_ticks, 100);
         assert_eq!(parsed.total_docs_indexed, 60);
     }
@@ -3674,8 +3669,7 @@ mod tests {
             "version": "0.1.0",
             "now": 0
         });
-        let resp: RobotResponse<SearchPipelineStatusData> =
-            serde_json::from_value(json).unwrap();
+        let resp: RobotResponse<SearchPipelineStatusData> = serde_json::from_value(json).unwrap();
         assert!(resp.ok);
         let data = resp.into_result().unwrap();
         assert_eq!(data.state, "paused");
@@ -3707,10 +3701,7 @@ mod tests {
             parsed.config_path.as_deref(),
             Some("/home/user/.claude/config.json")
         );
-        assert_eq!(
-            parsed.binary_path.as_deref(),
-            Some("/usr/local/bin/claude")
-        );
+        assert_eq!(parsed.binary_path.as_deref(), Some("/usr/local/bin/claude"));
         assert_eq!(parsed.version.as_deref(), Some("1.2.3"));
     }
 
@@ -3895,7 +3886,10 @@ mod tests {
         assert_eq!(info.slug, "codex");
         assert!(info.detected);
         assert_eq!(info.evidence.len(), 1);
-        assert_eq!(info.config_path.as_deref(), Some("/home/user/.codex/config.toml"));
+        assert_eq!(
+            info.config_path.as_deref(),
+            Some("/home/user/.codex/config.toml")
+        );
         assert_eq!(info.version.as_deref(), Some("0.5.0"));
     }
 
@@ -4133,7 +4127,10 @@ mod tests {
         let json = serde_json::to_string(&data).unwrap();
         let back: MissionStateData = serde_json::from_str(&json).unwrap();
         assert_eq!(back.mission_id, "m-1");
-        assert_eq!(back.lifecycle_state, crate::plan::MissionLifecycleState::Running);
+        assert_eq!(
+            back.lifecycle_state,
+            crate::plan::MissionLifecycleState::Running
+        );
         assert_eq!(back.candidate_count, 5);
         assert_eq!(back.available_transitions.len(), 1);
     }
@@ -4213,7 +4210,10 @@ mod tests {
         let json = serde_json::to_string(&data).unwrap();
         let back: MissionDecisionsData = serde_json::from_str(&json).unwrap();
         assert_eq!(back.mission_id, "m-1");
-        assert_eq!(back.lifecycle_state, crate::plan::MissionLifecycleState::Planned);
+        assert_eq!(
+            back.lifecycle_state,
+            crate::plan::MissionLifecycleState::Planned
+        );
     }
 
     #[test]
@@ -4272,10 +4272,7 @@ mod tests {
             serde_json::to_string(&TxStepRisk::Critical).unwrap(),
             "\"critical\""
         );
-        assert_eq!(
-            serde_json::to_string(&TxStepRisk::Low).unwrap(),
-            "\"low\""
-        );
+        assert_eq!(serde_json::to_string(&TxStepRisk::Low).unwrap(), "\"low\"");
     }
 
     #[test]
@@ -4849,8 +4846,7 @@ mod tests {
         let resp = RobotResponse::success(detail, 200);
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"ok\":true"));
-        let back: RobotResponse<WorkflowStatusDetailData> =
-            serde_json::from_str(&json).unwrap();
+        let back: RobotResponse<WorkflowStatusDetailData> = serde_json::from_str(&json).unwrap();
         assert!(back.ok);
         assert_eq!(back.data.unwrap().status, "completed");
     }
