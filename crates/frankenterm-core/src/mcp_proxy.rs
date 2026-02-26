@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[allow(unused_imports)]
 use mcp_proxy_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
     FrameworkMcpResult as McpResult, FrameworkServer as Server, FrameworkServerBuilder,

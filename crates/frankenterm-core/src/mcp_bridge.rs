@@ -155,7 +155,7 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
 
     #[cfg(feature = "mcp-client")]
     {
-        builder = mcp_proxy::compose_proxy_tools(builder, config.as_ref(), db_path.clone())?;
+        builder = super::mcp_proxy::compose_proxy_tools(builder, config.as_ref(), db_path.clone())?;
     }
 
     let server = builder.build();
