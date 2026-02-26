@@ -2372,4 +2372,99 @@ mod test {
         assert!(a < b);
         assert_eq!(a, a);
     }
+
+    // --- Floating pane PDU roundtrip tests ---
+
+    #[test]
+    fn create_floating_pane_pdu_roundtrip() {
+        let pdu = Pdu::CreateFloatingPane(CreateFloatingPane {
+            tab_id: 1,
+            pane_id: 42,
+            rect: FloatingPaneRect {
+                left: 10,
+                top: 5,
+                width: 30,
+                height: 15,
+            },
+        });
+        let mut encoded = Vec::new();
+        pdu.encode(&mut encoded, 100).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 100);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn move_floating_pane_pdu_roundtrip() {
+        let pdu = Pdu::MoveFloatingPane(MoveFloatingPane {
+            pane_id: 7,
+            rect: FloatingPaneRect {
+                left: 20,
+                top: 10,
+                width: 40,
+                height: 20,
+            },
+        });
+        let mut encoded = Vec::new();
+        pdu.encode(&mut encoded, 101).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn set_floating_pane_z_pdu_roundtrip() {
+        let pdu = Pdu::SetFloatingPaneZ(SetFloatingPaneZ {
+            pane_id: 3,
+            z_order: 99,
+        });
+        let mut encoded = Vec::new();
+        pdu.encode(&mut encoded, 102).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn toggle_floating_pane_pdu_roundtrip() {
+        for visible in [true, false] {
+            let pdu = Pdu::ToggleFloatingPane(ToggleFloatingPane {
+                pane_id: 5,
+                visible,
+            });
+            let mut encoded = Vec::new();
+            pdu.encode(&mut encoded, 103).unwrap();
+            let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.pdu, pdu);
+        }
+    }
+
+    #[test]
+    fn remove_floating_pane_pdu_roundtrip() {
+        let pdu = Pdu::RemoveFloatingPane(RemoveFloatingPane { pane_id: 99 });
+        let mut encoded = Vec::new();
+        pdu.encode(&mut encoded, 104).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn floating_pane_pdus_pdu_name() {
+        assert_eq!(
+            Pdu::CreateFloatingPane(CreateFloatingPane {
+                tab_id: 0,
+                pane_id: 0,
+                rect: FloatingPaneRect {
+                    left: 0,
+                    top: 0,
+                    width: 5,
+                    height: 3,
+                },
+            })
+            .pdu_name(),
+            "CreateFloatingPane"
+        );
+        assert_eq!(
+            Pdu::RemoveFloatingPane(RemoveFloatingPane { pane_id: 0 }).pdu_name(),
+            "RemoveFloatingPane"
+        );
+    }
 }
