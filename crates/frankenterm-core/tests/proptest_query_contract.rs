@@ -65,8 +65,9 @@ fn arb_valid_search_input() -> impl Strategy<Value = SearchQueryInput> {
         proptest::option::of(0_i64..100_000),
         proptest::option::of(proptest::bool::ANY),
         proptest::option::of(arb_search_mode()),
+        proptest::option::of(proptest::bool::ANY),
     )
-        .prop_map(|(query, limit, pane, since, until, snippets, mode)| {
+        .prop_map(|(query, limit, pane, since, until, snippets, mode, explain)| {
             // Ensure since <= until when both are present
             let (since, until) = match (since, until) {
                 (Some(s), Some(u)) if s > u => (Some(u), Some(s)),
@@ -80,6 +81,7 @@ fn arb_valid_search_input() -> impl Strategy<Value = SearchQueryInput> {
                 until,
                 snippets,
                 mode,
+                explain,
             }
         })
 }
@@ -93,8 +95,9 @@ fn arb_unified_search_query() -> impl Strategy<Value = UnifiedSearchQuery> {
         proptest::option::of(0_i64..100_000),
         proptest::bool::ANY,
         arb_search_mode(),
+        proptest::bool::ANY,
     )
-        .prop_map(|(query, limit, pane, since, until, snippets, mode)| {
+        .prop_map(|(query, limit, pane, since, until, snippets, mode, explain)| {
             let (since, until) = match (since, until) {
                 (Some(s), Some(u)) if s > u => (Some(u), Some(s)),
                 other => other,
@@ -107,6 +110,7 @@ fn arb_unified_search_query() -> impl Strategy<Value = UnifiedSearchQuery> {
                 until,
                 snippets,
                 mode,
+                explain,
             }
         })
 }
@@ -188,6 +192,7 @@ proptest! {
             until: None,
             snippets: Some(snippets),
             mode: Some(mode),
+            explain: None,
         };
         let output = parse_unified_search_query(input, SearchQueryDefaults::default())
             .expect("should parse");
@@ -456,6 +461,7 @@ proptest! {
         prop_assert_eq!(restored.until, query.until);
         prop_assert_eq!(restored.snippets, query.snippets);
         prop_assert_eq!(restored.mode, query.mode);
+        prop_assert_eq!(restored.explain, query.explain);
     }
 
     /// None fields are omitted from JSON (skip_serializing_if).
@@ -469,11 +475,13 @@ proptest! {
             until: None,
             snippets: false,
             mode: UnifiedSearchMode::Lexical,
+            explain: false,
         };
         let json = serde_json::to_string(&q).expect("serialize");
         prop_assert!(!json.contains("pane"), "pane:None should be omitted");
         prop_assert!(!json.contains("since"), "since:None should be omitted");
         prop_assert!(!json.contains("until"), "until:None should be omitted");
+        prop_assert!(!json.contains("explain"), "explain:false should be omitted");
     }
 }
 

@@ -75,6 +75,8 @@ pub struct SearchQueryInput {
     pub until: Option<i64>,
     pub snippets: Option<bool>,
     pub mode: Option<UnifiedSearchMode>,
+    /// When true, return per-result scoring breakdown (`SearchExplainData`).
+    pub explain: Option<bool>,
 }
 
 /// Canonical validated query parameters.
@@ -90,6 +92,9 @@ pub struct UnifiedSearchQuery {
     pub until: Option<i64>,
     pub snippets: bool,
     pub mode: UnifiedSearchMode,
+    /// When true, include per-result scoring breakdown in the response.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub explain: bool,
 }
 
 /// Parse result with the canonical query and lint warnings.
@@ -272,6 +277,7 @@ pub fn parse_unified_search_query(
             until: input.until,
             snippets: input.snippets.unwrap_or(defaults.snippets),
             mode: input.mode.unwrap_or(defaults.mode),
+            explain: input.explain.unwrap_or(false),
         },
         lints,
     })
@@ -325,6 +331,7 @@ mod tests {
         assert_eq!(parsed.query.limit, SEARCH_LIMIT_DEFAULT);
         assert!(parsed.query.snippets);
         assert_eq!(parsed.query.mode, UnifiedSearchMode::Lexical);
+        assert!(!parsed.query.explain);
         assert!(parsed.lints.is_empty());
     }
 
@@ -339,6 +346,7 @@ mod tests {
                 until: Some(200),
                 snippets: Some(false),
                 mode: Some(UnifiedSearchMode::Hybrid),
+                explain: Some(true),
             },
             SearchQueryDefaults::default(),
         )
@@ -350,6 +358,7 @@ mod tests {
         assert_eq!(parsed.query.until, Some(200));
         assert!(!parsed.query.snippets);
         assert_eq!(parsed.query.mode, UnifiedSearchMode::Hybrid);
+        assert!(parsed.query.explain);
     }
 
     #[test]
@@ -703,6 +712,7 @@ mod tests {
             until: Some(200),
             snippets: true,
             mode: UnifiedSearchMode::Lexical,
+            explain: false,
         };
         let opts = to_storage_search_options(&query);
         assert_eq!(opts.limit, Some(50));
@@ -731,6 +741,7 @@ mod tests {
             until: None,
             snippets: false,
             mode: UnifiedSearchMode::Lexical,
+            explain: false,
         };
         let opts = to_storage_search_options(&query);
         assert!(opts.pane_id.is_none());
@@ -810,6 +821,7 @@ mod tests {
             until: Some(200),
             snippets: true,
             mode: UnifiedSearchMode::Hybrid,
+            explain: true,
         };
         let json = serde_json::to_string(&query).unwrap();
         let restored: UnifiedSearchQuery = serde_json::from_str(&json).unwrap();
@@ -826,6 +838,7 @@ mod tests {
             until: None,
             snippets: false,
             mode: UnifiedSearchMode::Lexical,
+            explain: false,
         };
         let json = serde_json::to_string(&query).unwrap();
         assert!(!json.contains("pane"));
@@ -845,5 +858,105 @@ mod tests {
         assert!(input.until.is_none());
         assert!(input.snippets.is_none());
         assert!(input.mode.is_none());
+        assert!(input.explain.is_none());
+    }
+
+    // ── explain flag ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_explain_defaults_to_false() {
+        let parsed = parse_unified_search_query(
+            SearchQueryInput {
+                query: "test".to_string(),
+                ..SearchQueryInput::default()
+            },
+            SearchQueryDefaults::default(),
+        )
+        .expect("parse query");
+        assert!(!parsed.query.explain);
+    }
+
+    #[test]
+    fn parse_explain_true_preserved() {
+        let parsed = parse_unified_search_query(
+            SearchQueryInput {
+                query: "test".to_string(),
+                explain: Some(true),
+                ..SearchQueryInput::default()
+            },
+            SearchQueryDefaults::default(),
+        )
+        .expect("parse query");
+        assert!(parsed.query.explain);
+    }
+
+    #[test]
+    fn parse_explain_false_preserved() {
+        let parsed = parse_unified_search_query(
+            SearchQueryInput {
+                query: "test".to_string(),
+                explain: Some(false),
+                ..SearchQueryInput::default()
+            },
+            SearchQueryDefaults::default(),
+        )
+        .expect("parse query");
+        assert!(!parsed.query.explain);
+    }
+
+    #[test]
+    fn explain_false_not_serialized() {
+        let query = UnifiedSearchQuery {
+            query: "test".to_string(),
+            limit: 20,
+            pane: None,
+            since: None,
+            until: None,
+            snippets: false,
+            mode: UnifiedSearchMode::Lexical,
+            explain: false,
+        };
+        let json = serde_json::to_string(&query).unwrap();
+        assert!(!json.contains("explain"));
+    }
+
+    #[test]
+    fn explain_true_serialized() {
+        let query = UnifiedSearchQuery {
+            query: "test".to_string(),
+            limit: 20,
+            pane: None,
+            since: None,
+            until: None,
+            snippets: false,
+            mode: UnifiedSearchMode::Lexical,
+            explain: true,
+        };
+        let json = serde_json::to_string(&query).unwrap();
+        assert!(json.contains("\"explain\":true"));
+    }
+
+    #[test]
+    fn explain_serde_roundtrip_true() {
+        let query = UnifiedSearchQuery {
+            query: "test".to_string(),
+            limit: 20,
+            pane: None,
+            since: None,
+            until: None,
+            snippets: true,
+            mode: UnifiedSearchMode::Lexical,
+            explain: true,
+        };
+        let json = serde_json::to_string(&query).unwrap();
+        let restored: UnifiedSearchQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, query);
+    }
+
+    #[test]
+    fn explain_defaults_when_missing_from_json() {
+        let json = r#"{"query":"test","limit":20,"snippets":true,"mode":"lexical"}"#;
+        let parsed: UnifiedSearchQuery = serde_json::from_str(json).unwrap();
+        assert!(!parsed.explain);
     }
 }

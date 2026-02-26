@@ -13124,6 +13124,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         until,
                                         snippets,
                                         mode: Some(mode.into()),
+                                        explain: None,
                                     },
                                     frankenterm_core::query_contract::SearchQueryDefaults::default(
                                     ),
@@ -17828,6 +17829,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             until,
                             snippets: Some(true),
                             mode: Some(mode.into()),
+                            explain: None,
                         },
                         frankenterm_core::query_contract::SearchQueryDefaults::default(),
                     ) {

@@ -923,6 +923,7 @@ impl ToolHandler for WaSearchTool {
                 until: params.until,
                 snippets: params.snippets,
                 mode: params.mode,
+                explain: None,
             },
             SearchQueryDefaults::default(),
         ) {
