@@ -518,6 +518,16 @@ pub mod process {
 ///
 /// Re-exports the extension traits needed for TCP stream I/O.
 /// For Unix-specific I/O (BufReader, lines, etc.) see the `unix` module.
+#[cfg(feature = "asupersync-runtime")]
+pub mod io {
+    pub use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+}
+
+/// Async I/O traits for the active runtime.
+///
+/// Re-exports the extension traits needed for TCP stream I/O.
+/// For Unix-specific I/O (BufReader, lines, etc.) see the `unix` module.
+#[cfg(not(feature = "asupersync-runtime"))]
 pub mod io {
     pub use tokio::io::{AsyncReadExt, AsyncWriteExt};
 }
@@ -525,6 +535,15 @@ pub mod io {
 /// Async networking primitives for the active runtime.
 ///
 /// For Unix sockets, see the `unix` module.
+#[cfg(feature = "asupersync-runtime")]
+pub mod net {
+    pub use asupersync::net::{TcpListener, TcpStream};
+}
+
+/// Async networking primitives for the active runtime.
+///
+/// For Unix sockets, see the `unix` module.
+#[cfg(not(feature = "asupersync-runtime"))]
 pub mod net {
     pub use tokio::net::{TcpListener, TcpStream};
 }
