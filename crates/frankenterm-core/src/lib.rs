@@ -49,6 +49,7 @@ pub mod adaptive_radix_tree;
 pub mod aegis_backpressure;
 pub mod aegis_diagnostics;
 pub mod aegis_entropy_anomaly;
+pub mod agent_config_templates;
 pub mod agent_correlator;
 #[cfg(feature = "agent-detection")]
 pub mod agent_detection;

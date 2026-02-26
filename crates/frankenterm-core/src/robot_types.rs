@@ -883,6 +883,84 @@ impl From<&crate::agent_correlator::AgentInventory> for AgentInventoryData {
 }
 
 // ============================================================================
+// Agent Configuration (ft-dr6zv.2.4)
+// ============================================================================
+
+/// Response data for `ft robot agents configure`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfigureData {
+    /// Results per agent.
+    pub results: Vec<AgentConfigureResultItem>,
+    /// Total agents processed.
+    pub total: usize,
+    /// Number of files created.
+    pub created: usize,
+    /// Number of files updated (append or replace).
+    pub updated: usize,
+    /// Number of files skipped (already current).
+    pub skipped: usize,
+    /// Number of errors.
+    pub errors: usize,
+}
+
+/// Per-agent result in a configure operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfigureResultItem {
+    /// Agent slug.
+    pub slug: String,
+    /// Human-readable agent name.
+    pub display_name: String,
+    /// What action was taken.
+    pub action: String,
+    /// Target file path (relative).
+    pub filename: String,
+    /// Whether a backup was created before modification.
+    pub backup_created: bool,
+    /// Error message if this agent's config generation failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response data for `ft robot agents configure --dry-run`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfigureDryRunData {
+    /// Plan items showing what would happen.
+    pub plan: Vec<AgentConfigurePlanItem>,
+    /// Total agents in the plan.
+    pub total: usize,
+    /// How many would create new files.
+    pub would_create: usize,
+    /// How many would modify existing files.
+    pub would_modify: usize,
+    /// How many would be skipped.
+    pub would_skip: usize,
+}
+
+/// A single item in a configure dry-run plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfigurePlanItem {
+    /// Agent slug.
+    pub slug: String,
+    /// Human-readable agent name.
+    pub display_name: String,
+    /// Config file type (e.g. "claude_md", "agents_md").
+    pub config_kind: String,
+    /// Where the file would be placed.
+    pub scope: String,
+    /// Target file path (relative).
+    pub filename: String,
+    /// Whether the target file already exists.
+    pub file_exists: bool,
+    /// Whether the FrankenTerm section already exists in the file.
+    pub section_exists: bool,
+    /// What action would be taken.
+    pub action: String,
+    /// Preview of the content that would be written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_preview: Option<String>,
+}
+
+// ============================================================================
 // Workflows
 // ============================================================================
 
