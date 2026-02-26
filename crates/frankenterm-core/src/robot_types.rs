@@ -1138,6 +1138,259 @@ pub struct MissionDecisionsData {
 }
 
 // ============================================================================
+// Transactional Execution (ft-1i2ge.8.8)
+// ============================================================================
+
+/// Risk classification for a transaction step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxStepRisk {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Transaction lifecycle phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxPhaseState {
+    Planned,
+    Preparing,
+    Committing,
+    Compensating,
+    Completed,
+    Aborted,
+}
+
+/// Precondition kind for a transaction step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TxPreconditionKind {
+    PolicyApproved,
+    ReservationHeld { paths: Vec<String> },
+    ApprovalRequired { approver: String },
+    TargetReachable { target_id: String },
+    ContextFresh { max_age_ms: u64 },
+}
+
+/// Precondition on a transaction step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxPreconditionData {
+    pub kind: TxPreconditionKind,
+    pub description: String,
+    pub required: bool,
+}
+
+/// Compensation kind for rollback/recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TxCompensationKind {
+    Rollback,
+    NotifyOperator,
+    RetryWithBackoff { max_retries: u32 },
+    SkipAndContinue,
+    Alternative { alternative_step_id: String },
+}
+
+/// Compensating action associated with a step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxCompensatingActionData {
+    pub step_id: String,
+    pub description: String,
+    pub action_type: TxCompensationKind,
+}
+
+/// Risk summary across all steps in a plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxRiskSummaryData {
+    pub total_steps: usize,
+    pub high_risk_count: usize,
+    pub critical_risk_count: usize,
+    pub uncompensated_steps: usize,
+    pub overall_risk: TxStepRisk,
+}
+
+/// Rejected dependency edge in plan compilation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxRejectedEdgeData {
+    pub from_step: String,
+    pub to_step: String,
+    pub reason: String,
+}
+
+/// Step data in a compiled transaction plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxStepData {
+    pub id: String,
+    pub bead_id: String,
+    pub agent_id: String,
+    pub description: String,
+    pub depends_on: Vec<String>,
+    pub preconditions: Vec<TxPreconditionData>,
+    pub compensations: Vec<TxCompensatingActionData>,
+    pub risk: TxStepRisk,
+    pub score: f64,
+}
+
+/// Response data for `ft robot tx plan`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxPlanData {
+    pub plan_id: String,
+    pub plan_hash: u64,
+    pub steps: Vec<TxStepData>,
+    pub execution_order: Vec<String>,
+    pub parallel_levels: Vec<Vec<String>>,
+    pub risk_summary: TxRiskSummaryData,
+    pub rejected_edges: Vec<TxRejectedEdgeData>,
+}
+
+/// Step outcome in a transaction execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TxStepOutcome {
+    Success {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+    },
+    Failed {
+        error_code: String,
+        error_message: String,
+        compensated: bool,
+    },
+    Skipped {
+        reason: String,
+    },
+    Compensated {
+        compensation_result: String,
+    },
+    Pending,
+}
+
+/// Resume recommendation after transaction interruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxResumeRecommendation {
+    ContinueFromCheckpoint,
+    RestartFresh,
+    CompensateAndAbort,
+    AlreadyComplete,
+}
+
+/// Per-step execution record in a transaction ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxStepRecordData {
+    pub ordinal: u64,
+    pub step_id: String,
+    pub idem_key: String,
+    pub execution_id: String,
+    pub timestamp_ms: u64,
+    pub outcome: TxStepOutcome,
+    pub risk: TxStepRisk,
+    pub prev_hash: String,
+    pub agent_id: String,
+}
+
+/// Chain verification result for idempotency integrity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxChainVerificationData {
+    pub chain_intact: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_break_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_ordinals: Vec<u64>,
+    pub total_records: usize,
+}
+
+/// Response data for `ft robot tx run`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxRunData {
+    pub execution_id: String,
+    pub plan_id: String,
+    pub plan_hash: u64,
+    pub phase: TxPhaseState,
+    pub step_count: usize,
+    pub completed_count: usize,
+    pub failed_count: usize,
+    pub skipped_count: usize,
+    pub records: Vec<TxStepRecordData>,
+    pub chain_verification: TxChainVerificationData,
+}
+
+/// Resume context for interrupted transactions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxResumeData {
+    pub execution_id: String,
+    pub plan_id: String,
+    pub interrupted_phase: TxPhaseState,
+    pub completed_steps: Vec<String>,
+    pub failed_steps: Vec<String>,
+    pub remaining_steps: Vec<String>,
+    pub compensated_steps: Vec<String>,
+    pub chain_intact: bool,
+    pub last_hash: String,
+    pub recommendation: TxResumeRecommendation,
+}
+
+/// Response data for `ft robot tx rollback`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxRollbackData {
+    pub execution_id: String,
+    pub plan_id: String,
+    pub phase: TxPhaseState,
+    pub compensated_steps: Vec<String>,
+    pub failed_compensations: Vec<String>,
+    pub total_compensated: usize,
+    pub total_failed: usize,
+    pub chain_verification: TxChainVerificationData,
+}
+
+/// Forensic bundle classification level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxBundleClassification {
+    Internal,
+    TeamReview,
+    ExternalAudit,
+}
+
+/// Timeline entry in a forensic bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxTimelineEntryData {
+    pub timestamp_ms: u64,
+    pub phase: String,
+    pub step_id: String,
+    pub kind: String,
+    pub reason_code: String,
+    pub summary: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<u64>,
+    pub record_hash: String,
+}
+
+/// Response data for `ft robot tx show`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxShowData {
+    pub execution_id: String,
+    pub plan_id: String,
+    pub plan_hash: u64,
+    pub phase: TxPhaseState,
+    pub classification: TxBundleClassification,
+    pub step_count: usize,
+    pub record_count: usize,
+    pub high_risk_count: usize,
+    pub critical_risk_count: usize,
+    pub overall_risk: TxStepRisk,
+    pub chain_intact: bool,
+    pub timeline: Vec<TxTimelineEntryData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<TxResumeData>,
+    pub records: Vec<TxStepRecordData>,
+    pub redacted_field_count: usize,
+}
+
+// ============================================================================
 // Workflows
 // ============================================================================
 
@@ -3847,5 +4100,343 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"ok\":true"));
         assert!(json.contains("m-test"));
+    }
+
+    // ================================================================
+    // Transactional Execution types
+    // ================================================================
+
+    #[test]
+    fn tx_step_risk_serde_roundtrip() {
+        for risk in [
+            TxStepRisk::Low,
+            TxStepRisk::Medium,
+            TxStepRisk::High,
+            TxStepRisk::Critical,
+        ] {
+            let json = serde_json::to_string(&risk).unwrap();
+            let back: TxStepRisk = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, risk);
+        }
+    }
+
+    #[test]
+    fn tx_step_risk_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TxStepRisk::Critical).unwrap(),
+            "\"critical\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TxStepRisk::Low).unwrap(),
+            "\"low\""
+        );
+    }
+
+    #[test]
+    fn tx_phase_state_serde_roundtrip() {
+        for phase in [
+            TxPhaseState::Planned,
+            TxPhaseState::Preparing,
+            TxPhaseState::Committing,
+            TxPhaseState::Compensating,
+            TxPhaseState::Completed,
+            TxPhaseState::Aborted,
+        ] {
+            let json = serde_json::to_string(&phase).unwrap();
+            let back: TxPhaseState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, phase);
+        }
+    }
+
+    #[test]
+    fn tx_precondition_kind_tagged_serde() {
+        let kind = TxPreconditionKind::ReservationHeld {
+            paths: vec!["src/main.rs".to_string()],
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        assert!(json.contains("\"kind\":\"reservation_held\""));
+        let back: TxPreconditionKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, kind);
+    }
+
+    #[test]
+    fn tx_compensation_kind_tagged_serde() {
+        let kind = TxCompensationKind::RetryWithBackoff { max_retries: 3 };
+        let json = serde_json::to_string(&kind).unwrap();
+        assert!(json.contains("\"kind\":\"retry_with_backoff\""));
+        let back: TxCompensationKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, kind);
+    }
+
+    #[test]
+    fn tx_risk_summary_serde() {
+        let summary = TxRiskSummaryData {
+            total_steps: 5,
+            high_risk_count: 1,
+            critical_risk_count: 0,
+            uncompensated_steps: 0,
+            overall_risk: TxStepRisk::Medium,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: TxRiskSummaryData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total_steps, 5);
+        assert_eq!(back.overall_risk, TxStepRisk::Medium);
+    }
+
+    #[test]
+    fn tx_plan_data_serde_roundtrip() {
+        let plan = TxPlanData {
+            plan_id: "plan-001".to_string(),
+            plan_hash: 0xdeadbeef,
+            steps: vec![TxStepData {
+                id: "s1".to_string(),
+                bead_id: "b1".to_string(),
+                agent_id: "agent-a".to_string(),
+                description: "Deploy service".to_string(),
+                depends_on: vec![],
+                preconditions: vec![TxPreconditionData {
+                    kind: TxPreconditionKind::PolicyApproved,
+                    description: "Policy check".to_string(),
+                    required: true,
+                }],
+                compensations: vec![TxCompensatingActionData {
+                    step_id: "s1".to_string(),
+                    description: "Rollback deploy".to_string(),
+                    action_type: TxCompensationKind::Rollback,
+                }],
+                risk: TxStepRisk::Medium,
+                score: 0.85,
+            }],
+            execution_order: vec!["s1".to_string()],
+            parallel_levels: vec![vec!["s1".to_string()]],
+            risk_summary: TxRiskSummaryData {
+                total_steps: 1,
+                high_risk_count: 0,
+                critical_risk_count: 0,
+                uncompensated_steps: 0,
+                overall_risk: TxStepRisk::Medium,
+            },
+            rejected_edges: vec![],
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: TxPlanData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.plan_id, "plan-001");
+        assert_eq!(back.plan_hash, 0xdeadbeef);
+        assert_eq!(back.steps.len(), 1);
+        assert_eq!(back.steps[0].preconditions.len(), 1);
+        assert_eq!(back.steps[0].compensations.len(), 1);
+    }
+
+    #[test]
+    fn tx_step_outcome_variants_serde() {
+        let outcomes = vec![
+            TxStepOutcome::Success {
+                result: Some("ok".to_string()),
+            },
+            TxStepOutcome::Failed {
+                error_code: "FT-5001".to_string(),
+                error_message: "timeout".to_string(),
+                compensated: true,
+            },
+            TxStepOutcome::Skipped {
+                reason: "precondition unmet".to_string(),
+            },
+            TxStepOutcome::Compensated {
+                compensation_result: "rolled back".to_string(),
+            },
+            TxStepOutcome::Pending,
+        ];
+        for outcome in &outcomes {
+            let json = serde_json::to_string(outcome).unwrap();
+            let back: TxStepOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, outcome);
+        }
+    }
+
+    #[test]
+    fn tx_resume_recommendation_serde() {
+        for rec in [
+            TxResumeRecommendation::ContinueFromCheckpoint,
+            TxResumeRecommendation::RestartFresh,
+            TxResumeRecommendation::CompensateAndAbort,
+            TxResumeRecommendation::AlreadyComplete,
+        ] {
+            let json = serde_json::to_string(&rec).unwrap();
+            let back: TxResumeRecommendation = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, rec);
+        }
+    }
+
+    #[test]
+    fn tx_run_data_serde() {
+        let data = TxRunData {
+            execution_id: "exec-001".to_string(),
+            plan_id: "plan-001".to_string(),
+            plan_hash: 0xbeef,
+            phase: TxPhaseState::Completed,
+            step_count: 2,
+            completed_count: 2,
+            failed_count: 0,
+            skipped_count: 0,
+            records: vec![TxStepRecordData {
+                ordinal: 0,
+                step_id: "s1".to_string(),
+                idem_key: "txk:abc123".to_string(),
+                execution_id: "exec-001".to_string(),
+                timestamp_ms: 1700000000000,
+                outcome: TxStepOutcome::Success { result: None },
+                risk: TxStepRisk::Low,
+                prev_hash: "genesis".to_string(),
+                agent_id: "agent-a".to_string(),
+            }],
+            chain_verification: TxChainVerificationData {
+                chain_intact: true,
+                first_break_at: None,
+                missing_ordinals: vec![],
+                total_records: 1,
+            },
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TxRunData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.execution_id, "exec-001");
+        assert_eq!(back.phase, TxPhaseState::Completed);
+        assert_eq!(back.records.len(), 1);
+        assert!(back.chain_verification.chain_intact);
+    }
+
+    #[test]
+    fn tx_rollback_data_serde() {
+        let data = TxRollbackData {
+            execution_id: "exec-002".to_string(),
+            plan_id: "plan-002".to_string(),
+            phase: TxPhaseState::Compensating,
+            compensated_steps: vec!["s1".to_string(), "s2".to_string()],
+            failed_compensations: vec![],
+            total_compensated: 2,
+            total_failed: 0,
+            chain_verification: TxChainVerificationData {
+                chain_intact: true,
+                first_break_at: None,
+                missing_ordinals: vec![],
+                total_records: 4,
+            },
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TxRollbackData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.compensated_steps.len(), 2);
+        assert_eq!(back.total_compensated, 2);
+    }
+
+    #[test]
+    fn tx_show_data_serde() {
+        let data = TxShowData {
+            execution_id: "exec-003".to_string(),
+            plan_id: "plan-003".to_string(),
+            plan_hash: 0xcafe,
+            phase: TxPhaseState::Completed,
+            classification: TxBundleClassification::TeamReview,
+            step_count: 3,
+            record_count: 3,
+            high_risk_count: 1,
+            critical_risk_count: 0,
+            overall_risk: TxStepRisk::High,
+            chain_intact: true,
+            timeline: vec![TxTimelineEntryData {
+                timestamp_ms: 1700000000000,
+                phase: "commit".to_string(),
+                step_id: "s1".to_string(),
+                kind: "step_committed".to_string(),
+                reason_code: "ok".to_string(),
+                summary: "Step s1 committed".to_string(),
+                agent_id: "agent-a".to_string(),
+                ordinal: Some(0),
+                record_hash: "h123".to_string(),
+            }],
+            resume: None,
+            records: vec![],
+            redacted_field_count: 0,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TxShowData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.execution_id, "exec-003");
+        assert_eq!(back.classification, TxBundleClassification::TeamReview);
+        assert_eq!(back.timeline.len(), 1);
+    }
+
+    #[test]
+    fn tx_show_data_in_robot_envelope() {
+        let data = TxShowData {
+            execution_id: "exec-env".to_string(),
+            plan_id: "plan-env".to_string(),
+            plan_hash: 42,
+            phase: TxPhaseState::Completed,
+            classification: TxBundleClassification::Internal,
+            step_count: 1,
+            record_count: 1,
+            high_risk_count: 0,
+            critical_risk_count: 0,
+            overall_risk: TxStepRisk::Low,
+            chain_intact: true,
+            timeline: vec![],
+            resume: None,
+            records: vec![],
+            redacted_field_count: 0,
+        };
+        let resp = RobotResponse::success(data, 3);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        assert!(json.contains("exec-env"));
+        let back: RobotResponse<TxShowData> = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.data.unwrap().execution_id, "exec-env");
+    }
+
+    #[test]
+    fn tx_chain_verification_omits_empty_fields() {
+        let cv = TxChainVerificationData {
+            chain_intact: true,
+            first_break_at: None,
+            missing_ordinals: vec![],
+            total_records: 10,
+        };
+        let json = serde_json::to_string(&cv).unwrap();
+        assert!(!json.contains("first_break_at"));
+        assert!(!json.contains("missing_ordinals"));
+    }
+
+    #[test]
+    fn tx_resume_data_serde() {
+        let data = TxResumeData {
+            execution_id: "exec-resume".to_string(),
+            plan_id: "plan-resume".to_string(),
+            interrupted_phase: TxPhaseState::Committing,
+            completed_steps: vec!["s1".to_string()],
+            failed_steps: vec!["s2".to_string()],
+            remaining_steps: vec!["s3".to_string()],
+            compensated_steps: vec![],
+            chain_intact: true,
+            last_hash: "h456".to_string(),
+            recommendation: TxResumeRecommendation::ContinueFromCheckpoint,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TxResumeData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.interrupted_phase, TxPhaseState::Committing);
+        assert_eq!(
+            back.recommendation,
+            TxResumeRecommendation::ContinueFromCheckpoint
+        );
+    }
+
+    #[test]
+    fn tx_bundle_classification_serde() {
+        for cls in [
+            TxBundleClassification::Internal,
+            TxBundleClassification::TeamReview,
+            TxBundleClassification::ExternalAudit,
+        ] {
+            let json = serde_json::to_string(&cls).unwrap();
+            let back: TxBundleClassification = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, cls);
+        }
     }
 }
