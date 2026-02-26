@@ -479,6 +479,7 @@ pub mod tx_observability;
 pub mod tx_plan_compiler;
 pub mod undo;
 pub mod union_find;
+pub mod utf8_chunked;
 pub mod user_preferences;
 pub mod van_emde_boas;
 #[cfg(feature = "vc-export")]
