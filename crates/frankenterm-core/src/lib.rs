@@ -329,6 +329,7 @@ pub mod pairing_heap;
 pub mod pane_lifecycle;
 pub mod pane_tiers;
 pub mod pane_typestate;
+pub mod pattern_trigger;
 pub mod patterns;
 pub mod persistent_ds;
 pub mod plan;
