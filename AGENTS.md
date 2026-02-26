@@ -689,7 +689,7 @@ rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
 
 ```
 mcp__morph-mcp__warp_grep(
-  repoPath: "/dp/frankenterm",
+  repoPath: "/data/projects/frankenterm-rch",
   query: "How does the pattern detection engine work?"
 )
 ```
