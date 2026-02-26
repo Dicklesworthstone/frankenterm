@@ -67,6 +67,15 @@ legacy `wa://...` scheme for backward compatibility.
 | `wa.events_triage` | Set/clear an event triage state | `docs/json-schema/wa-robot-event-mutation.json` |
 | `wa.events_label` | Add/remove/list event labels | `docs/json-schema/wa-robot-event-mutation.json` |
 | `wa.workflow_run` | Execute workflow | `docs/json-schema/wa-robot-workflow-run.json` |
+| `wa.tx_plan` | Validate and summarize mission tx contract metadata | Inline (`McpTxPlanData`) |
+| `wa.tx_run` | Execute tx prepare+commit (+compensation on partial failure) | Inline (`McpTxRunData`) |
+| `wa.tx_rollback` | Execute compensation phase for committed tx steps | Inline (`McpTxRollbackData`) |
+| `wa.tx_show` | Inspect tx lifecycle, receipts, and legal transitions | Inline (`McpTxShowData`) |
+| `wa.mission_state` | Query mission lifecycle, assignments, and counters | Inline (`McpMissionStateData`) |
+| `wa.mission_explain` | Show legal transitions, failure catalog, assignment context | Inline (`McpMissionExplainData`) |
+| `wa.mission_pause` | Pause active mission with checkpoint | Inline (`McpMissionControlData`) |
+| `wa.mission_resume` | Resume paused mission, restore prior state | Inline (`McpMissionControlData`) |
+| `wa.mission_abort` | Abort mission, cancel in-flight assignments | Inline (`McpMissionControlData`) |
 | `wa.accounts` | List accounts | `docs/json-schema/wa-robot-accounts.json` |
 | `wa.accounts_refresh` | Refresh account usage | `docs/json-schema/wa-robot-accounts-refresh.json` |
 | `wa.rules_list` | List detection rules | `docs/json-schema/wa-robot-rules-list.json` |
@@ -119,6 +128,33 @@ All tools accept an optional `format?: "json" | "toon"` parameter (default: `jso
 
 - `wa.workflow_run`
   - Params: `{ name: string, pane_id: u64, force?: bool=false, dry_run?: bool=false }`
+
+- `wa.tx_plan`
+  - Params: `{ contract_file?: string }`
+
+- `wa.tx_run`
+  - Params: `{ contract_file?: string, fail_step?: string, paused?: bool=false, kill_switch?: "off"|"safe_mode"|"hard_stop" }`
+
+- `wa.tx_rollback`
+  - Params: `{ contract_file?: string, fail_compensation_for_step?: string }`
+
+- `wa.tx_show`
+  - Params: `{ contract_file?: string, include_contract?: bool=false }`
+
+- `wa.mission_state`
+  - Params: `{ mission_file?: string, mission_state?: string, run_state?: string, agent_state?: string, action_state?: string, assignment_id?: string, assignee?: string, limit?: integer }`
+
+- `wa.mission_explain`
+  - Params: `{ mission_file?: string, assignment_id?: string }`
+
+- `wa.mission_pause`
+  - Params: `{ mission_file?: string, reason: string, requested_by?: string="mcp-agent" }`
+
+- `wa.mission_resume`
+  - Params: `{ mission_file?: string, requested_by?: string="mcp-agent" }`
+
+- `wa.mission_abort`
+  - Params: `{ mission_file?: string, reason: string, requested_by?: string="mcp-agent", error_code?: string }`
 
 - `wa.accounts`
   - Params: `{ service?: string }`
