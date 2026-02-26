@@ -224,11 +224,7 @@ pub enum ProcessResult {
 impl ReplayCheckpointer {
     /// Create a new checkpointer.
     #[must_use]
-    pub fn new(
-        replay_run_id: String,
-        config: CheckpointConfig,
-        failure_mode: FailureMode,
-    ) -> Self {
+    pub fn new(replay_run_id: String, config: CheckpointConfig, failure_mode: FailureMode) -> Self {
         let state = CheckpointState::new(replay_run_id.clone());
         Self {
             config,
@@ -249,7 +245,11 @@ impl ReplayCheckpointer {
     /// Create with default config.
     #[must_use]
     pub fn with_defaults(replay_run_id: String) -> Self {
-        Self::new(replay_run_id, CheckpointConfig::default(), FailureMode::Default)
+        Self::new(
+            replay_run_id,
+            CheckpointConfig::default(),
+            FailureMode::Default,
+        )
     }
 
     /// Record a successfully processed event.
@@ -854,7 +854,11 @@ mod tests {
 
     #[test]
     fn failure_mode_serde() {
-        for mode in [FailureMode::Default, FailureMode::Lenient, FailureMode::Strict] {
+        for mode in [
+            FailureMode::Default,
+            FailureMode::Lenient,
+            FailureMode::Strict,
+        ] {
             let json = serde_json::to_string(&mode).unwrap();
             let back: FailureMode = serde_json::from_str(&json).unwrap();
             assert_eq!(mode, back);

@@ -850,12 +850,12 @@ mod tests {
     #[test]
     fn edges_contain_preceded_by() {
         let graph = DecisionGraph::from_decisions(&sample_events());
-        let preceded: Vec<&CausalEdge> = graph
-            .edges()
-            .iter()
-            .filter(|e| e.edge_type == EdgeType::PrecededBy)
-            .collect();
-        assert!(!preceded.is_empty());
+        assert!(
+            graph
+                .edges()
+                .iter()
+                .any(|e| e.edge_type == EdgeType::PrecededBy)
+        );
     }
 
     // ── L1 equivalence with different node_id assignment ────────────────

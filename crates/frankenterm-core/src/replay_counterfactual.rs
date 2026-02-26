@@ -128,9 +128,7 @@ impl OverridePackage {
     /// Total number of overrides.
     #[must_use]
     pub fn override_count(&self) -> usize {
-        self.pattern_overrides.len()
-            + self.workflow_overrides.len()
-            + self.policy_overrides.len()
+        self.pattern_overrides.len() + self.workflow_overrides.len() + self.policy_overrides.len()
     }
 
     /// Whether this is an empty override package (baseline replay).
@@ -485,10 +483,7 @@ pub struct OverrideManifest {
 impl OverrideManifest {
     /// Build a manifest from a package and optional baseline hash lookup.
     #[must_use]
-    pub fn build(
-        pkg: &OverridePackage,
-        baseline_hashes: &BTreeMap<String, String>,
-    ) -> Self {
+    pub fn build(pkg: &OverridePackage, baseline_hashes: &BTreeMap<String, String>) -> Self {
         let mut entries = Vec::new();
 
         for o in &pkg.pattern_overrides {
@@ -503,16 +498,17 @@ impl OverrideManifest {
                 });
             }
             // If no matches and it's an Add, create entry for the new ID.
-            if o.action == OverrideAction::Add && !o.rule_id.contains('*') {
-                if !baseline_hashes.contains_key(&o.rule_id) {
-                    entries.push(ManifestEntry {
-                        item_id: o.rule_id.clone(),
-                        category: "pattern".to_string(),
-                        action: o.action,
-                        original_hash: None,
-                        override_hash: o.definition_hash.clone(),
-                    });
-                }
+            if o.action == OverrideAction::Add
+                && !o.rule_id.contains('*')
+                && !baseline_hashes.contains_key(&o.rule_id)
+            {
+                entries.push(ManifestEntry {
+                    item_id: o.rule_id.clone(),
+                    category: "pattern".to_string(),
+                    action: o.action,
+                    original_hash: None,
+                    override_hash: o.definition_hash.clone(),
+                });
             }
         }
 
@@ -527,16 +523,17 @@ impl OverrideManifest {
                     override_hash: o.definition_hash.clone(),
                 });
             }
-            if o.action == OverrideAction::Add && !o.workflow_id.contains('*') {
-                if !baseline_hashes.contains_key(&o.workflow_id) {
-                    entries.push(ManifestEntry {
-                        item_id: o.workflow_id.clone(),
-                        category: "workflow".to_string(),
-                        action: o.action,
-                        original_hash: None,
-                        override_hash: o.definition_hash.clone(),
-                    });
-                }
+            if o.action == OverrideAction::Add
+                && !o.workflow_id.contains('*')
+                && !baseline_hashes.contains_key(&o.workflow_id)
+            {
+                entries.push(ManifestEntry {
+                    item_id: o.workflow_id.clone(),
+                    category: "workflow".to_string(),
+                    action: o.action,
+                    original_hash: None,
+                    override_hash: o.definition_hash.clone(),
+                });
             }
         }
 
@@ -551,16 +548,17 @@ impl OverrideManifest {
                     override_hash: o.definition_hash.clone(),
                 });
             }
-            if o.action == OverrideAction::Add && !o.policy_id.contains('*') {
-                if !baseline_hashes.contains_key(&o.policy_id) {
-                    entries.push(ManifestEntry {
-                        item_id: o.policy_id.clone(),
-                        category: "policy".to_string(),
-                        action: o.action,
-                        original_hash: None,
-                        override_hash: o.definition_hash.clone(),
-                    });
-                }
+            if o.action == OverrideAction::Add
+                && !o.policy_id.contains('*')
+                && !baseline_hashes.contains_key(&o.policy_id)
+            {
+                entries.push(ManifestEntry {
+                    item_id: o.policy_id.clone(),
+                    category: "policy".to_string(),
+                    action: o.action,
+                    original_hash: None,
+                    override_hash: o.definition_hash.clone(),
+                });
             }
         }
 
@@ -570,10 +568,7 @@ impl OverrideManifest {
         }
     }
 
-    fn resolve_ids(
-        pattern: &str,
-        baseline: &BTreeMap<String, String>,
-    ) -> Vec<String> {
+    fn resolve_ids(pattern: &str, baseline: &BTreeMap<String, String>) -> Vec<String> {
         if pattern.contains('*') {
             baseline
                 .keys()
@@ -684,11 +679,7 @@ impl OverrideApplicator {
     }
 
     /// Look up override for a pattern rule.
-    pub fn lookup_pattern(
-        &self,
-        rule_id: &str,
-        original_hash: Option<&str>,
-    ) -> LookupResult {
+    pub fn lookup_pattern(&self, rule_id: &str, original_hash: Option<&str>) -> LookupResult {
         if let Some(o) = self.exact_patterns.get(rule_id) {
             return self.apply_pattern_override(o, rule_id, original_hash);
         }
@@ -701,11 +692,7 @@ impl OverrideApplicator {
     }
 
     /// Look up override for a workflow.
-    pub fn lookup_workflow(
-        &self,
-        workflow_id: &str,
-        original_hash: Option<&str>,
-    ) -> LookupResult {
+    pub fn lookup_workflow(&self, workflow_id: &str, original_hash: Option<&str>) -> LookupResult {
         if let Some(o) = self.exact_workflows.get(workflow_id) {
             return self.apply_workflow_override(o, workflow_id, original_hash);
         }
@@ -718,11 +705,7 @@ impl OverrideApplicator {
     }
 
     /// Look up override for a policy.
-    pub fn lookup_policy(
-        &self,
-        policy_id: &str,
-        original_hash: Option<&str>,
-    ) -> LookupResult {
+    pub fn lookup_policy(&self, policy_id: &str, original_hash: Option<&str>) -> LookupResult {
         if let Some(o) = self.exact_policies.get(policy_id) {
             return self.apply_policy_override(o, policy_id, original_hash);
         }
@@ -782,9 +765,7 @@ impl OverrideApplicator {
             OverrideAction::Replace => {
                 LookupResult::Replace(o.new_definition.clone().unwrap_or_default())
             }
-            OverrideAction::Add => {
-                LookupResult::Add(o.new_definition.clone().unwrap_or_default())
-            }
+            OverrideAction::Add => LookupResult::Add(o.new_definition.clone().unwrap_or_default()),
         }
     }
 
@@ -806,9 +787,7 @@ impl OverrideApplicator {
             OverrideAction::Replace => {
                 LookupResult::Replace(o.new_steps.clone().unwrap_or_default())
             }
-            OverrideAction::Add => {
-                LookupResult::Add(o.new_steps.clone().unwrap_or_default())
-            }
+            OverrideAction::Add => LookupResult::Add(o.new_steps.clone().unwrap_or_default()),
         }
     }
 
@@ -830,9 +809,7 @@ impl OverrideApplicator {
             OverrideAction::Replace => {
                 LookupResult::Replace(o.new_rules.clone().unwrap_or_default())
             }
-            OverrideAction::Add => {
-                LookupResult::Add(o.new_rules.clone().unwrap_or_default())
-            }
+            OverrideAction::Add => LookupResult::Add(o.new_rules.clone().unwrap_or_default()),
         }
     }
 }
@@ -1158,7 +1135,10 @@ definition_hash = "0000000000000000"
         let pkg = OverridePackageLoader::load(sample_toml()).unwrap();
         let mut baseline = BTreeMap::new();
         baseline.insert("rate_limit_api".to_string(), "orig_hash_1".to_string());
-        baseline.insert("error_detect_timeout".to_string(), "orig_hash_2".to_string());
+        baseline.insert(
+            "error_detect_timeout".to_string(),
+            "orig_hash_2".to_string(),
+        );
         baseline.insert("deploy_canary".to_string(), "orig_hash_3".to_string());
         baseline.insert("max_retries".to_string(), "orig_hash_4".to_string());
 
@@ -1178,7 +1158,10 @@ definition_hash = "0000000000000000"
         let manifest = OverrideManifest::build(&pkg, &baseline);
         // Should expand rate_limit_* to two entries.
         assert_eq!(manifest.entries.len(), 2);
-        assert!(manifest.entries.iter().all(|e| e.action == OverrideAction::Disable));
+        assert!(manifest
+            .entries
+            .iter()
+            .all(|e| e.action == OverrideAction::Disable));
     }
 
     #[test]
@@ -1275,7 +1258,11 @@ new_definition = "def"
 
     #[test]
     fn override_action_serde() {
-        for action in [OverrideAction::Replace, OverrideAction::Disable, OverrideAction::Add] {
+        for action in [
+            OverrideAction::Replace,
+            OverrideAction::Disable,
+            OverrideAction::Add,
+        ] {
             let json = serde_json::to_string(&action).unwrap();
             let restored: OverrideAction = serde_json::from_str(&json).unwrap();
             assert_eq!(restored, action);

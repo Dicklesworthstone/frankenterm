@@ -150,10 +150,7 @@ pub enum FaultType {
         window_size: usize,
     },
     /// Duplicate matching events.
-    Duplicate {
-        filter: EventFilter,
-        count: usize,
-    },
+    Duplicate { filter: EventFilter, count: usize },
 }
 
 impl FaultType {
@@ -278,12 +275,7 @@ impl FaultPresets {
 
     /// network_partition: delay all events for a duration window.
     #[must_use]
-    pub fn network_partition(
-        start_ms: u64,
-        end_ms: u64,
-        delay_ms: u64,
-        seed: u64,
-    ) -> FaultSpec {
+    pub fn network_partition(start_ms: u64, end_ms: u64, delay_ms: u64, seed: u64) -> FaultSpec {
         FaultSpec {
             name: "network_partition".to_string(),
             description: format!("Delay all events by {delay_ms}ms between {start_ms}-{end_ms}ms"),
@@ -331,13 +323,7 @@ impl FaultLog {
     }
 
     /// Record a fault injection.
-    pub fn record(
-        &mut self,
-        fault_type: &str,
-        event_id: &str,
-        position: u64,
-        description: &str,
-    ) {
+    pub fn record(&mut self, fault_type: &str, event_id: &str, position: u64, description: &str) {
         self.entries.push(FaultLogEntry {
             fault_type: fault_type.to_string(),
             event_id: event_id.to_string(),
@@ -480,7 +466,7 @@ impl FaultInjector {
                                 }
                             }
                         } else if field == "payload" {
-                            evt.payload = mutation.clone();
+                            evt.payload.clone_from(mutation);
                         }
                     }
                     self.log.record(
@@ -547,7 +533,7 @@ impl FaultInjector {
                     buffer.push(event);
                     if buffer.len() >= window_size {
                         self.shuffle_buffer(&mut buffer);
-                        for evt in buffer.drain(..) {
+                        for evt in std::mem::take(&mut buffer) {
                             let processed = self.process(evt);
                             output.extend(processed);
                         }
@@ -556,7 +542,7 @@ impl FaultInjector {
                     // Flush buffer before non-matching event.
                     if !buffer.is_empty() {
                         self.shuffle_buffer(&mut buffer);
-                        for evt in buffer.drain(..) {
+                        for evt in std::mem::take(&mut buffer) {
                             let processed = self.process(evt);
                             output.extend(processed);
                         }
@@ -568,7 +554,7 @@ impl FaultInjector {
             // Flush remaining buffer.
             if !buffer.is_empty() {
                 self.shuffle_buffer(&mut buffer);
-                for evt in buffer.drain(..) {
+                for evt in std::mem::take(&mut buffer) {
                     let processed = self.process(evt);
                     output.extend(processed);
                 }

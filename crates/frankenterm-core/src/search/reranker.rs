@@ -96,19 +96,14 @@ impl Reranker for CrossEncoderReranker {
 // ── B6: Rerank configuration ────────────────────────────────────────────
 
 /// Backend selector for the reranking step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RerankBackend {
     /// No-op: return candidates unchanged (default).
+    #[default]
     Passthrough,
     /// Delegate to frankensearch-rerank adapter (cross-encoder scoring).
     FrankenSearch,
-}
-
-impl Default for RerankBackend {
-    fn default() -> Self {
-        Self::Passthrough
-    }
 }
 
 impl RerankBackend {
@@ -994,7 +989,7 @@ mod tests {
 
     #[test]
     fn rerank_config_serde_absent_defaults() {
-        let json = r#"{}"#;
+        let json = r"{}";
         let cfg: RerankConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.enabled);
         assert_eq!(cfg.backend, RerankBackend::Passthrough);
@@ -1043,10 +1038,7 @@ mod tests {
         let json = serde_json::to_string(&outcome).unwrap();
         assert!(json.contains("too few candidates"));
         let back: RerankOutcome = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            back.skip_reason.as_deref(),
-            Some("too few candidates")
-        );
+        assert_eq!(back.skip_reason.as_deref(), Some("too few candidates"));
     }
 
     // =====================================================================
@@ -1073,7 +1065,8 @@ mod tests {
     fn rerank_fused_disabled_returns_unchanged() {
         let results = make_fused(&[(1, 0.9), (2, 0.8), (3, 0.7)]);
         let config = RerankConfig::default(); // enabled = false
-        let (out, outcome) = rerank_fused_results(results.clone(), &text_for_id, &config, &PassthroughReranker);
+        let (out, outcome) =
+            rerank_fused_results(results.clone(), &text_for_id, &config, &PassthroughReranker);
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].id, 1);
         assert!(!outcome.reranked);
@@ -1086,7 +1079,8 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let (out, outcome) = rerank_fused_results(vec![], &text_for_id, &config, &PassthroughReranker);
+        let (out, outcome) =
+            rerank_fused_results(vec![], &text_for_id, &config, &PassthroughReranker);
         assert!(out.is_empty());
         assert!(!outcome.reranked);
         assert_eq!(outcome.skip_reason.as_deref(), Some("empty results"));
@@ -1100,14 +1094,17 @@ mod tests {
             min_candidates: 5, // need 5, only have 2
             ..Default::default()
         };
-        let (out, outcome) = rerank_fused_results(results, &text_for_id, &config, &PassthroughReranker);
+        let (out, outcome) =
+            rerank_fused_results(results, &text_for_id, &config, &PassthroughReranker);
         assert_eq!(out.len(), 2);
         assert!(!outcome.reranked);
-        assert!(outcome
-            .skip_reason
-            .as_deref()
-            .unwrap()
-            .contains("too few candidates"));
+        assert!(
+            outcome
+                .skip_reason
+                .as_deref()
+                .unwrap()
+                .contains("too few candidates")
+        );
     }
 
     #[test]
@@ -1174,11 +1171,13 @@ mod tests {
             rerank_fused_results(results, &sparse_text, &config, &PassthroughReranker);
         assert_eq!(out.len(), 3);
         assert!(!outcome.reranked);
-        assert!(outcome
-            .skip_reason
-            .as_deref()
-            .unwrap()
-            .contains("too few candidates"));
+        assert!(
+            outcome
+                .skip_reason
+                .as_deref()
+                .unwrap()
+                .contains("too few candidates")
+        );
     }
 
     /// A test reranker that reverses document order and assigns decreasing scores.
@@ -1195,7 +1194,7 @@ mod tests {
             }
             docs.reverse();
             for (i, doc) in docs.iter_mut().enumerate() {
-                doc.score = 1.0 - (i as f32 * 0.1);
+                doc.score = (i as f32).mul_add(-0.1, 1.0);
             }
             Ok(docs)
         }
@@ -1203,13 +1202,7 @@ mod tests {
 
     #[test]
     fn rerank_fused_with_reversing_reranker() {
-        let results = make_fused(&[
-            (1, 0.9),
-            (2, 0.8),
-            (3, 0.7),
-            (4, 0.6),
-            (5, 0.5),
-        ]);
+        let results = make_fused(&[(1, 0.9), (2, 0.8), (3, 0.7), (4, 0.6), (5, 0.5)]);
         let config = RerankConfig {
             enabled: true,
             min_candidates: 3,
@@ -1245,15 +1238,16 @@ mod tests {
             fallback_to_passthrough: true,
             ..Default::default()
         };
-        let (out, outcome) =
-            rerank_fused_results(results, &text_for_id, &config, &FailingReranker);
+        let (out, outcome) = rerank_fused_results(results, &text_for_id, &config, &FailingReranker);
         assert_eq!(out.len(), 5);
         assert!(!outcome.reranked);
-        assert!(outcome
-            .skip_reason
-            .as_deref()
-            .unwrap()
-            .contains("reranker error (fallback)"));
+        assert!(
+            outcome
+                .skip_reason
+                .as_deref()
+                .unwrap()
+                .contains("reranker error (fallback)")
+        );
         // Original order preserved on fallback
         assert_eq!(out[0].id, 1);
     }
@@ -1267,15 +1261,16 @@ mod tests {
             fallback_to_passthrough: false,
             ..Default::default()
         };
-        let (out, outcome) =
-            rerank_fused_results(results, &text_for_id, &config, &FailingReranker);
+        let (out, outcome) = rerank_fused_results(results, &text_for_id, &config, &FailingReranker);
         assert_eq!(out.len(), 5);
         assert!(!outcome.reranked);
-        assert!(outcome
-            .skip_reason
-            .as_deref()
-            .unwrap()
-            .contains("reranker error:"));
+        assert!(
+            outcome
+                .skip_reason
+                .as_deref()
+                .unwrap()
+                .contains("reranker error:")
+        );
     }
 
     // =====================================================================

@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::replay_decision_diff::{DecisionDiff, DiffConfig, EquivalenceLevel};
 use crate::replay_decision_graph::{DecisionEvent, DecisionGraph};
-use crate::replay_guardrails_gate::{EvaluationContext, GateEvaluator, GateResult, RegressionBudget};
+use crate::replay_guardrails_gate::{
+    EvaluationContext, GateEvaluator, GateResult, RegressionBudget,
+};
 use crate::replay_report::{ReportFormat, ReportGenerator, ReportMeta};
 use crate::replay_risk_scoring::RiskScorer;
 
@@ -20,9 +22,10 @@ use crate::replay_risk_scoring::RiskScorer;
 // ============================================================================
 
 /// Output mode for replay CLI commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ReplayOutputMode {
     /// Colored terminal output for humans (default).
+    #[default]
     Human,
     /// Machine-readable JSON (one envelope per line) for robot consumers.
     Robot,
@@ -30,12 +33,6 @@ pub enum ReplayOutputMode {
     Verbose,
     /// Errors only.
     Quiet,
-}
-
-impl Default for ReplayOutputMode {
-    fn default() -> Self {
-        Self::Human
-    }
 }
 
 // ============================================================================
@@ -68,11 +65,12 @@ impl ReplayExitCode {
 // ============================================================================
 
 /// Equivalence level argument for `ft replay run`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EquivalenceLevelArg {
     /// Structural: same decisions, order may differ.
     Structural,
     /// Decision: same decisions, same attributes (ignoring timing).
+    #[default]
     Decision,
     /// Full: exact match including timing.
     Full,
@@ -90,20 +88,16 @@ impl EquivalenceLevelArg {
     }
 }
 
-impl Default for EquivalenceLevelArg {
-    fn default() -> Self {
-        Self::Decision
-    }
-}
 
 // ============================================================================
 // SpeedArg — CLI speed parameter
 // ============================================================================
 
 /// Playback speed for `ft replay run`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub enum SpeedArg {
     /// Real-time (1x).
+    #[default]
     Normal,
     /// Double speed (2x).
     Double,
@@ -140,11 +134,6 @@ impl SpeedArg {
     }
 }
 
-impl Default for SpeedArg {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
 
 // ============================================================================
 // InspectResult — artifact metadata inspection
@@ -479,7 +468,10 @@ mod tests {
 
     #[test]
     fn speed_parse_instant() {
-        assert_eq!(SpeedArg::from_str_arg("instant").unwrap(), SpeedArg::Instant);
+        assert_eq!(
+            SpeedArg::from_str_arg("instant").unwrap(),
+            SpeedArg::Instant
+        );
     }
 
     #[test]
@@ -525,7 +517,10 @@ mod tests {
 
     #[test]
     fn equiv_arg_default() {
-        assert_eq!(EquivalenceLevelArg::default(), EquivalenceLevelArg::Decision);
+        assert_eq!(
+            EquivalenceLevelArg::default(),
+            EquivalenceLevelArg::Decision
+        );
     }
 
     // ── InspectResult ─────────────────────────────────────────────────
@@ -604,7 +599,8 @@ mod tests {
         let runner = DiffRunner::new();
         let events = vec![make_event("r1", 100, 1, "d1", "o1")];
         let result = runner.run(&events, &events, &DiffConfig::default());
-        let formatted = runner.format_result(&result, ReplayOutputMode::Human, &ReportMeta::default());
+        let formatted =
+            runner.format_result(&result, ReplayOutputMode::Human, &ReportMeta::default());
         assert!(!formatted.is_empty());
     }
 
@@ -613,7 +609,8 @@ mod tests {
         let runner = DiffRunner::new();
         let events = vec![make_event("r1", 100, 1, "d1", "o1")];
         let result = runner.run(&events, &events, &DiffConfig::default());
-        let formatted = runner.format_result(&result, ReplayOutputMode::Robot, &ReportMeta::default());
+        let formatted =
+            runner.format_result(&result, ReplayOutputMode::Robot, &ReportMeta::default());
         // Robot mode should be valid JSON.
         let parsed: serde_json::Value = serde_json::from_str(&formatted).unwrap();
         assert!(parsed.is_object());
@@ -624,7 +621,8 @@ mod tests {
         let runner = DiffRunner::new();
         let events = vec![make_event("r1", 100, 1, "d1", "o1")];
         let result = runner.run(&events, &events, &DiffConfig::default());
-        let formatted = runner.format_result(&result, ReplayOutputMode::Quiet, &ReportMeta::default());
+        let formatted =
+            runner.format_result(&result, ReplayOutputMode::Quiet, &ReportMeta::default());
         assert!(formatted.is_empty(), "quiet pass should produce no output");
     }
 
@@ -634,7 +632,8 @@ mod tests {
         let base = vec![make_event("pol_auth", 100, 1, "d1", "o1")];
         let cand = vec![make_event("pol_auth", 100, 1, "d2", "o2")];
         let result = runner.run(&base, &cand, &DiffConfig::default());
-        let formatted = runner.format_result(&result, ReplayOutputMode::Quiet, &ReportMeta::default());
+        let formatted =
+            runner.format_result(&result, ReplayOutputMode::Quiet, &ReportMeta::default());
         assert!(formatted.contains("FAIL"));
     }
 
@@ -699,14 +698,12 @@ mod tests {
 
     #[test]
     fn suite_result_render_human() {
-        let results = vec![
-            ArtifactResult {
-                artifact_path: "a.replay".into(),
-                passed: true,
-                gate_result_summary: "Pass".into(),
-                error: None,
-            },
-        ];
+        let results = vec![ArtifactResult {
+            artifact_path: "a.replay".into(),
+            passed: true,
+            gate_result_summary: "Pass".into(),
+            error: None,
+        }];
         let suite = RegressionSuiteResult::from_results(results);
         let human = suite.render_human();
         assert!(human.contains("Regression Suite Results"));

@@ -410,7 +410,10 @@ impl InMemoryEventStore {
 
     /// Add events to the store.
     pub fn insert(&self, events: impl IntoIterator<Item = RecorderEvent>) {
-        let mut store = self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut store = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         store.extend(events);
         store.sort_by_key(|e| (e.occurred_at_ms, e.sequence));
     }
@@ -418,13 +421,19 @@ impl InMemoryEventStore {
     /// Number of events in the store.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Whether the store is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 }
 
@@ -436,7 +445,10 @@ impl Default for InMemoryEventStore {
 
 impl RecorderEventReader for InMemoryEventStore {
     fn read_events(&self, filter: &EventFilter) -> Vec<RecorderEvent> {
-        let store = self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         store
             .iter()
             .filter(|e| {
@@ -748,7 +760,10 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
                 .with_justification(justification.clone()),
         );
 
-        let mut grants = self.elevation_grants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut grants = self
+            .elevation_grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Remove any existing grant for this actor.
         grants.retain(|g| g.actor != actor);
         grants.push(ElevationGrant {
@@ -762,7 +777,10 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
 
     /// Revoke elevation for an actor.
     pub fn revoke_elevation(&self, actor: &ActorIdentity, now_ms: u64) {
-        let mut grants = self.elevation_grants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut grants = self
+            .elevation_grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let had_grant = grants.iter().any(|g| &g.actor == actor);
         grants.retain(|g| &g.actor != actor);
 
@@ -780,7 +798,10 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
 
     /// Clean up expired elevation grants.
     pub fn expire_grants(&self, now_ms: u64) -> usize {
-        let mut grants = self.elevation_grants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut grants = self
+            .elevation_grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = grants.len();
         let expired: Vec<_> = grants
             .iter()
@@ -806,7 +827,10 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
     /// Get the number of active elevation grants.
     #[must_use]
     pub fn active_grants(&self) -> usize {
-        self.elevation_grants.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+        self.elevation_grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Access the audit log.
@@ -819,7 +843,10 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
     fn effective_tier(&self, actor: &ActorIdentity, now_ms: u64) -> AccessTier {
         let base = AccessTier::default_for_actor(actor.kind);
 
-        let grants = self.elevation_grants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let grants = self
+            .elevation_grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(grant) = grants
             .iter()
             .find(|g| g.actor == *actor && g.is_valid_at(now_ms))
@@ -1036,9 +1063,9 @@ mod tests {
     use crate::policy::ActorKind;
     use crate::recorder_audit::AuditLogConfig;
     use crate::recording::{
-        RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
-        RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
-        RECORDER_EVENT_SCHEMA_VERSION_V1,
+        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEventCausality, RecorderEventPayload,
+        RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind,
+        RecorderTextEncoding,
     };
 
     // -----------------------------------------------------------------------

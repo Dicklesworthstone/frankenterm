@@ -968,7 +968,7 @@ mod tests {
     #[test]
     fn validate_all_scenarios_dependencies_met() {
         let validations = validate_scenario_interfaces();
-        for (_, v) in &validations {
+        for v in validations.values() {
             assert!(v.dependencies_met);
         }
     }

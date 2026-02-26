@@ -456,13 +456,13 @@ mod tests {
 
     #[test]
     fn limits_from_toml() {
-        let toml = r#"
+        let toml = r"
 max_events = 500
 max_wall_clock_ms = 10000
 memory_warning_events = 200
 max_concurrent = 2
 watchdog_timeout_ms = 5000
-"#;
+";
         let limits = ResourceLimits::from_toml(toml).unwrap();
         assert_eq!(limits.max_events, 500);
         assert_eq!(limits.max_concurrent, 2);

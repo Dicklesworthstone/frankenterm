@@ -68,7 +68,11 @@ fn f16_to_f32(half: u16) -> f32 {
 
 /// 8-lane unrolled dot product.
 fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "dot_product: vectors must have equal length");
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "dot_product: vectors must have equal length"
+    );
     let n = a.len();
     let chunks = n / 8;
     let mut sum0 = 0.0f32;

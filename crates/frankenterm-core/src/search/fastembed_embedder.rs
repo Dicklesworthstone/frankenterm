@@ -224,7 +224,9 @@ fn stub_text_embedding() -> fastembed::TextEmbedding {
             fastembed::InitOptions::new(EmbeddingModel::AllMiniLML6V2)
                 .with_show_download_progress(false),
         )
-        .expect("FastEmbedEmbedder::new() requires at least one cached model; use try_new() instead")
+        .expect(
+            "FastEmbedEmbedder::new() requires at least one cached model; use try_new() instead",
+        )
     })
 }
 
@@ -304,9 +306,7 @@ pub enum FastEmbedInitResult {
     /// Model loaded successfully.
     Ok(FastEmbedEmbedder),
     /// Model failed to load. Error message describes why.
-    Degraded {
-        error: String,
-    },
+    Degraded { error: String },
 }
 
 impl std::fmt::Debug for FastEmbedInitResult {
@@ -333,9 +333,7 @@ pub fn try_init_fastembed(config: FastEmbedConfig) -> FastEmbedInitResult {
 ///
 /// This is the recommended entry point for production code. It logs degradation
 /// via `tracing::warn!` and never panics.
-pub fn best_available_embedder(
-    config: FastEmbedConfig,
-) -> (Box<dyn Embedder>, bool) {
+pub fn best_available_embedder(config: FastEmbedConfig) -> (Box<dyn Embedder>, bool) {
     match try_init_fastembed(config) {
         FastEmbedInitResult::Ok(emb) => {
             tracing::info!(
@@ -592,7 +590,9 @@ mod tests {
         let emb = FastEmbedEmbedder::try_new_default().unwrap();
         let v1 = emb.embed("error: compilation failed").unwrap();
         let v2 = emb.embed("error: build failure").unwrap();
-        let v3 = emb.embed("the quick brown fox jumps over the lazy dog").unwrap();
+        let v3 = emb
+            .embed("the quick brown fox jumps over the lazy dog")
+            .unwrap();
 
         let sim_12 = cosine_sim(&v1, &v2);
         let sim_13 = cosine_sim(&v1, &v3);

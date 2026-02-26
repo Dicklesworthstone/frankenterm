@@ -473,10 +473,7 @@ impl SideEffectBarrier for CounterfactualBarrier {
         if let Some(rule) = matched_override {
             // Record the original effect with override annotation.
             let mut metadata = request.metadata.clone();
-            metadata.insert(
-                "override_applied".to_string(),
-                rule.description.clone(),
-            );
+            metadata.insert("override_applied".to_string(), rule.description.clone());
             metadata.insert(
                 "original_payload".to_string(),
                 truncate_payload(&request.payload, 200),
@@ -563,11 +560,7 @@ fn truncate_payload(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
 
-    fn make_request(
-        effect_type: EffectType,
-        pane_id: Option<u64>,
-        payload: &str,
-    ) -> EffectRequest {
+    fn make_request(effect_type: EffectType, pane_id: Option<u64>, payload: &str) -> EffectRequest {
         EffectRequest {
             timestamp_ms: 1000,
             effect_type,
@@ -844,7 +837,10 @@ mod tests {
         let barrier = ReplayBarrier::new();
         let req = make_request(EffectType::SpawnProcess, Some(2), "bash --login");
         barrier.process(&req);
-        let entries = barrier.log().unwrap().effects_of_type(EffectType::SpawnProcess);
+        let entries = barrier
+            .log()
+            .unwrap()
+            .effects_of_type(EffectType::SpawnProcess);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].payload_summary, "bash --login");
     }
@@ -863,7 +859,10 @@ mod tests {
         let barrier = ReplayBarrier::new();
         let req = make_request(EffectType::FileWrite, None, "/tmp/output.json");
         barrier.process(&req);
-        let entries = barrier.log().unwrap().effects_of_type(EffectType::FileWrite);
+        let entries = barrier
+            .log()
+            .unwrap()
+            .effects_of_type(EffectType::FileWrite);
         assert_eq!(entries.len(), 1);
     }
 
@@ -1150,7 +1149,7 @@ mod tests {
         ];
         let req = make_request(EffectType::SendKeys, Some(1), "test");
         let outcomes: Vec<EffectOutcome> = barriers.iter().map(|b| b.process(&req)).collect();
-        assert!(outcomes[0].executed);  // LiveBarrier
+        assert!(outcomes[0].executed); // LiveBarrier
         assert!(!outcomes[1].executed); // ReplayBarrier
         assert!(!outcomes[2].executed); // CounterfactualBarrier
     }
@@ -1244,11 +1243,7 @@ mod tests {
         for et in types {
             let req = make_request(et, Some(1), "payload");
             let outcome = barrier.process(&req);
-            assert!(
-                !outcome.executed,
-                "ReplayBarrier must not execute {:?}",
-                et
-            );
+            assert!(!outcome.executed, "ReplayBarrier must not execute {:?}", et);
         }
         assert_eq!(barrier.log().unwrap().len(), types.len());
     }
@@ -1261,8 +1256,7 @@ mod tests {
         let mut req = make_request(EffectType::SendKeys, Some(1), "test");
         req.metadata
             .insert("workflow_id".to_string(), "wf-123".to_string());
-        req.metadata
-            .insert("step".to_string(), "3".to_string());
+        req.metadata.insert("step".to_string(), "3".to_string());
         barrier.process(&req);
         let entry = &barrier.log().unwrap().entries()[0];
         assert_eq!(entry.metadata.get("workflow_id").unwrap(), "wf-123");

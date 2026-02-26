@@ -28,19 +28,14 @@ use std::sync::atomic::Ordering;
 /// Maps to frankensearch `Priority` for batch coalescer dispatch:
 /// - `Interactive`: tight deadline (~15ms), triggers early batch dispatch
 /// - `Background`: can wait for fuller batches, maximizing throughput
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EmbedPriority {
     /// Search-time query embedding — low latency required.
     Interactive,
     /// Index-time document embedding — throughput preferred.
+    #[default]
     Background,
-}
-
-impl Default for EmbedPriority {
-    fn default() -> Self {
-        Self::Background
-    }
 }
 
 impl EmbedPriority {
@@ -463,13 +458,25 @@ mod tests {
 
     #[test]
     fn priority_parse() {
-        assert_eq!(EmbedPriority::parse("interactive"), EmbedPriority::Interactive);
-        assert_eq!(EmbedPriority::parse("INTERACTIVE"), EmbedPriority::Interactive);
+        assert_eq!(
+            EmbedPriority::parse("interactive"),
+            EmbedPriority::Interactive
+        );
+        assert_eq!(
+            EmbedPriority::parse("INTERACTIVE"),
+            EmbedPriority::Interactive
+        );
         assert_eq!(EmbedPriority::parse("query"), EmbedPriority::Interactive);
         assert_eq!(EmbedPriority::parse("search"), EmbedPriority::Interactive);
         assert_eq!(EmbedPriority::parse("urgent"), EmbedPriority::Interactive);
-        assert_eq!(EmbedPriority::parse("background"), EmbedPriority::Background);
-        assert_eq!(EmbedPriority::parse("BACKGROUND"), EmbedPriority::Background);
+        assert_eq!(
+            EmbedPriority::parse("background"),
+            EmbedPriority::Background
+        );
+        assert_eq!(
+            EmbedPriority::parse("BACKGROUND"),
+            EmbedPriority::Background
+        );
         assert_eq!(EmbedPriority::parse("index"), EmbedPriority::Background);
         assert_eq!(EmbedPriority::parse("unknown"), EmbedPriority::Background);
         assert_eq!(EmbedPriority::parse(""), EmbedPriority::Background);
@@ -500,14 +507,26 @@ mod tests {
 
     #[test]
     fn to_fs_priority_maps_correctly() {
-        assert_eq!(to_fs_priority(EmbedPriority::Interactive), Priority::Interactive);
-        assert_eq!(to_fs_priority(EmbedPriority::Background), Priority::Background);
+        assert_eq!(
+            to_fs_priority(EmbedPriority::Interactive),
+            Priority::Interactive
+        );
+        assert_eq!(
+            to_fs_priority(EmbedPriority::Background),
+            Priority::Background
+        );
     }
 
     #[test]
     fn from_fs_priority_maps_correctly() {
-        assert_eq!(from_fs_priority(Priority::Interactive), EmbedPriority::Interactive);
-        assert_eq!(from_fs_priority(Priority::Background), EmbedPriority::Background);
+        assert_eq!(
+            from_fs_priority(Priority::Interactive),
+            EmbedPriority::Interactive
+        );
+        assert_eq!(
+            from_fs_priority(Priority::Background),
+            EmbedPriority::Background
+        );
     }
 
     #[test]
@@ -545,7 +564,7 @@ mod tests {
 
     #[test]
     fn config_serde_missing_fields_use_defaults() {
-        let json = r#"{}"#;
+        let json = r"{}";
         let cfg: DaemonBridgeConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg, DaemonBridgeConfig::default());
     }
@@ -748,8 +767,16 @@ mod tests {
     fn batch_request_len() {
         let req = BatchEmbedRequest {
             entries: vec![
-                SingleEmbedEntry { id: 1, text: "a".into(), model: None },
-                SingleEmbedEntry { id: 2, text: "b".into(), model: None },
+                SingleEmbedEntry {
+                    id: 1,
+                    text: "a".into(),
+                    model: None,
+                },
+                SingleEmbedEntry {
+                    id: 2,
+                    text: "b".into(),
+                    model: None,
+                },
             ],
             priority: EmbedPriority::Background,
         };
@@ -771,8 +798,16 @@ mod tests {
     fn batch_request_texts() {
         let req = BatchEmbedRequest {
             entries: vec![
-                SingleEmbedEntry { id: 1, text: "hello".into(), model: None },
-                SingleEmbedEntry { id: 2, text: "world".into(), model: Some("hash".into()) },
+                SingleEmbedEntry {
+                    id: 1,
+                    text: "hello".into(),
+                    model: None,
+                },
+                SingleEmbedEntry {
+                    id: 2,
+                    text: "world".into(),
+                    model: Some("hash".into()),
+                },
             ],
             priority: EmbedPriority::Background,
         };
@@ -782,9 +817,11 @@ mod tests {
     #[test]
     fn batch_request_serde_roundtrip() {
         let req = BatchEmbedRequest {
-            entries: vec![
-                SingleEmbedEntry { id: 1, text: "test".into(), model: None },
-            ],
+            entries: vec![SingleEmbedEntry {
+                id: 1,
+                text: "test".into(),
+                model: None,
+            }],
             priority: EmbedPriority::Interactive,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -803,9 +840,21 @@ mod tests {
     #[test]
     fn entries_to_texts_preserves_order() {
         let entries = vec![
-            SingleEmbedEntry { id: 3, text: "third".into(), model: None },
-            SingleEmbedEntry { id: 1, text: "first".into(), model: None },
-            SingleEmbedEntry { id: 2, text: "second".into(), model: None },
+            SingleEmbedEntry {
+                id: 3,
+                text: "third".into(),
+                model: None,
+            },
+            SingleEmbedEntry {
+                id: 1,
+                text: "first".into(),
+                model: None,
+            },
+            SingleEmbedEntry {
+                id: 2,
+                text: "second".into(),
+                model: None,
+            },
         ];
         assert_eq!(entries_to_texts(&entries), vec!["third", "first", "second"]);
     }
@@ -820,8 +869,16 @@ mod tests {
     #[test]
     fn vectors_to_results_pairs_correctly() {
         let entries = vec![
-            SingleEmbedEntry { id: 10, text: "a".into(), model: None },
-            SingleEmbedEntry { id: 20, text: "b".into(), model: None },
+            SingleEmbedEntry {
+                id: 10,
+                text: "a".into(),
+                model: None,
+            },
+            SingleEmbedEntry {
+                id: 20,
+                text: "b".into(),
+                model: None,
+            },
         ];
         let vectors = vec![vec![0.1, 0.2], vec![0.3, 0.4]];
         let results = vectors_to_results(&vectors, &entries, "test-model", 42);
@@ -836,9 +893,11 @@ mod tests {
 
     #[test]
     fn vectors_to_results_truncates_on_mismatch() {
-        let entries = vec![
-            SingleEmbedEntry { id: 1, text: "a".into(), model: None },
-        ];
+        let entries = vec![SingleEmbedEntry {
+            id: 1,
+            text: "a".into(),
+            model: None,
+        }];
         let vectors = vec![vec![0.1], vec![0.2], vec![0.3]];
         let results = vectors_to_results(&vectors, &entries, "m", 0);
         assert_eq!(results.len(), 1);
@@ -912,7 +971,12 @@ mod tests {
         };
         let expl = explain_bridge(&cfg, &m);
         assert!(expl.is_degraded);
-        assert!(expl.degradation_reason.as_deref().unwrap().contains("cache"));
+        assert!(
+            expl.degradation_reason
+                .as_deref()
+                .unwrap()
+                .contains("cache")
+        );
     }
 
     #[test]
@@ -928,7 +992,12 @@ mod tests {
         };
         let expl = explain_bridge(&cfg, &m);
         assert!(expl.is_degraded);
-        assert!(expl.degradation_reason.as_deref().unwrap().contains("batch"));
+        assert!(
+            expl.degradation_reason
+                .as_deref()
+                .unwrap()
+                .contains("batch")
+        );
     }
 
     #[test]

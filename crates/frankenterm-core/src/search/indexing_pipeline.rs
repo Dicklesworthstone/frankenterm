@@ -840,7 +840,7 @@ mod tests {
 
         let result = pipeline.flush(3000).unwrap();
         // Should not panic regardless of whether there's pending data.
-        assert!(result.flushed_docs == 0 || result.flushed_docs > 0);
+        let _ = result.flushed_docs; // Should not panic regardless of pending data.
     }
 
     #[test]

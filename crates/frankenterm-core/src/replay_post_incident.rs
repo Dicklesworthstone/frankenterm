@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn empty_incident_id_error() {
         let input = PostIncidentInput {
-            incident_id: "".into(),
+            incident_id: String::new(),
             recording_path: "test.ftreplay".into(),
             ..sample_input()
         };
@@ -406,7 +406,7 @@ mod tests {
     #[test]
     fn empty_recording_path_error() {
         let input = PostIncidentInput {
-            recording_path: "".into(),
+            recording_path: String::new(),
             ..sample_input()
         };
         let result = validate_input(&input);
@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn pipeline_invalid_input_fails() {
         let input = PostIncidentInput {
-            incident_id: "".into(),
+            incident_id: String::new(),
             recording_path: "test.ftreplay".into(),
             ..sample_input()
         };

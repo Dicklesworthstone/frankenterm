@@ -239,7 +239,10 @@ impl ReportGenerator {
             override_path: self.meta.override_path.clone(),
             equivalence_level: if diff.summary.is_empty() {
                 "L2".into()
-            } else if diff.summary.added == 0 && diff.summary.removed == 0 && diff.summary.modified == 0 {
+            } else if diff.summary.added == 0
+                && diff.summary.removed == 0
+                && diff.summary.modified == 0
+            {
                 "L1".into()
             } else if diff.summary.added == 0 && diff.summary.removed == 0 {
                 "L0".into()
@@ -280,7 +283,10 @@ impl ReportGenerator {
             out.push_str(&format!("| Override | `{}` |\n", self.meta.override_path));
         }
         if self.meta.replay_duration_ms > 0 {
-            out.push_str(&format!("| Duration | {}ms |\n", self.meta.replay_duration_ms));
+            out.push_str(&format!(
+                "| Duration | {}ms |\n",
+                self.meta.replay_duration_ms
+            ));
         }
         out.push('\n');
 
@@ -366,7 +372,10 @@ impl ReportGenerator {
 
     // ── Helpers ────────────────────────────────────────────────────────
 
-    fn sort_by_severity<'a>(&self, diff: &'a DecisionDiff) -> Vec<(&'a Divergence, DivergenceSeverity)> {
+    fn sort_by_severity<'a>(
+        &self,
+        diff: &'a DecisionDiff,
+    ) -> Vec<(&'a Divergence, DivergenceSeverity)> {
         let mut scored: Vec<(&Divergence, DivergenceSeverity)> = diff
             .divergences
             .iter()
@@ -406,10 +415,15 @@ fn format_root_cause(div: &Divergence) -> String {
         RootCause::RuleDefinitionChange { rule_id, .. } => {
             format!("Rule definition changed: {}", rule_id)
         }
-        RootCause::InputDivergence { upstream_rule_id, .. } => {
+        RootCause::InputDivergence {
+            upstream_rule_id, ..
+        } => {
             format!("Input diverged from: {}", upstream_rule_id)
         }
-        RootCause::OverrideApplied { rule_id, override_id } => {
+        RootCause::OverrideApplied {
+            rule_id,
+            override_id,
+        } => {
             format!("Override applied: {} -> {}", override_id, rule_id)
         }
         RootCause::NewDecision { rule_id } => format!("New decision: {}", rule_id),
@@ -471,7 +485,7 @@ mod tests {
             make_event("pol_auth", 300, 1, "def3", "out3"),
         ];
         let cand_events = vec![
-            make_event("rule_a", 100, 1, "def1", "out1"),       // unchanged
+            make_event("rule_a", 100, 1, "def1", "out1"), // unchanged
             make_event("wf_deploy", 200, 1, "def2", "out_mod"), // modified
             make_event("pol_auth", 300, 1, "def3_v2", "out_mod2"), // modified (def change)
         ];
@@ -588,7 +602,9 @@ mod tests {
     fn csv_format_headers() {
         let generator = ReportGenerator::new(sample_meta());
         let report = generator.generate(&sample_diff(), ReportFormat::Csv);
-        assert!(report.starts_with("position,divergence_type,severity,rule_id,root_cause,baseline_output,candidate_output"));
+        assert!(report.starts_with(
+            "position,divergence_type,severity,rule_id,root_cause,baseline_output,candidate_output"
+        ));
     }
 
     #[test]
@@ -596,17 +612,15 @@ mod tests {
         let generator = ReportGenerator::new(sample_meta());
         let diff = sample_diff();
         let report = generator.generate(&diff, ReportFormat::Csv);
-        let lines: Vec<&str> = report.lines().collect();
         // Header + one line per divergence.
-        assert_eq!(lines.len(), 1 + diff.divergences.len());
+        assert_eq!(report.lines().count(), 1 + diff.divergences.len());
     }
 
     #[test]
     fn csv_format_empty_diff() {
         let generator = ReportGenerator::new(sample_meta());
         let report = generator.generate(&empty_diff(), ReportFormat::Csv);
-        let lines: Vec<&str> = report.lines().collect();
-        assert_eq!(lines.len(), 1); // Header only.
+        assert_eq!(report.lines().count(), 1); // Header only.
     }
 
     // ── All formats produce non-empty output ───────────────────────────
@@ -615,9 +629,18 @@ mod tests {
     fn all_formats_nonempty() {
         let generator = ReportGenerator::new(sample_meta());
         let diff = sample_diff();
-        for format in &[ReportFormat::Human, ReportFormat::Json, ReportFormat::Markdown, ReportFormat::Csv] {
+        for format in &[
+            ReportFormat::Human,
+            ReportFormat::Json,
+            ReportFormat::Markdown,
+            ReportFormat::Csv,
+        ] {
             let report = generator.generate(&diff, *format);
-            assert!(!report.is_empty(), "format {:?} should produce non-empty output", format);
+            assert!(
+                !report.is_empty(),
+                "format {:?} should produce non-empty output",
+                format
+            );
         }
     }
 
@@ -660,7 +683,10 @@ mod tests {
             let details = &report[details_start..];
             if let Some(crit_pos) = details.find("Critical") {
                 if let Some(medium_pos) = details.find("Medium") {
-                    assert!(crit_pos < medium_pos, "Critical should appear before Medium");
+                    assert!(
+                        crit_pos < medium_pos,
+                        "Critical should appear before Medium"
+                    );
                 }
             }
         }

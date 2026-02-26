@@ -118,7 +118,8 @@ impl RemediationEngine {
                     rationale: format!(
                         "Rule '{}' definition changed ({} → {}). \
                          If intentional, add an expected-divergence annotation in the PR.",
-                        rule_id, &baseline_hash[..baseline_hash.len().min(8)],
+                        rule_id,
+                        &baseline_hash[..baseline_hash.len().min(8)],
                         &candidate_hash[..candidate_hash.len().min(8)]
                     ),
                     confidence: 0.9,
@@ -137,8 +138,7 @@ impl RemediationEngine {
             }
 
             RootCause::InputDivergence {
-                upstream_rule_id,
-                ..
+                upstream_rule_id, ..
             } => {
                 suggestions.push(Suggestion {
                     action: SuggestionAction::InvestigateUpstream,
@@ -302,7 +302,9 @@ fn build_unknown_suggestion(div: &Divergence, score: &RiskScore) -> Suggestion {
         DivergenceType::Modified => Suggestion {
             action: SuggestionAction::InvestigateUpstream,
             target: rule_id,
-            rationale: "Modified output with unknown root cause. Investigate inputs and rule definition.".into(),
+            rationale:
+                "Modified output with unknown root cause. Investigate inputs and rule definition."
+                    .into(),
             confidence: 0.5,
             effort_estimate: if score.severity >= DivergenceSeverity::High {
                 EffortEstimate::High
@@ -313,14 +315,17 @@ fn build_unknown_suggestion(div: &Divergence, score: &RiskScore) -> Suggestion {
         DivergenceType::Added => Suggestion {
             action: SuggestionAction::AddAnnotation,
             target: rule_id,
-            rationale: "New decision appeared with unknown cause. Add annotation if intentional.".into(),
+            rationale: "New decision appeared with unknown cause. Add annotation if intentional."
+                .into(),
             confidence: 0.6,
             effort_estimate: EffortEstimate::Low,
         },
         DivergenceType::Removed => Suggestion {
             action: SuggestionAction::InvestigateUpstream,
             target: rule_id,
-            rationale: "Decision dropped with unknown cause. Investigate rule matching and input data.".into(),
+            rationale:
+                "Decision dropped with unknown cause. Investigate rule matching and input data."
+                    .into(),
             confidence: 0.5,
             effort_estimate: EffortEstimate::Medium,
         },
@@ -484,7 +489,9 @@ mod tests {
             },
         };
         let suggestions = engine.suggest(&div);
-        let has_revert = suggestions.iter().any(|s| s.action == SuggestionAction::RevertChange);
+        let has_revert = suggestions
+            .iter()
+            .any(|s| s.action == SuggestionAction::RevertChange);
         assert!(has_revert, "high-severity dropped should suggest revert");
     }
 
@@ -561,12 +568,7 @@ mod tests {
                 "r",
                 "r",
             ),
-            make_divergence(
-                DivergenceType::Modified,
-                RootCause::Unknown,
-                "r2",
-                "r2",
-            ),
+            make_divergence(DivergenceType::Modified, RootCause::Unknown, "r2", "r2"),
         ];
         for div in &divergences {
             for s in engine.suggest(div) {
@@ -692,15 +694,12 @@ mod tests {
     fn suggest_all_coverage() {
         let engine = RemediationEngine::new();
         let divergences = vec![
-            make_divergence(
-                DivergenceType::Modified,
-                RootCause::Unknown,
-                "r1",
-                "r1",
-            ),
+            make_divergence(DivergenceType::Modified, RootCause::Unknown, "r1", "r1"),
             make_divergence(
                 DivergenceType::Added,
-                RootCause::NewDecision { rule_id: "r2".into() },
+                RootCause::NewDecision {
+                    rule_id: "r2".into(),
+                },
                 "r2",
                 "r2",
             ),
@@ -708,7 +707,11 @@ mod tests {
         let results = engine.suggest_all(&divergences);
         assert_eq!(results.len(), divergences.len());
         for (i, suggestions) in &results {
-            assert!(!suggestions.is_empty(), "divergence {} has no suggestions", i);
+            assert!(
+                !suggestions.is_empty(),
+                "divergence {} has no suggestions",
+                i
+            );
         }
     }
 
@@ -733,7 +736,11 @@ mod tests {
 
     #[test]
     fn effort_serde() {
-        for effort in &[EffortEstimate::Low, EffortEstimate::Medium, EffortEstimate::High] {
+        for effort in &[
+            EffortEstimate::Low,
+            EffortEstimate::Medium,
+            EffortEstimate::High,
+        ] {
             let json = serde_json::to_string(effort).unwrap();
             let restored: EffortEstimate = serde_json::from_str(&json).unwrap();
             assert_eq!(restored, *effort);
@@ -875,12 +882,7 @@ mod tests {
                 "r",
                 "r",
             ),
-            make_divergence(
-                DivergenceType::Modified,
-                RootCause::Unknown,
-                "r",
-                "r",
-            ),
+            make_divergence(DivergenceType::Modified, RootCause::Unknown, "r", "r"),
         ];
         for div in &test_cases {
             for s in engine.suggest(div) {

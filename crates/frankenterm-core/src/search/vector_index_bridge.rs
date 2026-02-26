@@ -18,18 +18,13 @@ use std::path::{Path, PathBuf};
 use crate::Error;
 
 /// Vector index backend selector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum VectorIndexBackend {
     /// Legacy in-memory FTVI index.
+    #[default]
     Ftvi,
     /// FrankenSearch FSVI file-backed index.
     Fsvi,
-}
-
-impl Default for VectorIndexBackend {
-    fn default() -> Self {
-        Self::Ftvi
-    }
 }
 
 /// A search hit from the FSVI adapter.
@@ -54,7 +49,10 @@ impl FsviAdapter {
     /// Open an existing FSVI index from disk.
     pub fn open(path: &Path) -> Result<Self, Error> {
         let index = VectorIndex::open(path).map_err(|e| {
-            Error::Runtime(format!("failed to open FSVI index at {}: {e}", path.display()))
+            Error::Runtime(format!(
+                "failed to open FSVI index at {}: {e}",
+                path.display()
+            ))
         })?;
         Ok(Self {
             index,
@@ -63,11 +61,7 @@ impl FsviAdapter {
     }
 
     /// Create a new empty FSVI index.
-    pub fn create(
-        path: &Path,
-        embedder_id: &str,
-        dimension: usize,
-    ) -> Result<Self, Error> {
+    pub fn create(path: &Path, embedder_id: &str, dimension: usize) -> Result<Self, Error> {
         let writer = VectorIndex::create(path, embedder_id, dimension).map_err(|e| {
             Error::Runtime(format!(
                 "failed to create FSVI index at {}: {e}",
@@ -116,9 +110,9 @@ impl FsviAdapter {
     /// Append a vector with a u64 ID (converted to string doc_id).
     pub fn append(&mut self, id: u64, vector: &[f32]) -> Result<(), Error> {
         let doc_id = id.to_string();
-        self.index.append(&doc_id, vector).map_err(|e| {
-            Error::Runtime(format!("FSVI append failed for id {id}: {e}"))
-        })
+        self.index
+            .append(&doc_id, vector)
+            .map_err(|e| Error::Runtime(format!("FSVI append failed for id {id}: {e}")))
     }
 
     /// Append a batch of (id, vector) pairs.
@@ -127,24 +121,24 @@ impl FsviAdapter {
             .iter()
             .map(|(id, vec)| (id.to_string(), vec.clone()))
             .collect();
-        self.index.append_batch(&string_entries).map_err(|e| {
-            Error::Runtime(format!("FSVI batch append failed: {e}"))
-        })
+        self.index
+            .append_batch(&string_entries)
+            .map_err(|e| Error::Runtime(format!("FSVI batch append failed: {e}")))
     }
 
     /// Soft-delete a document by u64 ID.
     pub fn soft_delete(&mut self, id: u64) -> Result<bool, Error> {
         let doc_id = id.to_string();
-        self.index.soft_delete(&doc_id).map_err(|e| {
-            Error::Runtime(format!("FSVI soft_delete failed for id {id}: {e}"))
-        })
+        self.index
+            .soft_delete(&doc_id)
+            .map_err(|e| Error::Runtime(format!("FSVI soft_delete failed for id {id}: {e}")))
     }
 
     /// Compact the index (merge WAL, vacuum tombstones).
     pub fn compact(&mut self) -> Result<(), Error> {
-        self.index.compact().map_err(|e| {
-            Error::Runtime(format!("FSVI compact failed: {e}"))
-        })?;
+        self.index
+            .compact()
+            .map_err(|e| Error::Runtime(format!("FSVI compact failed: {e}")))?;
         Ok(())
     }
 
@@ -194,19 +188,16 @@ pub fn convert_ftvi_to_fsvi(
 ) -> Result<usize, Error> {
     use super::vector_index::FtviIndex;
 
-    let ftvi = FtviIndex::from_bytes(ftvi_data).map_err(|e| {
-        Error::Runtime(format!("failed to parse FTVI data: {e}"))
-    })?;
+    let ftvi = FtviIndex::from_bytes(ftvi_data)
+        .map_err(|e| Error::Runtime(format!("failed to parse FTVI data: {e}")))?;
 
     if ftvi.is_empty() {
         // Create an empty FSVI index
-        let writer =
-            VectorIndex::create(output_path, embedder_id, ftvi.dimension()).map_err(|e| {
-                Error::Runtime(format!("failed to create FSVI index: {e}"))
-            })?;
-        writer.finish().map_err(|e| {
-            Error::Runtime(format!("failed to finish FSVI writer: {e}"))
-        })?;
+        let writer = VectorIndex::create(output_path, embedder_id, ftvi.dimension())
+            .map_err(|e| Error::Runtime(format!("failed to create FSVI index: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| Error::Runtime(format!("failed to finish FSVI writer: {e}")))?;
         return Ok(0);
     }
 
@@ -218,14 +209,14 @@ pub fn convert_ftvi_to_fsvi(
         let id = ftvi.id_at(i);
         let vector = ftvi.vector_at(i);
         let doc_id = id.to_string();
-        writer.write_record(&doc_id, vector).map_err(|e| {
-            Error::Runtime(format!("FSVI write_record failed for id {id}: {e}"))
-        })?;
+        writer
+            .write_record(&doc_id, vector)
+            .map_err(|e| Error::Runtime(format!("FSVI write_record failed for id {id}: {e}")))?;
     }
 
-    writer.finish().map_err(|e| {
-        Error::Runtime(format!("failed to finish FSVI writer: {e}"))
-    })?;
+    writer
+        .finish()
+        .map_err(|e| Error::Runtime(format!("failed to finish FSVI writer: {e}")))?;
 
     Ok(count)
 }
@@ -262,8 +253,8 @@ impl FsviAdapter {
 
 #[cfg(test)]
 mod tests {
+    use super::super::vector_index::{FtviIndex, write_ftvi_vec};
     use super::*;
-    use super::super::vector_index::{write_ftvi_vec, FtviIndex};
     use tempfile::TempDir;
 
     fn temp_fsvi_path(dir: &TempDir, name: &str) -> PathBuf {
@@ -434,14 +425,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn convert_preserves_search_ordering() {
         let dir = TempDir::new().unwrap();
 
-        let records: Vec<(u64, &[f32])> = vec![
-            (10, &[1.0, 0.0]),
-            (20, &[0.0, 1.0]),
-            (30, &[0.9, 0.1]),
-        ];
+        let records: Vec<(u64, &[f32])> =
+            vec![(10, &[1.0, 0.0]), (20, &[0.0, 1.0]), (30, &[0.9, 0.1])];
         let ftvi_data = write_ftvi_vec(2, &records).unwrap();
 
         // Search in FTVI

@@ -2868,9 +2868,10 @@ mod tests {
 
     #[test]
     fn count_decisions_only_counts_policy_and_approval_markers() {
-        let mut events = Vec::new();
-        events.push(make_decision_event("ev-1", 1, 0));
-        events.push(make_ingress_event("ev-2", 1, 1, "hello"));
+        let mut events = vec![
+            make_decision_event("ev-1", 1, 0),
+            make_ingress_event("ev-2", 1, 1, "hello"),
+        ];
         events.push(RecorderEvent {
             schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             event_id: "ev-3".to_string(),
@@ -3654,7 +3655,7 @@ mod tests {
             .migrate_timeline_values(
                 FTREPLAY_FILE_SCHEMA_VERSION,
                 FTREPLAY_FILE_SCHEMA_VERSION,
-                &[event.clone()],
+                std::slice::from_ref(&event),
             )
             .expect("no-op migrate");
         assert_eq!(migrated[0], event);

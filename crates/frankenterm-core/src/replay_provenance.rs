@@ -18,21 +18,16 @@ use std::sync::Mutex;
 // ============================================================================
 
 /// Controls how much detail the provenance emitter captures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceVerbosity {
     /// Decisions only — no input data or event context.
     Minimal,
     /// Decisions + input hashes.
+    #[default]
     Standard,
     /// Decisions + full input data + event context.
     Verbose,
-}
-
-impl Default for ProvenanceVerbosity {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 // ============================================================================
@@ -259,8 +254,7 @@ impl ReplayProvenanceEmitter {
             .filter(|l| !l.trim().is_empty())
             .enumerate()
             .map(|(i, line)| {
-                serde_json::from_str(line)
-                    .map_err(|e| format!("line {}: {}", i + 1, e))
+                serde_json::from_str(line).map_err(|e| format!("line {}: {}", i + 1, e))
             })
             .collect()
     }
@@ -586,8 +580,7 @@ impl ReplayAuditTrail {
             .filter(|l| !l.trim().is_empty())
             .enumerate()
             .map(|(i, line)| {
-                serde_json::from_str(line)
-                    .map_err(|e| format!("line {}: {}", i + 1, e))
+                serde_json::from_str(line).map_err(|e| format!("line {}: {}", i + 1, e))
             })
             .collect()
     }
@@ -637,11 +630,9 @@ pub fn verify_chain(entries: &[ReplayAuditEntry]) -> AuditChainVerification {
     // Check sequential links.
     for i in 1..entries.len() {
         let prev_hash = entries[i - 1].hash();
-        if entries[i].prev_entry_hash != prev_hash {
-            if chain_intact {
-                chain_intact = false;
-                first_break_at = Some(entries[i].ordinal);
-            }
+        if entries[i].prev_entry_hash != prev_hash && chain_intact {
+            chain_intact = false;
+            first_break_at = Some(entries[i].ordinal);
         }
     }
 
@@ -685,11 +676,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn make_params(
-        event_id: &str,
-        dt: DecisionType,
-        rule: &str,
-    ) -> ProvenanceRecordParams {
+    fn make_params(event_id: &str, dt: DecisionType, rule: &str) -> ProvenanceRecordParams {
         ProvenanceRecordParams {
             event_id: event_id.to_string(),
             decision_type: dt,
@@ -734,7 +721,11 @@ mod tests {
     #[test]
     fn emitter_workflow_step_fields() {
         let emitter = ReplayProvenanceEmitter::with_defaults("run_002".into());
-        emitter.record(make_params("evt_2", DecisionType::WorkflowStep, "wf_step_1"));
+        emitter.record(make_params(
+            "evt_2",
+            DecisionType::WorkflowStep,
+            "wf_step_1",
+        ));
         let e = &emitter.entries()[0];
         assert_eq!(e.decision_type, DecisionType::WorkflowStep);
         assert_eq!(e.rule_id, "wf_step_1");
@@ -743,7 +734,11 @@ mod tests {
     #[test]
     fn emitter_policy_evaluation_fields() {
         let emitter = ReplayProvenanceEmitter::with_defaults("run_003".into());
-        emitter.record(make_params("evt_3", DecisionType::PolicyEvaluation, "policy_x"));
+        emitter.record(make_params(
+            "evt_3",
+            DecisionType::PolicyEvaluation,
+            "policy_x",
+        ));
         let e = &emitter.entries()[0];
         assert_eq!(e.decision_type, DecisionType::PolicyEvaluation);
     }
@@ -830,7 +825,11 @@ mod tests {
     fn emitter_buffer_sink() {
         let emitter = ReplayProvenanceEmitter::with_defaults("run_buf".into());
         for i in 0..5 {
-            emitter.record(make_params(&format!("e{i}"), DecisionType::PatternMatch, "r"));
+            emitter.record(make_params(
+                &format!("e{i}"),
+                DecisionType::PatternMatch,
+                "r",
+            ));
         }
         assert_eq!(emitter.len(), 5);
         let drained = emitter.drain();
@@ -846,7 +845,11 @@ mod tests {
         };
         let emitter = ReplayProvenanceEmitter::new("run_evict".into(), config);
         for i in 0..5 {
-            emitter.record(make_params(&format!("e{i}"), DecisionType::PatternMatch, "r"));
+            emitter.record(make_params(
+                &format!("e{i}"),
+                DecisionType::PatternMatch,
+                "r",
+            ));
         }
         assert_eq!(emitter.len(), 3);
         // Should have the last 3 entries
@@ -914,7 +917,12 @@ mod tests {
     #[test]
     fn trace_push_link() {
         let mut trace = DecisionExplanationTrace::single(
-            0, "e1".into(), "r1".into(), "h".into(), "h".into(), "ok".into(),
+            0,
+            "e1".into(),
+            "r1".into(),
+            "h".into(),
+            "h".into(),
+            "ok".into(),
         );
         assert!(!trace.has_counterfactual);
         trace.push_link(ExplanationLink {
@@ -932,7 +940,12 @@ mod tests {
     #[test]
     fn trace_serde_roundtrip() {
         let trace = DecisionExplanationTrace::single(
-            5, "evt".into(), "rule".into(), "h1".into(), "h2".into(), "out".into(),
+            5,
+            "evt".into(),
+            "rule".into(),
+            "h1".into(),
+            "h2".into(),
+            "out".into(),
         );
         let json = serde_json::to_string(&trace).unwrap();
         let back: DecisionExplanationTrace = serde_json::from_str(&json).unwrap();
@@ -945,10 +958,20 @@ mod tests {
     fn trace_collector_counts() {
         let collector = ExplanationTraceCollector::new();
         collector.add(DecisionExplanationTrace::single(
-            0, "e".into(), "r".into(), "h".into(), "h".into(), "ok".into(),
+            0,
+            "e".into(),
+            "r".into(),
+            "h".into(),
+            "h".into(),
+            "ok".into(),
         ));
         collector.add(DecisionExplanationTrace::single(
-            1, "e".into(), "r".into(), "a".into(), "b".into(), "diff".into(),
+            1,
+            "e".into(),
+            "r".into(),
+            "a".into(),
+            "b".into(),
+            "diff".into(),
         ));
         assert_eq!(collector.len(), 2);
         assert_eq!(collector.counterfactual_count(), 1);

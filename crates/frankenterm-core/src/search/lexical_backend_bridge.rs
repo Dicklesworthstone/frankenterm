@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn config_serde_missing_fields_use_defaults() {
-        let json = r#"{}"#;
+        let json = r"{}";
         let cfg: LexicalBackendConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg, LexicalBackendConfig::default());
     }

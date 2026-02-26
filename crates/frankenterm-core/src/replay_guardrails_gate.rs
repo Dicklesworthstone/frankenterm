@@ -659,13 +659,13 @@ mod tests {
 
     #[test]
     fn budget_from_toml() {
-        let toml = r#"
+        let toml = r"
 max_critical = 1
 max_high = 2
 max_medium = 10
 skip_budget_percent = 15.0
 time_budget_ms = 3600000
-"#;
+";
         let b = RegressionBudget::from_toml(toml).unwrap();
         assert_eq!(b.max_critical, 1);
         assert_eq!(b.max_high, 2);

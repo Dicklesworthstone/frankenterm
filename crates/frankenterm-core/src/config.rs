@@ -4202,13 +4202,13 @@ retention_days = 7
 
     #[test]
     fn safety_trauma_guard_toml_parses() {
-        let toml = r#"
+        let toml = r"
 [safety.trauma_guard]
 enabled = false
 max_consecutive_failures = 6
 similarity_threshold = 0.91
 window_size = 256
-"#;
+";
         let config = Config::from_toml(toml).expect("Failed to parse");
         assert!(!config.safety.trauma_guard.enabled);
         assert_eq!(config.safety.trauma_guard.max_consecutive_failures, 6);

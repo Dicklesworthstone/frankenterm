@@ -533,7 +533,9 @@ pub fn evaluate_gate3_regression(
     });
 
     let mut report = GateReport::new(GateId::Regression, checks, duration_ms, evaluated_at.into());
-    report.evidence_bundle_path = results.evidence_bundle_path.clone();
+    report
+        .evidence_bundle_path
+        .clone_from(&results.evidence_bundle_path);
     report
 }
 
@@ -805,7 +807,7 @@ mod tests {
 
     #[test]
     fn parse_single_waiver_from_pr() {
-        let body = r#"Some PR text.
+        let body = r"Some PR text.
 
 <!-- replay-waiver
 gate: smoke
@@ -815,7 +817,7 @@ author: dev@example.com
 expires: 2026-03-01T00:00:00Z
 -->
 
-More text."#;
+More text.";
         let waivers = parse_waivers(body);
         assert_eq!(waivers.len(), 1);
         assert_eq!(waivers[0].gate, GateId::Smoke);
@@ -830,7 +832,7 @@ More text."#;
 
     #[test]
     fn parse_multiple_waivers() {
-        let body = r#"<!-- replay-waiver
+        let body = r"<!-- replay-waiver
 gate: smoke
 check: *
 reason: Emergency hotfix
@@ -843,7 +845,7 @@ check: performance_budgets
 reason: Known perf regression in new feature
 author: dev
 expires: 2026-04-01T00:00:00Z
--->"#;
+-->";
         let waivers = parse_waivers(body);
         assert_eq!(waivers.len(), 2);
         assert_eq!(waivers[0].gate, GateId::Smoke);
@@ -854,20 +856,20 @@ expires: 2026-04-01T00:00:00Z
 
     #[test]
     fn parse_waiver_missing_reason_skipped() {
-        let body = r#"<!-- replay-waiver
+        let body = r"<!-- replay-waiver
 gate: smoke
 check: test
--->"#;
+-->";
         let waivers = parse_waivers(body);
         assert!(waivers.is_empty());
     }
 
     #[test]
     fn parse_waiver_invalid_gate_skipped() {
-        let body = r#"<!-- replay-waiver
+        let body = r"<!-- replay-waiver
 gate: invalid_gate
 reason: something
--->"#;
+-->";
         let waivers = parse_waivers(body);
         assert!(waivers.is_empty());
     }

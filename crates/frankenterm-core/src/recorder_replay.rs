@@ -1031,9 +1031,9 @@ mod tests {
     use crate::policy::ActorKind;
     use crate::recorder_retention::SensitivityTier;
     use crate::recording::{
-        RecorderControlMarkerType, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
-        RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
-        RecorderSegmentKind, RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+        RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+        RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
+        RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
     };
 
     // -----------------------------------------------------------------------
@@ -1430,9 +1430,11 @@ mod tests {
 
         let frames = session.collect_remaining();
         assert_eq!(frames.len(), 4); // 4 IngressText, 1 LifecycleMarker skipped.
-        assert!(frames
-            .iter()
-            .all(|f| f.event.event_kind == QueryEventKind::IngressText));
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.event.event_kind == QueryEventKind::IngressText)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1702,16 +1704,20 @@ mod tests {
     #[test]
     fn replay_error_display() {
         assert_eq!(ReplayError::EmptySession.to_string(), "no events to replay");
-        assert!(ReplayError::InvalidConfig("bad".into())
+        assert!(
+            ReplayError::InvalidConfig("bad".into())
+                .to_string()
+                .contains("bad")
+        );
+        assert!(
+            ReplayError::SeekOutOfRange {
+                target_ms: 50,
+                min_ms: 100,
+                max_ms: 200
+            }
             .to_string()
-            .contains("bad"));
-        assert!(ReplayError::SeekOutOfRange {
-            target_ms: 50,
-            min_ms: 100,
-            max_ms: 200
-        }
-        .to_string()
-        .contains("50"));
+            .contains("50")
+        );
     }
 
     #[test]
@@ -2375,7 +2381,7 @@ mod tests {
         );
         assert_eq!(
             realtime.advance_to_event(&second, 10_000),
-            Duration::from_millis(1000)
+            Duration::from_secs(1)
         );
         assert_eq!(realtime.snapshot().occurred_at_ms, 1500);
         assert_eq!(realtime.snapshot().recorded_at_ms, 2000);

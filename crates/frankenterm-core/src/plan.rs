@@ -12454,7 +12454,7 @@ mod tests {
             .reservation_intent
             .as_mut()
             .unwrap()
-            .paths = vec!["".to_string()];
+            .paths = vec![String::new()];
 
         let err = mission.validate().unwrap_err();
         assert!(matches!(
@@ -14109,7 +14109,7 @@ mod tests {
         let mut second = first.clone();
         let policy = MissionReplanBackoffPolicy::default();
 
-        let triggers = vec![
+        let triggers = [
             MissionReplanTrigger {
                 kind: MissionReplanTriggerKind::Failed,
                 assignment_id: Some(AssignmentId("assignment:a".to_string())),
@@ -18144,7 +18144,7 @@ mod tests {
 
     #[test]
     fn journal_entry_all_kinds_serde_roundtrip() {
-        let kinds = vec![
+        let kinds = [
             MissionJournalEntryKind::LifecycleTransition {
                 from: MissionLifecycleState::Running,
                 to: MissionLifecycleState::Paused,

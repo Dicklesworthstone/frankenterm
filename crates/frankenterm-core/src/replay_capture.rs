@@ -23,14 +23,14 @@ use std::sync::{Arc, Mutex};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
-use crate::event_id::{generate_event_id_v1, RecorderMergeKey, StreamKind};
+use crate::event_id::{RecorderMergeKey, StreamKind, generate_event_id_v1};
 use crate::ingest::CapturedSegment;
 use crate::policy::Redactor;
 use crate::recording::{
-    captured_kind_to_segment, epoch_ms_now, EgressEvent, EgressTap, GlobalSequence, IngressEvent,
-    IngressOutcome, IngressTap, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
+    EgressEvent, EgressTap, GlobalSequence, IngressEvent, IngressOutcome, IngressTap,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
     RecorderEventSource, RecorderLifecyclePhase, RecorderRedactionLevel, RecorderTextEncoding,
-    RECORDER_EVENT_SCHEMA_VERSION_V1,
+    captured_kind_to_segment, epoch_ms_now,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,7 +69,10 @@ impl CollectingCaptureSink {
 
     /// Return a snapshot of all collected events.
     pub fn events(&self) -> Vec<(RecorderEvent, RecorderMergeKey)> {
-        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Return just the recorder events without merge keys.
@@ -84,7 +87,10 @@ impl CollectingCaptureSink {
 
     /// Return the number of collected events.
     pub fn len(&self) -> usize {
-        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Return true if no events have been collected.
@@ -94,13 +100,19 @@ impl CollectingCaptureSink {
 
     /// Clear all collected events.
     pub fn clear(&self) {
-        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 }
 
 impl CaptureSink for CollectingCaptureSink {
     fn on_event(&self, event: RecorderEvent, merge_key: RecorderMergeKey) {
-        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((event, merge_key));
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((event, merge_key));
     }
 }
 
@@ -671,7 +683,10 @@ impl CaptureAdapter {
 
     /// Get or create a per-pane sequence counter, returning the next value.
     fn next_pane_seq(&self, pane_id: u64) -> u64 {
-        let mut map = self.pane_sequences.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .pane_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let counter = map.entry(pane_id).or_insert_with(|| AtomicU64::new(0));
         counter.fetch_add(1, Ordering::Relaxed)
     }
@@ -2249,9 +2264,11 @@ mod tests {
             RecorderEventPayload::ControlMarker { details, .. } => {
                 assert_eq!(details["redaction_meta"]["sensitivity_tier"], "t3");
                 assert_eq!(details["redaction_meta"]["mode"], "mask");
-                assert!(details["redaction_meta"]["applied"]
-                    .as_bool()
-                    .unwrap_or(false));
+                assert!(
+                    details["redaction_meta"]["applied"]
+                        .as_bool()
+                        .unwrap_or(false)
+                );
             }
             other => panic!("expected ControlMarker, got {other:?}"),
         }

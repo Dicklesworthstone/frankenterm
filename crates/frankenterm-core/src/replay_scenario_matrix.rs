@@ -575,7 +575,7 @@ label = "b"
     fn matrix_result_all_pass() {
         let scenarios = vec![ScenarioResult {
             artifact_label: "a".into(),
-            override_label: "".into(),
+            override_label: String::new(),
             baseline_decisions: vec!["d1".into()],
             candidate_decisions: vec!["d1".into()],
             diff: DiffSummary {
@@ -627,7 +627,7 @@ label = "b"
     fn matrix_result_json_roundtrip() {
         let scenarios = vec![ScenarioResult {
             artifact_label: "test".into(),
-            override_label: "".into(),
+            override_label: String::new(),
             baseline_decisions: vec!["d1".into()],
             candidate_decisions: vec!["d1".into()],
             diff: DiffSummary::default(),

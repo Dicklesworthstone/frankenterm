@@ -97,17 +97,13 @@ pub struct RerankExplanation {
 /// Each entry shows how a document's rank and score changed due to reranking.
 /// Only documents present in both lists are included.
 #[must_use]
-pub fn explain_rerank(
-    originals: &[ScoredDoc],
-    reranked: &[ScoredDoc],
-) -> Vec<RerankExplanation> {
+pub fn explain_rerank(originals: &[ScoredDoc], reranked: &[ScoredDoc]) -> Vec<RerankExplanation> {
     let orig_rank: HashMap<u64, usize> = originals
         .iter()
         .enumerate()
         .map(|(i, d)| (d.id, i))
         .collect();
-    let orig_score: HashMap<u64, f32> =
-        originals.iter().map(|d| (d.id, d.score)).collect();
+    let orig_score: HashMap<u64, f32> = originals.iter().map(|d| (d.id, d.score)).collect();
 
     reranked
         .iter()
@@ -489,13 +485,13 @@ mod tests {
         let exps = explain_rerank(&originals, &reranked);
         assert_eq!(exps.len(), 3);
 
-        let exp3 = exps.iter().find(|e| e.doc_id == 3).unwrap();
-        assert_eq!(exp3.original_rank, 2);
-        assert_eq!(exp3.reranked_rank, 0);
-        assert_eq!(exp3.rank_delta, 2);
+        let explain_doc3 = exps.iter().find(|e| e.doc_id == 3).unwrap();
+        assert_eq!(explain_doc3.original_rank, 2);
+        assert_eq!(explain_doc3.reranked_rank, 0);
+        assert_eq!(explain_doc3.rank_delta, 2);
 
-        let exp1 = exps.iter().find(|e| e.doc_id == 1).unwrap();
-        assert_eq!(exp1.rank_delta, -2);
+        let explain_doc1 = exps.iter().find(|e| e.doc_id == 1).unwrap();
+        assert_eq!(explain_doc1.rank_delta, -2);
     }
 
     #[test]
@@ -668,22 +664,14 @@ mod tests {
 
     #[test]
     fn local_to_fs_adapter_empty_input() {
-        let adapter = LocalToFsRerankerAdapter::new(
-            Box::new(PassthroughReranker),
-            "pt",
-            "pt",
-        );
+        let adapter = LocalToFsRerankerAdapter::new(Box::new(PassthroughReranker), "pt", "pt");
         let result = adapter.rerank_via_bridge("q", &[]);
         assert!(result.is_err());
     }
 
     #[test]
     fn local_to_fs_adapter_preserves_id_mapping() {
-        let adapter = LocalToFsRerankerAdapter::new(
-            Box::new(PassthroughReranker),
-            "pt",
-            "pt",
-        );
+        let adapter = LocalToFsRerankerAdapter::new(Box::new(PassthroughReranker), "pt", "pt");
         let docs = vec![RerankDocument {
             doc_id: "12345".into(),
             text: "test".into(),
@@ -694,11 +682,7 @@ mod tests {
 
     #[test]
     fn local_to_fs_adapter_non_numeric_id_fallback() {
-        let adapter = LocalToFsRerankerAdapter::new(
-            Box::new(PassthroughReranker),
-            "pt",
-            "pt",
-        );
+        let adapter = LocalToFsRerankerAdapter::new(Box::new(PassthroughReranker), "pt", "pt");
         let docs = vec![RerankDocument {
             doc_id: "not-a-number".into(),
             text: "test".into(),

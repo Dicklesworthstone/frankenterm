@@ -160,17 +160,11 @@ impl PaneMergeResolver {
         // Seed the heap with the first event from each pane.
         for (cursor_idx, (_pid, _cursor, events)) in pane_cursors.iter().enumerate() {
             if !events.is_empty() {
-                heap.push(Reverse((
-                    events[0].merge_key.clone(),
-                    cursor_idx,
-                    0,
-                )));
+                heap.push(Reverse((events[0].merge_key.clone(), cursor_idx, 0)));
             }
         }
 
-        let mut output = Vec::with_capacity(
-            pane_cursors.iter().map(|(_, _, e)| e.len()).sum(),
-        );
+        let mut output = Vec::with_capacity(pane_cursors.iter().map(|(_, _, e)| e.len()).sum());
 
         while let Some(Reverse((_, cursor_idx, event_idx))) = heap.pop() {
             let (pid, _, events) = &pane_cursors[cursor_idx];
@@ -443,10 +437,7 @@ mod tests {
     #[test]
     fn gap_markers_included_by_default() {
         let mut resolver = PaneMergeResolver::with_defaults();
-        resolver.add_pane_stream(
-            1,
-            vec![ev(100, 1, 0), gap(200, 1, 1), ev(300, 1, 2)],
-        );
+        resolver.add_pane_stream(1, vec![ev(100, 1, 0), gap(200, 1, 1), ev(300, 1, 2)]);
         let merged = resolver.merge();
         assert_eq!(merged.len(), 3);
         assert!(merged[1].is_gap_marker);
@@ -459,10 +450,7 @@ mod tests {
             ..Default::default()
         };
         let mut resolver = PaneMergeResolver::new(config);
-        resolver.add_pane_stream(
-            1,
-            vec![ev(100, 1, 0), gap(200, 1, 1), ev(300, 1, 2)],
-        );
+        resolver.add_pane_stream(1, vec![ev(100, 1, 0), gap(200, 1, 1), ev(300, 1, 2)]);
         let merged = resolver.merge();
         assert_eq!(merged.len(), 2);
         assert!(!merged.iter().any(|e| e.is_gap_marker));
@@ -565,7 +553,10 @@ mod tests {
             .map(|e| e.merge_key.event_id.clone())
             .collect();
 
-        assert_eq!(m1, m2, "Merge must be deterministic regardless of insertion order");
+        assert_eq!(
+            m1, m2,
+            "Merge must be deterministic regardless of insertion order"
+        );
     }
 
     #[test]
@@ -592,10 +583,7 @@ mod tests {
             include_gap_markers: true,
         };
         let mut resolver = PaneMergeResolver::new(config);
-        resolver.add_pane_stream(
-            1,
-            vec![ev(100, 1, 0), gap(200, 1, 1), ev(5000, 1, 2)],
-        );
+        resolver.add_pane_stream(1, vec![ev(100, 1, 0), gap(200, 1, 1), ev(5000, 1, 2)]);
         resolver.merge();
         let stats = resolver.stats();
         assert_eq!(stats.total_events, 3);
@@ -653,7 +641,10 @@ mod tests {
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: MergeConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(config.future_skew_threshold_ms, back.future_skew_threshold_ms);
+        assert_eq!(
+            config.future_skew_threshold_ms,
+            back.future_skew_threshold_ms
+        );
         assert_eq!(config.include_gap_markers, back.include_gap_markers);
     }
 
@@ -688,9 +679,8 @@ mod tests {
     fn large_merge_100_panes() {
         let mut resolver = PaneMergeResolver::with_defaults();
         for pane in 0..100 {
-            let events: Vec<MergeEvent> = (0..10)
-                .map(|i| ev(pane * 100 + i * 10, pane, i))
-                .collect();
+            let events: Vec<MergeEvent> =
+                (0..10).map(|i| ev(pane * 100 + i * 10, pane, i)).collect();
             resolver.add_pane_stream(pane, events);
         }
         let merged = resolver.merge();

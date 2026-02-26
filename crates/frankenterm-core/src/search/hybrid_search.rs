@@ -1145,14 +1145,19 @@ mod tests {
 
         let fs_ids: Vec<u64> = fs_results.iter().map(|r| r.id).collect();
         let local_ids: Vec<u64> = local_results.iter().map(|r| r.id).collect();
-        assert_eq!(fs_ids, local_ids, "unit-weight frankensearch should match local RRF ranking");
+        assert_eq!(
+            fs_ids, local_ids,
+            "unit-weight frankensearch should match local RRF ranking"
+        );
 
         // Scores should be very close (both compute weight/(k+rank+1) with weight=1.0)
         for (fs, local) in fs_results.iter().zip(local_results.iter()) {
             assert!(
                 (fs.score - local.score).abs() < 1e-5,
                 "score mismatch for id={}: fs={} local={}",
-                fs.id, fs.score, local.score
+                fs.id,
+                fs.score,
+                local.score
             );
         }
     }
