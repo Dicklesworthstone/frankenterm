@@ -17,8 +17,8 @@ use super::{
     WaEventsUnhandledTemplateResource, WaGetTextTool, WaPanesResource, WaReleaseTool,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
     WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
-    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaWaitForTool, WaWorkflowRunTool,
-    WaWorkflowsResource,
+    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
+    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowsResource,
 };
 use mcp_bridge_framework::{FrameworkServer as Server, FrameworkStdioTransport as StdioTransport};
 use std::path::PathBuf;
@@ -51,6 +51,18 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
         .tool(FormatAwareToolHandler::new(WaCassSearchTool))
         .tool(FormatAwareToolHandler::new(WaCassViewTool))
         .tool(FormatAwareToolHandler::new(WaCassStatusTool))
+        .tool(FormatAwareToolHandler::new(WaTxPlanTool::new(Arc::clone(
+            &config,
+        ))))
+        .tool(FormatAwareToolHandler::new(WaTxRunTool::new(Arc::clone(
+            &config,
+        ))))
+        .tool(FormatAwareToolHandler::new(WaTxRollbackTool::new(Arc::clone(
+            &config,
+        ))))
+        .tool(FormatAwareToolHandler::new(WaTxShowTool::new(Arc::clone(
+            &config,
+        ))))
         .resource(WaPanesResource::new(config.ingest.panes.clone()))
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
         .resource(WaRulesResource)

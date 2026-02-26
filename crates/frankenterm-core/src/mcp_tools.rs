@@ -1821,6 +1821,522 @@ impl ToolHandler for WaWorkflowRunTool {
     }
 }
 
+pub(super) struct WaTxPlanTool {
+    config: Arc<Config>,
+}
+
+impl WaTxPlanTool {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ToolHandler for WaTxPlanTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.tx_plan".to_string(),
+            description: Some(
+                "Validate and summarize mission transaction contract metadata (robot parity)"
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "contract_file": { "type": "string", "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)" }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "tx".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: TxPlanParams = if arguments.is_null() {
+            TxPlanParams::default()
+        } else {
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid params: {err}"),
+                        Some("Expected object with optional contract_file".to_string()),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        };
+
+        let contract_path = match mcp_resolve_mission_tx_file_path(
+            self.config.as_ref(),
+            params.contract_file.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let contract = match mcp_load_mission_tx_contract_from_path(&contract_path) {
+            Ok(contract) => contract,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let data = McpTxPlanData {
+            contract_file: contract_path.display().to_string(),
+            tx_id: contract.intent.tx_id.0.clone(),
+            plan_id: contract.plan.plan_id.0.clone(),
+            lifecycle_state: contract.lifecycle_state,
+            step_count: contract.plan.steps.len(),
+            precondition_count: contract.plan.preconditions.len(),
+            compensation_count: contract.plan.compensations.len(),
+            legal_transitions: mcp_tx_transition_info(contract.lifecycle_state),
+        };
+
+        let envelope = McpEnvelope::success(data, elapsed_ms(start));
+        envelope_to_content(envelope)
+    }
+}
+
+pub(super) struct WaTxShowTool {
+    config: Arc<Config>,
+}
+
+impl WaTxShowTool {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ToolHandler for WaTxShowTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.tx_show".to_string(),
+            description: Some(
+                "Inspect mission tx lifecycle, receipts, and legal transitions (robot parity)"
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "contract_file": { "type": "string", "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)" },
+                    "include_contract": { "type": "boolean", "default": false, "description": "Include full contract payload in response" }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "tx".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: TxShowParams = if arguments.is_null() {
+            TxShowParams::default()
+        } else {
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid params: {err}"),
+                        Some(
+                            "Expected object with optional contract_file, include_contract"
+                                .to_string(),
+                        ),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        };
+
+        let contract_path = match mcp_resolve_mission_tx_file_path(
+            self.config.as_ref(),
+            params.contract_file.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let contract = match mcp_load_mission_tx_contract_from_path(&contract_path) {
+            Ok(contract) => contract,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let data = McpTxShowData {
+            contract_file: contract_path.display().to_string(),
+            tx_id: contract.intent.tx_id.0.clone(),
+            plan_id: contract.plan.plan_id.0.clone(),
+            lifecycle_state: contract.lifecycle_state,
+            outcome: contract.outcome.clone(),
+            step_count: contract.plan.steps.len(),
+            precondition_count: contract.plan.preconditions.len(),
+            compensation_count: contract.plan.compensations.len(),
+            receipt_count: contract.receipts.len(),
+            legal_transitions: mcp_tx_transition_info(contract.lifecycle_state),
+            contract: params.include_contract.then_some(contract),
+        };
+
+        let envelope = McpEnvelope::success(data, elapsed_ms(start));
+        envelope_to_content(envelope)
+    }
+}
+
+pub(super) struct WaTxRunTool {
+    config: Arc<Config>,
+}
+
+impl WaTxRunTool {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ToolHandler for WaTxRunTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.tx_run".to_string(),
+            description: Some(
+                "Execute deterministic tx prepare+commit and compensation on partial failure (robot parity)"
+                    .to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "contract_file": { "type": "string", "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)" },
+                    "fail_step": { "type": "string", "description": "Deterministic commit failure injection step_id" },
+                    "paused": { "type": "boolean", "default": false, "description": "Treat mission as paused; commit returns pause-suspended outcome" },
+                    "kill_switch": { "type": "string", "description": "off|safe_mode|hard_stop (safe-mode/hard-stop also accepted)" }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "tx".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: TxRunParams = if arguments.is_null() {
+            TxRunParams::default()
+        } else {
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid params: {err}"),
+                        Some(
+                            "Expected object with optional contract_file, fail_step, paused, kill_switch"
+                                .to_string(),
+                        ),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        };
+
+        let contract_path = match mcp_resolve_mission_tx_file_path(
+            self.config.as_ref(),
+            params.contract_file.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+        let contract = match mcp_load_mission_tx_contract_from_path(&contract_path) {
+            Ok(contract) => contract,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+        let kill_switch = match mcp_parse_mission_kill_switch(params.kill_switch.as_deref()) {
+            Ok(level) => level,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        if let Some(fail_step_id) = params.fail_step.as_deref()
+            && !contract
+                .plan
+                .steps
+                .iter()
+                .any(|step| step.step_id.0 == fail_step_id)
+        {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                format!("Unknown fail_step: {fail_step_id}"),
+                Some("Use step IDs from wa.tx_show(include_contract=true).".to_string()),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
+        let now_ms = i64::try_from(now_ms()).unwrap_or(0);
+        let gate_inputs = mcp_build_tx_prepare_gate_inputs(&contract);
+        let prepare_report = match crate::plan::evaluate_prepare_phase(
+            &contract.intent.tx_id,
+            &contract.plan,
+            &gate_inputs,
+            kill_switch,
+            now_ms,
+        ) {
+            Ok(report) => report,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    "robot.tx_execution_failed",
+                    format!("prepare phase failed: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let mut commit_report = None;
+        let mut compensation_report = None;
+        let mut final_state = match prepare_report.outcome {
+            crate::plan::TxPrepareOutcome::AllReady => crate::plan::MissionTxState::Prepared,
+            crate::plan::TxPrepareOutcome::Denied => crate::plan::MissionTxState::Failed,
+            crate::plan::TxPrepareOutcome::Deferred => crate::plan::MissionTxState::Planned,
+        };
+
+        if prepare_report.outcome.commit_eligible() {
+            let mut prepared_contract = contract.clone();
+            prepared_contract.lifecycle_state = crate::plan::MissionTxState::Prepared;
+            let commit_inputs = mcp_build_tx_commit_step_inputs(
+                &prepared_contract,
+                params.fail_step.as_deref(),
+                now_ms,
+            );
+            let commit = match crate::plan::execute_commit_phase(
+                &prepared_contract,
+                &commit_inputs,
+                kill_switch,
+                params.paused,
+                now_ms,
+            ) {
+                Ok(report) => report,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        "robot.tx_execution_failed",
+                        format!("commit phase failed: {err}"),
+                        None,
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            };
+
+            final_state = commit.outcome.target_tx_state();
+            if matches!(commit.outcome, crate::plan::TxCommitOutcome::PartialFailure) {
+                let mut compensating_contract = prepared_contract.clone();
+                compensating_contract.lifecycle_state = crate::plan::MissionTxState::Compensating;
+                let comp_inputs = mcp_build_tx_compensation_inputs(&commit, None, now_ms);
+                let compensation = match crate::plan::execute_compensation_phase(
+                    &compensating_contract,
+                    &commit,
+                    &comp_inputs,
+                    now_ms,
+                ) {
+                    Ok(report) => report,
+                    Err(err) => {
+                        let envelope = McpEnvelope::<()>::error(
+                            "robot.tx_execution_failed",
+                            format!("compensation phase failed: {err}"),
+                            None,
+                            elapsed_ms(start),
+                        );
+                        return envelope_to_content(envelope);
+                    }
+                };
+                final_state = compensation.outcome.target_tx_state();
+                compensation_report = Some(compensation);
+            }
+
+            commit_report = Some(commit);
+        }
+
+        let data = McpTxRunData {
+            contract_file: contract_path.display().to_string(),
+            tx_id: contract.intent.tx_id.0.clone(),
+            plan_id: contract.plan.plan_id.0.clone(),
+            prepare_report,
+            commit_report,
+            compensation_report,
+            final_state,
+        };
+        let envelope = McpEnvelope::success(data, elapsed_ms(start));
+        envelope_to_content(envelope)
+    }
+}
+
+pub(super) struct WaTxRollbackTool {
+    config: Arc<Config>,
+}
+
+impl WaTxRollbackTool {
+    pub(super) fn new(config: Arc<Config>) -> Self {
+        Self { config }
+    }
+}
+
+impl ToolHandler for WaTxRollbackTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.tx_rollback".to_string(),
+            description: Some(
+                "Execute compensation phase for committed tx steps (robot parity)".to_string(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "contract_file": { "type": "string", "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)" },
+                    "fail_compensation_for_step": { "type": "string", "description": "Deterministic compensation failure injection step_id" }
+                },
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "tx".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+        let params: TxRollbackParams = if arguments.is_null() {
+            TxRollbackParams::default()
+        } else {
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Invalid params: {err}"),
+                        Some(
+                            "Expected object with optional contract_file, fail_compensation_for_step"
+                                .to_string(),
+                        ),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            }
+        };
+
+        let contract_path = match mcp_resolve_mission_tx_file_path(
+            self.config.as_ref(),
+            params.contract_file.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+        let contract = match mcp_load_mission_tx_contract_from_path(&contract_path) {
+            Ok(contract) => contract,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+
+        if let Some(step_id) = params.fail_compensation_for_step.as_deref()
+            && !contract
+                .plan
+                .steps
+                .iter()
+                .any(|step| step.step_id.0 == step_id)
+        {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                format!("Unknown fail_compensation_for_step: {step_id}"),
+                Some("Use step IDs from wa.tx_show(include_contract=true).".to_string()),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
+        let now_ms = i64::try_from(now_ms()).unwrap_or(0);
+        let commit_report = mcp_build_tx_synthetic_commit_report(&contract, now_ms);
+        let comp_inputs = mcp_build_tx_compensation_inputs(
+            &commit_report,
+            params.fail_compensation_for_step.as_deref(),
+            now_ms,
+        );
+        let mut compensating_contract = contract.clone();
+        compensating_contract.lifecycle_state = crate::plan::MissionTxState::Compensating;
+        let compensation_report = match crate::plan::execute_compensation_phase(
+            &compensating_contract,
+            &commit_report,
+            &comp_inputs,
+            now_ms,
+        ) {
+            Ok(report) => report,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    "robot.tx_execution_failed",
+                    format!("rollback compensation failed: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let data = McpTxRollbackData {
+            contract_file: contract_path.display().to_string(),
+            tx_id: contract.intent.tx_id.0.clone(),
+            plan_id: contract.plan.plan_id.0.clone(),
+            final_state: compensation_report.outcome.target_tx_state(),
+            compensation_report,
+        };
+        let envelope = McpEnvelope::success(data, elapsed_ms(start));
+        envelope_to_content(envelope)
+    }
+}
+
 pub(super) struct WaReservationsTool {
     db_path: Arc<PathBuf>,
 }

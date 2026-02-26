@@ -2,12 +2,13 @@
 //!
 //! This module provides a thin MCP surface that mirrors robot-mode semantics.
 
+#[allow(unused_imports)]
 use std::collections::HashMap;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod mcp_framework {
@@ -21,6 +22,7 @@ mod mcp_framework {
     };
 }
 
+#[allow(unused_imports)]
 use mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
     FrameworkMcpResult as McpResult, FrameworkResource as Resource,
@@ -103,7 +105,8 @@ use mcp_resources::{
 use mcp_tools::{
     WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
     WaEventsTool, WaGetTextTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
-    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaWaitForTool, WaWorkflowRunTool,
+    WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
+    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
 };
 
 const MCP_VERSION: &str = "v1";
@@ -409,6 +412,96 @@ struct McpWorkflowRunData {
     step_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     elapsed_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TxPlanParams {
+    #[serde(default)]
+    contract_file: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TxRunParams {
+    #[serde(default)]
+    contract_file: Option<String>,
+    #[serde(default)]
+    fail_step: Option<String>,
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    kill_switch: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TxRollbackParams {
+    #[serde(default)]
+    contract_file: Option<String>,
+    #[serde(default)]
+    fail_compensation_for_step: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TxShowParams {
+    #[serde(default)]
+    contract_file: Option<String>,
+    #[serde(default)]
+    include_contract: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpTxTransitionInfo {
+    kind: String,
+    to: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpTxPlanData {
+    contract_file: String,
+    tx_id: String,
+    plan_id: String,
+    lifecycle_state: crate::plan::MissionTxState,
+    step_count: usize,
+    precondition_count: usize,
+    compensation_count: usize,
+    legal_transitions: Vec<McpTxTransitionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpTxRunData {
+    contract_file: String,
+    tx_id: String,
+    plan_id: String,
+    prepare_report: crate::plan::TxPrepareReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_report: Option<crate::plan::TxCommitReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compensation_report: Option<crate::plan::TxCompensationReport>,
+    final_state: crate::plan::MissionTxState,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpTxRollbackData {
+    contract_file: String,
+    tx_id: String,
+    plan_id: String,
+    compensation_report: crate::plan::TxCompensationReport,
+    final_state: crate::plan::MissionTxState,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpTxShowData {
+    contract_file: String,
+    tx_id: String,
+    plan_id: String,
+    lifecycle_state: crate::plan::MissionTxState,
+    outcome: crate::plan::TxOutcome,
+    step_count: usize,
+    precondition_count: usize,
+    compensation_count: usize,
+    receipt_count: usize,
+    legal_transitions: Vec<McpTxTransitionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contract: Option<crate::plan::MissionTxContract>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1550,6 +1643,197 @@ fn now_ms() -> u64 {
         .map_or(0, |dur| u64::try_from(dur.as_millis()).unwrap_or(u64::MAX))
 }
 
+fn mcp_default_mission_tx_file_path(
+    config: &Config,
+) -> std::result::Result<PathBuf, McpToolError> {
+    let layout = config.workspace_layout(None).map_err(McpToolError::from_error)?;
+    Ok(layout.ft_dir.join("mission").join("tx-active.json"))
+}
+
+fn mcp_resolve_mission_tx_file_path(
+    config: &Config,
+    contract_file: Option<&str>,
+) -> std::result::Result<PathBuf, McpToolError> {
+    match contract_file {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => mcp_default_mission_tx_file_path(config),
+    }
+}
+
+fn mcp_load_mission_tx_contract_from_path(
+    path: &Path,
+) -> std::result::Result<crate::plan::MissionTxContract, McpToolError> {
+    let raw = std::fs::read_to_string(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            McpToolError::new(
+                "robot.tx_not_found",
+                format!("Tx contract file not found: {}", path.display()),
+                Some("Pass contract_file or create .ft/mission/tx-active.json.".to_string()),
+            )
+        } else {
+            McpToolError::new(
+                "robot.tx_read_failed",
+                format!("Failed to read tx contract file {}: {err}", path.display()),
+                None,
+            )
+        }
+    })?;
+
+    let contract: crate::plan::MissionTxContract =
+        serde_json::from_str(&raw).map_err(|err| {
+            McpToolError::new(
+                "robot.tx_invalid_json",
+                format!("Invalid tx contract JSON in {}: {err}", path.display()),
+                Some("Ensure the file matches the MissionTxContract schema.".to_string()),
+            )
+        })?;
+
+    contract.validate().map_err(|err| {
+        McpToolError::new(
+            "robot.tx_validation_failed",
+            format!("Tx contract validation failed: {err}"),
+            Some("Inspect contract via wa.tx_show include_contract=true.".to_string()),
+        )
+    })?;
+
+    Ok(contract)
+}
+
+fn mcp_parse_mission_kill_switch(
+    raw: Option<&str>,
+) -> std::result::Result<crate::plan::MissionKillSwitchLevel, McpToolError> {
+    match raw.unwrap_or("off").trim().to_ascii_lowercase().as_str() {
+        "off" => Ok(crate::plan::MissionKillSwitchLevel::Off),
+        "safe_mode" | "safe-mode" | "safemode" => Ok(crate::plan::MissionKillSwitchLevel::SafeMode),
+        "hard_stop" | "hard-stop" | "hardstop" => Ok(crate::plan::MissionKillSwitchLevel::HardStop),
+        other => Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!("Unknown kill_switch value: {other}"),
+            Some("Valid values: off, safe_mode, hard_stop.".to_string()),
+        )),
+    }
+}
+
+fn mcp_tx_transition_info(state: crate::plan::MissionTxState) -> Vec<McpTxTransitionInfo> {
+    crate::plan::mission_tx_transition_table()
+        .iter()
+        .filter(|rule| rule.from == state)
+        .map(|rule| McpTxTransitionInfo {
+            kind: rule.kind.to_string(),
+            to: rule.to.to_string(),
+        })
+        .collect()
+}
+
+fn mcp_build_tx_prepare_gate_inputs(
+    contract: &crate::plan::MissionTxContract,
+) -> Vec<crate::plan::TxPrepareGateInput> {
+    contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| crate::plan::TxPrepareGateInput {
+            step_id: step.step_id.clone(),
+            policy_passed: true,
+            policy_reason_code: None,
+            reservation_available: true,
+            reservation_reason_code: None,
+            approval_satisfied: true,
+            approval_reason_code: None,
+            target_liveness: true,
+            liveness_reason_code: None,
+        })
+        .collect()
+}
+
+fn mcp_build_tx_commit_step_inputs(
+    contract: &crate::plan::MissionTxContract,
+    fail_step: Option<&str>,
+    completed_at_ms: i64,
+) -> Vec<crate::plan::TxCommitStepInput> {
+    contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| {
+            let should_fail = fail_step == Some(step.step_id.0.as_str());
+            crate::plan::TxCommitStepInput {
+                step_id: step.step_id.clone(),
+                success: !should_fail,
+                reason_code: if should_fail {
+                    "commit_step_failed_injected".to_string()
+                } else {
+                    "commit_step_succeeded".to_string()
+                },
+                error_code: should_fail.then(|| "FTX3999".to_string()),
+                completed_at_ms,
+            }
+        })
+        .collect()
+}
+
+fn mcp_build_tx_compensation_inputs(
+    commit_report: &crate::plan::TxCommitReport,
+    fail_for_step: Option<&str>,
+    completed_at_ms: i64,
+) -> Vec<crate::plan::TxCompensationStepInput> {
+    commit_report
+        .step_results
+        .iter()
+        .filter(|result| result.outcome.is_committed())
+        .map(|result| {
+            let should_fail = fail_for_step == Some(result.step_id.0.as_str());
+            crate::plan::TxCompensationStepInput {
+                for_step_id: result.step_id.clone(),
+                success: !should_fail,
+                reason_code: if should_fail {
+                    "compensation_failed_injected".to_string()
+                } else {
+                    "compensation_succeeded".to_string()
+                },
+                error_code: should_fail.then(|| "FTX4999".to_string()),
+                completed_at_ms,
+            }
+        })
+        .collect()
+}
+
+fn mcp_build_tx_synthetic_commit_report(
+    contract: &crate::plan::MissionTxContract,
+    completed_at_ms: i64,
+) -> crate::plan::TxCommitReport {
+    let step_results = contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| crate::plan::TxCommitStepResult {
+            step_id: step.step_id.clone(),
+            ordinal: step.ordinal,
+            outcome: crate::plan::TxCommitStepOutcome::Committed {
+                reason_code: "synthetic_prior_commit".to_string(),
+            },
+            decision_path: "rollback_synthetic_commit_report".to_string(),
+            completed_at_ms,
+        })
+        .collect::<Vec<_>>();
+
+    crate::plan::TxCommitReport {
+        tx_id: contract.intent.tx_id.clone(),
+        plan_id: contract.plan.plan_id.clone(),
+        outcome: crate::plan::TxCommitOutcome::FullyCommitted,
+        step_results,
+        failure_boundary: None,
+        committed_count: contract.plan.steps.len(),
+        failed_count: 0,
+        skipped_count: 0,
+        decision_path: "rollback_synthetic_commit_report".to_string(),
+        reason_code: "synthetic_all_committed".to_string(),
+        error_code: None,
+        completed_at_ms,
+        receipts: Vec::new(),
+    }
+}
+
 /// Build a redacted summary of MCP tool arguments (keys only, no values).
 fn redact_mcp_args(tool_name: &str, args: &serde_json::Value) -> String {
     let keys = args
@@ -1654,10 +1938,13 @@ mod tests {
     }
 
     fn json_value_strategy() -> impl Strategy<Value = serde_json::Value> {
+        // TOON uses f64 internally (standard JSON semantics), so restrict integers
+        // to the f64-exact range (±2^53) to ensure lossless roundtrip.
+        const F64_INT_MAX: i64 = 1_i64 << 53;
         let leaf = proptest::prop_oneof![
             Just(serde_json::Value::Null),
             any::<bool>().prop_map(serde_json::Value::Bool),
-            any::<i64>().prop_map(|n| serde_json::Value::Number(n.into())),
+            (-F64_INT_MAX..=F64_INT_MAX).prop_map(|n| serde_json::Value::Number(n.into())),
             ".*".prop_map(serde_json::Value::String),
         ];
 
@@ -1674,6 +1961,71 @@ mod tests {
                 ),
             ]
         })
+    }
+
+    fn sample_mcp_tx_contract() -> crate::plan::MissionTxContract {
+        use crate::plan::{
+            MissionActorRole, MissionTxContract, MissionTxState, StepAction, TxCompensation, TxId,
+            TxIntent, TxOutcome, TxPlan, TxPlanId, TxPrecondition, TxStep, TxStepId,
+        };
+
+        let tx_id = TxId("tx:mcp-test".to_string());
+        MissionTxContract {
+            tx_version: crate::plan::MISSION_TX_SCHEMA_VERSION,
+            intent: TxIntent {
+                tx_id: tx_id.clone(),
+                requested_by: MissionActorRole::Dispatcher,
+                summary: "mcp tx test".to_string(),
+                correlation_id: "mcp-tx-corr".to_string(),
+                created_at_ms: 1_704_200_000_000,
+            },
+            plan: TxPlan {
+                plan_id: TxPlanId("tx-plan:mcp-test".to_string()),
+                tx_id,
+                steps: vec![
+                    TxStep {
+                        step_id: TxStepId("tx-step:1".to_string()),
+                        ordinal: 1,
+                        action: StepAction::SendText {
+                            pane_id: 1,
+                            text: "/do-step-1".to_string(),
+                            paste_mode: Some(false),
+                        },
+                    },
+                    TxStep {
+                        step_id: TxStepId("tx-step:2".to_string()),
+                        ordinal: 2,
+                        action: StepAction::SendText {
+                            pane_id: 2,
+                            text: "/do-step-2".to_string(),
+                            paste_mode: Some(true),
+                        },
+                    },
+                ],
+                preconditions: vec![TxPrecondition::PromptActive { pane_id: 1 }],
+                compensations: vec![
+                    TxCompensation {
+                        for_step_id: TxStepId("tx-step:1".to_string()),
+                        action: StepAction::SendText {
+                            pane_id: 1,
+                            text: "/undo-step-1".to_string(),
+                            paste_mode: Some(false),
+                        },
+                    },
+                    TxCompensation {
+                        for_step_id: TxStepId("tx-step:2".to_string()),
+                        action: StepAction::SendText {
+                            pane_id: 2,
+                            text: "/undo-step-2".to_string(),
+                            paste_mode: Some(true),
+                        },
+                    },
+                ],
+            },
+            lifecycle_state: MissionTxState::Planned,
+            outcome: TxOutcome::Pending,
+            receipts: Vec::new(),
+        }
     }
 
     #[test]
@@ -1741,6 +2093,33 @@ mod tests {
         let _decoded = toon_rust::try_decode(&text, None).expect("TOON decode should succeed");
     }
 
+    /// Deep-compare two JSON values allowing ±1 ULP tolerance on numbers.
+    /// TOON uses f64 internally and its encode→json_stringify→parse roundtrip
+    /// can introduce 1 ULP drift on some values. This comparator accounts for
+    /// both the i64/f64 type distinction and the 1 ULP decimal roundtrip issue.
+    fn json_values_equivalent(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+        match (a, b) {
+            (serde_json::Value::Null, serde_json::Value::Null) => true,
+            (serde_json::Value::Bool(x), serde_json::Value::Bool(y)) => x == y,
+            (serde_json::Value::String(x), serde_json::Value::String(y)) => x == y,
+            (serde_json::Value::Number(x), serde_json::Value::Number(y)) => {
+                let fx = x.as_f64().unwrap_or(f64::NAN);
+                let fy = y.as_f64().unwrap_or(f64::NAN);
+                (fx - fy).abs() <= fx.abs().max(fy.abs()).max(1.0) * 2.0 * f64::EPSILON
+            }
+            (serde_json::Value::Array(x), serde_json::Value::Array(y)) => {
+                x.len() == y.len()
+                    && x.iter().zip(y.iter()).all(|(a, b)| json_values_equivalent(a, b))
+            }
+            (serde_json::Value::Object(x), serde_json::Value::Object(y)) => {
+                x.len() == y.len()
+                    && x.iter()
+                        .all(|(k, v)| y.get(k).is_some_and(|yv| json_values_equivalent(v, yv)))
+            }
+            _ => false,
+        }
+    }
+
     proptest::proptest! {
         #[test]
         fn proptest_toon_roundtrip_preserves_json_semantics(value in json_value_strategy()) {
@@ -1750,7 +2129,11 @@ mod tests {
                 .join("\n");
             let decoded_value: serde_json::Value =
                 serde_json::from_str(&decoded_json).expect("decoded TOON should parse as JSON");
-            prop_assert_eq!(decoded_value, value);
+            prop_assert!(
+                json_values_equivalent(&decoded_value, &value),
+                "TOON roundtrip mismatch:\n  decoded: {}\n  original: {}",
+                decoded_value, value,
+            );
         }
 
         #[test]
@@ -1770,7 +2153,11 @@ mod tests {
             .join("\n");
             let decoded_value: serde_json::Value =
                 serde_json::from_str(&decoded_json).expect("decoded TOON should parse as JSON");
-            prop_assert_eq!(decoded_value, value);
+            prop_assert!(
+                json_values_equivalent(&decoded_value, &value),
+                "line decode roundtrip mismatch:\n  decoded: {}\n  original: {}",
+                decoded_value, value,
+            );
         }
 
         #[test]
@@ -1995,6 +2382,76 @@ mod tests {
         assert_eq!(code, MCP_ERR_CONFIG);
     }
 
+    #[test]
+    fn mcp_parse_mission_kill_switch_supports_expected_values() {
+        assert_eq!(
+            mcp_parse_mission_kill_switch(None).expect("default should parse"),
+            crate::plan::MissionKillSwitchLevel::Off
+        );
+        assert_eq!(
+            mcp_parse_mission_kill_switch(Some("safe_mode")).expect("snake case should parse"),
+            crate::plan::MissionKillSwitchLevel::SafeMode
+        );
+        assert_eq!(
+            mcp_parse_mission_kill_switch(Some("hard-stop")).expect("kebab case should parse"),
+            crate::plan::MissionKillSwitchLevel::HardStop
+        );
+        let err = mcp_parse_mission_kill_switch(Some("invalid"))
+            .expect_err("invalid value should fail");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+    }
+
+    #[test]
+    fn mcp_load_mission_tx_contract_maps_errors_and_accepts_valid_contract() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "ft-mcp-tx-loader-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+
+        let missing_path = temp_root.join("missing.json");
+        let missing = mcp_load_mission_tx_contract_from_path(&missing_path)
+            .expect_err("missing path should fail");
+        assert_eq!(missing.code, "robot.tx_not_found");
+
+        let invalid_json_path = temp_root.join("invalid.json");
+        std::fs::write(&invalid_json_path, "{broken").expect("write invalid json");
+        let invalid = mcp_load_mission_tx_contract_from_path(&invalid_json_path)
+            .expect_err("invalid json should fail");
+        assert_eq!(invalid.code, "robot.tx_invalid_json");
+
+        let mut invalid_contract = sample_mcp_tx_contract();
+        invalid_contract.plan.steps.clear();
+        let invalid_contract_path = temp_root.join("invalid-contract.json");
+        std::fs::write(
+            &invalid_contract_path,
+            serde_json::to_string_pretty(&invalid_contract).expect("serialize invalid contract"),
+        )
+        .expect("write invalid contract");
+        let validation = mcp_load_mission_tx_contract_from_path(&invalid_contract_path)
+            .expect_err("invalid contract should fail validation");
+        assert_eq!(validation.code, "robot.tx_validation_failed");
+
+        let valid_contract = sample_mcp_tx_contract();
+        let valid_contract_path = temp_root.join("valid-contract.json");
+        std::fs::write(
+            &valid_contract_path,
+            serde_json::to_string_pretty(&valid_contract).expect("serialize valid contract"),
+        )
+        .expect("write valid contract");
+        let loaded = mcp_load_mission_tx_contract_from_path(&valid_contract_path)
+            .expect("valid contract should load");
+        assert_eq!(loaded.intent.tx_id.0, "tx:mcp-test");
+        assert_eq!(loaded.plan.steps.len(), 2);
+    }
+
+    #[test]
+    fn mcp_tx_transition_info_returns_rules_for_planned_state() {
+        let transitions = mcp_tx_transition_info(crate::plan::MissionTxState::Planned);
+        assert!(!transitions.is_empty());
+    }
+
     // ── Tool definition validation (wa-nu4.3.1.3) ────────────────────────
 
     #[test]
@@ -2013,6 +2470,10 @@ mod tests {
             "wa.search",
             "wa.events",
             "wa.workflow_run",
+            "wa.tx_plan",
+            "wa.tx_run",
+            "wa.tx_rollback",
+            "wa.tx_show",
             "wa.accounts",
             "wa.accounts_refresh",
             "wa.rules_list",
@@ -2042,6 +2503,10 @@ mod tests {
             "wa.wait_for",
             "wa.rules_list",
             "wa.rules_test",
+            "wa.tx_plan",
+            "wa.tx_run",
+            "wa.tx_rollback",
+            "wa.tx_show",
         ];
         for name in &always_present {
             assert!(
@@ -2141,10 +2606,10 @@ mod tests {
         let server = build_server_with_db(&Config::default(), Some(PathBuf::from("wa-test.db")))
             .expect("build mcp server");
         let count = server.tools().len();
-        // 5 non-storage + 12 storage-dependent = 17 total
+        // 9 non-storage + 12 storage-dependent = 21 total
         assert!(
-            count >= 17,
-            "Expected at least 17 tools with DB, got {count}"
+            count >= 21,
+            "Expected at least 21 tools with DB, got {count}"
         );
     }
 

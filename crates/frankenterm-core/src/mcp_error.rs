@@ -18,6 +18,7 @@ pub(crate) const MCP_ERR_RESERVATION_CONFLICT: &str = "FT-MCP-0012";
 pub(crate) const MCP_ERR_CAUT: &str = "FT-MCP-0013";
 pub(crate) const MCP_ERR_CASS: &str = "FT-MCP-0014";
 
+#[derive(Debug)]
 pub(crate) struct McpToolError {
     pub(crate) code: &'static str,
     pub(crate) message: String,
