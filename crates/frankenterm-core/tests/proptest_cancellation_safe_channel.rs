@@ -11,7 +11,7 @@
 //! - Stress patterns (many reserves, selective commits)
 
 use frankenterm_core::cancellation_safe_channel::{
-    tx_channel, ReserveGuard, TxChannelError, TxChannelMetrics, TxChannelRegistry,
+    ReserveGuard, TxChannelError, TxChannelMetrics, TxChannelRegistry, tx_channel,
 };
 use proptest::prelude::*;
 

@@ -15,7 +15,7 @@ fn arb_pair_vec() -> impl Strategy<Value = Vec<(u32, u32)>> {
 }
 
 fn arb_bimap() -> impl Strategy<Value = BiMap<u32, u32>> {
-    arb_pair_vec().prop_map(|pairs| BiMap::from_pairs(pairs))
+    arb_pair_vec().prop_map(BiMap::from_pairs)
 }
 
 fn arb_string_bimap() -> impl Strategy<Value = BiMap<String, String>> {
@@ -23,7 +23,7 @@ fn arb_string_bimap() -> impl Strategy<Value = BiMap<String, String>> {
         ("[a-z]{1,5}".prop_map(|s| s), "[A-Z]{1,5}".prop_map(|s| s)),
         0..20,
     )
-    .prop_map(|pairs| BiMap::from_pairs(pairs))
+    .prop_map(BiMap::from_pairs)
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +144,8 @@ proptest! {
     // 13. is_empty consistent with len
     #[test]
     fn is_empty_consistent(bm in arb_bimap()) {
-        prop_assert_eq!(bm.is_empty(), bm.len() == 0);
+        let len_zero = bm.len() == 0;
+        prop_assert_eq!(bm.is_empty(), len_zero);
     }
 
     // 14. contains_key iff get_by_key is Some

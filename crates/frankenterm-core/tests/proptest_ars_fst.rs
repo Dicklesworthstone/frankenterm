@@ -60,7 +60,7 @@ proptest! {
         let compiler = FstCompiler::with_defaults();
         let index = compiler.compile(&entries).unwrap();
         // Root + at least one node per entry.
-        prop_assert!(index.node_count() >= index.len() + 1);
+        prop_assert!(index.node_count() > index.len());
     }
 
     #[test]

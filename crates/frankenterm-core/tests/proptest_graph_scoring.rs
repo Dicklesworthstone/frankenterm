@@ -1,5 +1,7 @@
 //! Property-based tests for `graph_scoring` — PageRank and betweenness centrality.
 
+#![allow(clippy::float_cmp)]
+
 use proptest::prelude::*;
 
 use frankenterm_core::graph_scoring::*;

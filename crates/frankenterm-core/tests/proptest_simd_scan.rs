@@ -18,7 +18,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::simd_scan::{
-    scan_newlines_and_ansi, scan_newlines_and_ansi_with_state, OutputScanMetrics, OutputScanState,
+    OutputScanMetrics, OutputScanState, scan_newlines_and_ansi, scan_newlines_and_ansi_with_state,
 };
 
 // =============================================================================

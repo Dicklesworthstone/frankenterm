@@ -52,7 +52,7 @@ proptest! {
         root_label in "[a-z]{1,10}",
         child_labels in proptest::collection::vec("[a-z]{1,10}", 1..5),
     ) {
-        let children: Vec<TreeNode> = child_labels.iter().map(|l| TreeNode::leaf(l)).collect();
+        let children: Vec<TreeNode> = child_labels.iter().map(TreeNode::leaf).collect();
         let tree = TreeNode::branch(root_label, children);
         let output = render_tree(&tree);
         for label in &child_labels {

@@ -533,10 +533,10 @@ proptest! {
     // SC-2: Throttle curves are monotonic functions of severity
     #[test]
     fn throttle_curves_monotonic(severity in 0.0..=1.0_f64) {
-        let poll = 1.0 + 3.0 * severity;
+        let poll = 3.0f64.mul_add(severity, 1.0);
         let skip = 0.5 * severity * severity;
         let detect = 0.25 * severity;
-        let buffer = 1.0 - 0.8 * severity;
+        let buffer = (-0.8f64).mul_add(severity, 1.0);
 
         prop_assert!(poll >= 1.0);
         prop_assert!(poll <= 4.0 + 1e-10);

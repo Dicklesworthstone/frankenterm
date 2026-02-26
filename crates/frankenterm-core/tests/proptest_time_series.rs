@@ -69,7 +69,8 @@ proptest! {
     #[test]
     fn is_empty_iff_len_zero(config in arb_config(), points in arb_points(50)) {
         let ts = build_ts(config, &points);
-        prop_assert_eq!(ts.is_empty(), ts.len() == 0);
+        let len_zero = ts.len() == 0;
+        prop_assert_eq!(ts.is_empty(), len_zero);
     }
 
     // 5. latest is the last pushed point (when not evicted)

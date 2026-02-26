@@ -31,6 +31,8 @@ use frankenterm_core::replay_scenario_matrix::{
     RunnerConfig, ScenarioMatrixRunner, ScenarioResult,
 };
 
+type DecisionGenerator = Box<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync>;
+
 // ── Strategies ────────────────────────────────────────────────────────────
 
 fn arb_label() -> impl Strategy<Value = String> {
@@ -407,7 +409,7 @@ proptest! {
             },
         };
         // Generator produces divergent results (override adds extra decision).
-        let dg: Box<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync> =
+        let dg: DecisionGenerator =
             Box::new(|_art, ovr| {
                 if ovr.is_some() {
                     Ok(vec!["d1".into(), "extra".into()])
@@ -440,7 +442,7 @@ proptest! {
             config: RunnerConfig::default(),
         };
         let expected = config.scenario_count();
-        let dg: Box<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync> =
+        let dg: DecisionGenerator =
             Box::new(|_art, _ovr| Ok(vec!["d1".into()]));
         let runner = ScenarioMatrixRunner::new(config, dg);
         let mut events = Vec::new();
@@ -462,7 +464,7 @@ proptest! {
             overrides: vec![],
             config: RunnerConfig::default(),
         };
-        let dg: Box<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync> =
+        let dg: DecisionGenerator =
             Box::new(|_art, _ovr| Ok(vec!["d1".into(), "d2".into()]));
         let runner = ScenarioMatrixRunner::new(config, dg);
         let result = runner.run(|_| {});
@@ -484,7 +486,7 @@ proptest! {
             config: RunnerConfig::default(),
         };
         let expected = config.scenario_count();
-        let dg: Box<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync> =
+        let dg: DecisionGenerator =
             Box::new(|_art, _ovr| Err("fail".into()));
         let runner = ScenarioMatrixRunner::new(config, dg);
         let result = runner.run(|_| {});

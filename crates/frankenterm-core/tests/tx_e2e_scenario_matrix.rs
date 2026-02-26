@@ -680,7 +680,7 @@ fn resume_after_full_pipeline() {
     )
     .unwrap();
 
-    let mut comp_contract = build_contract("resume4", NUM_STEPS, MissionTxState::Compensating);
+    let comp_contract = build_contract("resume4", NUM_STEPS, MissionTxState::Compensating);
     let comp_inputs = success_comp_inputs(NUM_STEPS);
     let comp_report =
         execute_compensation_phase(&comp_contract, &commit_report, &comp_inputs, 20_000).unwrap();

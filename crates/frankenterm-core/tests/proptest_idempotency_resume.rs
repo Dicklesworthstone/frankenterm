@@ -15,11 +15,11 @@
 //! - Idempotency check result should_proceed logic
 
 use frankenterm_core::plan::{
-    execute_commit_phase, reconstruct_tx_resume_state, validate_tx_idempotency,
     MissionActorRole, MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction,
     TxCommitStepInput, TxCompensation, TxExecutionRecord, TxId, TxIdempotencyCheckResult,
-    TxIdempotencyVerdict, TxIntent, TxOutcome, TxPhase, TxPlan, TxPlanId, TxReceipt,
-    TxResumeState, TxStep, TxStepExecutionRecord, TxStepId,
+    TxIdempotencyVerdict, TxIntent, TxOutcome, TxPhase, TxPlan, TxPlanId, TxReceipt, TxResumeState,
+    TxStep, TxStepExecutionRecord, TxStepId, execute_commit_phase, reconstruct_tx_resume_state,
+    validate_tx_idempotency,
 };
 use proptest::prelude::*;
 

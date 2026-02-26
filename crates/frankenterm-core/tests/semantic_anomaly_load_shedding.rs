@@ -407,10 +407,7 @@ fn metrics_accounting_consistency() {
 
     // === Invariant: batches_processed > 0 if anything was processed ===
     if snap.segments_processed > 0 {
-        assert!(
-            snap.batches_processed > 0,
-            "processed > 0 but no batches?"
-        );
+        assert!(snap.batches_processed > 0, "processed > 0 but no batches?");
     }
 
     // === Invariant: avg_batch_fill > 0 if batches were processed ===

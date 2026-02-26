@@ -11,9 +11,9 @@ use frankenterm_core::recorder_replay::{
     ReplayConfig, ReplayEngineRoute, ReplayEquivalenceLevel, ReplayScheduler,
 };
 use frankenterm_core::recording::{
-    RecorderControlMarkerType, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
-    RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
-    RecorderSegmentKind, RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+    RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
+    RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
 use frankenterm_core::replay_capture::{DecisionEvent, DecisionType};
 use proptest::prelude::*;
@@ -47,7 +47,7 @@ fn arb_decision_type() -> impl Strategy<Value = DecisionType> {
 fn make_payload(stream_kind: StreamKind, text: &str, salt: u8) -> RecorderEventPayload {
     match stream_kind {
         StreamKind::Lifecycle => RecorderEventPayload::LifecycleMarker {
-            lifecycle_phase: if salt.is_multiple_of(2) {
+            lifecycle_phase: if salt % 2 == 0 {
                 RecorderLifecyclePhase::CaptureStarted
             } else {
                 RecorderLifecyclePhase::CaptureStopped
@@ -56,7 +56,7 @@ fn make_payload(stream_kind: StreamKind, text: &str, salt: u8) -> RecorderEventP
             details: json!({ "salt": salt, "kind": "lifecycle" }),
         },
         StreamKind::Control => RecorderEventPayload::ControlMarker {
-            control_marker_type: if salt.is_multiple_of(2) {
+            control_marker_type: if salt % 2 == 0 {
                 RecorderControlMarkerType::PolicyDecision
             } else {
                 RecorderControlMarkerType::ApprovalCheckpoint
@@ -460,6 +460,7 @@ proptest! {
         let first_bytes = first.decision_trace_bytes().expect("trace serialization should succeed");
         let second_bytes = second.decision_trace_bytes().expect("trace serialization should succeed");
         prop_assert_eq!(&first_bytes, &second_bytes);
+        #[allow(clippy::naive_bytecount)]
         let newline_count = first_bytes.iter().filter(|byte| **byte == b'\n').count();
         prop_assert_eq!(newline_count, first.decisions().len());
     }

@@ -247,7 +247,6 @@ proptest! {
             max_lineage_depth: 20,
             auto_deprecate_parent: false, // Don't deprecate so we can chain.
             incubate_evolutions: false,   // Active so we can re-evolve.
-            ..Default::default()
         };
         let mut engine = EvolutionEngine::new(config);
         let mut current_id = engine.register_original("c1", vec![1], vec!["v1".into()], 1000);
@@ -310,7 +309,6 @@ proptest! {
             max_lineage_depth: max_depth,
             auto_deprecate_parent: false,
             incubate_evolutions: false,
-            ..Default::default()
         };
         let mut engine = EvolutionEngine::new(config);
         let mut current = engine.register_original("c1", vec![1], vec!["v1".into()], 1000);
@@ -432,9 +430,9 @@ proptest! {
             ids.push(id);
         }
 
-        for i in 0..n_evolve.min(n_originals) {
+        for (i, &parent_id) in ids.iter().enumerate().take(n_evolve.min(n_originals)) {
             let req = EvolutionRequest {
-                parent_reflex_id: ids[i],
+                parent_reflex_id: parent_id,
                 cluster_id: "c1".to_string(),
                 new_trigger_key: vec![i as u8],
                 new_commands: vec!["new".into()],

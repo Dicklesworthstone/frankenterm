@@ -399,6 +399,7 @@ enum WalAction {
 
 /// WAL correctness model corresponding to `wal_correctness.tla`.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct WalModel {
     mem_state: BTreeMap<usize, u8>,
     wal: Vec<WalOp>,

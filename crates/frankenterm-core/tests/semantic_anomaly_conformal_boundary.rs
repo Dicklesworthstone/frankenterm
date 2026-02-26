@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use frankenterm_core::events::EventBus;
 use frankenterm_core::semantic_anomaly::{
-    ConformalAnomalyConfig, ConformalAnomalyDetector, EntropyGateConfig,
-    GatedAnomalyDetector, GatedObservation,
+    ConformalAnomalyConfig, ConformalAnomalyDetector, EntropyGateConfig, GatedAnomalyDetector,
+    GatedObservation,
 };
 use frankenterm_core::semantic_anomaly_watchdog::{SemanticAnomalyWatchdog, WatchdogConfig};
 use frankenterm_core::semantic_shock_response::{
@@ -70,7 +70,9 @@ fn normal_terminal_output(seed: u64) -> Vec<u8> {
 fn orthogonal_payload() -> Vec<u8> {
     let mut payload = Vec::with_capacity(2048);
     // High-entropy binary-like data mixed with Java stack trace.
-    payload.extend_from_slice(b"Exception in thread \"main\" java.lang.OutOfMemoryError: GC overhead limit exceeded\n");
+    payload.extend_from_slice(
+        b"Exception in thread \"main\" java.lang.OutOfMemoryError: GC overhead limit exceeded\n",
+    );
     payload.extend_from_slice(b"\tat java.base/java.util.HashMap.resize(HashMap.java:798)\n");
     payload.extend_from_slice(b"\tat java.base/java.util.HashMap.putVal(HashMap.java:642)\n");
     // Add some high-entropy bytes to make embedding very different.
@@ -130,10 +132,7 @@ fn conformal_detector_detects_orthogonal_shock() {
                 "orthogonal payload should have p_value < alpha(0.05), got {}",
                 shock.p_value
             );
-            assert!(
-                shock.distance > 0.0,
-                "distance should be positive"
-            );
+            assert!(shock.distance > 0.0, "distance should be positive");
             eprintln!(
                 "Shock detected: p_value={:.6}, distance={:.4}",
                 shock.p_value, shock.distance
@@ -197,10 +196,10 @@ fn gated_detector_orthogonal_shock() {
                 "should have calibration data"
             );
         }
-        GatedObservation::Processed {
-            anomaly: None, ..
-        } => {
-            eprintln!("Note: gated detector did not flag orthogonal payload as anomaly (probabilistic)");
+        GatedObservation::Processed { anomaly: None, .. } => {
+            eprintln!(
+                "Note: gated detector did not flag orthogonal payload as anomaly (probabilistic)"
+            );
         }
         GatedObservation::Skipped(decision) => {
             panic!(
@@ -278,9 +277,7 @@ fn full_pipeline_orthogonal_shock_eventbus() {
     let mut detection_events = Vec::new();
     while let Some(Ok(event)) = det_sub.try_recv() {
         if let frankenterm_core::events::Event::PatternDetected {
-            pane_id,
-            detection,
-            ..
+            pane_id, detection, ..
         } = event
         {
             eprintln!(
@@ -302,10 +299,7 @@ fn full_pipeline_orthogonal_shock_eventbus() {
         let (pane_id, detection) = &detection_events[0];
         assert_eq!(*pane_id, 1);
         assert_eq!(detection.event_type, "semantic_anomaly");
-        assert_eq!(
-            detection.rule_id,
-            "core.semantic_anomaly:conformal_shock"
-        );
+        assert_eq!(detection.rule_id, "core.semantic_anomaly:conformal_shock");
     }
 
     watchdog.shutdown();
@@ -365,9 +359,7 @@ fn shock_responder_pause_and_clear_integration() {
     let mut fed_count = 0u32;
     while let Some(Ok(event)) = det_sub.try_recv() {
         if let frankenterm_core::events::Event::PatternDetected {
-            pane_id,
-            detection,
-            ..
+            pane_id, detection, ..
         } = event
         {
             let _ = responder.handle_detection(pane_id, &detection);
@@ -546,10 +538,7 @@ fn embedding_produces_distinct_vectors() {
         dist_anomalous1 > 0.0 && dist_anomalous2 > 0.0,
         "anomalous payload should produce a different embedding"
     );
-    assert!(
-        dist_normal >= 0.0,
-        "distance should be non-negative"
-    );
+    assert!(dist_normal >= 0.0, "distance should be non-negative");
 
     // All embeddings should be unit vectors (length ~1.0).
     let norm1: f32 = normal1.iter().map(|x| x * x).sum::<f32>().sqrt();

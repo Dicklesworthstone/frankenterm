@@ -52,13 +52,8 @@ fn arb_edge_type() -> impl Strategy<Value = EdgeType> {
 }
 
 fn arb_event(index: usize) -> impl Strategy<Value = DecisionEvent> {
-    (
-        arb_decision_type(),
-        "[a-z]{1,6}",
-        0u64..10000,
-        0u64..5,
-    )
-        .prop_map(move |(dt, rule_id, ts_offset, pane_id)| {
+    (arb_decision_type(), "[a-z]{1,6}", 0u64..10000, 0u64..5).prop_map(
+        move |(dt, rule_id, ts_offset, pane_id)| {
             let triggered_by = if index > 0 && index % 3 == 0 {
                 Some((index - 1) as u64)
             } else {
@@ -77,7 +72,8 @@ fn arb_event(index: usize) -> impl Strategy<Value = DecisionEvent> {
                 wall_clock_ms: ts_offset * 2,
                 replay_run_id: "run_prop".into(),
             }
-        })
+        },
+    )
 }
 
 fn arb_events(max_len: usize) -> impl Strategy<Value = Vec<DecisionEvent>> {

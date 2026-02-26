@@ -14,14 +14,14 @@ use proptest::prelude::*;
 // ── Strategies ─────────────────────────────────────────────────────────
 
 fn arb_config() -> impl Strategy<Value = AegisConfig> {
-    (any::<bool>(), any::<bool>(), 40..=120_usize).prop_map(
-        |(structured, overlay, max_width)| AegisConfig {
+    (any::<bool>(), any::<bool>(), 40..=120_usize).prop_map(|(structured, overlay, max_width)| {
+        AegisConfig {
             structured_logging: structured,
             overlay_enabled: overlay,
             overlay_max_width: max_width,
             ..Default::default()
-        },
-    )
+        }
+    })
 }
 
 fn arb_severity() -> impl Strategy<Value = OverlaySeverity> {
@@ -95,7 +95,7 @@ proptest! {
             title: "T".into(),
             summary: "S".into(),
             evidence: vec![],
-            action: "".into(),
+            action: String::new(),
             severity,
         };
         let rendered = card.render(80);
@@ -126,7 +126,7 @@ proptest! {
                 value: value.clone(),
                 intuition: "meaning".into(),
             }],
-            action: "".into(),
+            action: String::new(),
             severity: OverlaySeverity::Info,
         };
         let rendered = card.render(80);

@@ -4,8 +4,8 @@
 //! and the combined anomaly detector.
 
 use frankenterm_core::aegis_entropy_anomaly::{
-    AnomalyDecision, EProcess, EntropyAnomalyConfig, EntropyAnomalyDetector,
-    ErrorDensityTracker, PaneAnomalySnapshot,
+    AnomalyDecision, EProcess, EntropyAnomalyConfig, EntropyAnomalyDetector, ErrorDensityTracker,
+    PaneAnomalySnapshot,
 };
 use proptest::prelude::*;
 
@@ -22,13 +22,13 @@ fn arb_decay() -> impl Strategy<Value = f64> {
 fn arb_config() -> impl Strategy<Value = EntropyAnomalyConfig> {
     (
         arb_alpha(),
-        64..=8192_usize,                // window_bytes
-        1.0..=4.0_f64,                  // collapse_threshold
-        1..=10_usize,                   // min_collapse_streak
-        0.01..=0.5_f64,                 // error_density_threshold
-        arb_decay(),                     // e_value_decay
-        1..=20_usize,                   // warmup_observations
-        10..=100_usize,                 // density_window
+        64..=8192_usize, // window_bytes
+        1.0..=4.0_f64,   // collapse_threshold
+        1..=10_usize,    // min_collapse_streak
+        0.01..=0.5_f64,  // error_density_threshold
+        arb_decay(),     // e_value_decay
+        1..=20_usize,    // warmup_observations
+        10..=100_usize,  // density_window
     )
         .prop_map(
             |(alpha, window, threshold, streak, err_thresh, decay, warmup, density_win)| {
@@ -192,7 +192,7 @@ proptest! {
         for obs in observations {
             tracker.record(obs);
             let d = tracker.density();
-            prop_assert!(d >= 0.0 && d <= 1.0, "Density {} out of bounds", d);
+            prop_assert!((0.0..=1.0).contains(&d), "Density {} out of bounds", d);
         }
     }
 

@@ -33,9 +33,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use frankenterm_core::replay_artifact_registry::{
-    ArtifactEntry, ArtifactManifest, ArtifactRegistry, ArtifactSensitivityTier,
-    ArtifactStatus, FsBackend, ListFilter, ManifestValidationError, PruneOptions, PruneResult,
-    sha256_bytes, MANIFEST_SCHEMA_VERSION,
+    ArtifactEntry, ArtifactManifest, ArtifactRegistry, ArtifactSensitivityTier, ArtifactStatus,
+    FsBackend, ListFilter, MANIFEST_SCHEMA_VERSION, ManifestValidationError, PruneOptions,
+    PruneResult, sha256_bytes,
 };
 
 // ── Mock FS ──────────────────────────────────────────────────────────────
@@ -100,10 +100,7 @@ fn arb_tier() -> impl Strategy<Value = ArtifactSensitivityTier> {
 }
 
 fn arb_status() -> impl Strategy<Value = ArtifactStatus> {
-    prop_oneof![
-        Just(ArtifactStatus::Active),
-        Just(ArtifactStatus::Retired),
-    ]
+    prop_oneof![Just(ArtifactStatus::Active), Just(ArtifactStatus::Retired),]
 }
 
 fn arb_entry() -> impl Strategy<Value = ArtifactEntry> {

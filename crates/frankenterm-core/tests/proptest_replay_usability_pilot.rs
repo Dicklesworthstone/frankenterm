@@ -25,10 +25,10 @@
 use proptest::prelude::*;
 
 use frankenterm_core::replay_usability_pilot::{
-    PilotScenario, ALL_SCENARIOS, ScenarioOutcome, ScenarioResult,
-    FeedbackLog, FrictionPoint, FrictionCategory, Participant, ParticipantType,
-    calculate_metrics, evaluate_pilot, SuccessCriteria, pilot_summary_report,
-    validate_scenario_interfaces, extract_improvements, PilotMetrics, PilotEvaluation,
+    ALL_SCENARIOS, FeedbackLog, FrictionCategory, FrictionPoint, Participant, ParticipantType,
+    PilotEvaluation, PilotMetrics, PilotScenario, ScenarioOutcome, ScenarioResult, SuccessCriteria,
+    calculate_metrics, evaluate_pilot, extract_improvements, pilot_summary_report,
+    validate_scenario_interfaces,
 };
 
 fn arb_scenario() -> impl Strategy<Value = PilotScenario> {
@@ -45,16 +45,18 @@ fn arb_outcome() -> impl Strategy<Value = ScenarioOutcome> {
 }
 
 fn arb_result() -> impl Strategy<Value = ScenarioResult> {
-    (arb_scenario(), arb_outcome(), 1u64..600).prop_map(|(scenario, outcome, dur)| {
-        ScenarioResult {
-            scenario,
-            participant_id: "OP-001".into(),
-            outcome,
-            duration_secs: dur,
-            errors: if outcome == ScenarioOutcome::Failed { vec!["error".into()] } else { vec![] },
-            friction_points: vec![],
-            notes: None,
-        }
+    (arb_scenario(), arb_outcome(), 1u64..600).prop_map(|(scenario, outcome, dur)| ScenarioResult {
+        scenario,
+        participant_id: "OP-001".into(),
+        outcome,
+        duration_secs: dur,
+        errors: if outcome == ScenarioOutcome::Failed {
+            vec!["error".into()]
+        } else {
+            vec![]
+        },
+        friction_points: vec![],
+        notes: None,
     })
 }
 

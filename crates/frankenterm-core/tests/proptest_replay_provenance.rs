@@ -4,10 +4,9 @@
 //! ReplayAuditTrail, and tamper detection.
 
 use frankenterm_core::replay_provenance::{
-    AuditEntryParams, DecisionExplanationTrace, DecisionType,
-    ExplanationLink, ExplanationTraceCollector, ProvenanceConfig,
-    ProvenanceRecordParams, ProvenanceVerbosity, ReplayAuditEntry, ReplayAuditTrail,
-    ReplayProvenanceEmitter, REPLAY_AUDIT_GENESIS,
+    AuditEntryParams, DecisionExplanationTrace, DecisionType, ExplanationLink,
+    ExplanationTraceCollector, ProvenanceConfig, ProvenanceRecordParams, ProvenanceVerbosity,
+    REPLAY_AUDIT_GENESIS, ReplayAuditEntry, ReplayAuditTrail, ReplayProvenanceEmitter,
     verify_chain,
 };
 use proptest::prelude::*;
@@ -38,16 +37,16 @@ fn arb_verbosity() -> impl Strategy<Value = ProvenanceVerbosity> {
 
 fn arb_record_params() -> impl Strategy<Value = ProvenanceRecordParams> {
     (
-        "[a-z0-9]{4,12}",     // event_id
+        "[a-z0-9]{4,12}", // event_id
         arb_decision_type(),
-        "[a-z_]{3,15}",       // rule_id
-        "[a-f0-9]{8,16}",     // definition_hash
-        "[a-z ]{3,20}",       // output_summary
-        0..100_000_u64,        // wall_clock_ms
-        0..100_000_u64,        // virtual_clock_ms
+        "[a-z_]{3,15}",   // rule_id
+        "[a-f0-9]{8,16}", // definition_hash
+        "[a-z ]{3,20}",   // output_summary
+        0..100_000_u64,   // wall_clock_ms
+        0..100_000_u64,   // virtual_clock_ms
     )
-        .prop_map(
-            |(event_id, dt, rule_id, def_hash, output, wall, virt)| ProvenanceRecordParams {
+        .prop_map(|(event_id, dt, rule_id, def_hash, output, wall, virt)| {
+            ProvenanceRecordParams {
                 event_id,
                 decision_type: dt,
                 rule_id,
@@ -57,17 +56,17 @@ fn arb_record_params() -> impl Strategy<Value = ProvenanceRecordParams> {
                 virtual_clock_ms: virt,
                 input_data: json!({"ts": wall}),
                 event_context: Some(json!({"v": virt})),
-            },
-        )
+            }
+        })
 }
 
 fn arb_audit_params() -> impl Strategy<Value = AuditEntryParams> {
     (
-        "[a-z0-9]{6,12}",    // replay_run_id
-        "[a-z_]{3,10}",      // actor
+        "[a-z0-9]{6,12}",     // replay_run_id
+        "[a-z_]{3,10}",       // actor
         0..100_000_u64,       // started_at_ms
         100_000..200_000_u64, // completed_at_ms
-        "[a-z.]{5,20}",      // artifact_ref
+        "[a-z.]{5,20}",       // artifact_ref
         0..100_u64,           // decision_count
         0..10_u64,            // anomaly_count
     )

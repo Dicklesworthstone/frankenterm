@@ -33,8 +33,7 @@ use std::collections::BTreeMap;
 
 use frankenterm_core::replay_counterfactual::{
     LookupResult, OverrideAction, OverrideApplicator, OverrideError, OverrideManifest,
-    OverridePackage, OverridePackageLoader, SubstitutionRecord,
-    definition_hash, wildcard_matches,
+    OverridePackage, OverridePackageLoader, SubstitutionRecord, definition_hash, wildcard_matches,
 };
 
 // ── Strategies ──────────────────────────────────────────────────────────
@@ -62,15 +61,27 @@ fn arb_package_toml(
     n_policies: usize,
 ) -> impl Strategy<Value = String> {
     let patterns = proptest::collection::vec(
-        (arb_rule_id(), arb_action(), proptest::option::of(arb_definition())),
+        (
+            arb_rule_id(),
+            arb_action(),
+            proptest::option::of(arb_definition()),
+        ),
         n_patterns..=n_patterns,
     );
     let workflows = proptest::collection::vec(
-        (arb_rule_id(), arb_action(), proptest::option::of(arb_definition())),
+        (
+            arb_rule_id(),
+            arb_action(),
+            proptest::option::of(arb_definition()),
+        ),
         n_workflows..=n_workflows,
     );
     let policies = proptest::collection::vec(
-        (arb_rule_id(), arb_action(), proptest::option::of(arb_definition())),
+        (
+            arb_rule_id(),
+            arb_action(),
+            proptest::option::of(arb_definition()),
+        ),
         n_policies..=n_policies,
     );
 

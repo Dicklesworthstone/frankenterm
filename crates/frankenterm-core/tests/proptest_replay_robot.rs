@@ -26,13 +26,12 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 
 use frankenterm_core::replay_robot::{
-    ArtifactAddData, ArtifactInspectData, ArtifactListData, ArtifactPruneData,
-    ArtifactResultData, ArtifactRetireData, ArtifactSummary, DiffData, DiffRequest,
-    InspectData, InspectRequest, ReplayRequest, ReplayRobotCommand, RegressionSuiteData,
-    classify_replay_command,
+    ArtifactAddData, ArtifactInspectData, ArtifactListData, ArtifactPruneData, ArtifactResultData,
+    ArtifactRetireData, ArtifactSummary, DiffData, DiffRequest, InspectData, InspectRequest,
     REPLAY_ERR_ALREADY_RETIRED, REPLAY_ERR_DUPLICATE, REPLAY_ERR_FILE_NOT_FOUND,
     REPLAY_ERR_INTEGRITY_ERROR, REPLAY_ERR_NOT_FOUND, REPLAY_ERR_PARSE_ERROR,
-    REPLAY_ERR_SCHEMA_MISMATCH,
+    REPLAY_ERR_SCHEMA_MISMATCH, RegressionSuiteData, ReplayRequest, ReplayRobotCommand,
+    classify_replay_command,
 };
 
 fn arb_command() -> impl Strategy<Value = ReplayRobotCommand> {

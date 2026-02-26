@@ -3,8 +3,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::search::{
-    MigrationController, MigrationControllerConfig, MigrationPhase, ReplayGateConfig,
-    RetirementGateResult, default_scenarios, run_default_retirement_gate,
+    MigrationController, MigrationControllerConfig, MigrationPhase,
+    RetirementGateResult, run_default_retirement_gate,
 };
 
 // ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ proptest! {
 
 proptest! {
     #[test]
-    fn mc_7_rollback_resets_failures(initial_failures in 0u32..100) {
+    fn mc_7_rollback_resets_failures(_initial_failures in 0u32..100) {
         let mut ctrl = MigrationController::new();
         ctrl.advance_to(MigrationPhase::Shadow).unwrap();
         // Manually set failures (via field, only accessible here because it's in test).

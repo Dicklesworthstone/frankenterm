@@ -5,9 +5,8 @@ use proptest::prelude::*;
 use frankenterm_core::robot_types::{
     RobotResponse, TxBundleClassification, TxChainVerificationData, TxCompensatingActionData,
     TxCompensationKind, TxPhaseState, TxPlanData, TxPreconditionData, TxPreconditionKind,
-    TxRejectedEdgeData, TxResumeData, TxResumeRecommendation, TxRiskSummaryData, TxRollbackData,
+    TxResumeData, TxResumeRecommendation, TxRiskSummaryData, TxRollbackData,
     TxRunData, TxShowData, TxStepData, TxStepOutcome, TxStepRecordData, TxStepRisk,
-    TxTimelineEntryData,
 };
 
 // ---------------------------------------------------------------------------

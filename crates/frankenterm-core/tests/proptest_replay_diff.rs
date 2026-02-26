@@ -7,10 +7,10 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use frankenterm_core::differential_snapshot::BaseSnapshot;
 use frankenterm_core::session_pane_state::{PaneStateSnapshot, ScrollbackRef, TerminalState};
 use frankenterm_core::session_topology::{
-    PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot, TOPOLOGY_SCHEMA_VERSION,
+    PaneNode, TOPOLOGY_SCHEMA_VERSION, TabSnapshot, TopologySnapshot, WindowSnapshot,
 };
-use proptest::prelude::*;
 use proptest::prelude::ProptestConfig;
+use proptest::prelude::*;
 
 fn proptest_cases() -> u32 {
     std::env::var("PROPTEST_CASES")

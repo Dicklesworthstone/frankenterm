@@ -227,7 +227,7 @@ proptest! {
     fn longest_path_monotone((g, edges) in arb_dag_with_edges(15)) {
         let dists = longest_paths(&g).unwrap();
         for (u, v) in edges {
-            prop_assert!(dists[v] >= dists[u] + 1,
+            prop_assert!(dists[v] > dists[u],
                 "dist[{}]={} < dist[{}]+1={}", v, dists[v], u, dists[u] + 1);
         }
     }
@@ -288,8 +288,8 @@ proptest! {
     #[test]
     fn closure_reflexive(g in arb_graph(10)) {
         let reach = transitive_closure(&g);
-        for i in 0..g.node_count() {
-            prop_assert!(reach[i][i]);
+        for (i, row) in reach.iter().enumerate() {
+            prop_assert!(row[i]);
         }
     }
 
@@ -297,9 +297,9 @@ proptest! {
     #[test]
     fn closure_includes_edges(g in arb_graph(10)) {
         let reach = transitive_closure(&g);
-        for u in 0..g.node_count() {
+        for (u, row) in reach.iter().enumerate() {
             for &v in g.successors(u) {
-                prop_assert!(reach[u][v]);
+                prop_assert!(row[v]);
             }
         }
     }

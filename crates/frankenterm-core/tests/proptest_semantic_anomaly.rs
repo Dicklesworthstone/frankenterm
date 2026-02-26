@@ -1,3 +1,4 @@
+#![allow(clippy::float_cmp, clippy::suboptimal_flops)]
 //! Property-based tests for semantic anomaly detection.
 //!
 //! Beads: ft-344j8.8 (conformal prediction), ft-344j8.9 (entropy gating)

@@ -2,6 +2,12 @@
 //!
 //! AARSP bead: ft-2p9cb.1.1.1 (verification matrix, property tests)
 
+#![allow(
+    clippy::float_cmp,
+    clippy::manual_range_contains,
+    clippy::suboptimal_flops
+)]
+
 use frankenterm_core::latency_stages::*;
 use proptest::prelude::*;
 
@@ -723,11 +729,11 @@ proptest! {
         let mut ctx = CorrelationContext::new("run-total", 0);
         let mut t = 100_u64;
         let mut expected_total = 0.0_f64;
-        for i in 0..stages_to_use {
-            let probe = ctx.begin_stage(LatencyStage::PIPELINE_STAGES[i], t);
-            t += durations[i];
+        for (stage, &dur) in LatencyStage::PIPELINE_STAGES.iter().zip(durations.iter()).take(stages_to_use) {
+            let probe = ctx.begin_stage(*stage, t);
+            t += dur;
             ctx.end_stage(probe, t);
-            expected_total += durations[i] as f64;
+            expected_total += dur as f64;
             t += 10;
         }
         let run = ctx.to_pipeline_run();
@@ -763,7 +769,7 @@ proptest! {
         for &v in &values {
             oh.record(v);
         }
-        let true_max = values.iter().cloned().fold(0.0_f64, f64::max);
+        let true_max = values.iter().copied().fold(0.0_f64, f64::max);
         prop_assert!((oh.max_overhead_us - true_max).abs() < 1e-10);
     }
 
@@ -941,7 +947,7 @@ proptest! {
         start in 1_u64..1_000_000,
         regress in 1_u64..1_000_000,
     ) {
-        let end = if regress >= start { 0 } else { start - regress };
+        let end = start.checked_sub(regress).unwrap_or(0);
         let probe = FastProbe::begin(stage, start);
         let elapsed = probe.elapsed_us(end);
         prop_assert!((elapsed - 0.0).abs() < 1e-10);
@@ -1027,12 +1033,10 @@ proptest! {
         let levels = MitigationLevel::ALL;
         let la = levels[a];
         let lb = levels[b];
-        if la < lb {
-            prop_assert!(la.severity() < lb.severity());
-        } else if la == lb {
-            prop_assert_eq!(la.severity(), lb.severity());
-        } else {
-            prop_assert!(la.severity() > lb.severity());
+        match la.cmp(&lb) {
+            std::cmp::Ordering::Less => prop_assert!(la.severity() < lb.severity()),
+            std::cmp::Ordering::Equal => prop_assert_eq!(la.severity(), lb.severity()),
+            std::cmp::Ordering::Greater => prop_assert!(la.severity() > lb.severity()),
         }
     }
 }
@@ -1659,13 +1663,13 @@ proptest! {
         let lanes = [SchedulerLane::Input, SchedulerLane::Control, SchedulerLane::Bulk];
         let a = lanes[a_idx];
         let b = lanes[b_idx];
-        if a_idx < b_idx {
-            prop_assert!(a < b);
-            prop_assert!(a.priority() < b.priority());
-        } else if a_idx == b_idx {
-            prop_assert_eq!(a, b);
-        } else {
-            prop_assert!(a > b);
+        match a_idx.cmp(&b_idx) {
+            std::cmp::Ordering::Less => {
+                prop_assert!(a < b);
+                prop_assert!(a.priority() < b.priority());
+            }
+            std::cmp::Ordering::Equal => prop_assert_eq!(a, b),
+            std::cmp::Ordering::Greater => prop_assert!(a > b),
         }
     }
 
@@ -1868,15 +1872,14 @@ proptest! {
             track_sojourn: false,
         };
         let mut ring = InputRing::new(config);
-        let mut t = 0_u64;
 
-        for enqueue in ops {
+        for (t, enqueue) in ops.into_iter().enumerate() {
+            let t = t as u64;
             if enqueue {
                 let _ = ring.enqueue(LatencyStage::DeltaExtraction, 5.0, "op", t, 0);
             } else {
                 ring.dequeue(t);
             }
-            t += 1;
         }
 
         let snap = ring.snapshot();
@@ -2811,7 +2814,7 @@ proptest! {
     ) {
         let mut parser = IngestParser::with_defaults();
         // Feed data without newline.
-        let no_newlines: Vec<u8> = data.iter().filter(|&&b| b != b'\n').cloned().collect();
+        let no_newlines: Vec<u8> = data.iter().filter(|&&b| b != b'\n').copied().collect();
         if !no_newlines.is_empty() {
             parser.feed(&no_newlines);
             let result = parser.flush();
@@ -4362,7 +4365,7 @@ proptest! {
             timestamp_us: 0,
         };
         for i in 0..n {
-            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, &[ok.clone()], i as u64);
+            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, std::slice::from_ref(&ok), i as u64);
         }
         prop_assert_eq!(mc.states_explored(), n as u64);
     }
@@ -4397,14 +4400,14 @@ proptest! {
         };
         let mut prev_count = 0_usize;
         for i in 0..n_ok {
-            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, &[ok.clone()], i as u64);
+            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, std::slice::from_ref(&ok), i as u64);
             let count = mc.counterexample_count();
             prop_assert!(count >= prev_count);
             prev_count = count;
         }
         for i in 0..n_bad {
             mc.new_trace();
-            mc.step(TraceAction::EpochAdvance { new_epoch: 100 + i as u64 }, &[bad.clone()], 100 + i as u64);
+            mc.step(TraceAction::EpochAdvance { new_epoch: 100 + i as u64 }, std::slice::from_ref(&bad), 100 + i as u64);
             let count = mc.counterexample_count();
             prop_assert!(count >= prev_count);
             prev_count = count;
@@ -4432,7 +4435,7 @@ proptest! {
         };
         for i in 0..n {
             mc.new_trace();
-            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, &[bad.clone()], i as u64);
+            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, std::slice::from_ref(&bad), i as u64);
         }
         mc.reset();
         prop_assert_eq!(mc.states_explored(), 0);
@@ -4455,7 +4458,7 @@ proptest! {
             timestamp_us: 0,
         };
         for i in 0..n {
-            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, &[ok.clone()], i as u64);
+            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, std::slice::from_ref(&ok), i as u64);
         }
         let is_nv = matches!(mc.verdict(), ModelCheckVerdict::NoViolation { .. });
         prop_assert!(is_nv);
@@ -4488,7 +4491,7 @@ proptest! {
         };
         for i in 0..n {
             mc.new_trace();
-            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, &[bad.clone()], i as u64);
+            mc.step(TraceAction::EpochAdvance { new_epoch: i as u64 }, std::slice::from_ref(&bad), i as u64);
         }
         let preds = mc.violated_predicates();
         // All the same predicate, so only 1 unique

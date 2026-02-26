@@ -122,7 +122,7 @@ proptest! {
     ) {
         let stats = DurationStats::from_durations(&durations).unwrap();
         let s = stats.survival(t);
-        prop_assert!(s >= 0.0 && s <= 1.0);
+        prop_assert!((0.0..=1.0).contains(&s));
     }
 
     #[test]

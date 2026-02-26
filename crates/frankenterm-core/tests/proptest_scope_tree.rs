@@ -10,8 +10,8 @@
 //! - Canonical string determinism
 
 use frankenterm_core::scope_tree::{
-    register_standard_scopes, well_known, ScopeHandle, ScopeId, ScopeState, ScopeTier,
-    ScopeTree, ScopeTreeError, ScopeTreeSnapshot,
+    ScopeHandle, ScopeId, ScopeState, ScopeTier, ScopeTree, ScopeTreeError, ScopeTreeSnapshot,
+    register_standard_scopes, well_known,
 };
 use proptest::prelude::*;
 

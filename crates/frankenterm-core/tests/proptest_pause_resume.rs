@@ -16,8 +16,8 @@
 
 use frankenterm_core::plan::{
     ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId, Mission,
-    MissionActorRole, MissionCheckpoint, MissionControlCommand, MissionId,
-    MissionLifecycleState, MissionOwnership, MissionPauseResumeState, StepAction,
+    MissionActorRole, MissionCheckpoint, MissionControlCommand, MissionId, MissionLifecycleState,
+    MissionOwnership, MissionPauseResumeState, StepAction,
 };
 use proptest::prelude::*;
 
@@ -64,31 +64,40 @@ fn arb_timestamp() -> impl Strategy<Value = i64> {
 
 fn arb_control_command() -> impl Strategy<Value = MissionControlCommand> {
     prop_oneof![
-        (arb_non_empty_string(), arb_non_empty_string(), arb_timestamp()).prop_map(
-            |(by, reason, ts)| MissionControlCommand::Pause {
+        (
+            arb_non_empty_string(),
+            arb_non_empty_string(),
+            arb_timestamp()
+        )
+            .prop_map(|(by, reason, ts)| MissionControlCommand::Pause {
                 requested_by: by,
                 reason_code: reason,
                 requested_at_ms: ts,
                 correlation_id: None,
-            }
-        ),
-        (arb_non_empty_string(), arb_non_empty_string(), arb_timestamp()).prop_map(
-            |(by, reason, ts)| MissionControlCommand::Resume {
+            }),
+        (
+            arb_non_empty_string(),
+            arb_non_empty_string(),
+            arb_timestamp()
+        )
+            .prop_map(|(by, reason, ts)| MissionControlCommand::Resume {
                 requested_by: by,
                 reason_code: reason,
                 requested_at_ms: ts,
                 correlation_id: None,
-            }
-        ),
-        (arb_non_empty_string(), arb_non_empty_string(), arb_timestamp()).prop_map(
-            |(by, reason, ts)| MissionControlCommand::Abort {
+            }),
+        (
+            arb_non_empty_string(),
+            arb_non_empty_string(),
+            arb_timestamp()
+        )
+            .prop_map(|(by, reason, ts)| MissionControlCommand::Abort {
                 requested_by: by,
                 reason_code: reason,
                 error_code: None,
                 requested_at_ms: ts,
                 correlation_id: None,
-            }
-        ),
+            }),
     ]
 }
 

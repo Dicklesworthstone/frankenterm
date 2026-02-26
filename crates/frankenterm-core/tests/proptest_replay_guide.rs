@@ -25,10 +25,9 @@
 use proptest::prelude::*;
 
 use frankenterm_core::replay_guide::{
-    GuideWorkflow, GuideContext, GuideStepInput, GuideStepOutput,
-    GuideStepStatus, GuideProgress, GuideRobotCommand,
-    ALL_WORKFLOWS, execute_step, start_workflow, list_workflows,
-    guide_tool_schema,
+    ALL_WORKFLOWS, GuideContext, GuideProgress, GuideRobotCommand, GuideStepInput, GuideStepOutput,
+    GuideStepStatus, GuideWorkflow, execute_step, guide_tool_schema, list_workflows,
+    start_workflow,
 };
 
 proptest! {

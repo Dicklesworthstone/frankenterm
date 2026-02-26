@@ -15,7 +15,7 @@ use frankenterm_core::cancellation::{
     ShutdownCoordinator, ShutdownPolicy, ShutdownReason,
 };
 use frankenterm_core::scope_tree::{
-    register_standard_scopes, well_known, ScopeId, ScopeState, ScopeTier, ScopeTree,
+    ScopeId, ScopeState, ScopeTier, ScopeTree, register_standard_scopes, well_known,
 };
 use proptest::prelude::*;
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 // ── Strategies ──────────────────────────────────────────────────────────────
 
 fn arb_scope_id() -> impl Strategy<Value = ScopeId> {
-    "[a-z][a-z0-9_:]{1,20}".prop_map(|s| ScopeId(s))
+    "[a-z][a-z0-9_:]{1,20}".prop_map(ScopeId)
 }
 
 fn arb_tier() -> impl Strategy<Value = ScopeTier> {
@@ -65,9 +65,7 @@ fn arb_escalation() -> impl Strategy<Value = EscalationAction> {
 
 fn arb_finalizer_action() -> impl Strategy<Value = FinalizerAction> {
     prop_oneof![
-        "[a-z_]{1,15}".prop_map(|name| FinalizerAction::FlushChannel {
-            channel_name: name,
-        }),
+        "[a-z_]{1,15}".prop_map(|name| FinalizerAction::FlushChannel { channel_name: name }),
         "[a-z_]{1,15}".prop_map(|key| FinalizerAction::PersistState { key }),
         (0u64..10000).prop_map(|id| FinalizerAction::CloseConnection { conn_id: id }),
         "[a-z_]{1,15}".prop_map(|id| FinalizerAction::ReleaseResource { resource_id: id }),
@@ -80,11 +78,10 @@ fn arb_finalizer_status() -> impl Strategy<Value = FinalizerStatus> {
         Just(FinalizerStatus::Pending),
         Just(FinalizerStatus::Running),
         (0u64..10000).prop_map(|d| FinalizerStatus::Completed { duration_ms: d }),
-        ("[a-z ]{1,20}", 0u64..10000)
-            .prop_map(|(e, d)| FinalizerStatus::Failed {
-                error: e,
-                duration_ms: d,
-            }),
+        ("[a-z ]{1,20}", 0u64..10000).prop_map(|(e, d)| FinalizerStatus::Failed {
+            error: e,
+            duration_ms: d,
+        }),
         "[a-z ]{1,20}".prop_map(|r| FinalizerStatus::Skipped { reason: r }),
     ]
 }
@@ -402,9 +399,7 @@ fn all_shutdown_reasons_display_non_empty() {
         ShutdownReason::ResourceExhausted {
             resource: "r".into(),
         },
-        ShutdownReason::PolicyViolation {
-            rule: "p".into(),
-        },
+        ShutdownReason::PolicyViolation { rule: "p".into() },
         ShutdownReason::ParentShutdown {
             parent_id: ScopeId("p".into()),
         },
@@ -412,7 +407,11 @@ fn all_shutdown_reasons_display_non_empty() {
 
     for r in reasons {
         let display = r.to_string();
-        assert!(!display.is_empty(), "display should not be empty for {:?}", r);
+        assert!(
+            !display.is_empty(),
+            "display should not be empty for {:?}",
+            r
+        );
     }
 }
 
@@ -573,7 +572,11 @@ fn full_two_phase_with_cascade_and_finalizers() {
 
     // Verify events
     let all_events = coord.events();
-    assert!(all_events.len() >= 10, "should have many events: {}", all_events.len());
+    assert!(
+        all_events.len() >= 10,
+        "should have many events: {}",
+        all_events.len()
+    );
 
     // All events should have correlation IDs
     for event in all_events {
@@ -587,8 +590,14 @@ fn force_close_skips_finalizers() {
     tree.start(&ScopeId::root(), 1000).unwrap();
 
     let scope = ScopeId("daemon:fc_test".into());
-    tree.register(scope.clone(), ScopeTier::Daemon, &ScopeId::root(), "fc", 1000)
-        .unwrap();
+    tree.register(
+        scope.clone(),
+        ScopeTier::Daemon,
+        &ScopeId::root(),
+        "fc",
+        1000,
+    )
+    .unwrap();
     tree.start(&scope, 1100).unwrap();
 
     let mut coord = ShutdownCoordinator::new();

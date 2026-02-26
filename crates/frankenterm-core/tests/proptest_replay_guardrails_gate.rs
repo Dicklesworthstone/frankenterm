@@ -25,8 +25,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::replay_guardrails_gate::{
-    EvaluationContext, ExpectedDivergenceAnnotation, GateEvaluator, GateResult,
-    RegressionBudget, Violation, Warning,
+    EvaluationContext, ExpectedDivergenceAnnotation, GateEvaluator, GateResult, RegressionBudget,
+    Violation, Warning,
 };
 use frankenterm_core::replay_report::{JsonDivergence, JsonReport, JsonRiskSummary};
 

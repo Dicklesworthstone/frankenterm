@@ -7,7 +7,9 @@
 #![cfg(feature = "subprocess-bridge")]
 
 use frankenterm_core::mission_events::*;
-use frankenterm_core::planner_features::{Assignment as PlannerAssignment, AssignmentSet, SolverConfig};
+use frankenterm_core::planner_features::{
+    Assignment as PlannerAssignment, AssignmentSet, SolverConfig,
+};
 use frankenterm_core::shadow_mode_evaluator::*;
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -101,21 +103,17 @@ fn arb_score() -> impl Strategy<Value = f64> {
 }
 
 /// Generate a vec of unique (bead_id, agent_id, score) tuples for assignments.
-fn arb_unique_assignments(
-    max_count: usize,
-) -> impl Strategy<Value = Vec<(String, String, f64)>> {
-    proptest::collection::vec(
-        (arb_bead_id(), arb_agent_id(), arb_score()),
-        1..=max_count,
+fn arb_unique_assignments(max_count: usize) -> impl Strategy<Value = Vec<(String, String, f64)>> {
+    proptest::collection::vec((arb_bead_id(), arb_agent_id(), arb_score()), 1..=max_count).prop_map(
+        |tuples| {
+            // Deduplicate by bead_id to avoid HashMap collisions in the evaluator
+            let mut seen = HashSet::new();
+            tuples
+                .into_iter()
+                .filter(|(b, _, _)| seen.insert(b.clone()))
+                .collect()
+        },
     )
-    .prop_map(|tuples| {
-        // Deduplicate by bead_id to avoid HashMap collisions in the evaluator
-        let mut seen = HashSet::new();
-        tuples
-            .into_iter()
-            .filter(|(b, _, _)| seen.insert(b.clone()))
-            .collect()
-    })
 }
 
 // ── SE-P01: Fidelity score is always in [0.0, 1.0], never NaN ────────────────

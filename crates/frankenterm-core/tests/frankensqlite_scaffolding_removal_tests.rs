@@ -241,8 +241,7 @@ fn test_steady_state_modules_count() {
 fn test_no_overlap_transitional_steady_state() {
     let trans: BTreeSet<&str> = TRANSITIONAL_MODULES.iter().copied().collect();
     let steady: BTreeSet<&str> = STEADY_STATE_MODULES.iter().copied().collect();
-    let overlap: Vec<_> = trans.intersection(&steady).collect();
-    assert!(overlap.is_empty());
+    assert!(trans.intersection(&steady).next().is_none());
 }
 
 // ═══════════════════════════════════════════════════════════════════════

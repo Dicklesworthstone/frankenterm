@@ -25,10 +25,9 @@
 use proptest::prelude::*;
 
 use frankenterm_core::replay_ci_gate::{
-    GateId, GateStatus, GateCheck, GateReport, Waiver, EvidenceBundle,
-    evaluate_gate1_smoke, evaluate_gate2_test_suite, evaluate_gate3_regression,
-    TestSuiteResults, RegressionResults, parse_waivers, matches_replay_path,
-    ALL_GATES, MIN_PROPTEST_CASES,
+    ALL_GATES, EvidenceBundle, GateCheck, GateId, GateReport, GateStatus, MIN_PROPTEST_CASES,
+    RegressionResults, TestSuiteResults, Waiver, evaluate_gate1_smoke, evaluate_gate2_test_suite,
+    evaluate_gate3_regression, matches_replay_path, parse_waivers,
 };
 
 proptest! {
@@ -50,7 +49,7 @@ proptest! {
     fn cg02_gate_numbers(idx in 0usize..3) {
         let gate = ALL_GATES[idx];
         let num = gate.gate_number();
-        prop_assert!(num >= 1 && num <= 3);
+        prop_assert!((1..=3).contains(&num));
         prop_assert_eq!(num as usize, idx + 1);
     }
 

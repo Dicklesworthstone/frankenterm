@@ -355,7 +355,7 @@ proptest! {
         let mut mgr = PaneSnapshotManager::new(0, config);
         let interval_us = interval_ms * 1000;
 
-        let mut sorted_times: Vec<u64> = attempts.iter().copied().collect();
+        let mut sorted_times: Vec<u64> = attempts.to_vec();
         sorted_times.sort_unstable();
         sorted_times.dedup();
 

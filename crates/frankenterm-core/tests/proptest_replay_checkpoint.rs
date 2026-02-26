@@ -29,8 +29,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::replay_checkpoint::{
-    CheckpointConfig, CheckpointState, FailureMode, ProcessResult, ReplayCheckpointer,
-    ReplayError, ReplayErrorKind, ReplayReport, CHECKPOINT_VERSION,
+    CHECKPOINT_VERSION, CheckpointConfig, CheckpointState, FailureMode, ProcessResult,
+    ReplayCheckpointer, ReplayError, ReplayErrorKind, ReplayReport,
 };
 
 // ── Strategies ──────────────────────────────────────────────────────────
@@ -56,14 +56,15 @@ fn arb_error_kind() -> impl Strategy<Value = ReplayErrorKind> {
 }
 
 fn arb_replay_error() -> impl Strategy<Value = ReplayError> {
-    (arb_error_kind(), 0u64..1000, "evt_[a-z]{4}", "msg_[a-z]{8}")
-        .prop_map(|(kind, pos, eid, msg)| ReplayError {
+    (arb_error_kind(), 0u64..1000, "evt_[a-z]{4}", "msg_[a-z]{8}").prop_map(
+        |(kind, pos, eid, msg)| ReplayError {
             kind,
             event_position: pos,
             event_id: Some(eid),
             message: msg,
             context: None,
-        })
+        },
+    )
 }
 
 fn arb_checkpoint_config() -> impl Strategy<Value = CheckpointConfig> {

@@ -373,7 +373,7 @@ proptest! {
             .add_change_detection(1000, bayes_factor, 3, true)
             .add_mdl_extraction(2000, 0.5, 3, confidence)
             .add_safety_proof(3000, is_safe, if is_safe { vec![] } else { vec!["test".to_string()] })
-            .add_secret_scan(4000, is_clean, if is_clean { 0 } else { 1 })
+            .add_secret_scan(4000, is_clean, u64::from(!is_clean))
             .add_parameter_bounds(5000, risk_bound, risk_bound < 0.2, 2)
             .add_timeout_calc(6000, timeout_ms, 2.0, true);
 

@@ -6,7 +6,9 @@
 #![cfg(feature = "subprocess-bridge")]
 
 use frankenterm_core::tx_idempotency::*;
-use frankenterm_core::tx_plan_compiler::{compile_tx_plan, CompilerConfig, PlannerAssignment, StepRisk, TxPlan};
+use frankenterm_core::tx_plan_compiler::{
+    CompilerConfig, PlannerAssignment, StepRisk, TxPlan, compile_tx_plan,
+};
 use proptest::prelude::*;
 
 // ── Strategies ───────────────────────────────────────────────────────────────

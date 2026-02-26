@@ -25,7 +25,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::trauma_guard::{
-    hash_command, TraumaConfig, TraumaDecision, TraumaEvent, TraumaState,
+    TraumaConfig, TraumaDecision, TraumaEvent, TraumaState, hash_command,
 };
 
 fn arb_command() -> impl Strategy<Value = String> {
@@ -57,13 +57,11 @@ fn arb_error_signatures(count: usize) -> impl Strategy<Value = Vec<String>> {
 }
 
 fn arb_config() -> impl Strategy<Value = TraumaConfig> {
-    (2usize..256, 2u64..10, 32usize..1024).prop_map(|(hist, threshold, bloom)| {
-        TraumaConfig {
-            history_limit: hist,
-            loop_threshold: threshold,
-            bloom_capacity: bloom,
-            ..TraumaConfig::default()
-        }
+    (2usize..256, 2u64..10, 32usize..1024).prop_map(|(hist, threshold, bloom)| TraumaConfig {
+        history_limit: hist,
+        loop_threshold: threshold,
+        bloom_capacity: bloom,
+        ..TraumaConfig::default()
     })
 }
 

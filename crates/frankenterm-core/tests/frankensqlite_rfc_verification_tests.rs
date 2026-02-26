@@ -1,3 +1,4 @@
+#![allow(clippy::trivially_copy_pass_by_ref, clippy::unnecessary_literal_bound)]
 //! E5.F2.T1: RFC verification tests for upstream extraction patterns.
 //!
 //! Validates the three RFC patterns (EventSource/Cursor, Migration Engine,

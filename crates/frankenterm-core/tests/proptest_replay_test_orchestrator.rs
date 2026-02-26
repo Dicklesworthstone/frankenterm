@@ -24,14 +24,11 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_ci_gate::{
-    GateCheck, GateId, GateReport, GateStatus, ALL_GATES,
-};
+use frankenterm_core::replay_ci_gate::{ALL_GATES, GateCheck, GateId, GateReport, GateStatus};
 use frankenterm_core::replay_test_orchestrator::{
-    orchestrate, OrchestratorConfig, OrchestratorResult,
-    EvidenceManifest, ManifestEntry, ManifestFileType,
-    RetentionPolicy, RetentionCandidate, evaluate_retention, prune_count,
-    SummaryReport, GateRunResult,
+    EvidenceManifest, GateRunResult, ManifestEntry, ManifestFileType, OrchestratorConfig,
+    OrchestratorResult, RetentionCandidate, RetentionPolicy, SummaryReport, evaluate_retention,
+    orchestrate, prune_count,
 };
 
 fn pass_report(gate: GateId, dur: u64) -> GateReport {

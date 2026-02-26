@@ -344,15 +344,14 @@ proptest! {
         let cmd = make_cmd_block(0, cmd_text);
         let detections = gzr.detect_params(&[cmd], &error_text);
         // Should find file path in at least some cases.
-        let file_params: Vec<_> = detections
+        let has_file_params = detections
             .iter()
             .flat_map(|(_, p)| p)
-            .filter(|p| p.kind == ParamKind::FilePath)
-            .collect();
+            .any(|p| p.kind == ParamKind::FilePath);
         // File should be detected if it meets min_param_len.
         if file.len() >= 2 {
             prop_assert!(
-                !file_params.is_empty(),
+                has_file_params,
                 "should detect {} as file path parameter",
                 file
             );
@@ -367,13 +366,8 @@ proptest! {
         let error = "error in /completely/different/path.xyz:999";
         let block = make_cmd_block(0, cmd);
         let detections = gzr.detect_params(&[block], error);
-        let file_params: Vec<_> = detections
-            .iter()
-            .flat_map(|(_, p)| p)
-            .filter(|p| p.kind == ParamKind::FilePath)
-            .collect();
         prop_assert!(
-            file_params.is_empty(),
+            !detections.iter().flat_map(|(_, p)| p).any(|p| p.kind == ParamKind::FilePath),
             "no file path overlap should produce no file detections"
         );
     }

@@ -1,5 +1,7 @@
 //! Property-based tests for `shortest_path` — weighted graph algorithms.
 
+#![allow(clippy::float_cmp, clippy::needless_range_loop)]
+
 use proptest::prelude::*;
 
 use frankenterm_core::shortest_path::*;

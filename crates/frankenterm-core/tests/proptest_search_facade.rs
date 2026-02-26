@@ -3,8 +3,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::search::{
-    FacadeConfig, FacadeRouting, FusedResult, HybridSearchService, SearchFacade, SearchMode,
-    check_schema_preservation, snapshot_fused_result_schema,
+    FacadeConfig, FacadeRouting, HybridSearchService, SearchFacade, SearchMode,
+    check_schema_preservation,
 };
 
 // ---------------------------------------------------------------------------
@@ -19,6 +19,7 @@ fn arb_routing() -> impl Strategy<Value = FacadeRouting> {
     ]
 }
 
+#[allow(dead_code)]
 fn arb_mode() -> impl Strategy<Value = SearchMode> {
     prop_oneof![
         Just(SearchMode::Lexical),

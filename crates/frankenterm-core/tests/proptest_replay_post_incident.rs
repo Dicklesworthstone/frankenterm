@@ -25,10 +25,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::replay_post_incident::{
-    PipelineStep, PostIncidentInput, ALL_STEPS,
-    validate_input, execute_pipeline,
-    IncidentCorpus, IncidentCoverageStatus,
-    PipelineResult,
+    ALL_STEPS, IncidentCorpus, IncidentCoverageStatus, PipelineResult, PipelineStep,
+    PostIncidentInput, execute_pipeline, validate_input,
 };
 
 fn arb_incident_id() -> impl Strategy<Value = String> {

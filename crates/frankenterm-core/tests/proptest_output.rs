@@ -117,7 +117,7 @@ proptest! {
         match fmt {
             OutputFormat::Plain => prop_assert_eq!(eff1, EffectiveFormat::Plain),
             OutputFormat::Json => prop_assert_eq!(eff1, EffectiveFormat::Json),
-            _ => {}
+            OutputFormat::Auto | OutputFormat::Text => {}
         }
     }
 

@@ -42,8 +42,8 @@ fn arb_decision_type() -> impl Strategy<Value = DecisionType> {
 }
 
 fn arb_event(index: usize) -> impl Strategy<Value = DecisionEvent> {
-    (arb_decision_type(), "[a-z]{1,4}", 0u64..3)
-        .prop_map(move |(dt, rule_id, pane_id)| DecisionEvent {
+    (arb_decision_type(), "[a-z]{1,4}", 0u64..3).prop_map(move |(dt, rule_id, pane_id)| {
+        DecisionEvent {
             decision_type: dt,
             rule_id,
             definition_hash: format!("def_{}", index),
@@ -55,7 +55,8 @@ fn arb_event(index: usize) -> impl Strategy<Value = DecisionEvent> {
             overrides: None,
             wall_clock_ms: 0,
             replay_run_id: String::new(),
-        })
+        }
+    })
 }
 
 fn arb_events(max_len: usize) -> impl Strategy<Value = Vec<DecisionEvent>> {
