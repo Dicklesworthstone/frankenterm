@@ -332,6 +332,10 @@ harness = false
 name = "semantic_anomaly_bench"
 harness = false
 
+[[bench]]
+name = "frankensearch_bench"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
