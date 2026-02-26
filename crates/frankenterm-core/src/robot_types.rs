@@ -1550,6 +1550,85 @@ pub struct WorkflowAbortData {
     pub message: Option<String>,
 }
 
+/// Step log entry in a workflow execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStepLog {
+    pub step_index: usize,
+    pub step_name: String,
+    pub result_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_data: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_summary: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_refs: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    pub started_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+}
+
+/// Action plan associated with a workflow execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowActionPlan {
+    pub plan_id: String,
+    pub plan_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+}
+
+/// Extended workflow status with step logs and action plan.
+///
+/// This type includes all fields from main.rs `RobotWorkflowStatusData`,
+/// providing the complete status view for detailed workflow inspection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStatusDetailData {
+    pub execution_id: String,
+    pub workflow_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_event_id: Option<i64>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_step_result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_step: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_steps: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_condition: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_logs: Option<Vec<WorkflowStepLog>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_plan: Option<WorkflowActionPlan>,
+}
+
 // ============================================================================
 // Rules
 // ============================================================================
@@ -4652,5 +4731,127 @@ mod tests {
         assert!(!json.contains("pane_filter"));
         assert!(!json.contains("since_filter"));
         assert!(!json.contains("until_filter"));
+    }
+
+    // ================================================================
+    // Workflow Step Log & Action Plan types
+    // ================================================================
+
+    #[test]
+    fn workflow_step_log_serde_roundtrip() {
+        let log = WorkflowStepLog {
+            step_index: 0,
+            step_name: "send_text".to_string(),
+            result_type: "success".to_string(),
+            step_id: Some("step-001".to_string()),
+            step_kind: Some("send_text".to_string()),
+            result_data: Some(serde_json::json!({"sent": true})),
+            policy_summary: None,
+            verification_refs: None,
+            error_code: None,
+            started_at: 1700000000000,
+            completed_at: Some(1700000000100),
+            duration_ms: Some(100),
+        };
+        let json = serde_json::to_string(&log).unwrap();
+        let back: WorkflowStepLog = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.step_index, 0);
+        assert_eq!(back.step_name, "send_text");
+        assert_eq!(back.duration_ms, Some(100));
+        // None fields omitted
+        assert!(!json.contains("policy_summary"));
+        assert!(!json.contains("error_code"));
+    }
+
+    #[test]
+    fn workflow_action_plan_serde() {
+        let plan = WorkflowActionPlan {
+            plan_id: "wf-plan-001".to_string(),
+            plan_hash: "abc123".to_string(),
+            plan: Some(serde_json::json!({"steps": []})),
+            created_at: Some(1700000000000),
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: WorkflowActionPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.plan_id, "wf-plan-001");
+        assert!(back.plan.is_some());
+    }
+
+    #[test]
+    fn workflow_status_detail_serde() {
+        let detail = WorkflowStatusDetailData {
+            execution_id: "exec-wf-1".to_string(),
+            workflow_name: "deploy".to_string(),
+            pane_id: Some(42),
+            trigger_event_id: Some(100),
+            status: "running".to_string(),
+            step_name: Some("wait_for_prompt".to_string()),
+            elapsed_ms: Some(5000),
+            last_step_result: Some("success".to_string()),
+            current_step: Some(2),
+            total_steps: Some(5),
+            wait_condition: None,
+            context: None,
+            result: None,
+            error: None,
+            started_at: Some(1700000000000),
+            updated_at: Some(1700000005000),
+            completed_at: None,
+            step_logs: Some(vec![WorkflowStepLog {
+                step_index: 0,
+                step_name: "init".to_string(),
+                result_type: "success".to_string(),
+                step_id: None,
+                step_kind: None,
+                result_data: None,
+                policy_summary: None,
+                verification_refs: None,
+                error_code: None,
+                started_at: 1700000000000,
+                completed_at: Some(1700000000050),
+                duration_ms: Some(50),
+            }]),
+            action_plan: None,
+        };
+        let json = serde_json::to_string(&detail).unwrap();
+        let back: WorkflowStatusDetailData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.execution_id, "exec-wf-1");
+        assert_eq!(back.current_step, Some(2));
+        assert_eq!(back.step_logs.as_ref().unwrap().len(), 1);
+        // None fields omitted
+        assert!(!json.contains("wait_condition"));
+        assert!(!json.contains("\"error\""));
+    }
+
+    #[test]
+    fn workflow_status_detail_in_envelope() {
+        let detail = WorkflowStatusDetailData {
+            execution_id: "exec-env".to_string(),
+            workflow_name: "test-wf".to_string(),
+            pane_id: None,
+            trigger_event_id: None,
+            status: "completed".to_string(),
+            step_name: None,
+            elapsed_ms: Some(200),
+            last_step_result: None,
+            current_step: None,
+            total_steps: None,
+            wait_condition: None,
+            context: None,
+            result: Some(serde_json::json!({"ok": true})),
+            error: None,
+            started_at: None,
+            updated_at: None,
+            completed_at: Some(1700000000200),
+            step_logs: None,
+            action_plan: None,
+        };
+        let resp = RobotResponse::success(detail, 200);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        let back: RobotResponse<WorkflowStatusDetailData> =
+            serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.data.unwrap().status, "completed");
     }
 }
