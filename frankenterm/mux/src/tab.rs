@@ -9,7 +9,7 @@ use frankenterm_term::{StableRowIndex, TerminalSize};
 use parking_lot::Mutex;
 use rangeset::intersects_range;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::sync::Arc;
 use url::Url;
@@ -48,6 +48,10 @@ struct TabInner {
     zoomed: Option<Arc<dyn Pane>>,
     title: String,
     recency: Recency,
+    /// Set of pane IDs that have been collapsed because the terminal
+    /// shrank below the aggregate minimum constraints.  Collapsed panes
+    /// retain their tree position but are allocated zero space.
+    collapsed_panes: HashSet<PaneId>,
 }
 
 /// A Tab is a container of Panes
@@ -621,6 +625,257 @@ fn pane_size_satisfies_constraints(
     true
 }
 
+/// Collect all leaf panes from a tree, returning (pane_id, collapse_priority).
+fn collect_leaf_panes(tree: &Tree) -> Vec<(PaneId, CollapsePriority)> {
+    let mut result = Vec::new();
+    collect_leaf_panes_recursive(tree, &mut result);
+    result
+}
+
+fn collect_leaf_panes_recursive(tree: &Tree, out: &mut Vec<(PaneId, CollapsePriority)>) {
+    match tree {
+        Tree::Empty | Tree::Node { data: None, .. } => {}
+        Tree::Leaf(pane) => {
+            out.push((pane.pane_id(), pane.collapse_priority()));
+        }
+        Tree::Node {
+            left, right, data: Some(_), ..
+        } => {
+            collect_leaf_panes_recursive(left, out);
+            collect_leaf_panes_recursive(right, out);
+        }
+    }
+}
+
+/// Return a numeric collapse order: lower number = collapse first.
+/// `Low` collapses before `Normal` before `High`; `Never` is not collapsible.
+fn collapse_order(priority: CollapsePriority) -> Option<u8> {
+    match priority {
+        CollapsePriority::Low => Some(0),
+        CollapsePriority::Normal => Some(1),
+        CollapsePriority::High => Some(2),
+        CollapsePriority::Never => None,
+    }
+}
+
+/// Compute the minimum size of a tree when a given set of panes are
+/// treated as collapsed (contributing zero space).  This is used to
+/// determine whether collapsing certain panes makes the tree fit.
+fn compute_min_size_with_collapsed(tree: &Tree, collapsed: &HashSet<PaneId>) -> (usize, usize) {
+    match tree {
+        Tree::Empty | Tree::Node { data: None, .. } => (0, 0),
+        Tree::Leaf(pane) => {
+            if collapsed.contains(&pane.pane_id()) {
+                (0, 0)
+            } else {
+                let c = pane.pane_constraints();
+                (c.min_width.max(1), c.min_height.max(1))
+            }
+        }
+        Tree::Node {
+            left,
+            right,
+            data: Some(data),
+        } => {
+            let (lw, lh) = compute_min_size_with_collapsed(left, collapsed);
+            let (rw, rh) = compute_min_size_with_collapsed(right, collapsed);
+            match data.direction {
+                SplitDirection::Horizontal => {
+                    let w = if lw == 0 && rw == 0 {
+                        0
+                    } else if lw == 0 {
+                        rw
+                    } else if rw == 0 {
+                        lw
+                    } else {
+                        lw + 1 + rw
+                    };
+                    (w, lh.max(rh))
+                }
+                SplitDirection::Vertical => {
+                    let h = if lh == 0 && rh == 0 {
+                        0
+                    } else if lh == 0 {
+                        rh
+                    } else if rh == 0 {
+                        lh
+                    } else {
+                        lh + 1 + rh
+                    };
+                    (lw.max(rw), h)
+                }
+            }
+        }
+    }
+}
+
+/// Compute the resize budget for a given split: how far in each direction
+/// the split divider can be moved while respecting all constraints.
+/// Returns `(max_shrink_first, max_grow_first)` — negative deltas shrink
+/// the first child, positive deltas grow it.
+fn compute_split_resize_budget(
+    left: &Tree,
+    right: &Tree,
+    direction: SplitDirection,
+    first_size: &TerminalSize,
+    second_size: &TerminalSize,
+) -> (isize, isize) {
+    let (left_wc, left_hc) = (
+        compute_axis_constraints(left, Axis::Width),
+        compute_axis_constraints(left, Axis::Height),
+    );
+    let (right_wc, right_hc) = (
+        compute_axis_constraints(right, Axis::Width),
+        compute_axis_constraints(right, Axis::Height),
+    );
+
+    match direction {
+        SplitDirection::Horizontal => {
+            let left_can_shrink = first_size.cols.saturating_sub(left_wc.min);
+            let right_can_shrink = second_size.cols.saturating_sub(right_wc.min);
+            let left_can_grow = left_wc
+                .max
+                .map_or(right_can_shrink, |max| {
+                    max.saturating_sub(first_size.cols).min(right_can_shrink)
+                });
+            (-(left_can_shrink as isize), left_can_grow as isize)
+        }
+        SplitDirection::Vertical => {
+            let left_can_shrink = first_size.rows.saturating_sub(left_hc.min);
+            let right_can_shrink = second_size.rows.saturating_sub(right_hc.min);
+            let left_can_grow = left_hc
+                .max
+                .map_or(right_can_shrink, |max| {
+                    max.saturating_sub(first_size.rows).min(right_can_shrink)
+                });
+            (-(left_can_shrink as isize), left_can_grow as isize)
+        }
+    }
+}
+
+/// Returns `true` if every leaf pane in `tree` belongs to `collapsed`.
+fn is_subtree_fully_collapsed(tree: &Tree, collapsed: &HashSet<PaneId>) -> bool {
+    match tree {
+        Tree::Empty | Tree::Node { data: None, .. } => true,
+        Tree::Leaf(pane) => collapsed.contains(&pane.pane_id()),
+        Tree::Node {
+            left,
+            right,
+            data: Some(_),
+        } => {
+            is_subtree_fully_collapsed(left, collapsed)
+                && is_subtree_fully_collapsed(right, collapsed)
+        }
+    }
+}
+
+/// Post-pass that redistributes space away from fully-collapsed subtrees.
+/// At each split node, if one child is fully collapsed its allocated space
+/// (plus the separator cell) is given to the sibling.  Collapsed leaf panes
+/// receive a 1×1 allocation so that `pane.resize()` does not reject a 0-size.
+fn redistribute_for_collapsed(
+    tree: &mut Tree,
+    collapsed: &HashSet<PaneId>,
+    cell_dims: &TerminalSize,
+) {
+    if collapsed.is_empty() {
+        return;
+    }
+    match tree {
+        Tree::Empty | Tree::Leaf(_) | Tree::Node { data: None, .. } => {}
+        Tree::Node {
+            left,
+            right,
+            data: Some(data),
+        } => {
+            let left_collapsed = is_subtree_fully_collapsed(left, collapsed);
+            let right_collapsed = is_subtree_fully_collapsed(right, collapsed);
+
+            if left_collapsed && !right_collapsed {
+                match data.direction {
+                    SplitDirection::Horizontal => {
+                        // Left is collapsed: give its cols + 1 separator to right
+                        let freed = data.first.cols.saturating_add(1);
+                        data.second.cols = data.second.cols.saturating_add(freed);
+                        data.second.pixel_width =
+                            data.second.cols.saturating_mul(cell_dims.pixel_width);
+                        data.first.cols = 1;
+                        data.first.pixel_width = cell_dims.pixel_width;
+                    }
+                    SplitDirection::Vertical => {
+                        let freed = data.first.rows.saturating_add(1);
+                        data.second.rows = data.second.rows.saturating_add(freed);
+                        data.second.pixel_height =
+                            data.second.rows.saturating_mul(cell_dims.pixel_height);
+                        data.first.rows = 1;
+                        data.first.pixel_height = cell_dims.pixel_height;
+                    }
+                }
+            } else if right_collapsed && !left_collapsed {
+                match data.direction {
+                    SplitDirection::Horizontal => {
+                        let freed = data.second.cols.saturating_add(1);
+                        data.first.cols = data.first.cols.saturating_add(freed);
+                        data.first.pixel_width =
+                            data.first.cols.saturating_mul(cell_dims.pixel_width);
+                        data.second.cols = 1;
+                        data.second.pixel_width = cell_dims.pixel_width;
+                    }
+                    SplitDirection::Vertical => {
+                        let freed = data.second.rows.saturating_add(1);
+                        data.first.rows = data.first.rows.saturating_add(freed);
+                        data.first.pixel_height =
+                            data.first.rows.saturating_mul(cell_dims.pixel_height);
+                        data.second.rows = 1;
+                        data.second.pixel_height = cell_dims.pixel_height;
+                    }
+                }
+            }
+            // Both collapsed or neither: leave sizes as-is.
+
+            // Recurse into non-fully-collapsed children.
+            if !left_collapsed {
+                redistribute_for_collapsed(left, collapsed, cell_dims);
+            }
+            if !right_collapsed {
+                redistribute_for_collapsed(right, collapsed, cell_dims);
+            }
+        }
+    }
+}
+
+/// Recursively walk the tree in pre-order to find the split at `target_index`
+/// and compute its resize budget.
+fn find_split_budget(
+    tree: &Tree,
+    target_index: usize,
+    counter: &mut usize,
+) -> Option<(isize, isize)> {
+    match tree {
+        Tree::Empty | Tree::Leaf(_) | Tree::Node { data: None, .. } => None,
+        Tree::Node {
+            left,
+            right,
+            data: Some(data),
+        } => {
+            if *counter == target_index {
+                return Some(compute_split_resize_budget(
+                    left,
+                    right,
+                    data.direction,
+                    &data.first,
+                    &data.second,
+                ));
+            }
+            *counter += 1;
+            if let Some(result) = find_split_budget(left, target_index, counter) {
+                return Some(result);
+            }
+            find_split_budget(right, target_index, counter)
+        }
+    }
+}
+
 fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &TerminalSize) {
     let x_constraints = compute_axis_constraints(tree, Axis::Width);
     let min_x = x_constraints.min;
@@ -1083,6 +1338,26 @@ impl Tab {
         self.inner.lock().resize_split_by(split_index, delta)
     }
 
+    /// Returns `true` if the given pane is currently collapsed (hidden
+    /// because the terminal shrank below minimum constraints).
+    pub fn is_pane_collapsed(&self, pane_id: PaneId) -> bool {
+        self.inner.lock().is_pane_collapsed(pane_id)
+    }
+
+    /// Returns the set of currently collapsed pane IDs.
+    pub fn collapsed_pane_ids(&self) -> HashSet<PaneId> {
+        self.inner.lock().collapsed_pane_ids().clone()
+    }
+
+    /// Compute the resize budget for a split identified by its topological
+    /// index.  Returns `None` if the index is out of range, otherwise
+    /// `(max_shrink, max_grow)` where max_shrink is negative (how far
+    /// the first child can shrink) and max_grow is positive (how far
+    /// the first child can grow).
+    pub fn compute_split_budget(&self, split_index: usize) -> Option<(isize, isize)> {
+        self.inner.lock().compute_split_budget(split_index)
+    }
+
     /// Adjusts the size of the active pane in the specified direction
     /// by the specified amount.
     pub fn adjust_pane_size(&self, direction: PaneDirection, amount: usize) {
@@ -1209,6 +1484,7 @@ impl TabInner {
             zoomed: None,
             title: String::new(),
             recency: Recency::default(),
+            collapsed_panes: HashSet::new(),
         }
     }
 
@@ -1610,6 +1886,96 @@ impl TabInner {
         }
     }
 
+    /// Determine which panes should be collapsed so that the tree fits
+    /// within the given `(cols, rows)` budget.  Returns the set of pane
+    /// IDs to collapse.  Panes with `CollapsePriority::Never` are exempt.
+    fn select_panes_to_collapse(&self, cols: usize, rows: usize) -> HashSet<PaneId> {
+        let tree = match self.pane.as_ref() {
+            Some(t) => t,
+            None => return HashSet::new(),
+        };
+        let mut collapsed = self.collapsed_panes.clone();
+
+        // Collect candidates sorted by collapse order (Low first).
+        let mut candidates: Vec<(PaneId, u8)> = collect_leaf_panes(tree)
+            .into_iter()
+            .filter_map(|(id, priority)| {
+                collapse_order(priority).map(|order| (id, order))
+            })
+            .filter(|(id, _)| !collapsed.contains(id))
+            .collect();
+        candidates.sort_by_key(|&(_, order)| order);
+
+        for (pane_id, _) in candidates {
+            let (min_w, min_h) = compute_min_size_with_collapsed(tree, &collapsed);
+            if min_w <= cols && min_h <= rows {
+                break;
+            }
+            collapsed.insert(pane_id);
+        }
+        collapsed
+    }
+
+    /// Attempt to restore previously collapsed panes if the terminal has
+    /// grown large enough to accommodate them.  Returns the updated
+    /// collapsed set.
+    fn select_panes_to_uncollapse(&self, cols: usize, rows: usize) -> HashSet<PaneId> {
+        let tree = match self.pane.as_ref() {
+            Some(t) => t,
+            None => return HashSet::new(),
+        };
+        if self.collapsed_panes.is_empty() {
+            return HashSet::new();
+        }
+
+        // Build restoration order: High priority panes restore first.
+        let pane_priorities: HashMap<PaneId, CollapsePriority> = collect_leaf_panes(tree)
+            .into_iter()
+            .collect();
+        let mut restore_candidates: Vec<PaneId> = self.collapsed_panes.iter().copied().collect();
+        restore_candidates.sort_by(|a, b| {
+            let a_order = pane_priorities
+                .get(a)
+                .and_then(|p| collapse_order(*p))
+                .unwrap_or(3);
+            let b_order = pane_priorities
+                .get(b)
+                .and_then(|p| collapse_order(*p))
+                .unwrap_or(3);
+            b_order.cmp(&a_order) // High priority (order 2) restores before Low (order 0)
+        });
+
+        let mut collapsed = self.collapsed_panes.clone();
+        for pane_id in restore_candidates {
+            let mut trial = collapsed.clone();
+            trial.remove(&pane_id);
+            let (min_w, min_h) = compute_min_size_with_collapsed(tree, &trial);
+            if min_w <= cols && min_h <= rows {
+                collapsed = trial;
+            }
+        }
+        collapsed
+    }
+
+    /// Returns `true` if the given pane is currently collapsed.
+    fn is_pane_collapsed(&self, pane_id: PaneId) -> bool {
+        self.collapsed_panes.contains(&pane_id)
+    }
+
+    /// Returns the set of currently collapsed pane IDs.
+    fn collapsed_pane_ids(&self) -> &HashSet<PaneId> {
+        &self.collapsed_panes
+    }
+
+    /// Compute the resize budget for a split identified by its topological
+    /// index.  Returns `None` if the index is out of range, otherwise
+    /// `(max_shrink, max_grow)` for the first child.
+    fn compute_split_budget(&self, split_index: usize) -> Option<(isize, isize)> {
+        let tree = self.pane.as_ref()?;
+        let mut counter = 0usize;
+        find_split_budget(tree, split_index, &mut counter)
+    }
+
     /// Walks the pane tree to produce the topologically ordered flattened
     /// list of PositionedPane instances along with their positioning information.
     fn iter_panes(&mut self) -> Vec<PositionedPane> {
@@ -1838,6 +2204,17 @@ impl TabInner {
                 compute_axis_constraints(self.pane.as_ref().unwrap(), Axis::Height);
             let current_size = self.size;
 
+            // If the tree minimum exceeds available space, collapse panes
+            // in priority order to make it fit.
+            if width_constraints.min > size.cols || height_constraints.min > size.rows {
+                self.collapsed_panes =
+                    self.select_panes_to_collapse(size.cols, size.rows);
+            } else if !self.collapsed_panes.is_empty() {
+                // Terminal grew — try to restore previously collapsed panes
+                self.collapsed_panes =
+                    self.select_panes_to_uncollapse(size.cols, size.rows);
+            }
+
             // Constrain the new size to the minimum possible dimensions
             let cols = width_constraints
                 .max
@@ -1868,6 +2245,16 @@ impl TabInner {
                 rows as isize - current_size.rows as isize,
                 &dims,
             );
+
+            // Redistribute space away from collapsed subtrees so that
+            // their siblings receive the freed columns/rows.
+            if !self.collapsed_panes.is_empty() {
+                redistribute_for_collapsed(
+                    self.pane.as_mut().unwrap(),
+                    &self.collapsed_panes,
+                    &dims,
+                );
+            }
 
             self.size = size;
 
@@ -3161,6 +3548,7 @@ mod test {
         id: PaneId,
         size: Mutex<TerminalSize>,
         constraints: PaneConstraints,
+        priority: CollapsePriority,
     }
 
     impl FakePane {
@@ -3169,6 +3557,7 @@ mod test {
                 id,
                 size: Mutex::new(size),
                 constraints: PaneConstraints::default(),
+                priority: CollapsePriority::default(),
             })
         }
 
@@ -3181,6 +3570,21 @@ mod test {
                 id,
                 size: Mutex::new(size),
                 constraints,
+                priority: CollapsePriority::default(),
+            })
+        }
+
+        fn new_with_priority(
+            id: PaneId,
+            size: TerminalSize,
+            constraints: PaneConstraints,
+            priority: CollapsePriority,
+        ) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                constraints,
+                priority,
             })
         }
     }
@@ -3247,6 +3651,10 @@ mod test {
 
         fn pane_constraints(&self) -> PaneConstraints {
             self.constraints
+        }
+
+        fn collapse_priority(&self) -> CollapsePriority {
+            self.priority
         }
 
         fn get_title(&self) -> String {
@@ -4576,5 +4984,538 @@ mod test {
         let dbg = format!("{:?}", entry);
         assert!(dbg.contains("PaneEntry"));
         assert!(dbg.contains("vim"));
+    }
+
+    // ── Collapse priority tests ─────────────────────────────
+
+    #[test]
+    fn collapse_low_priority_pane_on_shrink() {
+        // Two horizontal panes: left has Low priority (min_width=20),
+        // right has Never priority (min_width=20).  Total min = 20+1+20 = 41.
+        // When we shrink to 30 cols, left should be collapsed.
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_priority(
+            1,
+            size,
+            PaneConstraints {
+                min_width: 20,
+                min_height: 3,
+                ..PaneConstraints::default()
+            },
+            CollapsePriority::Low,
+        ));
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new_with_priority(
+                2,
+                split.second,
+                PaneConstraints {
+                    min_width: 20,
+                    min_height: 3,
+                    ..PaneConstraints::default()
+                },
+                CollapsePriority::Never,
+            ),
+        )
+        .unwrap();
+
+        // Sanity: nothing collapsed yet
+        assert!(!tab.is_pane_collapsed(1));
+        assert!(!tab.is_pane_collapsed(2));
+
+        // Shrink to 30 cols — below min of 41 — should collapse pane 1 (Low)
+        let small = TerminalSize {
+            rows: 24,
+            cols: 30,
+            pixel_width: 300,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        tab.resize(small);
+
+        assert!(
+            tab.is_pane_collapsed(1),
+            "Low-priority pane should be collapsed"
+        );
+        assert!(
+            !tab.is_pane_collapsed(2),
+            "Never-priority pane should NOT be collapsed"
+        );
+
+        // The non-collapsed pane should have gotten the extra space
+        let panes = tab.iter_panes();
+        let pane2 = panes.iter().find(|p| p.pane.pane_id() == 2).unwrap();
+        // Pane 2 should use most of the 30 cols (minus 1 separator, 1 for collapsed)
+        assert!(
+            pane2.width >= 20,
+            "Non-collapsed pane should get the freed space, got width={}",
+            pane2.width
+        );
+    }
+
+    #[test]
+    fn collapse_priority_ordering() {
+        // Three horizontal panes: Low, Normal, High priority.
+        // Use a wide terminal so all three splits succeed.
+        let size = TerminalSize {
+            rows: 24,
+            cols: 200,
+            pixel_width: 2000,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_priority(
+            1,
+            size,
+            PaneConstraints {
+                min_width: 30,
+                min_height: 3,
+                ..PaneConstraints::default()
+            },
+            CollapsePriority::Low,
+        ));
+
+        // Split horizontally to add pane 2 (Normal)
+        let split1 = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new_with_priority(
+                2,
+                split1.second,
+                PaneConstraints {
+                    min_width: 30,
+                    min_height: 3,
+                    ..PaneConstraints::default()
+                },
+                CollapsePriority::Normal,
+            ),
+        )
+        .unwrap();
+
+        // Split the right pane (index 1) to add pane 3 (High)
+        let split2 = tab
+            .compute_split_size(
+                1,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            1,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new_with_priority(
+                3,
+                split2.second,
+                PaneConstraints {
+                    min_width: 30,
+                    min_height: 3,
+                    ..PaneConstraints::default()
+                },
+                CollapsePriority::High,
+            ),
+        )
+        .unwrap();
+
+        // Three panes at 30 min each: min total = 30+1+30+1+30 = 92.
+        // Shrink to 35 cols: needs two collapsed to fit (30+1+1+1+1 = 34 ≤ 35).
+        let small = TerminalSize {
+            rows: 24,
+            cols: 35,
+            pixel_width: 350,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        tab.resize(small);
+
+        // Low should collapse first, then Normal
+        assert!(
+            tab.is_pane_collapsed(1),
+            "Low-priority pane should be collapsed first"
+        );
+        assert!(
+            tab.is_pane_collapsed(2),
+            "Normal-priority pane should be collapsed second"
+        );
+        assert!(
+            !tab.is_pane_collapsed(3),
+            "High-priority pane should remain"
+        );
+    }
+
+    #[test]
+    fn never_priority_pane_exempt_from_collapse() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 60,
+            pixel_width: 600,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_priority(
+            1,
+            size,
+            PaneConstraints {
+                min_width: 25,
+                min_height: 3,
+                ..PaneConstraints::default()
+            },
+            CollapsePriority::Never,
+        ));
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new_with_priority(
+                2,
+                split.second,
+                PaneConstraints {
+                    min_width: 25,
+                    min_height: 3,
+                    ..PaneConstraints::default()
+                },
+                CollapsePriority::Never,
+            ),
+        )
+        .unwrap();
+
+        // Shrink below both panes' minimum — neither should collapse
+        let small = TerminalSize {
+            rows: 24,
+            cols: 20,
+            pixel_width: 200,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        tab.resize(small);
+
+        assert!(
+            !tab.is_pane_collapsed(1),
+            "Never-priority should never collapse"
+        );
+        assert!(
+            !tab.is_pane_collapsed(2),
+            "Never-priority should never collapse"
+        );
+    }
+
+    #[test]
+    fn uncollapse_panes_on_grow() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_priority(
+            1,
+            size,
+            PaneConstraints {
+                min_width: 20,
+                min_height: 3,
+                ..PaneConstraints::default()
+            },
+            CollapsePriority::Low,
+        ));
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new_with_priority(
+                2,
+                split.second,
+                PaneConstraints {
+                    min_width: 20,
+                    min_height: 3,
+                    ..PaneConstraints::default()
+                },
+                CollapsePriority::Normal,
+            ),
+        )
+        .unwrap();
+
+        // Shrink to cause collapse
+        let small = TerminalSize {
+            rows: 24,
+            cols: 25,
+            pixel_width: 250,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        tab.resize(small);
+        assert!(tab.is_pane_collapsed(1), "pane 1 should be collapsed");
+
+        // Grow back to original size — pane should uncollapse
+        tab.resize(size);
+        assert!(
+            !tab.is_pane_collapsed(1),
+            "pane 1 should be uncollapsed after growing"
+        );
+        assert!(
+            !tab.is_pane_collapsed(2),
+            "pane 2 should be uncollapsed after growing"
+        );
+    }
+
+    #[test]
+    fn collapsed_pane_ids_api() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_priority(
+            1,
+            size,
+            PaneConstraints {
+                min_width: 20,
+                min_height: 3,
+                ..PaneConstraints::default()
+            },
+            CollapsePriority::Low,
+        ));
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new_with_priority(
+                2,
+                split.second,
+                PaneConstraints {
+                    min_width: 20,
+                    min_height: 3,
+                    ..PaneConstraints::default()
+                },
+                CollapsePriority::Never,
+            ),
+        )
+        .unwrap();
+
+        // Initially empty
+        assert!(tab.collapsed_pane_ids().is_empty());
+
+        // Shrink to trigger collapse
+        let small = TerminalSize {
+            rows: 24,
+            cols: 25,
+            pixel_width: 250,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        tab.resize(small);
+
+        let collapsed = tab.collapsed_pane_ids();
+        assert!(collapsed.contains(&1));
+        assert!(!collapsed.contains(&2));
+    }
+
+    #[test]
+    fn compute_split_budget_basic() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_constraints(
+            1,
+            size,
+            PaneConstraints {
+                min_width: 10,
+                min_height: 3,
+                ..PaneConstraints::default()
+            },
+        ));
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new_with_constraints(
+                2,
+                split.second,
+                PaneConstraints {
+                    min_width: 10,
+                    min_height: 3,
+                    ..PaneConstraints::default()
+                },
+            ),
+        )
+        .unwrap();
+
+        let budget = tab.compute_split_budget(0);
+        assert!(budget.is_some(), "split 0 should exist");
+        let (shrink, grow) = budget.unwrap();
+        // Shrink is negative (how far first child can shrink)
+        assert!(shrink < 0, "should be able to shrink first child");
+        // Grow is positive (how far first child can grow)
+        assert!(grow > 0, "should be able to grow first child");
+
+        // Non-existent split returns None
+        assert!(tab.compute_split_budget(99).is_none());
+    }
+
+    #[test]
+    fn vertical_collapse_on_shrink() {
+        // Vertical split: top pane Low priority, bottom pane Never.
+        let size = TerminalSize {
+            rows: 40,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 1000,
+            dpi: 96,
+        };
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_priority(
+            1,
+            size,
+            PaneConstraints {
+                min_width: 5,
+                min_height: 15,
+                ..PaneConstraints::default()
+            },
+            CollapsePriority::Low,
+        ));
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Vertical,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Vertical,
+                ..Default::default()
+            },
+            FakePane::new_with_priority(
+                2,
+                split.second,
+                PaneConstraints {
+                    min_width: 5,
+                    min_height: 15,
+                    ..PaneConstraints::default()
+                },
+                CollapsePriority::Never,
+            ),
+        )
+        .unwrap();
+
+        // Shrink rows below minimum (15+1+15 = 31)
+        let small = TerminalSize {
+            rows: 20,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 500,
+            dpi: 96,
+        };
+        tab.resize(small);
+
+        assert!(
+            tab.is_pane_collapsed(1),
+            "Top pane (Low) should be collapsed on vertical shrink"
+        );
+        assert!(
+            !tab.is_pane_collapsed(2),
+            "Bottom pane (Never) should remain"
+        );
     }
 }
