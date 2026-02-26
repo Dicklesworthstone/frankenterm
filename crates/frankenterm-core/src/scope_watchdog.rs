@@ -876,12 +876,10 @@ mod tests {
         // The parent is draining with a live child — not an orphan yet.
         // The stuck-cancel detection should fire if grace period expired.
         let alerts = wd.scan(&tree2, 20_000);
-        let stuck: Vec<_> = alerts
-            .iter()
-            .filter(|a| matches!(a.kind, AlertKind::StuckCancellation { .. }))
-            .collect();
         assert!(
-            !stuck.is_empty(),
+            alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::StuckCancellation { .. })),
             "should detect stuck cancellation for draining parent"
         );
     }
@@ -898,11 +896,12 @@ mod tests {
 
         // Just after shutdown — not stuck yet
         let alerts = watchdog.scan(&tree, 5100);
-        let stuck: Vec<_> = alerts
-            .iter()
-            .filter(|a| matches!(a.kind, AlertKind::StuckCancellation { .. }))
-            .collect();
-        assert!(stuck.is_empty(), "should not be stuck at 100ms");
+        assert!(
+            !alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::StuckCancellation { .. })),
+            "should not be stuck at 100ms"
+        );
 
         // Well past grace period (default daemon = 15s)
         let alerts = watchdog.scan(&tree, 25_000);
@@ -997,19 +996,21 @@ mod tests {
 
         // Not stale yet at 5s
         let alerts = watchdog.scan(&tree, 6_000);
-        let stale: Vec<_> = alerts
-            .iter()
-            .filter(|a| matches!(a.kind, AlertKind::StaleCreated { .. }))
-            .collect();
-        assert!(stale.is_empty());
+        assert!(
+            !alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::StaleCreated { .. }))
+        );
 
         // Stale at 35s (threshold = 30s)
         let alerts = watchdog.scan(&tree, 35_000);
-        let stale: Vec<_> = alerts
-            .iter()
-            .filter(|a| matches!(a.kind, AlertKind::StaleCreated { .. }))
-            .collect();
-        assert_eq!(stale.len(), 1);
+        assert_eq!(
+            alerts
+                .iter()
+                .filter(|a| matches!(a.kind, AlertKind::StaleCreated { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1033,12 +1034,12 @@ mod tests {
         let mut watchdog = ScopeWatchdog::with_config(config);
         let alerts = watchdog.scan(&tree, 2000);
 
-        let depth_alerts: Vec<_> = alerts
-            .iter()
-            .filter(|a| matches!(a.kind, AlertKind::ExcessiveDepth { .. }))
-            .collect();
         // daemon:d1 is at depth 1, which equals max_depth (not exceeding)
-        assert!(depth_alerts.is_empty());
+        assert!(
+            !alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::ExcessiveDepth { .. }))
+        );
 
         // Add worker under daemon (depth 2 > max 1)
         tree.register(
@@ -1051,11 +1052,13 @@ mod tests {
         .unwrap();
 
         let alerts = watchdog.scan(&tree, 2100);
-        let depth_alerts: Vec<_> = alerts
-            .iter()
-            .filter(|a| matches!(a.kind, AlertKind::ExcessiveDepth { .. }))
-            .collect();
-        assert_eq!(depth_alerts.len(), 1);
+        assert_eq!(
+            alerts
+                .iter()
+                .filter(|a| matches!(a.kind, AlertKind::ExcessiveDepth { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]

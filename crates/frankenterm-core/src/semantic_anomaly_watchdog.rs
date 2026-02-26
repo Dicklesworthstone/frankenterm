@@ -552,6 +552,7 @@ fn publish_anomaly_event(bus: &EventBus, event: &SemanticAnomalyEvent) {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -564,7 +565,7 @@ mod tests {
         // Normalize.
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > f32::EPSILON {
-            for x in v.iter_mut() {
+            for x in &mut v {
                 *x /= norm;
             }
         }

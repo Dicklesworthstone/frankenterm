@@ -476,6 +476,7 @@ pub fn theoretical_fp_rate(num_bits: usize, num_hashes: u32, count: usize) -> f6
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 

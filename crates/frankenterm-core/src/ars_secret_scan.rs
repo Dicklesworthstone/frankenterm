@@ -1099,11 +1099,11 @@ mod tests {
         let scanner = default_scanner();
         let findings = scanner.scan_text_standalone("just normal text here");
         // Entropy might trigger on some tokens, so check pattern matches specifically.
-        let pattern_findings: Vec<_> = findings
-            .iter()
-            .filter(|f| f.detection_method == DetectionMethod::PatternMatch)
-            .collect();
-        assert!(pattern_findings.is_empty());
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.detection_method != DetectionMethod::PatternMatch)
+        );
     }
 
     // -------------------------------------------------------------------------

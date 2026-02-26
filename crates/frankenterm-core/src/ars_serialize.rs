@@ -755,7 +755,7 @@ mod tests {
                 reflex_id: i as u64,
                 cluster_id: "c".to_string(),
                 version: 1,
-                status: status.clone(),
+                status: *status,
                 tier: MaturityTier::Incubating,
                 successes: 0,
                 failures: 0,

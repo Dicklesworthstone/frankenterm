@@ -468,6 +468,7 @@ pub fn k_shortest_paths(
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -523,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "out of range")]
     fn add_edge_oob() {
         let mut g = WeightedGraph::new(2);
         g.add_edge(0, 5, 1.0);
@@ -666,12 +667,12 @@ mod tests {
         let g = diamond_graph();
         let fw = floyd_warshall(&g).unwrap();
         let dij = dijkstra(&g, 0);
-        for i in 0..g.node_count() {
+        for (i, fw_dist) in fw[0].iter().enumerate() {
             assert!(
-                (fw[0][i] - dij.distance_to(i)).abs() < 1e-10,
+                (fw_dist - dij.distance_to(i)).abs() < 1e-10,
                 "node {}: fw={}, dij={}",
                 i,
-                fw[0][i],
+                fw_dist,
                 dij.distance_to(i)
             );
         }

@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "out of range")]
     fn add_edge_out_of_range() {
         let mut g = DiGraph::new(3);
         g.add_edge(0, 5);
@@ -735,8 +735,8 @@ mod tests {
     fn closure_reflexive() {
         let g = diamond();
         let reach = transitive_closure(&g);
-        for i in 0..4 {
-            assert!(reach[i][i]);
+        for (i, row) in reach.iter().enumerate().take(4) {
+            assert!(row[i]);
         }
     }
 
@@ -808,8 +808,7 @@ mod tests {
         let g = DiGraph::from_edges(2, &[(0, 0), (0, 1)]);
         let sccs = tarjan_scc(&g);
         // Node 0 has self-loop → SCC of size 1 (self-loop counts)
-        let scc0: Vec<&Vec<usize>> = sccs.iter().filter(|s| s.contains(&0)).collect();
-        assert_eq!(scc0.len(), 1);
+        assert_eq!(sccs.iter().filter(|s| s.contains(&0)).count(), 1);
     }
 
     #[test]

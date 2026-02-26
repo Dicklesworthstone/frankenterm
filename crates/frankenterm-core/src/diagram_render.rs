@@ -606,8 +606,7 @@ mod tests {
         assert!(output.contains("line2"));
         assert!(output.contains("line3"));
         // Lines should be padded to same width
-        let lines: Vec<&str> = output.lines().collect();
-        assert!(lines.len() >= 5); // top + 3 content + bottom
+        assert!(output.lines().count() >= 5); // top + 3 content + bottom
     }
 
     #[test]

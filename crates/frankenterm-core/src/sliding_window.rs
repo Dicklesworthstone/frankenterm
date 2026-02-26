@@ -299,6 +299,7 @@ impl PartialEq for SlidingWindow {
 impl Eq for SlidingWindow {}
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 

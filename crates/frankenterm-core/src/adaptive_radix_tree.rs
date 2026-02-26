@@ -1007,8 +1007,8 @@ mod tests {
         match node {
             InnerNode::Node256 { children } => {
                 assert_eq!(children[200], Some(9_999));
-                for slot in 0..NODE48_MAX {
-                    assert_eq!(children[slot], Some(slot));
+                for (slot, child) in children.iter().enumerate().take(NODE48_MAX) {
+                    assert_eq!(*child, Some(slot));
                 }
             }
             _ => panic!("expected Node256 promotion when Node48 has no free slots"),

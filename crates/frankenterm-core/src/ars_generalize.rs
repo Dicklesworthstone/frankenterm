@@ -1147,6 +1147,7 @@ impl GeneralizationStats {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -1470,12 +1471,13 @@ mod tests {
         let detections = gzr.detect_params(&[cmd], error);
         // "cargo" and "build" might match as identifiers if present in error.
         // But since error has different content, should be minimal.
-        let file_params: Vec<_> = detections
-            .iter()
-            .flat_map(|(_, p)| p)
-            .filter(|p| p.kind == ParamKind::FilePath)
-            .collect();
-        assert!(file_params.is_empty(), "no file paths should match");
+        assert!(
+            detections
+                .iter()
+                .flat_map(|(_, p)| p)
+                .all(|p| p.kind != ParamKind::FilePath),
+            "no file paths should match"
+        );
     }
 
     #[test]
@@ -1488,13 +1490,11 @@ mod tests {
         let cmd = make_block(0, "cat a.rs");
         let error = "error in a.rs";
         let detections = gzr.detect_params(&[cmd], error);
-        let file_params: Vec<_> = detections
-            .iter()
-            .flat_map(|(_, p)| p)
-            .filter(|p| p.kind == ParamKind::FilePath)
-            .collect();
         assert!(
-            file_params.is_empty(),
+            detections
+                .iter()
+                .flat_map(|(_, p)| p)
+                .all(|p| p.kind != ParamKind::FilePath),
             "a.rs is too short for min_param_len=10"
         );
     }
@@ -2045,12 +2045,12 @@ mod tests {
         let cmd = make_block(0, "cat src/main.rs");
         let error = "error in src/main.rs";
         let detections = gzr.detect_params(&[cmd], error);
-        let file_params: Vec<_> = detections
-            .iter()
-            .flat_map(|(_, p)| p)
-            .filter(|p| p.kind == ParamKind::FilePath)
-            .collect();
-        assert!(file_params.is_empty());
+        assert!(
+            detections
+                .iter()
+                .flat_map(|(_, p)| p)
+                .all(|p| p.kind != ParamKind::FilePath)
+        );
     }
 
     #[test]

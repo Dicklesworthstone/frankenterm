@@ -349,6 +349,7 @@ impl PartialEq for TimeSeries {
 impl Eq for TimeSeries {}
 
 #[cfg(test)]
+#[allow(clippy::float_cmp, clippy::manual_range_contains, clippy::approx_constant)]
 mod tests {
     use super::*;
 

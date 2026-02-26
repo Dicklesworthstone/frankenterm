@@ -809,8 +809,8 @@ mod tests {
 
     #[test]
     fn evidence_value_from_f64() {
-        let v: EvidenceValue = 3.14.into();
-        assert_eq!(v, EvidenceValue::Number(3.14));
+        let v: EvidenceValue = std::f64::consts::PI.into();
+        assert_eq!(v, EvidenceValue::Number(std::f64::consts::PI));
     }
 
     #[test]

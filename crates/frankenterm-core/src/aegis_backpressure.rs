@@ -968,10 +968,10 @@ mod tests {
     fn throttle_actions_at_max_severity() {
         // Verify the curves at severity = 1.0
         let severity: f64 = 1.0;
-        let poll = 1.0 + 3.0 * severity;
+        let poll = 3.0f64.mul_add(severity, 1.0);
         let skip = 0.5 * severity * severity;
         let detect = 0.25 * severity;
-        let buffer = 1.0 - 0.8 * severity;
+        let buffer = (-0.8f64).mul_add(severity, 1.0);
         assert!((poll - 4.0).abs() < 1e-10);
         assert!((skip - 0.5).abs() < 1e-10);
         assert!((detect - 0.25).abs() < 1e-10);

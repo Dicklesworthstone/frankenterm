@@ -954,7 +954,7 @@ mod tests {
         for i in (0..10_000).step_by(3) {
             bs.set(i);
         }
-        let expected_count = (10_000 + 2) / 3;
+        let expected_count = 10_000_usize.div_ceil(3);
         assert_eq!(bs.count_ones(), expected_count);
         assert_eq!(bs.first_set(), Some(0));
         assert_eq!(bs.last_set(), Some(9999));
