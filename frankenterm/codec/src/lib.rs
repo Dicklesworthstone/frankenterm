@@ -21,7 +21,7 @@ use frankenterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
 use mux::client::{ClientId, ClientInfo};
 use mux::pane::PaneId;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use mux::tab::{PaneNode, SerdeUrl, SplitRequest, TabId};
+use mux::tab::{FloatingPaneRect, PaneNode, SerdeUrl, SplitRequest, TabId};
 use mux::window::WindowId;
 use portable_pty::CommandBuilder;
 use rangeset::*;
@@ -561,6 +561,11 @@ pdu! {
     GetPaneDirection: 60,
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
+    CreateFloatingPane: 63,
+    MoveFloatingPane: 64,
+    SetFloatingPaneZ: 65,
+    ToggleFloatingPane: 66,
+    RemoveFloatingPane: 67,
 }
 
 impl Pdu {
@@ -933,6 +938,36 @@ pub struct AdjustPaneSize {
     pub pane_id: PaneId,
     pub direction: PaneDirection,
     pub amount: usize,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct CreateFloatingPane {
+    pub tab_id: TabId,
+    pub pane_id: PaneId,
+    pub rect: FloatingPaneRect,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct MoveFloatingPane {
+    pub pane_id: PaneId,
+    pub rect: FloatingPaneRect,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SetFloatingPaneZ {
+    pub pane_id: PaneId,
+    pub z_order: u32,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct ToggleFloatingPane {
+    pub pane_id: PaneId,
+    pub visible: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct RemoveFloatingPane {
+    pub pane_id: PaneId,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

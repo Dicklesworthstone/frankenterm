@@ -4036,6 +4036,160 @@ mod test {
     }
 
     #[test]
+    fn floating_pane_z_order_deterministic_after_operations() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 750,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+
+        // Add three floating panes
+        for id in 10..13 {
+            tab.add_floating_pane(
+                FakePane::new(id, size),
+                FloatingPaneRect {
+                    left: id * 2,
+                    top: id,
+                    width: 20,
+                    height: 10,
+                },
+            );
+        }
+
+        // Bring pane 10 to front (z_order only, not focus)
+        assert!(tab.bring_floating_pane_to_front(10));
+
+        let panes = tab.iter_floating_panes();
+        assert_eq!(3, panes.len());
+
+        // Pane 10 now has the highest z_order and sorts last,
+        // but pane 12 retains focus since set_floating_pane_focus
+        // was not called.
+        assert_eq!(10, panes.last().unwrap().pane_id);
+        // Focus remains on pane 12 (last added)
+        let focused = panes.iter().find(|p| p.is_focused).unwrap();
+        assert_eq!(12, focused.pane_id);
+
+        // Verify z-orders are unique
+        let z_orders: Vec<u32> = panes.iter().map(|p| p.z_order).collect();
+        let mut deduped = z_orders.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(z_orders.len(), deduped.len(), "z-orders must be unique");
+    }
+
+    #[test]
+    fn floating_pane_reposition_updates_geometry() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 750,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+
+        tab.add_floating_pane(
+            FakePane::new(50, size),
+            FloatingPaneRect {
+                left: 5,
+                top: 5,
+                width: 30,
+                height: 15,
+            },
+        );
+
+        let new_rect = FloatingPaneRect {
+            left: 10,
+            top: 10,
+            width: 40,
+            height: 12,
+        };
+        let updated = tab.set_floating_pane_rect(50, new_rect).unwrap();
+        assert_eq!(10, updated.left);
+        assert_eq!(10, updated.top);
+        assert_eq!(40, updated.width);
+        assert_eq!(12, updated.height);
+
+        // Non-existent pane returns None
+        assert!(tab.set_floating_pane_rect(999, new_rect).is_none());
+    }
+
+    #[test]
+    fn floating_pane_resize_clamps_to_tab() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+
+        // Resize tab to a very small size and check floating pane gets clamped
+        tab.add_floating_pane(
+            FakePane::new(60, size),
+            FloatingPaneRect {
+                left: 50,
+                top: 10,
+                width: 30,
+                height: 15,
+            },
+        );
+
+        let small = TerminalSize {
+            rows: 10,
+            cols: 20,
+            pixel_width: 200,
+            pixel_height: 250,
+            dpi: 96,
+        };
+        tab.resize(small);
+
+        let panes = tab.iter_floating_panes();
+        assert_eq!(1, panes.len());
+        let fp = &panes[0];
+        // After resize to 20 cols, floating pane should be clamped
+        assert!(
+            fp.left + fp.width <= 20,
+            "floating pane should fit within new cols: left={} width={}",
+            fp.left,
+            fp.width
+        );
+        assert!(
+            fp.top + fp.height <= 10,
+            "floating pane should fit within new rows: top={} height={}",
+            fp.top,
+            fp.height
+        );
+    }
+
+    #[test]
+    fn floating_pane_remove_nonexistent_returns_none() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+
+        assert!(tab.remove_floating_pane(999).is_none());
+    }
+
+    #[test]
     fn resize_split_by_clamps_to_horizontal_constraints() {
         let size = TerminalSize {
             rows: 24,
@@ -4765,6 +4919,56 @@ mod test {
                 !tab.is_pane_collapsed(2),
                 "Never-priority pane must never be collapsed"
             );
+        }
+
+        /// Verify that after adding N floating panes and bringing random
+        /// ones to front, z-orders remain unique and the focused pane
+        /// renders last in iteration order.
+        #[test]
+        fn floating_z_order_always_unique_after_focus_ops(
+            bring_to_front_id in 10usize..15,
+        ) {
+            ensure_mux_initialized();
+            let size = TerminalSize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 1200,
+                pixel_height: 1000,
+                dpi: 96,
+            };
+            let tab = Tab::new(&size);
+            tab.assign_pane(&FakePane::new(1, size));
+
+            // Add 5 floating panes (ids 10-14)
+            for id in 10..15 {
+                tab.add_floating_pane(
+                    FakePane::new(id, size),
+                    FloatingPaneRect {
+                        left: id * 3,
+                        top: id * 2,
+                        width: 20,
+                        height: 10,
+                    },
+                );
+            }
+
+            // Bring a random one to front
+            tab.set_floating_pane_focus(bring_to_front_id);
+
+            let panes = tab.iter_floating_panes();
+            prop_assert_eq!(5, panes.len());
+
+            // Check z-orders are unique
+            let mut z_orders: Vec<u32> = panes.iter().map(|p| p.z_order).collect();
+            z_orders.sort();
+            let before = z_orders.len();
+            z_orders.dedup();
+            prop_assert_eq!(before, z_orders.len(), "z-orders must be unique");
+
+            // Focused pane must be last in iteration
+            let last = panes.last().unwrap();
+            prop_assert!(last.is_focused, "last in iteration must be focused");
+            prop_assert_eq!(bring_to_front_id, last.pane_id);
         }
     }
 
