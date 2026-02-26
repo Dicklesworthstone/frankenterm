@@ -725,6 +725,164 @@ pub struct EventMutationData {
 }
 
 // ============================================================================
+// Agent Inventory
+// ============================================================================
+
+/// Response data for `ft robot agents list` / `ft robot agents inventory`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInventoryData {
+    /// Agents detected via filesystem probes.
+    pub installed: Vec<InstalledAgentInfo>,
+    /// Agents currently active in panes, keyed by pane_id.
+    pub running: std::collections::BTreeMap<u64, RunningAgentInfo>,
+    /// Aggregate counts.
+    pub summary: AgentInventorySummary,
+    /// Whether the `agent-detection` feature is compiled in.
+    pub filesystem_detection_available: bool,
+}
+
+/// Individual installed agent from filesystem detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledAgentInfo {
+    /// Canonical agent slug (e.g. "claude", "codex", "gemini").
+    pub slug: String,
+    /// Human-readable display name (e.g. "Claude Code", "Codex").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Whether the agent was detected on this machine.
+    pub detected: bool,
+    /// Human-readable evidence strings from probes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// Filesystem root paths that were found.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub root_paths: Vec<String>,
+    /// Path to agent's configuration file, if found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    /// Path to agent binary, if found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    /// Detected agent version string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// Agent currently active in a pane (from correlator).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunningAgentInfo {
+    /// Canonical agent slug.
+    pub slug: String,
+    /// Human-readable display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Inferred agent state: "starting", "working", "rate_limited",
+    /// "waiting_approval", "idle", "active", "unknown".
+    pub state: String,
+    /// Session ID extracted from agent output, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// How this agent was detected.
+    pub source: String,
+    /// Pane ID where this agent is running.
+    pub pane_id: u64,
+}
+
+/// Aggregate counts for agent inventory.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentInventorySummary {
+    /// Number of distinct agents detected on filesystem.
+    pub installed_count: usize,
+    /// Number of panes with an active agent.
+    pub running_count: usize,
+    /// Number of installed agents that have configuration files.
+    pub configured_count: usize,
+    /// Number of installed agents not currently running.
+    pub installed_but_idle_count: usize,
+}
+
+/// Response data for `ft robot agents detect --refresh`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDetectRefreshResult {
+    /// Whether the refresh was performed.
+    pub refreshed: bool,
+    /// Number of agents detected after refresh.
+    pub detected_count: usize,
+    /// Total agents probed.
+    pub total_probed: usize,
+    /// Optional message (e.g. "feature not available").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl From<&crate::agent_correlator::InstalledAgentInventoryEntry> for InstalledAgentInfo {
+    fn from(entry: &crate::agent_correlator::InstalledAgentInventoryEntry) -> Self {
+        Self {
+            slug: entry.slug.clone(),
+            display_name: None,
+            detected: entry.detected,
+            evidence: entry.evidence.clone(),
+            root_paths: entry.root_paths.clone(),
+            config_path: entry.config_path.clone(),
+            binary_path: entry.binary_path.clone(),
+            version: entry.version.clone(),
+        }
+    }
+}
+
+impl From<(u64, &crate::agent_correlator::RunningAgentInventoryEntry)> for RunningAgentInfo {
+    fn from((pane_id, entry): (u64, &crate::agent_correlator::RunningAgentInventoryEntry)) -> Self {
+        Self {
+            slug: entry.slug.clone(),
+            display_name: None,
+            state: entry.state.clone(),
+            session_id: entry.session_id.clone(),
+            source: match entry.source {
+                crate::agent_correlator::DetectionSource::PatternEngine => "pattern_engine",
+                crate::agent_correlator::DetectionSource::PaneTitle => "pane_title",
+                crate::agent_correlator::DetectionSource::ProcessName => "process_name",
+            }
+            .to_string(),
+            pane_id,
+        }
+    }
+}
+
+impl From<&crate::agent_correlator::AgentInventory> for AgentInventoryData {
+    fn from(inv: &crate::agent_correlator::AgentInventory) -> Self {
+        let installed: Vec<InstalledAgentInfo> =
+            inv.installed.iter().map(InstalledAgentInfo::from).collect();
+        let running: std::collections::BTreeMap<u64, RunningAgentInfo> = inv
+            .running
+            .iter()
+            .map(|(&pid, entry)| (pid, RunningAgentInfo::from((pid, entry))))
+            .collect();
+
+        let running_slugs: std::collections::HashSet<&str> =
+            running.values().map(|r| r.slug.as_str()).collect();
+        let installed_count = installed.iter().filter(|a| a.detected).count();
+        let running_count = running.len();
+        let configured_count = installed.iter().filter(|a| a.config_path.is_some()).count();
+        let installed_but_idle_count = installed
+            .iter()
+            .filter(|a| a.detected && !running_slugs.contains(a.slug.as_str()))
+            .count();
+
+        Self {
+            installed,
+            running,
+            summary: AgentInventorySummary {
+                installed_count,
+                running_count,
+                configured_count,
+                installed_but_idle_count,
+            },
+            filesystem_detection_available: crate::agent_correlator::filesystem_detection_available(),
+        }
+    }
+}
+
+// ============================================================================
 // Workflows
 // ============================================================================
 
@@ -2868,5 +3026,282 @@ mod tests {
         let data = resp.into_result().unwrap();
         assert_eq!(data.state, "paused");
         assert!(data.watermarks.is_empty());
+    }
+
+    // --- Agent Inventory ---
+
+    #[test]
+    fn installed_agent_info_serde_roundtrip() {
+        let info = InstalledAgentInfo {
+            slug: "claude".to_string(),
+            display_name: Some("Claude Code".to_string()),
+            detected: true,
+            evidence: vec!["default root exists: ~/.claude".to_string()],
+            root_paths: vec!["/home/user/.claude".to_string()],
+            config_path: Some("/home/user/.claude/config.json".to_string()),
+            binary_path: Some("/usr/local/bin/claude".to_string()),
+            version: Some("1.2.3".to_string()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: InstalledAgentInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.slug, "claude");
+        assert_eq!(parsed.display_name.as_deref(), Some("Claude Code"));
+        assert!(parsed.detected);
+        assert_eq!(parsed.evidence.len(), 1);
+        assert_eq!(parsed.root_paths.len(), 1);
+        assert_eq!(
+            parsed.config_path.as_deref(),
+            Some("/home/user/.claude/config.json")
+        );
+        assert_eq!(
+            parsed.binary_path.as_deref(),
+            Some("/usr/local/bin/claude")
+        );
+        assert_eq!(parsed.version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn installed_agent_info_skips_empty_fields() {
+        let info = InstalledAgentInfo {
+            slug: "codex".to_string(),
+            display_name: None,
+            detected: false,
+            evidence: vec![],
+            root_paths: vec![],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("display_name"));
+        assert!(!json.contains("evidence"));
+        assert!(!json.contains("root_paths"));
+        assert!(!json.contains("config_path"));
+        assert!(!json.contains("binary_path"));
+        assert!(!json.contains("version"));
+    }
+
+    #[test]
+    fn running_agent_info_serde_roundtrip() {
+        let info = RunningAgentInfo {
+            slug: "gemini".to_string(),
+            display_name: Some("Gemini".to_string()),
+            state: "working".to_string(),
+            session_id: Some("sess-123".to_string()),
+            source: "pattern_engine".to_string(),
+            pane_id: 42,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: RunningAgentInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.slug, "gemini");
+        assert_eq!(parsed.state, "working");
+        assert_eq!(parsed.session_id.as_deref(), Some("sess-123"));
+        assert_eq!(parsed.source, "pattern_engine");
+        assert_eq!(parsed.pane_id, 42);
+    }
+
+    #[test]
+    fn agent_inventory_summary_default() {
+        let summary = AgentInventorySummary::default();
+        assert_eq!(summary.installed_count, 0);
+        assert_eq!(summary.running_count, 0);
+        assert_eq!(summary.configured_count, 0);
+        assert_eq!(summary.installed_but_idle_count, 0);
+    }
+
+    #[test]
+    fn agent_inventory_data_full_roundtrip() {
+        let mut running = std::collections::BTreeMap::new();
+        running.insert(
+            42,
+            RunningAgentInfo {
+                slug: "claude".to_string(),
+                display_name: None,
+                state: "working".to_string(),
+                session_id: None,
+                source: "pattern_engine".to_string(),
+                pane_id: 42,
+            },
+        );
+        let data = AgentInventoryData {
+            installed: vec![InstalledAgentInfo {
+                slug: "claude".to_string(),
+                display_name: None,
+                detected: true,
+                evidence: vec!["found ~/.claude".to_string()],
+                root_paths: vec![],
+                config_path: None,
+                binary_path: None,
+                version: None,
+            }],
+            running,
+            summary: AgentInventorySummary {
+                installed_count: 1,
+                running_count: 1,
+                configured_count: 0,
+                installed_but_idle_count: 0,
+            },
+            filesystem_detection_available: true,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let parsed: AgentInventoryData = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.installed.len(), 1);
+        assert_eq!(parsed.running.len(), 1);
+        assert!(parsed.running.contains_key(&42));
+        assert_eq!(parsed.summary.installed_count, 1);
+        assert_eq!(parsed.summary.running_count, 1);
+        assert!(parsed.filesystem_detection_available);
+    }
+
+    #[test]
+    fn agent_inventory_data_in_robot_envelope() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "installed": [{
+                    "slug": "claude",
+                    "detected": true,
+                    "evidence": ["found ~/.claude"]
+                }],
+                "running": {
+                    "42": {
+                        "slug": "claude",
+                        "state": "working",
+                        "source": "pattern_engine",
+                        "pane_id": 42
+                    }
+                },
+                "summary": {
+                    "installed_count": 1,
+                    "running_count": 1,
+                    "configured_count": 0,
+                    "installed_but_idle_count": 0
+                },
+                "filesystem_detection_available": true
+            },
+            "elapsed_ms": 5,
+            "version": "0.1.0",
+            "now": 1700000000000u64
+        });
+        let resp: RobotResponse<AgentInventoryData> = serde_json::from_value(json).unwrap();
+        assert!(resp.ok);
+        let data = resp.into_result().unwrap();
+        assert_eq!(data.installed.len(), 1);
+        assert_eq!(data.installed[0].slug, "claude");
+        assert_eq!(data.running.len(), 1);
+        let agent = data.running.get(&42).unwrap();
+        assert_eq!(agent.state, "working");
+    }
+
+    #[test]
+    fn agent_detect_refresh_result_roundtrip() {
+        let result = AgentDetectRefreshResult {
+            refreshed: true,
+            detected_count: 3,
+            total_probed: 12,
+            message: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: AgentDetectRefreshResult = serde_json::from_str(&json).unwrap();
+        assert!(parsed.refreshed);
+        assert_eq!(parsed.detected_count, 3);
+        assert_eq!(parsed.total_probed, 12);
+        assert!(parsed.message.is_none());
+    }
+
+    #[test]
+    fn agent_detect_refresh_with_message() {
+        let result = AgentDetectRefreshResult {
+            refreshed: false,
+            detected_count: 0,
+            total_probed: 0,
+            message: Some("agent-detection feature not available".to_string()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: AgentDetectRefreshResult = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.refreshed);
+        assert_eq!(
+            parsed.message.as_deref(),
+            Some("agent-detection feature not available")
+        );
+    }
+
+    #[test]
+    fn from_installed_inventory_entry() {
+        let entry = crate::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "codex".to_string(),
+            detected: true,
+            evidence: vec!["binary found".to_string()],
+            root_paths: vec!["/home/user/.codex".to_string()],
+            config_path: Some("/home/user/.codex/config.toml".to_string()),
+            binary_path: None,
+            version: Some("0.5.0".to_string()),
+        };
+        let info = InstalledAgentInfo::from(&entry);
+        assert_eq!(info.slug, "codex");
+        assert!(info.detected);
+        assert_eq!(info.evidence.len(), 1);
+        assert_eq!(info.config_path.as_deref(), Some("/home/user/.codex/config.toml"));
+        assert_eq!(info.version.as_deref(), Some("0.5.0"));
+    }
+
+    #[test]
+    fn from_running_inventory_entry() {
+        let entry = crate::agent_correlator::RunningAgentInventoryEntry {
+            slug: "claude".to_string(),
+            state: "working".to_string(),
+            session_id: Some("abc-123".to_string()),
+            source: crate::agent_correlator::DetectionSource::PatternEngine,
+        };
+        let info = RunningAgentInfo::from((7u64, &entry));
+        assert_eq!(info.slug, "claude");
+        assert_eq!(info.state, "working");
+        assert_eq!(info.session_id.as_deref(), Some("abc-123"));
+        assert_eq!(info.source, "pattern_engine");
+        assert_eq!(info.pane_id, 7);
+    }
+
+    #[test]
+    fn from_agent_inventory() {
+        let mut running = std::collections::BTreeMap::new();
+        running.insert(
+            10,
+            crate::agent_correlator::RunningAgentInventoryEntry {
+                slug: "claude".to_string(),
+                state: "idle".to_string(),
+                session_id: None,
+                source: crate::agent_correlator::DetectionSource::PaneTitle,
+            },
+        );
+        let inv = crate::agent_correlator::AgentInventory {
+            installed: vec![
+                crate::agent_correlator::InstalledAgentInventoryEntry {
+                    slug: "claude".to_string(),
+                    detected: true,
+                    evidence: vec![],
+                    root_paths: vec![],
+                    config_path: Some("/p/config".to_string()),
+                    binary_path: None,
+                    version: None,
+                },
+                crate::agent_correlator::InstalledAgentInventoryEntry {
+                    slug: "codex".to_string(),
+                    detected: true,
+                    evidence: vec![],
+                    root_paths: vec![],
+                    config_path: None,
+                    binary_path: None,
+                    version: None,
+                },
+            ],
+            running,
+        };
+        let data = AgentInventoryData::from(&inv);
+        assert_eq!(data.installed.len(), 2);
+        assert_eq!(data.running.len(), 1);
+        assert_eq!(data.summary.installed_count, 2);
+        assert_eq!(data.summary.running_count, 1);
+        assert_eq!(data.summary.configured_count, 1); // claude has config_path
+        assert_eq!(data.summary.installed_but_idle_count, 1); // codex is installed but not running
     }
 }
