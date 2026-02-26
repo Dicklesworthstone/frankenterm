@@ -4498,4 +4498,248 @@ mod tests {
         let cmd = approval_command(&decision);
         assert_eq!(cmd.as_deref(), Some("wa approve --id 123"));
     }
+
+    // ── Mission MCP helper tests (ft-1i2ge.5.3) ─────────────────────────
+
+    #[test]
+    fn mission_state_params_deserialize_defaults() {
+        let json = r"{}";
+        let params: MissionStateParams = serde_json::from_str(json).unwrap();
+        assert!(params.mission_file.is_none());
+        assert!(params.mission_state.is_none());
+        assert!(params.run_state.is_none());
+        assert!(params.agent_state.is_none());
+        assert!(params.action_state.is_none());
+        assert!(params.assignment_id.is_none());
+        assert!(params.assignee.is_none());
+        assert!(params.limit.is_none());
+    }
+
+    #[test]
+    fn mission_state_params_deserialize_with_filters() {
+        let json = r#"{"mission_state":"running","run_state":"pending","limit":10}"#;
+        let params: MissionStateParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.mission_state.as_deref(), Some("running"));
+        assert_eq!(params.run_state.as_deref(), Some("pending"));
+        assert_eq!(params.limit, Some(10));
+    }
+
+    #[test]
+    fn mission_pause_params_deserialize_with_reason() {
+        let json = r#"{"reason":"operator_request","requested_by":"test-agent"}"#;
+        let params: MissionPauseParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.reason.as_deref(), Some("operator_request"));
+        assert_eq!(params.requested_by, "test-agent");
+    }
+
+    #[test]
+    fn mission_pause_params_default_requested_by() {
+        let json = r#"{"reason":"test"}"#;
+        let params: MissionPauseParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.requested_by, "mcp-agent");
+    }
+
+    #[test]
+    fn mission_abort_params_deserialize_with_error_code() {
+        let json = r#"{"reason":"emergency","error_code":"E-ABORT-001"}"#;
+        let params: MissionAbortParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.reason.as_deref(), Some("emergency"));
+        assert_eq!(params.error_code.as_deref(), Some("E-ABORT-001"));
+        assert_eq!(params.requested_by, "mcp-agent");
+    }
+
+    #[test]
+    fn mission_explain_params_deserialize_defaults() {
+        let json = r"{}";
+        let params: MissionExplainParams = serde_json::from_str(json).unwrap();
+        assert!(params.mission_file.is_none());
+        assert!(params.assignment_id.is_none());
+    }
+
+    #[test]
+    fn mission_lifecycle_transitions_running_state() {
+        let transitions =
+            mcp_mission_lifecycle_transitions(crate::plan::MissionLifecycleState::Running);
+        assert!(!transitions.is_empty());
+        let kinds: Vec<&str> = transitions.iter().map(|t| t.kind.as_str()).collect();
+        // Running should allow pause and abort at minimum
+        assert!(
+            kinds.iter().any(|k| k.contains("Pause") || k.contains("pause")),
+            "Running state should have pause transition, got: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn mission_lifecycle_transitions_completed_state() {
+        let transitions =
+            mcp_mission_lifecycle_transitions(crate::plan::MissionLifecycleState::Completed);
+        // Terminal state — no outgoing transitions
+        assert!(
+            transitions.is_empty(),
+            "Completed state should have no transitions"
+        );
+    }
+
+    #[test]
+    fn mission_failure_catalog_not_empty() {
+        let catalog = mcp_mission_failure_catalog();
+        assert!(!catalog.is_empty());
+        for entry in &catalog {
+            assert!(!entry.code.is_empty());
+            assert!(!entry.reason_code.is_empty());
+            assert!(!entry.error_code.is_empty());
+        }
+    }
+
+    #[test]
+    fn mission_state_data_serializes() {
+        let data = McpMissionStateData {
+            mission_file: "/tmp/test.json".to_string(),
+            mission_id: "m-1".to_string(),
+            title: "Test Mission".to_string(),
+            mission_hash: "sha256:abcd".to_string(),
+            lifecycle_state: "running".to_string(),
+            candidate_count: 3,
+            assignment_count: 2,
+            matched_assignment_count: 1,
+            returned_assignment_count: 1,
+            assignment_counters: McpMissionAssignmentCounters {
+                pending_approval: 0,
+                approved: 1,
+                denied: 0,
+                expired: 0,
+                succeeded: 1,
+                failed: 0,
+                cancelled: 0,
+                unresolved: 0,
+            },
+            available_transitions: vec![],
+            assignments: vec![McpMissionAssignmentData {
+                assignment_id: "a-1".to_string(),
+                candidate_id: "c-1".to_string(),
+                assignee: "agent-1".to_string(),
+                run_state: "pending".to_string(),
+                agent_state: "approved".to_string(),
+                action_state: "ready".to_string(),
+                reason_code: None,
+                error_code: None,
+            }],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.contains("running"));
+        assert!(json.contains("a-1"));
+    }
+
+    #[test]
+    fn mission_control_data_serializes() {
+        let data = McpMissionControlData {
+            command: "pause".to_string(),
+            mission_file: "/tmp/test.json".to_string(),
+            mission_id: "m-1".to_string(),
+            lifecycle_from: "running".to_string(),
+            lifecycle_to: "paused".to_string(),
+            decision_path: "pause_mission->running->paused".to_string(),
+            reason_code: "operator_request".to_string(),
+            error_code: None,
+            checkpoint_id: Some("cp-m-1-123".to_string()),
+            mission_hash: "sha256:abcd".to_string(),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.contains("pause"));
+        assert!(json.contains("cp-m-1-123"));
+        assert!(!json.contains("error_code")); // skip_serializing_if None
+    }
+
+    #[test]
+    fn mission_build_assignments_with_no_assignments() {
+        use crate::plan::{Mission, MissionId, MissionOwnership};
+        let mission = Mission::new(
+            MissionId("m-test".to_string()),
+            "Test",
+            "ws-1",
+            MissionOwnership {
+                planner: "test".to_string(),
+                dispatcher: "test".to_string(),
+                operator: "test".to_string(),
+            },
+            1000,
+        );
+        let params = MissionStateParams::default();
+        let (assignments, counters, matched) = mcp_build_mission_assignments(&mission, &params);
+        assert!(assignments.is_empty());
+        assert_eq!(matched, 0);
+        assert_eq!(counters.approved, 0);
+        assert_eq!(counters.unresolved, 0);
+    }
+
+    #[test]
+    fn mission_build_assignments_filters_by_run_state() {
+        use crate::plan::{
+            ApprovalState, Assignment, AssignmentId, CandidateActionId, Mission, MissionId,
+            MissionOwnership, Outcome,
+        };
+        let mut mission = Mission::new(
+            MissionId("m-test".to_string()),
+            "Test",
+            "ws-1",
+            MissionOwnership {
+                planner: "test".to_string(),
+                dispatcher: "test".to_string(),
+                operator: "test".to_string(),
+            },
+            1000,
+        );
+        mission.assignments = vec![
+            Assignment {
+                assignment_id: AssignmentId("a-1".to_string()),
+                candidate_id: CandidateActionId("c-1".to_string()),
+                assignee: "agent-1".to_string(),
+                assigned_by: crate::plan::MissionActorRole::Planner,
+                approval_state: ApprovalState::NotRequired,
+                outcome: Some(Outcome::Success {
+                    reason_code: "ok".to_string(),
+                    completed_at_ms: 2000,
+                }),
+                reservation_intent: None,
+                escalation: None,
+                created_at_ms: 1000,
+                updated_at_ms: None,
+            },
+            Assignment {
+                assignment_id: AssignmentId("a-2".to_string()),
+                candidate_id: CandidateActionId("c-2".to_string()),
+                assignee: "agent-2".to_string(),
+                assigned_by: crate::plan::MissionActorRole::Planner,
+                approval_state: ApprovalState::NotRequired,
+                outcome: None,
+                reservation_intent: None,
+                escalation: None,
+                created_at_ms: 1000,
+                updated_at_ms: None,
+            },
+        ];
+        let params = MissionStateParams {
+            run_state: Some("pending".to_string()),
+            ..Default::default()
+        };
+        let (assignments, counters, matched) = mcp_build_mission_assignments(&mission, &params);
+        assert_eq!(matched, 1);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].assignment_id, "a-2");
+        assert_eq!(counters.succeeded, 1);
+        assert_eq!(counters.unresolved, 1);
+    }
+
+    #[test]
+    fn mission_transition_info_serializes() {
+        let info = McpMissionTransitionInfo {
+            kind: "PauseRequested".to_string(),
+            from: "Running".to_string(),
+            to: "Paused".to_string(),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("PauseRequested"));
+        assert!(json.contains("Running"));
+        assert!(json.contains("Paused"));
+    }
 }
