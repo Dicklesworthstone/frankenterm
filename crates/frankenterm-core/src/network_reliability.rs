@@ -463,6 +463,7 @@ impl ReliabilityConfig {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -531,7 +532,7 @@ mod tests {
 
     #[test]
     fn classify_unknown_defaults_to_transient() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "mystery");
+        let err = std::io::Error::other("mystery");
         assert_eq!(classify_io_error(&err), NetworkErrorKind::Transient);
     }
 
@@ -706,7 +707,7 @@ mod tests {
     fn calculator_jitter_varies_delay() {
         let policy = RetryPolicy {
             max_attempts: 10,
-            initial_backoff: Duration::from_millis(1000),
+            initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(60),
             backoff_multiplier: 1.0,
             jitter_factor: 1.0,

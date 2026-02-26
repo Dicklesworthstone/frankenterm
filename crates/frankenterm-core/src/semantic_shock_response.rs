@@ -30,19 +30,14 @@ use crate::trauma_guard::TraumaDecision;
 // =============================================================================
 
 /// Action to take when a semantic anomaly is detected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShockAction {
     /// Alert the operator but do NOT block commands.
+    #[default]
     Alert,
     /// Alert the operator AND pause command execution in the affected pane.
     Pause,
-}
-
-impl Default for ShockAction {
-    fn default() -> Self {
-        Self::Alert
-    }
 }
 
 /// Configuration for the semantic shock response system.
@@ -269,7 +264,10 @@ impl std::fmt::Debug for SemanticShockResponder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SemanticShockResponder")
             .field("config", &self.config)
-            .field("panes_tracked", &self.panes.read().map(|p| p.len()).unwrap_or(0))
+            .field(
+                "panes_tracked",
+                &self.panes.read().map(|p| p.len()).unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -372,9 +370,7 @@ impl SemanticShockResponder {
 
         // Add the new shock.
         state.shocks.push(record.clone());
-        self.metrics
-            .shocks_recorded
-            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.shocks_recorded.fetch_add(1, Ordering::Relaxed);
 
         // Enforce max shocks per pane.
         while state.shocks.len() > self.config.max_shocks_per_pane {
@@ -489,9 +485,7 @@ impl SemanticShockResponder {
                 state.shocks.clear();
                 if state.paused {
                     state.paused = false;
-                    self.metrics
-                        .panes_cleared
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics.panes_cleared.fetch_add(1, Ordering::Relaxed);
                 }
                 return true;
             }
@@ -508,9 +502,7 @@ impl SemanticShockResponder {
                     state.shocks.clear();
                     if state.paused {
                         state.paused = false;
-                        self.metrics
-                            .panes_cleared
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics.panes_cleared.fetch_add(1, Ordering::Relaxed);
                     }
                     cleared += 1;
                 }

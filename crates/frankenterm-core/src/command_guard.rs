@@ -207,8 +207,10 @@ static PACK_FILESYSTEM: SecurityPack = SecurityPack {
 
 static GIT_PUSH_FORCE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bgit\s+push\b.*(\s--force\b|\s-f\b)").unwrap());
-static GIT_PUSH_FORCE_LEASE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+push\b[^;&|\n]*--force-with-lease[^;&|\n]*(?:;|$|&&|\|\||\||\n)").unwrap());
+static GIT_PUSH_FORCE_LEASE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bgit\s+push\b[^;&|\n]*--force-with-lease[^;&|\n]*(?:;|$|&&|\|\||\||\n)")
+        .unwrap()
+});
 static GIT_RESET_HARD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bgit\s+reset\s+--hard\b").unwrap());
 static GIT_CLEAN_FD: LazyLock<Regex> = LazyLock::new(|| {

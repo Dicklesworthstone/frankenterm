@@ -914,12 +914,20 @@ mod tests {
             sample_detail("blocked", BeadStatus::Open, 1, &[("blocker", "blocks")]),
         ];
         let report = resolve_bead_readiness(&issues);
-        let blocked = report.candidates.iter().find(|c| c.id == "blocked").unwrap();
+        let blocked = report
+            .candidates
+            .iter()
+            .find(|c| c.id == "blocked")
+            .unwrap();
         assert!(!blocked.ready);
         assert_eq!(blocked.blocker_count, 1);
         assert_eq!(blocked.blocker_ids, vec!["blocker".to_string()]);
         // blocker itself is ready
-        let blocker = report.candidates.iter().find(|c| c.id == "blocker").unwrap();
+        let blocker = report
+            .candidates
+            .iter()
+            .find(|c| c.id == "blocker")
+            .unwrap();
         assert!(blocker.ready);
     }
 
@@ -1002,7 +1010,12 @@ mod tests {
             sample_detail("D", BeadStatus::Open, 0, &[]),
             sample_detail("B", BeadStatus::Open, 1, &[("D", "blocks")]),
             sample_detail("C", BeadStatus::Open, 1, &[("D", "blocks")]),
-            sample_detail("A", BeadStatus::Open, 2, &[("B", "blocks"), ("C", "blocks")]),
+            sample_detail(
+                "A",
+                BeadStatus::Open,
+                2,
+                &[("B", "blocks"), ("C", "blocks")],
+            ),
         ];
         let report = resolve_bead_readiness(&issues);
 
@@ -1184,7 +1197,10 @@ mod tests {
             priority: None,
             dependency_type: None,
         };
-        assert!(no_type.blocks_readiness(), "None type should block by default");
+        assert!(
+            no_type.blocks_readiness(),
+            "None type should block by default"
+        );
     }
 
     #[test]
@@ -1279,8 +1295,14 @@ mod tests {
     #[test]
     fn readiness_reason_code_ordering() {
         // Verify enum ordering is stable for sort (follows declaration order)
-        assert!(BeadResolverReasonCode::MissingDependencyNode < BeadResolverReasonCode::CyclicDependencyGraph);
-        assert!(BeadResolverReasonCode::CyclicDependencyGraph < BeadResolverReasonCode::PartialGraphData);
+        assert!(
+            BeadResolverReasonCode::MissingDependencyNode
+                < BeadResolverReasonCode::CyclicDependencyGraph
+        );
+        assert!(
+            BeadResolverReasonCode::CyclicDependencyGraph
+                < BeadResolverReasonCode::PartialGraphData
+        );
     }
 
     #[test]

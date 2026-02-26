@@ -74,6 +74,8 @@ impl PaddedAtomicU64 {
 /// (no allocation, no format!, no hashing — just a modulo).
 #[inline]
 fn shard_index(shard_count: usize) -> usize {
+    let safe_shard_count = shard_count.max(1);
+
     thread_local! {
         static THREAD_HASH: u64 = {
             // ThreadId::as_u64() is nightly-only; hash the Debug repr once.
@@ -87,7 +89,7 @@ fn shard_index(shard_count: usize) -> usize {
             h
         };
     }
-    THREAD_HASH.with(|h| (*h as usize) % shard_count)
+    THREAD_HASH.with(|h| (*h as usize) % safe_shard_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +633,11 @@ mod tests {
         let idx1 = shard_index(8);
         let idx2 = shard_index(8);
         assert_eq!(idx1, idx2, "Same thread should always get same shard");
+    }
+
+    #[test]
+    fn shard_index_zero_shards_clamps_to_zero() {
+        assert_eq!(shard_index(0), 0);
     }
 
     #[test]

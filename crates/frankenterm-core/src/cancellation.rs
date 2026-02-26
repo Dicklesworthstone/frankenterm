@@ -46,31 +46,20 @@ pub enum ShutdownReason {
     /// Normal process exit / graceful termination.
     GracefulTermination,
     /// Grace period expired during drain phase.
-    Timeout {
-        deadline_ms: i64,
-        elapsed_ms: i64,
-    },
+    Timeout { deadline_ms: i64, elapsed_ms: i64 },
     /// A child scope encountered an unrecoverable error.
     ChildError {
         child_id: ScopeId,
         error_msg: String,
     },
     /// Cascading failure propagating from another scope.
-    CascadingFailure {
-        origin_id: ScopeId,
-    },
+    CascadingFailure { origin_id: ScopeId },
     /// Resource budget exhausted (memory, FDs, connections).
-    ResourceExhausted {
-        resource: String,
-    },
+    ResourceExhausted { resource: String },
     /// Safety policy triggered shutdown.
-    PolicyViolation {
-        rule: String,
-    },
+    PolicyViolation { rule: String },
     /// Parent scope is shutting down (propagated cancellation).
-    ParentShutdown {
-        parent_id: ScopeId,
-    },
+    ParentShutdown { parent_id: ScopeId },
 }
 
 impl fmt::Display for ShutdownReason {
@@ -81,7 +70,10 @@ impl fmt::Display for ShutdownReason {
             Self::Timeout {
                 deadline_ms,
                 elapsed_ms,
-            } => write!(f, "timeout(deadline={deadline_ms}ms, elapsed={elapsed_ms}ms)"),
+            } => write!(
+                f,
+                "timeout(deadline={deadline_ms}ms, elapsed={elapsed_ms}ms)"
+            ),
             Self::ChildError {
                 child_id,
                 error_msg,
@@ -315,11 +307,7 @@ impl CancellationToken {
     /// The reason for cancellation, if set.
     #[must_use]
     pub fn reason(&self) -> Option<ShutdownReason> {
-        self.inner
-            .reason
-            .lock()
-            .expect("lock not poisoned")
-            .clone()
+        self.inner.reason.lock().expect("lock not poisoned").clone()
     }
 
     /// The scope this token belongs to.
@@ -337,11 +325,7 @@ impl CancellationToken {
     /// Number of registered child tokens.
     #[must_use]
     pub fn child_count(&self) -> usize {
-        self.inner
-            .children
-            .lock()
-            .expect("lock not poisoned")
-            .len()
+        self.inner.children.lock().expect("lock not poisoned").len()
     }
 
     /// Remove all cancelled children from the registry (GC sweep).
@@ -587,10 +571,7 @@ impl fmt::Display for ShutdownCoordinatorError {
                 scope_id,
                 expected,
                 actual,
-            } => write!(
-                f,
-                "scope {scope_id} in state {actual}, expected {expected}"
-            ),
+            } => write!(f, "scope {scope_id} in state {actual}, expected {expected}"),
         }
     }
 }
@@ -841,12 +822,7 @@ impl ShutdownCoordinator {
 
     /// Check if a scope's grace period has expired.
     #[must_use]
-    pub fn is_grace_expired(
-        &self,
-        tree: &ScopeTree,
-        scope_id: &ScopeId,
-        current_ms: i64,
-    ) -> bool {
+    pub fn is_grace_expired(&self, tree: &ScopeTree, scope_id: &ScopeId, current_ms: i64) -> bool {
         let node = match tree.get(scope_id) {
             Some(n) => n,
             None => return false,
@@ -1014,12 +990,13 @@ impl ShutdownCoordinator {
             }
         })?;
 
-        let finalizer = finalizers.iter_mut().find(|f| f.name == name).ok_or_else(|| {
-            ShutdownCoordinatorError::FinalizerNotFound {
+        let finalizer = finalizers
+            .iter_mut()
+            .find(|f| f.name == name)
+            .ok_or_else(|| ShutdownCoordinatorError::FinalizerNotFound {
                 scope_id: scope_id.clone(),
                 finalizer_name: name.to_string(),
-            }
-        })?;
+            })?;
 
         finalizer.status = FinalizerStatus::Running;
         self.emit_event(
@@ -1046,12 +1023,13 @@ impl ShutdownCoordinator {
             }
         })?;
 
-        let finalizer = finalizers.iter_mut().find(|f| f.name == name).ok_or_else(|| {
-            ShutdownCoordinatorError::FinalizerNotFound {
+        let finalizer = finalizers
+            .iter_mut()
+            .find(|f| f.name == name)
+            .ok_or_else(|| ShutdownCoordinatorError::FinalizerNotFound {
                 scope_id: scope_id.clone(),
                 finalizer_name: name.to_string(),
-            }
-        })?;
+            })?;
 
         finalizer.status = FinalizerStatus::Completed { duration_ms };
         self.emit_event(
@@ -1080,12 +1058,13 @@ impl ShutdownCoordinator {
             }
         })?;
 
-        let finalizer = finalizers.iter_mut().find(|f| f.name == name).ok_or_else(|| {
-            ShutdownCoordinatorError::FinalizerNotFound {
+        let finalizer = finalizers
+            .iter_mut()
+            .find(|f| f.name == name)
+            .ok_or_else(|| ShutdownCoordinatorError::FinalizerNotFound {
                 scope_id: scope_id.clone(),
                 finalizer_name: name.to_string(),
-            }
-        })?;
+            })?;
 
         finalizer.status = FinalizerStatus::Failed {
             error: error.to_string(),
@@ -1205,7 +1184,12 @@ impl ShutdownCoordinator {
 
         let run = finalizers
             .iter()
-            .filter(|f| !matches!(f.status, FinalizerStatus::Pending | FinalizerStatus::Skipped { .. }))
+            .filter(|f| {
+                !matches!(
+                    f.status,
+                    FinalizerStatus::Pending | FinalizerStatus::Skipped { .. }
+                )
+            })
             .count();
         let succeeded = finalizers
             .iter()
@@ -1224,15 +1208,11 @@ impl ShutdownCoordinator {
     }
 
     /// Emit a shutdown event.
-    fn emit_event(
-        &mut self,
-        scope_id: ScopeId,
-        event_type: ShutdownEventType,
-        timestamp_ms: i64,
-    ) {
-        let correlation_id = self.correlation_prefix.as_ref().map(|prefix| {
-            format!("{prefix}-{scope_id}-{timestamp_ms}")
-        });
+    fn emit_event(&mut self, scope_id: ScopeId, event_type: ShutdownEventType, timestamp_ms: i64) {
+        let correlation_id = self
+            .correlation_prefix
+            .as_ref()
+            .map(|prefix| format!("{prefix}-{scope_id}-{timestamp_ms}"));
 
         self.events.push(ShutdownEvent {
             timestamp_ms,
@@ -1271,7 +1251,10 @@ impl ShutdownCoordinator {
 
     /// Prune cancelled child tokens from all registered tokens.
     pub fn prune_cancelled(&mut self) -> usize {
-        self.tokens.values().map(|t| t.prune_cancelled_children()).sum()
+        self.tokens
+            .values()
+            .map(|t| t.prune_cancelled_children())
+            .sum()
     }
 
     /// Deterministic canonical string for testing.
@@ -1599,10 +1582,12 @@ mod tests {
             tree.get(&well_known::capture_worker(0)).unwrap().state,
             ScopeState::Draining
         );
-        assert!(coord
-            .token(&well_known::capture_worker(0))
-            .unwrap()
-            .is_cancelled());
+        assert!(
+            coord
+                .token(&well_known::capture_worker(0))
+                .unwrap()
+                .is_cancelled()
+        );
 
         // Phase 2: Begin finalize
         coord
@@ -1855,8 +1840,14 @@ mod tests {
         tree.start(&ScopeId::root(), 1000).unwrap();
 
         let scope = ScopeId("worker:test:0".into());
-        tree.register(scope.clone(), ScopeTier::Worker, &ScopeId::root(), "test-worker", 1000)
-            .unwrap();
+        tree.register(
+            scope.clone(),
+            ScopeTier::Worker,
+            &ScopeId::root(),
+            "test-worker",
+            1000,
+        )
+        .unwrap();
         tree.start(&scope, 1100).unwrap();
 
         let mut coord = ShutdownCoordinator::new();
@@ -1899,9 +1890,7 @@ mod tests {
         coord
             .request_shutdown(&mut tree, &scope, ShutdownReason::GracefulTermination, 2000)
             .unwrap();
-        coord
-            .begin_finalize(&mut tree, &scope, 800, 2800)
-            .unwrap();
+        coord.begin_finalize(&mut tree, &scope, 800, 2800).unwrap();
 
         coord.mark_finalizer_started(&scope, "f1", 2800).unwrap();
         coord

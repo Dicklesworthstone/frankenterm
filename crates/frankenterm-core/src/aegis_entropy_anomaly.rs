@@ -274,6 +274,7 @@ pub struct ErrorDensityTracker {
 impl ErrorDensityTracker {
     /// Create a new tracker with the given window size.
     pub fn new(window_size: usize) -> Self {
+        let window_size = window_size.max(1);
         Self {
             window: vec![false; window_size],
             cursor: 0,
@@ -789,6 +790,14 @@ mod tests {
     }
 
     #[test]
+    fn density_tracker_zero_window_clamps_to_one() {
+        let mut tracker = ErrorDensityTracker::new(0);
+        tracker.record(true);
+        assert!((tracker.density() - 1.0).abs() < 1e-10);
+        assert_eq!(tracker.hit_count(), 1);
+    }
+
+    #[test]
     fn density_tracker_all_hits() {
         let mut tracker = ErrorDensityTracker::new(10);
         for _ in 0..10 {
@@ -1026,7 +1035,7 @@ mod tests {
     fn detector_snapshot_serde_roundtrip() {
         let snap = PaneAnomalySnapshot {
             pane_id: 42,
-            e_value: 3.14,
+            e_value: std::f64::consts::PI,
             n_observations: 100,
             collapse_streak: 5,
             last_entropy: 2.1,

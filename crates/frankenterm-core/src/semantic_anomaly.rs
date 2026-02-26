@@ -208,7 +208,8 @@ impl SortedCalibrationBuffer {
         if self.is_empty() {
             return None;
         }
-        let idx = ((q * (self.sorted.len() - 1) as f32).round() as usize).min(self.sorted.len() - 1);
+        let idx =
+            ((q * (self.sorted.len() - 1) as f32).round() as usize).min(self.sorted.len() - 1);
         Some(self.sorted[idx])
     }
 }
@@ -929,6 +930,7 @@ impl GatedAnomalyDetector {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -968,7 +970,7 @@ mod tests {
     #[test]
     fn test_dot_product_simd_384d() {
         let a: Vec<f32> = (0..384).map(|i| (i as f32) * 0.01).collect();
-        let b: Vec<f32> = (0..384).map(|i| 1.0 - (i as f32) * 0.005).collect();
+        let b: Vec<f32> = (0..384).map(|i| (i as f32).mul_add(-0.005, 1.0)).collect();
         let naive: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
         let simd = dot_product_simd(&a, &b);
         assert!(
@@ -1088,7 +1090,7 @@ mod tests {
         assert_eq!(buf.quantile(1.0), Some(9.0));
         // Median of 0..9 is approximately 4 or 5.
         let med = buf.quantile(0.5).unwrap();
-        assert!(med >= 4.0 && med <= 5.0, "median={med}");
+        assert!((4.0..=5.0).contains(&med), "median={med}");
     }
 
     #[test]
@@ -1176,7 +1178,11 @@ mod tests {
 
         assert!(shock.is_some(), "Expected a semantic shock");
         let s = shock.unwrap();
-        assert!(s.z_score > 2.0, "Z-score {} should exceed threshold", s.z_score);
+        assert!(
+            s.z_score > 2.0,
+            "Z-score {} should exceed threshold",
+            s.z_score
+        );
         assert!(s.distance > 0.5, "Distance should be large");
     }
 
@@ -1585,7 +1591,10 @@ mod tests {
         // With identical inputs, calibration scores are all ~0.
         // A new identical input has distance ~0, which should have high p-value.
         // Expect zero or very few false positives.
-        assert!(anomalies <= 2, "anomalies={anomalies} too many for identical inputs");
+        assert!(
+            anomalies <= 2,
+            "anomalies={anomalies} too many for identical inputs"
+        );
     }
 
     // ── Entropy gate tests ─────────────────────────────────────────────────
@@ -1663,7 +1672,7 @@ mod tests {
         gate.evaluate(b"ab");
 
         // Constant → skip.
-        gate.evaluate(&vec![0x42u8; 100]);
+        gate.evaluate(&[0x42u8; 100]);
 
         // Diverse → pass.
         let mut diverse = Vec::with_capacity(256);
@@ -1689,7 +1698,7 @@ mod tests {
 
         // 3 skips, 1 pass.
         for _ in 0..3 {
-            gate.evaluate(&vec![0x00u8; 100]);
+            gate.evaluate(&[0x00u8; 100]);
         }
         let mut diverse = Vec::with_capacity(256);
         for b in 0..=255u8 {
@@ -1704,7 +1713,7 @@ mod tests {
     #[test]
     fn test_entropy_gate_snapshot() {
         let mut gate = EntropyGate::new(EntropyGateConfig::default());
-        gate.evaluate(&vec![0x41u8; 100]);
+        gate.evaluate(&[0x41u8; 100]);
 
         let snap = gate.snapshot();
         assert!(snap.enabled);
@@ -1715,7 +1724,7 @@ mod tests {
     #[test]
     fn test_entropy_gate_reset_stats() {
         let mut gate = EntropyGate::new(EntropyGateConfig::default());
-        gate.evaluate(&vec![0x41u8; 100]);
+        gate.evaluate(&[0x41u8; 100]);
         assert_eq!(gate.total_evaluated(), 1);
 
         gate.reset_stats();
@@ -1753,10 +1762,7 @@ mod tests {
     #[test]
     fn test_entropy_gate_decision_entropy() {
         assert_eq!(EntropyGateDecision::Disabled.entropy(), None);
-        assert_eq!(
-            EntropyGateDecision::Bypass { length: 5 }.entropy(),
-            None
-        );
+        assert_eq!(EntropyGateDecision::Bypass { length: 5 }.entropy(), None);
         assert_eq!(
             EntropyGateDecision::Pass { entropy: 4.5 }.entropy(),
             Some(4.5)

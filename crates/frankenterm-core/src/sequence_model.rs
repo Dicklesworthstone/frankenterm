@@ -97,7 +97,10 @@ impl SequenceAssigner {
     /// a single pane.
     pub fn assign(&self, pane_id: u64) -> (u64, u64) {
         let pane_seq = {
-            let mut map = self.pane_sequences.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut map = self
+                .pane_sequences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entry = map.entry(pane_id).or_insert(0);
             let seq = *entry;
             *entry += 1;
@@ -124,14 +127,20 @@ impl SequenceAssigner {
 
     /// Return the number of distinct panes that have been assigned sequences.
     pub fn pane_count(&self) -> usize {
-        self.pane_sequences.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+        self.pane_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Reset per-pane counter for a specific pane (e.g., pane closed and reopened).
     ///
     /// The global counter is never reset — it is process-lifetime monotonic.
     pub fn reset_pane(&self, pane_id: u64) {
-        self.pane_sequences.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pane_id);
+        self.pane_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&pane_id);
     }
 }
 
@@ -305,13 +314,21 @@ impl CorrelationTracker {
         root_id: Option<&str>,
     ) -> CorrelationContext {
         let parent = {
-            let mut map = self.last_event_per_pane.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut map = self
+                .last_event_per_pane
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let prev = map.get(&pane_id).cloned();
             map.insert(pane_id, event_id.to_string());
             prev
         };
 
-        let batch = self.active_batches.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&pane_id).cloned();
+        let batch = self
+            .active_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&pane_id)
+            .cloned();
 
         CorrelationContext {
             parent_event_id: parent,
@@ -332,13 +349,22 @@ impl CorrelationTracker {
 
     /// End the active batch for a pane.
     pub fn end_batch(&self, pane_id: u64) {
-        self.active_batches.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pane_id);
+        self.active_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&pane_id);
     }
 
     /// Clear tracking state for a pane (e.g., pane closed).
     pub fn clear_pane(&self, pane_id: u64) {
-        self.last_event_per_pane.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pane_id);
-        self.active_batches.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pane_id);
+        self.last_event_per_pane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&pane_id);
+        self.active_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&pane_id);
     }
 }
 
@@ -406,7 +432,10 @@ impl ClockSkewDetector {
         occurred_at_ms: u64,
         global_sequence: u64,
     ) -> Option<ClockSkewAnomaly> {
-        let mut map = self.last_ts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .last_ts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = map.insert(pane_id, occurred_at_ms);
 
         if let Some(prev_ts) = prev {
@@ -425,7 +454,10 @@ impl ClockSkewDetector {
                     delta_ms: delta,
                     global_sequence,
                 };
-                self.anomalies.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(anomaly.clone());
+                self.anomalies
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(anomaly.clone());
                 return Some(anomaly);
             }
         }
@@ -435,23 +467,38 @@ impl ClockSkewDetector {
 
     /// Return all detected anomalies.
     pub fn anomalies(&self) -> Vec<ClockSkewAnomaly> {
-        self.anomalies.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.anomalies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Return the number of detected anomalies.
     pub fn anomaly_count(&self) -> usize {
-        self.anomalies.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+        self.anomalies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Clear all tracking state.
     pub fn clear(&self) {
-        self.last_ts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
-        self.anomalies.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        self.last_ts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.anomalies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Clear state for a specific pane.
     pub fn clear_pane(&self, pane_id: u64) {
-        self.last_ts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&pane_id);
+        self.last_ts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&pane_id);
     }
 }
 

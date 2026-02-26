@@ -294,10 +294,7 @@ impl AegisEngine {
     }
 
     /// Process a backpressure observation and return throttle actions.
-    pub fn observe_backpressure(
-        &mut self,
-        obs: &QueueObservation,
-    ) -> PacBayesThrottleActions {
+    pub fn observe_backpressure(&mut self, obs: &QueueObservation) -> PacBayesThrottleActions {
         let actions = self.backpressure.observe(obs);
 
         // Log high-severity events
@@ -308,8 +305,14 @@ impl AegisEngine {
                 &[
                     ("severity", serde_json::Value::from(actions.severity)),
                     ("risk_bound", serde_json::Value::from(actions.risk_bound)),
-                    ("kl_divergence", serde_json::Value::from(actions.kl_divergence)),
-                    ("poll_multiplier", serde_json::Value::from(actions.poll_multiplier)),
+                    (
+                        "kl_divergence",
+                        serde_json::Value::from(actions.kl_divergence),
+                    ),
+                    (
+                        "poll_multiplier",
+                        serde_json::Value::from(actions.poll_multiplier),
+                    ),
                 ],
             );
         }
@@ -330,8 +333,10 @@ impl AegisEngine {
             let timestamp = format_timestamp();
             let evidence = format!(
                 "E-value: {:.1} >= {:.1}, entropy: {:.2}, error_density: {:.2}",
-                decision.e_value, decision.rejection_threshold,
-                decision.current_entropy, decision.error_density
+                decision.e_value,
+                decision.rejection_threshold,
+                decision.current_entropy,
+                decision.error_density
             );
             self.record_intervention(InterventionEvent {
                 timestamp: timestamp.clone(),
@@ -346,7 +351,10 @@ impl AegisEngine {
                     ("kind", serde_json::Value::from("entropy_anomaly_block")),
                     ("e_value", serde_json::Value::from(decision.e_value)),
                     ("entropy", serde_json::Value::from(decision.current_entropy)),
-                    ("error_density", serde_json::Value::from(decision.error_density)),
+                    (
+                        "error_density",
+                        serde_json::Value::from(decision.error_density),
+                    ),
                 ],
             );
         }
@@ -393,7 +401,10 @@ impl AegisEngine {
                 EvidenceLine {
                     label: "Poll multiplier".into(),
                     value: format!("{:.2}×", actions.poll_multiplier),
-                    intuition: format!("Polling interval scaled by {:.2}×", actions.poll_multiplier),
+                    intuition: format!(
+                        "Polling interval scaled by {:.2}×",
+                        actions.poll_multiplier
+                    ),
                 },
                 EvidenceLine {
                     label: "Threshold".into(),
@@ -413,18 +424,17 @@ impl AegisEngine {
     }
 
     /// Build a Galaxy-Brain overlay card for an entropy anomaly block.
-    pub fn entropy_anomaly_overlay(
-        &self,
-        pane_id: u64,
-        decision: &AnomalyDecision,
-    ) -> OverlayCard {
+    pub fn entropy_anomaly_overlay(&self, pane_id: u64, decision: &AnomalyDecision) -> OverlayCard {
         OverlayCard {
             title: format!("Aegis: Loop Detected (pane {})", pane_id),
             summary: "E-process null hypothesis rejected. Repeating error pattern detected.".into(),
             evidence: vec![
                 EvidenceLine {
                     label: "E-value".into(),
-                    value: format!("{:.1} ≥ {:.1}", decision.e_value, decision.rejection_threshold),
+                    value: format!(
+                        "{:.1} ≥ {:.1}",
+                        decision.e_value, decision.rejection_threshold
+                    ),
                     intuition: "Sequential test statistic exceeded rejection threshold".into(),
                 },
                 EvidenceLine {
@@ -464,9 +474,8 @@ impl AegisEngine {
 
     /// Export the dump as a pretty-printed JSON string.
     pub fn dump_json(&self) -> String {
-        serde_json::to_string_pretty(&self.dump()).unwrap_or_else(|e| {
-            format!("{{\"error\": \"serialization failed: {}\"}}", e)
-        })
+        serde_json::to_string_pretty(&self.dump())
+            .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e))
     }
 
     /// Drain buffered log events.
@@ -708,7 +717,7 @@ mod tests {
             title: "A very long title that should be truncated properly".into(),
             summary: "Short".into(),
             evidence: vec![],
-            action: "".into(),
+            action: String::new(),
             severity: OverlaySeverity::Info,
         };
         let rendered = card.render(40);
