@@ -344,6 +344,10 @@ harness = false
 name = "pattern_trigger"
 harness = false
 
+[[bench]]
+name = "scan_pipeline"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
