@@ -66,13 +66,13 @@ crossterm = { workspace = true, optional = true }
 
 # FrankenTUI (optional, migration target — see docs/adr/)
 ftui = { workspace = true, optional = true }
-ftui-core = { path = "../../../frankentui/crates/ftui-core", optional = true }
-ftui-render = { path = "../../../frankentui/crates/ftui-render", optional = true }
-ftui-layout = { path = "../../../frankentui/crates/ftui-layout", optional = true }
-ftui-style = { path = "../../../frankentui/crates/ftui-style", optional = true }
-ftui-widgets = { path = "../../../frankentui/crates/ftui-widgets", optional = true }
-ftui-runtime = { path = "../../../frankentui/crates/ftui-runtime", optional = true }
-ftui-backend = { path = "../../../frankentui/crates/ftui-backend", optional = true }
+ftui-core = { path = "../../vendor/frankentui/crates/ftui-core", optional = true }
+ftui-render = { path = "../../vendor/frankentui/crates/ftui-render", optional = true }
+ftui-layout = { path = "../../vendor/frankentui/crates/ftui-layout", optional = true }
+ftui-style = { path = "../../vendor/frankentui/crates/ftui-style", optional = true }
+ftui-widgets = { path = "../../vendor/frankentui/crates/ftui-widgets", optional = true }
+ftui-runtime = { path = "../../vendor/frankentui/crates/ftui-runtime", optional = true }
+ftui-backend = { path = "../../vendor/frankentui/crates/ftui-backend", optional = true }
 
 # MCP server (optional, behind feature)
 fastmcp = { workspace = true, optional = true }
@@ -94,11 +94,11 @@ frankensearch = { workspace = true, optional = true }
 franken-agent-detection = { workspace = true, optional = true }
 # FrankenRedis session integration (optional, behind feature)
 # Pin exact crate versions while sourcing code from the sibling source-of-truth repo.
-fr-store = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-store", optional = true }
-fr-protocol = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-protocol", optional = true }
-fr-config = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-config", optional = true }
-fr-expire = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-expire", optional = true }
-fr-persist = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-persist", optional = true }
+fr-store = { version = "=0.1.0", path = "../../vendor/frankenredis/crates/fr-store", optional = true }
+fr-protocol = { version = "=0.1.0", path = "../../vendor/frankenredis/crates/fr-protocol", optional = true }
+fr-config = { version = "=0.1.0", path = "../../vendor/frankenredis/crates/fr-config", optional = true }
+fr-expire = { version = "=0.1.0", path = "../../vendor/frankenredis/crates/fr-expire", optional = true }
+fr-persist = { version = "=0.1.0", path = "../../vendor/frankenredis/crates/fr-persist", optional = true }
 
 # Semantic search (optional, behind feature)
 tokenizers = { version = "0.21", optional = true }

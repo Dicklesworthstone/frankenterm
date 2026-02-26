@@ -1,0 +1,6 @@
+[submodule "vendor/frankenredis"]
+	path = vendor/frankenredis
+	url = https://github.com/Dicklesworthstone/frankenredis.git
+[submodule "vendor/frankentui"]
+	path = vendor/frankentui
+	url = https://github.com/Dicklesworthstone/frankentui.git
