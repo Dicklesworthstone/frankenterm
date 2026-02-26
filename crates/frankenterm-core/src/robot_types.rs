@@ -670,6 +670,73 @@ pub struct SearchPipelineControlResult {
     pub message: Option<String>,
 }
 
+/// Per-query search pipeline metrics.
+///
+/// Reports the search mode, fusion parameters, and per-tier performance
+/// for observability and debugging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchMetricsData {
+    /// Mode requested by the caller (e.g. "hybrid", "semantic", "lexical").
+    pub requested_mode: String,
+    /// Mode actually used after fallback logic.
+    pub effective_mode: String,
+    /// Reason for mode fallback, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    /// RRF fusion parameter k.
+    pub rrf_k: u32,
+    /// Weight assigned to lexical results in fusion.
+    pub lexical_weight: f32,
+    /// Weight assigned to semantic results in fusion.
+    pub semantic_weight: f32,
+    /// Fusion backend used (e.g. "frankensearch_rrf").
+    pub fusion_backend: String,
+    /// Number of lexical candidate results.
+    pub lexical_candidates: usize,
+    /// Number of semantic candidate results.
+    pub semantic_candidates: usize,
+    /// Whether the semantic embedding cache was hit.
+    pub semantic_cache_hit: bool,
+    /// Semantic tier latency in milliseconds.
+    pub semantic_latency_ms: u64,
+    /// Number of rows scanned by the semantic tier.
+    pub semantic_rows_scanned: usize,
+    /// Current semantic budget state (e.g. "nominal", "degraded").
+    pub semantic_budget_state: String,
+    /// Backoff deadline for semantic tier (epoch ms), if rate-limited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_backoff_until_ms: Option<i64>,
+}
+
+/// Response data for `ft robot search-index reindex`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchIndexReindexData {
+    pub batch_size: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_filter: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_filter: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_filter: Option<i64>,
+    pub scanned_segments: usize,
+    pub submitted_docs: usize,
+    pub accepted_docs: usize,
+    pub skipped_empty_docs: usize,
+    pub skipped_duplicate_docs: usize,
+    pub skipped_cass_docs: usize,
+    pub skipped_resize_pause_docs: usize,
+    pub deferred_rate_limited_docs: usize,
+    pub flushed_docs: usize,
+    pub expired_docs: usize,
+    pub evicted_docs: usize,
+    pub pane_metadata_docs: usize,
+    pub flush_operations: usize,
+    pub final_document_count: usize,
+    pub final_index_size_bytes: u64,
+    #[serde(default)]
+    pub source_counts: BTreeMap<String, usize>,
+}
+
 /// Response data for `ft robot events`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventsData {
@@ -4438,5 +4505,152 @@ mod tests {
             let back: TxBundleClassification = serde_json::from_str(&json).unwrap();
             assert_eq!(back, cls);
         }
+    }
+
+    // ================================================================
+    // Search Metrics & Reindex types
+    // ================================================================
+
+    #[test]
+    fn search_metrics_serde_roundtrip() {
+        let metrics = SearchMetricsData {
+            requested_mode: "hybrid".to_string(),
+            effective_mode: "hybrid".to_string(),
+            fallback_reason: None,
+            rrf_k: 60,
+            lexical_weight: 0.4,
+            semantic_weight: 0.6,
+            fusion_backend: "frankensearch_rrf".to_string(),
+            lexical_candidates: 25,
+            semantic_candidates: 30,
+            semantic_cache_hit: false,
+            semantic_latency_ms: 143,
+            semantic_rows_scanned: 500,
+            semantic_budget_state: "nominal".to_string(),
+            semantic_backoff_until_ms: None,
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        let back: SearchMetricsData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.requested_mode, "hybrid");
+        assert_eq!(back.rrf_k, 60);
+        assert_eq!(back.semantic_candidates, 30);
+        assert!(!json.contains("fallback_reason"));
+        assert!(!json.contains("semantic_backoff_until_ms"));
+    }
+
+    #[test]
+    fn search_metrics_with_fallback() {
+        let metrics = SearchMetricsData {
+            requested_mode: "semantic".to_string(),
+            effective_mode: "lexical".to_string(),
+            fallback_reason: Some("embedder unavailable".to_string()),
+            rrf_k: 60,
+            lexical_weight: 1.0,
+            semantic_weight: 0.0,
+            fusion_backend: "lexical_only".to_string(),
+            lexical_candidates: 10,
+            semantic_candidates: 0,
+            semantic_cache_hit: false,
+            semantic_latency_ms: 0,
+            semantic_rows_scanned: 0,
+            semantic_budget_state: "degraded".to_string(),
+            semantic_backoff_until_ms: Some(1700000060000),
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("fallback_reason"));
+        assert!(json.contains("embedder unavailable"));
+        let back: SearchMetricsData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.effective_mode, "lexical");
+        assert!(back.fallback_reason.is_some());
+    }
+
+    #[test]
+    fn search_metrics_in_robot_envelope() {
+        let metrics = SearchMetricsData {
+            requested_mode: "hybrid".to_string(),
+            effective_mode: "hybrid".to_string(),
+            fallback_reason: None,
+            rrf_k: 60,
+            lexical_weight: 0.5,
+            semantic_weight: 0.5,
+            fusion_backend: "rrf".to_string(),
+            lexical_candidates: 5,
+            semantic_candidates: 5,
+            semantic_cache_hit: true,
+            semantic_latency_ms: 12,
+            semantic_rows_scanned: 100,
+            semantic_budget_state: "nominal".to_string(),
+            semantic_backoff_until_ms: None,
+        };
+        let resp = RobotResponse::success(metrics, 15);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        assert!(json.contains("\"semantic_cache_hit\":true"));
+    }
+
+    #[test]
+    fn search_index_reindex_serde_roundtrip() {
+        let data = SearchIndexReindexData {
+            batch_size: 100,
+            pane_filter: Some(42),
+            since_filter: None,
+            until_filter: None,
+            scanned_segments: 500,
+            submitted_docs: 450,
+            accepted_docs: 400,
+            skipped_empty_docs: 20,
+            skipped_duplicate_docs: 15,
+            skipped_cass_docs: 5,
+            skipped_resize_pause_docs: 0,
+            deferred_rate_limited_docs: 10,
+            flushed_docs: 400,
+            expired_docs: 3,
+            evicted_docs: 1,
+            pane_metadata_docs: 42,
+            flush_operations: 4,
+            final_document_count: 396,
+            final_index_size_bytes: 1024000,
+            source_counts: BTreeMap::from([
+                ("pane_output".to_string(), 350),
+                ("pane_metadata".to_string(), 46),
+            ]),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: SearchIndexReindexData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.batch_size, 100);
+        assert_eq!(back.pane_filter, Some(42));
+        assert_eq!(back.accepted_docs, 400);
+        assert_eq!(back.final_document_count, 396);
+        assert_eq!(back.source_counts.len(), 2);
+    }
+
+    #[test]
+    fn search_index_reindex_omits_none_filters() {
+        let data = SearchIndexReindexData {
+            batch_size: 50,
+            pane_filter: None,
+            since_filter: None,
+            until_filter: None,
+            scanned_segments: 0,
+            submitted_docs: 0,
+            accepted_docs: 0,
+            skipped_empty_docs: 0,
+            skipped_duplicate_docs: 0,
+            skipped_cass_docs: 0,
+            skipped_resize_pause_docs: 0,
+            deferred_rate_limited_docs: 0,
+            flushed_docs: 0,
+            expired_docs: 0,
+            evicted_docs: 0,
+            pane_metadata_docs: 0,
+            flush_operations: 0,
+            final_document_count: 0,
+            final_index_size_bytes: 0,
+            source_counts: BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(!json.contains("pane_filter"));
+        assert!(!json.contains("since_filter"));
+        assert!(!json.contains("until_filter"));
     }
 }
