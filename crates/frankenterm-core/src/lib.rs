@@ -165,6 +165,7 @@ pub mod dataflow;
 pub mod degradation;
 pub mod desktop_notify;
 pub mod diagnostic;
+pub mod diagnostic_redaction;
 pub mod diagram_render;
 pub mod differential_snapshot;
 pub mod disjoint_intervals;
