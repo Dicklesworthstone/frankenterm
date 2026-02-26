@@ -253,11 +253,22 @@ proptest! {
             now_ms: 1_700_000_000_000,
         };
         let result = explain_search(&ctx);
-        prop_assert!(
-            result.reasons.iter().any(|r| r.code == "NO_INDEXED_DATA"),
-            "expected NO_INDEXED_DATA reason when no segments, got: {:?}",
-            result.reasons.iter().map(|r| r.code).collect::<Vec<_>>(),
-        );
+        // When pane_filter is Some but the pane doesn't exist (panes is empty),
+        // PANE_NOT_FOUND correctly takes precedence over NO_INDEXED_DATA
+        // (check_no_indexed_data defers to PANE_NOT_FOUND for unknown panes).
+        if pane_filter.is_some() {
+            prop_assert!(
+                result.reasons.iter().any(|r| r.code == "PANE_NOT_FOUND"),
+                "expected PANE_NOT_FOUND when filtering for absent pane, got: {:?}",
+                result.reasons.iter().map(|r| r.code).collect::<Vec<_>>(),
+            );
+        } else {
+            prop_assert!(
+                result.reasons.iter().any(|r| r.code == "NO_INDEXED_DATA"),
+                "expected NO_INDEXED_DATA reason when no segments, got: {:?}",
+                result.reasons.iter().map(|r| r.code).collect::<Vec<_>>(),
+            );
+        }
     }
 }
 
