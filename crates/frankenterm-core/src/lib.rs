@@ -88,6 +88,7 @@ pub mod binomial_heap;
 pub mod bloom_filter;
 pub mod bocpd;
 pub mod build_coord;
+pub mod byte_compression;
 pub mod cancellation;
 pub mod cancellation_safe_channel;
 #[cfg(feature = "subprocess-bridge")]

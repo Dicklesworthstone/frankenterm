@@ -336,6 +336,10 @@ harness = false
 name = "frankensearch_bench"
 harness = false
 
+[[bench]]
+name = "byte_compression"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
