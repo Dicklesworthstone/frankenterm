@@ -566,6 +566,11 @@ pdu! {
     SetFloatingPaneZ: 65,
     ToggleFloatingPane: 66,
     RemoveFloatingPane: 67,
+    SwapToLayout: 68,
+    SetLayoutCycle: 69,
+    CycleStack: 70,
+    SelectStackPane: 71,
+    UpdatePaneConstraints: 72,
 }
 
 impl Pdu {
@@ -968,6 +973,44 @@ pub struct ToggleFloatingPane {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct RemoveFloatingPane {
     pub pane_id: PaneId,
+}
+
+// --- Swap layout and stack PDUs (ft-2dd4s.5) ---
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SwapToLayout {
+    pub tab_id: TabId,
+    pub layout_index: usize,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SetLayoutCycle {
+    pub tab_id: TabId,
+    pub layout_names: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct CycleStack {
+    pub tab_id: TabId,
+    pub slot_index: usize,
+    /// true = forward (next), false = backward (prev)
+    pub forward: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SelectStackPane {
+    pub tab_id: TabId,
+    pub slot_index: usize,
+    pub pane_index: usize,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct UpdatePaneConstraints {
+    pub pane_id: PaneId,
+    pub min_width: Option<usize>,
+    pub max_width: Option<usize>,
+    pub min_height: Option<usize>,
+    pub max_height: Option<usize>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -2465,6 +2508,129 @@ mod test {
         assert_eq!(
             Pdu::RemoveFloatingPane(RemoveFloatingPane { pane_id: 0 }).pdu_name(),
             "RemoveFloatingPane"
+        );
+    }
+
+    // --- Swap layout and stack PDU roundtrip tests (ft-2dd4s.5) ---
+
+    #[test]
+    fn swap_to_layout_pdu_roundtrip() {
+        let pdu = Pdu::SwapToLayout(SwapToLayout {
+            tab_id: 1,
+            layout_index: 3,
+        });
+        let mut encoded = Vec::new();
+        pdu.encode(&mut encoded, 200).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 200);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn set_layout_cycle_pdu_roundtrip() {
+        let pdu = Pdu::SetLayoutCycle(SetLayoutCycle {
+            tab_id: 2,
+            layout_names: vec![
+                "grid-4".to_string(),
+                "main-side".to_string(),
+                "stacked".to_string(),
+            ],
+        });
+        let mut encoded = Vec::new();
+        pdu.encode(&mut encoded, 201).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn cycle_stack_pdu_roundtrip() {
+        for forward in [true, false] {
+            let pdu = Pdu::CycleStack(CycleStack {
+                tab_id: 1,
+                slot_index: 0,
+                forward,
+            });
+            let mut encoded = Vec::new();
+            pdu.encode(&mut encoded, 202).unwrap();
+            let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.pdu, pdu);
+        }
+    }
+
+    #[test]
+    fn select_stack_pane_pdu_roundtrip() {
+        let pdu = Pdu::SelectStackPane(SelectStackPane {
+            tab_id: 3,
+            slot_index: 2,
+            pane_index: 1,
+        });
+        let mut encoded = Vec::new();
+        pdu.encode(&mut encoded, 203).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn update_pane_constraints_pdu_roundtrip() {
+        let pdu = Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+            pane_id: 42,
+            min_width: Some(10),
+            max_width: None,
+            min_height: Some(5),
+            max_height: Some(50),
+        });
+        let mut encoded = Vec::new();
+        pdu.encode(&mut encoded, 204).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn frankenmux_pdus_pdu_name() {
+        assert_eq!(
+            Pdu::SwapToLayout(SwapToLayout {
+                tab_id: 0,
+                layout_index: 0,
+            })
+            .pdu_name(),
+            "SwapToLayout"
+        );
+        assert_eq!(
+            Pdu::SetLayoutCycle(SetLayoutCycle {
+                tab_id: 0,
+                layout_names: vec![],
+            })
+            .pdu_name(),
+            "SetLayoutCycle"
+        );
+        assert_eq!(
+            Pdu::CycleStack(CycleStack {
+                tab_id: 0,
+                slot_index: 0,
+                forward: true,
+            })
+            .pdu_name(),
+            "CycleStack"
+        );
+        assert_eq!(
+            Pdu::SelectStackPane(SelectStackPane {
+                tab_id: 0,
+                slot_index: 0,
+                pane_index: 0,
+            })
+            .pdu_name(),
+            "SelectStackPane"
+        );
+        assert_eq!(
+            Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+                pane_id: 0,
+                min_width: None,
+                max_width: None,
+                min_height: None,
+                max_height: None,
+            })
+            .pdu_name(),
+            "UpdatePaneConstraints"
         );
     }
 }

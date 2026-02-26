@@ -6371,4 +6371,240 @@ mod test {
             );
         }
     }
+
+    // ---- FrankenMux integration tests (ft-2dd4s.5) ----
+
+    /// Integration test: floating panes + swap layouts + constraints
+    /// all work together without interfering.
+    #[test]
+    fn frankenmux_integration_floating_and_swap() {
+        use crate::layout::default_cycle;
+
+        let size = TerminalSize {
+            rows: 40,
+            cols: 160,
+            pixel_width: 1600,
+            pixel_height: 1000,
+            dpi: 96,
+        };
+        ensure_mux_initialized();
+
+        let tab = Tab::new(&size);
+
+        // Create 3 tiled panes.
+        tab.assign_pane(&FakePane::new(1, size));
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new(2, split.second),
+        )
+        .unwrap();
+        let split2 = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Vertical,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Vertical,
+                ..Default::default()
+            },
+            FakePane::new(3, split2.second),
+        )
+        .unwrap();
+
+        // Add a floating pane.
+        let float_pane = FakePane::new(10, TerminalSize {
+            rows: 10,
+            cols: 40,
+            pixel_width: 400,
+            pixel_height: 250,
+            dpi: 96,
+        });
+        tab.add_floating_pane(
+            float_pane.clone(),
+            FloatingPaneRect {
+                left: 20,
+                top: 5,
+                width: 40,
+                height: 10,
+            },
+        );
+
+        // Verify initial state: 3 tiled + 1 floating.
+        let tiled = tab.iter_panes_ignoring_zoom();
+        assert_eq!(tiled.len(), 3, "Should have 3 tiled panes");
+        let floating = tab.iter_floating_panes();
+        assert_eq!(floating.len(), 1, "Should have 1 floating pane");
+
+        // Now swap layouts — this should only affect tiled panes, not floating.
+        tab.set_layout_cycle(default_cycle());
+        tab.swap_to_next_layout(); // main-side
+
+        // Floating pane should still be there.
+        let floating_after = tab.iter_floating_panes();
+        assert_eq!(
+            floating_after.len(),
+            1,
+            "Floating pane should survive layout swap"
+        );
+        assert_eq!(floating_after[0].pane_id, 10);
+
+        // All 3 tiled panes should still exist (in tree + stacks).
+        let tree_ids: HashSet<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|p| p.pane.pane_id())
+            .collect();
+        let stacked_ids: HashSet<PaneId> =
+            tab.all_stacked_pane_ids().into_iter().collect();
+        let all_tiled: HashSet<PaneId> =
+            tree_ids.union(&stacked_ids).copied().collect();
+        assert!(all_tiled.contains(&1));
+        assert!(all_tiled.contains(&2));
+        assert!(all_tiled.contains(&3));
+
+        // Swap to stacked layout.
+        tab.swap_to_layout_index(2);
+        assert_eq!(tab.current_layout_name().unwrap(), "stacked");
+
+        // Still 1 floating pane.
+        assert_eq!(tab.iter_floating_panes().len(), 1);
+
+        // Swap back to grid-4.
+        tab.swap_to_layout_index(0);
+
+        // All tiled panes still present.
+        let tree_ids: HashSet<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|p| p.pane.pane_id())
+            .collect();
+        let stacked_ids: HashSet<PaneId> =
+            tab.all_stacked_pane_ids().into_iter().collect();
+        let all_final: HashSet<PaneId> =
+            tree_ids.union(&stacked_ids).copied().collect();
+        assert_eq!(all_final.len(), 3);
+    }
+
+    /// Integration test: constraint-based resize works after layout swap.
+    #[test]
+    fn frankenmux_integration_constraints_after_swap() {
+        use crate::layout::default_cycle;
+
+        let size = TerminalSize {
+            rows: 40,
+            cols: 200,
+            pixel_width: 2000,
+            pixel_height: 1000,
+            dpi: 96,
+        };
+        ensure_mux_initialized();
+
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new_with_priority(
+            1,
+            size,
+            PaneConstraints {
+                min_width: 20,
+                min_height: 10,
+                ..PaneConstraints::default()
+            },
+            CollapsePriority::Low,
+        ));
+        let split = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            FakePane::new_with_priority(
+                2,
+                split.second,
+                PaneConstraints {
+                    min_width: 20,
+                    min_height: 10,
+                    ..PaneConstraints::default()
+                },
+                CollapsePriority::Never,
+            ),
+        )
+        .unwrap();
+
+        // Set layout cycle and swap.
+        tab.set_layout_cycle(default_cycle());
+        tab.swap_to_next_layout(); // main-side
+
+        // Now resize the tab smaller — constraints should still work.
+        let small = TerminalSize {
+            rows: 40,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 1000,
+            dpi: 96,
+        };
+        tab.resize(small);
+
+        // Tab should not crash and panes should still exist.
+        let panes = tab.iter_panes_ignoring_zoom();
+        assert!(
+            !panes.is_empty(),
+            "Tab should have panes after resize with constraints"
+        );
+    }
+
+    /// Integration test: zoom interacts correctly with layout swap.
+    #[test]
+    fn frankenmux_integration_zoom_and_swap() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(3);
+
+        // Zoom a pane.
+        tab.set_zoomed(true);
+
+        // Set layout cycle.
+        tab.set_layout_cycle(default_cycle());
+
+        // Swap layout while zoomed — should still work.
+        let name = tab.swap_to_next_layout();
+        assert!(name.is_some(), "Swap should work even when zoomed");
+
+        // All panes should be accounted for.
+        let tree_ids: HashSet<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|p| p.pane.pane_id())
+            .collect();
+        let stacked_ids: HashSet<PaneId> =
+            tab.all_stacked_pane_ids().into_iter().collect();
+        let all: HashSet<PaneId> = tree_ids.union(&stacked_ids).copied().collect();
+        assert_eq!(all.len(), 3, "All 3 panes should survive zoom + swap");
+    }
 }
