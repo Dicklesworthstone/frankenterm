@@ -538,8 +538,8 @@ fn test_full_matrix_build() {
     assert_eq!(matrix.entries.len(), 9);
     // Same major, same or higher minor → supported (1,0)+(1,0), (1,1)+(1,0), (1,1)+(1,1), (1,0)+(1,0) repeated
     // Cross major → unsupported: (0,9) vs (1,x) and (1,x) vs (0,9)
-    assert!(matrix.unsupported_pairs().len() > 0);
-    assert!(matrix.supported_pairs().len() > 0);
+    assert!(!matrix.unsupported_pairs().is_empty());
+    assert!(!matrix.supported_pairs().is_empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════

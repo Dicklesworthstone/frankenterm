@@ -109,7 +109,7 @@ fn bench_compression_levels(c: &mut Criterion) {
         let compressor = ByteCompressor::new(level);
 
         group.bench_with_input(BenchmarkId::new("compress", label), &payload, |b, data| {
-            b.iter(|| black_box(compressor.compress(black_box(data))))
+            b.iter(|| black_box(compressor.compress(black_box(data))));
         });
     }
 
@@ -117,7 +117,7 @@ fn bench_compression_levels(c: &mut Criterion) {
     let compressor = ByteCompressor::new(CompressionLevel::Default);
     let compressed = compressor.compress(&payload);
     group.bench_function("decompress_default", |b| {
-        b.iter(|| black_box(compressor.decompress(black_box(&compressed)).unwrap()))
+        b.iter(|| black_box(compressor.decompress(black_box(&compressed)).unwrap()));
     });
 
     group.finish();
@@ -182,7 +182,7 @@ fn bench_compression_payload_types(c: &mut Criterion) {
         let ratio = payload.len() as f64 / compressed.len() as f64;
 
         group.bench_with_input(
-            BenchmarkId::new(&format!("decompress_ratio_{ratio:.1}x"), label),
+            BenchmarkId::new(format!("decompress_ratio_{ratio:.1}x"), label),
             &compressed,
             |b, data| b.iter(|| black_box(compressor.decompress(black_box(data)).unwrap())),
         );
@@ -264,7 +264,7 @@ fn bench_batch_compression(c: &mut Criterion) {
     // Batch compression
     let refs: Vec<&[u8]> = pane_outputs.iter().map(|b| b.as_slice()).collect();
     group.bench_function("batch_10_panes", |b| {
-        b.iter(|| black_box(compressor.compress_batch(black_box(&refs))))
+        b.iter(|| black_box(compressor.compress_batch(black_box(&refs))));
     });
 
     // Individual compression for comparison
@@ -273,13 +273,13 @@ fn bench_batch_compression(c: &mut Criterion) {
             for pane in &pane_outputs {
                 black_box(compressor.compress(black_box(pane)));
             }
-        })
+        });
     });
 
     // Batch decompression
     let (batch, _stats) = compressor.compress_batch(&refs);
     group.bench_function("batch_decompress_10_panes", |b| {
-        b.iter(|| black_box(compressor.decompress_batch(black_box(&batch)).unwrap()))
+        b.iter(|| black_box(compressor.decompress_batch(black_box(&batch)).unwrap()));
     });
 
     group.finish();

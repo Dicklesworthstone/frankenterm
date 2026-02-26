@@ -640,9 +640,9 @@ fn test_decision_matrix_coverage() {
     b.add_gate("R0", true, 7, 7);
     b.add_risk(ResidualRisk {
         id: "r".to_string(),
-        description: "".to_string(),
+        description: String::new(),
         severity: RiskSeverity::Critical,
-        mitigation: "".to_string(),
+        mitigation: String::new(),
         accepted: false,
     });
     b.set_approval("ops", GoNoGoDecision::Go, "");
@@ -653,9 +653,9 @@ fn test_decision_matrix_coverage() {
     b.add_gate("R0", true, 7, 7);
     b.add_risk(ResidualRisk {
         id: "r".to_string(),
-        description: "".to_string(),
+        description: String::new(),
         severity: RiskSeverity::Medium,
-        mitigation: "".to_string(),
+        mitigation: String::new(),
         accepted: false,
     });
     b.set_approval("ops", GoNoGoDecision::Go, "");

@@ -578,12 +578,12 @@ fn test_fixture_corrupt_recovery_detects_torn() {
     write_standard_fixtures();
     let fixture = load_fixture_from_disk("fixture_corrupt_torn_record.json").unwrap();
     // The torn record has an empty event_id
-    let torn_events: Vec<_> = fixture
+    let torn_count = fixture
         .events
         .iter()
         .filter(|e| e.event_id.is_empty())
-        .collect();
-    assert_eq!(torn_events.len(), 1, "exactly one torn record");
+        .count();
+    assert_eq!(torn_count, 1, "exactly one torn record");
 }
 
 #[test]

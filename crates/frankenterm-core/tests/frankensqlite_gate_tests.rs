@@ -445,11 +445,11 @@ fn test_wave_t1_through_t5_pass_bt3_ready() {
 #[test]
 fn test_wave_t6_advisory_fail_blocks_bt4() {
     let mut results = all_pass();
-    results.iter_mut().for_each(|r| {
+    for r in &mut results {
         if r.tier == GateTier::T6 {
             r.passed = false;
         }
-    });
+    }
     let readiness = evaluate_wave_readiness(&results);
     assert!(readiness[&BeadTier::BT3]);
     assert!(!readiness[&BeadTier::BT4]); // T6 needed for BT4
@@ -458,11 +458,11 @@ fn test_wave_t6_advisory_fail_blocks_bt4() {
 #[test]
 fn test_wave_single_blocking_fail_cascades() {
     let mut results = all_pass();
-    results.iter_mut().for_each(|r| {
+    for r in &mut results {
         if r.tier == GateTier::T2 {
             r.passed = false;
         }
-    });
+    }
     let readiness = evaluate_wave_readiness(&results);
     assert!(readiness[&BeadTier::BT1]); // T1 still OK
     assert!(!readiness[&BeadTier::BT2]); // T2 failed

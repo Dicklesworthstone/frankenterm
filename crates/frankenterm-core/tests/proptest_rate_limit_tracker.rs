@@ -343,7 +343,7 @@ proptest! {
 
         // Check that the pane is still limited near the effective end
         if effective_end.as_secs() > 1 {
-            let check_time = now + effective_end - Duration::from_secs(1);
+            let check_time = (now + effective_end).checked_sub(Duration::from_secs(1)).unwrap();
             prop_assert!(
                 tracker.is_pane_rate_limited_at(1, check_time),
                 "should still be limited 1s before effective end"

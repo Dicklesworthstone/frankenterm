@@ -377,7 +377,7 @@ fn test_soak_error_rate_triggers_rollback() {
             timestamp_ms: i * 100,
             healthy: true,
             lag_ms: 5.0,
-            error_count: if i < 5 { 1 } else { 0 }, // 5% error rate > 1%
+            error_count: u32::from(i < 5), // 5% error rate > 1%
         })
         .collect();
     let verdict = evaluate_soak(&obs, &thresholds);
@@ -564,7 +564,7 @@ fn test_custom_thresholds() {
         max_unhealthy_consecutive: 5,
         max_lag_p99_ms: 100.0,
         max_error_rate: 0.05,
-        min_soak_duration_ms: 3600_000,
+        min_soak_duration_ms: 3_600_000,
     };
     assert_eq!(t.max_unhealthy_consecutive, 5);
 }

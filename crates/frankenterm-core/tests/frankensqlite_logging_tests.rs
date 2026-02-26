@@ -674,9 +674,9 @@ fn test_rollback_no_trigger_logs_info() {
     let _ = classify_migration_rollback_trigger(&input);
 
     let events = captured.lock().unwrap();
-    let info_events: Vec<_> = events.iter().filter(|e| e.level == Level::INFO).collect();
+    let has_info = events.iter().any(|e| e.level == Level::INFO);
     assert!(
-        !info_events.is_empty(),
+        has_info,
         "no-trigger classifier should log at info level"
     );
 }
@@ -693,9 +693,9 @@ fn test_rollback_trigger_logs_warn() {
     let _ = classify_migration_rollback_trigger(&input);
 
     let events = captured.lock().unwrap();
-    let warn_events: Vec<_> = events.iter().filter(|e| e.level == Level::WARN).collect();
+    let has_warn = events.iter().any(|e| e.level == Level::WARN);
     assert!(
-        !warn_events.is_empty(),
+        has_warn,
         "triggered rollback should log at warn level"
     );
 }
@@ -795,16 +795,14 @@ fn test_events_with_field_filters_correctly() {
             level: Level::INFO,
             target: "test".to_string(),
             message: "msg".to_string(),
-            fields: [("key1".to_string(), "val1".to_string())]
-                .into_iter()
+            fields: std::iter::once(("key1".to_string(), "val1".to_string()))
                 .collect(),
         },
         CapturedEvent {
             level: Level::INFO,
             target: "test".to_string(),
             message: "msg".to_string(),
-            fields: [("key2".to_string(), "val2".to_string())]
-                .into_iter()
+            fields: std::iter::once(("key2".to_string(), "val2".to_string()))
                 .collect(),
         },
     ];
@@ -820,16 +818,14 @@ fn test_events_with_field_value_filters_correctly() {
             level: Level::INFO,
             target: "test".to_string(),
             message: "msg".to_string(),
-            fields: [("stage".to_string(), "M0".to_string())]
-                .into_iter()
+            fields: std::iter::once(("stage".to_string(), "M0".to_string()))
                 .collect(),
         },
         CapturedEvent {
             level: Level::INFO,
             target: "test".to_string(),
             message: "msg".to_string(),
-            fields: [("stage".to_string(), "M1".to_string())]
-                .into_iter()
+            fields: std::iter::once(("stage".to_string(), "M1".to_string()))
                 .collect(),
         },
     ];
@@ -981,8 +977,8 @@ fn test_rollback_classifier_warn_includes_write_failure_count() {
     let _ = classify_migration_rollback_trigger(&input);
 
     let events = captured.lock().unwrap();
-    let warn_events: Vec<_> = events.iter().filter(|e| e.level == Level::WARN).collect();
-    assert!(!warn_events.is_empty());
+    let has_warn = events.iter().any(|e| e.level == Level::WARN);
+    assert!(has_warn);
     assert!(
         has_field(&events, "high_severity_write_failures"),
         "should include write failure count in warn log"
@@ -1003,9 +999,9 @@ fn test_bootstrap_logs_at_info_level() {
     let _ = bootstrap_recorder_storage(config);
 
     let events = captured.lock().unwrap();
-    let info_events: Vec<_> = events.iter().filter(|e| e.level == Level::INFO).collect();
+    let has_info = events.iter().any(|e| e.level == Level::INFO);
     assert!(
-        !info_events.is_empty(),
+        has_info,
         "bootstrap should log at INFO level"
     );
 }

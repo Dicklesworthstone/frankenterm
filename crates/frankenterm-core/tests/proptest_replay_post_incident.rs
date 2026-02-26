@@ -75,7 +75,7 @@ proptest! {
     #[test]
     fn pi03_empty_id_fails(path in arb_recording_path()) {
         let input = PostIncidentInput {
-            incident_id: "".into(),
+            incident_id: String::new(),
             recording_path: path,
             severity: None,
             description: None,

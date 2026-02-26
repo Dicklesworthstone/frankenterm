@@ -116,9 +116,9 @@ impl Utf8ChunkedValidator {
             let available = bytes.len().min(needed);
 
             // Copy continuation bytes
-            for i in 0..available {
-                self.pending[self.pending_len as usize + i] = bytes[i];
-            }
+            let dst_start = self.pending_len as usize;
+            self.pending[dst_start..dst_start + available]
+                .copy_from_slice(&bytes[..available]);
             consumed = available;
 
             if available == needed {

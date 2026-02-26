@@ -259,7 +259,7 @@ proptest! {
         q.access(id);
         q.access(id);
         // Can't directly inspect frequency, but accessing shouldn't panic
-        prop_assert!(q.len() >= 1);
+        prop_assert!(!q.is_empty());
     }
 }
 

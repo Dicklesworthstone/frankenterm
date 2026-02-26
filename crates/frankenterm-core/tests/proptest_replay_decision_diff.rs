@@ -93,7 +93,7 @@ fn arb_root_cause() -> impl Strategy<Value = RootCause> {
         "[a-z]{1,4}".prop_map(|rule_id| RootCause::NewDecision { rule_id }),
         "[a-z]{1,4}".prop_map(|rule_id| RootCause::DroppedDecision { rule_id }),
         (0u64..10000, 0u64..10000).prop_map(|(b, c)| {
-            let delta = if c >= b { c - b } else { b - c };
+            let delta = b.abs_diff(c);
             RootCause::TimingShift {
                 baseline_ms: b,
                 candidate_ms: c,

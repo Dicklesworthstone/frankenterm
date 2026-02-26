@@ -40,7 +40,7 @@ impl EvidenceTier {
         ]
     }
 
-    fn label(&self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             EvidenceTier::T1UnitTests => "T1 Unit Tests",
             EvidenceTier::T2IntegrationTests => "T2 Integration Tests",
@@ -54,7 +54,7 @@ impl EvidenceTier {
     }
 
     /// Whether this tier is blocking (T6 is advisory).
-    fn is_blocking(&self) -> bool {
+    fn is_blocking(self) -> bool {
         !matches!(self, EvidenceTier::T6PerfSoak)
     }
 }
@@ -266,12 +266,12 @@ fn test_evidence_tier_t6_is_advisory() {
 
 #[test]
 fn test_evidence_tier_t1_through_t5_are_blocking() {
-    let blocking: Vec<_> = EvidenceTier::all()
+    let blocking_count = EvidenceTier::all()
         .into_iter()
         .filter(|t| t.is_blocking())
-        .collect();
+        .count();
     // T1-T5 + MigrationDryRun + RollbackDrill = 7 blocking
-    assert_eq!(blocking.len(), 7);
+    assert_eq!(blocking_count, 7);
 }
 
 #[test]

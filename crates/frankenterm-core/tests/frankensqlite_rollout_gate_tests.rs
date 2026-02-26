@@ -42,7 +42,7 @@ impl RolloutStage {
         }
     }
 
-    fn predecessor(&self) -> Option<RolloutStage> {
+    fn predecessor(self) -> Option<RolloutStage> {
         match self {
             RolloutStage::R0 => None,
             RolloutStage::R1 => Some(RolloutStage::R0),
@@ -178,21 +178,20 @@ fn evaluate_r0(tier_results: &HashMap<String, bool>, rollback_drill_exists: bool
 
 /// Evaluate R1 gate: shadow migration ran without invariant violations.
 fn evaluate_r1(shadow_ran: bool, invariant_violations: u32) -> RolloutGate {
-    let mut criteria = Vec::new();
-
-    criteria.push(GateCriterion {
-        name: "Shadow migration executed".to_string(),
-        description: "M0-M4 ran in shadow mode (no M5 activation)".to_string(),
-        satisfied: shadow_ran,
-        evidence_ref: Some("shadow_migration_log.json".to_string()),
-    });
-
-    criteria.push(GateCriterion {
-        name: "Zero invariant violations".to_string(),
-        description: "No digest, cardinality, or ordering violations during shadow".to_string(),
-        satisfied: invariant_violations == 0,
-        evidence_ref: Some("invariant_check_report.json".to_string()),
-    });
+    let criteria = vec![
+        GateCriterion {
+            name: "Shadow migration executed".to_string(),
+            description: "M0-M4 ran in shadow mode (no M5 activation)".to_string(),
+            satisfied: shadow_ran,
+            evidence_ref: Some("shadow_migration_log.json".to_string()),
+        },
+        GateCriterion {
+            name: "Zero invariant violations".to_string(),
+            description: "No digest, cardinality, or ordering violations during shadow".to_string(),
+            satisfied: invariant_violations == 0,
+            evidence_ref: Some("invariant_check_report.json".to_string()),
+        },
+    ];
 
     let passed = criteria.iter().all(|c| c.satisfied);
 
@@ -210,42 +209,38 @@ fn evaluate_r1(shadow_ran: bool, invariant_violations: u32) -> RolloutGate {
 
 /// Evaluate R2 gate: canary soak window passes health/lag/correctness.
 fn evaluate_r2(soak: &SoakMetrics, rollback_runbook_approved: bool) -> RolloutGate {
-    let mut criteria = Vec::new();
-
-    criteria.push(GateCriterion {
-        name: "Health pass rate >= 99%".to_string(),
-        description: "Health checks pass at >= 99% during soak window".to_string(),
-        satisfied: soak.health_pass_rate() >= 0.99,
-        evidence_ref: Some("soak_health_metrics.json".to_string()),
-    });
-
-    criteria.push(GateCriterion {
-        name: "Lag within budget".to_string(),
-        description: "p99 lag stays within budget during soak".to_string(),
-        satisfied: soak.lag_within_budget(),
-        evidence_ref: Some("soak_lag_metrics.json".to_string()),
-    });
-
-    criteria.push(GateCriterion {
-        name: "Zero invariant violations".to_string(),
-        description: "No data integrity violations during canary".to_string(),
-        satisfied: soak.invariant_violations == 0,
-        evidence_ref: Some("canary_invariant_report.json".to_string()),
-    });
-
-    criteria.push(GateCriterion {
-        name: "Soak window complete".to_string(),
-        description: "Soak ran for required minimum duration".to_string(),
-        satisfied: soak.soak_complete(),
-        evidence_ref: Some("soak_duration_report.json".to_string()),
-    });
-
-    criteria.push(GateCriterion {
-        name: "Rollback runbook approved".to_string(),
-        description: "Rollback runbook reviewed and approved by operator".to_string(),
-        satisfied: rollback_runbook_approved,
-        evidence_ref: Some("rollback_runbook_approval.json".to_string()),
-    });
+    let criteria = vec![
+        GateCriterion {
+            name: "Health pass rate >= 99%".to_string(),
+            description: "Health checks pass at >= 99% during soak window".to_string(),
+            satisfied: soak.health_pass_rate() >= 0.99,
+            evidence_ref: Some("soak_health_metrics.json".to_string()),
+        },
+        GateCriterion {
+            name: "Lag within budget".to_string(),
+            description: "p99 lag stays within budget during soak".to_string(),
+            satisfied: soak.lag_within_budget(),
+            evidence_ref: Some("soak_lag_metrics.json".to_string()),
+        },
+        GateCriterion {
+            name: "Zero invariant violations".to_string(),
+            description: "No data integrity violations during canary".to_string(),
+            satisfied: soak.invariant_violations == 0,
+            evidence_ref: Some("canary_invariant_report.json".to_string()),
+        },
+        GateCriterion {
+            name: "Soak window complete".to_string(),
+            description: "Soak ran for required minimum duration".to_string(),
+            satisfied: soak.soak_complete(),
+            evidence_ref: Some("soak_duration_report.json".to_string()),
+        },
+        GateCriterion {
+            name: "Rollback runbook approved".to_string(),
+            description: "Rollback runbook reviewed and approved by operator".to_string(),
+            satisfied: rollback_runbook_approved,
+            evidence_ref: Some("rollback_runbook_approval.json".to_string()),
+        },
+    ];
 
     let passed = criteria.iter().all(|c| c.satisfied);
 
@@ -301,21 +296,20 @@ fn evaluate_r3(workspaces_passed: u32, workspaces_total: u32, incidents: u32) ->
 
 /// Evaluate R4 gate: promotion criteria.
 fn evaluate_r4(r3_passed: bool, all_regression_tests_green: bool) -> RolloutGate {
-    let mut criteria = Vec::new();
-
-    criteria.push(GateCriterion {
-        name: "R3 gate passed".to_string(),
-        description: "Progressive rollout completed successfully".to_string(),
-        satisfied: r3_passed,
-        evidence_ref: Some("r3_gate_evidence.json".to_string()),
-    });
-
-    criteria.push(GateCriterion {
-        name: "Full regression suite green".to_string(),
-        description: "All T1-T6 tiers pass on promoted backend".to_string(),
-        satisfied: all_regression_tests_green,
-        evidence_ref: Some("regression_suite_report.json".to_string()),
-    });
+    let criteria = vec![
+        GateCriterion {
+            name: "R3 gate passed".to_string(),
+            description: "Progressive rollout completed successfully".to_string(),
+            satisfied: r3_passed,
+            evidence_ref: Some("r3_gate_evidence.json".to_string()),
+        },
+        GateCriterion {
+            name: "Full regression suite green".to_string(),
+            description: "All T1-T6 tiers pass on promoted backend".to_string(),
+            satisfied: all_regression_tests_green,
+            evidence_ref: Some("regression_suite_report.json".to_string()),
+        },
+    ];
 
     let passed = criteria.iter().all(|c| c.satisfied);
 
