@@ -248,9 +248,9 @@ pub struct TriggerScanner {
     /// Pattern metadata (category, etc.) indexed by pattern ID.
     patterns: Vec<TriggerPattern>,
     /// Indices of case-insensitive patterns (into `patterns`).
-    ci_indices: Vec<usize>,
+    nocase_indices: Vec<usize>,
     /// Indices of case-sensitive patterns (into `patterns`).
-    cs_indices: Vec<usize>,
+    exact_indices: Vec<usize>,
 }
 
 impl TriggerScanner {
@@ -260,34 +260,34 @@ impl TriggerScanner {
     /// and separate Aho-Corasick automatons are built for each.
     #[must_use]
     pub fn new(patterns: Vec<TriggerPattern>) -> Self {
-        let mut cs_patterns: Vec<String> = Vec::new();
-        let mut ci_patterns: Vec<String> = Vec::new();
-        let mut cs_indices: Vec<usize> = Vec::new();
-        let mut ci_indices: Vec<usize> = Vec::new();
+        let mut exact_patterns: Vec<String> = Vec::new();
+        let mut nocase_patterns: Vec<String> = Vec::new();
+        let mut exact_indices: Vec<usize> = Vec::new();
+        let mut nocase_indices: Vec<usize> = Vec::new();
 
         for (i, p) in patterns.iter().enumerate() {
             if p.case_insensitive {
-                ci_patterns.push(p.pattern.clone());
-                ci_indices.push(i);
+                nocase_patterns.push(p.pattern.clone());
+                nocase_indices.push(i);
             } else {
-                cs_patterns.push(p.pattern.clone());
-                cs_indices.push(i);
+                exact_patterns.push(p.pattern.clone());
+                exact_indices.push(i);
             }
         }
 
         let automaton = AhoCorasickBuilder::new()
             .match_kind(MatchKind::LeftmostFirst)
-            .build(&cs_patterns)
+            .build(&exact_patterns)
             .unwrap_or_else(|_| AhoCorasick::new(Vec::<&str>::new()).unwrap());
 
-        let automaton_ci = if ci_patterns.is_empty() {
+        let automaton_ci = if nocase_patterns.is_empty() {
             None
         } else {
             Some(
                 AhoCorasickBuilder::new()
                     .match_kind(MatchKind::LeftmostFirst)
                     .ascii_case_insensitive(true)
-                    .build(&ci_patterns)
+                    .build(&nocase_patterns)
                     .unwrap_or_else(|_| AhoCorasick::new(Vec::<&str>::new()).unwrap()),
             )
         };
@@ -296,8 +296,8 @@ impl TriggerScanner {
             automaton,
             automaton_ci,
             patterns,
-            ci_indices,
-            cs_indices,
+            nocase_indices,
+            exact_indices,
         }
     }
 
@@ -311,7 +311,7 @@ impl TriggerScanner {
 
         // Case-sensitive matches
         for mat in self.automaton.find_iter(input) {
-            let pattern_idx = self.cs_indices[mat.pattern().as_usize()];
+            let pattern_idx = self.exact_indices[mat.pattern().as_usize()];
             let category = self.patterns[pattern_idx].category;
             *result.counts.entry(category).or_insert(0) += 1;
             result.total_matches += 1;
@@ -320,7 +320,7 @@ impl TriggerScanner {
         // Case-insensitive matches
         if let Some(ref aci) = self.automaton_ci {
             for mat in aci.find_iter(input) {
-                let pattern_idx = self.ci_indices[mat.pattern().as_usize()];
+                let pattern_idx = self.nocase_indices[mat.pattern().as_usize()];
                 let category = self.patterns[pattern_idx].category;
                 *result.counts.entry(category).or_insert(0) += 1;
                 result.total_matches += 1;
@@ -337,7 +337,7 @@ impl TriggerScanner {
 
         // Case-sensitive matches
         for mat in self.automaton.find_iter(input) {
-            let pattern_idx = self.cs_indices[mat.pattern().as_usize()];
+            let pattern_idx = self.exact_indices[mat.pattern().as_usize()];
             matches.push(TriggerMatch {
                 offset: mat.start(),
                 length: mat.end() - mat.start(),
@@ -349,7 +349,7 @@ impl TriggerScanner {
         // Case-insensitive matches
         if let Some(ref aci) = self.automaton_ci {
             for mat in aci.find_iter(input) {
-                let pattern_idx = self.ci_indices[mat.pattern().as_usize()];
+                let pattern_idx = self.nocase_indices[mat.pattern().as_usize()];
                 matches.push(TriggerMatch {
                     offset: mat.start(),
                     length: mat.end() - mat.start(),
