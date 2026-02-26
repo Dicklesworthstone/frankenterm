@@ -58,7 +58,7 @@ impl EmbedWorker {
 
 fn build_embedder(model: Option<&str>) -> Result<Box<dyn Embedder>, String> {
     match model.map(str::trim) {
-        None | Some("") | Some("hash") | Some("fnv1a-hash") => {
+        None | Some("" | "hash" | "fnv1a-hash") => {
             Ok(Box::new(HashEmbedder::default()))
         }
         Some(raw) => {

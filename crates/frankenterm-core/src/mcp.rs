@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod mcp_framework {
-    pub(crate) use fastmcp::{
+    pub use fastmcp::{
         Content as FrameworkContent, McpContext as FrameworkMcpContext,
         McpError as FrameworkMcpError, McpResult as FrameworkMcpResult,
         Resource as FrameworkResource, ResourceContent as FrameworkResourceContent,
@@ -3967,7 +3967,7 @@ mod tests {
 
     #[test]
     fn events_params_deserialize_defaults() {
-        let json = r#"{}"#;
+        let json = r"{}";
         let params: EventsParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.limit, default_events_limit());
         assert!(params.pane.is_none());
@@ -4017,7 +4017,7 @@ mod tests {
 
     #[test]
     fn state_params_deserialize_empty() {
-        let json = r#"{}"#;
+        let json = r"{}";
         let params: StateParams = serde_json::from_str(json).unwrap();
         assert!(params.domain.is_none());
         assert!(params.agent.is_none());
@@ -4072,8 +4072,8 @@ mod tests {
         let text = "line1\nline2\nline3\n";
         let (result, truncated, info) = apply_tail_truncation(text, 2);
         // Should take last 2 non-empty lines
-        assert!(truncated || !truncated); // just assert no panic
-        let _ = (result, info);
+        // Assert the function ran without panicking; consume return values.
+        let _ = (result, truncated, info);
     }
 
     // ── approval_command with approval present ──────────────────────────

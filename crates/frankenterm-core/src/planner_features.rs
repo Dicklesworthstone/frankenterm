@@ -45,11 +45,15 @@ impl PlannerFeatureVector {
     /// Composite score with caller-supplied weights.
     #[must_use]
     pub fn composite_score_with_weights(&self, w: &PlannerWeights) -> f64 {
-        let raw = w.impact * self.impact
-            + w.urgency * self.urgency
-            + w.risk * (1.0 - self.risk) // invert: low risk is good
-            + w.fit * self.fit
-            + w.confidence * self.confidence;
+        let raw = w
+            .confidence
+            .mul_add(self.confidence, w.fit.mul_add(
+                self.fit,
+                w.risk.mul_add(
+                    1.0 - self.risk, // invert: low risk is good
+                    w.impact.mul_add(self.impact, w.urgency * self.urgency),
+                ),
+            ));
         raw.clamp(0.0, 1.0)
     }
 }
@@ -259,8 +263,9 @@ fn extract_impact(candidate: &BeadReadyCandidate, config: &PlannerExtractionConf
     let depth_norm =
         (candidate.critical_path_depth_hint as f64 / config.max_critical_depth as f64).min(1.0);
 
-    let impact = config.impact_unblock_weight * unblock_norm
-        + config.impact_depth_weight * depth_norm;
+    let impact = config
+        .impact_unblock_weight
+        .mul_add(unblock_norm, config.impact_depth_weight * depth_norm);
     impact.clamp(0.0, 1.0)
 }
 
@@ -289,8 +294,9 @@ fn extract_urgency(
         .map(|h| (h / config.max_staleness_hours).min(1.0))
         .unwrap_or(0.0);
 
-    let urgency = config.urgency_priority_weight * priority_norm
-        + config.urgency_staleness_weight * staleness_norm;
+    let urgency = config
+        .urgency_priority_weight
+        .mul_add(priority_norm, config.urgency_staleness_weight * staleness_norm);
     urgency.clamp(0.0, 1.0)
 }
 
@@ -319,10 +325,7 @@ fn extract_risk(candidate: &BeadReadyCandidate) -> f64 {
 ///
 /// Returns 1.0 if at least one agent is Ready with spare capacity,
 /// lower if agents are degraded or fully loaded.
-fn extract_fit(
-    _candidate: &BeadReadyCandidate,
-    agents: &[MissionAgentCapabilityProfile],
-) -> f64 {
+fn extract_fit(_candidate: &BeadReadyCandidate, agents: &[MissionAgentCapabilityProfile]) -> f64 {
     if agents.is_empty() {
         return 0.0;
     }
@@ -360,10 +363,7 @@ fn extract_fit(
 ///
 /// Full confidence when: not degraded, staleness data available, beads data complete.
 /// Lower confidence for partial/degraded data.
-fn extract_confidence(
-    candidate: &BeadReadyCandidate,
-    context: &PlannerExtractionContext,
-) -> f64 {
+fn extract_confidence(candidate: &BeadReadyCandidate, context: &PlannerExtractionContext) -> f64 {
     let mut confidence: f64 = 1.0;
 
     // Each degraded reason reduces confidence.
@@ -514,7 +514,7 @@ pub fn score_candidates(inputs: &[ScorerInput], config: &ScorerConfig) -> Scorer
                 match tag.as_str() {
                     "safety" | "policy" => tag_multiplier = tag_multiplier.max(config.safety_bonus),
                     "regression" | "bug" => {
-                        tag_multiplier = tag_multiplier.max(config.regression_bonus)
+                        tag_multiplier = tag_multiplier.max(config.regression_bonus);
                     }
                     _ => {}
                 }
@@ -711,8 +711,7 @@ pub fn solve_assignments(
 
     let mut assignments: Vec<Assignment> = Vec::new();
     let mut rejected: Vec<RejectedCandidate> = Vec::new();
-    let mut assigned_bead_ids: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut assigned_bead_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for candidate in &scored.scored {
         if assignments.len() >= config.max_assignments {
@@ -737,15 +736,13 @@ pub fn solve_assignments(
 
         // Check conflicts with already-assigned beads.
         for conflict in &config.conflicts {
-            if conflict.bead_a == candidate.bead_id
-                && assigned_bead_ids.contains(&conflict.bead_b)
+            if conflict.bead_a == candidate.bead_id && assigned_bead_ids.contains(&conflict.bead_b)
             {
                 reasons.push(RejectionReason::ConflictWithAssigned {
                     conflicting_bead_id: conflict.bead_b.clone(),
                 });
             }
-            if conflict.bead_b == candidate.bead_id
-                && assigned_bead_ids.contains(&conflict.bead_a)
+            if conflict.bead_b == candidate.bead_id && assigned_bead_ids.contains(&conflict.bead_a)
             {
                 reasons.push(RejectionReason::ConflictWithAssigned {
                     conflicting_bead_id: conflict.bead_a.clone(),
@@ -889,7 +886,7 @@ pub fn explain_decisions(
             .find(|s| s.bead_id == rejected.bead_id);
 
         let mut factors = scored
-            .map(|s| build_factors_for_scored(s))
+            .map(build_factors_for_scored)
             .unwrap_or_default();
 
         for reason in &rejected.reasons {
@@ -968,7 +965,9 @@ fn build_factors_for_scored(scored: &ScoredCandidate) -> Vec<ExplanationFactor> 
 fn format_rejection_reason(reason: &RejectionReason) -> String {
     match reason {
         RejectionReason::NoCapacity => "No agent has spare capacity".to_string(),
-        RejectionReason::ConflictWithAssigned { conflicting_bead_id } => {
+        RejectionReason::ConflictWithAssigned {
+            conflicting_bead_id,
+        } => {
             format!("Conflicts with assigned bead {}", conflicting_bead_id)
         }
         RejectionReason::SafetyGateDenied { gate_name } => {
@@ -1050,9 +1049,7 @@ pub enum GovernorAction {
     /// Penalize the score to suppress thrashing.
     PenalizeScore { factor: f64 },
     /// Block reassignment during cooldown.
-    BlockReassignment {
-        remaining_cycles: u64,
-    },
+    BlockReassignment { remaining_cycles: u64 },
 }
 
 /// Result of governor evaluation for a single bead.
@@ -1099,10 +1096,7 @@ impl ThrashGovernor {
     /// Returns adjusted scores and verdicts. Caller should use adjusted scores
     /// in the solver instead of raw scores.
     #[must_use]
-    pub fn evaluate(
-        &self,
-        candidates: &[ScoredCandidate],
-    ) -> GovernorReport {
+    pub fn evaluate(&self, candidates: &[ScoredCandidate]) -> GovernorReport {
         let mut verdicts = Vec::new();
         let mut thrashing = Vec::new();
         let mut starving = Vec::new();
@@ -1220,8 +1214,7 @@ impl ThrashGovernor {
     /// Record the outcome of a cycle: which beads were assigned and which were not.
     pub fn record_cycle(&mut self, assigned_bead_ids: &[String]) {
         self.current_cycle += 1;
-        let assigned_set: std::collections::HashSet<&String> =
-            assigned_bead_ids.iter().collect();
+        let assigned_set: std::collections::HashSet<&String> = assigned_bead_ids.iter().collect();
 
         // Update known beads.
         let known_ids: Vec<String> = self.bead_states.keys().cloned().collect();
@@ -1252,20 +1245,14 @@ impl ThrashGovernor {
 
     /// Record which agent was assigned to a bead (for cooldown tracking).
     pub fn record_agent_assignment(&mut self, bead_id: &str, agent_id: &str) {
-        let state = self
-            .bead_states
-            .entry(bead_id.to_string())
-            .or_default();
+        let state = self.bead_states.entry(bead_id.to_string()).or_default();
         state.last_agent_id = Some(agent_id.to_string());
     }
 
     /// Register a bead as known but not assigned (for tracking starvation from start).
     pub fn register_bead(&mut self, bead_id: &str) {
-        self.bead_states
-            .entry(bead_id.to_string())
-            .or_default();
+        self.bead_states.entry(bead_id.to_string()).or_default();
     }
-
 }
 
 /// Push an assignment entry into bounded history.
@@ -1283,10 +1270,7 @@ fn count_flips(history: &[bool]) -> u32 {
     if history.len() < 2 {
         return 0;
     }
-    history
-        .windows(2)
-        .filter(|w| w[0] != w[1])
-        .count() as u32
+    history.windows(2).filter(|w| w[0] != w[1]).count() as u32
 }
 
 // ── Multi-objective mission profiles (ft-1i2ge.2.9) ─────────────────────────
@@ -1841,7 +1825,7 @@ impl MissionRuntimeConfig {
         value: Option<f64>,
     ) {
         if let Some(v) = value {
-            if v < 0.0 || v > 1.0 {
+            if !(0.0..=1.0).contains(&v) {
                 diagnostics.push(ConfigDiagnostic {
                     severity: ConfigDiagnosticSeverity::Error,
                     field: field.to_string(),
@@ -1987,7 +1971,7 @@ pub struct ResolvedMissionConfig {
 mod tests {
     use super::*;
     use crate::beads_types::{
-        resolve_bead_readiness, BeadDependencyRef, BeadIssueDetail, BeadIssueType,
+        BeadDependencyRef, BeadIssueDetail, BeadIssueType, resolve_bead_readiness,
     };
 
     fn sample_detail(
@@ -2186,8 +2170,7 @@ mod tests {
         let c = &report.candidates[0];
         let config = PlannerExtractionConfig::default();
         let mut ctx = PlannerExtractionContext::default();
-        ctx.staleness_hours
-            .insert("very-stale".to_string(), 1000.0); // way over max
+        ctx.staleness_hours.insert("very-stale".to_string(), 1000.0); // way over max
         let urgency = extract_urgency(c, &ctx, &config);
         // 0.7 * 1.0 + 0.3 * 1.0 = 1.0
         assert!((urgency - 1.0).abs() < 1e-10);
@@ -2389,7 +2372,7 @@ mod tests {
             confidence: 0.5,
         };
         let score = fv.composite_score();
-        assert!(score >= 0.0 && score <= 1.0);
+        assert!((0.0..=1.0).contains(&score));
     }
 
     #[test]
@@ -2561,7 +2544,14 @@ mod tests {
 
     // ── Multi-factor scorer (ft-1i2ge.2.4) ──────────────────────────────
 
-    fn make_fv(id: &str, impact: f64, urgency: f64, risk: f64, fit: f64, confidence: f64) -> PlannerFeatureVector {
+    fn make_fv(
+        id: &str,
+        impact: f64,
+        urgency: f64,
+        risk: f64,
+        fit: f64,
+        confidence: f64,
+    ) -> PlannerFeatureVector {
         PlannerFeatureVector {
             bead_id: id.to_string(),
             impact,
@@ -2572,7 +2562,11 @@ mod tests {
         }
     }
 
-    fn make_input(fv: PlannerFeatureVector, effort: Option<EffortBucket>, tags: Vec<&str>) -> ScorerInput {
+    fn make_input(
+        fv: PlannerFeatureVector,
+        effort: Option<EffortBucket>,
+        tags: Vec<&str>,
+    ) -> ScorerInput {
         ScorerInput {
             features: fv,
             effort,
@@ -2778,7 +2772,11 @@ mod tests {
     fn scorer_report_serde_roundtrip() {
         let inputs = vec![
             make_input(make_fv("a", 0.5, 0.5, 0.0, 1.0, 1.0), None, vec!["safety"]),
-            make_input(make_fv("b", 0.3, 0.3, 0.1, 0.8, 0.9), Some(EffortBucket::Large), vec![]),
+            make_input(
+                make_fv("b", 0.3, 0.3, 0.1, 0.8, 0.9),
+                Some(EffortBucket::Large),
+                vec![],
+            ),
         ];
         let report = score_candidates(&inputs, &ScorerConfig::default());
         let json = serde_json::to_string(&report).unwrap();
@@ -2792,14 +2790,8 @@ mod tests {
         let fv_policy = make_fv("policy", 0.5, 0.5, 0.0, 1.0, 1.0);
         let fv_safety = make_fv("safety", 0.5, 0.5, 0.0, 1.0, 1.0);
         let config = ScorerConfig::default();
-        let r1 = score_candidates(
-            &[make_input(fv_policy, None, vec!["policy"])],
-            &config,
-        );
-        let r2 = score_candidates(
-            &[make_input(fv_safety, None, vec!["safety"])],
-            &config,
-        );
+        let r1 = score_candidates(&[make_input(fv_policy, None, vec!["policy"])], &config);
+        let r2 = score_candidates(&[make_input(fv_safety, None, vec!["safety"])], &config);
         assert!((r1.scored[0].final_score - r2.scored[0].final_score).abs() < 1e-10);
     }
 
@@ -2808,14 +2800,8 @@ mod tests {
         let fv_bug = make_fv("bug", 0.5, 0.5, 0.0, 1.0, 1.0);
         let fv_reg = make_fv("reg", 0.5, 0.5, 0.0, 1.0, 1.0);
         let config = ScorerConfig::default();
-        let r1 = score_candidates(
-            &[make_input(fv_bug, None, vec!["bug"])],
-            &config,
-        );
-        let r2 = score_candidates(
-            &[make_input(fv_reg, None, vec!["regression"])],
-            &config,
-        );
+        let r1 = score_candidates(&[make_input(fv_bug, None, vec!["bug"])], &config);
+        let r2 = score_candidates(&[make_input(fv_reg, None, vec!["regression"])], &config);
         assert!((r1.scored[0].final_score - r2.scored[0].final_score).abs() < 1e-10);
     }
 
@@ -2857,7 +2843,8 @@ mod tests {
         // Verify tag_multiplier = safety_bonus = 1.15
         assert!((c.tag_multiplier - 1.15).abs() < 1e-10);
         // final_score = clamp((composite - penalty) * multiplier, 0, 1)
-        let expected = ((c.feature_composite - c.effort_penalty) * c.tag_multiplier).clamp(0.0, 1.0);
+        let expected =
+            ((c.feature_composite - c.effort_penalty) * c.tag_multiplier).clamp(0.0, 1.0);
         assert!((c.final_score - expected).abs() < 1e-10);
     }
 
@@ -2958,7 +2945,11 @@ mod tests {
         ];
         let result = solve_assignments(&scored, &agents, &SolverConfig::default());
         assert_eq!(result.assignment_count(), 2);
-        let agent_ids: Vec<&str> = result.assignments.iter().map(|a| a.agent_id.as_str()).collect();
+        let agent_ids: Vec<&str> = result
+            .assignments
+            .iter()
+            .map(|a| a.agent_id.as_str())
+            .collect();
         assert!(agent_ids.contains(&"a1"));
         assert!(agent_ids.contains(&"a2"));
     }
@@ -3047,9 +3038,11 @@ mod tests {
         }];
         let result = solve_assignments(&scored, &agents, &SolverConfig::default());
         assert_eq!(result.assignment_count(), 0);
-        assert!(result.rejected[0]
-            .reasons
-            .contains(&RejectionReason::NoCapacity));
+        assert!(
+            result.rejected[0]
+                .reasons
+                .contains(&RejectionReason::NoCapacity)
+        );
     }
 
     #[test]
@@ -3106,11 +3099,7 @@ mod tests {
     #[test]
     fn solver_assignment_ranks_sequential() {
         let scored = scored_report(&[("b1", 0.9), ("b2", 0.7), ("b3", 0.5)]);
-        let agents = vec![
-            ready_agent("a1"),
-            ready_agent("a2"),
-            ready_agent("a3"),
-        ];
+        let agents = vec![ready_agent("a1"), ready_agent("a2"), ready_agent("a3")];
         let result = solve_assignments(&scored, &agents, &SolverConfig::default());
         for (i, a) in result.assignments.iter().enumerate() {
             assert_eq!(a.rank, i + 1);
@@ -3282,10 +3271,11 @@ mod tests {
         assert!(rejected_expls.len() >= 2);
         for expl in &rejected_expls {
             assert!(expl.summary.contains("Rejected"));
-            assert!(expl
-                .factors
-                .iter()
-                .any(|f| f.dimension == "rejection" && f.polarity == FactorPolarity::Negative));
+            assert!(
+                expl.factors
+                    .iter()
+                    .any(|f| f.dimension == "rejection" && f.polarity == FactorPolarity::Negative)
+            );
         }
     }
 
@@ -3576,10 +3566,12 @@ mod tests {
         assert_eq!(rejected_expl.outcome, DecisionOutcome::Rejected);
         // 3 scored factors + 1 rejection factor
         assert_eq!(rejected_expl.factors.len(), 4);
-        assert!(rejected_expl
-            .factors
-            .iter()
-            .any(|f| f.dimension == "rejection"));
+        assert!(
+            rejected_expl
+                .factors
+                .iter()
+                .any(|f| f.dimension == "rejection")
+        );
     }
 
     #[test]
@@ -3663,7 +3655,12 @@ mod tests {
         let v = &report.verdicts[0];
         // Assigned at cycle 1, current_cycle is 1, elapsed=0, remaining=3.
         assert!(
-            matches!(v.action, GovernorAction::BlockReassignment { remaining_cycles: 3 }),
+            matches!(
+                v.action,
+                GovernorAction::BlockReassignment {
+                    remaining_cycles: 3
+                }
+            ),
             "Expected block with 3 remaining, got {:?}",
             v.action
         );
@@ -3679,8 +3676,8 @@ mod tests {
         });
 
         gov.record_cycle(&["b1".to_string()]);
-        gov.record_cycle(&[]);  // cycle 2
-        gov.record_cycle(&[]);  // cycle 3: cooldown expires
+        gov.record_cycle(&[]); // cycle 2
+        gov.record_cycle(&[]); // cycle 3: cooldown expires
 
         let candidates = vec![make_scored("b1", 0.9)];
         let report = gov.evaluate(&candidates);
@@ -3711,7 +3708,9 @@ mod tests {
         let report = gov.evaluate(&candidates);
         let v = &report.verdicts[0];
         // After threshold (3), extra 2 cycles → boost = 2 * 0.05 = 0.10
-        assert!(matches!(v.action, GovernorAction::BoostScore { amount } if (amount - 0.10).abs() < 1e-9));
+        assert!(
+            matches!(v.action, GovernorAction::BoostScore { amount } if (amount - 0.10).abs() < 1e-9)
+        );
         assert!((v.adjusted_score - 0.4).abs() < 1e-9);
         assert_eq!(report.starving_bead_ids, vec!["b1"]);
     }
@@ -3878,7 +3877,10 @@ mod tests {
 
         // b1 should be blocked (cooldown).
         let v1 = report.verdicts.iter().find(|v| v.bead_id == "b1").unwrap();
-        assert!(matches!(v1.action, GovernorAction::BlockReassignment { .. }));
+        assert!(matches!(
+            v1.action,
+            GovernorAction::BlockReassignment { .. }
+        ));
 
         // b2 skipped 1 cycle, threshold is 3 → allowed (no boost yet).
         let v2 = report.verdicts.iter().find(|v| v.bead_id == "b2").unwrap();
@@ -4044,8 +4046,12 @@ mod tests {
     fn profile_balanced_is_default() {
         let balanced = MissionProfile::balanced();
         let default_scorer = ScorerConfig::default();
-        assert!((balanced.scorer_config.weights.impact - default_scorer.weights.impact).abs() < 1e-9);
-        assert!((balanced.scorer_config.weights.urgency - default_scorer.weights.urgency).abs() < 1e-9);
+        assert!(
+            (balanced.scorer_config.weights.impact - default_scorer.weights.impact).abs() < 1e-9
+        );
+        assert!(
+            (balanced.scorer_config.weights.urgency - default_scorer.weights.urgency).abs() < 1e-9
+        );
     }
 
     #[test]
@@ -4053,7 +4059,9 @@ mod tests {
         let safety = MissionProfile::safety_first();
         let balanced = MissionProfile::balanced();
         assert!(safety.scorer_config.weights.risk > balanced.scorer_config.weights.risk);
-        assert!(safety.scorer_config.weights.confidence > balanced.scorer_config.weights.confidence);
+        assert!(
+            safety.scorer_config.weights.confidence > balanced.scorer_config.weights.confidence
+        );
         assert!(safety.scorer_config.safety_bonus > balanced.scorer_config.safety_bonus);
         assert!(
             safety.scorer_config.min_confidence_threshold
@@ -4337,10 +4345,12 @@ mod tests {
         let result = config.validate();
         assert!(!result.valid);
         assert!(result.error_count() > 0);
-        assert!(result
-            .diagnostics
-            .iter()
-            .any(|d| d.field == "cadence_ms" && d.severity == ConfigDiagnosticSeverity::Error));
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.field == "cadence_ms" && d.severity == ConfigDiagnosticSeverity::Error)
+        );
     }
 
     #[test]
@@ -4375,10 +4385,12 @@ mod tests {
         };
         let result = config.validate();
         assert!(!result.valid);
-        assert!(result
-            .diagnostics
-            .iter()
-            .any(|d| d.field.contains("impact_weight")));
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.field.contains("impact_weight"))
+        );
     }
 
     #[test]
@@ -4990,7 +5002,11 @@ mod tests {
             explain2.explanations.len(),
             "Explanation count must be deterministic"
         );
-        for (e1, e2) in explain1.explanations.iter().zip(explain2.explanations.iter()) {
+        for (e1, e2) in explain1
+            .explanations
+            .iter()
+            .zip(explain2.explanations.iter())
+        {
             assert_eq!(e1.bead_id, e2.bead_id);
             assert_eq!(e1.outcome, e2.outcome);
             assert_eq!(e1.summary, e2.summary);
@@ -5059,8 +5075,16 @@ mod tests {
 
         // All scores in [0.0, 1.0].
         for f in &features.features {
-            assert!(f.impact >= 0.0 && f.impact <= 1.0, "impact OOB: {}", f.impact);
-            assert!(f.urgency >= 0.0 && f.urgency <= 1.0, "urgency OOB: {}", f.urgency);
+            assert!(
+                f.impact >= 0.0 && f.impact <= 1.0,
+                "impact OOB: {}",
+                f.impact
+            );
+            assert!(
+                f.urgency >= 0.0 && f.urgency <= 1.0,
+                "urgency OOB: {}",
+                f.urgency
+            );
             assert!(f.risk >= 0.0 && f.risk <= 1.0, "risk OOB: {}", f.risk);
             assert!(f.fit >= 0.0 && f.fit <= 1.0, "fit OOB: {}", f.fit);
             assert!(

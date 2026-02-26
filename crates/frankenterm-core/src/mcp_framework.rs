@@ -6,27 +6,27 @@
 
 #[cfg(any(feature = "mcp", feature = "mcp-client"))]
 #[allow(unused_imports)]
-pub(crate) use fastmcp::{
+pub use fastmcp::{
     Content as FrameworkContent, McpContext as FrameworkMcpContext, McpError as FrameworkMcpError,
     McpResult as FrameworkMcpResult, Tool as FrameworkTool,
 };
 
 #[cfg(feature = "mcp-client")]
 #[allow(unused_imports)]
-pub(crate) use fastmcp::mcp_config::{
+pub use fastmcp::mcp_config::{
     ConfigLoader as FrameworkConfigLoader, ServerConfig as FrameworkServerConfig,
 };
 
 #[cfg(feature = "mcp-client")]
 #[allow(unused_imports)]
-pub(crate) use fastmcp::{
+pub use fastmcp::{
     Client as FrameworkClient, ClientBuilder as FrameworkClientBuilder,
     McpErrorCode as FrameworkMcpErrorCode,
 };
 
 #[cfg(feature = "mcp")]
 #[allow(unused_imports)]
-pub(crate) use fastmcp::{
+pub use fastmcp::{
     Resource as FrameworkResource, ResourceContent as FrameworkResourceContent,
     ResourceHandler as FrameworkResourceHandler, ResourceTemplate as FrameworkResourceTemplate,
     Server as FrameworkServer, ServerBuilder as FrameworkServerBuilder,

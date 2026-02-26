@@ -10,7 +10,7 @@ use std::time::Instant;
 use serde::Serialize;
 
 mod mcp_resources_framework {
-    pub(crate) use fastmcp::{
+    pub use fastmcp::{
         Content as FrameworkContent, McpContext as FrameworkMcpContext,
         McpError as FrameworkMcpError, McpResult as FrameworkMcpResult,
         Resource as FrameworkResource, ResourceContent as FrameworkResourceContent,

@@ -14,7 +14,7 @@
 //! All operations use resumable checkpoints with a separate consumer ID
 //! so they don't interfere with the live incremental indexer.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 

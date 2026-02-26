@@ -6,10 +6,10 @@
 //! - outbound tool invocation with mapped errors.
 
 mod mcp_client_framework {
-    pub(crate) use fastmcp::mcp_config::{
+    pub use fastmcp::mcp_config::{
         ConfigLoader as FrameworkConfigLoader, ServerConfig as FrameworkServerConfig,
     };
-    pub(crate) use fastmcp::{
+    pub use fastmcp::{
         Client as FrameworkClient, ClientBuilder as FrameworkClientBuilder,
         Content as FrameworkContent, McpError as FrameworkMcpError,
         McpErrorCode as FrameworkMcpErrorCode, Tool as FrameworkTool,

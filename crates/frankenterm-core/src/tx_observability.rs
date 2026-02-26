@@ -19,8 +19,7 @@
 //! the output is identical — suitable for CI artifact comparison and replay linkage.
 
 use crate::tx_idempotency::{
-    ChainVerification, ResumeContext, ResumeRecommendation, StepOutcome, TxExecutionLedger,
-    TxPhase,
+    ChainVerification, ResumeContext, ResumeRecommendation, StepOutcome, TxExecutionLedger, TxPhase,
 };
 use crate::tx_plan_compiler::{StepRisk, TxPlan};
 use serde::{Deserialize, Serialize};
@@ -98,9 +97,9 @@ impl TxEventKind {
             | Self::StepCommitted
             | Self::StepFailed
             | Self::CommitCompleted => TxObservabilityPhase::Commit,
-            Self::CompensationStarted
-            | Self::StepCompensated
-            | Self::CompensationCompleted => TxObservabilityPhase::Compensate,
+            Self::CompensationStarted | Self::StepCompensated | Self::CompensationCompleted => {
+                TxObservabilityPhase::Compensate
+            }
             Self::ResumeContextBuilt | Self::ResumeExecuted => TxObservabilityPhase::Resume,
             Self::ExecutionRecorded | Self::ChainVerified | Self::BundleExported => {
                 TxObservabilityPhase::Observability
@@ -257,16 +256,16 @@ pub fn build_timeline(
 
         let summary = match &record.outcome {
             StepOutcome::Success { result } => {
-                format!("success{}", result.as_deref().map_or("", |_| " (with result)"))
+                format!(
+                    "success{}",
+                    result.as_deref().map_or("", |_| " (with result)")
+                )
             }
             StepOutcome::Failed {
                 error_code,
                 compensated,
                 ..
-            } => format!(
-                "failed: {} (compensated={})",
-                error_code, compensated
-            ),
+            } => format!("failed: {} (compensated={})", error_code, compensated),
             StepOutcome::Skipped { reason } => format!("skipped: {}", reason),
             StepOutcome::Compensated { .. } => "compensated".to_string(),
             StepOutcome::Pending => unreachable!(),
@@ -373,9 +372,7 @@ pub fn redact_outcome(outcome: &StepOutcome, policy: &RedactionPolicy) -> StepOu
     match outcome {
         StepOutcome::Success { result } => StepOutcome::Success {
             result: if policy.redact_results {
-                result
-                    .as_ref()
-                    .map(|_| policy.redaction_marker.clone())
+                result.as_ref().map(|_| policy.redaction_marker.clone())
             } else {
                 result.clone()
             },
@@ -479,11 +476,11 @@ impl PlanSnapshot {
             high_risk_count: plan.risk_summary.high_risk_count,
             critical_risk_count: plan.risk_summary.critical_risk_count,
             uncompensated_steps: plan.risk_summary.uncompensated_steps,
-            overall_risk: plan.risk_summary.overall_risk.clone(),
+            overall_risk: plan.risk_summary.overall_risk,
             step_risks: plan
                 .steps
                 .iter()
-                .map(|s| (s.id.clone(), s.risk.clone()))
+                .map(|s| (s.id.clone(), s.risk))
                 .collect(),
         }
     }
@@ -533,7 +530,7 @@ impl LedgerSnapshot {
                 idem_key: r.idem_key.as_str().to_string(),
                 timestamp_ms: r.timestamp_ms,
                 outcome_kind: outcome_kind_str(&r.outcome),
-                risk: r.risk.clone(),
+                risk: r.risk,
                 agent_id: r.agent_id.clone(),
                 record_hash: r.hash(),
             })
@@ -1118,16 +1115,8 @@ mod tests {
         let ledger = make_test_ledger(&plan);
         let config = TxObservabilityConfig::default();
 
-        let bundle = build_forensic_bundle(
-            &plan,
-            &ledger,
-            &[],
-            None,
-            "test",
-            "INC-002",
-            6000,
-            &config,
-        );
+        let bundle =
+            build_forensic_bundle(&plan, &ledger, &[], None, "test", "INC-002", 6000, &config);
 
         let json = serde_json::to_string(&bundle).unwrap();
         let restored: TxForensicBundle = serde_json::from_str(&json).unwrap();
@@ -1150,21 +1139,23 @@ mod tests {
             ..Default::default()
         };
 
-        let bundle = build_forensic_bundle(
-            &plan,
-            &ledger,
-            &[],
-            None,
-            "test",
-            "INC-003",
-            7000,
-            &config,
-        );
+        let bundle =
+            build_forensic_bundle(&plan, &ledger, &[], None, "test", "INC-003", 7000, &config);
 
         assert_eq!(bundle.metadata.workspace, "[REDACTED]");
         assert_eq!(bundle.metadata.track, "[REDACTED]");
-        assert!(bundle.redaction.categories.contains(&"command_text".to_string()));
-        assert!(bundle.redaction.categories.contains(&"workspace_labels".to_string()));
+        assert!(
+            bundle
+                .redaction
+                .categories
+                .contains(&"command_text".to_string())
+        );
+        assert!(
+            bundle
+                .redaction
+                .categories
+                .contains(&"workspace_labels".to_string())
+        );
         assert!(bundle.redaction.fields_redacted > 0);
     }
 
@@ -1202,16 +1193,8 @@ mod tests {
             ..Default::default()
         };
 
-        let bundle = build_forensic_bundle(
-            &plan,
-            &ledger,
-            &[],
-            None,
-            "test",
-            "INC-005",
-            9000,
-            &config,
-        );
+        let bundle =
+            build_forensic_bundle(&plan, &ledger, &[], None, "test", "INC-005", 9000, &config);
 
         assert_eq!(bundle.timeline.len(), 1);
     }
@@ -1293,9 +1276,7 @@ mod tests {
             "failed"
         );
         assert_eq!(
-            outcome_kind_str(&StepOutcome::Skipped {
-                reason: "z".into()
-            }),
+            outcome_kind_str(&StepOutcome::Skipped { reason: "z".into() }),
             "skipped"
         );
         assert_eq!(

@@ -269,7 +269,7 @@ impl InteractiveBootstrap {
     }
 
     fn build_bootstrap_script(&self, profile_dir: &Path, login_url: &str) -> String {
-        let profile_dir_str = profile_dir.display();
+        let _profile_dir_str = profile_dir.display();
         let timeout = self.config.timeout_ms;
         let poll_interval = self.config.poll_interval_ms;
 

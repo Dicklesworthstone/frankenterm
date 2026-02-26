@@ -4,7 +4,7 @@
 //! preserving behavior and registration order.
 
 mod mcp_bridge_framework {
-    pub(crate) use fastmcp::{
+    pub use fastmcp::{
         Server as FrameworkServer, StdioTransport as FrameworkStdioTransport,
     };
 }

@@ -438,7 +438,7 @@ fn compute_diff(
                             && e.details
                                 .get("bead_id")
                                 .and_then(|v| v.as_str())
-                                .map_or(false, |b| b == bead_id)
+                                .is_some_and(|b| b == bead_id)
                     })
                     .map(|e| e.reason_code.clone())
                     .unwrap_or_default(),
@@ -496,7 +496,7 @@ fn compute_diff(
         .filter(|a| {
             dispatched_set
                 .get(a.bead_id.as_str())
-                .map_or(false, |&actual| actual == a.agent_id)
+                .is_some_and(|&actual| actual == a.agent_id)
         })
         .count();
 

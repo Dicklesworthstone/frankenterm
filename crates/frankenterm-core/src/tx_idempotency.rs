@@ -103,9 +103,7 @@ pub enum StepOutcome {
         compensated: bool,
     },
     /// Step was skipped (e.g., precondition not met, already completed).
-    Skipped {
-        reason: String,
-    },
+    Skipped { reason: String },
     /// Step was compensated (rollback executed).
     Compensated {
         original_outcome: Box<StepOutcome>,
@@ -359,9 +357,7 @@ impl TxExecutionLedger {
         timestamp_ms: u64,
     ) -> Result<String, IdempotencyError> {
         if self.phase.is_terminal() {
-            return Err(IdempotencyError::LedgerSealed {
-                phase: self.phase,
-            });
+            return Err(IdempotencyError::LedgerSealed { phase: self.phase });
         }
 
         if self.key_index.contains_key(idem_key.as_str()) {
@@ -385,7 +381,7 @@ impl TxExecutionLedger {
         };
 
         let record_hash = record.hash();
-        self.last_hash = record_hash.clone();
+        self.last_hash.clone_from(&record_hash);
         self.key_index
             .insert(idem_key.as_str().to_string(), ordinal);
         self.records.push(record);
@@ -455,11 +451,7 @@ impl TxExecutionLedger {
     /// Get step IDs that still need execution (not in ledger at all).
     #[must_use]
     pub fn pending_step_ids(&self, plan: &TxPlan) -> Vec<String> {
-        let executed: HashSet<&str> = self
-            .records
-            .iter()
-            .map(|r| r.idem_key.step_id())
-            .collect();
+        let executed: HashSet<&str> = self.records.iter().map(|r| r.idem_key.step_id()).collect();
         plan.steps
             .iter()
             .filter(|s| !executed.contains(s.id.as_str()))
@@ -764,14 +756,20 @@ impl IdempotencyStore {
         agent_id: &str,
         timestamp_ms: u64,
     ) -> Result<String, IdempotencyError> {
-        let ledger = self
-            .ledgers
-            .get_mut(execution_id)
-            .ok_or_else(|| IdempotencyError::LedgerNotFound {
-                execution_id: execution_id.to_string(),
-            })?;
+        let ledger =
+            self.ledgers
+                .get_mut(execution_id)
+                .ok_or_else(|| IdempotencyError::LedgerNotFound {
+                    execution_id: execution_id.to_string(),
+                })?;
 
-        let hash = ledger.append(idem_key.clone(), outcome.clone(), risk, agent_id, timestamp_ms)?;
+        let hash = ledger.append(
+            idem_key.clone(),
+            outcome.clone(),
+            risk,
+            agent_id,
+            timestamp_ms,
+        )?;
 
         // Also record in the global dedup guard.
         self.dedup
@@ -782,11 +780,7 @@ impl IdempotencyStore {
 
     /// Build a resume context for a given execution.
     #[must_use]
-    pub fn resume_context(
-        &self,
-        execution_id: &str,
-        plan: &TxPlan,
-    ) -> Option<ResumeContext> {
+    pub fn resume_context(&self, execution_id: &str, plan: &TxPlan) -> Option<ResumeContext> {
         self.ledgers
             .get(execution_id)
             .map(|ledger| ResumeContext::from_ledger(ledger, plan))
@@ -798,12 +792,12 @@ impl IdempotencyStore {
         &mut self,
         execution_id: &str,
     ) -> Result<TxExecutionLedger, IdempotencyError> {
-        let ledger = self
-            .ledgers
-            .get(execution_id)
-            .ok_or_else(|| IdempotencyError::LedgerNotFound {
-                execution_id: execution_id.to_string(),
-            })?;
+        let ledger =
+            self.ledgers
+                .get(execution_id)
+                .ok_or_else(|| IdempotencyError::LedgerNotFound {
+                    execution_id: execution_id.to_string(),
+                })?;
 
         if !ledger.phase().is_terminal() {
             return Err(IdempotencyError::LedgerNotTerminal {
@@ -906,9 +900,7 @@ fn fnv1a_hash(data: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tx_plan_compiler::{
-        compile_tx_plan, CompilerConfig, PlannerAssignment,
-    };
+    use crate::tx_plan_compiler::{CompilerConfig, PlannerAssignment, compile_tx_plan};
 
     fn make_key(plan: &str, step: &str) -> IdempotencyKey {
         IdempotencyKey::new(plan, step, "action-content")
@@ -1228,9 +1220,7 @@ mod tests {
     #[test]
     fn ledger_invalid_phase_transition() {
         let mut ledger = TxExecutionLedger::new("exec-1", "plan-1", 0);
-        let err = ledger
-            .transition_phase(TxPhase::Committing)
-            .unwrap_err();
+        let err = ledger.transition_phase(TxPhase::Committing).unwrap_err();
         assert!(matches!(
             err,
             IdempotencyError::InvalidPhaseTransition { .. }
@@ -1247,7 +1237,13 @@ mod tests {
         let k2 = make_key("plan-1", "step-fail");
 
         ledger
-            .append(k1, StepOutcome::Success { result: None }, StepRisk::Low, "a", 1000)
+            .append(
+                k1,
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "a",
+                1000,
+            )
             .unwrap();
         ledger
             .append(
@@ -1276,7 +1272,13 @@ mod tests {
         // Execute first step only.
         let key = make_key("test-plan", &plan.steps[0].id);
         ledger
-            .append(key, StepOutcome::Success { result: None }, StepRisk::Low, "a", 1000)
+            .append(
+                key,
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "a",
+                1000,
+            )
             .unwrap();
 
         let pending = ledger.pending_step_ids(&plan);
@@ -1315,7 +1317,13 @@ mod tests {
         ledger.transition_phase(TxPhase::Preparing).unwrap();
         let key = make_key("plan-1", "s1");
         ledger
-            .append(key, StepOutcome::Success { result: None }, StepRisk::Low, "a", 1000)
+            .append(
+                key,
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "a",
+                1000,
+            )
             .unwrap();
 
         let json = serde_json::to_string(&ledger).unwrap();
@@ -1339,12 +1347,7 @@ mod tests {
     fn dedup_record_and_check() {
         let mut guard = DeduplicationGuard::new(10);
         let key = make_key("p1", "s1");
-        guard.record(
-            &key,
-            "exec-1",
-            StepOutcome::Success { result: None },
-            1000,
-        );
+        guard.record(&key, "exec-1", StepOutcome::Success { result: None }, 1000);
         assert_eq!(guard.len(), 1);
         let entry = guard.check(&key).unwrap();
         assert_eq!(entry.execution_id, "exec-1");
@@ -1380,18 +1383,8 @@ mod tests {
     fn dedup_update_in_place() {
         let mut guard = DeduplicationGuard::new(10);
         let key = make_key("p1", "s1");
-        guard.record(
-            &key,
-            "exec-1",
-            StepOutcome::Pending,
-            1000,
-        );
-        guard.record(
-            &key,
-            "exec-1",
-            StepOutcome::Success { result: None },
-            2000,
-        );
+        guard.record(&key, "exec-1", StepOutcome::Pending, 1000);
+        guard.record(&key, "exec-1", StepOutcome::Success { result: None }, 2000);
         assert_eq!(guard.len(), 1);
         let entry = guard.check(&key).unwrap();
         assert!(matches!(entry.outcome, StepOutcome::Success { .. }));
@@ -1446,7 +1439,13 @@ mod tests {
         // Execute only first step.
         let key = make_key("test-plan", &plan.steps[0].id);
         ledger
-            .append(key, StepOutcome::Success { result: None }, StepRisk::Low, "a", 1000)
+            .append(
+                key,
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "a",
+                1000,
+            )
             .unwrap();
 
         let ctx = ResumeContext::from_ledger(&ledger, &plan);
@@ -1467,7 +1466,13 @@ mod tests {
 
         let key = make_key("test-plan", &plan.steps[0].id);
         ledger
-            .append(key, StepOutcome::Success { result: None }, StepRisk::Low, "a", 1000)
+            .append(
+                key,
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "a",
+                1000,
+            )
             .unwrap();
 
         let ctx = ResumeContext::from_ledger(&ledger, &plan);
@@ -1499,10 +1504,7 @@ mod tests {
             .unwrap();
 
         let ctx = ResumeContext::from_ledger(&ledger, &plan);
-        assert_eq!(
-            ctx.recommendation,
-            ResumeRecommendation::CompensateAndAbort
-        );
+        assert_eq!(ctx.recommendation, ResumeRecommendation::CompensateAndAbort);
     }
 
     #[test]
@@ -1559,7 +1561,14 @@ mod tests {
 
         // Record execution.
         store
-            .record_execution("exec-1", key.clone(), outcome.clone(), StepRisk::Low, "a", 1000)
+            .record_execution(
+                "exec-1",
+                key.clone(),
+                outcome.clone(),
+                StepRisk::Low,
+                "a",
+                1000,
+            )
             .unwrap();
 
         // Dedup hit after recording.
@@ -1619,7 +1628,14 @@ mod tests {
         let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
         let key = make_key("p1", "s1");
         let err = store
-            .record_execution("nonexistent", key, StepOutcome::Pending, StepRisk::Low, "a", 1000)
+            .record_execution(
+                "nonexistent",
+                key,
+                StepOutcome::Pending,
+                StepRisk::Low,
+                "a",
+                1000,
+            )
             .unwrap_err();
         assert!(matches!(err, IdempotencyError::LedgerNotFound { .. }));
     }
@@ -1697,9 +1713,7 @@ mod tests {
     #[test]
     fn error_serde_roundtrip() {
         let errors = vec![
-            IdempotencyError::DuplicateExecution {
-                key: "k1".into(),
-            },
+            IdempotencyError::DuplicateExecution { key: "k1".into() },
             IdempotencyError::InvalidPhaseTransition {
                 from: TxPhase::Planned,
                 to: TxPhase::Completed,

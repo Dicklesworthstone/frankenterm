@@ -1,5 +1,6 @@
 //! Extracted MCP tool handlers (strangler-fig migration slice).
 
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 // wa.rules_list tool

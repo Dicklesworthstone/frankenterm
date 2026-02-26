@@ -6,7 +6,7 @@
 //! - remote tools are mounted under `<proxy_prefix>/<server>/<tool>`.
 
 mod mcp_proxy_framework {
-    pub(crate) use fastmcp::{
+    pub use fastmcp::{
         Content as FrameworkContent, McpContext as FrameworkMcpContext,
         McpError as FrameworkMcpError, McpResult as FrameworkMcpResult, Server as FrameworkServer,
         ServerBuilder as FrameworkServerBuilder, Tool as FrameworkTool,
@@ -404,7 +404,7 @@ impl RemoteProxyToolHandler {
         server_name: String,
         client: Arc<Mutex<FtMcpClient>>,
     ) -> Self {
-        definition.name = exposed_name.clone();
+        definition.name.clone_from(&exposed_name);
         Self {
             definition,
             exposed_name,

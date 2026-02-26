@@ -1,7 +1,7 @@
 //! Middleware wrappers for MCP tool handling.
 
 mod mcp_middleware_framework {
-    pub(crate) use fastmcp::{
+    pub use fastmcp::{
         Content as FrameworkContent, McpContext as FrameworkMcpContext,
         McpError as FrameworkMcpError, McpResult as FrameworkMcpResult, Tool as FrameworkTool,
         ToolHandler as FrameworkToolHandler,
