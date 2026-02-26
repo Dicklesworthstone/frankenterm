@@ -219,6 +219,23 @@ impl Error {
             ),
         }
     }
+
+    /// Classify this error using the network reliability taxonomy.
+    #[must_use]
+    pub fn error_kind(&self) -> crate::network_reliability::NetworkErrorKind {
+        use crate::network_reliability::NetworkErrorKind;
+        match self {
+            Self::Wezterm(e) => e.error_kind(),
+            Self::Io(e) => crate::network_reliability::classify_io_error(e),
+            Self::Cancelled(_) => NetworkErrorKind::Transient,
+            Self::Panicked(_) | Self::Runtime(_) => NetworkErrorKind::Transient,
+            Self::Json(_) | Self::Pattern(_) | Self::Config(_) | Self::SetupError(_) => {
+                NetworkErrorKind::Permanent
+            }
+            Self::Policy(_) => NetworkErrorKind::Degraded,
+            Self::Storage(_) | Self::Workflow(_) => NetworkErrorKind::Transient,
+        }
+    }
 }
 
 /// WezTerm-specific errors
@@ -333,6 +350,21 @@ impl WeztermError {
                 | Self::Timeout(_)
                 | Self::CommandFailed(_)
         )
+    }
+
+    /// Classify this error using the network reliability taxonomy.
+    #[must_use]
+    pub fn error_kind(&self) -> crate::network_reliability::NetworkErrorKind {
+        use crate::network_reliability::NetworkErrorKind;
+        match self {
+            Self::Timeout(_) | Self::CommandFailed(_) => NetworkErrorKind::Transient,
+            Self::CliNotFound
+            | Self::NotRunning
+            | Self::SocketNotFound(_)
+            | Self::ParseError(_)
+            | Self::PaneNotFound(_) => NetworkErrorKind::Permanent,
+            Self::CircuitOpen { .. } => NetworkErrorKind::Degraded,
+        }
     }
 }
 
@@ -1191,5 +1223,65 @@ mod tests {
         let r = WeztermError::Timeout(30).remediation();
         let text = r.render_plain();
         assert!(text.contains("30"));
+    }
+
+    // -- error_kind classification --
+
+    #[test]
+    fn wezterm_timeout_is_transient() {
+        use crate::network_reliability::NetworkErrorKind;
+        assert_eq!(
+            WeztermError::Timeout(5).error_kind(),
+            NetworkErrorKind::Transient
+        );
+    }
+
+    #[test]
+    fn wezterm_cli_not_found_is_permanent() {
+        use crate::network_reliability::NetworkErrorKind;
+        assert_eq!(
+            WeztermError::CliNotFound.error_kind(),
+            NetworkErrorKind::Permanent
+        );
+    }
+
+    #[test]
+    fn wezterm_circuit_open_is_degraded() {
+        use crate::network_reliability::NetworkErrorKind;
+        assert_eq!(
+            WeztermError::CircuitOpen {
+                retry_after_ms: 100
+            }
+            .error_kind(),
+            NetworkErrorKind::Degraded
+        );
+    }
+
+    #[test]
+    fn top_level_io_error_classifies() {
+        use crate::network_reliability::NetworkErrorKind;
+        let err = Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "t/o"));
+        assert_eq!(err.error_kind(), NetworkErrorKind::Transient);
+    }
+
+    #[test]
+    fn top_level_json_error_is_permanent() {
+        use crate::network_reliability::NetworkErrorKind;
+        let err = Error::Json(serde_json::from_str::<String>("bad").unwrap_err());
+        assert_eq!(err.error_kind(), NetworkErrorKind::Permanent);
+    }
+
+    #[test]
+    fn top_level_cancelled_is_transient() {
+        use crate::network_reliability::NetworkErrorKind;
+        let err = Error::Cancelled("test".to_string());
+        assert_eq!(err.error_kind(), NetworkErrorKind::Transient);
+    }
+
+    #[test]
+    fn top_level_policy_is_degraded() {
+        use crate::network_reliability::NetworkErrorKind;
+        let err = Error::Policy("rate limited".to_string());
+        assert_eq!(err.error_kind(), NetworkErrorKind::Degraded);
     }
 }
