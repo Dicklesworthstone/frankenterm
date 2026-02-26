@@ -87,10 +87,12 @@ pub mod binomial_heap;
 pub mod bloom_filter;
 pub mod bocpd;
 pub mod build_coord;
-#[cfg(feature = "session-resume")]
-pub mod casr_types;
 pub mod cancellation;
 pub mod cancellation_safe_channel;
+#[cfg(feature = "subprocess-bridge")]
+pub mod canary_rollout_controller;
+#[cfg(feature = "session-resume")]
+pub mod casr_types;
 pub mod cass;
 pub mod causal_dag;
 pub mod caut;
@@ -131,6 +133,7 @@ pub mod cx {
 
     impl Cx {
         /// Stub checkpoint — always succeeds.
+        #[allow(clippy::result_unit_err)]
         pub fn checkpoint(&self) -> Result<(), ()> {
             Ok(())
         }
@@ -293,9 +296,7 @@ pub mod outcome {
     impl PanicPayload {
         #[must_use]
         pub fn new(msg: impl Into<String>) -> Self {
-            Self {
-                msg: msg.into(),
-            }
+            Self { msg: msg.into() }
         }
 
         #[must_use]
@@ -465,9 +466,9 @@ pub mod trie;
 #[cfg(feature = "subprocess-bridge")]
 pub mod tx_idempotency;
 #[cfg(feature = "subprocess-bridge")]
-pub mod tx_plan_compiler;
-#[cfg(feature = "subprocess-bridge")]
 pub mod tx_observability;
+#[cfg(feature = "subprocess-bridge")]
+pub mod tx_plan_compiler;
 pub mod undo;
 pub mod union_find;
 pub mod user_preferences;
