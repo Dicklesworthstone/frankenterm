@@ -52,6 +52,26 @@ pub struct RobotResponse<T> {
     pub now: u64,
 }
 
+impl<T> RobotResponse<T> {
+    /// Build a success envelope wrapping `data`.
+    pub fn success(data: T, elapsed_ms: u64) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Self {
+            ok: true,
+            data: Some(data),
+            error: None,
+            error_code: None,
+            hint: None,
+            elapsed_ms,
+            version: crate::VERSION.to_string(),
+            now,
+        }
+    }
+}
+
 impl<T: serde::de::DeserializeOwned> RobotResponse<T> {
     /// Parse a JSON string into a typed response.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
@@ -958,6 +978,163 @@ pub struct AgentConfigurePlanItem {
     /// Preview of the content that would be written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_preview: Option<String>,
+}
+
+// ============================================================================
+// Mission (ft-1i2ge.5.2)
+// ============================================================================
+
+/// Run-state classification for a mission assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionRunState {
+    Pending,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+/// Approval-gate state classification for a mission assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionAgentState {
+    NotRequired,
+    Pending,
+    Approved,
+    Denied,
+    Expired,
+}
+
+/// Composite action readiness for a mission assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionActionState {
+    Ready,
+    Blocked,
+    Completed,
+}
+
+/// Filter parameters for mission state and decision queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionStateFilters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_state: Option<crate::plan::MissionLifecycleState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_state: Option<MissionRunState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_state: Option<MissionAgentState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_state: Option<MissionActionState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    pub limit: usize,
+}
+
+/// Per-outcome counters across mission assignments.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MissionAssignmentCounters {
+    pub pending_approval: usize,
+    pub approved: usize,
+    pub denied: usize,
+    pub expired: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub unresolved: usize,
+}
+
+/// Available state transition from the current lifecycle position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionTransitionInfo {
+    pub kind: String,
+    pub to: String,
+}
+
+/// Individual assignment in the robot mission state payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionAssignmentData {
+    pub assignment_id: String,
+    pub candidate_id: String,
+    pub assignee: String,
+    pub assigned_by: crate::plan::MissionActorRole,
+    pub action_type: String,
+    pub run_state: MissionRunState,
+    pub agent_state: MissionAgentState,
+    pub action_state: MissionActionState,
+    pub approval_state: crate::plan::ApprovalState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<crate::plan::Outcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+/// Response data for `ft robot mission state`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionStateData {
+    pub mission_file: String,
+    pub mission_id: String,
+    pub title: String,
+    pub mission_hash: String,
+    pub lifecycle_state: crate::plan::MissionLifecycleState,
+    pub mission_matches_filter: bool,
+    pub candidate_count: usize,
+    pub assignment_count: usize,
+    pub matched_assignment_count: usize,
+    pub returned_assignment_count: usize,
+    pub filters: MissionStateFilters,
+    pub assignment_counters: MissionAssignmentCounters,
+    pub available_transitions: Vec<MissionTransitionInfo>,
+    pub assignments: Vec<MissionAssignmentData>,
+}
+
+/// Failure classification entry for mission decision explainability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionFailureCatalogEntry {
+    pub reason_code: String,
+    pub error_code: String,
+    pub terminality: String,
+    pub retryability: String,
+    pub human_hint: String,
+    pub machine_hint: String,
+}
+
+/// Per-assignment decision data with dispatch details.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionDecisionData {
+    pub assignment: MissionAssignmentData,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_action: Option<crate::plan::StepAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_contract: Option<crate::plan::MissionDispatchContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_target: Option<crate::plan::MissionDispatchTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run_execution: Option<crate::plan::MissionDispatchExecution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_error: Option<String>,
+}
+
+/// Response data for `ft robot mission decisions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionDecisionsData {
+    pub mission_file: String,
+    pub mission_id: String,
+    pub title: String,
+    pub mission_hash: String,
+    pub lifecycle_state: crate::plan::MissionLifecycleState,
+    pub mission_matches_filter: bool,
+    pub candidate_count: usize,
+    pub assignment_count: usize,
+    pub matched_assignment_count: usize,
+    pub returned_assignment_count: usize,
+    pub filters: MissionStateFilters,
+    pub available_transitions: Vec<MissionTransitionInfo>,
+    pub failure_catalog: Vec<MissionFailureCatalogEntry>,
+    pub decisions: Vec<MissionDecisionData>,
 }
 
 // ============================================================================
@@ -3381,5 +3558,294 @@ mod tests {
         assert_eq!(data.summary.running_count, 1);
         assert_eq!(data.summary.configured_count, 1); // claude has config_path
         assert_eq!(data.summary.installed_but_idle_count, 1); // codex is installed but not running
+    }
+
+    // -----------------------------------------------------------------------
+    // Mission types (ft-1i2ge.5.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mission_run_state_serde_roundtrip() {
+        for state in [
+            MissionRunState::Pending,
+            MissionRunState::Succeeded,
+            MissionRunState::Failed,
+            MissionRunState::Cancelled,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            let back: MissionRunState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn mission_agent_state_serde_roundtrip() {
+        for state in [
+            MissionAgentState::NotRequired,
+            MissionAgentState::Pending,
+            MissionAgentState::Approved,
+            MissionAgentState::Denied,
+            MissionAgentState::Expired,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            let back: MissionAgentState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn mission_action_state_serde_roundtrip() {
+        for state in [
+            MissionActionState::Ready,
+            MissionActionState::Blocked,
+            MissionActionState::Completed,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            let back: MissionActionState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn mission_run_state_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&MissionRunState::Succeeded).unwrap(),
+            "\"succeeded\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MissionAgentState::NotRequired).unwrap(),
+            "\"not_required\""
+        );
+    }
+
+    #[test]
+    fn mission_assignment_counters_default() {
+        let c = MissionAssignmentCounters::default();
+        assert_eq!(c.pending_approval, 0);
+        assert_eq!(c.approved, 0);
+        assert_eq!(c.succeeded, 0);
+        assert_eq!(c.failed, 0);
+        assert_eq!(c.unresolved, 0);
+    }
+
+    #[test]
+    fn mission_state_filters_minimal_serde() {
+        let filters = MissionStateFilters {
+            mission_state: None,
+            run_state: None,
+            agent_state: None,
+            action_state: None,
+            assignment_id: None,
+            assignee: None,
+            limit: 50,
+        };
+        let json = serde_json::to_string(&filters).unwrap();
+        assert!(json.contains("\"limit\":50"));
+        assert!(!json.contains("mission_state"));
+        assert!(!json.contains("assignment_id"));
+    }
+
+    #[test]
+    fn mission_state_filters_with_values() {
+        let filters = MissionStateFilters {
+            mission_state: Some(crate::plan::MissionLifecycleState::Running),
+            run_state: Some(MissionRunState::Pending),
+            agent_state: Some(MissionAgentState::Approved),
+            action_state: Some(MissionActionState::Ready),
+            assignment_id: Some("assign-1".to_string()),
+            assignee: Some("agent-a".to_string()),
+            limit: 10,
+        };
+        let json = serde_json::to_string(&filters).unwrap();
+        let back: MissionStateFilters = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.mission_state,
+            Some(crate::plan::MissionLifecycleState::Running)
+        );
+        assert_eq!(back.run_state, Some(MissionRunState::Pending));
+        assert_eq!(back.agent_state, Some(MissionAgentState::Approved));
+        assert_eq!(back.limit, 10);
+    }
+
+    #[test]
+    fn mission_transition_info_serde() {
+        let info = MissionTransitionInfo {
+            kind: "approve".to_string(),
+            to: "running".to_string(),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: MissionTransitionInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, "approve");
+        assert_eq!(back.to, "running");
+    }
+
+    #[test]
+    fn mission_assignment_data_serde_roundtrip() {
+        let data = MissionAssignmentData {
+            assignment_id: "a-1".to_string(),
+            candidate_id: "c-1".to_string(),
+            assignee: "agent-x".to_string(),
+            assigned_by: crate::plan::MissionActorRole::Planner,
+            action_type: "send_text".to_string(),
+            run_state: MissionRunState::Pending,
+            agent_state: MissionAgentState::Approved,
+            action_state: MissionActionState::Ready,
+            approval_state: crate::plan::ApprovalState::NotRequired,
+            outcome: None,
+            reason_code: None,
+            error_code: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: MissionAssignmentData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.assignment_id, "a-1");
+        assert_eq!(back.run_state, MissionRunState::Pending);
+        assert_eq!(back.agent_state, MissionAgentState::Approved);
+    }
+
+    #[test]
+    fn mission_state_data_serde_roundtrip() {
+        let data = MissionStateData {
+            mission_file: "mission.json".to_string(),
+            mission_id: "m-1".to_string(),
+            title: "Test Mission".to_string(),
+            mission_hash: "abc123".to_string(),
+            lifecycle_state: crate::plan::MissionLifecycleState::Running,
+            mission_matches_filter: true,
+            candidate_count: 5,
+            assignment_count: 3,
+            matched_assignment_count: 2,
+            returned_assignment_count: 2,
+            filters: MissionStateFilters {
+                mission_state: None,
+                run_state: None,
+                agent_state: None,
+                action_state: None,
+                assignment_id: None,
+                assignee: None,
+                limit: 50,
+            },
+            assignment_counters: MissionAssignmentCounters::default(),
+            available_transitions: vec![MissionTransitionInfo {
+                kind: "complete".to_string(),
+                to: "completed".to_string(),
+            }],
+            assignments: vec![],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: MissionStateData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mission_id, "m-1");
+        assert_eq!(back.lifecycle_state, crate::plan::MissionLifecycleState::Running);
+        assert_eq!(back.candidate_count, 5);
+        assert_eq!(back.available_transitions.len(), 1);
+    }
+
+    #[test]
+    fn mission_failure_catalog_entry_serde() {
+        let entry = MissionFailureCatalogEntry {
+            reason_code: "timeout".to_string(),
+            error_code: "E-1001".to_string(),
+            terminality: "non_terminal".to_string(),
+            retryability: "retryable".to_string(),
+            human_hint: "Retry after cooldown".to_string(),
+            machine_hint: "retry_with_backoff".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: MissionFailureCatalogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reason_code, "timeout");
+        assert_eq!(back.error_code, "E-1001");
+    }
+
+    #[test]
+    fn mission_decision_data_serde_minimal() {
+        let data = MissionDecisionData {
+            assignment: MissionAssignmentData {
+                assignment_id: "a-1".to_string(),
+                candidate_id: "c-1".to_string(),
+                assignee: "x".to_string(),
+                assigned_by: crate::plan::MissionActorRole::Dispatcher,
+                action_type: "send_text".to_string(),
+                run_state: MissionRunState::Pending,
+                agent_state: MissionAgentState::NotRequired,
+                action_state: MissionActionState::Ready,
+                approval_state: crate::plan::ApprovalState::NotRequired,
+                outcome: None,
+                reason_code: None,
+                error_code: None,
+            },
+            candidate_action: None,
+            dispatch_contract: None,
+            dispatch_target: None,
+            dry_run_execution: None,
+            decision_error: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        // Optional fields should be omitted.
+        assert!(!json.contains("candidate_action"));
+        assert!(!json.contains("dispatch_contract"));
+        assert!(!json.contains("decision_error"));
+    }
+
+    #[test]
+    fn mission_decisions_data_serde_roundtrip() {
+        let data = MissionDecisionsData {
+            mission_file: "m.json".to_string(),
+            mission_id: "m-1".to_string(),
+            title: "Test".to_string(),
+            mission_hash: "hash".to_string(),
+            lifecycle_state: crate::plan::MissionLifecycleState::Planned,
+            mission_matches_filter: true,
+            candidate_count: 1,
+            assignment_count: 1,
+            matched_assignment_count: 1,
+            returned_assignment_count: 1,
+            filters: MissionStateFilters {
+                mission_state: None,
+                run_state: None,
+                agent_state: None,
+                action_state: None,
+                assignment_id: None,
+                assignee: None,
+                limit: 10,
+            },
+            available_transitions: vec![],
+            failure_catalog: vec![],
+            decisions: vec![],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: MissionDecisionsData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mission_id, "m-1");
+        assert_eq!(back.lifecycle_state, crate::plan::MissionLifecycleState::Planned);
+    }
+
+    #[test]
+    fn mission_state_data_in_robot_envelope() {
+        let data = MissionStateData {
+            mission_file: "active.json".to_string(),
+            mission_id: "m-test".to_string(),
+            title: "Envelope Test".to_string(),
+            mission_hash: "def456".to_string(),
+            lifecycle_state: crate::plan::MissionLifecycleState::Completed,
+            mission_matches_filter: true,
+            candidate_count: 0,
+            assignment_count: 0,
+            matched_assignment_count: 0,
+            returned_assignment_count: 0,
+            filters: MissionStateFilters {
+                mission_state: None,
+                run_state: None,
+                agent_state: None,
+                action_state: None,
+                assignment_id: None,
+                assignee: None,
+                limit: 50,
+            },
+            assignment_counters: MissionAssignmentCounters::default(),
+            available_transitions: vec![],
+            assignments: vec![],
+        };
+        let resp = RobotResponse::success(data, 5);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        assert!(json.contains("m-test"));
     }
 }
