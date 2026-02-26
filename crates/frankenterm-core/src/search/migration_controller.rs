@@ -24,10 +24,11 @@ use super::regression_diff::{
 // ---------------------------------------------------------------------------
 
 /// Phase in the legacy-to-orchestrated migration lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MigrationPhase {
     /// Initial state: pre-flight checks not yet run.
+    #[default]
     PreCheck,
     /// Shadow mode: both paths run, legacy returned, diffs logged.
     Shadow,
@@ -82,11 +83,6 @@ impl MigrationPhase {
     }
 }
 
-impl Default for MigrationPhase {
-    fn default() -> Self {
-        Self::PreCheck
-    }
-}
 
 impl std::fmt::Display for MigrationPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

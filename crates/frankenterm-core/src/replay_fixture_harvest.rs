@@ -377,17 +377,9 @@ impl Default for RetentionPolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RetentionEnforcer {
     pub policy: RetentionPolicy,
-}
-
-impl Default for RetentionEnforcer {
-    fn default() -> Self {
-        Self {
-            policy: RetentionPolicy::default(),
-        }
-    }
 }
 
 impl RetentionEnforcer {
@@ -719,23 +711,12 @@ pub struct FtreplayValidationReport {
     pub causality_integrity_verified: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FtreplayWriter {
     pub config: ArtifactWriterConfig,
     staged_entities: Vec<serde_json::Value>,
     staged_events: Vec<RecorderEvent>,
     staged_decisions: Vec<serde_json::Value>,
-}
-
-impl Default for FtreplayWriter {
-    fn default() -> Self {
-        Self {
-            config: ArtifactWriterConfig::default(),
-            staged_entities: Vec::new(),
-            staged_events: Vec::new(),
-            staged_decisions: Vec::new(),
-        }
-    }
 }
 
 impl FtreplayWriter {
@@ -1361,16 +1342,9 @@ fn parse_timeline_values_to_events(
         .collect()
 }
 
+#[derive(Default)]
 pub struct HarvestPipeline {
     harvester: FixtureHarvester,
-}
-
-impl Default for HarvestPipeline {
-    fn default() -> Self {
-        Self {
-            harvester: FixtureHarvester::default(),
-        }
-    }
 }
 
 impl HarvestPipeline {

@@ -271,8 +271,7 @@ impl SlidingWindow {
             return 0;
         }
         let elapsed = now_ms - self.head_start_ms;
-        let future_buckets = (elapsed / self.bucket_duration_ms) as usize;
-        future_buckets // how many buckets have passed since head was updated
+        (elapsed / self.bucket_duration_ms) as usize // how many buckets have passed since head was updated
     }
 
     fn is_bucket_expired(&self, bucket_idx: usize, expired_count: usize) -> bool {
@@ -443,7 +442,7 @@ mod tests {
         w.record(50); // bucket 0
         w.record(150); // bucket 1
         w.record(250); // bucket 2
-        // Recent 1 bucket should have 1 event
+                       // Recent 1 bucket should have 1 event
         let recent = w.recent_count(250, 1);
         assert!(recent >= 1);
     }

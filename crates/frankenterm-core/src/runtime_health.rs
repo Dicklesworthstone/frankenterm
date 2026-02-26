@@ -22,6 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 use crate::runtime_telemetry::{FailureClass, HealthTier, RuntimePhase, RuntimeTelemetryLog};
 
@@ -548,10 +549,7 @@ impl IncidentEnrichment {
     }
 
     /// Add a tier transition record.
-    pub fn add_tier_transition(
-        &mut self,
-        record: crate::runtime_telemetry::TierTransitionRecord,
-    ) {
+    pub fn add_tier_transition(&mut self, record: crate::runtime_telemetry::TierTransitionRecord) {
         self.tier_transitions.push(record);
     }
 
@@ -605,10 +603,7 @@ pub fn check_telemetry_log(log: &RuntimeTelemetryLog) -> RuntimeHealthCheck {
             .with_evidence(&format!("Buffered: {}", snap.buffered_events))
             .with_evidence(&format!(
                 "Tier distribution: G={} Y={} R={} B={}",
-                snap.tier_counts[0],
-                snap.tier_counts[1],
-                snap.tier_counts[2],
-                snap.tier_counts[3]
+                snap.tier_counts[0], snap.tier_counts[1], snap.tier_counts[2], snap.tier_counts[3]
             ))
             .with_remediation(
                 RemediationHint::text("Increase telemetry log max_events or reduce event volume")
@@ -634,10 +629,7 @@ pub fn check_telemetry_log(log: &RuntimeTelemetryLog) -> RuntimeHealthCheck {
             )
             .with_evidence(&format!(
                 "Tier distribution: G={} Y={} R={} B={}",
-                snap.tier_counts[0],
-                snap.tier_counts[1],
-                snap.tier_counts[2],
-                snap.tier_counts[3]
+                snap.tier_counts[0], snap.tier_counts[1], snap.tier_counts[2], snap.tier_counts[3]
             ))
             .with_remediation(RemediationHint::with_command(
                 "Check recent error events",
@@ -728,10 +720,7 @@ pub fn check_tier_distribution(log: &RuntimeTelemetryLog) -> RuntimeHealthCheck 
         )
         .with_evidence(&format!(
             "G={} Y={} R={} B={}",
-            snap.tier_counts[0],
-            snap.tier_counts[1],
-            snap.tier_counts[2],
-            snap.tier_counts[3],
+            snap.tier_counts[0], snap.tier_counts[1], snap.tier_counts[2], snap.tier_counts[3],
         ));
     }
 
@@ -750,7 +739,7 @@ pub fn check_tier_distribution(log: &RuntimeTelemetryLog) -> RuntimeHealthCheck 
 /// Check scope lifecycle health: are any scopes stuck in non-terminal states?
 #[must_use]
 pub fn check_scope_health(
-    scope_states: &HashMap<String, String>,
+    scope_states: &HashMap<String, String, impl BuildHasher>,
 ) -> RuntimeHealthCheck {
     if scope_states.is_empty() {
         return RuntimeHealthCheck::skip(
@@ -782,9 +771,7 @@ pub fn check_scope_health(
         return RuntimeHealthCheck::fail(
             "scope_health",
             "Scope Lifecycle",
-            &format!(
-                "{finalizing_count} scope(s) stuck in finalizing state"
-            ),
+            &format!("{finalizing_count} scope(s) stuck in finalizing state"),
         )
         .with_failure_class(FailureClass::Deadlock)
         .with_evidence(&stuck_scopes.join(", "))
@@ -798,9 +785,7 @@ pub fn check_scope_health(
         return RuntimeHealthCheck::warn(
             "scope_health",
             "Scope Lifecycle",
-            &format!(
-                "{draining_count} scope(s) in draining state"
-            ),
+            &format!("{draining_count} scope(s) in draining state"),
         )
         .with_evidence(&stuck_scopes.join(", "))
         .with_remediation(
@@ -810,15 +795,19 @@ pub fn check_scope_health(
     }
 
     let total = scope_states.len();
-    let running = scope_states.values().filter(|s| s.as_str() == "running").count();
-    let closed = scope_states.values().filter(|s| s.as_str() == "closed").count();
+    let running = scope_states
+        .values()
+        .filter(|s| s.as_str() == "running")
+        .count();
+    let closed = scope_states
+        .values()
+        .filter(|s| s.as_str() == "closed")
+        .count();
 
     RuntimeHealthCheck::pass(
         "scope_health",
         "Scope Lifecycle",
-        &format!(
-            "Healthy: {total} scopes ({running} running, {closed} closed)"
-        ),
+        &format!("Healthy: {total} scopes ({running} running, {closed} closed)"),
     )
 }
 
@@ -893,7 +882,10 @@ pub fn check_failure_patterns(log: &RuntimeTelemetryLog) -> RuntimeHealthCheck {
         return RuntimeHealthCheck::warn(
             "failure_patterns",
             "Failure Patterns",
-            &format!("{total_failures} failure(s) detected: {}", detail.join(", ")),
+            &format!(
+                "{total_failures} failure(s) detected: {}",
+                detail.join(", ")
+            ),
         );
     }
 
@@ -1224,9 +1216,7 @@ mod tests {
     fn report_worst_tier_wins() {
         let mut reg = HealthCheckRegistry::new();
         reg.register(RuntimeHealthCheck::pass("a", "A", "OK"));
-        reg.register(
-            RuntimeHealthCheck::fail("b", "B", "Critical").with_tier(HealthTier::Black),
-        );
+        reg.register(RuntimeHealthCheck::fail("b", "B", "Critical").with_tier(HealthTier::Black));
         reg.register(RuntimeHealthCheck::warn("c", "C", "Warn"));
 
         let report = reg.build_report();
@@ -1281,8 +1271,7 @@ mod tests {
 
     #[test]
     fn incident_enrichment_basic() {
-        let enrichment =
-            IncidentEnrichment::new(HealthTier::Red, RuntimePhase::Running);
+        let enrichment = IncidentEnrichment::new(HealthTier::Red, RuntimePhase::Running);
         assert_eq!(enrichment.schema_version, 1);
         assert_eq!(enrichment.health_tier, HealthTier::Red);
         assert_eq!(enrichment.phase, RuntimePhase::Running);
@@ -1313,16 +1302,14 @@ mod tests {
         reg.register(RuntimeHealthCheck::pass("a", "A", "OK"));
         let report = reg.build_report();
 
-        let enrichment =
-            IncidentEnrichment::new(HealthTier::Green, RuntimePhase::Running)
-                .with_doctor_report(report);
+        let enrichment = IncidentEnrichment::new(HealthTier::Green, RuntimePhase::Running)
+            .with_doctor_report(report);
         assert!(enrichment.doctor_report.is_some());
     }
 
     #[test]
     fn incident_enrichment_active_failures() {
-        let mut enrichment =
-            IncidentEnrichment::new(HealthTier::Red, RuntimePhase::Running);
+        let mut enrichment = IncidentEnrichment::new(HealthTier::Red, RuntimePhase::Running);
         enrichment.add_active_failure(ActiveFailure {
             component: "rt.storage".to_string(),
             failure_class: FailureClass::Timeout,
@@ -1338,8 +1325,7 @@ mod tests {
 
     #[test]
     fn incident_enrichment_to_json() {
-        let enrichment =
-            IncidentEnrichment::new(HealthTier::Green, RuntimePhase::Running);
+        let enrichment = IncidentEnrichment::new(HealthTier::Green, RuntimePhase::Running);
         let json = enrichment.to_json();
         assert!(json.contains("schema_version"));
         assert!(json.contains("\"green\""));
@@ -1347,8 +1333,7 @@ mod tests {
 
     #[test]
     fn incident_enrichment_serde_roundtrip() {
-        let mut enrichment =
-            IncidentEnrichment::new(HealthTier::Yellow, RuntimePhase::Draining);
+        let mut enrichment = IncidentEnrichment::new(HealthTier::Yellow, RuntimePhase::Draining);
         enrichment.add_scope_state("root", "draining");
         enrichment.add_active_failure(ActiveFailure {
             component: "rt.test".to_string(),
@@ -1563,8 +1548,7 @@ mod tests {
 
     #[test]
     fn incident_enrichment_data_from() {
-        let enrichment =
-            IncidentEnrichment::new(HealthTier::Red, RuntimePhase::Draining);
+        let enrichment = IncidentEnrichment::new(HealthTier::Red, RuntimePhase::Draining);
         let data = IncidentEnrichmentData::from(&enrichment);
         assert_eq!(data.health_tier, "red");
         assert_eq!(data.phase, "draining");

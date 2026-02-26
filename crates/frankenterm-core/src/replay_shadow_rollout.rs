@@ -386,7 +386,7 @@ pub struct RolloutMetrics {
 #[must_use]
 pub fn weekly_digest(metrics: &RolloutMetrics) -> String {
     let mut lines = Vec::new();
-    lines.push(format!("## Replay Gates Weekly Digest"));
+    lines.push("## Replay Gates Weekly Digest".to_string());
     lines.push(format!("**Stage:** {}", metrics.stage.as_str()));
     lines.push(format!("**Days in stage:** {}", metrics.days_in_stage));
     lines.push(String::new());
@@ -414,7 +414,7 @@ pub fn weekly_digest(metrics: &RolloutMetrics) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replay_ci_gate::{ALL_GATES, GateCheck};
+    use crate::replay_ci_gate::{GateCheck, ALL_GATES};
 
     fn make_pass_report(gate: GateId) -> GateReport {
         GateReport::new(

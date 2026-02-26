@@ -29,7 +29,7 @@ use std::fmt;
 /// Lifecycle policy for the lexical index.
 ///
 /// Determines how documents enter and exit the index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IngestLifecyclePolicy {
     /// Checkpoint-driven incremental indexing from append-log.
@@ -39,13 +39,8 @@ pub enum IngestLifecyclePolicy {
     /// TTL-based with LRU eviction.
     /// Documents expire after `ttl_days` and are evicted when the index
     /// exceeds `max_index_size_bytes`. Used by search/indexing.rs.
+    #[default]
     TtlLru,
-}
-
-impl Default for IngestLifecyclePolicy {
-    fn default() -> Self {
-        Self::TtlLru
-    }
 }
 
 impl IngestLifecyclePolicy {
@@ -80,20 +75,15 @@ impl fmt::Display for IngestLifecyclePolicy {
 ///
 /// Tracks which field schema is authoritative. Schema migration between
 /// versions requires a full reindex.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LexicalSchemaVersion {
     /// Recorder-lexical v1: 25-field schema with terminal-specific tokenizers.
     /// Schema name: `ft.recorder.lexical.v1`.
     RecorderV1,
     /// FrankenSearch-managed schema: simplified fields with automatic migration.
+    #[default]
     FrankenSearchV1,
-}
-
-impl Default for LexicalSchemaVersion {
-    fn default() -> Self {
-        Self::FrankenSearchV1
-    }
 }
 
 impl LexicalSchemaVersion {

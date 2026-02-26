@@ -79,21 +79,16 @@ impl From<SearchMode> for SearchModeConfig {
 // ── B3: Embedder dispatch types ───────────────────────────────────────
 
 /// Reranker dispatch strategy (B6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RerankerDispatch {
     /// Reranking disabled (no post-fusion reranking step).
+    #[default]
     Disabled,
     /// Use local reranker implementation (PassthroughReranker or CrossEncoderReranker).
     Legacy,
     /// Use frankensearch reranker via bridge adapter.
     Managed,
-}
-
-impl Default for RerankerDispatch {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 impl RerankerDispatch {
@@ -134,21 +129,16 @@ impl fmt::Display for RerankerDispatch {
 ///
 /// Controls whether the embedding daemon uses the local worker path or
 /// delegates to frankensearch's `BatchCoalescer` + `CachedEmbedder`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonDispatch {
     /// Daemon is disabled (no background embedding).
+    #[default]
     Disabled,
     /// Legacy daemon worker — processes requests one at a time.
     Legacy,
     /// Managed daemon via frankensearch BatchCoalescer + CachedEmbedder.
     Managed,
-}
-
-impl Default for DaemonDispatch {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 impl DaemonDispatch {
@@ -195,21 +185,16 @@ impl fmt::Display for DaemonDispatch {
 ///
 /// Controls whether lexical indexing/querying uses the recorder-lexical
 /// (direct tantivy) path or the frankensearch-managed lexical backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LexicalDispatch {
     /// Lexical search disabled.
+    #[default]
     Disabled,
     /// Direct tantivy via recorder-lexical pipeline.
     RecorderDirect,
     /// FrankenSearch-managed lexical backend.
     Managed,
-}
-
-impl Default for LexicalDispatch {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 impl LexicalDispatch {
@@ -253,19 +238,14 @@ impl fmt::Display for LexicalDispatch {
 }
 
 /// Embedder dispatch strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EmbedderDispatch {
     /// Caller embeds externally and provides pre-ranked lists.
+    #[default]
     Legacy,
     /// Orchestrator manages an embedder stack with tiered fallback.
     Managed,
-}
-
-impl Default for EmbedderDispatch {
-    fn default() -> Self {
-        Self::Legacy
-    }
 }
 
 /// Availability tier of the managed embedder stack.

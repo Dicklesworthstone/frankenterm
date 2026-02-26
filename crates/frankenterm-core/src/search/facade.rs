@@ -26,10 +26,11 @@ use super::orchestrator::{
 // ---------------------------------------------------------------------------
 
 /// Facade routing strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FacadeRouting {
     /// Route directly through `HybridSearchService` (current production path).
+    #[default]
     Legacy,
     /// Route through `SearchOrchestrator` (new path).
     Orchestrated,
@@ -59,11 +60,6 @@ impl FacadeRouting {
     }
 }
 
-impl Default for FacadeRouting {
-    fn default() -> Self {
-        Self::Legacy
-    }
-}
 
 impl std::fmt::Display for FacadeRouting {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
