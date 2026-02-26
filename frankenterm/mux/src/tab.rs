@@ -1,4 +1,5 @@
 use crate::domain::DomainId;
+use crate::layout::{LayoutCycle, PaneStack, SwapLayout, redistribute_panes};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
 use crate::{Mux, MuxNotification, WindowId};
@@ -52,6 +53,13 @@ struct TabInner {
     /// shrank below the aggregate minimum constraints.  Collapsed panes
     /// retain their tree position but are allocated zero space.
     collapsed_panes: HashSet<PaneId>,
+    /// Optional layout cycle for swap-layout support.
+    /// When set, the user can cycle through pre-defined arrangements.
+    layout_cycle: Option<LayoutCycle>,
+    /// Pane stacks: slot_index → PaneStack.  When a layout has fewer
+    /// slots than panes, overflow panes are stacked in the last slot.
+    /// Only the active pane in each stack is visible in the tree.
+    pane_stacks: HashMap<usize, PaneStack>,
 }
 
 /// A Tab is a container of Panes
@@ -753,6 +761,24 @@ fn compute_split_resize_budget(
     }
 }
 
+/// Replace a pane in the tree by matching on PaneId.
+fn replace_pane_recursive(tree: &mut Tree, old_id: PaneId, new_pane: Arc<dyn Pane>) {
+    match tree {
+        Tree::Empty | Tree::Node { data: None, .. } => {}
+        Tree::Leaf(pane) => {
+            if pane.pane_id() == old_id {
+                *pane = new_pane;
+            }
+        }
+        Tree::Node {
+            left, right, ..
+        } => {
+            replace_pane_recursive(left, old_id, new_pane.clone());
+            replace_pane_recursive(right, old_id, new_pane);
+        }
+    }
+}
+
 /// Returns `true` if every leaf pane in `tree` belongs to `collapsed`.
 fn is_subtree_fully_collapsed(tree: &Tree, collapsed: &HashSet<PaneId>) -> bool {
     match tree {
@@ -1349,6 +1375,47 @@ impl Tab {
         self.inner.lock().collapsed_pane_ids().clone()
     }
 
+    /// Set the layout cycle for swap-layout support.
+    pub fn set_layout_cycle(&self, cycle: LayoutCycle) {
+        self.inner.lock().set_layout_cycle(cycle)
+    }
+
+    /// Swap to the next layout in the cycle.
+    /// Returns the name of the new layout, or None if no cycle is configured.
+    pub fn swap_to_next_layout(&self) -> Option<String> {
+        self.inner.lock().swap_to_next_layout()
+    }
+
+    /// Swap to the previous layout in the cycle.
+    pub fn swap_to_prev_layout(&self) -> Option<String> {
+        self.inner.lock().swap_to_prev_layout()
+    }
+
+    /// Swap to a specific layout by index in the cycle.
+    pub fn swap_to_layout_index(&self, index: usize) -> Option<String> {
+        self.inner.lock().swap_to_layout_index(index)
+    }
+
+    /// Cycle to the next pane in a stack at the given slot index.
+    pub fn cycle_stack(&self, slot_index: usize) -> Option<PaneId> {
+        self.inner.lock().cycle_stack(slot_index)
+    }
+
+    /// Returns the current layout name, if a cycle is active.
+    pub fn current_layout_name(&self) -> Option<String> {
+        self.inner.lock().current_layout_name()
+    }
+
+    /// Returns the number of pane stacks.
+    pub fn stack_count(&self) -> usize {
+        self.inner.lock().stack_count()
+    }
+
+    /// Returns all stacked pane IDs across all slots.
+    pub fn all_stacked_pane_ids(&self) -> Vec<PaneId> {
+        self.inner.lock().all_stacked_pane_ids()
+    }
+
     /// Compute the resize budget for a split identified by its topological
     /// index.  Returns `None` if the index is out of range, otherwise
     /// `(max_shrink, max_grow)` where max_shrink is negative (how far
@@ -1485,6 +1552,8 @@ impl TabInner {
             title: String::new(),
             recency: Recency::default(),
             collapsed_panes: HashSet::new(),
+            layout_cycle: None,
+            pane_stacks: HashMap::new(),
         }
     }
 
@@ -1965,6 +2034,150 @@ impl TabInner {
     /// Returns the set of currently collapsed pane IDs.
     fn collapsed_pane_ids(&self) -> &HashSet<PaneId> {
         &self.collapsed_panes
+    }
+
+    // --- Swap layout support ---
+
+    /// Set the layout cycle for this tab.
+    fn set_layout_cycle(&mut self, cycle: LayoutCycle) {
+        self.layout_cycle = Some(cycle);
+    }
+
+    /// Swap to the next layout in the cycle.  Returns the name of the
+    /// new layout, or None if no cycle is configured or the tab has no panes.
+    fn swap_to_next_layout(&mut self) -> Option<String> {
+        let cycle = self.layout_cycle.as_mut()?;
+        let layout = cycle.next().clone();
+        self.apply_layout(&layout)
+    }
+
+    /// Swap to the previous layout in the cycle.
+    fn swap_to_prev_layout(&mut self) -> Option<String> {
+        let cycle = self.layout_cycle.as_mut()?;
+        let layout = cycle.prev().clone();
+        self.apply_layout(&layout)
+    }
+
+    /// Swap to a specific layout by index in the cycle.
+    fn swap_to_layout_index(&mut self, index: usize) -> Option<String> {
+        let cycle = self.layout_cycle.as_mut()?;
+        if !cycle.select(index) {
+            return None;
+        }
+        let layout = cycle.current().clone();
+        self.apply_layout(&layout)
+    }
+
+    /// Apply a layout, redistributing panes from the current tree.
+    fn apply_layout(&mut self, layout: &SwapLayout) -> Option<String> {
+        // Collect all panes from the current tree AND from any existing stacks.
+        let all_panes = self.collect_all_panes();
+        if all_panes.is_empty() {
+            return None;
+        }
+
+        let active_pane_id = self
+            .get_active_pane()
+            .map(|p| p.pane_id())
+            .unwrap_or_else(|| all_panes[0].pane_id());
+
+        let result = redistribute_panes(
+            &layout.arrangement,
+            all_panes,
+            active_pane_id,
+            self.size,
+        )?;
+
+        self.pane = Some(result.tree);
+        self.pane_stacks = result.stacks;
+        self.active = result.active_index;
+        self.collapsed_panes.clear();
+
+        // Apply sizes to the new tree.
+        let size = self.size;
+        if let Some(tree) = self.pane.as_mut() {
+            apply_sizes_from_splits(tree, &size);
+        }
+
+        // Notify about the focus change.
+        if let Some(pane) = self.get_active_pane() {
+            self.recency.tag(self.active);
+            Mux::try_get().map(|mux| {
+                mux.notify(MuxNotification::PaneFocused(pane.pane_id()));
+            });
+        }
+
+        Some(layout.name.clone())
+    }
+
+    /// Collect all panes: from the tree leaves AND from stacked (hidden) panes.
+    fn collect_all_panes(&mut self) -> Vec<Arc<dyn Pane>> {
+        let mut panes: Vec<Arc<dyn Pane>> = Vec::new();
+
+        // Collect from tree leaves.
+        let positioned = self.iter_panes_ignoring_zoom();
+        for pp in &positioned {
+            panes.push(pp.pane.clone());
+        }
+
+        // Collect from stacks (non-visible panes that aren't already in the tree).
+        let tree_ids: HashSet<PaneId> = panes.iter().map(|p| p.pane_id()).collect();
+        for (_slot, stack) in self.pane_stacks.drain() {
+            for p in stack.into_panes() {
+                if !tree_ids.contains(&p.pane_id()) {
+                    panes.push(p);
+                }
+            }
+        }
+
+        panes
+    }
+
+    /// Cycle to the next pane in a stack at the given slot index.
+    /// Returns the newly visible pane ID, or None if no stack at that slot.
+    fn cycle_stack(&mut self, slot_index: usize) -> Option<PaneId> {
+        let stack = self.pane_stacks.get_mut(&slot_index)?;
+        if stack.is_single() {
+            return None; // nothing to cycle
+        }
+
+        let old_pane_id = stack.active_pane().pane_id();
+        stack.cycle_next();
+        let new_pane = stack.active_pane().clone();
+        let new_pane_id = new_pane.pane_id();
+
+        // Swap the visible pane in the tree leaf.
+        self.replace_pane_in_tree(old_pane_id, new_pane);
+
+        Some(new_pane_id)
+    }
+
+    /// Replace a pane in the tree by its ID with a new pane.
+    fn replace_pane_in_tree(&mut self, old_id: PaneId, new_pane: Arc<dyn Pane>) {
+        if let Some(tree) = self.pane.as_mut() {
+            replace_pane_recursive(tree, old_id, new_pane);
+            let size = self.size;
+            apply_sizes_from_splits(tree, &size);
+        }
+    }
+
+    /// Returns the current layout name, if a cycle is active.
+    fn current_layout_name(&self) -> Option<String> {
+        self.layout_cycle.as_ref().map(|c| c.current().name.clone())
+    }
+
+    /// Returns the number of pane stacks.
+    fn stack_count(&self) -> usize {
+        self.pane_stacks.len()
+    }
+
+    /// Returns all stacked pane IDs across all slots.
+    fn all_stacked_pane_ids(&self) -> Vec<PaneId> {
+        let mut ids = Vec::new();
+        for (_slot, stack) in &self.pane_stacks {
+            ids.extend(stack.pane_ids());
+        }
+        ids
     }
 
     /// Compute the resize budget for a split identified by its topological
@@ -5863,5 +6076,299 @@ mod test {
             !tab.is_pane_collapsed(2),
             "Bottom pane (Never) should remain"
         );
+    }
+
+    // ---- Swap layout tests ----
+
+    /// Helper: create a tab with N panes in a horizontal split chain.
+    fn make_tab_with_n_panes(n: usize) -> (Tab, TerminalSize) {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 400, // Wide enough for up to 8 panes with separators
+            pixel_width: 4000,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        ensure_mux_initialized();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        for i in 2..=n {
+            // Split the last pane (right-most) to avoid shrinking pane 0 too much.
+            let last_idx = i - 2; // index of the last leaf
+            let split = tab
+                .compute_split_size(
+                    last_idx,
+                    SplitRequest {
+                        direction: SplitDirection::Horizontal,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            tab.split_and_insert(
+                last_idx,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+                FakePane::new(i as PaneId, split.second),
+            )
+            .unwrap();
+        }
+        (tab, size)
+    }
+
+    #[test]
+    fn swap_layout_preserves_all_panes() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(4);
+        let pane_ids_before: HashSet<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|p| p.pane.pane_id())
+            .collect();
+        assert_eq!(pane_ids_before.len(), 4);
+
+        tab.set_layout_cycle(default_cycle());
+
+        // Swap to main-side (3 slots, 4 panes → 1 stacked)
+        let name = tab.swap_to_next_layout().unwrap();
+        assert_eq!(name, "main-side");
+
+        // All pane IDs should still be present (tree + stacks).
+        let tree_ids: HashSet<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|p| p.pane.pane_id())
+            .collect();
+        let stacked_ids: HashSet<PaneId> = tab.all_stacked_pane_ids().into_iter().collect();
+        let all_ids: HashSet<PaneId> = tree_ids.union(&stacked_ids).copied().collect();
+        assert_eq!(
+            pane_ids_before, all_ids,
+            "No panes should be lost during layout swap"
+        );
+    }
+
+    #[test]
+    fn swap_layout_cycle_wraps() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(2);
+        tab.set_layout_cycle(default_cycle());
+
+        // Cycle through all layouts and back to start.
+        let n1 = tab.swap_to_next_layout().unwrap(); // main-side
+        let n2 = tab.swap_to_next_layout().unwrap(); // stacked
+        let n3 = tab.swap_to_next_layout().unwrap(); // main-bottom
+        let n4 = tab.swap_to_next_layout().unwrap(); // grid-4 (wraps)
+        assert_eq!(n1, "main-side");
+        assert_eq!(n2, "stacked");
+        assert_eq!(n3, "main-bottom");
+        assert_eq!(n4, "grid-4");
+    }
+
+    #[test]
+    fn swap_to_stacked_puts_all_panes_in_stack() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(3);
+        tab.set_layout_cycle(default_cycle());
+
+        // Advance to "stacked" layout (index 2).
+        tab.swap_to_layout_index(2);
+        let name = tab.current_layout_name().unwrap();
+        assert_eq!(name, "stacked");
+
+        // Stacked layout has 1 slot → 2 overflow panes stacked.
+        let tree_panes = tab.iter_panes_ignoring_zoom();
+        assert_eq!(tree_panes.len(), 1, "Stacked layout should show 1 leaf");
+        assert!(
+            tab.stack_count() > 0,
+            "Should have at least one stack for overflow panes"
+        );
+    }
+
+    #[test]
+    fn swap_layout_focus_preserved() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(3);
+
+        // Find pane 2 and set it as active.
+        let pane_2 = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .find(|p| p.pane.pane_id() == 2)
+            .unwrap()
+            .pane
+            .clone();
+        tab.set_active_pane(&pane_2);
+        let active_before = tab.get_active_pane().unwrap().pane_id();
+        assert_eq!(active_before, 2);
+
+        tab.set_layout_cycle(default_cycle());
+        tab.swap_to_next_layout(); // main-side: has main slot
+
+        // Active pane should still be pane 2 (placed in main slot).
+        let active_after = tab.get_active_pane().unwrap().pane_id();
+        assert_eq!(
+            active_after, active_before,
+            "Focus should be preserved across layout swap"
+        );
+    }
+
+    #[test]
+    fn swap_layout_roundtrip_restores_pane_set() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(4);
+        let ids_before: HashSet<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|p| p.pane.pane_id())
+            .collect();
+
+        tab.set_layout_cycle(default_cycle());
+
+        // Swap forward through entire cycle and back.
+        for _ in 0..4 {
+            tab.swap_to_next_layout();
+        }
+
+        // Verify all panes present.
+        let tree_ids: HashSet<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|p| p.pane.pane_id())
+            .collect();
+        let stacked_ids: HashSet<PaneId> = tab.all_stacked_pane_ids().into_iter().collect();
+        let all_ids: HashSet<PaneId> = tree_ids.union(&stacked_ids).copied().collect();
+        assert_eq!(
+            ids_before, all_ids,
+            "Full cycle swap should preserve all panes"
+        );
+    }
+
+    #[test]
+    fn cycle_stack_switches_visible_pane() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(3);
+        tab.set_layout_cycle(default_cycle());
+
+        // Switch to stacked layout (all 3 panes in 1 slot).
+        tab.swap_to_layout_index(2);
+
+        let visible_before = tab.iter_panes_ignoring_zoom()[0].pane.pane_id();
+
+        // Cycle the stack.
+        let new_visible = tab.cycle_stack(0);
+        if let Some(new_id) = new_visible {
+            assert_ne!(
+                new_id, visible_before,
+                "Cycling stack should change visible pane"
+            );
+            // Verify new pane is now in the tree.
+            let current = tab.iter_panes_ignoring_zoom()[0].pane.pane_id();
+            assert_eq!(current, new_id);
+        }
+    }
+
+    #[test]
+    fn swap_without_cycle_returns_none() {
+        let (tab, _size) = make_tab_with_n_panes(2);
+        assert!(
+            tab.swap_to_next_layout().is_none(),
+            "Should return None when no cycle is set"
+        );
+        assert!(tab.current_layout_name().is_none());
+    }
+
+    #[test]
+    fn layout_swap_with_single_pane() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(1);
+        tab.set_layout_cycle(default_cycle());
+
+        // Swap to grid-4 (4 slots, but only 1 pane).
+        tab.swap_to_next_layout();
+        let panes = tab.iter_panes_ignoring_zoom();
+        // Should have the pane somewhere in the tree.
+        let has_pane_1 = panes.iter().any(|p| p.pane.pane_id() == 1);
+        assert!(has_pane_1, "Single pane should be placed in the layout");
+    }
+
+    // ---- Proptest: swap layout invariants ----
+
+    proptest! {
+        /// Swapping through any number of layouts never loses panes.
+        #[test]
+        fn swap_layout_never_loses_panes(
+            num_panes in 1usize..8,
+            num_swaps in 1usize..12,
+        ) {
+            use crate::layout::default_cycle;
+
+            let (tab, _size) = make_tab_with_n_panes(num_panes);
+            let ids_before: HashSet<PaneId> = tab
+                .iter_panes_ignoring_zoom()
+                .iter()
+                .map(|p| p.pane.pane_id())
+                .collect();
+
+            tab.set_layout_cycle(default_cycle());
+
+            for _ in 0..num_swaps {
+                tab.swap_to_next_layout();
+            }
+
+            let tree_ids: HashSet<PaneId> = tab
+                .iter_panes_ignoring_zoom()
+                .iter()
+                .map(|p| p.pane.pane_id())
+                .collect();
+            let stacked_ids: HashSet<PaneId> =
+                tab.all_stacked_pane_ids().into_iter().collect();
+            let all_ids: HashSet<PaneId> =
+                tree_ids.union(&stacked_ids).copied().collect();
+
+            prop_assert_eq!(
+                ids_before.len(),
+                all_ids.len(),
+                "pane count mismatch: before={}, after={}",
+                ids_before.len(),
+                all_ids.len()
+            );
+            for id in &ids_before {
+                prop_assert!(
+                    all_ids.contains(id),
+                    "pane {} lost during swap",
+                    id
+                );
+            }
+        }
+
+        /// Focus is always on a valid pane after any sequence of swaps.
+        #[test]
+        fn swap_layout_focus_always_valid(
+            num_panes in 1usize..6,
+            num_swaps in 1usize..8,
+        ) {
+            use crate::layout::default_cycle;
+
+            let (tab, _size) = make_tab_with_n_panes(num_panes);
+            tab.set_layout_cycle(default_cycle());
+
+            for _ in 0..num_swaps {
+                tab.swap_to_next_layout();
+            }
+
+            let active = tab.get_active_pane();
+            prop_assert!(
+                active.is_some(),
+                "Active pane should never be None after swap"
+            );
+        }
     }
 }

@@ -48,8 +48,14 @@
 #![allow(clippy::useless_conversion)]
 #![allow(clippy::useless_format)]
 #![allow(clippy::wildcard_in_or_patterns)]
+#[cfg(all(feature = "async-smol", feature = "async-asupersync"))]
+compile_error!(
+    "mux async runtime features are mutually exclusive; enable only one of \"async-smol\" or \"async-asupersync\""
+);
 #[cfg(not(any(feature = "async-smol", feature = "async-asupersync")))]
-compile_error!("mux requires either feature \"async-smol\" or \"async-asupersync\"");
+compile_error!(
+    "mux requires one async runtime feature: \"async-asupersync\" (preferred) or \"async-smol\""
+);
 
 use crate::client::{ClientId, ClientInfo};
 use crate::pane::{CachePolicy, Pane, PaneId};
@@ -92,6 +98,7 @@ pub mod client;
 pub mod connui;
 pub mod domain;
 pub mod events;
+pub mod layout;
 pub mod localpane;
 pub mod pane;
 pub mod renderable;
