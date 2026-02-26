@@ -444,6 +444,38 @@ impl ContentIndexingPipeline {
     }
 }
 
+// ============================================================================
+// Robot type conversions
+// ============================================================================
+
+impl From<&PaneWatermark> for crate::robot_types::PipelineWatermarkInfo {
+    fn from(wm: &PaneWatermark) -> Self {
+        Self {
+            pane_id: wm.pane_id,
+            last_indexed_at_ms: wm.last_indexed_at_ms,
+            total_docs_indexed: wm.total_docs_indexed,
+            session_id: wm.session_id.clone(),
+        }
+    }
+}
+
+impl From<&PipelineStatus> for crate::robot_types::SearchPipelineStatusData {
+    fn from(status: &PipelineStatus) -> Self {
+        Self {
+            state: match status.state {
+                PipelineState::Running => "running".to_string(),
+                PipelineState::Paused => "paused".to_string(),
+                PipelineState::Stopped => "stopped".to_string(),
+            },
+            watermarks: status.watermarks.iter().map(Into::into).collect(),
+            total_ticks: status.total_ticks,
+            total_docs_indexed: status.total_docs_indexed,
+            total_lines_consumed: status.total_lines_consumed,
+            index_stats: serde_json::to_value(&status.index_stats).ok(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,5 +906,39 @@ mod tests {
         let json = serde_json::to_string(&reason).unwrap();
         let reason2: PipelineSkipReason = serde_json::from_str(&json).unwrap();
         assert_eq!(reason, reason2);
+    }
+
+    #[test]
+    fn watermark_to_robot_type() {
+        let wm = PaneWatermark {
+            pane_id: 7,
+            last_indexed_at_ms: 5000,
+            total_docs_indexed: 25,
+            session_id: Some("sess-x".to_string()),
+        };
+        let info: crate::robot_types::PipelineWatermarkInfo = (&wm).into();
+        assert_eq!(info.pane_id, 7);
+        assert_eq!(info.last_indexed_at_ms, 5000);
+        assert_eq!(info.total_docs_indexed, 25);
+        assert_eq!(info.session_id.as_deref(), Some("sess-x"));
+    }
+
+    #[test]
+    fn pipeline_status_to_robot_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path());
+        let mut pipeline = ContentIndexingPipeline::new(test_config(), index);
+
+        let lines = make_lines(&["test data"], 1000, 100);
+        let panes = vec![(1u64, Some("sess-a".to_string()), lines)];
+        pipeline.tick(&panes, 2000, false, None);
+
+        let status = pipeline.status(3000);
+        let robot_status: crate::robot_types::SearchPipelineStatusData = (&status).into();
+
+        assert_eq!(robot_status.state, "running");
+        assert!(!robot_status.watermarks.is_empty());
+        assert!(robot_status.total_ticks >= 1);
+        assert!(robot_status.index_stats.is_some());
     }
 }

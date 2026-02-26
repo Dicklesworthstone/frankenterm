@@ -500,6 +500,156 @@ pub struct SearchIndexStatsData {
     pub last_error: Option<String>,
 }
 
+/// Per-result scoring breakdown for `ft robot search --explain`.
+///
+/// Provides full visibility into how each search result was scored across
+/// the multi-tier pipeline: lexical (BM25), semantic similarity, RRF fusion,
+/// and optional cross-encoder reranking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchScoringBreakdown {
+    /// BM25 lexical score (if lexical/hybrid mode).
+    #[serde(default)]
+    pub bm25_score: Option<f64>,
+    /// Matching terms from the lexical query (highlighted).
+    #[serde(default)]
+    pub matching_terms: Vec<String>,
+    /// Semantic cosine similarity score (if semantic/hybrid mode).
+    #[serde(default)]
+    pub semantic_similarity: Option<f64>,
+    /// Embedder tier that produced the semantic vector.
+    #[serde(default)]
+    pub embedder_tier: Option<String>,
+    /// Reciprocal Rank Fusion rank position (1-based).
+    #[serde(default)]
+    pub rrf_rank: Option<usize>,
+    /// RRF fused score.
+    #[serde(default)]
+    pub rrf_score: Option<f64>,
+    /// Cross-encoder reranker score (if quality tier completed).
+    #[serde(default)]
+    pub reranker_score: Option<f64>,
+    /// Final combined score used for ordering.
+    pub final_score: f64,
+}
+
+/// Extended search hit with per-result scoring explanation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplainedSearchHit {
+    /// Base search hit fields.
+    #[serde(flatten)]
+    pub hit: SearchHit,
+    /// Detailed scoring breakdown.
+    pub scoring: SearchScoringBreakdown,
+}
+
+/// Response data for `ft robot search --explain`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchExplainData {
+    pub query: String,
+    pub results: Vec<ExplainedSearchHit>,
+    pub total_hits: usize,
+    pub limit: usize,
+    #[serde(default)]
+    pub pane_filter: Option<u64>,
+    /// Search mode used.
+    pub mode: String,
+    /// Pipeline timing breakdown.
+    #[serde(default)]
+    pub timing: Option<SearchPipelineTiming>,
+    /// Two-tier metrics from the search pipeline.
+    #[serde(default)]
+    pub tier_metrics: Option<serde_json::Value>,
+}
+
+/// Timing breakdown for the search pipeline phases.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchPipelineTiming {
+    /// Total query time in microseconds.
+    pub total_us: u64,
+    /// Lexical retrieval time in microseconds.
+    #[serde(default)]
+    pub lexical_us: Option<u64>,
+    /// Semantic retrieval time in microseconds.
+    #[serde(default)]
+    pub semantic_us: Option<u64>,
+    /// RRF fusion time in microseconds.
+    #[serde(default)]
+    pub fusion_us: Option<u64>,
+    /// Reranking time in microseconds.
+    #[serde(default)]
+    pub rerank_us: Option<u64>,
+}
+
+/// Phase marker for streaming JSONL search output.
+///
+/// Emitted between result batches in `--format jsonl` to indicate
+/// which tier of the search pipeline produced the following results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SearchStreamPhase {
+    /// Fast tier results (hash embedder + BM25).
+    #[serde(rename = "phase_fast")]
+    Fast { result_count: usize },
+    /// Quality tier results (model2vec/fastembed + cross-encoder).
+    #[serde(rename = "phase_quality")]
+    Quality { result_count: usize },
+    /// Search complete.
+    #[serde(rename = "phase_done")]
+    Done {
+        total_results: usize,
+        total_us: u64,
+    },
+}
+
+/// Indexing pipeline status for `ft robot search-index pipeline`.
+///
+/// Extends `SearchIndexStatsData` with pipeline-level operational state
+/// from [`ContentIndexingPipeline`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchPipelineStatusData {
+    /// Pipeline lifecycle state (running, paused, stopped).
+    pub state: String,
+    /// Per-pane watermark info.
+    pub watermarks: Vec<PipelineWatermarkInfo>,
+    /// Total indexing ticks performed.
+    pub total_ticks: u64,
+    /// Total documents indexed across all panes.
+    pub total_docs_indexed: u64,
+    /// Total scrollback lines consumed across all panes.
+    pub total_lines_consumed: u64,
+    /// Index-level stats snapshot.
+    #[serde(default)]
+    pub index_stats: Option<serde_json::Value>,
+}
+
+/// Per-pane watermark info for pipeline status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineWatermarkInfo {
+    /// Pane identifier.
+    pub pane_id: u64,
+    /// Highest captured_at_ms value that has been indexed.
+    pub last_indexed_at_ms: i64,
+    /// Total documents indexed from this pane.
+    pub total_docs_indexed: u64,
+    /// Session ID associated with this pane.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Response for `ft robot search-index pause/resume/rebuild` control commands.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchPipelineControlResult {
+    /// The action that was performed.
+    pub action: String,
+    /// Whether the action succeeded.
+    pub success: bool,
+    /// Pipeline state after the action.
+    pub state_after: String,
+    /// Optional message providing context.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
 /// Response data for `ft robot events`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventsData {
@@ -2464,5 +2614,259 @@ mod tests {
         assert_eq!(info.status, "released");
         assert_eq!(info.released_at, Some(1700000030000));
         assert_eq!(info.owner_kind, "human");
+    }
+
+    // ========================================================================
+    // Search API types (ft-dr6zv.1.6)
+    // ========================================================================
+
+    #[test]
+    fn scoring_breakdown_full_roundtrip() {
+        let breakdown = SearchScoringBreakdown {
+            bm25_score: Some(8.42),
+            matching_terms: vec!["cargo".to_string(), "build".to_string()],
+            semantic_similarity: Some(0.87),
+            embedder_tier: Some("fastembed".to_string()),
+            rrf_rank: Some(3),
+            rrf_score: Some(0.0156),
+            reranker_score: Some(0.92),
+            final_score: 0.92,
+        };
+        let json = serde_json::to_string(&breakdown).unwrap();
+        let parsed: SearchScoringBreakdown = serde_json::from_str(&json).unwrap();
+        assert!((parsed.bm25_score.unwrap() - 8.42).abs() < 1e-10);
+        assert_eq!(parsed.matching_terms.len(), 2);
+        assert!((parsed.semantic_similarity.unwrap() - 0.87).abs() < 1e-10);
+        assert_eq!(parsed.embedder_tier.as_deref(), Some("fastembed"));
+        assert_eq!(parsed.rrf_rank, Some(3));
+        assert!((parsed.reranker_score.unwrap() - 0.92).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scoring_breakdown_minimal() {
+        let json = json!({ "final_score": 5.0 });
+        let parsed: SearchScoringBreakdown = serde_json::from_value(json).unwrap();
+        assert!((parsed.final_score - 5.0).abs() < 1e-10);
+        assert!(parsed.bm25_score.is_none());
+        assert!(parsed.matching_terms.is_empty());
+        assert!(parsed.semantic_similarity.is_none());
+        assert!(parsed.reranker_score.is_none());
+    }
+
+    #[test]
+    fn explained_search_hit_flattens_base_hit() {
+        let json = json!({
+            "segment_id": 100,
+            "pane_id": 5,
+            "seq": 42,
+            "captured_at": 1700000000000i64,
+            "score": 0.95,
+            "snippet": "$ >>cargo build<<",
+            "scoring": {
+                "bm25_score": 7.5,
+                "matching_terms": ["cargo"],
+                "final_score": 0.95
+            }
+        });
+        let hit: ExplainedSearchHit = serde_json::from_value(json).unwrap();
+        assert_eq!(hit.hit.segment_id, 100);
+        assert_eq!(hit.hit.pane_id, 5);
+        assert_eq!(hit.hit.snippet.as_deref(), Some("$ >>cargo build<<"));
+        assert!((hit.scoring.bm25_score.unwrap() - 7.5).abs() < 1e-10);
+        assert_eq!(hit.scoring.matching_terms, vec!["cargo"]);
+    }
+
+    #[test]
+    fn search_explain_data_roundtrip() {
+        let data = SearchExplainData {
+            query: "compile error".to_string(),
+            results: vec![],
+            total_hits: 0,
+            limit: 20,
+            pane_filter: Some(3),
+            mode: "hybrid".to_string(),
+            timing: Some(SearchPipelineTiming {
+                total_us: 1500,
+                lexical_us: Some(400),
+                semantic_us: Some(800),
+                fusion_us: Some(200),
+                rerank_us: Some(100),
+            }),
+            tier_metrics: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let parsed: SearchExplainData = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.query, "compile error");
+        assert_eq!(parsed.pane_filter, Some(3));
+        assert_eq!(parsed.mode, "hybrid");
+        let timing = parsed.timing.unwrap();
+        assert_eq!(timing.total_us, 1500);
+        assert_eq!(timing.lexical_us, Some(400));
+        assert_eq!(timing.semantic_us, Some(800));
+    }
+
+    #[test]
+    fn search_stream_phase_tags() {
+        let fast = SearchStreamPhase::Fast { result_count: 10 };
+        let json = serde_json::to_string(&fast).unwrap();
+        assert!(json.contains("\"type\":\"phase_fast\""));
+        let parsed: SearchStreamPhase = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SearchStreamPhase::Fast { result_count } => assert_eq!(result_count, 10),
+            _ => panic!("expected Fast variant"),
+        }
+
+        let quality = SearchStreamPhase::Quality { result_count: 5 };
+        let json = serde_json::to_string(&quality).unwrap();
+        assert!(json.contains("\"type\":\"phase_quality\""));
+
+        let done = SearchStreamPhase::Done {
+            total_results: 15,
+            total_us: 2500,
+        };
+        let json = serde_json::to_string(&done).unwrap();
+        assert!(json.contains("\"type\":\"phase_done\""));
+        let parsed: SearchStreamPhase = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SearchStreamPhase::Done {
+                total_results,
+                total_us,
+            } => {
+                assert_eq!(total_results, 15);
+                assert_eq!(total_us, 2500);
+            }
+            _ => panic!("expected Done variant"),
+        }
+    }
+
+    #[test]
+    fn pipeline_status_data_roundtrip() {
+        let status = SearchPipelineStatusData {
+            state: "running".to_string(),
+            watermarks: vec![
+                PipelineWatermarkInfo {
+                    pane_id: 1,
+                    last_indexed_at_ms: 1700000000000,
+                    total_docs_indexed: 42,
+                    session_id: Some("sess-a".to_string()),
+                },
+                PipelineWatermarkInfo {
+                    pane_id: 2,
+                    last_indexed_at_ms: 1700000005000,
+                    total_docs_indexed: 18,
+                    session_id: None,
+                },
+            ],
+            total_ticks: 100,
+            total_docs_indexed: 60,
+            total_lines_consumed: 3000,
+            index_stats: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: SearchPipelineStatusData = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.state, "running");
+        assert_eq!(parsed.watermarks.len(), 2);
+        assert_eq!(parsed.watermarks[0].pane_id, 1);
+        assert_eq!(parsed.watermarks[0].total_docs_indexed, 42);
+        assert_eq!(
+            parsed.watermarks[0].session_id.as_deref(),
+            Some("sess-a")
+        );
+        assert_eq!(parsed.total_ticks, 100);
+        assert_eq!(parsed.total_docs_indexed, 60);
+    }
+
+    #[test]
+    fn pipeline_control_result_roundtrip() {
+        let result = SearchPipelineControlResult {
+            action: "pause".to_string(),
+            success: true,
+            state_after: "paused".to_string(),
+            message: Some("Pipeline paused successfully".to_string()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: SearchPipelineControlResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.action, "pause");
+        assert!(parsed.success);
+        assert_eq!(parsed.state_after, "paused");
+        assert_eq!(
+            parsed.message.as_deref(),
+            Some("Pipeline paused successfully")
+        );
+    }
+
+    #[test]
+    fn pipeline_control_result_minimal() {
+        let json = json!({
+            "action": "resume",
+            "success": true,
+            "state_after": "running"
+        });
+        let parsed: SearchPipelineControlResult = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.action, "resume");
+        assert!(parsed.message.is_none());
+    }
+
+    #[test]
+    fn search_explain_in_robot_envelope() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "query": "error compiling",
+                "results": [{
+                    "segment_id": 1,
+                    "pane_id": 5,
+                    "seq": 10,
+                    "captured_at": 1700000000000i64,
+                    "score": 0.88,
+                    "scoring": {
+                        "bm25_score": 6.2,
+                        "matching_terms": ["error", "compiling"],
+                        "semantic_similarity": 0.85,
+                        "embedder_tier": "model2vec",
+                        "rrf_rank": 1,
+                        "rrf_score": 0.0167,
+                        "final_score": 0.88
+                    }
+                }],
+                "total_hits": 1,
+                "limit": 20,
+                "mode": "hybrid"
+            },
+            "elapsed_ms": 42,
+            "version": "0.1.0",
+            "now": 1700000000000u64
+        });
+        let resp: RobotResponse<SearchExplainData> = serde_json::from_value(json).unwrap();
+        assert!(resp.ok);
+        let data = resp.into_result().unwrap();
+        assert_eq!(data.results.len(), 1);
+        let hit = &data.results[0];
+        assert_eq!(hit.hit.pane_id, 5);
+        assert_eq!(hit.scoring.matching_terms.len(), 2);
+        assert_eq!(hit.scoring.embedder_tier.as_deref(), Some("model2vec"));
+    }
+
+    #[test]
+    fn pipeline_status_in_robot_envelope() {
+        let json = json!({
+            "ok": true,
+            "data": {
+                "state": "paused",
+                "watermarks": [],
+                "total_ticks": 0,
+                "total_docs_indexed": 0,
+                "total_lines_consumed": 0
+            },
+            "elapsed_ms": 1,
+            "version": "0.1.0",
+            "now": 0
+        });
+        let resp: RobotResponse<SearchPipelineStatusData> =
+            serde_json::from_value(json).unwrap();
+        assert!(resp.ok);
+        let data = resp.into_result().unwrap();
+        assert_eq!(data.state, "paused");
+        assert!(data.watermarks.is_empty());
     }
 }
