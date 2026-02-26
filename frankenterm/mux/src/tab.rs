@@ -4624,6 +4624,148 @@ mod test {
             prop_assert_eq!(size.cols, resized.cols);
             prop_assert_eq!(size.rows, resized.rows);
         }
+
+        /// Verify that collapsing and uncollapsing are consistent: after a
+        /// shrink + grow cycle, no pane remains spuriously collapsed.
+        #[test]
+        fn collapse_uncollapse_cycle_is_consistent(
+            target_cols in 10usize..60,
+        ) {
+            let initial_cols = 120usize;
+            let size = TerminalSize {
+                rows: 24,
+                cols: initial_cols,
+                pixel_width: initial_cols * 10,
+                pixel_height: 600,
+                dpi: 96,
+            };
+
+            let tab = Tab::new(&size);
+            tab.assign_pane(&FakePane::new_with_priority(
+                1,
+                size,
+                PaneConstraints {
+                    min_width: 20,
+                    min_height: 3,
+                    ..PaneConstraints::default()
+                },
+                CollapsePriority::Low,
+            ));
+            let split = tab
+                .compute_split_size(
+                    0,
+                    SplitRequest {
+                        direction: SplitDirection::Horizontal,
+                        ..Default::default()
+                    },
+                )
+                .expect("split");
+            tab.split_and_insert(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+                FakePane::new_with_priority(
+                    2,
+                    split.second,
+                    PaneConstraints {
+                        min_width: 20,
+                        min_height: 3,
+                        ..PaneConstraints::default()
+                    },
+                    CollapsePriority::Normal,
+                ),
+            )
+            .expect("insert");
+
+            // Shrink to target_cols
+            let small = TerminalSize {
+                rows: 24,
+                cols: target_cols,
+                pixel_width: target_cols * 10,
+                pixel_height: 600,
+                dpi: 96,
+            };
+            tab.resize(small);
+
+            // Grow back to original
+            tab.resize(size);
+
+            // After growing back, no pane should remain collapsed
+            prop_assert!(
+                tab.collapsed_pane_ids().is_empty(),
+                "all panes should be uncollapsed after growing back to original"
+            );
+        }
+
+        /// Verify that Never-priority panes are never found in the collapsed set
+        /// regardless of target size.
+        #[test]
+        fn never_priority_never_in_collapsed_set(
+            target_cols in 5usize..40,
+        ) {
+            let size = TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 800,
+                pixel_height: 600,
+                dpi: 96,
+            };
+
+            let tab = Tab::new(&size);
+            tab.assign_pane(&FakePane::new_with_priority(
+                1,
+                size,
+                PaneConstraints {
+                    min_width: 15,
+                    min_height: 3,
+                    ..PaneConstraints::default()
+                },
+                CollapsePriority::Low,
+            ));
+            let split = tab
+                .compute_split_size(
+                    0,
+                    SplitRequest {
+                        direction: SplitDirection::Horizontal,
+                        ..Default::default()
+                    },
+                )
+                .expect("split");
+            tab.split_and_insert(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Horizontal,
+                    ..Default::default()
+                },
+                FakePane::new_with_priority(
+                    2,
+                    split.second,
+                    PaneConstraints {
+                        min_width: 15,
+                        min_height: 3,
+                        ..PaneConstraints::default()
+                    },
+                    CollapsePriority::Never,
+                ),
+            )
+            .expect("insert");
+
+            let small = TerminalSize {
+                rows: 24,
+                cols: target_cols,
+                pixel_width: target_cols * 10,
+                pixel_height: 600,
+                dpi: 96,
+            };
+            tab.resize(small);
+
+            prop_assert!(
+                !tab.is_pane_collapsed(2),
+                "Never-priority pane must never be collapsed"
+            );
+        }
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {
