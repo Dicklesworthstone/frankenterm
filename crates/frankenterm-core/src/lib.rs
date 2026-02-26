@@ -397,6 +397,7 @@ pub mod rope;
 pub mod rulesets;
 pub mod runtime;
 pub mod runtime_compat;
+pub mod runtime_health;
 pub mod runtime_telemetry;
 pub mod scope_tree;
 pub mod scope_watchdog;
