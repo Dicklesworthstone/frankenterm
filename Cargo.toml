@@ -368,7 +368,7 @@ crossterm = "0.29.0"
 
 # FrankenTUI (optional, migration target for TUI — see docs/adr/0001-adopt-frankentui-for-tui-migration.md)
 # Git dep; use .cargo/config.toml for local path overrides during development.
-ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankentui", default-features = false, features = ["runtime"] }
+ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", default-features = false, features = ["runtime"] }
 
 # ZIP archives (for .ftx extension packages)
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -381,8 +381,8 @@ wasmtime-wasi = { version = "41", default-features = false, features = ["p1"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 # FastMCP (optional MCP server dependencies)
-asupersync = { version = "0.2.0" }
-asupersync-macros = { version = "0.2.0" }
+asupersync = { version = "0.2.6" }
+asupersync-macros = { version = "0.2.6" }
 rich_rust = { version = "0.2.0" }
 log = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
@@ -418,14 +418,14 @@ strip = true        # Remove debug symbols
 [patch.crates-io]
 # Pin git revs to avoid branch drift and to keep the dependency graph single-sourced.
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "f58a4e5e437aa564286729c0e2ec50b1e62c1f0e" }
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "c7c15f630caf9bd2c6b9f39feed6212d64986dfa" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "662710bf6f53b0300eb9e6bcf60e5cc93b0cac41" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "c7c15f630caf9bd2c6b9f39feed6212d64986dfa" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "662710bf6f53b0300eb9e6bcf60e5cc93b0cac41" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "f58a4e5e437aa564286729c0e2ec50b1e62c1f0e" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "c7c15f630caf9bd2c6b9f39feed6212d64986dfa" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "662710bf6f53b0300eb9e6bcf60e5cc93b0cac41" }
 
 [patch."https://github.com/Dicklesworthstone/frankensearch"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "c7c15f630caf9bd2c6b9f39feed6212d64986dfa" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "662710bf6f53b0300eb9e6bcf60e5cc93b0cac41" }
