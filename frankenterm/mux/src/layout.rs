@@ -474,12 +474,11 @@ fn build_tree_from_arrangement(
             if assigned.len() > 1 {
                 let stack = PaneStack::new(assigned.clone());
                 // Check if active pane is in this stack.
-                for (si, p) in assigned.iter().enumerate() {
+                for p in assigned {
                     if p.pane_id() == active_pane_id {
                         *active_leaf_index = leaf_idx;
                         break;
                     }
-                    let _ = si;
                 }
                 stacks.insert(idx, stack);
             }
