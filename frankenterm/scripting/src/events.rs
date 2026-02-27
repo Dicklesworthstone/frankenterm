@@ -131,13 +131,19 @@ impl EventBus {
         0
     }
 
+    /// Maximum number of unique event names tracked in fire_counts.
+    /// Prevents unbounded HashMap growth from dynamically-generated event names.
+    const MAX_FIRE_COUNT_ENTRIES: usize = 4096;
+
     /// Fire an event and collect all resulting actions.
     ///
     /// Hooks are executed in tier order, then priority order within each tier.
     pub fn fire(&self, event: &str, payload: &Value) -> Result<Vec<Action>> {
-        // Update fire count
+        // Update fire count (capped to prevent unbounded growth)
         if let Ok(mut counts) = self.fire_counts.lock() {
-            *counts.entry(event.to_string()).or_default() += 1;
+            if counts.contains_key(event) || counts.len() < Self::MAX_FIRE_COUNT_ENTRIES {
+                *counts.entry(event.to_string()).or_default() += 1;
+            }
         }
 
         // Collect matching hooks (sorted by tier then priority)
