@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::config as wa_config;
@@ -17,6 +18,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_READ_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_WRITE_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct DirectMuxClientConfig {
@@ -139,6 +141,7 @@ impl DirectMuxError {
 }
 
 pub struct DirectMuxClient {
+    connection_id: u64,
     stream: UnixStream,
     socket_path: PathBuf,
     read_buf: Vec<u8>,
@@ -151,6 +154,7 @@ pub struct DirectMuxClient {
 impl std::fmt::Debug for DirectMuxClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DirectMuxClient")
+            .field("connection_id", &self.connection_id)
             .field("socket_path", &self.socket_path)
             .field("serial", &self.serial)
             .field("pending_responses", &self.pending_responses.len())
@@ -167,6 +171,12 @@ impl DirectMuxClient {
         }
 
         let preferred_mode = resolve_compression_mode(config.compression_mode, &socket_path);
+        tracing::debug!(
+            socket_path = %socket_path.display(),
+            configured_compression_mode = ?config.compression_mode,
+            preferred_compression_mode = ?preferred_mode,
+            "connecting direct mux client"
+        );
         match Self::connect_with_mode(socket_path.clone(), config.clone(), preferred_mode).await {
             Ok(client) => Ok(client),
             Err(err)
@@ -176,6 +186,14 @@ impl DirectMuxClient {
                     &err,
                 ) =>
             {
+                tracing::warn!(
+                    socket_path = %socket_path.display(),
+                    preferred_compression_mode = ?preferred_mode,
+                    fallback_compression_mode = ?CompressionMode::Always,
+                    error_kind = ?err.protocol_error_kind(),
+                    error = %err,
+                    "retrying direct mux connection with compression fallback"
+                );
                 Self::connect_with_mode(socket_path, config, CompressionMode::Always).await
             }
             Err(err) => Err(err),
@@ -187,11 +205,13 @@ impl DirectMuxClient {
         config: DirectMuxClientConfig,
         compression_mode: CompressionMode,
     ) -> Result<Self, DirectMuxError> {
+        let connection_id = next_connection_id();
         let stream = timeout(config.connect_timeout, compat_unix::connect(&socket_path))
             .await
             .map_err(|_| DirectMuxError::ConnectTimeout(socket_path.clone()))??;
 
         let mut client = Self {
+            connection_id,
             stream,
             compression_mode,
             socket_path,
@@ -201,8 +221,38 @@ impl DirectMuxClient {
             config,
         };
 
-        client.verify_codec_version().await?;
-        client.register_client().await?;
+        if let Err(err) = client.verify_codec_version().await {
+            tracing::warn!(
+                connection_id = client.connection_id,
+                socket_path = %client.socket_path.display(),
+                phase = "codec_version_handshake",
+                error_kind = ?err.protocol_error_kind(),
+                error = %err,
+                "direct mux codec verification failed"
+            );
+            return Err(err);
+        }
+        if let Err(err) = client.register_client().await {
+            tracing::warn!(
+                connection_id = client.connection_id,
+                socket_path = %client.socket_path.display(),
+                phase = "register_client",
+                error_kind = ?err.protocol_error_kind(),
+                error = %err,
+                "direct mux client registration failed"
+            );
+            return Err(err);
+        }
+        tracing::debug!(
+            connection_id = client.connection_id,
+            socket_path = %client.socket_path.display(),
+            compression_mode = ?client.compression_mode,
+            connect_timeout_ms = duration_to_ms_u64(client.config.connect_timeout),
+            read_timeout_ms = duration_to_ms_u64(client.config.read_timeout),
+            write_timeout_ms = duration_to_ms_u64(client.config.write_timeout),
+            phase = "connected",
+            "direct mux client connected"
+        );
         Ok(client)
     }
 
@@ -411,6 +461,14 @@ impl DirectMuxClient {
             return Ok(Vec::new());
         }
 
+        tracing::trace!(
+            connection_id = self.connection_id,
+            request_count = requests.len(),
+            max_pipeline_depth,
+            phase = "batch_start",
+            "starting mux request batch"
+        );
+
         if max_pipeline_depth <= 1 {
             let mut responses = Vec::with_capacity(requests.len());
             for request in requests {
@@ -451,6 +509,13 @@ impl DirectMuxClient {
                 DirectMuxError::Codec("pipeline batch completed with missing response".to_string())
             })?);
         }
+        tracing::trace!(
+            connection_id = self.connection_id,
+            response_count = ordered.len(),
+            max_pipeline_depth,
+            phase = "batch_complete",
+            "mux request batch completed"
+        );
         Ok(ordered)
     }
 
@@ -461,17 +526,66 @@ impl DirectMuxClient {
 
     async fn send_request_only(&mut self, pdu: Pdu) -> Result<u64, DirectMuxError> {
         let serial = next_request_serial(&mut self.serial)?;
+        let pdu_name = pdu.pdu_name();
         let mut buf = Vec::new();
+        tracing::trace!(
+            connection_id = self.connection_id,
+            request_serial = serial,
+            request_pdu = pdu_name,
+            phase = "encode",
+            compression_mode = ?self.compression_mode,
+            "encoding mux request"
+        );
         pdu.encode_with_mode(&mut buf, serial, self.compression_mode)
             .map_err(|err| DirectMuxError::Codec(err.to_string()))?;
-        timeout(self.config.write_timeout, self.stream.write_all(&buf))
-            .await
-            .map_err(|_| DirectMuxError::WriteTimeout)??;
+        let encoded_len = buf.len();
+        match timeout(self.config.write_timeout, self.stream.write_all(&buf)).await {
+            Ok(Ok(())) => {
+                tracing::trace!(
+                    connection_id = self.connection_id,
+                    request_serial = serial,
+                    request_pdu = pdu_name,
+                    encoded_bytes = encoded_len,
+                    phase = "write_complete",
+                    "mux request write completed"
+                );
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    connection_id = self.connection_id,
+                    request_serial = serial,
+                    request_pdu = pdu_name,
+                    encoded_bytes = encoded_len,
+                    phase = "write_error",
+                    error = %err,
+                    "mux request write failed"
+                );
+                return Err(DirectMuxError::Io(err));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    connection_id = self.connection_id,
+                    request_serial = serial,
+                    request_pdu = pdu_name,
+                    encoded_bytes = encoded_len,
+                    timeout_ms = duration_to_ms_u64(self.config.write_timeout),
+                    phase = "write_timeout",
+                    "mux request write timed out"
+                );
+                return Err(DirectMuxError::WriteTimeout);
+            }
+        }
         Ok(serial)
     }
 
     async fn await_response(&mut self, serial: u64) -> Result<Pdu, DirectMuxError> {
         if let Some(pending) = self.pending_responses.remove(&serial) {
+            tracing::trace!(
+                connection_id = self.connection_id,
+                request_serial = serial,
+                phase = "response_pending_hit",
+                "served mux response from pending map"
+            );
             return Self::response_from_pdu(pending);
         }
         loop {
@@ -479,6 +593,13 @@ impl DirectMuxClient {
             if decoded.serial == serial {
                 return Self::response_from_pdu(decoded.pdu);
             }
+            tracing::trace!(
+                connection_id = self.connection_id,
+                request_serial = serial,
+                response_serial = decoded.serial,
+                phase = "response_out_of_order",
+                "stashing out-of-order mux response"
+            );
             self.stash_pending_response(decoded.serial, decoded.pdu)?;
         }
     }
@@ -492,6 +613,12 @@ impl DirectMuxClient {
 
     fn stash_pending_response(&mut self, serial: u64, pdu: Pdu) -> Result<(), DirectMuxError> {
         if self.pending_responses.insert(serial, pdu).is_some() {
+            tracing::warn!(
+                connection_id = self.connection_id,
+                duplicate_serial = serial,
+                phase = "stash_pending_response",
+                "duplicate mux response serial observed"
+            );
             return Err(DirectMuxError::UnexpectedResponse {
                 expected: "unique serial".to_string(),
                 got: format!("duplicate response serial {serial}"),
@@ -505,27 +632,70 @@ impl DirectMuxClient {
             if let Some(decoded) =
                 decode_from_buffer(&mut self.read_buf, self.config.max_frame_bytes)?
             {
+                tracing::trace!(
+                    connection_id = self.connection_id,
+                    response_serial = decoded.serial,
+                    response_pdu = decoded.pdu.pdu_name(),
+                    phase = "decode_buffered_pdu",
+                    "decoded mux response from buffered bytes"
+                );
                 return Ok(decoded);
             }
 
             let mut temp = vec![0u8; 4096];
-            let read = timeout(
+            let read = match timeout(
                 self.config.read_timeout,
                 unix_stream_read(&mut self.stream, &mut temp),
             )
             .await
-            .map_err(|_| DirectMuxError::ReadTimeout)??;
+            {
+                Ok(Ok(read)) => read,
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        connection_id = self.connection_id,
+                        phase = "read_io_error",
+                        error = %err,
+                        "mux response read failed"
+                    );
+                    return Err(DirectMuxError::Io(err));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        connection_id = self.connection_id,
+                        timeout_ms = duration_to_ms_u64(self.config.read_timeout),
+                        phase = "read_timeout",
+                        "mux response read timed out"
+                    );
+                    return Err(DirectMuxError::ReadTimeout);
+                }
+            };
             if read == 0 {
+                tracing::debug!(
+                    connection_id = self.connection_id,
+                    phase = "read_eof",
+                    "mux socket disconnected during response read"
+                );
                 return Err(DirectMuxError::Disconnected);
             }
             self.read_buf.extend_from_slice(&temp[..read]);
             if self.read_buf.len() > self.config.max_frame_bytes {
+                tracing::warn!(
+                    connection_id = self.connection_id,
+                    buffered_bytes = self.read_buf.len(),
+                    max_frame_bytes = self.config.max_frame_bytes,
+                    phase = "frame_too_large",
+                    "mux response frame exceeded configured max size"
+                );
                 return Err(DirectMuxError::FrameTooLarge {
                     max_bytes: self.config.max_frame_bytes,
                 });
             }
         }
     }
+}
+
+fn next_connection_id() -> u64 {
+    NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 fn next_request_serial(serial: &mut u64) -> Result<u64, DirectMuxError> {
@@ -944,7 +1114,7 @@ fn bonus_lines_to_text(lines: codec::SerializedLines) -> String {
 mod tests {
     use super::*;
     use crate::runtime_compat::unix as compat_unix;
-    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder, sleep};
+    use crate::runtime_compat::{CompatRuntime, Mutex, RuntimeBuilder, sleep};
     use proptest::prelude::*;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -1463,7 +1633,7 @@ mod tests {
             });
 
             let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-            let client = Arc::new(tokio::sync::Mutex::new(
+            let client = Arc::new(Mutex::new(
                 DirectMuxClient::connect(config).await.expect("connect"),
             ));
             let pane_ids = vec![11_u64, 22, 33, 44, 55];
