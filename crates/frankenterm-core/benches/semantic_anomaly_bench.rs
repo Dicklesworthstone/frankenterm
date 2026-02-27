@@ -24,7 +24,7 @@ fn bench_dot_product(c: &mut Criterion) {
 
     for &dim in &[8, 64, 128, 384, 768] {
         let a: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.01).collect();
-        let b: Vec<f32> = (0..dim).map(|i| 1.0 - (i as f32) * 0.005).collect();
+        let b: Vec<f32> = (0..dim).map(|i| (i as f32).mul_add(-0.005, 1.0)).collect();
 
         group.bench_with_input(BenchmarkId::new("dim", dim), &dim, |bench, _| {
             bench.iter(|| dot_product_simd(&a, &b));
@@ -129,7 +129,15 @@ fn bench_conformal_observe(c: &mut Criterion) {
 
         // Create a slightly different vector for each iteration.
         let test_vec: Vec<f32> = (0..dim)
-            .map(|i| if i == 0 { 0.98 } else if i == 1 { 0.02 } else { 0.0 })
+            .map(|i| {
+                if i == 0 {
+                    0.98
+                } else if i == 1 {
+                    0.02
+                } else {
+                    0.0
+                }
+            })
             .collect();
 
         group.bench_with_input(BenchmarkId::new("dim", dim), &dim, |bench, _| {
@@ -157,7 +165,15 @@ fn bench_zscore_observe(c: &mut Criterion) {
         }
 
         let test_vec: Vec<f32> = (0..dim)
-            .map(|i| if i == 0 { 0.98 } else if i == 1 { 0.02 } else { 0.0 })
+            .map(|i| {
+                if i == 0 {
+                    0.98
+                } else if i == 1 {
+                    0.02
+                } else {
+                    0.0
+                }
+            })
             .collect();
 
         group.bench_with_input(BenchmarkId::new("dim", dim), &dim, |bench, _| {

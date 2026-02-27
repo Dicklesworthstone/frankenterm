@@ -66,7 +66,7 @@ fn arb_assignment_set() -> impl Strategy<Value = AssignmentSet> {
             .map(|&id| Assignment {
                 bead_id: format!("b{id}"),
                 agent_id: format!("a{}", id % 5),
-                score: 0.5 + (id as f64 * 0.01),
+                score: (id as f64).mul_add(0.01, 0.5),
                 rank: id,
             })
             .collect();

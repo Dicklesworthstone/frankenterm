@@ -162,7 +162,7 @@ fn representative_payloads() -> Vec<SerializationPayload> {
                         "pane_id": i % 16,
                         "seq": i * 5,
                         "captured_at": 1_700_000_000_000_i64 + i,
-                        "score": 0.99_f64 - (i as f64 * 0.001),
+                        "score": (i as f64).mul_add(-0.001, 0.99_f64),
                         "snippet": format!("build-{i}: warning: retry budget nearly exhausted"),
                     }))
                     .collect::<Vec<_>>()

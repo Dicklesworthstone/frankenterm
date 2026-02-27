@@ -27,9 +27,9 @@ use std::time::Instant;
 use crate::beads_types::{BeadIssueDetail, BeadReadinessReport};
 use crate::plan::MissionAgentCapabilityProfile;
 use crate::planner_features::{
-    extract_planner_features, score_candidates, solve_assignments, Assignment, AssignmentSet,
-    PlannerExtractionConfig, PlannerExtractionContext, PlannerExtractionReport,
-    RejectedCandidate, RejectionReason, ScorerConfig, ScorerInput, ScorerReport, SolverConfig,
+    Assignment, AssignmentSet, PlannerExtractionConfig, PlannerExtractionContext,
+    PlannerExtractionReport, RejectedCandidate, RejectionReason, ScorerConfig, ScorerInput,
+    ScorerReport, SolverConfig, extract_planner_features, score_candidates, solve_assignments,
 };
 
 // ── Loop state ──────────────────────────────────────────────────────────────
@@ -876,7 +876,9 @@ impl MissionLoop {
             self.state.metrics_history.remove(0);
         }
         self.state.metrics_history.push(sample);
-        self.state.previous_ready_ids.clone_from(&readiness.ready_ids);
+        self.state
+            .previous_ready_ids
+            .clone_from(&readiness.ready_ids);
         self.state.previous_assignment_by_bead = current_assignment_by_bead;
     }
 
@@ -1053,12 +1055,7 @@ impl MissionLoop {
 
                 let overlapping: Vec<String> = assignment_paths
                     .iter()
-                    .filter(|p| {
-                        reservation
-                            .paths
-                            .iter()
-                            .any(|rp| paths_overlap(p, rp))
-                    })
+                    .filter(|p| reservation.paths.iter().any(|rp| paths_overlap(p, rp)))
                     .cloned()
                     .collect();
 
@@ -1131,7 +1128,11 @@ impl MissionLoop {
             // Auto-resolve: highest score wins.
             let winner = bead_agents
                 .iter()
-                .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| {
+                    a.score
+                        .partial_cmp(&b.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .unwrap();
             let losers: Vec<&str> = bead_agents
                 .iter()
@@ -1215,10 +1216,7 @@ impl MissionLoop {
                 conflicts.push(AssignmentConflict {
                     conflict_id,
                     conflict_type: ConflictType::ActiveClaimCollision,
-                    involved_agents: vec![
-                        assignment.agent_id.clone(),
-                        existing.agent_id.clone(),
-                    ],
+                    involved_agents: vec![assignment.agent_id.clone(), existing.agent_id.clone()],
                     involved_beads: vec![assignment.bead_id.clone()],
                     conflicting_paths: Vec::new(),
                     detected_at_ms: current_ms,
@@ -2160,11 +2158,7 @@ mod tests {
         }
     }
 
-    fn make_reservation(
-        holder: &str,
-        paths: &[&str],
-        bead_id: Option<&str>,
-    ) -> KnownReservation {
+    fn make_reservation(holder: &str, paths: &[&str], bead_id: Option<&str>) -> KnownReservation {
         KnownReservation {
             holder: holder.to_string(),
             paths: paths.iter().map(|p| p.to_string()).collect(),
@@ -2233,15 +2227,21 @@ mod tests {
         );
         assert_eq!(report.conflicts[0].reason_code, "reservation_overlap");
         assert_eq!(report.conflicts[0].error_code, "FTM2001");
-        assert!(report.conflicts[0]
-            .conflicting_paths
-            .contains(&"src/plan.rs".to_string()));
-        assert!(report.conflicts[0]
-            .involved_agents
-            .contains(&"agent1".to_string()));
-        assert!(report.conflicts[0]
-            .involved_agents
-            .contains(&"agent2".to_string()));
+        assert!(
+            report.conflicts[0]
+                .conflicting_paths
+                .contains(&"src/plan.rs".to_string())
+        );
+        assert!(
+            report.conflicts[0]
+                .involved_agents
+                .contains(&"agent1".to_string())
+        );
+        assert!(
+            report.conflicts[0]
+                .involved_agents
+                .contains(&"agent2".to_string())
+        );
     }
 
     #[test]
@@ -2379,7 +2379,11 @@ mod tests {
         assert!(!report.messages.is_empty());
         // Each conflict sends to all involved agents.
         assert_eq!(report.messages.len(), 2); // 1 conflict × 2 agents
-        let recipients: Vec<&str> = report.messages.iter().map(|m| m.recipient.as_str()).collect();
+        let recipients: Vec<&str> = report
+            .messages
+            .iter()
+            .map(|m| m.recipient.as_str())
+            .collect();
         assert!(recipients.contains(&"agent1"));
         assert!(recipients.contains(&"agent2"));
     }
@@ -2761,10 +2765,7 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let back: ConflictDetectionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.enabled, config.enabled);
-        assert_eq!(
-            back.max_conflicts_per_cycle,
-            config.max_conflicts_per_cycle
-        );
+        assert_eq!(back.max_conflicts_per_cycle, config.max_conflicts_per_cycle);
         assert_eq!(back.strategy, config.strategy);
         assert_eq!(back.generate_messages, config.generate_messages);
     }
@@ -2839,10 +2840,12 @@ mod tests {
         let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
         // Two conflicts: agent2 vs winner and agent3 vs winner.
         assert_eq!(report.conflicts.len(), 2);
-        assert!(report
-            .conflicts
-            .iter()
-            .all(|c| c.conflict_type == ConflictType::ConcurrentBeadClaim));
+        assert!(
+            report
+                .conflicts
+                .iter()
+                .all(|c| c.conflict_type == ConflictType::ConcurrentBeadClaim)
+        );
     }
 
     #[test]

@@ -154,7 +154,7 @@ fn bench_diff_1000_divergences(c: &mut Criterion) {
     group.bench_function("diff_1000_divergences", |b| {
         b.iter_batched(
             || (),
-            |_| {
+            |()| {
                 let divergences = run_diff_benchmark();
                 black_box(divergences);
             },

@@ -15,13 +15,13 @@
 use std::collections::HashMap;
 
 use frankenterm_core::event_id::{RecorderMergeKey, StreamKind};
-use frankenterm_core::recording::{
-    RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
-    RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
-    RECORDER_EVENT_SCHEMA_VERSION_V1,
-};
+use frankenterm_core::policy::ActionKind;
 use frankenterm_core::recorder_replay::{
     ReplayConfig, ReplayEquivalenceLevel, ReplayScheduler, VirtualClock, VirtualClockSnapshot,
+};
+use frankenterm_core::recording::{
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
+    RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
 use frankenterm_core::replay_merge::{
     ClockAnomalyAnnotation, MergeConfig, MergeEvent, MergeEventPayload, PaneMergeResolver,
@@ -29,13 +29,12 @@ use frankenterm_core::replay_merge::{
 use frankenterm_core::replay_provenance::{
     AuditEntryParams, DecisionExplanationTrace, DecisionType, ExplanationLink,
     ExplanationTraceCollector, ProvenanceConfig, ProvenanceRecordParams, ProvenanceVerbosity,
-    ReplayAuditTrail, ReplayProvenanceEmitter, REPLAY_AUDIT_GENESIS,
+    REPLAY_AUDIT_GENESIS, ReplayAuditTrail, ReplayProvenanceEmitter,
 };
 use frankenterm_core::replay_side_effect_barrier::{
     CounterfactualBarrier, EffectRequest, EffectType, LiveBarrier, OverrideRule, ReplayBarrier,
     SideEffectBarrier, SideEffectLog,
 };
-use frankenterm_core::policy::ActionKind;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -96,11 +95,7 @@ fn make_merge_event(
     }
 }
 
-fn make_effect_request(
-    effect_type: EffectType,
-    pane_id: u64,
-    payload: &str,
-) -> EffectRequest {
+fn make_effect_request(effect_type: EffectType, pane_id: u64, payload: &str) -> EffectRequest {
     EffectRequest {
         timestamp_ms: 1000,
         effect_type,
@@ -540,7 +535,10 @@ fn i14_deterministic_replay_decision_ids() {
     let run1 = collect_ids(events.clone());
     let run2 = collect_ids(events);
 
-    assert_eq!(run1, run2, "identical input must produce identical decision IDs");
+    assert_eq!(
+        run1, run2,
+        "identical input must produce identical decision IDs"
+    );
 }
 
 // ── I-15: Pane filter restricts replay scope ─────────────────────────────
@@ -572,13 +570,14 @@ fn i15_pane_filter_restricts_scope() {
 fn i16_merge_stats_consistency() {
     let mut resolver = PaneMergeResolver::with_defaults();
 
-    resolver.add_pane_stream(1, vec![
-        make_merge_event(1000, 1, 0, "ingress_text"),
-        make_merge_event(2000, 1, 1, "ingress_text"),
-    ]);
-    resolver.add_pane_stream(2, vec![
-        make_merge_event(1500, 2, 0, "ingress_text"),
-    ]);
+    resolver.add_pane_stream(
+        1,
+        vec![
+            make_merge_event(1000, 1, 0, "ingress_text"),
+            make_merge_event(2000, 1, 1, "ingress_text"),
+        ],
+    );
+    resolver.add_pane_stream(2, vec![make_merge_event(1500, 2, 0, "ingress_text")]);
 
     // pane_count is tracked before merge (merge drains pane_streams)
     assert_eq!(resolver.pane_count(), 2);
@@ -696,7 +695,10 @@ fn i20_equivalence_levels() {
         while scheduler.next_step().is_some() {
             count += 1;
         }
-        assert_eq!(count, 2, "all events should replay at every equivalence level");
+        assert_eq!(
+            count, 2,
+            "all events should replay at every equivalence level"
+        );
     }
 }
 
@@ -818,8 +820,7 @@ fn i24_full_pipeline_end_to_end() {
 
     // 3. Schedule replay with provenance tracking
     let emitter = ReplayProvenanceEmitter::with_defaults("run-pipeline".to_string());
-    let mut scheduler =
-        ReplayScheduler::new(recorder_events, ReplayConfig::instant()).unwrap();
+    let mut scheduler = ReplayScheduler::new(recorder_events, ReplayConfig::instant()).unwrap();
 
     let barrier = ReplayBarrier::new();
     let mut decision_count = 0u64;
@@ -833,7 +834,10 @@ fn i24_full_pipeline_end_to_end() {
             decision_type: DecisionType::MergeReorder,
             rule_id: format!("merge-{}", step.cursor),
             definition_hash: "pipeline-hash".to_string(),
-            output_summary: format!("pane={} ts={}", step.merge_pane_id, step.merge_recorded_at_ms),
+            output_summary: format!(
+                "pane={} ts={}",
+                step.merge_pane_id, step.merge_recorded_at_ms
+            ),
             wall_clock_ms: step.merge_recorded_at_ms,
             virtual_clock_ms: step.clock.occurred_at_ms,
             input_data: serde_json::json!({"cursor": step.cursor}),

@@ -543,10 +543,12 @@ mod tests {
             ..CompilerConfig::default()
         };
         let plan = compile_tx_plan("p1", &assignments, &config);
-        assert!(plan.steps[0]
-            .preconditions
-            .iter()
-            .any(|p| p.kind == PreconditionKind::PolicyApproved));
+        assert!(
+            plan.steps[0]
+                .preconditions
+                .iter()
+                .any(|p| p.kind == PreconditionKind::PolicyApproved)
+        );
     }
 
     #[test]
@@ -557,10 +559,12 @@ mod tests {
             ..CompilerConfig::default()
         };
         let plan = compile_tx_plan("p1", &assignments, &config);
-        assert!(!plan.steps[0]
-            .preconditions
-            .iter()
-            .any(|p| p.kind == PreconditionKind::PolicyApproved));
+        assert!(
+            !plan.steps[0]
+                .preconditions
+                .iter()
+                .any(|p| p.kind == PreconditionKind::PolicyApproved)
+        );
     }
 
     #[test]
@@ -571,10 +575,14 @@ mod tests {
             ..CompilerConfig::default()
         };
         let plan = compile_tx_plan("p1", &assignments, &config);
-        let has_freshness = plan.steps[0].preconditions.iter().any(|p| {
-            matches!(p.kind, PreconditionKind::ContextFresh { .. })
-        });
-        assert!(has_freshness, "Low-score step should require context freshness");
+        let has_freshness = plan.steps[0]
+            .preconditions
+            .iter()
+            .any(|p| matches!(p.kind, PreconditionKind::ContextFresh { .. }));
+        assert!(
+            has_freshness,
+            "Low-score step should require context freshness"
+        );
     }
 
     #[test]
@@ -582,9 +590,10 @@ mod tests {
         let assignments = vec![assignment("b1", "a1", 0.9)];
         let config = CompilerConfig::default();
         let plan = compile_tx_plan("p1", &assignments, &config);
-        let has_freshness = plan.steps[0].preconditions.iter().any(|p| {
-            matches!(p.kind, PreconditionKind::ContextFresh { .. })
-        });
+        let has_freshness = plan.steps[0]
+            .preconditions
+            .iter()
+            .any(|p| matches!(p.kind, PreconditionKind::ContextFresh { .. }));
         assert!(
             !has_freshness,
             "High-score step should not require context freshness"
@@ -656,10 +665,7 @@ mod tests {
 
     #[test]
     fn compile_risk_summary_all_low() {
-        let assignments = vec![
-            assignment("b1", "a1", 0.9),
-            assignment("b2", "a2", 0.8),
-        ];
+        let assignments = vec![assignment("b1", "a1", 0.9), assignment("b2", "a2", 0.8)];
         let plan = compile_tx_plan("p1", &assignments, &CompilerConfig::default());
         assert_eq!(plan.risk_summary.total_steps, 2);
         assert_eq!(plan.risk_summary.high_risk_count, 0);

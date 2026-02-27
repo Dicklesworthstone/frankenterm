@@ -1,9 +1,9 @@
 #![cfg(all(feature = "mcp", feature = "mcp-client"))]
 
 mod mcp_test_framework {
-    pub(crate) use fastmcp::Content as FrameworkContent;
-    pub(crate) use fastmcp::memory::create_memory_transport_pair as framework_create_memory_transport_pair;
-    pub(crate) use fastmcp::testing::TestClient as FrameworkTestClient;
+    pub use fastmcp::Content as FrameworkContent;
+    pub use fastmcp::memory::create_memory_transport_pair as framework_create_memory_transport_pair;
+    pub use fastmcp::testing::TestClient as FrameworkTestClient;
 }
 
 use frankenterm_core::config::Config;
@@ -11,11 +11,13 @@ use frankenterm_core::mcp::build_server_with_db;
 use mcp_test_framework::{
     FrameworkContent, FrameworkTestClient, framework_create_memory_transport_pair,
 };
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 fn init_test_logging() {
@@ -162,6 +164,36 @@ fn make_proxy_config(discovery_path: &Path, server_name: &str) -> Config {
     config
 }
 
+fn wait_for_proxy_audit_row(db_path: &Path, action_kind: &str) -> (String, String) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let conn = Connection::open(db_path).expect("open audit db");
+        let mut stmt = conn
+            .prepare(
+                "SELECT COALESCE(input_summary, ''), result
+                 FROM audit_actions
+                 WHERE action_kind = ?1
+                 ORDER BY id DESC
+                 LIMIT 1",
+            )
+            .expect("prepare audit query");
+        let row = stmt
+            .query_row([action_kind], |row| {
+                let input_summary = row.get::<_, String>(0)?;
+                let result = row.get::<_, String>(1)?;
+                Ok((input_summary, result))
+            })
+            .optional()
+            .expect("query audit row");
+
+        if let Some(found) = row {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for audit action {action_kind}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn proxy_mounts_remote_tools_with_prefixed_routes() {
     init_test_logging();
@@ -218,7 +250,7 @@ fn proxy_routes_calls_to_remote_tools() {
 
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        let _ = server.run_transport(server_transport);
+        server.run_transport(server_transport);
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -233,6 +265,60 @@ fn proxy_routes_calls_to_remote_tools() {
         reply.first(),
         Some(FrameworkContent::Text { text }) if text == "proxy-route-check"
     ));
+}
+
+#[test]
+fn proxy_routes_remote_calls_with_audit_traceability() {
+    init_test_logging();
+    if !python3_available() {
+        eprintln!("Skipping proxy audit test: python3 is not available");
+        return;
+    }
+
+    let temp_dir = tempdir().expect("temp dir");
+    let script_path = write_mock_proxy_server_script(temp_dir.path());
+    let discovery_path = write_discovery_config(
+        temp_dir.path(),
+        "mock",
+        "python3",
+        &["-u".to_string(), script_path.display().to_string()],
+    );
+    let config = make_proxy_config(&discovery_path, "mock");
+    let db_path = temp_dir.path().join("mcp_proxy_audit.sqlite3");
+    let server =
+        build_server_with_db(&config, Some(db_path.clone())).expect("build proxy-enabled server");
+
+    let (client_transport, server_transport) = framework_create_memory_transport_pair();
+    std::thread::spawn(move || {
+        server.run_transport(server_transport);
+    });
+
+    let mut client = FrameworkTestClient::new(client_transport);
+    client.initialize().expect("initialize in-memory client");
+
+    let secret_payload = "audit-secret-value";
+    let reply = client
+        .call_tool("remote/mock/echo", json!({"text": secret_payload}))
+        .expect("invoke proxied remote tool");
+    assert!(matches!(
+        reply.first(),
+        Some(FrameworkContent::Text { text }) if text == secret_payload
+    ));
+
+    let (input_summary, result) = wait_for_proxy_audit_row(&db_path, "mcp.remote/mock/echo");
+    assert_eq!(result, "success");
+    assert!(
+        input_summary.contains("mcp:remote/mock/echo"),
+        "expected tool marker in input summary: {input_summary}"
+    );
+    assert!(
+        input_summary.contains("keys=[text]"),
+        "expected redacted key list in input summary: {input_summary}"
+    );
+    assert!(
+        !input_summary.contains(secret_payload),
+        "secret payload should be redacted from audit summary: {input_summary}"
+    );
 }
 
 #[test]

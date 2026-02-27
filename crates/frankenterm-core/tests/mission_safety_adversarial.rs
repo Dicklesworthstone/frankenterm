@@ -96,11 +96,7 @@ fn adv_01_envelope_at_exact_cap_allows_all() {
         },
         ..MissionLoopConfig::default()
     });
-    let issues = vec![
-        issue("a", 0, &[]),
-        issue("b", 1, &[]),
-        issue("c", 2, &[]),
-    ];
+    let issues = vec![issue("a", 0, &[]), issue("b", 1, &[]), issue("c", 2, &[])];
     let agents = vec![
         MissionAgentCapabilityProfile {
             agent_id: "a1".to_string(),
@@ -132,17 +128,13 @@ fn adv_01_envelope_at_exact_cap_allows_all() {
     // With 3 beads, 3 agents, and cap=3, all should pass.
     assert_eq!(decision.assignment_set.assignment_count(), 3);
     // No envelope rejections.
-    let envelope_rejections: Vec<_> = decision
-        .assignment_set
-        .rejected
-        .iter()
-        .filter(|r| {
+    assert!(
+        !decision.assignment_set.rejected.iter().any(|r| {
             r.reasons
                 .iter()
                 .any(|reason| matches!(reason, RejectionReason::SafetyGateDenied { .. }))
         })
-        .collect();
-    assert!(envelope_rejections.is_empty());
+    );
 }
 
 // ── ADV-02: Safety envelope — one over cap rejects exactly one ──────────────
@@ -158,11 +150,7 @@ fn adv_02_envelope_one_over_cap_rejects_one() {
         },
         ..MissionLoopConfig::default()
     });
-    let issues = vec![
-        issue("a", 0, &[]),
-        issue("b", 1, &[]),
-        issue("c", 2, &[]),
-    ];
+    let issues = vec![issue("a", 0, &[]), issue("b", 1, &[]), issue("c", 2, &[])];
     let agents: Vec<MissionAgentCapabilityProfile> = (0..3)
         .map(|i| MissionAgentCapabilityProfile {
             agent_id: format!("a{}", i),
@@ -176,7 +164,7 @@ fn adv_02_envelope_one_over_cap_rejects_one() {
     let ctx = PlannerExtractionContext::default();
     let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
     assert_eq!(decision.assignment_set.assignment_count(), 2);
-    let cap_rejections: Vec<_> = decision
+    let cap_rejection_count = decision
         .assignment_set
         .rejected
         .iter()
@@ -189,8 +177,8 @@ fn adv_02_envelope_one_over_cap_rejects_one() {
                 )
             })
         })
-        .collect();
-    assert_eq!(cap_rejections.len(), 1);
+        .count();
+    assert_eq!(cap_rejection_count, 1);
 }
 
 // ── ADV-03: Safety envelope — risky label case insensitivity ────────────────
@@ -287,12 +275,12 @@ fn adv_05_all_conflict_types_in_single_cycle() {
     let aset = assignment_set(vec![
         assignment("a", "agent1", 1.0),
         assignment("b", "agent3", 0.8),
-        assignment("b", "agent4", 0.3),  // concurrent claim on "b"
-        assignment("c", "agent5", 0.5),  // collides with active claim
+        assignment("b", "agent4", 0.3), // concurrent claim on "b"
+        assignment("c", "agent5", 0.5), // collides with active claim
     ]);
     let reservations = vec![
         reservation("agent1", &["src/plan.rs"], Some("a")),
-        reservation("agent2", &["src/plan.rs"], Some("x")),  // overlaps with agent1
+        reservation("agent2", &["src/plan.rs"], Some("x")), // overlaps with agent1
     ];
     let active = vec![active_claim("c", "agent6")];
     let issues = vec![
@@ -340,8 +328,8 @@ fn adv_06_conflict_flood_bounded() {
 #[test]
 fn adv_07_strategy_affects_winner() {
     let issues = vec![
-        issue("a", 0, &[]),  // higher priority
-        issue("b", 2, &[]),  // lower priority
+        issue("a", 0, &[]), // higher priority
+        issue("b", 2, &[]), // lower priority
     ];
 
     // PriorityWins: agent1 (bead "a", P0) wins.
@@ -421,7 +409,11 @@ fn adv_08_deconfliction_messages_route_correctly() {
     // Each conflict sends to 2 agents → 4 messages total.
     assert_eq!(report.messages.len(), 4);
 
-    let recipients: Vec<&str> = report.messages.iter().map(|m| m.recipient.as_str()).collect();
+    let recipients: Vec<&str> = report
+        .messages
+        .iter()
+        .map(|m| m.recipient.as_str())
+        .collect();
     // alice appears in both conflicts.
     assert_eq!(recipients.iter().filter(|&&r| r == "alice").count(), 2);
     assert!(recipients.contains(&"bob"));
@@ -451,10 +443,7 @@ fn adv_09_error_codes_match_conflict_type() {
     assert_eq!(r1.conflicts[0].reason_code, "reservation_overlap");
 
     // Concurrent bead claim → FTM2002.
-    let aset2 = assignment_set(vec![
-        assignment("z", "a1", 1.0),
-        assignment("z", "a2", 0.5),
-    ]);
+    let aset2 = assignment_set(vec![assignment("z", "a1", 1.0), assignment("z", "a2", 0.5)]);
     let issues2 = vec![issue("z", 0, &[])];
     let r2 = ml.detect_conflicts(&aset2, &[], &[], 6000, &issues2);
     assert_eq!(r2.conflicts[0].error_code, "FTM2002");
@@ -478,10 +467,7 @@ fn adv_10_conflict_state_accumulates() {
 
     // 3 cycles, each with a conflict.
     for cycle in 0..3u64 {
-        let aset = assignment_set(vec![
-            assignment("x", "a1", 1.0),
-            assignment("x", "a2", 0.5),
-        ]);
+        let aset = assignment_set(vec![assignment("x", "a1", 1.0), assignment("x", "a2", 0.5)]);
         ml.detect_conflicts(&aset, &[], &[], (cycle * 1000) as i64, &issues);
     }
 
@@ -502,10 +488,7 @@ fn adv_11_disabled_detection_no_side_effects() {
         },
         ..MissionLoopConfig::default()
     });
-    let aset = assignment_set(vec![
-        assignment("x", "a1", 1.0),
-        assignment("x", "a2", 0.5),
-    ]);
+    let aset = assignment_set(vec![assignment("x", "a1", 1.0), assignment("x", "a2", 0.5)]);
     let issues = vec![issue("x", 0, &[])];
     let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
 
@@ -554,11 +537,11 @@ fn adv_12_mixed_risky_non_risky_independent_caps() {
     // Max total = 5, max risky = 1.
     // 2 safe + 1 risky = 3 assigned, 1 risky rejected.
     assert!(decision.assignment_set.assignment_count() <= 3);
-    let risky_rejections: Vec<_> = decision
+    let has_risky_rejections = decision
         .assignment_set
         .rejected
         .iter()
-        .filter(|r| {
+        .any(|r| {
             r.reasons.iter().any(|reason| {
                 matches!(
                     reason,
@@ -566,9 +549,8 @@ fn adv_12_mixed_risky_non_risky_independent_caps() {
                     if gate_name == "mission.envelope.max_risky_assignments_per_cycle"
                 )
             })
-        })
-        .collect();
-    assert!(risky_rejections.len() >= 1);
+        });
+    assert!(has_risky_rejections);
 }
 
 // ── ADV-13: Conflict detection — reservation with no bead_id skipped ────────
@@ -755,13 +737,7 @@ fn adv_18_empty_inputs_no_crashes() {
     let mut ml = loop_with_config(MissionLoopConfig::default());
 
     // Empty everything.
-    let r1 = ml.detect_conflicts(
-        &assignment_set(Vec::new()),
-        &[],
-        &[],
-        5000,
-        &[],
-    );
+    let r1 = ml.detect_conflicts(&assignment_set(Vec::new()), &[], &[], 5000, &[]);
     assert!(r1.conflicts.is_empty());
     assert!(r1.messages.is_empty());
 
@@ -791,10 +767,7 @@ fn adv_18_empty_inputs_no_crashes() {
 #[test]
 fn adv_19_deterministic_detection() {
     let issues = vec![issue("x", 0, &[])];
-    let aset = assignment_set(vec![
-        assignment("x", "a1", 1.0),
-        assignment("x", "a2", 0.5),
-    ]);
+    let aset = assignment_set(vec![assignment("x", "a1", 1.0), assignment("x", "a2", 0.5)]);
 
     let mut ml1 = loop_with_config(MissionLoopConfig::default());
     let r1 = ml1.detect_conflicts(&aset, &[], &[], 5000, &issues);
@@ -826,11 +799,7 @@ fn adv_20_envelope_and_conflict_detection_compose() {
         ..MissionLoopConfig::default()
     });
 
-    let issues = vec![
-        issue("a", 0, &[]),
-        issue("b", 1, &[]),
-        issue("c", 2, &[]),
-    ];
+    let issues = vec![issue("a", 0, &[]), issue("b", 1, &[]), issue("c", 2, &[])];
     let agents: Vec<MissionAgentCapabilityProfile> = (0..3)
         .map(|i| MissionAgentCapabilityProfile {
             agent_id: format!("a{}", i),
@@ -849,10 +818,8 @@ fn adv_20_envelope_and_conflict_detection_compose() {
 
     // Now run conflict detection on the envelope-filtered assignments.
     // Both surviving assignments claim "a" → conflict.
-    let post_envelope_set = assignment_set(vec![
-        assignment("a", "a0", 1.0),
-        assignment("a", "a1", 0.5),
-    ]);
+    let post_envelope_set =
+        assignment_set(vec![assignment("a", "a0", 1.0), assignment("a", "a1", 0.5)]);
     let report = ml.detect_conflicts(&post_envelope_set, &[], &[], 2000, &issues);
     assert_eq!(report.conflicts.len(), 1);
     assert_eq!(
@@ -876,10 +843,7 @@ fn adv_21_history_bounded_across_cycles() {
 
     // Run 100 cycles with a conflict each.
     for i in 0..100u64 {
-        let aset = assignment_set(vec![
-            assignment("x", "a1", 1.0),
-            assignment("x", "a2", 0.5),
-        ]);
+        let aset = assignment_set(vec![assignment("x", "a1", 1.0), assignment("x", "a2", 0.5)]);
         ml.detect_conflicts(&aset, &[], &[], (i * 1000) as i64, &issues);
     }
 
@@ -894,17 +858,17 @@ fn adv_21_history_bounded_across_cycles() {
 #[test]
 fn adv_22_state_serde_with_conflicts() {
     let mut ml = loop_with_config(MissionLoopConfig::default());
-    let aset = assignment_set(vec![
-        assignment("x", "a1", 1.0),
-        assignment("x", "a2", 0.5),
-    ]);
+    let aset = assignment_set(vec![assignment("x", "a1", 1.0), assignment("x", "a2", 0.5)]);
     let issues = vec![issue("x", 0, &[])];
     ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
 
     let state = ml.state().clone();
     let json = serde_json::to_string(&state).unwrap();
     let back: MissionLoopState = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.total_conflicts_detected, state.total_conflicts_detected);
+    assert_eq!(
+        back.total_conflicts_detected,
+        state.total_conflicts_detected
+    );
     assert_eq!(
         back.total_conflicts_auto_resolved,
         state.total_conflicts_auto_resolved
@@ -956,10 +920,7 @@ fn adv_24_metrics_count_conflict_rejections() {
         },
         ..MissionLoopConfig::default()
     });
-    let issues = vec![
-        issue("a", 0, &[]),
-        issue("b", 1, &[]),
-    ];
+    let issues = vec![issue("a", 0, &[]), issue("b", 1, &[])];
     let agents = vec![
         MissionAgentCapabilityProfile {
             agent_id: "a1".to_string(),

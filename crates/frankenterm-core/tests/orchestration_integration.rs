@@ -14,9 +14,9 @@
 use frankenterm_core::plan::{
     AssignmentId, Mission, MissionControlCommand, MissionControlDecision,
     MissionDispatchDeduplicationState, MissionDispatchMechanism, MissionFailureCode,
-    MissionFailureTerminality, MissionId, MissionJournalEntryKind,
-    MissionKillSwitchActivation, MissionKillSwitchLevel, MissionLifecycleState,
-    MissionLifecycleTransitionKind, MissionOwnership, Outcome,
+    MissionFailureTerminality, MissionId, MissionJournalEntryKind, MissionKillSwitchActivation,
+    MissionKillSwitchLevel, MissionLifecycleState, MissionLifecycleTransitionKind,
+    MissionOwnership, Outcome,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -213,7 +213,10 @@ fn journal_compaction_preserves_post_checkpoint() {
 
     // Entries 1 and 2 should be removed, 3-5 + checkpoint remain
     let remaining = journal.entries_since(0);
-    assert!(remaining.len() >= 3, "should have at least entries 3, 4, 5 remaining");
+    assert!(
+        remaining.len() >= 3,
+        "should have at least entries 3, 4, 5 remaining"
+    );
 }
 
 #[test]
@@ -392,15 +395,27 @@ fn dedup_state_evict_before_cutoff() {
 fn failure_code_terminality_classification() {
     // Terminal failures
     let pd = MissionFailureCode::PolicyDenied.contract();
-    assert!(matches!(pd.terminality, MissionFailureTerminality::Terminal));
+    assert!(matches!(
+        pd.terminality,
+        MissionFailureTerminality::Terminal
+    ));
     let ad = MissionFailureCode::ApprovalDenied.contract();
-    assert!(matches!(ad.terminality, MissionFailureTerminality::Terminal));
+    assert!(matches!(
+        ad.terminality,
+        MissionFailureTerminality::Terminal
+    ));
 
     // Non-terminal (retryable)
     let rl = MissionFailureCode::RateLimited.contract();
-    assert!(matches!(rl.terminality, MissionFailureTerminality::NonTerminal));
+    assert!(matches!(
+        rl.terminality,
+        MissionFailureTerminality::NonTerminal
+    ));
     let ss = MissionFailureCode::StaleState.contract();
-    assert!(matches!(ss.terminality, MissionFailureTerminality::NonTerminal));
+    assert!(matches!(
+        ss.terminality,
+        MissionFailureTerminality::NonTerminal
+    ));
 }
 
 #[test]
@@ -413,11 +428,17 @@ fn failure_code_retryability() {
 
     // After backoff: RateLimited
     let rl = MissionFailureCode::RateLimited.contract();
-    assert!(matches!(rl.retryability, MissionFailureRetryability::AfterBackoff));
+    assert!(matches!(
+        rl.retryability,
+        MissionFailureRetryability::AfterBackoff
+    ));
 
     // After state refresh: StaleState
     let ss = MissionFailureCode::StaleState.contract();
-    assert!(matches!(ss.retryability, MissionFailureRetryability::AfterStateRefresh));
+    assert!(matches!(
+        ss.retryability,
+        MissionFailureRetryability::AfterStateRefresh
+    ));
 }
 
 // ── Outcome Canonical Strings ───────────────────────────────────────────────

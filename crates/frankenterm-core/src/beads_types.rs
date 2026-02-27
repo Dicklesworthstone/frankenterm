@@ -914,21 +914,21 @@ mod tests {
             sample_detail("blocked", BeadStatus::Open, 1, &[("blocker", "blocks")]),
         ];
         let report = resolve_bead_readiness(&issues);
-        let blocked = report
+        let blocked_candidate = report
             .candidates
             .iter()
             .find(|c| c.id == "blocked")
             .unwrap();
-        assert!(!blocked.ready);
-        assert_eq!(blocked.blocker_count, 1);
-        assert_eq!(blocked.blocker_ids, vec!["blocker".to_string()]);
+        assert!(!blocked_candidate.ready);
+        assert_eq!(blocked_candidate.blocker_count, 1);
+        assert_eq!(blocked_candidate.blocker_ids, vec!["blocker".to_string()]);
         // blocker itself is ready
-        let blocker = report
+        let blocker_entry = report
             .candidates
             .iter()
             .find(|c| c.id == "blocker")
             .unwrap();
-        assert!(blocker.ready);
+        assert!(blocker_entry.ready);
     }
 
     #[test]

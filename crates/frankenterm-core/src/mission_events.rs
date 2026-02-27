@@ -81,9 +81,9 @@ impl MissionEventKind {
             | Self::ScoringCompleted
             | Self::AssignmentsSolved => MissionPhase::Plan,
 
-            Self::SafetyEnvelopeApplied
-            | Self::SafetyGateRejection
-            | Self::RetryStormThrottled => MissionPhase::Safety,
+            Self::SafetyEnvelopeApplied | Self::SafetyGateRejection | Self::RetryStormThrottled => {
+                MissionPhase::Safety
+            }
 
             Self::AssignmentEmitted | Self::AssignmentRejected => MissionPhase::Dispatch,
 
@@ -272,8 +272,10 @@ impl MissionEventBuilder {
     /// Add a string detail.
     #[must_use]
     pub fn detail_str(mut self, key: &str, value: &str) -> Self {
-        self.details
-            .insert(key.to_string(), serde_json::Value::String(value.to_string()));
+        self.details.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
         self
     }
 
@@ -581,11 +583,9 @@ impl<'a> CycleEventEmitter<'a> {
 
     /// Emit cycle-started event.
     pub fn emit_cycle_started(&mut self, trigger_kind: &str) -> Option<u64> {
-        let builder = MissionEventBuilder::new(
-            MissionEventKind::CycleStarted,
-            reason_codes::CYCLE_STARTED,
-        )
-        .detail_str("trigger_kind", trigger_kind);
+        let builder =
+            MissionEventBuilder::new(MissionEventKind::CycleStarted, reason_codes::CYCLE_STARTED)
+                .detail_str("trigger_kind", trigger_kind);
         self.emit_builder(builder)
     }
 
@@ -726,10 +726,9 @@ impl<'a> CycleEventEmitter<'a> {
         reason_code: &str,
         reasons: &[String],
     ) -> Option<u64> {
-        let builder =
-            MissionEventBuilder::new(MissionEventKind::AssignmentRejected, reason_code)
-                .detail_str("bead_id", bead_id)
-                .detail_strings("rejection_reasons", reasons);
+        let builder = MissionEventBuilder::new(MissionEventKind::AssignmentRejected, reason_code)
+            .detail_str("bead_id", bead_id)
+            .detail_strings("rejection_reasons", reasons);
         self.emit_builder(builder)
     }
 
@@ -903,16 +902,14 @@ mod tests {
     #[test]
     fn builder_produces_correct_event() {
         let mut log = default_log();
-        let builder = MissionEventBuilder::new(
-            MissionEventKind::CycleStarted,
-            reason_codes::CYCLE_STARTED,
-        )
-        .cycle(5, 5000)
-        .correlation("corr-abc")
-        .labels("my-ws", "my-trk")
-        .detail_str("trigger_kind", "cadence_tick")
-        .detail_u64("pending_triggers", 3)
-        .detail_bool("forced", false);
+        let builder =
+            MissionEventBuilder::new(MissionEventKind::CycleStarted, reason_codes::CYCLE_STARTED)
+                .cycle(5, 5000)
+                .correlation("corr-abc")
+                .labels("my-ws", "my-trk")
+                .detail_str("trigger_kind", "cadence_tick")
+                .detail_u64("pending_triggers", 3)
+                .detail_bool("forced", false);
         let seq = log.emit(builder).unwrap();
         assert_eq!(seq, 1);
 
@@ -1197,10 +1194,16 @@ mod tests {
         assert_eq!(summary.total_appended, 8);
         assert_eq!(summary.total_evicted, 3);
         assert_eq!(summary.next_sequence, 9);
-        assert!(summary.by_kind.contains_key(&MissionEventKind::CycleStarted));
-        assert!(summary
-            .by_kind
-            .contains_key(&MissionEventKind::AssignmentEmitted));
+        assert!(
+            summary
+                .by_kind
+                .contains_key(&MissionEventKind::CycleStarted)
+        );
+        assert!(
+            summary
+                .by_kind
+                .contains_key(&MissionEventKind::AssignmentEmitted)
+        );
     }
 
     // ── Serde roundtrip tests ───────────────────────────────────────────
@@ -1311,9 +1314,9 @@ mod tests {
                 "Reason code '{}' must start with 'mission.'",
                 code
             );
-            let parts: Vec<&str> = code.split('.').collect();
+            let segment_count = code.split('.').count();
             assert!(
-                parts.len() == 3,
+                segment_count == 3,
                 "Reason code '{}' must have exactly 3 dot-separated segments",
                 code
             );
@@ -1365,8 +1368,7 @@ mod tests {
     fn cycle_emitter_readiness_empty_uses_correct_reason() {
         let mut log = default_log();
         {
-            let mut emitter =
-                CycleEventEmitter::new(&mut log, 1, 1000, "corr-1", "ws", "trk");
+            let mut emitter = CycleEventEmitter::new(&mut log, 1, 1000, "corr-1", "ws", "trk");
             emitter.emit_readiness_resolved(10, 0);
         }
         assert_eq!(
@@ -1379,8 +1381,7 @@ mod tests {
     fn cycle_emitter_scoring_below_threshold_uses_correct_reason() {
         let mut log = default_log();
         {
-            let mut emitter =
-                CycleEventEmitter::new(&mut log, 1, 1000, "corr-1", "ws", "trk");
+            let mut emitter = CycleEventEmitter::new(&mut log, 1, 1000, "corr-1", "ws", "trk");
             emitter.emit_scoring_completed(5, 0, None);
         }
         assert_eq!(
@@ -1393,8 +1394,7 @@ mod tests {
     fn cycle_emitter_safety_gate_rejection_maps_gate_name() {
         let mut log = default_log();
         {
-            let mut emitter =
-                CycleEventEmitter::new(&mut log, 1, 1000, "corr-1", "ws", "trk");
+            let mut emitter = CycleEventEmitter::new(&mut log, 1, 1000, "corr-1", "ws", "trk");
             emitter.emit_safety_gate_rejection(
                 "mission.envelope.max_assignments_per_cycle",
                 "bead-x",
@@ -1405,11 +1405,7 @@ mod tests {
                 "bead-y",
                 0.6,
             );
-            emitter.emit_safety_gate_rejection(
-                "mission.envelope.retry_storm",
-                "bead-z",
-                0.4,
-            );
+            emitter.emit_safety_gate_rejection("mission.envelope.retry_storm", "bead-z", 0.4);
         }
         let events = log.events();
         assert_eq!(events[0].reason_code, reason_codes::GATE_MAX_ASSIGNMENTS);
@@ -1421,8 +1417,7 @@ mod tests {
     fn cycle_emitter_assignment_emitted_carries_details() {
         let mut log = default_log();
         {
-            let mut emitter =
-                CycleEventEmitter::new(&mut log, 1, 1000, "corr-1", "ws", "trk");
+            let mut emitter = CycleEventEmitter::new(&mut log, 1, 1000, "corr-1", "ws", "trk");
             emitter.emit_assignment_emitted("bead-a", "agent-1", 0.95, 1);
         }
         let event = log.latest().unwrap();
@@ -1445,8 +1440,7 @@ mod tests {
     fn cycle_emitter_conflict_detected_maps_type() {
         let mut log = default_log();
         {
-            let mut emitter =
-                CycleEventEmitter::new(&mut log, 1, 1000, "corr-1", "ws", "trk");
+            let mut emitter = CycleEventEmitter::new(&mut log, 1, 1000, "corr-1", "ws", "trk");
             emitter.emit_conflict_detected(
                 "c-001",
                 "file_reservation_overlap",
@@ -1553,12 +1547,16 @@ mod tests {
             emitter.emit_assignment_emitted("bead-1", "agent-a", 0.9, 1);
             emitter.emit_assignment_emitted("bead-2", "agent-b", 0.8, 2);
             emitter.emit_assignment_emitted("bead-3", "agent-a", 0.7, 3);
-            emitter.emit_assignment_rejected("bead-4", reason_codes::REJECTION_CONFLICT, &[
-                "ConflictWithAssigned".to_string(),
-            ]);
-            emitter.emit_assignment_rejected("bead-5", reason_codes::REJECTION_SOLVER, &[
-                "BelowThreshold".to_string(),
-            ]);
+            emitter.emit_assignment_rejected(
+                "bead-4",
+                reason_codes::REJECTION_CONFLICT,
+                &["ConflictWithAssigned".to_string()],
+            );
+            emitter.emit_assignment_rejected(
+                "bead-5",
+                reason_codes::REJECTION_SOLVER,
+                &["BelowThreshold".to_string()],
+            );
             // Reconcile phase
             emitter.emit_conflict_detected(
                 "c-001",
@@ -1583,7 +1581,12 @@ mod tests {
         // Verify sequences are monotonically increasing.
         let seqs: Vec<u64> = log.events().iter().map(|e| e.sequence).collect();
         for w in seqs.windows(2) {
-            assert!(w[0] < w[1], "Sequences must be monotonic: {} >= {}", w[0], w[1]);
+            assert!(
+                w[0] < w[1],
+                "Sequences must be monotonic: {} >= {}",
+                w[0],
+                w[1]
+            );
         }
     }
 }

@@ -117,7 +117,7 @@ proptest! {
                 .map(|i| PlannerAssignment {
                     bead_id: "shared".to_string(),
                     agent_id: format!("agent{}", i),
-                    score: 1.0 - (i as f64 * 0.05),
+                    score: (i as f64).mul_add(-0.05, 1.0),
                     rank: 1,
                 })
                 .collect(),
@@ -217,7 +217,7 @@ proptest! {
                 .map(|i| PlannerAssignment {
                     bead_id: "shared-bead".to_string(),
                     agent_id: format!("a{}", i),
-                    score: 1.0 - (i as f64 * 0.1),
+                    score: (i as f64).mul_add(-0.1, 1.0),
                     rank: 1,
                 })
                 .collect(),
@@ -334,18 +334,22 @@ proptest! {
                 loser_agent,
                 ..
             } => {
-                if pri_a < pri_b {
-                    prop_assert_eq!(winner_agent, "agent-alpha");
-                    prop_assert_eq!(loser_agent, "agent-beta");
-                } else if pri_a > pri_b {
-                    prop_assert_eq!(winner_agent, "agent-beta");
-                    prop_assert_eq!(loser_agent, "agent-alpha");
-                } else {
-                    // Equal priority: score_a >= score_b → alpha wins.
-                    // score_a is the new assignment's score, score_b=0.0 for reservations.
-                    // In resolve_conflict, agent_a=alpha with score_a, agent_b=beta with 0.0.
-                    if score_a >= 0.0 {
+                match pri_a.cmp(&pri_b) {
+                    std::cmp::Ordering::Less => {
                         prop_assert_eq!(winner_agent, "agent-alpha");
+                        prop_assert_eq!(loser_agent, "agent-beta");
+                    }
+                    std::cmp::Ordering::Greater => {
+                        prop_assert_eq!(winner_agent, "agent-beta");
+                        prop_assert_eq!(loser_agent, "agent-alpha");
+                    }
+                    std::cmp::Ordering::Equal => {
+                        // Equal priority: score_a >= score_b → alpha wins.
+                        // score_a is the new assignment's score, score_b=0.0 for reservations.
+                        // In resolve_conflict, agent_a=alpha with score_a, agent_b=beta with 0.0.
+                        if score_a >= 0.0 {
+                            prop_assert_eq!(winner_agent, "agent-alpha");
+                        }
                     }
                 }
             }
@@ -368,7 +372,7 @@ proptest! {
                 .map(|i| PlannerAssignment {
                     bead_id: "x".to_string(),
                     agent_id: format!("a{}", i),
-                    score: 1.0 - (i as f64 * 0.1),
+                    score: (i as f64).mul_add(-0.1, 1.0),
                     rank: 1,
                 })
                 .collect(),
@@ -569,7 +573,7 @@ proptest! {
                 .map(|i| PlannerAssignment {
                     bead_id: "x".to_string(),
                     agent_id: format!("a{}", i),
-                    score: 1.0 - (i as f64 * 0.1),
+                    score: (i as f64).mul_add(-0.1, 1.0),
                     rank: 1,
                 })
                 .collect(),

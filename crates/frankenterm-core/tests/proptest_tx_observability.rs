@@ -6,8 +6,8 @@
 #![cfg(feature = "subprocess-bridge")]
 
 use frankenterm_core::tx_idempotency::*;
-use frankenterm_core::tx_observability::*;
 use frankenterm_core::tx_observability::reason_codes;
+use frankenterm_core::tx_observability::*;
 use frankenterm_core::tx_plan_compiler::*;
 use proptest::prelude::*;
 use std::collections::HashMap;
@@ -139,9 +139,7 @@ fn arb_step_count() -> impl Strategy<Value = usize> {
 fn arb_step_outcome() -> impl Strategy<Value = StepOutcome> {
     prop_oneof![
         Just(StepOutcome::Success { result: None }),
-        "[a-z]{3,12}".prop_map(|r| StepOutcome::Success {
-            result: Some(r),
-        }),
+        "[a-z]{3,12}".prop_map(|r| StepOutcome::Success { result: Some(r) }),
         Just(StepOutcome::Failed {
             error_code: "E001".to_string(),
             error_message: "test failure".to_string(),
@@ -173,7 +171,11 @@ fn to_p01_all_event_kinds_map_to_phase() {
                 | TxObservabilityPhase::Resume
                 | TxObservabilityPhase::Observability
         );
-        assert!(is_valid, "Kind {:?} mapped to invalid phase {:?}", kind, phase);
+        assert!(
+            is_valid,
+            "Kind {:?} mapped to invalid phase {:?}",
+            kind, phase
+        );
     }
 }
 
@@ -207,7 +209,11 @@ fn to_p03_phase_serde_roundtrip() {
     for phase in &phases {
         let json = serde_json::to_string(phase).unwrap();
         let restored: TxObservabilityPhase = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored, *phase, "Phase serde roundtrip failed for {:?}", phase);
+        assert_eq!(
+            restored, *phase,
+            "Phase serde roundtrip failed for {:?}",
+            phase
+        );
     }
 }
 
@@ -216,10 +222,19 @@ fn to_p03_phase_serde_roundtrip() {
 #[test]
 fn to_p04_redaction_none_all_false() {
     let policy = RedactionPolicy::none();
-    assert!(!policy.redact_command_text, "none() should not redact command_text");
-    assert!(!policy.redact_error_messages, "none() should not redact error_messages");
+    assert!(
+        !policy.redact_command_text,
+        "none() should not redact command_text"
+    );
+    assert!(
+        !policy.redact_error_messages,
+        "none() should not redact error_messages"
+    );
     assert!(!policy.redact_results, "none() should not redact results");
-    assert!(!policy.redact_approval_codes, "none() should not redact approval_codes");
+    assert!(
+        !policy.redact_approval_codes,
+        "none() should not redact approval_codes"
+    );
     assert!(!policy.redact_labels, "none() should not redact labels");
 }
 
@@ -228,10 +243,19 @@ fn to_p04_redaction_none_all_false() {
 #[test]
 fn to_p05_redaction_maximum_all_true() {
     let policy = RedactionPolicy::maximum();
-    assert!(policy.redact_command_text, "maximum() should redact command_text");
-    assert!(policy.redact_error_messages, "maximum() should redact error_messages");
+    assert!(
+        policy.redact_command_text,
+        "maximum() should redact command_text"
+    );
+    assert!(
+        policy.redact_error_messages,
+        "maximum() should redact error_messages"
+    );
     assert!(policy.redact_results, "maximum() should redact results");
-    assert!(policy.redact_approval_codes, "maximum() should redact approval_codes");
+    assert!(
+        policy.redact_approval_codes,
+        "maximum() should redact approval_codes"
+    );
     assert!(policy.redact_labels, "maximum() should redact labels");
 }
 

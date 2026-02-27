@@ -41,9 +41,7 @@ use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionGraph, Deci
 use frankenterm_core::replay_guardrails_gate::{
     EvaluationContext, ExpectedDivergenceAnnotation, GateEvaluator, GateResult, RegressionBudget,
 };
-use frankenterm_core::replay_report::{
-    JsonReport, ReportFormat, ReportGenerator, ReportMeta,
-};
+use frankenterm_core::replay_report::{JsonReport, ReportFormat, ReportGenerator, ReportMeta};
 use frankenterm_core::replay_risk_scoring::{Recommendation, RiskScorer};
 
 // ── Fixture helpers ───────────────────────────────────────────────────────
@@ -106,7 +104,10 @@ fn g01_identical_graphs() {
     let graph = DecisionGraph::from_decisions(&events);
     let diff = DecisionDiff::diff(&graph, &graph, &DiffConfig::default());
 
-    assert!(diff.divergences.is_empty(), "identical graphs should have no divergences");
+    assert!(
+        diff.divergences.is_empty(),
+        "identical graphs should have no divergences"
+    );
     assert!(diff.is_equivalent(EquivalenceLevel::L2));
     assert_eq!(diff.summary.unchanged, 3);
     assert_eq!(diff.summary.added, 0);
@@ -119,12 +120,8 @@ fn g01_identical_graphs() {
 
 #[test]
 fn g02_single_modified() {
-    let base = DecisionGraph::from_decisions(&[
-        pm("rule_a", 100, 1, "def1", "out1"),
-    ]);
-    let cand = DecisionGraph::from_decisions(&[
-        pm("rule_a", 100, 1, "def1", "out_modified"),
-    ]);
+    let base = DecisionGraph::from_decisions(&[pm("rule_a", 100, 1, "def1", "out1")]);
+    let cand = DecisionGraph::from_decisions(&[pm("rule_a", 100, 1, "def1", "out_modified")]);
     let diff = DecisionDiff::diff(&base, &cand, &DiffConfig::default());
 
     assert_eq!(diff.divergences.len(), 1);
@@ -137,9 +134,7 @@ fn g02_single_modified() {
 
 #[test]
 fn g03_added_decision() {
-    let base = DecisionGraph::from_decisions(&[
-        pm("rule_a", 100, 1, "def1", "out1"),
-    ]);
+    let base = DecisionGraph::from_decisions(&[pm("rule_a", 100, 1, "def1", "out1")]);
     let cand = DecisionGraph::from_decisions(&[
         pm("rule_a", 100, 1, "def1", "out1"),
         pm("rule_b", 200, 1, "def2", "out2"),
@@ -158,9 +153,7 @@ fn g04_removed_decision() {
         pm("rule_a", 100, 1, "def1", "out1"),
         pm("rule_b", 200, 1, "def2", "out2"),
     ]);
-    let cand = DecisionGraph::from_decisions(&[
-        pm("rule_a", 100, 1, "def1", "out1"),
-    ]);
+    let cand = DecisionGraph::from_decisions(&[pm("rule_a", 100, 1, "def1", "out1")]);
     let diff = DecisionDiff::diff(&base, &cand, &DiffConfig::default());
 
     assert_eq!(diff.summary.removed, 1);
@@ -171,9 +164,7 @@ fn g04_removed_decision() {
 
 #[test]
 fn g05_timing_shift() {
-    let base = DecisionGraph::from_decisions(&[
-        pm("rule_a", 100, 1, "def1", "out1"),
-    ]);
+    let base = DecisionGraph::from_decisions(&[pm("rule_a", 100, 1, "def1", "out1")]);
     let cand = DecisionGraph::from_decisions(&[
         pm("rule_a", 150, 1, "def1", "out1"), // shifted by 50ms (within 100ms tolerance)
     ]);
@@ -194,9 +185,7 @@ fn g05_timing_shift() {
 
 #[test]
 fn g06_policy_definition_change() {
-    let base = DecisionGraph::from_decisions(&[
-        pol("pol_auth", 100, 1, "def_v1", "allow"),
-    ]);
+    let base = DecisionGraph::from_decisions(&[pol("pol_auth", 100, 1, "def_v1", "allow")]);
     let cand = DecisionGraph::from_decisions(&[
         pol("pol_auth", 100, 1, "def_v2", "deny"), // definition changed
     ]);
@@ -237,14 +226,14 @@ fn g07_cascading_divergences() {
 #[test]
 fn g08_mixed_divergences() {
     let base = DecisionGraph::from_decisions(&[
-        pm("rule_a", 100, 1, "def1", "out1"),   // unchanged
-        pm("rule_b", 200, 1, "def2", "out2"),   // modified
-        pm("rule_c", 300, 1, "def3", "out3"),   // removed
+        pm("rule_a", 100, 1, "def1", "out1"), // unchanged
+        pm("rule_b", 200, 1, "def2", "out2"), // modified
+        pm("rule_c", 300, 1, "def3", "out3"), // removed
     ]);
     let cand = DecisionGraph::from_decisions(&[
-        pm("rule_a", 100, 1, "def1", "out1"),   // unchanged
+        pm("rule_a", 100, 1, "def1", "out1"),    // unchanged
         pm("rule_b", 200, 1, "def2", "out2_v2"), // modified
-        pm("rule_d", 400, 1, "def4", "out4"),   // added
+        pm("rule_d", 400, 1, "def4", "out4"),    // added
     ]);
     let diff = DecisionDiff::diff(&base, &cand, &DiffConfig::default());
 
@@ -360,7 +349,7 @@ fn g13_human_severity_order() {
         pol("pol_auth", 200, 1, "def2", "out2"),
     ]);
     let cand = DecisionGraph::from_decisions(&[
-        pm("rule_low", 100, 1, "def1", "out1_v2"),   // Low
+        pm("rule_low", 100, 1, "def1", "out1_v2"),     // Low
         pol("pol_auth", 200, 1, "def2_v2", "out2_v2"), // Critical (policy def change)
     ]);
     let diff = DecisionDiff::diff(&base, &cand, &DiffConfig::default());
@@ -372,7 +361,10 @@ fn g13_human_severity_order() {
         let details = &human[details_start..];
         if let Some(crit_pos) = details.find("Critical") {
             if let Some(low_pos) = details.find("Low") {
-                assert!(crit_pos < low_pos, "Critical should appear before Low in details");
+                assert!(
+                    crit_pos < low_pos,
+                    "Critical should appear before Low in details"
+                );
             }
         }
     }
@@ -398,12 +390,8 @@ fn g14_gate_empty_pass() {
 
 #[test]
 fn g15_gate_critical_fail() {
-    let base = DecisionGraph::from_decisions(&[
-        pol("pol_auth", 100, 1, "def_v1", "allow"),
-    ]);
-    let cand = DecisionGraph::from_decisions(&[
-        pol("pol_auth", 100, 1, "def_v2", "deny"),
-    ]);
+    let base = DecisionGraph::from_decisions(&[pol("pol_auth", 100, 1, "def_v1", "allow")]);
+    let cand = DecisionGraph::from_decisions(&[pol("pol_auth", 100, 1, "def_v2", "deny")]);
     let diff = DecisionDiff::diff(&base, &cand, &DiffConfig::default());
     let generator = ReportGenerator::new(meta());
     let json_str = generator.generate(&diff, ReportFormat::Json);
@@ -413,7 +401,10 @@ fn g15_gate_critical_fail() {
     let result = eval.evaluate_simple(&report);
     assert!(result.is_fail());
     assert!(
-        result.violations().iter().any(|v| v.budget_dimension == "max_critical"),
+        result
+            .violations()
+            .iter()
+            .any(|v| v.budget_dimension == "max_critical"),
         "should have critical violation"
     );
 }
@@ -422,12 +413,8 @@ fn g15_gate_critical_fail() {
 
 #[test]
 fn g16_gate_annotation_pass() {
-    let base = DecisionGraph::from_decisions(&[
-        pol("pol_auth", 100, 1, "def_v1", "allow"),
-    ]);
-    let cand = DecisionGraph::from_decisions(&[
-        pol("pol_auth", 100, 1, "def_v2", "deny"),
-    ]);
+    let base = DecisionGraph::from_decisions(&[pol("pol_auth", 100, 1, "def_v1", "allow")]);
+    let cand = DecisionGraph::from_decisions(&[pol("pol_auth", 100, 1, "def_v2", "deny")]);
     let diff = DecisionDiff::diff(&base, &cand, &DiffConfig::default());
     let generator = ReportGenerator::new(meta());
     let json_str = generator.generate(&diff, ReportFormat::Json);
@@ -446,7 +433,11 @@ fn g16_gate_annotation_pass() {
 
     let eval = GateEvaluator::with_defaults();
     let result = eval.evaluate(&report, &ctx);
-    assert!(result.is_pass(), "annotated divergence should pass: {:?}", result);
+    assert!(
+        result.is_pass(),
+        "annotated divergence should pass: {:?}",
+        result
+    );
 }
 
 // ── G-17: Gate: skip budget → Fail ────────────────────────────────────────
@@ -475,12 +466,8 @@ fn g17_gate_skip_budget() {
 
 #[test]
 fn g18_gate_custom_budget() {
-    let base = DecisionGraph::from_decisions(&[
-        wf("wf_deploy", 100, 1, "def1", "out1"),
-    ]);
-    let cand = DecisionGraph::from_decisions(&[
-        wf("wf_deploy", 100, 1, "def1", "out1_v2"),
-    ]);
+    let base = DecisionGraph::from_decisions(&[wf("wf_deploy", 100, 1, "def1", "out1")]);
+    let cand = DecisionGraph::from_decisions(&[wf("wf_deploy", 100, 1, "def1", "out1_v2")]);
     let diff = DecisionDiff::diff(&base, &cand, &DiffConfig::default());
     let generator = ReportGenerator::new(meta());
     let json_str = generator.generate(&diff, ReportFormat::Json);
@@ -594,7 +581,11 @@ fn g23_risk_score_sum() {
     let diff = make_standard_diff();
     let scorer = RiskScorer::new();
     let risk = scorer.aggregate(&diff.divergences);
-    let count_sum = risk.critical_count + risk.high_count + risk.medium_count + risk.low_count + risk.info_count;
+    let count_sum = risk.critical_count
+        + risk.high_count
+        + risk.medium_count
+        + risk.low_count
+        + risk.info_count;
     assert_eq!(count_sum, diff.divergences.len() as u64);
 }
 
@@ -659,8 +650,8 @@ fn make_standard_diff() -> DecisionDiff {
         pol("pol_auth", 300, 1, "def3", "out3"),
     ]);
     let cand = DecisionGraph::from_decisions(&[
-        pm("rule_a", 100, 1, "def1", "out1"),        // unchanged
-        wf("wf_deploy", 200, 1, "def2", "out_mod"),  // modified
+        pm("rule_a", 100, 1, "def1", "out1"),         // unchanged
+        wf("wf_deploy", 200, 1, "def2", "out_mod"),   // modified
         pol("pol_auth", 300, 1, "def3_v2", "out_v2"), // modified (def change)
     ]);
     DecisionDiff::diff(&base, &cand, &DiffConfig::default())

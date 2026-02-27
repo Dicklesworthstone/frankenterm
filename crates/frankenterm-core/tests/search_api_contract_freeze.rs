@@ -34,20 +34,19 @@ use std::fs;
 use std::path::PathBuf;
 
 use frankenterm_core::search::{
-    ChunkPolicyConfig, CommandBlockExtractionConfig, FusedResult, FusionBackend,
-    HashEmbedder, HybridSearchService, IndexFlushReason, IndexableDocument, IndexedDocument,
-    IndexingConfig, IndexingIngestReport, PassthroughReranker, Reranker, ScoredDoc,
-    ScrollbackLine, SearchDocumentSource, SearchIndex, SearchIndexStats, SearchMode,
-    TwoTierMetrics, chunk_scrollback_lines, extract_agent_artifacts,
-    extract_command_output_blocks, rrf_fuse,
+    ChunkDirection, ChunkSourceOffset, Embedder, EmbedderInfo, EmbedderTier,
+    RECORDER_CHUNKING_POLICY_V1,
+};
+use frankenterm_core::search::{
+    ChunkPolicyConfig, CommandBlockExtractionConfig, FusedResult, FusionBackend, HashEmbedder,
+    HybridSearchService, IndexFlushReason, IndexableDocument, IndexedDocument, IndexingConfig,
+    IndexingIngestReport, PassthroughReranker, Reranker, ScoredDoc, ScrollbackLine,
+    SearchDocumentSource, SearchIndex, SearchIndexStats, SearchMode, TwoTierMetrics,
+    chunk_scrollback_lines, extract_agent_artifacts, extract_command_output_blocks, rrf_fuse,
 };
 use frankenterm_core::search_explain::{
     GapInfo, PaneExplainInfo, PaneIndexingInfo, SearchExplainContext, SearchExplainEvidence,
     SearchExplainReason, SearchExplainResult, explain_search, render_explain_plain,
-};
-use frankenterm_core::search::{
-    ChunkDirection, ChunkSourceOffset, Embedder, EmbedderInfo, EmbedderTier,
-    RECORDER_CHUNKING_POLICY_V1,
 };
 use tempfile::tempdir;
 
@@ -321,12 +320,27 @@ fn contract_search_mode_variants() {
 #[test]
 fn contract_fusion_backend_parse_and_as_str() {
     // All inputs normalize to FrankenSearchRrf
-    assert_eq!(FusionBackend::parse("frankensearch"), FusionBackend::FrankenSearchRrf);
-    assert_eq!(FusionBackend::parse("frankensearch_rrf"), FusionBackend::FrankenSearchRrf);
-    assert_eq!(FusionBackend::parse("frankensearch-rrf"), FusionBackend::FrankenSearchRrf);
-    assert_eq!(FusionBackend::parse("legacy"), FusionBackend::FrankenSearchRrf);
+    assert_eq!(
+        FusionBackend::parse("frankensearch"),
+        FusionBackend::FrankenSearchRrf
+    );
+    assert_eq!(
+        FusionBackend::parse("frankensearch_rrf"),
+        FusionBackend::FrankenSearchRrf
+    );
+    assert_eq!(
+        FusionBackend::parse("frankensearch-rrf"),
+        FusionBackend::FrankenSearchRrf
+    );
+    assert_eq!(
+        FusionBackend::parse("legacy"),
+        FusionBackend::FrankenSearchRrf
+    );
     assert_eq!(FusionBackend::parse(""), FusionBackend::FrankenSearchRrf);
-    assert_eq!(FusionBackend::FrankenSearchRrf.as_str(), "frankensearch_rrf");
+    assert_eq!(
+        FusionBackend::FrankenSearchRrf.as_str(),
+        "frankensearch_rrf"
+    );
 }
 
 #[test]
@@ -520,15 +534,27 @@ fn contract_scored_doc_fields() {
 fn contract_passthrough_reranker_preserves_order() {
     let reranker = PassthroughReranker;
     let candidates = vec![
-        ScoredDoc { id: 1, text: "a".to_string(), score: 0.9 },
-        ScoredDoc { id: 2, text: "b".to_string(), score: 0.7 },
-        ScoredDoc { id: 3, text: "c".to_string(), score: 0.5 },
+        ScoredDoc {
+            id: 1,
+            text: "a".to_string(),
+            score: 0.9,
+        },
+        ScoredDoc {
+            id: 2,
+            text: "b".to_string(),
+            score: 0.7,
+        },
+        ScoredDoc {
+            id: 3,
+            text: "c".to_string(),
+            score: 0.5,
+        },
     ];
-    let reranked = reranker.rerank("query", candidates).expect("rerank");
-    assert_eq!(reranked.len(), 3);
-    assert_eq!(reranked[0].id, 1);
-    assert_eq!(reranked[1].id, 2);
-    assert_eq!(reranked[2].id, 3);
+    let ranked_results = reranker.rerank("query", candidates).expect("rerank");
+    assert_eq!(ranked_results.len(), 3);
+    assert_eq!(ranked_results[0].id, 1);
+    assert_eq!(ranked_results[1].id, 2);
+    assert_eq!(ranked_results[2].id, 3);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -545,7 +571,7 @@ fn contract_chunk_scrollback_lines_signature() {
             session_id: None,
         },
         ScrollbackLine {
-            text: "".to_string(),
+            text: String::new(),
             captured_at_ms: 2_000,
             pane_id: Some(1),
             session_id: None,
@@ -560,7 +586,10 @@ fn contract_chunk_scrollback_lines_signature() {
     let docs = chunk_scrollback_lines(&lines, 5_000);
     // At least produces some documents; exact count is implementation detail
     assert!(!docs.is_empty());
-    assert!(docs.iter().all(|d| d.source == SearchDocumentSource::Scrollback));
+    assert!(
+        docs.iter()
+            .all(|d| d.source == SearchDocumentSource::Scrollback)
+    );
 }
 
 #[test]
@@ -597,7 +626,11 @@ fn contract_extract_agent_artifacts_signature() {
     );
     // Should extract code block, error, and tool artifacts
     assert!(!artifacts.is_empty());
-    assert!(artifacts.iter().all(|d| d.source == SearchDocumentSource::AgentArtifact));
+    assert!(
+        artifacts
+            .iter()
+            .all(|d| d.source == SearchDocumentSource::AgentArtifact)
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -636,11 +669,20 @@ fn contract_search_schema_properties() {
     let Some(schema) = load_search_schema() else {
         return;
     };
-    let props = schema["properties"].as_object().expect("properties is object");
+    let props = schema["properties"]
+        .as_object()
+        .expect("properties is object");
     // Freeze: top-level property names
     let expected = [
-        "query", "results", "total_hits", "limit", "pane_filter",
-        "since_filter", "until_filter", "mode", "metrics",
+        "query",
+        "results",
+        "total_hits",
+        "limit",
+        "pane_filter",
+        "since_filter",
+        "until_filter",
+        "mode",
+        "metrics",
     ];
     for field in &expected {
         assert!(props.contains_key(*field), "missing property: {}", field);
@@ -672,8 +714,15 @@ fn contract_search_schema_search_hit_def() {
 
     let props = hit["properties"].as_object().expect("hit properties");
     let expected_fields = [
-        "segment_id", "pane_id", "seq", "captured_at", "score",
-        "snippet", "content", "semantic_score", "fusion_rank",
+        "segment_id",
+        "pane_id",
+        "seq",
+        "captured_at",
+        "score",
+        "snippet",
+        "content",
+        "semantic_score",
+        "fusion_rank",
     ];
     for field in &expected_fields {
         assert!(props.contains_key(*field), "search_hit missing: {}", field);
@@ -701,10 +750,19 @@ fn contract_search_schema_metrics_fields() {
         .as_object()
         .expect("metrics properties");
     let expected = [
-        "requested_mode", "effective_mode", "fallback_reason", "rrf_k",
-        "lexical_weight", "semantic_weight", "lexical_candidates",
-        "semantic_candidates", "semantic_cache_hit", "semantic_latency_ms",
-        "semantic_rows_scanned", "semantic_budget_state", "semantic_backoff_until_ms",
+        "requested_mode",
+        "effective_mode",
+        "fallback_reason",
+        "rrf_k",
+        "lexical_weight",
+        "semantic_weight",
+        "lexical_candidates",
+        "semantic_candidates",
+        "semantic_cache_hit",
+        "semantic_latency_ms",
+        "semantic_rows_scanned",
+        "semantic_budget_state",
+        "semantic_backoff_until_ms",
     ];
     for field in &expected {
         assert!(metrics.contains_key(*field), "metrics missing: {}", field);
@@ -807,22 +865,17 @@ fn regression_index_ingest_and_stats() {
         stats.source_counts.get("scrollback").copied().unwrap_or(0),
         2
     );
+    assert_eq!(stats.source_counts.get("command").copied().unwrap_or(0), 2);
+    assert_eq!(stats.source_counts.get("agent").copied().unwrap_or(0), 2);
     assert_eq!(
-        stats.source_counts.get("command").copied().unwrap_or(0),
-        2
-    );
-    assert_eq!(
-        stats.source_counts.get("agent").copied().unwrap_or(0),
-        2
-    );
-    assert_eq!(
-        stats.source_counts.get("pane_metadata").copied().unwrap_or(0),
+        stats
+            .source_counts
+            .get("pane_metadata")
+            .copied()
+            .unwrap_or(0),
         1
     );
-    assert_eq!(
-        stats.source_counts.get("cass").copied().unwrap_or(0),
-        1
-    );
+    assert_eq!(stats.source_counts.get("cass").copied().unwrap_or(0), 1);
 }
 
 #[test]
@@ -844,7 +897,11 @@ fn regression_search_lexical_results() {
 
     // "cargo" should find command documents
     let results = index.search("cargo", 10, base_ts + 200);
-    assert!(results.len() >= 2, "expected >=2 cargo hits, got {}", results.len());
+    assert!(
+        results.len() >= 2,
+        "expected >=2 cargo hits, got {}",
+        results.len()
+    );
 
     // "panic" should find the error artifact
     let panic_results = index.search("panic", 10, base_ts + 201);
@@ -862,17 +919,8 @@ fn regression_search_lexical_results() {
 #[test]
 fn regression_hybrid_fusion_determinism() {
     // Same inputs always produce same fused ranking
-    let lexical = vec![
-        (1_u64, 10.0_f32),
-        (2, 9.0),
-        (3, 8.0),
-        (4, 7.0),
-    ];
-    let semantic = vec![
-        (3_u64, 0.99_f32),
-        (5, 0.95),
-        (1, 0.90),
-    ];
+    let lexical = vec![(1_u64, 10.0_f32), (2, 9.0), (3, 8.0), (4, 7.0)];
+    let semantic = vec![(3_u64, 0.99_f32), (5, 0.95), (1, 0.90)];
 
     let svc = HybridSearchService::new()
         .with_mode(SearchMode::Hybrid)
@@ -915,7 +963,7 @@ fn regression_duplicate_document_dedup() {
         None,
     );
     let r1 = index
-        .ingest_documents(&[doc.clone()], base_ts + 1, false, None)
+        .ingest_documents(std::slice::from_ref(&doc), base_ts + 1, false, None)
         .expect("first ingest");
     assert_eq!(r1.accepted_docs, 1);
 
@@ -1196,7 +1244,10 @@ fn contract_search_explain_diagnostic_codes_frozen() {
     };
     let result4 = explain_search(&ctx4);
     assert!(
-        result4.reasons.iter().any(|r| r.code == "RETENTION_CLEANUP"),
+        result4
+            .reasons
+            .iter()
+            .any(|r| r.code == "RETENTION_CLEANUP"),
         "should detect RETENTION_CLEANUP"
     );
 }

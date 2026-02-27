@@ -37,6 +37,7 @@ fn emit_dispatch(log: &mut MissionEventLog, cycle_id: u64, bead_id: &str, agent_
     );
 }
 
+#[allow(dead_code)]
 fn emit_rejection(log: &mut MissionEventLog, cycle_id: u64, bead_id: &str) {
     log.emit(
         MissionEventBuilder::new(
@@ -50,6 +51,7 @@ fn emit_rejection(log: &mut MissionEventLog, cycle_id: u64, bead_id: &str) {
     );
 }
 
+#[allow(dead_code)]
 fn emit_safety(log: &mut MissionEventLog, cycle_id: u64) {
     log.emit(
         MissionEventBuilder::new(
@@ -62,6 +64,7 @@ fn emit_safety(log: &mut MissionEventLog, cycle_id: u64) {
     );
 }
 
+#[allow(dead_code)]
 fn emit_conflict(log: &mut MissionEventLog, cycle_id: u64, kind: MissionEventKind) {
     log.emit(
         MissionEventBuilder::new(kind, "mission.conflict")
