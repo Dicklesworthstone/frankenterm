@@ -503,3 +503,322 @@ fn macos_memory_budget_falls_back_to_advisory_mode() {
         "macOS fallback should still read process RSS"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ESO Isomorphism Proofs: Behavioral equivalence under bounded caps
+// ---------------------------------------------------------------------------
+//
+// Each test below proves that a bounded buffer cap does NOT change observable
+// behavior for inputs within the budget. Only adversarial (over-budget) inputs
+// are affected, and the effect is safe truncation/eviction.
+//
+// Format per patch:
+//   - Ordering preserved:     yes — insertion/iteration order unchanged
+//   - Tie-breaking unchanged: yes — eviction uses deterministic LRU/FIFO
+//   - Floating-point:         N/A — no floating-point in cap logic
+//   - Golden outputs:         deterministic assertion below
+
+use frankenterm_core::events::{CooldownVerdict, DedupeVerdict, EventDeduplicator, NotificationCooldown};
+use frankenterm_core::patterns::{AgentType, Detection, DetectionContext, Severity};
+use frankenterm_core::rate_limit_tracker::RateLimitTracker;
+use frankenterm_core::ring_buffer::RingBuffer;
+use std::time::{Duration, Instant};
+
+/// ESO Proof: EventDeduplicator
+///
+/// Change: Added max_capacity with LRU eviction (oldest key evicted).
+/// - Ordering preserved:     yes — insertion_order VecDeque maintains FIFO
+/// - Tie-breaking unchanged: yes — HashMap lookup unchanged for existing keys
+/// - Floating-point:         N/A
+/// - Golden outputs:         10 keys within cap=10 → all detected as New then Duplicate
+#[test]
+fn eso_dedup_isomorphism_within_budget() {
+    let cap = 10;
+    let mut dedup = EventDeduplicator::with_config(Duration::from_secs(3600), cap);
+
+    // Insert exactly cap unique keys
+    let keys: Vec<String> = (0..cap).map(|i| format!("evt_{i}")).collect();
+    for key in &keys {
+        let verdict = dedup.check(key);
+        assert!(
+            matches!(verdict, DedupeVerdict::New),
+            "first insertion of {key} should be New"
+        );
+    }
+
+    // Re-check all — every key should be Duplicate (all still tracked)
+    for key in &keys {
+        let verdict = dedup.check(key);
+        assert!(
+            matches!(verdict, DedupeVerdict::Duplicate { .. }),
+            "{key} should be Duplicate on re-check within budget"
+        );
+    }
+}
+
+/// ESO Proof: EventDeduplicator — adversarial overflow
+///
+/// Change: Excess entries beyond max_capacity are evicted (oldest first).
+/// - Safety: only the oldest entry is removed; newest always survives.
+#[test]
+fn eso_dedup_adversarial_overflow_evicts_oldest() {
+    let cap = 5;
+    let mut dedup = EventDeduplicator::with_config(Duration::from_secs(3600), cap);
+
+    // Insert cap + 3 unique keys
+    let all_keys: Vec<String> = (0..cap + 3).map(|i| format!("key_{i}")).collect();
+    for key in &all_keys {
+        let _ = dedup.check(key);
+    }
+
+    // The first 3 keys should have been evicted (New on re-check)
+    for key in &all_keys[..3] {
+        let verdict = dedup.check(key);
+        assert!(
+            matches!(verdict, DedupeVerdict::New),
+            "evicted key {key} should be New"
+        );
+    }
+
+    // The last `cap` keys (minus the 3 re-inserted above which displaced more)
+    // should include the most recent entries. At minimum, the very last key
+    // inserted before this check should still be tracked.
+    let last_key = &all_keys[cap + 2];
+    let verdict = dedup.check(last_key);
+    assert!(
+        matches!(verdict, DedupeVerdict::Duplicate { .. }),
+        "most recent key should still be tracked"
+    );
+}
+
+/// ESO Proof: NotificationCooldown
+///
+/// Change: Added max_capacity with LRU eviction.
+/// - Ordering preserved:     yes
+/// - Tie-breaking unchanged: yes
+/// - Golden outputs:         5 keys within cap=5 → all Suppress on re-check
+#[test]
+fn eso_cooldown_isomorphism_within_budget() {
+    let cap = 5;
+    let mut cooldown = NotificationCooldown::with_config(Duration::from_secs(3600), cap);
+
+    let keys: Vec<String> = (0..cap).map(|i| format!("notif_{i}")).collect();
+    for key in &keys {
+        let verdict = cooldown.check(key);
+        assert!(
+            matches!(verdict, CooldownVerdict::Send { .. }),
+            "first check of {key} should Send"
+        );
+    }
+
+    // All keys still within budget → all Suppress
+    for key in &keys {
+        let verdict = cooldown.check(key);
+        assert!(
+            matches!(verdict, CooldownVerdict::Suppress { .. }),
+            "{key} should Suppress on re-check within budget"
+        );
+    }
+}
+
+/// ESO Proof: RateLimitTracker — pane cap isomorphism
+///
+/// Change: MAX_TRACKED_PANES = 256 with LRU eviction.
+/// - Ordering preserved:     yes — pane_order Vec maintains insertion order
+/// - Tie-breaking unchanged: yes
+/// - Golden outputs:         100 panes within cap → all tracked
+#[test]
+fn eso_rate_tracker_isomorphism_within_budget() {
+    let mut tracker = RateLimitTracker::new();
+    let now = Instant::now();
+
+    // Insert 100 unique panes (well within 256 cap)
+    for i in 0u64..100 {
+        tracker.record_at(
+            i,
+            AgentType::ClaudeCode,
+            "test_rule".to_string(),
+            None,
+            now + Duration::from_millis(i),
+        );
+    }
+
+    assert_eq!(tracker.tracked_pane_count(), 100);
+
+    // All 100 panes should be rate-limited (tracked)
+    for i in 0u64..100 {
+        assert!(
+            tracker.is_pane_rate_limited_at(i, now + Duration::from_millis(200)),
+            "pane {i} should be tracked within budget"
+        );
+    }
+}
+
+/// ESO Proof: RateLimitTracker — events-per-pane cap isomorphism
+///
+/// Change: MAX_EVENTS_PER_PANE = 64 with FIFO eviction.
+/// - Golden outputs:         64 events recorded → total_event_count == 64
+#[test]
+fn eso_rate_tracker_events_per_pane_within_budget() {
+    let mut tracker = RateLimitTracker::new();
+    let now = Instant::now();
+
+    for i in 0..64 {
+        tracker.record_at(
+            42,
+            AgentType::ClaudeCode,
+            format!("rule_{i}"),
+            None,
+            now + Duration::from_millis(i as u64),
+        );
+    }
+
+    assert_eq!(tracker.total_event_count(), 64, "exactly 64 events should be tracked");
+}
+
+/// ESO Proof: RingBuffer — behavioral equivalence within capacity
+///
+/// Change: RingBuffer has fixed capacity with eviction tracking.
+/// - Ordering preserved:     yes — circular buffer maintains FIFO order
+/// - Golden outputs:         push 10 items into cap=10 → all retained, order preserved
+#[test]
+fn eso_ring_buffer_isomorphism_within_budget() {
+    let mut ring = RingBuffer::new(10);
+
+    for i in 0u32..10 {
+        let evicted = ring.push(i);
+        assert!(evicted.is_none(), "no eviction within capacity");
+    }
+
+    assert_eq!(ring.len(), 10);
+    assert_eq!(ring.total_evicted(), 0);
+    assert_eq!(ring.total_pushed(), 10);
+
+    // Order preserved
+    let items: Vec<u32> = ring.iter().copied().collect();
+    assert_eq!(items, (0..10).collect::<Vec<u32>>());
+}
+
+/// ESO Proof: RingBuffer — adversarial overflow evicts oldest
+///
+/// Change: When capacity exceeded, oldest items evicted first.
+/// - Safety: newest items always preserved; eviction count tracked.
+#[test]
+fn eso_ring_buffer_adversarial_overflow() {
+    let mut ring = RingBuffer::new(5);
+
+    for i in 0u32..8 {
+        let _ = ring.push(i);
+    }
+
+    assert_eq!(ring.len(), 5);
+    assert_eq!(ring.total_evicted(), 3);
+
+    // Ring should contain [3, 4, 5, 6, 7] — tail of inputs
+    let items: Vec<u32> = ring.iter().copied().collect();
+    assert_eq!(items, vec![3, 4, 5, 6, 7]);
+    assert_eq!(ring.front(), Some(&3));
+    assert_eq!(ring.back(), Some(&7));
+}
+
+/// ESO Proof: DetectionContext — seen-key cap isomorphism
+///
+/// Change: MAX_SEEN_KEYS = 1000 with LRU eviction.
+/// - Ordering preserved:     yes — seen_order VecDeque maintains FIFO
+/// - Golden outputs:         500 detections within cap → all marked as seen
+#[test]
+fn eso_detection_context_isomorphism_within_budget() {
+    let mut ctx = DetectionContext::new();
+
+    for i in 0..500 {
+        let detection = Detection {
+            rule_id: format!("rule_{i}"),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "test".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: format!("text_{i}"),
+            span: (0, 0),
+        };
+        let was_new = ctx.mark_seen(&detection);
+        assert!(was_new, "detection {i} should be new");
+    }
+
+    assert_eq!(ctx.seen_count(), 500);
+
+    // Re-check: all should be marked as already seen (returns false)
+    for i in 0..500 {
+        let detection = Detection {
+            rule_id: format!("rule_{i}"),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "test".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: format!("text_{i}"),
+            span: (0, 0),
+        };
+        let was_new = ctx.mark_seen(&detection);
+        assert!(!was_new, "detection {i} should NOT be new on re-check");
+    }
+}
+
+/// ESO Proof: Scrollback eviction — deterministic plan under tier constraints
+///
+/// Change: Eviction respects PaneTier priority ordering.
+/// - Ordering preserved:     yes — BTreeMap iteration order
+/// - Tie-breaking unchanged: yes — tier priority is total order
+/// - Golden outputs:         identical inputs produce identical JSON plans
+#[test]
+fn eso_scrollback_eviction_plan_determinism() {
+    use frankenterm_core::scrollback_eviction::ScrollbackEvictor;
+
+    let store = FixedStore {
+        segments: HashMap::from([
+            (1, 10_000),
+            (2, 8_000),
+            (3, 3_000),
+            (4, 500),
+        ]),
+    };
+    let tiers = FixedTierSource {
+        tiers: HashMap::from([
+            (1, PaneTier::Active),
+            (2, PaneTier::Idle),
+            (3, PaneTier::Background),
+            (4, PaneTier::Dormant),
+        ]),
+    };
+
+    let evictor = ScrollbackEvictor::new(
+        frankenterm_core::scrollback_eviction::EvictionConfig::default(),
+        store.clone(),
+        tiers.clone(),
+    );
+
+    let plan_a = evictor.plan(MemoryPressureTier::Orange).expect("plan A");
+    let plan_b = evictor.plan(MemoryPressureTier::Orange).expect("plan B");
+
+    let json_a = serde_json::to_string(&plan_a).expect("serialize A");
+    let json_b = serde_json::to_string(&plan_b).expect("serialize B");
+
+    assert_eq!(json_a, json_b, "ESO proof: identical inputs → identical eviction plans");
+
+    // Dormant pane (4) should have a lower max_segments allowance than Active (1)
+    if !plan_a.is_empty() {
+        let active_max = plan_a.targets.iter()
+            .find(|t| t.pane_id == 1)
+            .map(|t| t.max_segments)
+            .unwrap_or(usize::MAX);
+        let dormant_max = plan_a.targets.iter()
+            .find(|t| t.pane_id == 4)
+            .map(|t| t.max_segments)
+            .unwrap_or(usize::MAX);
+        assert!(
+            dormant_max <= active_max,
+            "ESO: dormant max_segments {} > active max_segments {}",
+            dormant_max, active_max
+        );
+    }
+}
