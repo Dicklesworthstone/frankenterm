@@ -1,0 +1,53 @@
+{
+  "generated_at_utc": "2026-02-27T08:01:48Z",
+  "bead_id": "ft-1i2ge.8.12",
+  "run_id": "20260227_025927",
+  "scenario_id": "mission_tx_chaos_perf",
+  "correlation_id": "ft-1i2ge.8.12-20260227_025927",
+  "status": "pass",
+  "heavy_command_policy": "all cargo test commands executed via rch exec",
+  "suites": {
+    "chaos_fault_injection": {
+      "test_binary": "chaos_planner_dispatcher",
+      "passing_tests": 24,
+      "expected_min": 24,
+      "duration_seconds": 105,
+      "artifact_log": "tests/e2e/logs/mission_tx_chaos_perf_20260227_025927.chaos.stdout.log"
+    },
+    "performance_budget": {
+      "test_binary": "mission_perf_scalability",
+      "passing_tests": 26,
+      "expected_min": 20,
+      "duration_seconds": 6,
+      "artifact_log": "tests/e2e/logs/mission_tx_chaos_perf_20260227_025927.performance.stdout.log"
+    },
+    "failure_recovery_matrix": {
+      "test_binary": "tx_e2e_scenario_matrix",
+      "passing_tests": 19,
+      "expected_min": 19,
+      "duration_seconds": 9,
+      "artifact_log": "tests/e2e/logs/mission_tx_chaos_perf_20260227_025927.tx_matrix.stdout.log"
+    },
+    "tx_correctness_regression": {
+      "test_binary": "tx_correctness_suite",
+      "passing_tests": 44,
+      "expected_min": 20,
+      "duration_seconds": 14,
+      "artifact_log": "tests/e2e/logs/mission_tx_chaos_perf_20260227_025927.tx_correctness.stdout.log"
+    }
+  },
+  "readiness_gates": {
+    "bounded_failure_behavior": true,
+    "measured_tx_overhead": true,
+    "kill_switch_verified": true,
+    "rollback_readiness_verified": true
+  },
+  "evidence_summary": {
+    "kill_switch_signal_hits": 4,
+    "rollback_signal_hits": 13
+  },
+  "residual_risks": [
+    "No long-haul soak in this bead run; covered by downstream G6 soak gate.",
+    "No live multi-host partition drill in this bead run; deferred to production hardening game-day workflows."
+  ]
+}

@@ -1,0 +1,82 @@
+{
+  "generated_at_utc": "2026-02-27T08:19:11Z",
+  "bead_id": "ft-1i2ge.7.6",
+  "scenario_name": "ft_1i2ge_7_6",
+  "log_bundle": {
+    "mission_soak_jsonl": "tests/e2e/logs/mission_soak_20260227_031416.jsonl",
+    "mission_chaos_jsonl": "tests/e2e/logs/mission_chaos_20260227_031811.jsonl"
+  },
+  "soak_report": {
+    "generated_at_utc": "2026-02-27T08:18:06Z",
+    "bead_id": "ft-1i2ge.7.6",
+    "run_id": "20260227_031416",
+    "scenario_id": "mission_soak",
+    "correlation_id": "ft-1i2ge.7.6-soak-20260227_031416",
+    "tx_id": "tx-soak-20260227_031416",
+    "fixed_seed": "1706001",
+    "heavy_command_policy": "all cargo test commands executed via rch exec",
+    "baseline": {
+      "perf_suite_pass_count": 26,
+      "perf_suite_duration_seconds": 165,
+      "tx_matrix_pass_count": 19,
+      "tx_matrix_duration_seconds": 7
+    },
+    "soak_cycles": {
+      "count": 3,
+      "cycle_total_duration_seconds": [
+        16,
+        18,
+        17
+      ],
+      "resume_pass_counts": [
+        4,
+        4,
+        4
+      ]
+    },
+    "assertions": {
+      "deterministic_resume_behavior": true,
+      "no_unbounded_degradation": true
+    },
+    "residual_risks": [
+      "Campaign uses deterministic fixed-seed simulation windows rather than multi-hour wall-clock runtime.",
+      "Cross-host partition failures are validated in dedicated infrastructure drills, not this soak harness."
+    ]
+  },
+  "chaos_report": {
+    "generated_at_utc": "2026-02-27T08:18:58Z",
+    "bead_id": "ft-1i2ge.7.6",
+    "run_id": "20260227_031811",
+    "scenario_id": "mission_chaos",
+    "correlation_id": "ft-1i2ge.7.6-chaos-20260227_031811",
+    "tx_id": "tx-chaos-20260227_031811",
+    "fixed_seed": "1706001",
+    "heavy_command_policy": "all cargo test commands executed via rch exec",
+    "suites": {
+      "chaos_planner_dispatcher_pass_count": 24,
+      "tx_scenario_matrix_pass_count": 19,
+      "tx_observability_pass_count": 20,
+      "resume_run_a_pass_count": 4,
+      "resume_run_b_pass_count": 4,
+      "resume_run_a_duration_seconds": 6,
+      "resume_run_b_duration_seconds": 6
+    },
+    "assertions": {
+      "rollback_storm_coverage": true,
+      "deterministic_recovery_behavior": true,
+      "no_unsafe_dispatch_escalation": true,
+      "no_unbounded_degradation": true
+    },
+    "artifacts": {
+      "chaos_log": "tests/e2e/logs/mission_chaos_20260227_031811.chaos_planner_dispatcher.stdout.log",
+      "tx_matrix_log": "tests/e2e/logs/mission_chaos_20260227_031811.tx_scenario_matrix.stdout.log",
+      "tx_observability_log": "tests/e2e/logs/mission_chaos_20260227_031811.tx_observability.stdout.log",
+      "resume_run_a_log": "tests/e2e/logs/mission_chaos_20260227_031811.resume_recovery_a.stdout.log",
+      "resume_run_b_log": "tests/e2e/logs/mission_chaos_20260227_031811.resume_recovery_b.stdout.log"
+    },
+    "residual_risks": [
+      "Chaos campaign is deterministic with fixed seeds and does not model fully random external faults.",
+      "Cross-process network partitions remain covered by dedicated distributed-mode drills."
+    ]
+  }
+}

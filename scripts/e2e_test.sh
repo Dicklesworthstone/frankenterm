@@ -506,6 +506,8 @@ SCENARIO_REGISTRY=(
     "ft_1i2ge_8_6|Validate compensation planner and automatic rollback engine|false|cargo,jq,rch|Protects compensation barrier semantics reverse ordering and rollback state contracts"
     "ft_1i2ge_8_7|Validate durable idempotency, dedupe, and resume invariants|false|cargo,jq,rch|Protects restart-safe idempotency keys dedup guards double-execution blocking and resume reconstruction"
     "ft_1i2ge_8_10|Validate unit/property/concurrency correctness suite for tx semantics|false|cargo,jq,rch|Protects state machine transitions concurrency determinism reason codes and pipeline integrity"
+    "ft_1i2ge_8_12|Validate tx chaos/performance hardening and rollout-readiness evidence bundle|false|cargo,jq,rch|Protects tx bounded-failure behavior performance budgets and go/no-go evidence artifacts"
+    "ft_1i2ge_7_6|Validate mission long-haul soak + chaos burn-in evidence bundle|false|cargo,jq,rch|Protects tx-heavy soak stability rollback storm handling and deterministic resume-after-restart recovery"
     "ft_e34d9_10_3_2_cancellation|Validate two-phase cancellation and shutdown protocol rollout|false|cargo,jq,rch|Protects cancellation propagation shutdown lifecycle finalizer ordering and grace period semantics"
     "ft_e34d9_10_1_2_doctrine_pack|Validate asupersync runtime doctrine contract/invariants + failure injection|false|jq,python3|Protects doctrine semantics, anti-pattern gates, and user-facing guarantees"
     "ft_e34d9_10_2_1_runtime_bootstrap|Validate unified runtime bootstrap contract for CLI/watch/web/robot + failure injection|false|jq,python3|Protects runtime bootstrap lifecycle parity and configuration parsing contract"
@@ -11290,6 +11292,149 @@ run_scenario_ft_1i2ge_8_10() {
     return 0
 }
 
+run_scenario_ft_1i2ge_8_12() {
+    local scenario_dir="$1"
+    local case_name="ft_1i2ge_8_12"
+    local script_path="$PROJECT_ROOT/tests/e2e/test_mission_tx_chaos_perf.sh"
+    local scenario_stdout="$scenario_dir/${case_name}.stdout.log"
+    local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
+    local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/mission_tx_chaos_perf_* 2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+
+    log_info "[$case_name] Step 1: running tx chaos/perf hardening e2e harness"
+    set +e
+    timeout "$TIMEOUT" bash "$script_path" >"$scenario_stdout" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ "$rc" -eq 124 ]]; then
+        log_fail "[$case_name] harness timed out after ${TIMEOUT}s"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        log_fail "[$case_name] harness failed (exit=$rc)"
+        tail -n 120 "$scenario_stdout" >&2 || true
+        return "$rc"
+    fi
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/mission_tx_chaos_perf_* 2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    while IFS= read -r log_path; do
+        if [[ -z "$log_path" ]]; then
+            continue
+        fi
+        if [[ ! -f "$before_snapshot" ]] || ! grep -Fxq "$log_path" "$before_snapshot"; then
+            cp -f "$log_path" "$scenario_dir/" || true
+        fi
+    done < "$after_snapshot"
+
+    if [[ -f "$PROJECT_ROOT/docs/metrics/mission_tx_rollout_readiness.json" ]]; then
+        cp -f "$PROJECT_ROOT/docs/metrics/mission_tx_rollout_readiness.json" "$scenario_dir/" || true
+    fi
+
+    log_pass "[$case_name] tx chaos/perf hardening e2e completed"
+    return 0
+}
+
+run_scenario_ft_1i2ge_7_6() {
+    local scenario_dir="$1"
+    local case_name="ft_1i2ge_7_6"
+    local soak_script="$PROJECT_ROOT/tests/e2e/test_mission_soak.sh"
+    local chaos_script="$PROJECT_ROOT/tests/e2e/test_mission_chaos.sh"
+    local soak_stdout="$scenario_dir/${case_name}.soak.stdout.log"
+    local chaos_stdout="$scenario_dir/${case_name}.chaos.stdout.log"
+    local before_snapshot="$scenario_dir/${case_name}.logs.before.txt"
+    local after_snapshot="$scenario_dir/${case_name}.logs.after.txt"
+    local harness_timeout=$((TIMEOUT * 10))
+    local combined_report="$PROJECT_ROOT/docs/metrics/mission_soak_chaos_evidence.json"
+    local soak_report="$PROJECT_ROOT/docs/metrics/mission_soak_evidence.json"
+    local chaos_report="$PROJECT_ROOT/docs/metrics/mission_chaos_evidence.json"
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/mission_soak_* "$PROJECT_ROOT/tests/e2e/logs"/mission_chaos_* \
+        2>/dev/null | LC_ALL=C sort >"$before_snapshot" || true
+
+    log_info "[$case_name] Step 1: running mission soak harness"
+    set +e
+    timeout "${harness_timeout}" bash "$soak_script" >"$soak_stdout" 2>&1
+    local soak_rc=$?
+    set -e
+
+    if [[ "$soak_rc" -eq 124 ]]; then
+        log_fail "[$case_name] soak harness timed out after ${harness_timeout}s"
+        tail -n 120 "$soak_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$soak_rc" -ne 0 ]]; then
+        log_fail "[$case_name] soak harness failed (exit=$soak_rc)"
+        tail -n 120 "$soak_stdout" >&2 || true
+        return "$soak_rc"
+    fi
+
+    log_info "[$case_name] Step 2: running mission chaos harness"
+    set +e
+    timeout "${harness_timeout}" bash "$chaos_script" >"$chaos_stdout" 2>&1
+    local chaos_rc=$?
+    set -e
+
+    if [[ "$chaos_rc" -eq 124 ]]; then
+        log_fail "[$case_name] chaos harness timed out after ${harness_timeout}s"
+        tail -n 120 "$chaos_stdout" >&2 || true
+        return 4
+    fi
+    if [[ "$chaos_rc" -ne 0 ]]; then
+        log_fail "[$case_name] chaos harness failed (exit=$chaos_rc)"
+        tail -n 120 "$chaos_stdout" >&2 || true
+        return "$chaos_rc"
+    fi
+
+    ls -1 "$PROJECT_ROOT/tests/e2e/logs"/mission_soak_* "$PROJECT_ROOT/tests/e2e/logs"/mission_chaos_* \
+        2>/dev/null | LC_ALL=C sort >"$after_snapshot" || true
+    while IFS= read -r log_path; do
+        if [[ -z "$log_path" ]]; then
+            continue
+        fi
+        if [[ ! -f "$before_snapshot" ]] || ! grep -Fxq "$log_path" "$before_snapshot"; then
+            cp -f "$log_path" "$scenario_dir/" || true
+        fi
+    done < "$after_snapshot"
+
+    if [[ -f "$soak_report" ]]; then
+        cp -f "$soak_report" "$scenario_dir/" || true
+    fi
+    if [[ -f "$chaos_report" ]]; then
+        cp -f "$chaos_report" "$scenario_dir/" || true
+    fi
+
+    if [[ -f "$soak_report" && -f "$chaos_report" ]]; then
+        jq -n \
+            --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            --arg bead_id "ft-1i2ge.7.6" \
+            --arg run_id "$RUN_ID" \
+            --arg scenario_name "$case_name" \
+            --arg soak_log "$(ls -1t "$PROJECT_ROOT/tests/e2e/logs"/mission_soak_*.jsonl 2>/dev/null | head -n1 | sed "s#^${PROJECT_ROOT}/##")" \
+            --arg chaos_log "$(ls -1t "$PROJECT_ROOT/tests/e2e/logs"/mission_chaos_*.jsonl 2>/dev/null | head -n1 | sed "s#^${PROJECT_ROOT}/##")" \
+            --argjson soak "$(cat "$soak_report")" \
+            --argjson chaos "$(cat "$chaos_report")" \
+            '{
+                generated_at_utc: $generated_at,
+                bead_id: $bead_id,
+                run_id: $run_id,
+                scenario_name: $scenario_name,
+                log_bundle: {
+                    mission_soak_jsonl: $soak_log,
+                    mission_chaos_jsonl: $chaos_log
+                },
+                soak_report: $soak,
+                chaos_report: $chaos
+            }' > "$combined_report"
+        cp -f "$combined_report" "$scenario_dir/" || true
+    fi
+
+    log_pass "[$case_name] mission soak + chaos burn-in e2e completed"
+    return 0
+}
+
 run_scenario_ft_e34d9_10_3_2_cancellation() {
     local scenario_dir="$1"
     local case_name="ft_e34d9_10_3_2_cancellation"
@@ -11933,6 +12078,12 @@ dispatch_scenario() {
             ;;
         ft_1i2ge_8_10)
             run_scenario_ft_1i2ge_8_10 "$scenario_dir" || result=$?
+            ;;
+        ft_1i2ge_8_12)
+            run_scenario_ft_1i2ge_8_12 "$scenario_dir" || result=$?
+            ;;
+        ft_1i2ge_7_6)
+            run_scenario_ft_1i2ge_7_6 "$scenario_dir" || result=$?
             ;;
         ft_e34d9_10_3_2_cancellation)
             run_scenario_ft_e34d9_10_3_2_cancellation "$scenario_dir" || result=$?
