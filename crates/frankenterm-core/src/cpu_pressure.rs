@@ -225,6 +225,7 @@ impl CpuPressureMonitor {
     fn read_cpu_pressure(&self) -> f64 {
         #[cfg(target_os = "linux")]
         {
+            let _ = &self.ncpu;
             read_linux_psi_avg10()
         }
         #[cfg(target_os = "macos")]

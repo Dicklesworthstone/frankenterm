@@ -318,7 +318,7 @@ fn read_process_info(pid: u32) -> Option<RawProcessInfo> {
         .first()
         .map(|s| parse_linux_state(s))
         .unwrap_or(ProcessState::Unknown);
-    let ppid = fields
+    let parent_pid = fields
         .get(1)
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
@@ -344,7 +344,7 @@ fn read_process_info(pid: u32) -> Option<RawProcessInfo> {
 
     Some(RawProcessInfo {
         pid,
-        ppid,
+        ppid: parent_pid,
         name,
         argv,
         state,

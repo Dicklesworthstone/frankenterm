@@ -124,6 +124,11 @@ impl PaneStack {
         self.panes.len()
     }
 
+    /// Returns true if the stack is empty.
+    pub fn is_empty(&self) -> bool {
+        self.panes.is_empty()
+    }
+
     /// Returns true if the stack has only one pane.
     pub fn is_single(&self) -> bool {
         self.panes.len() == 1
@@ -218,7 +223,7 @@ impl LayoutCycle {
     }
 
     /// Advance to the next layout and return it.
-    pub fn next(&mut self) -> &SwapLayout {
+    pub fn advance(&mut self) -> &SwapLayout {
         self.current = (self.current + 1) % self.layouts.len();
         &self.layouts[self.current]
     }
@@ -324,12 +329,12 @@ pub fn redistribute_panes(
 
     // Distribute other panes to remaining slots.
     let mut pane_iter = other_panes.into_iter();
-    for i in 0..slot_count {
+    for (i, slot) in slot_assignments.iter_mut().enumerate().take(slot_count) {
         if i == main_target {
             continue; // main slot already has the active pane
         }
         if let Some(p) = pane_iter.next() {
-            slot_assignments[i].push(p);
+            slot.push(p);
         }
     }
 
@@ -655,10 +660,10 @@ mod tests {
     fn layout_cycle_wraps() {
         let mut cycle = default_cycle();
         assert_eq!(cycle.current().name, "grid-4");
-        assert_eq!(cycle.next().name, "main-side");
-        assert_eq!(cycle.next().name, "stacked");
-        assert_eq!(cycle.next().name, "main-bottom");
-        assert_eq!(cycle.next().name, "grid-4"); // wraps
+        assert_eq!(cycle.advance().name, "main-side");
+        assert_eq!(cycle.advance().name, "stacked");
+        assert_eq!(cycle.advance().name, "main-bottom");
+        assert_eq!(cycle.advance().name, "grid-4"); // wraps
     }
 
     #[test]

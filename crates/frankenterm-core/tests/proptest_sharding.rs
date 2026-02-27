@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use proptest::prelude::*;
 
 use frankenterm_core::circuit_breaker::CircuitBreakerStatus;
+use frankenterm_core::config::{Config, VendoredShardingConfig};
 use frankenterm_core::patterns::AgentType;
 use frankenterm_core::sharding::{
     AssignmentStrategy, ShardHealthEntry, ShardHealthReport, ShardId, assign_pane_with_strategy,
@@ -22,6 +23,52 @@ fn arb_shard_count() -> impl Strategy<Value = usize> {
 
 fn arb_shards() -> impl Strategy<Value = Vec<ShardId>> {
     arb_shard_count().prop_map(|count| (0..count).map(ShardId).collect())
+}
+
+fn arb_assignment_strategy_for_shard_count(
+    shard_count: usize,
+) -> impl Strategy<Value = AssignmentStrategy> {
+    prop_oneof![
+        Just(AssignmentStrategy::RoundRobin),
+        (1u32..256).prop_map(|virtual_nodes| AssignmentStrategy::ConsistentHash { virtual_nodes }),
+        (
+            prop::collection::vec(("[a-z]{1,8}", 0usize..shard_count), 0..10),
+            prop::option::of(0usize..shard_count),
+        )
+            .prop_map(
+                |(domain_pairs, default_shard)| AssignmentStrategy::ByDomain {
+                    domain_to_shard: domain_pairs
+                        .into_iter()
+                        .map(|(domain, shard)| (domain, ShardId(shard)))
+                        .collect(),
+                    default_shard: default_shard.map(ShardId),
+                }
+            ),
+        (
+            prop::collection::vec((arb_agent_type(), 0usize..shard_count), 0..10),
+            prop::option::of(0usize..shard_count),
+        )
+            .prop_map(
+                |(agent_pairs, default_shard)| AssignmentStrategy::ByAgentType {
+                    agent_to_shard: agent_pairs
+                        .into_iter()
+                        .map(|(agent, shard)| (agent, ShardId(shard)))
+                        .collect(),
+                    default_shard: default_shard.map(ShardId),
+                }
+            ),
+        (
+            prop::collection::vec((any::<u64>(), 0usize..shard_count), 0..12),
+            prop::option::of(0usize..shard_count),
+        )
+            .prop_map(|(manual_pairs, default_shard)| AssignmentStrategy::Manual {
+                pane_to_shard: manual_pairs
+                    .into_iter()
+                    .map(|(pane_id, shard)| (pane_id, ShardId(shard)))
+                    .collect(),
+                default_shard: default_shard.map(ShardId),
+            }),
+    ]
 }
 
 fn arb_agent_type() -> impl Strategy<Value = AgentType> {
@@ -221,7 +268,7 @@ proptest! {
 
     #[test]
     fn prop_consistent_hash_minimal_disruption(
-        pane_ids in prop::collection::vec(any::<u64>(), 20..400),
+        pane_ids in prop::collection::vec(any::<u64>(), 120..800),
         base_nodes in 2usize..10,
         virtual_nodes in 16u32..256,
     ) {
@@ -239,8 +286,15 @@ proptest! {
             }
         }
 
-        // Adding one node should not remap every key.
-        prop_assert!(remapped < pane_ids.len());
+        // Adding one node should remap at most ~1/N keys where N is original
+        // shard count (minimal-disruption expectation for consistent hashing).
+        let max_allowed = (pane_ids.len() + base_nodes - 1) / base_nodes;
+        prop_assert!(
+            remapped <= max_allowed,
+            "remapped {remapped}/{} keys (max allowed {max_allowed}) when expanding {base_nodes} -> {} shards",
+            pane_ids.len(),
+            base_nodes + 1
+        );
     }
 
     /// Consistent hash is deterministic: same inputs → same shard.
@@ -255,6 +309,46 @@ proptest! {
         let s1 = assign_pane_with_strategy(&strategy, &shards, pane_id, None, None);
         let s2 = assign_pane_with_strategy(&strategy, &shards, pane_id, None, None);
         prop_assert_eq!(s1, s2, "consistent hash should be deterministic");
+    }
+}
+
+// =========================================================================
+// Sharding config roundtrip and validation
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(120))]
+
+    #[test]
+    fn prop_vendored_sharding_config_roundtrip_and_validate(
+        input in (2usize..16).prop_flat_map(|shard_count| {
+            (
+                Just(shard_count),
+                arb_assignment_strategy_for_shard_count(shard_count),
+            )
+        }),
+    ) {
+        let (shard_count, assignment) = input;
+        let socket_paths = (0..shard_count)
+            .map(|idx| format!("/tmp/ft-prop-shard-{idx}.sock"))
+            .collect::<Vec<_>>();
+
+        let sharding = VendoredShardingConfig {
+            enabled: true,
+            socket_paths: socket_paths.clone(),
+            assignment: assignment.clone(),
+        };
+
+        let encoded = serde_json::to_string(&sharding).unwrap();
+        let decoded: VendoredShardingConfig = serde_json::from_str(&encoded).unwrap();
+
+        prop_assert!(decoded.enabled);
+        prop_assert_eq!(&decoded.socket_paths, &socket_paths);
+        prop_assert_eq!(&decoded.assignment, &assignment);
+
+        let mut config = Config::default();
+        config.vendored.sharding = decoded;
+        prop_assert!(config.validate().is_ok());
     }
 }
 

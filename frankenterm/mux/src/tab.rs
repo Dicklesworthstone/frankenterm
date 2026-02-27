@@ -2047,7 +2047,7 @@ impl TabInner {
     /// new layout, or None if no cycle is configured or the tab has no panes.
     fn swap_to_next_layout(&mut self) -> Option<String> {
         let cycle = self.layout_cycle.as_mut()?;
-        let layout = cycle.next().clone();
+        let layout = cycle.advance().clone();
         self.apply_layout(&layout)
     }
 
@@ -2174,7 +2174,7 @@ impl TabInner {
     /// Returns all stacked pane IDs across all slots.
     fn all_stacked_pane_ids(&self) -> Vec<PaneId> {
         let mut ids = Vec::new();
-        for (_slot, stack) in &self.pane_stacks {
+        for stack in self.pane_stacks.values() {
             ids.extend(stack.pane_ids());
         }
         ids

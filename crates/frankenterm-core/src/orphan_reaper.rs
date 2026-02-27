@@ -243,6 +243,7 @@ fn parse_ps_age_secs_macos(age: &str) -> Result<u64, String> {
 /// Parse the `etime` format from `ps -o etime=`.
 ///
 /// Formats: `SS`, `MM:SS`, `HH:MM:SS`, `D-HH:MM:SS`
+#[cfg(any(target_os = "macos", test))]
 fn parse_etime(etime: &str) -> Result<u64, String> {
     if etime.is_empty() {
         return Err("empty etime".to_string());
