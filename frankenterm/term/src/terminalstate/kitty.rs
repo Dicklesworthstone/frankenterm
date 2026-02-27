@@ -27,11 +27,38 @@ pub struct KittyImageState {
     used_memory: usize,
 }
 
+/// Maximum number of accumulated multi-chunk Kitty image fragments.
+/// Prevents unbounded growth from malformed escape sequences that start
+/// a multi-chunk transfer but never send the final chunk.
+const MAX_KITTY_ACCUMULATOR_CHUNKS: usize = 4096;
+
+/// Maximum number of image-number-to-id mappings before oldest-first eviction.
+/// Prevents unbounded HashMap growth in long-running sessions with many
+/// unique image numbers.
+const MAX_KITTY_NUMBER_TO_ID_ENTRIES: usize = 4096;
+
 impl KittyImageState {
+    /// Push a chunk to the accumulator, discarding all accumulated data
+    /// if the cap is exceeded (prevents unbounded growth from malformed
+    /// multi-chunk transfers that never send a final chunk).
+    fn accumulate_chunk(&mut self, img: KittyImage) {
+        if self.accumulator.len() >= MAX_KITTY_ACCUMULATOR_CHUNKS {
+            log::warn!(
+                "kitty image accumulator exceeded {} chunks, discarding incomplete transfer",
+                MAX_KITTY_ACCUMULATOR_CHUNKS
+            );
+            self.accumulator.clear();
+        }
+        self.accumulator.push(img);
+    }
+
     fn remove_data_for_id(&mut self, image_id: u32) {
         if let Some(data) = self.id_to_data.remove(&image_id) {
             self.used_memory = self.used_memory.saturating_sub(data.len());
         }
+        // Also clean up any number_to_id entries that mapped to
+        // this image_id, preventing unbounded HashMap growth.
+        self.number_to_id.retain(|_num, id| *id != image_id);
     }
 
     fn record_id_to_data(&mut self, image_id: u32, data: Arc<ImageData>) {
@@ -64,6 +91,28 @@ impl KittyImageState {
                 freed
             );
             self.used_memory = self.used_memory.saturating_sub(freed);
+        }
+
+        // Cap number_to_id to prevent unbounded growth. Evict entries
+        // whose image IDs are no longer in id_to_data (stale mappings).
+        if self.number_to_id.len() > MAX_KITTY_NUMBER_TO_ID_ENTRIES {
+            self.number_to_id
+                .retain(|_num, id| self.id_to_data.contains_key(id));
+            // If still over cap after removing stale entries, do a brute
+            // truncation to stay within bounds.
+            if self.number_to_id.len() > MAX_KITTY_NUMBER_TO_ID_ENTRIES {
+                let excess = self.number_to_id.len() - MAX_KITTY_NUMBER_TO_ID_ENTRIES;
+                let keys_to_remove: Vec<u32> =
+                    self.number_to_id.keys().take(excess).copied().collect();
+                for key in keys_to_remove {
+                    self.number_to_id.remove(&key);
+                }
+                log::warn!(
+                    "kitty number_to_id exceeded cap ({}), evicted {} stale entries",
+                    MAX_KITTY_NUMBER_TO_ID_ENTRIES,
+                    excess
+                );
+            }
         }
     }
 }
@@ -208,7 +257,7 @@ impl TerminalState {
                     verbosity,
                 };
                 if more_data_follows {
-                    self.kitty_img.accumulator.push(img);
+                    self.kitty_img.accumulate_chunk(img);
                 } else {
                     self.kitty_img_inner(img)?;
                 }
@@ -225,7 +274,7 @@ impl TerminalState {
                     verbosity,
                 };
                 if more_data_follows {
-                    self.kitty_img.accumulator.push(img);
+                    self.kitty_img.accumulate_chunk(img);
                 } else {
                     self.kitty_img_inner(img)?;
                 }

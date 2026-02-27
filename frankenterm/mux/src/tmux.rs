@@ -17,6 +17,28 @@ use std::io::Write;
 use std::sync::Arc;
 use termwiz::tmux_cc::*;
 
+/// Maximum backlog payload size per pane (1 MiB). Payloads exceeding
+/// this are truncated to the tail bytes so the most recent output is
+/// preserved.
+const MAX_BACKLOG_BYTES_PER_PANE: usize = 1_048_576;
+
+/// Warning threshold for tmux command queue depth. Exceeding this
+/// indicates protocol churn or a stalled consumer.
+const CMD_QUEUE_WARNING_DEPTH: usize = 10_000;
+
+fn cap_backlog_payload(payload: &[u8]) -> Vec<u8> {
+    if payload.len() <= MAX_BACKLOG_BYTES_PER_PANE {
+        payload.to_vec()
+    } else {
+        log::warn!(
+            "tmux backlog payload ({} bytes) exceeds {} limit; keeping tail",
+            payload.len(),
+            MAX_BACKLOG_BYTES_PER_PANE,
+        );
+        payload[payload.len() - MAX_BACKLOG_BYTES_PER_PANE..].to_vec()
+    }
+}
+
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum AttachState {
     Init,
@@ -185,7 +207,9 @@ impl TmuxDomainState {
                     } else {
                         // the output may come early then pane is ready, in this case we
                         // backlog it
-                        self.backlog.lock().insert(*pane, text.to_vec());
+                        self.backlog
+                            .lock()
+                            .insert(*pane, cap_backlog_payload(text));
                         log::debug!("Tmux pane {} havn't been attached", pane);
                     }
                 }
@@ -259,6 +283,13 @@ impl TmuxDomainState {
             return;
         }
         let mut cmd_queue = self.cmd_queue.as_ref().lock();
+        if cmd_queue.len() > CMD_QUEUE_WARNING_DEPTH {
+            log::warn!(
+                "tmux command queue depth ({}) exceeds {} threshold; possible protocol churn",
+                cmd_queue.len(),
+                CMD_QUEUE_WARNING_DEPTH,
+            );
+        }
         while let Some(first) = cmd_queue.front() {
             let cmd = first.get_command(self.domain_id);
             if cmd.is_empty() {
@@ -450,5 +481,35 @@ impl Domain for TmuxDomain {
 
     fn state(&self) -> DomainState {
         DomainState::Attached
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backlog_payload_cap_keeps_small_payload_unchanged() {
+        let small = vec![0u8; 1024];
+        let capped = cap_backlog_payload(&small);
+        assert_eq!(small, capped);
+    }
+
+    #[test]
+    fn backlog_payload_cap_keeps_tail_when_payload_exceeds_limit() {
+        let large_len = MAX_BACKLOG_BYTES_PER_PANE + 512;
+        let large: Vec<u8> = (0..large_len).map(|i| (i % 256) as u8).collect();
+        let capped = cap_backlog_payload(&large);
+        assert_eq!(MAX_BACKLOG_BYTES_PER_PANE, capped.len());
+        // The capped output should be the tail of the original
+        assert_eq!(&large[large_len - MAX_BACKLOG_BYTES_PER_PANE..], &capped[..]);
+    }
+
+    #[test]
+    fn backlog_payload_cap_at_exact_limit_is_unchanged() {
+        let exact = vec![42u8; MAX_BACKLOG_BYTES_PER_PANE];
+        let capped = cap_backlog_payload(&exact);
+        assert_eq!(exact.len(), capped.len());
+        assert_eq!(exact, capped);
     }
 }

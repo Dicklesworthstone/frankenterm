@@ -17,14 +17,31 @@ use crate::allocate::*;
 mod sixel;
 use sixel::SixelBuilder;
 
+const MAX_TCAP_NAMES: usize = 512;
+const MAX_TCAP_CURRENT_BYTES: usize = 1_048_576;
+
 #[derive(Default)]
 struct GetTcapBuilder {
     current: Vec<u8>,
     names: Vec<String>,
+    discarding: bool,
 }
 
 impl GetTcapBuilder {
     fn flush(&mut self) {
+        if self.discarding {
+            self.current.clear();
+            return;
+        }
+        if self.names.len() >= MAX_TCAP_NAMES {
+            log::warn!(
+                "XtGetTcap names exceeded {} limit; discarding further names",
+                MAX_TCAP_NAMES,
+            );
+            self.discarding = true;
+            self.current.clear();
+            return;
+        }
         let decoded = hex::decode(&self.current)
             .map(|s| String::from_utf8_lossy(&s).to_string())
             .unwrap_or_else(|_| String::from_utf8_lossy(&self.current).to_string());
@@ -35,7 +52,7 @@ impl GetTcapBuilder {
     pub fn push(&mut self, data: u8) {
         if data == b';' {
             self.flush();
-        } else {
+        } else if !self.discarding && self.current.len() < MAX_TCAP_CURRENT_BYTES {
             self.current.push(data);
         }
     }
@@ -887,6 +904,72 @@ mod test {
         assert_eq!(2, short_dcs.len());
         assert_eq!(MAX_SHORT_DCS_BYTES, short_dcs[0].data.len());
         assert_eq!(b"OK".to_vec(), short_dcs[1].data);
+    }
+
+    #[test]
+    fn overlong_xtgettcap_current_is_capped() {
+        let mut p = Parser::new();
+        let mut seq = Vec::with_capacity(MAX_TCAP_CURRENT_BYTES + 512);
+        // DCS +q  starts XtGetTcap mode
+        seq.extend_from_slice(b"\x1bP+q");
+        // Push more bytes than the per-name cap without a semicolon separator
+        seq.extend(std::iter::repeat_n(b'4', MAX_TCAP_CURRENT_BYTES + 128));
+        // Terminate the DCS
+        seq.extend_from_slice(b"\x1b\\");
+        // Parse a subsequent well-formed XtGetTcap to verify recovery
+        seq.extend_from_slice(b"\x1bP+q544e\x1b\\");
+
+        let actions = p.parse_as_vec(&seq);
+        let mut tcap_results = Vec::new();
+        for action in &actions {
+            if let Action::XtGetTcap(names) = action {
+                tcap_results.push(names.clone());
+            }
+        }
+
+        assert_eq!(2, tcap_results.len());
+        // First XtGetTcap: the single name should be capped at MAX_TCAP_CURRENT_BYTES
+        assert_eq!(1, tcap_results[0].len());
+        // The decoded hex output is half the input byte count (2 hex chars per output byte).
+        // Since we're pushing raw hex chars that may or may not decode cleanly,
+        // just verify the result is bounded.
+        assert!(tcap_results[0][0].len() <= MAX_TCAP_CURRENT_BYTES);
+        // Second XtGetTcap: verify parser recovered correctly
+        assert_eq!(vec!["TN".to_string()], tcap_results[1]);
+    }
+
+    #[test]
+    fn overlong_xtgettcap_names_are_capped() {
+        let mut p = Parser::new();
+        let mut seq = Vec::new();
+        // DCS +q starts XtGetTcap mode
+        seq.extend_from_slice(b"\x1bP+q");
+        // Push MAX_TCAP_NAMES + 10 semicolon-separated single-byte names
+        for i in 0..(MAX_TCAP_NAMES + 10) {
+            if i > 0 {
+                seq.push(b';');
+            }
+            // Each name is a single hex digit
+            seq.push(b'4');
+        }
+        // Terminate
+        seq.extend_from_slice(b"\x1b\\");
+        // Follow with a well-formed XtGetTcap
+        seq.extend_from_slice(b"\x1bP+q544e\x1b\\");
+
+        let actions = p.parse_as_vec(&seq);
+        let mut tcap_results = Vec::new();
+        for action in &actions {
+            if let Action::XtGetTcap(names) = action {
+                tcap_results.push(names.clone());
+            }
+        }
+
+        assert_eq!(2, tcap_results.len());
+        // First XtGetTcap: names should be capped at MAX_TCAP_NAMES
+        assert!(tcap_results[0].len() <= MAX_TCAP_NAMES);
+        // Second XtGetTcap: parser recovered
+        assert_eq!(vec!["TN".to_string()], tcap_results[1]);
     }
 
     #[test]

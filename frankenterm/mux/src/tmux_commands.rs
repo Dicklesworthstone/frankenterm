@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context};
 use frankenterm_term::TerminalSize;
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{MasterPty, PtySize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
@@ -108,51 +108,85 @@ impl TmuxDomainState {
         Ok(())
     }
 
+    fn remove_tmux_pane_state_entries(
+        remote_panes: &mut HashMap<TmuxPaneId, Arc<Mutex<TmuxRemotePane>>>,
+        backlog: &mut HashMap<TmuxPaneId, Vec<u8>>,
+        pane_ids: &[TmuxPaneId],
+    ) -> Vec<PaneId> {
+        let mut local_pane_ids = Vec::with_capacity(pane_ids.len());
+        for pane_id in pane_ids {
+            if let Some(remote) = remote_panes.remove(pane_id) {
+                local_pane_ids.push(remote.lock().local_pane_id);
+            }
+            let _ = backlog.remove(pane_id);
+        }
+        local_pane_ids
+    }
+
     fn remove_detached_pane(
         &self,
         window_id: TmuxWindowId,
         new_set: &HashSet<TmuxPaneId>,
     ) -> anyhow::Result<()> {
-        let mut gui_tabs = self.gui_tabs.lock();
+        let (tab_id, to_remove, tab_empty) = {
+            let mut gui_tabs = self.gui_tabs.lock();
 
-        let (tab_id, panes) = match gui_tabs.get_mut(&window_id) {
-            Some(tab) => (tab.tab_id, &mut tab.panes),
-            None => anyhow::bail!("The window {window_id} is not attached"),
+            let (tab_id, panes) = match gui_tabs.get_mut(&window_id) {
+                Some(tab) => (tab.tab_id, &mut tab.panes),
+                None => anyhow::bail!("The window {window_id} is not attached"),
+            };
+
+            let to_remove: Vec<_> = panes.difference(new_set).cloned().collect();
+            for pane_id in &to_remove {
+                let _ = panes.remove(pane_id);
+            }
+
+            let tab_empty = panes.is_empty();
+            if tab_empty {
+                gui_tabs.remove(&window_id);
+            }
+
+            (tab_id, to_remove, tab_empty)
         };
 
-        let to_remove: Vec<_> = panes.difference(new_set).cloned().collect();
+        let local_pane_ids = {
+            let mut pane_map = self.remote_panes.lock();
+            let mut backlog = self.backlog.lock();
+            Self::remove_tmux_pane_state_entries(&mut pane_map, &mut backlog, &to_remove)
+        };
 
         let mux = Mux::get();
-        for p in to_remove {
-            let pane_map = self.remote_panes.lock();
-            let Some(pane) = pane_map.get(&p) else {
-                continue;
-            };
-            let local_pane_id = pane.lock().local_pane_id;
-            mux.remove_pane(local_pane_id);
-            panes.remove(&p);
+        for pane_id in local_pane_ids {
+            mux.remove_pane(pane_id);
         }
-
-        if panes.is_empty() {
+        if tab_empty {
             mux.remove_tab(tab_id);
-            gui_tabs.remove(&window_id);
         }
 
         Ok(())
     }
 
     pub fn remove_detached_window(&self, window_id: TmuxWindowId) -> anyhow::Result<()> {
-        let mut gui_tabs = self.gui_tabs.lock();
-        let tab = match gui_tabs.get(&window_id) {
-            Some(x) => x,
-            None => {
-                anyhow::bail!("Cannot find the window {window_id}")
+        let tab = {
+            let mut gui_tabs = self.gui_tabs.lock();
+            match gui_tabs.remove(&window_id) {
+                Some(tab) => tab,
+                None => anyhow::bail!("Cannot find the window {window_id}"),
             }
         };
 
+        let detached_panes: Vec<_> = tab.panes.iter().copied().collect();
+        let local_pane_ids = {
+            let mut pane_map = self.remote_panes.lock();
+            let mut backlog = self.backlog.lock();
+            Self::remove_tmux_pane_state_entries(&mut pane_map, &mut backlog, &detached_panes)
+        };
+
         let mux = Mux::get();
+        for pane_id in local_pane_ids {
+            mux.remove_pane(pane_id);
+        }
         mux.remove_tab(tab.tab_id);
-        gui_tabs.remove(&window_id);
 
         Ok(())
     }
@@ -360,6 +394,26 @@ impl TmuxDomainState {
             return Ok(());
         };
         let mux = Mux::get();
+
+        if !new_window {
+            let active_window_ids: HashSet<TmuxWindowId> = windows
+                .iter()
+                .filter(|window| window.session_id == current_session)
+                .map(|window| window.window_id)
+                .collect();
+            let stale_window_ids: Vec<TmuxWindowId> = {
+                let gui_tabs = self.gui_tabs.lock();
+                gui_tabs
+                    .keys()
+                    .copied()
+                    .filter(|window_id| !active_window_ids.contains(window_id))
+                    .collect()
+            };
+
+            for stale_window_id in stale_window_ids {
+                let _ = self.remove_detached_window(stale_window_id);
+            }
+        }
 
         self.create_gui_window();
         let mut gui_window = self.gui_window.lock();
@@ -1221,5 +1275,53 @@ impl TmuxCommand for AttachDone {
         // Do nothing, just change the state.
         *tmux_domain.inner.attach_state.lock() = AttachState::Done;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_remote_pane(local_pane_id: PaneId, pane_id: TmuxPaneId) -> Arc<Mutex<TmuxRemotePane>> {
+        let (_read, write) = filedescriptor::socketpair().expect("socketpair");
+        Arc::new(Mutex::new(TmuxRemotePane {
+            local_pane_id,
+            output_write: write,
+            active_lock: Arc::new((Mutex::new(false), Condvar::new())),
+            session_id: 1,
+            window_id: 1,
+            pane_id,
+            cursor_x: 0,
+            cursor_y: 0,
+            pane_width: 80,
+            pane_height: 24,
+            pane_left: 0,
+            pane_top: 0,
+        }))
+    }
+
+    #[test]
+    fn remove_tmux_pane_state_entries_removes_requested_ids_only() {
+        let mut remote_panes: HashMap<TmuxPaneId, Arc<Mutex<TmuxRemotePane>>> = HashMap::new();
+        remote_panes.insert(11, make_remote_pane(101, 11));
+        remote_panes.insert(22, make_remote_pane(202, 22));
+
+        let mut backlog: HashMap<TmuxPaneId, Vec<u8>> = HashMap::new();
+        backlog.insert(11, b"pane-11".to_vec());
+        backlog.insert(22, b"pane-22".to_vec());
+        backlog.insert(33, b"pane-33".to_vec());
+
+        let removed_local_ids = TmuxDomainState::remove_tmux_pane_state_entries(
+            &mut remote_panes,
+            &mut backlog,
+            &[11, 33],
+        );
+
+        assert_eq!(removed_local_ids, vec![101]);
+        assert!(!remote_panes.contains_key(&11));
+        assert!(remote_panes.contains_key(&22));
+        assert!(!backlog.contains_key(&11));
+        assert!(backlog.contains_key(&22));
+        assert!(!backlog.contains_key(&33));
     }
 }
