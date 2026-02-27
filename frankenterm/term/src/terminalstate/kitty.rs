@@ -96,8 +96,9 @@ impl KittyImageState {
         // Cap number_to_id to prevent unbounded growth. Evict entries
         // whose image IDs are no longer in id_to_data (stale mappings).
         if self.number_to_id.len() > MAX_KITTY_NUMBER_TO_ID_ENTRIES {
+            let id_to_data = &self.id_to_data;
             self.number_to_id
-                .retain(|_num, id| self.id_to_data.contains_key(id));
+                .retain(|_num, id| id_to_data.contains_key(id));
             // If still over cap after removing stale entries, do a brute
             // truncation to stay within bounds.
             if self.number_to_id.len() > MAX_KITTY_NUMBER_TO_ID_ENTRIES {
@@ -906,7 +907,7 @@ impl TerminalState {
             let place;
             let final_verbosity = img.verbosity();
 
-            self.kitty_img.accumulator.push(img);
+            self.kitty_img.accumulate_chunk(img);
 
             let mut empty_data = KittyImageData::Direct(String::new());
             match self.kitty_img.accumulator.remove(0) {
