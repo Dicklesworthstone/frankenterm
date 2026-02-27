@@ -12,7 +12,7 @@
 //! - domain-aware throttling with per-domain budget caps (`wa-1u90p.5.3`)
 //! - observability via scheduler metrics and snapshots
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{OnceLock, RwLock};
 
 use crate::resize_invariants::{
@@ -735,7 +735,7 @@ const GUARDRAIL_REASON_SURGE_CLAMPED_BY_FLOOR: &str = "surge_reserve_clamped_by_
 #[derive(Debug)]
 pub struct ResizeScheduler {
     config: ResizeSchedulerConfig,
-    panes: HashMap<u64, PaneState>,
+    panes: BTreeMap<u64, PaneState>,
     metrics: ResizeSchedulerMetrics,
     lifecycle_events: VecDeque<ResizeTransactionLifecycleEvent>,
     next_lifecycle_event_seq: u64,
@@ -755,7 +755,7 @@ impl ResizeScheduler {
     pub fn new(config: ResizeSchedulerConfig) -> Self {
         let scheduler = Self {
             config,
-            panes: HashMap::new(),
+            panes: BTreeMap::new(),
             metrics: ResizeSchedulerMetrics::default(),
             lifecycle_events: VecDeque::new(),
             next_lifecycle_event_seq: 0,
