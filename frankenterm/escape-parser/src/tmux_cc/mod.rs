@@ -8,6 +8,12 @@ pub type TmuxWindowId = u64;
 pub type TmuxPaneId = u64;
 pub type TmuxSessionId = u64;
 
+/// Maximum accumulated output size (in bytes) for a tmux CC guarded block.
+/// Prevents unbounded memory growth when a `%begin` event is followed by
+/// excessive output before the corresponding `%end`/`%error` marker.
+/// 1 MiB is generous for any real tmux command response.
+const MAX_GUARDED_OUTPUT_LEN: usize = 1_048_576;
+
 pub mod parser {
     use pest_derive::Parser;
     #[derive(Parser)]
@@ -929,8 +935,16 @@ impl Parser {
                     .begun
                     .as_mut()
                     .ok_or_else(|| format_err!("missing begun"))?;
-                begun.output.push_str(line);
-                begun.output.push('\n');
+                if begun.output.len() + line.len() + 1 > MAX_GUARDED_OUTPUT_LEN {
+                    log::warn!(
+                        "tmux CC guarded output exceeded {} byte cap, discarding block",
+                        MAX_GUARDED_OUTPUT_LEN
+                    );
+                    self.begun.take();
+                } else {
+                    begun.output.push_str(line);
+                    begun.output.push('\n');
+                }
                 None
             }
         };
