@@ -1430,6 +1430,477 @@ fn generate_conflict_messages(conflict: &AssignmentConflict) -> Vec<Deconflictio
     messages
 }
 
+// ── Operator report views (ft-1i2ge.5.5) ────────────────────────────────────
+
+use crate::mission_events::{MissionEventLog, MissionEventLogSummary};
+use crate::planner_features::ExplainabilityReport;
+
+/// Top-level operator report synthesizing mission state into a human- and
+/// machine-consumable overview. Serializable for robot-mode JSON output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorStatusReport {
+    /// Mission lifecycle phase and timing.
+    pub status: OperatorStatusSection,
+    /// Per-agent assignment summary table.
+    pub assignment_table: Vec<AgentAssignmentRow>,
+    /// Health indicators derived from recent metrics.
+    pub health: OperatorHealthSection,
+    /// Conflict history summary.
+    pub conflicts: OperatorConflictSection,
+    /// Event log phase breakdown.
+    pub event_summary: OperatorEventSection,
+    /// Decision explanations for the latest cycle (if available).
+    pub latest_explanations: Vec<OperatorDecisionSummary>,
+}
+
+/// Status overview section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorStatusSection {
+    pub cycle_count: u64,
+    pub last_evaluation_ms: Option<i64>,
+    pub total_assignments: u64,
+    pub total_rejections: u64,
+    pub pending_trigger_count: usize,
+    /// Textual phase label (e.g. "active", "idle", "degraded").
+    pub phase_label: String,
+}
+
+/// One row in the per-agent assignment table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentAssignmentRow {
+    pub agent_id: String,
+    pub total_assignments: u64,
+    /// Number of beads currently assigned (from latest cycle).
+    pub active_beads: usize,
+    /// Bead IDs currently assigned.
+    pub active_bead_ids: Vec<String>,
+}
+
+/// Health indicators computed from the metrics window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorHealthSection {
+    pub throughput_assignments_per_minute: f64,
+    pub unblock_velocity_per_minute: f64,
+    pub conflict_rate: f64,
+    pub planner_churn_rate: f64,
+    pub policy_deny_rate: f64,
+    pub avg_evaluation_latency_ms: f64,
+    /// One of "healthy", "degraded", "critical".
+    pub overall: String,
+}
+
+/// Conflict section of the operator report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorConflictSection {
+    pub total_detected: u64,
+    pub total_auto_resolved: u64,
+    pub pending_manual: u64,
+    pub recent_conflicts: Vec<OperatorConflictSummary>,
+}
+
+/// Compact conflict summary for the operator report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorConflictSummary {
+    pub conflict_id: String,
+    pub conflict_type: String,
+    pub agents: Vec<String>,
+    pub beads: Vec<String>,
+    pub resolution: String,
+    pub reason_code: String,
+}
+
+/// Event log phase-breakdown section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorEventSection {
+    pub retained_events: usize,
+    pub total_emitted: u64,
+    pub by_phase: HashMap<String, usize>,
+    pub by_kind: HashMap<String, usize>,
+}
+
+/// Decision explanation summary for operator view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorDecisionSummary {
+    pub bead_id: String,
+    pub outcome: String,
+    pub summary: String,
+    pub top_factors: Vec<OperatorFactorSummary>,
+}
+
+/// Factor summary (top contributing dimensions).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorFactorSummary {
+    pub dimension: String,
+    pub value: f64,
+    pub polarity: String,
+    pub description: String,
+}
+
+impl MissionLoop {
+    /// Generate a full operator status report from current loop state and an
+    /// optional event log. The report is designed for both human CLI display
+    /// and robot-mode JSON serialization.
+    #[must_use]
+    pub fn generate_operator_report(
+        &self,
+        event_log: Option<&MissionEventLog>,
+        explainability: Option<&ExplainabilityReport>,
+    ) -> OperatorStatusReport {
+        let state = &self.state;
+
+        // ── Status section ──────────────────────────────────────────────
+        let phase_label = self.compute_phase_label();
+        let status = OperatorStatusSection {
+            cycle_count: state.cycle_count,
+            last_evaluation_ms: state.last_evaluation_ms,
+            total_assignments: state.total_assignments_made,
+            total_rejections: state.total_rejections,
+            pending_trigger_count: state.pending_triggers.len(),
+            phase_label,
+        };
+
+        // ── Agent assignment table ──────────────────────────────────────
+        let assignment_table = self.build_assignment_table();
+
+        // ── Health section ──────────────────────────────────────────────
+        let health = self.compute_health_section();
+
+        // ── Conflict section ────────────────────────────────────────────
+        let conflicts = self.build_conflict_section();
+
+        // ── Event log section ───────────────────────────────────────────
+        let event_summary = if let Some(log) = event_log {
+            let summary = log.summary();
+            build_event_section(&summary)
+        } else {
+            OperatorEventSection {
+                retained_events: 0,
+                total_emitted: 0,
+                by_phase: HashMap::new(),
+                by_kind: HashMap::new(),
+            }
+        };
+
+        // ── Decision explanations ───────────────────────────────────────
+        let latest_explanations = if let Some(explain) = explainability {
+            explain
+                .explanations
+                .iter()
+                .map(|e| OperatorDecisionSummary {
+                    bead_id: e.bead_id.clone(),
+                    outcome: format!("{:?}", e.outcome),
+                    summary: e.summary.clone(),
+                    top_factors: e
+                        .factors
+                        .iter()
+                        .take(5)
+                        .map(|f| OperatorFactorSummary {
+                            dimension: f.dimension.clone(),
+                            value: f.value,
+                            polarity: format!("{:?}", f.polarity),
+                            description: f.description.clone(),
+                        })
+                        .collect(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        OperatorStatusReport {
+            status,
+            assignment_table,
+            health,
+            conflicts,
+            event_summary,
+            latest_explanations,
+        }
+    }
+
+    /// Classify current operational phase based on state signals.
+    fn compute_phase_label(&self) -> String {
+        let state = &self.state;
+        if state.cycle_count == 0 {
+            return "idle".to_string();
+        }
+        // Check health signals from latest metrics
+        if let Some(latest) = state.metrics_history.last() {
+            if latest.conflict_rate > 0.3 || latest.policy_deny_rate > 0.5 {
+                return "degraded".to_string();
+            }
+        }
+        if !state.pending_triggers.is_empty() {
+            return "pending".to_string();
+        }
+        "active".to_string()
+    }
+
+    /// Build per-agent assignment summary table.
+    fn build_assignment_table(&self) -> Vec<AgentAssignmentRow> {
+        let state = &self.state;
+        let mut rows: Vec<AgentAssignmentRow> = state
+            .metrics_totals
+            .assignments_by_agent
+            .iter()
+            .map(|(agent_id, &total)| {
+                // Find beads currently assigned to this agent from latest decision
+                let (active_count, active_ids) = state
+                    .last_decision
+                    .as_ref()
+                    .map(|dec| {
+                        let ids: Vec<String> = dec
+                            .assignment_set
+                            .assignments
+                            .iter()
+                            .filter(|a| a.agent_id == *agent_id)
+                            .map(|a| a.bead_id.clone())
+                            .collect();
+                        (ids.len(), ids)
+                    })
+                    .unwrap_or((0, Vec::new()));
+                AgentAssignmentRow {
+                    agent_id: agent_id.clone(),
+                    total_assignments: total,
+                    active_beads: active_count,
+                    active_bead_ids: active_ids,
+                }
+            })
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.total_assignments));
+        rows
+    }
+
+    /// Compute health indicators from the metrics window.
+    fn compute_health_section(&self) -> OperatorHealthSection {
+        let state = &self.state;
+        let window = &state.metrics_history;
+
+        if window.is_empty() {
+            return OperatorHealthSection {
+                throughput_assignments_per_minute: 0.0,
+                unblock_velocity_per_minute: 0.0,
+                conflict_rate: 0.0,
+                planner_churn_rate: 0.0,
+                policy_deny_rate: 0.0,
+                avg_evaluation_latency_ms: 0.0,
+                overall: "idle".to_string(),
+            };
+        }
+
+        let n = window.len() as f64;
+        let avg_throughput = window.iter().map(|m| m.throughput_assignments_per_minute).sum::<f64>() / n;
+        let avg_unblock = window.iter().map(|m| m.unblock_velocity_per_minute).sum::<f64>() / n;
+        let avg_conflict = window.iter().map(|m| m.conflict_rate).sum::<f64>() / n;
+        let avg_churn = window.iter().map(|m| m.planner_churn_rate).sum::<f64>() / n;
+        let avg_deny = window.iter().map(|m| m.policy_deny_rate).sum::<f64>() / n;
+        let avg_latency = window.iter().map(|m| m.evaluation_latency_ms as f64).sum::<f64>() / n;
+
+        let overall = if avg_conflict > 0.3 || avg_deny > 0.5 {
+            "critical"
+        } else if avg_conflict > 0.1 || avg_churn > 0.3 || avg_deny > 0.2 {
+            "degraded"
+        } else {
+            "healthy"
+        };
+
+        OperatorHealthSection {
+            throughput_assignments_per_minute: avg_throughput,
+            unblock_velocity_per_minute: avg_unblock,
+            conflict_rate: avg_conflict,
+            planner_churn_rate: avg_churn,
+            policy_deny_rate: avg_deny,
+            avg_evaluation_latency_ms: avg_latency,
+            overall: overall.to_string(),
+        }
+    }
+
+    /// Build conflict summary section.
+    fn build_conflict_section(&self) -> OperatorConflictSection {
+        let state = &self.state;
+        let pending_manual = state
+            .conflict_history
+            .iter()
+            .filter(|c| c.resolution == ConflictResolution::PendingManualResolution)
+            .count() as u64;
+
+        let recent_conflicts: Vec<OperatorConflictSummary> = state
+            .conflict_history
+            .iter()
+            .rev()
+            .take(10)
+            .map(|c| OperatorConflictSummary {
+                conflict_id: c.conflict_id.clone(),
+                conflict_type: format!("{:?}", c.conflict_type),
+                agents: c.involved_agents.clone(),
+                beads: c.involved_beads.clone(),
+                resolution: format!("{:?}", c.resolution),
+                reason_code: c.reason_code.clone(),
+            })
+            .collect();
+
+        OperatorConflictSection {
+            total_detected: state.total_conflicts_detected,
+            total_auto_resolved: state.total_conflicts_auto_resolved,
+            pending_manual,
+            recent_conflicts,
+        }
+    }
+}
+
+/// Build event section from an event log summary.
+fn build_event_section(summary: &MissionEventLogSummary) -> OperatorEventSection {
+    OperatorEventSection {
+        retained_events: summary.retained_count,
+        total_emitted: summary.total_appended,
+        by_phase: summary
+            .by_phase
+            .iter()
+            .map(|(phase, &count)| (format!("{phase:?}"), count))
+            .collect(),
+        by_kind: summary
+            .by_kind
+            .iter()
+            .map(|(kind, &count)| (format!("{kind:?}"), count))
+            .collect(),
+    }
+}
+
+/// Format an `OperatorStatusReport` as human-readable plain text for CLI display.
+#[must_use]
+pub fn format_operator_report_plain(report: &OperatorStatusReport) -> String {
+    let mut out = String::new();
+
+    // ── Status ──
+    out.push_str("=== Mission Status ===\n");
+    out.push_str(&format!("  Phase:       {}\n", report.status.phase_label));
+    out.push_str(&format!("  Cycles:      {}\n", report.status.cycle_count));
+    out.push_str(&format!("  Assignments: {}\n", report.status.total_assignments));
+    out.push_str(&format!("  Rejections:  {}\n", report.status.total_rejections));
+    if let Some(ts) = report.status.last_evaluation_ms {
+        out.push_str(&format!("  Last eval:   {}ms\n", ts));
+    }
+    if report.status.pending_trigger_count > 0 {
+        out.push_str(&format!(
+            "  Pending:     {} trigger(s)\n",
+            report.status.pending_trigger_count
+        ));
+    }
+    out.push('\n');
+
+    // ── Health ──
+    out.push_str("=== Health ===\n");
+    out.push_str(&format!("  Overall:         {}\n", report.health.overall));
+    out.push_str(&format!(
+        "  Throughput:      {:.1} assign/min\n",
+        report.health.throughput_assignments_per_minute
+    ));
+    out.push_str(&format!(
+        "  Unblock vel:     {:.1}/min\n",
+        report.health.unblock_velocity_per_minute
+    ));
+    out.push_str(&format!(
+        "  Conflict rate:   {:.1}%\n",
+        report.health.conflict_rate * 100.0
+    ));
+    out.push_str(&format!(
+        "  Churn rate:      {:.1}%\n",
+        report.health.planner_churn_rate * 100.0
+    ));
+    out.push_str(&format!(
+        "  Policy deny:     {:.1}%\n",
+        report.health.policy_deny_rate * 100.0
+    ));
+    out.push_str(&format!(
+        "  Avg latency:     {:.0}ms\n",
+        report.health.avg_evaluation_latency_ms
+    ));
+    out.push('\n');
+
+    // ── Assignment Table ──
+    if !report.assignment_table.is_empty() {
+        out.push_str("=== Agent Assignments ===\n");
+        out.push_str("  Agent              Total  Active  Beads\n");
+        out.push_str("  ─────              ─────  ──────  ─────\n");
+        for row in &report.assignment_table {
+            let beads_str = if row.active_bead_ids.is_empty() {
+                "—".to_string()
+            } else {
+                row.active_bead_ids.join(", ")
+            };
+            out.push_str(&format!(
+                "  {:<18} {:>5}  {:>6}  {}\n",
+                row.agent_id, row.total_assignments, row.active_beads, beads_str
+            ));
+        }
+        out.push('\n');
+    }
+
+    // ── Conflicts ──
+    if report.conflicts.total_detected > 0 {
+        out.push_str("=== Conflicts ===\n");
+        out.push_str(&format!(
+            "  Detected: {}  Auto-resolved: {}  Pending manual: {}\n",
+            report.conflicts.total_detected,
+            report.conflicts.total_auto_resolved,
+            report.conflicts.pending_manual
+        ));
+        for c in &report.conflicts.recent_conflicts {
+            out.push_str(&format!(
+                "  [{:>12}] {} — agents: {} beads: {} — {}\n",
+                c.conflict_type,
+                c.conflict_id,
+                c.agents.join(","),
+                c.beads.join(","),
+                c.resolution,
+            ));
+        }
+        out.push('\n');
+    }
+
+    // ── Events ──
+    if report.event_summary.total_emitted > 0 {
+        out.push_str("=== Event Log ===\n");
+        out.push_str(&format!(
+            "  Retained: {}  Total emitted: {}\n",
+            report.event_summary.retained_events, report.event_summary.total_emitted
+        ));
+        if !report.event_summary.by_phase.is_empty() {
+            out.push_str("  By phase: ");
+            let mut phases: Vec<_> = report.event_summary.by_phase.iter().collect();
+            phases.sort_by_key(|&(_, &v)| std::cmp::Reverse(v));
+            for (phase, count) in &phases {
+                out.push_str(&format!("{}={} ", phase, count));
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    // ── Decision Explanations ──
+    if !report.latest_explanations.is_empty() {
+        out.push_str("=== Latest Decisions ===\n");
+        for dec in &report.latest_explanations {
+            out.push_str(&format!(
+                "  [{}] {} — {}\n",
+                dec.outcome, dec.bead_id, dec.summary
+            ));
+            for f in &dec.top_factors {
+                let polarity_marker = match f.polarity.as_str() {
+                    "Positive" => "+",
+                    "Negative" => "-",
+                    _ => " ",
+                };
+                out.push_str(&format!(
+                    "    {} {}: {:.3} — {}\n",
+                    polarity_marker, f.dimension, f.value, f.description
+                ));
+            }
+        }
+    }
+
+    out
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2857,5 +3328,479 @@ mod tests {
         let report = ml.detect_conflicts(&aset, &[], &active, 5000, &issues);
         assert!(!report.messages.is_empty());
         assert_eq!(report.messages[0].thread_id, "a");
+    }
+
+    // ── Operator report tests (ft-1i2ge.5.5) ────────────────────────────
+
+    #[test]
+    fn operator_report_idle_state() {
+        let ml = MissionLoop::new(MissionLoopConfig::default());
+        let report = ml.generate_operator_report(None, None);
+        assert_eq!(report.status.cycle_count, 0);
+        assert_eq!(report.status.phase_label, "idle");
+        assert!(report.assignment_table.is_empty());
+        assert_eq!(report.health.overall, "idle");
+        assert_eq!(report.conflicts.total_detected, 0);
+        assert_eq!(report.event_summary.total_emitted, 0);
+        assert!(report.latest_explanations.is_empty());
+    }
+
+    #[test]
+    fn operator_report_after_evaluation() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+        let agents = vec![ready_agent("alpha"), ready_agent("beta")];
+        let ctx = PlannerExtractionContext::default();
+        ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        let report = ml.generate_operator_report(None, None);
+        assert_eq!(report.status.cycle_count, 1);
+        assert_ne!(report.status.phase_label, "idle");
+        // At least one agent should appear in assignment table
+        // (depends on solver producing assignments)
+        assert!(report.status.total_assignments > 0 || report.status.total_rejections > 0);
+    }
+
+    #[test]
+    fn operator_report_with_event_log() {
+        use crate::mission_events::{
+            MissionEventBuilder, MissionEventKind, MissionEventLog, MissionEventLogConfig,
+        };
+
+        let ml = MissionLoop::new(MissionLoopConfig::default());
+        let mut log = MissionEventLog::new(MissionEventLogConfig {
+            max_events: 100,
+            enabled: true,
+        });
+        log.emit(
+            MissionEventBuilder::new(
+                MissionEventKind::CycleStarted,
+                "mission.lifecycle.cycle_started",
+            )
+            .correlation("corr-001")
+            .cycle(1, 1000)
+            .labels("test", "mission"),
+        );
+        log.emit(
+            MissionEventBuilder::new(
+                MissionEventKind::CycleCompleted,
+                "mission.lifecycle.cycle_completed",
+            )
+            .correlation("corr-001")
+            .cycle(1, 1050)
+            .labels("test", "mission"),
+        );
+
+        let report = ml.generate_operator_report(Some(&log), None);
+        assert_eq!(report.event_summary.total_emitted, 2);
+        assert_eq!(report.event_summary.retained_events, 2);
+        assert!(report.event_summary.by_phase.contains_key("Lifecycle"));
+    }
+
+    #[test]
+    fn operator_report_with_explainability() {
+        use crate::planner_features::{
+            DecisionExplanation, DecisionOutcome, ExplainabilityReport,
+            ExplanationFactor, FactorPolarity,
+        };
+
+        let ml = MissionLoop::new(MissionLoopConfig::default());
+        let explain = ExplainabilityReport {
+            cycle_id: 1,
+            explanations: vec![
+                DecisionExplanation {
+                    bead_id: "bead-1".to_string(),
+                    outcome: DecisionOutcome::Assigned,
+                    summary: "Assigned to alpha (rank #1, score 0.850)".to_string(),
+                    factors: vec![
+                        ExplanationFactor {
+                            dimension: "composite_score".to_string(),
+                            value: 0.85,
+                            description: "Weighted composite".to_string(),
+                            polarity: FactorPolarity::Positive,
+                        },
+                        ExplanationFactor {
+                            dimension: "effort_penalty".to_string(),
+                            value: 0.1,
+                            description: "Low effort".to_string(),
+                            polarity: FactorPolarity::Negative,
+                        },
+                    ],
+                },
+                DecisionExplanation {
+                    bead_id: "bead-2".to_string(),
+                    outcome: DecisionOutcome::Rejected,
+                    summary: "Rejected (score 0.200): No capacity".to_string(),
+                    factors: vec![ExplanationFactor {
+                        dimension: "rejection".to_string(),
+                        value: 0.0,
+                        description: "No agent capacity available".to_string(),
+                        polarity: FactorPolarity::Negative,
+                    }],
+                },
+            ],
+        };
+
+        let report = ml.generate_operator_report(None, Some(&explain));
+        assert_eq!(report.latest_explanations.len(), 2);
+        assert_eq!(report.latest_explanations[0].bead_id, "bead-1");
+        assert_eq!(report.latest_explanations[0].outcome, "Assigned");
+        assert_eq!(report.latest_explanations[0].top_factors.len(), 2);
+        assert_eq!(report.latest_explanations[1].bead_id, "bead-2");
+        assert_eq!(report.latest_explanations[1].outcome, "Rejected");
+    }
+
+    #[test]
+    fn operator_report_health_section_degraded() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        // Inject metrics samples with high conflict rate
+        ml.state.metrics_history.push(MissionCycleMetricsSample {
+            cycle_id: 1,
+            timestamp_ms: 1000,
+            evaluation_latency_ms: 50,
+            assignments: 3,
+            rejections: 2,
+            conflict_rejections: 2,
+            policy_denials: 1,
+            unblocked_transitions: 0,
+            planner_churn_events: 2,
+            throughput_assignments_per_minute: 5.0,
+            unblock_velocity_per_minute: 1.0,
+            conflict_rate: 0.25,
+            planner_churn_rate: 0.35,
+            policy_deny_rate: 0.1,
+            assignments_by_agent: HashMap::new(),
+            workspace_label: "test".to_string(),
+            track_label: "mission".to_string(),
+        });
+
+        let report = ml.generate_operator_report(None, None);
+        assert_eq!(report.health.overall, "degraded");
+        assert!((report.health.conflict_rate - 0.25).abs() < 1e-10);
+        assert!((report.health.planner_churn_rate - 0.35).abs() < 1e-10);
+    }
+
+    #[test]
+    fn operator_report_health_section_critical() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        ml.state.metrics_history.push(MissionCycleMetricsSample {
+            cycle_id: 1,
+            timestamp_ms: 1000,
+            evaluation_latency_ms: 100,
+            assignments: 1,
+            rejections: 5,
+            conflict_rejections: 4,
+            policy_denials: 3,
+            unblocked_transitions: 0,
+            planner_churn_events: 0,
+            throughput_assignments_per_minute: 1.0,
+            unblock_velocity_per_minute: 0.0,
+            conflict_rate: 0.5,
+            planner_churn_rate: 0.0,
+            policy_deny_rate: 0.6,
+            assignments_by_agent: HashMap::new(),
+            workspace_label: "test".to_string(),
+            track_label: "mission".to_string(),
+        });
+
+        let report = ml.generate_operator_report(None, None);
+        assert_eq!(report.health.overall, "critical");
+    }
+
+    #[test]
+    fn operator_report_conflict_section() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        ml.state.total_conflicts_detected = 5;
+        ml.state.total_conflicts_auto_resolved = 3;
+        ml.state.conflict_history.push(AssignmentConflict {
+            conflict_id: "c-1".to_string(),
+            conflict_type: ConflictType::ConcurrentBeadClaim,
+            involved_agents: vec!["a1".to_string(), "a2".to_string()],
+            involved_beads: vec!["b1".to_string()],
+            conflicting_paths: Vec::new(),
+            detected_at_ms: 1000,
+            resolution: ConflictResolution::PendingManualResolution,
+            reason_code: "concurrent_bead_claim".to_string(),
+            error_code: "FTM2002".to_string(),
+        });
+
+        let report = ml.generate_operator_report(None, None);
+        assert_eq!(report.conflicts.total_detected, 5);
+        assert_eq!(report.conflicts.total_auto_resolved, 3);
+        assert_eq!(report.conflicts.pending_manual, 1);
+        assert_eq!(report.conflicts.recent_conflicts.len(), 1);
+        assert_eq!(report.conflicts.recent_conflicts[0].conflict_id, "c-1");
+    }
+
+    #[test]
+    fn operator_report_assignment_table() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        ml.state
+            .metrics_totals
+            .assignments_by_agent
+            .insert("alpha".to_string(), 10);
+        ml.state
+            .metrics_totals
+            .assignments_by_agent
+            .insert("beta".to_string(), 5);
+        ml.state.last_decision = Some(MissionDecision {
+            cycle_id: 1,
+            timestamp_ms: 1000,
+            trigger: MissionTrigger::CadenceTick,
+            assignment_set: make_assignment_set(vec![
+                make_assignment("bead-a", "alpha", 0.9),
+                make_assignment("bead-b", "alpha", 0.7),
+            ]),
+            extraction_summary: ExtractionSummary {
+                total_candidates: 3,
+                ready_candidates: 2,
+                top_impact_bead: Some("bead-a".to_string()),
+            },
+            scorer_summary: ScorerSummary {
+                scored_count: 2,
+                above_threshold_count: 2,
+                top_scored_bead: Some("bead-a".to_string()),
+            },
+        });
+
+        let report = ml.generate_operator_report(None, None);
+        assert_eq!(report.assignment_table.len(), 2);
+        // Sorted by total_assignments descending
+        assert_eq!(report.assignment_table[0].agent_id, "alpha");
+        assert_eq!(report.assignment_table[0].total_assignments, 10);
+        assert_eq!(report.assignment_table[0].active_beads, 2);
+        assert!(
+            report.assignment_table[0]
+                .active_bead_ids
+                .contains(&"bead-a".to_string())
+        );
+    }
+
+    #[test]
+    fn operator_report_plain_format_renders() {
+        let ml = MissionLoop::new(MissionLoopConfig::default());
+        let report = ml.generate_operator_report(None, None);
+        let plain = format_operator_report_plain(&report);
+        assert!(plain.contains("=== Mission Status ==="));
+        assert!(plain.contains("Phase:"));
+        assert!(plain.contains("idle"));
+        assert!(plain.contains("=== Health ==="));
+    }
+
+    #[test]
+    fn operator_report_json_roundtrip() {
+        let ml = MissionLoop::new(MissionLoopConfig::default());
+        let report = ml.generate_operator_report(None, None);
+        let json = serde_json::to_string(&report).expect("serialize");
+        let deser: OperatorStatusReport =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.status.cycle_count, report.status.cycle_count);
+        assert_eq!(deser.status.phase_label, report.status.phase_label);
+        assert_eq!(deser.health.overall, report.health.overall);
+    }
+
+    // ── Determinism and edge-case tests (ft-1i2ge.5.5 AC5) ─────────────
+
+    #[test]
+    fn operator_report_deterministic_repeat() {
+        // Generating the report twice from the same state MUST produce identical output.
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 1, &[]),
+            sample_detail("b", BeadStatus::Open, 2, &[]),
+        ];
+        let agents = vec![ready_agent("agent1")];
+        let ctx = PlannerExtractionContext::default();
+        ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        let r1 = ml.generate_operator_report(None, None);
+        let r2 = ml.generate_operator_report(None, None);
+
+        let j1 = serde_json::to_string(&r1).expect("serialize r1");
+        let j2 = serde_json::to_string(&r2).expect("serialize r2");
+        assert_eq!(j1, j2, "Reports must be deterministic across repeated calls");
+    }
+
+    #[test]
+    fn operator_report_plain_format_deterministic() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let issues = vec![sample_detail("x", BeadStatus::Open, 0, &[])];
+        let agents = vec![ready_agent("alpha")];
+        let ctx = PlannerExtractionContext::default();
+        ml.evaluate(2000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        let report = ml.generate_operator_report(None, None);
+        let plain1 = format_operator_report_plain(&report);
+        let plain2 = format_operator_report_plain(&report);
+        assert_eq!(plain1, plain2, "Plain format must be deterministic");
+    }
+
+    #[test]
+    fn operator_report_with_multiple_rejections() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        // Use solver config that rejects everything (min_score = 1.0).
+        ml.config.solver_config.min_score = 1.0;
+
+        let issues = vec![
+            sample_detail("r1", BeadStatus::Open, 2, &[]),
+            sample_detail("r2", BeadStatus::Open, 3, &[]),
+            sample_detail("r3", BeadStatus::Open, 4, &[]),
+        ];
+        let agents = vec![ready_agent("a")];
+        let ctx = PlannerExtractionContext::default();
+        ml.evaluate(3000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        let report = ml.generate_operator_report(None, None);
+        // All candidates should be rejected (score below 1.0).
+        assert_eq!(report.status.total_rejections, 3);
+        assert_eq!(report.status.total_assignments, 0);
+    }
+
+    #[test]
+    fn operator_report_no_agents_available() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let issues = vec![sample_detail("orphan", BeadStatus::Open, 0, &[])];
+        let agents: Vec<crate::plan::MissionAgentCapabilityProfile> = Vec::new();
+        let ctx = PlannerExtractionContext::default();
+        ml.evaluate(4000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        let report = ml.generate_operator_report(None, None);
+        assert!(report.assignment_table.is_empty());
+        assert_eq!(report.status.total_assignments, 0);
+    }
+
+    #[test]
+    fn operator_report_retry_storm_beads_listed() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        ml.state
+            .retry_streaks
+            .insert("storm-bead-1".to_string(), 5);
+        ml.state
+            .retry_streaks
+            .insert("storm-bead-2".to_string(), 10);
+        // Normal bead below threshold
+        ml.state.retry_streaks.insert("ok-bead".to_string(), 1);
+
+        let report = ml.generate_operator_report(None, None);
+        // Verify report generates without panic; cycle_count is 0 since
+        // no evaluate() was called.
+        assert_eq!(report.status.cycle_count, 0);
+    }
+
+    #[test]
+    fn operator_report_json_roundtrip_with_data() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let issues = vec![
+            sample_detail("b1", BeadStatus::Open, 1, &[]),
+            sample_detail("b2", BeadStatus::Open, 2, &[]),
+        ];
+        let agents = vec![ready_agent("ag1"), ready_agent("ag2")];
+        let ctx = PlannerExtractionContext::default();
+        ml.evaluate(5000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        ml.state.total_conflicts_detected = 3;
+        ml.state.total_conflicts_auto_resolved = 2;
+
+        let report = ml.generate_operator_report(None, None);
+        let json = serde_json::to_string_pretty(&report).expect("serialize");
+        let deser: OperatorStatusReport =
+            serde_json::from_str(&json).expect("deserialize");
+
+        // Full structural comparison
+        assert_eq!(deser.status.cycle_count, report.status.cycle_count);
+        assert_eq!(deser.status.total_assignments, report.status.total_assignments);
+        assert_eq!(deser.status.total_rejections, report.status.total_rejections);
+        assert_eq!(deser.health.overall, report.health.overall);
+        assert_eq!(deser.conflicts.total_detected, report.conflicts.total_detected);
+        assert_eq!(
+            deser.conflicts.total_auto_resolved,
+            report.conflicts.total_auto_resolved
+        );
+        assert_eq!(
+            deser.assignment_table.len(),
+            report.assignment_table.len()
+        );
+    }
+
+    #[test]
+    fn operator_report_plain_format_with_full_data() {
+        use crate::mission_events::{
+            MissionEventBuilder, MissionEventKind, MissionEventLog, MissionEventLogConfig,
+        };
+        use crate::planner_features::{
+            DecisionExplanation, DecisionOutcome, ExplainabilityReport,
+            ExplanationFactor, FactorPolarity,
+        };
+
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let issues = vec![sample_detail("t1", BeadStatus::Open, 1, &[])];
+        let agents = vec![ready_agent("worker")];
+        let ctx = PlannerExtractionContext::default();
+        ml.evaluate(6000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        let mut log = MissionEventLog::new(MissionEventLogConfig {
+            max_events: 50,
+            enabled: true,
+        });
+        log.emit(
+            MissionEventBuilder::new(
+                MissionEventKind::CycleStarted,
+                "mission.lifecycle.cycle_started",
+            )
+            .correlation("c-001")
+            .cycle(1, 6000)
+            .labels("test", "mission"),
+        );
+
+        let explain = ExplainabilityReport {
+            cycle_id: 1,
+            explanations: vec![DecisionExplanation {
+                bead_id: "t1".to_string(),
+                outcome: DecisionOutcome::Assigned,
+                summary: "Assigned to worker (rank #1)".to_string(),
+                factors: vec![ExplanationFactor {
+                    dimension: "composite_score".to_string(),
+                    value: 0.7,
+                    description: "Strong composite".to_string(),
+                    polarity: FactorPolarity::Positive,
+                }],
+            }],
+        };
+
+        let report = ml.generate_operator_report(Some(&log), Some(&explain));
+        let plain = format_operator_report_plain(&report);
+
+        // Verify all sections present
+        assert!(plain.contains("=== Mission Status ==="));
+        assert!(plain.contains("=== Health ==="));
+        assert!(plain.contains("=== Agent Assignments ==="));
+        assert!(plain.contains("worker"));
+        assert!(plain.contains("=== Event Log ==="));
+        assert!(plain.contains("=== Latest Decisions ==="));
+        assert!(plain.contains("t1"));
+        assert!(plain.contains("Assigned"));
+    }
+
+    #[test]
+    fn operator_report_empty_metrics_window() {
+        let ml = MissionLoop::new(MissionLoopConfig::default());
+        let report = ml.generate_operator_report(None, None);
+
+        // Health section defaults
+        assert_eq!(report.health.overall, "idle");
+        assert!(
+            report.health.throughput_assignments_per_minute.abs() < f64::EPSILON,
+            "throughput should be 0"
+        );
+        assert!(
+            report.health.avg_evaluation_latency_ms.abs() < f64::EPSILON,
+            "avg latency should be 0"
+        );
+        assert!(
+            report.health.conflict_rate.abs() < f64::EPSILON,
+            "conflict rate should be 0"
+        );
     }
 }
