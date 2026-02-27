@@ -53,6 +53,8 @@ use crate::runtime_compat::mpsc;
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
 use crate::storage_telemetry::{SloStatus, StorageHealthTier, StoragePipelineSnapshot};
 
+pub mod mmap_store;
+
 // =============================================================================
 // Schema Definition
 // =============================================================================
@@ -5601,6 +5603,62 @@ impl Default for StorageConfig {
     }
 }
 
+const FT_STORAGE_MMAP_ENABLE_ENV: &str = "FT_STORAGE_MMAP_ENABLE";
+const FT_STORAGE_MMAP_DIR_ENV: &str = "FT_STORAGE_MMAP_DIR";
+
+#[derive(Debug, Clone)]
+struct MmapMirrorRuntimeConfig {
+    base_dir: PathBuf,
+}
+
+impl MmapMirrorRuntimeConfig {
+    fn from_db_path(db_path: &str) -> Option<Self> {
+        let enabled = std::env::var(FT_STORAGE_MMAP_ENABLE_ENV)
+            .ok()
+            .map(|value| env_value_is_truthy(&value))
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+
+        let db_path = Path::new(db_path);
+        let db_parent = db_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let fallback_dir = db_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map_or_else(
+                || db_parent.join("ft.mmap_scrollback"),
+                |stem| db_parent.join(format!("{stem}.mmap_scrollback")),
+            );
+
+        let base_dir = std::env::var(FT_STORAGE_MMAP_DIR_ENV)
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(|candidate| {
+                if candidate.is_relative() {
+                    db_parent.join(candidate)
+                } else {
+                    candidate
+                }
+            })
+            .unwrap_or(fallback_dir);
+
+        Some(Self { base_dir })
+    }
+}
+
+fn env_value_is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn ensure_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -5714,6 +5772,8 @@ pub struct StorageHandle {
     write_tx: WriteCommandSender,
     /// Database path for read connections
     db_path: Arc<String>,
+    /// Optional mmap mirror directory for segment fast-path reads.
+    mmap_mirror_dir: Option<Arc<PathBuf>>,
     /// Writer thread join handle (for shutdown) - shared to allow Clone
     writer_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Semantic budget state for hybrid search guardrails/telemetry.
@@ -5782,22 +5842,16 @@ impl StorageHandle {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
-        #[cfg(feature = "asupersync-runtime")]
-        {
-            asupersync::runtime::spawn_blocking(work).await
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            crate::runtime_compat::task::spawn_blocking(work)
-                .await
-                .map_err(|e| StorageError::Database(format!("{join_error_prefix}: {e}")))?
-        }
+        crate::runtime_compat::spawn_blocking(work)
+            .await
+            .map_err(|e| StorageError::Database(format!("{join_error_prefix}: {e}")))?
     }
 
     /// Create a storage handle with custom configuration
     pub async fn with_config(db_path: &str, config: StorageConfig) -> Result<Self> {
         // Ensure parent directory exists
         ensure_parent_dir(Path::new(db_path))?;
+        let mmap_runtime = MmapMirrorRuntimeConfig::from_db_path(db_path);
 
         // Open connection, recover WAL if needed, and initialize schema (blocking)
         let db_path_owned = db_path.to_string();
@@ -5820,16 +5874,19 @@ impl StorageHandle {
 
         // Create bounded channel for write commands
         let (write_tx, mut write_rx) = mpsc::channel::<WriteCommand>(config.write_queue_size);
+        let mmap_runtime_for_writer = mmap_runtime.clone();
 
         // Spawn writer thread
         let writer_handle = thread::spawn(move || {
             let mut conn = init_result;
-            writer_loop(&mut conn, &mut write_rx);
+            let mut mmap_mirror = init_mmap_mirror_store(mmap_runtime_for_writer.as_ref());
+            writer_loop(&mut conn, &mut write_rx, &mut mmap_mirror);
         });
 
         Ok(Self {
             write_tx: WriteCommandSender::new(write_tx),
             db_path: Arc::new(db_path.to_string()),
+            mmap_mirror_dir: mmap_runtime.map(|runtime| Arc::new(runtime.base_dir)),
             writer_handle: Arc::new(Mutex::new(Some(writer_handle))),
             semantic_budget_state: Arc::new(Mutex::new(SemanticBudgetState::new(
                 SemanticBudgetConfig::default(),
@@ -7722,8 +7779,28 @@ impl StorageHandle {
     /// Get recent segments for a pane
     pub async fn get_segments(&self, pane_id: u64, limit: usize) -> Result<Vec<Segment>> {
         let db_path = Arc::clone(&self.db_path);
+        let mmap_mirror_dir = self
+            .mmap_mirror_dir
+            .as_ref()
+            .map(|dir| dir.as_ref().clone());
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            if let Some(mmap_dir) = mmap_mirror_dir.as_ref() {
+                match query_segments_from_mmap(mmap_dir, pane_id, limit) {
+                    Ok(Some(segments)) => return Ok(segments),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            pane_id,
+                            limit,
+                            path = %mmap_dir.display(),
+                            error = %error,
+                            "mmap segment read failed; falling back to sqlite"
+                        );
+                    }
+                }
+            }
+
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open read connection: {e}"))
             })?;
@@ -9130,6 +9207,99 @@ impl Default for SegmentScanQuery {
 /// Maximum commands to drain per batch iteration.
 const WRITER_BATCH_CAP: usize = 128;
 
+#[derive(Debug, Serialize, Deserialize)]
+struct MmapSegmentLine {
+    id: i64,
+    pane_id: u64,
+    seq: u64,
+    content: String,
+    content_hash: Option<String>,
+    captured_at: i64,
+}
+
+fn encode_mmap_segment_line(segment: &Segment) -> Result<String> {
+    let line = MmapSegmentLine {
+        id: segment.id,
+        pane_id: segment.pane_id,
+        seq: segment.seq,
+        content: segment.content.clone(),
+        content_hash: segment.content_hash.clone(),
+        captured_at: segment.captured_at,
+    };
+    serde_json::to_string(&line).map_err(|error| {
+        StorageError::Database(format!("Failed to encode mmap segment line: {error}")).into()
+    })
+}
+
+fn decode_mmap_segment_line(raw_line: &str) -> Result<Segment> {
+    let line: MmapSegmentLine = serde_json::from_str(raw_line).map_err(|error| {
+        StorageError::Database(format!("Failed to decode mmap segment line: {error}"))
+    })?;
+    let content_len = line.content.len();
+    Ok(Segment {
+        id: line.id,
+        pane_id: line.pane_id,
+        seq: line.seq,
+        content: line.content,
+        content_len,
+        content_hash: line.content_hash,
+        captured_at: line.captured_at,
+    })
+}
+
+fn init_mmap_mirror_store(
+    runtime: Option<&MmapMirrorRuntimeConfig>,
+) -> Option<mmap_store::MmapScrollbackStore> {
+    let runtime = runtime?;
+
+    let config = mmap_store::MmapStoreConfig::new(runtime.base_dir.clone());
+    match mmap_store::MmapScrollbackStore::new(config) {
+        Ok(store) => {
+            tracing::info!(
+                path = %runtime.base_dir.display(),
+                "mmap segment mirror enabled"
+            );
+            Some(store)
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %runtime.base_dir.display(),
+                error = %error,
+                "failed to initialize mmap segment mirror; continuing with sqlite only"
+            );
+            None
+        }
+    }
+}
+
+fn mirror_segment_into_mmap(
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment: &Segment,
+) {
+    let Some(store) = mmap_mirror.as_mut() else {
+        return;
+    };
+
+    let write_result = encode_mmap_segment_line(segment).and_then(|line| {
+        store.append_line(segment.pane_id, &line).map_err(|error| {
+            StorageError::Database(format!(
+                "Failed to append mmap segment mirror line: {error}"
+            ))
+            .into()
+        })
+    });
+
+    if let Err(error) = write_result {
+        tracing::warn!(
+            pane_id = segment.pane_id,
+            seq = segment.seq,
+            error = %error,
+            "mmap segment mirror write failed; disabling mirror lane"
+        );
+        *mmap_mirror = None;
+    }
+}
+
 /// Returns true if the command is a control operation that must run outside a
 /// transaction (Shutdown, Vacuum, Checkpoint).
 fn is_control_command(cmd: &WriteCommand) -> bool {
@@ -9146,7 +9316,11 @@ fn is_control_command(cmd: &WriteCommand) -> bool {
 /// Batches pending writes into SQLite transactions to amortize journal/fsync
 /// overhead.  Control commands (Shutdown, Vacuum, Checkpoint) commit any open
 /// transaction first, then execute outside a transaction.
-fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
+fn writer_loop(
+    conn: &mut Connection,
+    rx: &mut mpsc::Receiver<WriteCommand>,
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+) {
     #[cfg(feature = "asupersync-runtime")]
     let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
         .build()
@@ -9188,7 +9362,7 @@ fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
                 let _ = conn.execute_batch("COMMIT");
                 txn_open = false;
             }
-            dispatch_write_command(conn, cmd, &mut should_break);
+            dispatch_write_command(conn, cmd, &mut should_break, mmap_mirror);
         }
 
         if txn_open {
@@ -9202,7 +9376,12 @@ fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
 }
 
 /// Dispatch a single write command to the appropriate sync handler.
-fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break: &mut bool) {
+fn dispatch_write_command(
+    conn: &mut Connection,
+    cmd: WriteCommand,
+    should_break: &mut bool,
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+) {
     match cmd {
         WriteCommand::AppendSegment {
             pane_id,
@@ -9211,6 +9390,9 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             respond,
         } => {
             let result = append_segment_sync(conn, pane_id, &content, content_hash.as_deref());
+            if let Ok(segment) = &result {
+                mirror_segment_into_mmap(mmap_mirror, segment);
+            }
             let _ = respond.send(result);
         }
         WriteCommand::RecordGap {
@@ -14900,6 +15082,61 @@ fn query_segments(conn: &Connection, pane_id: u64, limit: usize) -> Result<Vec<S
     Ok(results)
 }
 
+fn query_segments_from_mmap(
+    base_dir: &Path,
+    pane_id: u64,
+    limit: usize,
+) -> Result<Option<Vec<Segment>>> {
+    if limit == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let config = mmap_store::MmapStoreConfig::new(base_dir.to_path_buf());
+    let mut store = mmap_store::MmapScrollbackStore::new(config).map_err(|error| {
+        StorageError::Database(format!("Failed to open mmap segment mirror store: {error}"))
+    })?;
+
+    match store.ensure_pane(pane_id) {
+        Ok(()) => {}
+        Err(mmap_store::MmapStoreError::UnknownPane(_)) => return Ok(None),
+        Err(error) => {
+            return Err(StorageError::Database(format!(
+                "Failed to prepare mmap pane {pane_id} for read: {error}"
+            ))
+            .into());
+        }
+    }
+
+    let lines = match store.tail_lines(pane_id, limit) {
+        Ok(lines) => lines,
+        Err(mmap_store::MmapStoreError::UnknownPane(_)) => return Ok(None),
+        Err(error) => {
+            return Err(StorageError::Database(format!(
+                "Failed to read mmap pane {pane_id} lines: {error}"
+            ))
+            .into());
+        }
+    };
+
+    let mut segments = Vec::with_capacity(lines.len());
+    for raw_line in lines {
+        let segment = decode_mmap_segment_line(&raw_line)?;
+        if segment.pane_id != pane_id {
+            return Err(StorageError::Database(format!(
+                "Mmap segment pane mismatch: expected {pane_id}, found {}",
+                segment.pane_id
+            ))
+            .into());
+        }
+        segments.push(segment);
+    }
+
+    // tail_lines() returns oldest->newest within the requested window;
+    // query_segments() returns newest->oldest, so align ordering.
+    segments.reverse();
+    Ok(Some(segments))
+}
+
 #[allow(clippy::cast_sign_loss)]
 fn query_segment_by_id(conn: &Connection, segment_id: i64) -> Result<Option<Segment>> {
     conn.query_row(
@@ -18949,6 +19186,131 @@ async fn storage_handle_writer_queue_processes_all() {
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
     let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+}
+
+#[test]
+fn mmap_segment_line_round_trip_preserves_multiline_content() {
+    let segment = Segment {
+        id: 11,
+        pane_id: 7,
+        seq: 3,
+        content: "line 1\nline 2\r\nline 3".to_string(),
+        content_len: "line 1\nline 2\r\nline 3".len(),
+        content_hash: Some("abc123".to_string()),
+        captured_at: 1_700_000_123_456,
+    };
+
+    let encoded = encode_mmap_segment_line(&segment).expect("encode mmap segment");
+    assert!(
+        !encoded.contains('\n'),
+        "encoded mmap line must be single-line json"
+    );
+
+    let decoded = decode_mmap_segment_line(&encoded).expect("decode mmap segment");
+    assert_eq!(decoded.id, segment.id);
+    assert_eq!(decoded.pane_id, segment.pane_id);
+    assert_eq!(decoded.seq, segment.seq);
+    assert_eq!(decoded.content, segment.content);
+    assert_eq!(decoded.content_len, segment.content_len);
+    assert_eq!(decoded.content_hash, segment.content_hash);
+    assert_eq!(decoded.captured_at, segment.captured_at);
+}
+
+#[tokio::test]
+async fn get_segments_prefers_mmap_lane_and_falls_back_to_sqlite_on_decode_error() {
+    use std::io::Write;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("mmap_lane_storage.db");
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    let mut handle = StorageHandle::new(&db_path_str)
+        .await
+        .expect("create handle");
+    handle
+        .upsert_pane(PaneRecord {
+            pane_id: 1,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("pane-1".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        })
+        .await
+        .expect("upsert pane");
+
+    handle
+        .append_segment(1, "alpha\nwith newline", None)
+        .await
+        .expect("append alpha");
+    handle
+        .append_segment(1, "beta", None)
+        .await
+        .expect("append beta");
+    let sqlite_segments = handle
+        .get_segments(1, 10)
+        .await
+        .expect("query sqlite segments");
+    assert_eq!(sqlite_segments.len(), 2);
+
+    let mmap_dir = temp_dir.path().join("segment_mmap_lane");
+    let mut mmap_store =
+        mmap_store::MmapScrollbackStore::new(mmap_store::MmapStoreConfig::new(mmap_dir.clone()))
+            .expect("create mmap store");
+    for segment in sqlite_segments.iter().rev() {
+        let line = encode_mmap_segment_line(segment).expect("encode mirror line");
+        mmap_store
+            .append_line(segment.pane_id, &line)
+            .expect("append mirror line");
+    }
+
+    handle.mmap_mirror_dir = Some(Arc::new(mmap_dir.clone()));
+    let mmap_segments = handle
+        .get_segments(1, 10)
+        .await
+        .expect("query mmap segments");
+    assert_eq!(mmap_segments.len(), sqlite_segments.len());
+    for (got, expected) in mmap_segments.iter().zip(&sqlite_segments) {
+        assert_eq!(got.id, expected.id);
+        assert_eq!(got.pane_id, expected.pane_id);
+        assert_eq!(got.seq, expected.seq);
+        assert_eq!(got.content, expected.content);
+        assert_eq!(got.content_len, expected.content_len);
+        assert_eq!(got.content_hash, expected.content_hash);
+        assert_eq!(got.captured_at, expected.captured_at);
+    }
+
+    let mut corrupted_log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(mmap_dir.join("1.log"))
+        .expect("open mmap log for corruption");
+    corrupted_log
+        .write_all(b"{this-is-not-json}\n")
+        .expect("append invalid json line");
+
+    let fallback_segments = handle
+        .get_segments(1, 10)
+        .await
+        .expect("fallback query should use sqlite");
+    assert_eq!(fallback_segments.len(), sqlite_segments.len());
+    for (got, expected) in fallback_segments.iter().zip(&sqlite_segments) {
+        assert_eq!(got.id, expected.id);
+        assert_eq!(got.pane_id, expected.pane_id);
+        assert_eq!(got.seq, expected.seq);
+        assert_eq!(got.content, expected.content);
+        assert_eq!(got.content_len, expected.content_len);
+        assert_eq!(got.content_hash, expected.content_hash);
+        assert_eq!(got.captured_at, expected.captured_at);
+    }
+
+    handle.shutdown().await.expect("shutdown handle");
 }
 
 // =============================================================================

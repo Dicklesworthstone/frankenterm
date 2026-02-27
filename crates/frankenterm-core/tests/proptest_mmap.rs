@@ -1,10 +1,8 @@
 //! Property tests for mmap scrollback offset/index helpers and store operations.
 
-#[path = "../src/storage/mmap_store.rs"]
-mod mmap_store;
-
-use mmap_store::{
-    LineOffset, MmapScrollbackStore, MmapStoreConfig, build_offsets_from_lengths, page_align_down,
+use frankenterm_core::storage::mmap_store::{
+    build_offsets_from_lengths, page_align_down, LineOffset, MmapScrollbackStore, MmapStoreConfig,
+    PaneStorageMode,
 };
 use proptest::prelude::*;
 
@@ -609,4 +607,91 @@ proptest! {
             "LineOffset equality should match u64: {:?} vs {:?}", lo_a, lo_b
         );
     }
+}
+
+#[test]
+fn store_reopens_existing_log_with_rebuilt_offsets() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = MmapStoreConfig::new(temp.path().to_path_buf());
+    let pane = 77u64;
+
+    {
+        let mut store = MmapScrollbackStore::new(config.clone()).expect("create store");
+        store.append_line(pane, "alpha").expect("append alpha");
+        store.append_line(pane, "beta").expect("append beta");
+        store.append_line(pane, "gamma").expect("append gamma");
+    }
+
+    let mut reopened = MmapScrollbackStore::new(config).expect("reopen store");
+    reopened.ensure_pane(pane).expect("load existing pane");
+
+    assert_eq!(
+        reopened.line_count(pane),
+        3,
+        "offset rebuild should recover count"
+    );
+    let tail = reopened.tail_lines(pane, 2).expect("tail after reopen");
+    assert_eq!(tail, vec!["beta".to_string(), "gamma".to_string()]);
+}
+
+#[test]
+fn store_falls_back_to_sqlite_when_log_path_is_unwritable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pane = 515u64;
+    let blocked_log_path = temp.path().join(format!("{pane}.log"));
+    std::fs::create_dir_all(&blocked_log_path).expect("create blocking directory");
+
+    let sqlite_path = temp.path().join("fallback.sqlite3");
+    let config = MmapStoreConfig::new(temp.path().to_path_buf()).with_sqlite_fallback(sqlite_path);
+    let mut store = MmapScrollbackStore::new(config).expect("create store");
+
+    store
+        .append_line(pane, "alpha-fallback")
+        .expect("append alpha with fallback");
+    store
+        .append_line(pane, "beta-fallback")
+        .expect("append beta with fallback");
+
+    assert_eq!(
+        store.pane_storage_mode(pane),
+        Some(PaneStorageMode::SqliteFallback),
+        "pane should switch to sqlite fallback when mmap log file cannot be opened"
+    );
+    assert_eq!(
+        store.line_count(pane),
+        2,
+        "sqlite fallback count should track writes"
+    );
+    assert_eq!(
+        store
+            .tail_lines(pane, 2)
+            .expect("tail from sqlite fallback"),
+        vec!["alpha-fallback".to_string(), "beta-fallback".to_string()]
+    );
+}
+
+#[test]
+fn store_falls_back_to_sqlite_when_mmap_tail_offsets_are_invalidated() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pane = 616u64;
+    let sqlite_path = temp.path().join("fallback.sqlite3");
+    let config = MmapStoreConfig::new(temp.path().to_path_buf()).with_sqlite_fallback(sqlite_path);
+    let mut store = MmapScrollbackStore::new(config).expect("create store");
+
+    store.append_line(pane, "alpha").expect("append alpha");
+    store.append_line(pane, "beta").expect("append beta");
+    store.append_line(pane, "gamma").expect("append gamma");
+
+    let log_path = temp.path().join(format!("{pane}.log"));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&log_path)
+        .expect("open pane log for truncation")
+        .set_len(0)
+        .expect("truncate pane log");
+
+    let tail = store
+        .tail_lines(pane, 2)
+        .expect("tail should fall back to sqlite");
+    assert_eq!(tail, vec!["beta".to_string(), "gamma".to_string()]);
 }

@@ -1,64 +1,77 @@
-# Mmap Scrollback Store (wa-8vla)
+# Mmap Scrollback Store (ft-8vla)
 
 ## Context
 
-`frankenterm-core` stores captured output in SQLite (`output_segments`). This is durable and searchable, but very large scrollback reconstruction paths (`tail` reads, restore/replay contexts) still create avoidable heap pressure when large slices are materialized eagerly.
+`frankenterm-core` persists captured pane output to SQLite (`output_segments`) for durability and search. The `ft-8vla` track adds a file-backed mirror lane that supports fast tail retrieval for large scrollbacks while preserving SQLite as the source of truth.
 
-The `wa-8vla` objective is an mmap-backed, append-oriented scrollback content lane where read paths can rely on OS page cache rather than large user-space allocations.
+## Current Status (2026-02-26)
 
-## Scope for This Slice
+The implementation is now integrated into `storage.rs` behind runtime gates:
 
-This first slice establishes:
+- `FT_STORAGE_MMAP_ENABLE=true|1|yes|on` enables the mirror lane.
+- `FT_STORAGE_MMAP_DIR` optionally overrides the mirror directory.
+- Without explicit `FT_STORAGE_MMAP_DIR`, the lane defaults to `<db_stem>.mmap_scrollback` next to the SQLite database.
 
-- Proposed storage contract and on-disk shape
-- Rust API scaffold for a pane-scoped append/read store
-- Proptest and benchmark scaffolding for offset/index invariants
+## Runtime Architecture
 
-This slice does **not** yet wire the store into `storage.rs` or `robot get-text` production paths, to avoid collisions with active concurrent reservations.
+### 1. Write path
 
-## Design Direction
+- SQLite append (`append_segment_sync`) executes first.
+- On successful SQLite append, segment content is mirrored into a per-pane log lane (`MmapScrollbackStore`).
+- Mirror-line payloads are single-line JSON envelopes (`MmapSegmentLine`) so multiline segment content is safe in line-oriented files.
+- If mirror append fails, mirror writes are disabled and the system continues on SQLite-only mode.
 
-### 1. Data plane
+### 2. Read path
+
+- `StorageHandle::get_segments` checks whether the mirror lane is configured.
+- If configured, `query_segments_from_mmap` is attempted first.
+- Any mirror preparation/read/decode issue falls back to SQLite query semantics.
+- If the pane is unknown in the mirror lane, SQLite is used without erroring.
+
+### 3. Fallback guarantees
+
+- SQLite remains authoritative for correctness and recovery.
+- Mirror-lane corruption or path failures do not block normal read/write operations.
+- Fallback behavior is covered by deterministic tests for both write-path and read-path failures.
+
+## Data Model
 
 Per-pane append log files:
 
-- `${base_dir}/{pane_id}.log` (raw UTF-8 bytes + `\n` delimiters)
-- `${base_dir}/{pane_id}.idx` (line start offsets, LE u64)
+- `${base_dir}/{pane_id}.log` containing one JSON segment envelope per line.
 
-Current scaffold keeps index in memory and appends payload bytes to `.log`; mmap integration will swap read path from `read_to_end` to page-window reads over mapped regions.
-
-### 2. API surface
-
-`MmapScrollbackStore` should support:
+Store API in `mmap_store.rs` includes:
 
 - `append_line(pane_id, line)`
 - `tail_lines(pane_id, n)`
 - `line_count(pane_id)`
-- `flush(pane_id)` / checkpoint hooks
+- `pane_storage_mode(pane_id)` for mmap vs sqlite-fallback mode introspection.
 
-### 3. Invariants
+## Validation Matrix
 
-- Offsets are monotonic non-decreasing.
-- Every index entry points to a valid byte position within log file bounds.
-- Tail reads never cross negative index boundaries.
-- Page alignment helper is deterministic and idempotent.
+### Unit / integration tests
 
-### 4. Benchmarks (planned)
+- `mmap_segment_line_round_trip_preserves_multiline_content`
+- `get_segments_prefers_mmap_lane_and_falls_back_to_sqlite_on_decode_error`
+- `store_falls_back_to_sqlite_when_log_path_is_unwritable`
+- `store_falls_back_to_sqlite_when_mmap_tail_offsets_are_invalidated`
 
-- Offset-building throughput from variable line lengths.
-- Tail-window extraction from offset arrays.
-- Page-alignment helper hot-path overhead.
+### Property tests
 
-## Integration Plan (Follow-on)
+- `crates/frankenterm-core/tests/proptest_mmap.rs` covers offset helpers and store invariants.
 
-1. Add `memmap2` dependency and implement mapped read windows.
-2. Add durability metadata (checkpoint offset, file generation).
-3. Integrate behind feature/config gate in `storage` read path.
-4. Add fallback path to SQLite-only reads on mapping/open failures.
-5. Add comparative Criterion runs (`mmap` vs `sqlite`) on representative corpora.
+### Benchmarks
 
-## Open Questions
+- `crates/frankenterm-core/benches/mmap_scrollback.rs` includes mmap-vs-sqlite append and tail comparisons.
 
-- Keep `.idx` fully memory-mirrored, or mmap index file too?
-- Best compaction strategy (segment rollovers vs periodic rewrite)?
-- Should search remain SQLite-only while content retrieval uses mmap, or should we co-store text shards for hybrid retrieval?
+### E2E harness
+
+- `tests/e2e/test_ft_8vla_mmap_scrollback.sh`
+- Emits structured JSONL logs (`tests/e2e/logs/ft_8vla_mmap_scrollback_*.jsonl`) with nominal, failure-injection, recovery, and benchmark-compile checks.
+- Executes cargo workloads through `rch exec -- ...` and records remote vs fail-open local execution mode.
+
+## Open Follow-ons
+
+- Replace current file-read implementation with true mapped read windows once a safe abstraction compatible with workspace lint policy (`unsafe_code = forbid`) is adopted.
+- Decide whether to persist a dedicated offset index file (`.idx`) for faster cold-start reconstruction.
+- Evaluate compaction/segment-rolling policy for long-lived panes.

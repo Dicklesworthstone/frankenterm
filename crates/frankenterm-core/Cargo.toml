@@ -254,6 +254,10 @@ name = "scrollback_eviction"
 harness = false
 
 [[bench]]
+name = "mmap_scrollback"
+harness = false
+
+[[bench]]
 name = "outcome_vs_result"
 harness = false
 required-features = ["asupersync-runtime"]
