@@ -32,6 +32,30 @@ impl CautService {
         }
     }
 
+    /// caut provider argument corresponding to this service.
+    #[must_use]
+    pub fn provider_arg(self) -> &'static str {
+        match self {
+            Self::OpenAI => "codex",
+        }
+    }
+
+    /// Parse user-provided service input.
+    #[must_use]
+    pub fn from_cli_input(input: &str) -> Option<Self> {
+        if is_openai_slug(input) {
+            Some(Self::OpenAI)
+        } else {
+            None
+        }
+    }
+
+    /// Supported service values for CLI/UI hints.
+    #[must_use]
+    pub fn supported_cli_inputs() -> &'static [&'static str] {
+        &["openai", "codex"]
+    }
+
     /// Map a canonical agent provider to the corresponding caut service.
     #[must_use]
     pub fn from_provider(provider: &AgentProvider) -> Option<Self> {
@@ -54,7 +78,7 @@ impl CautService {
 fn is_openai_slug(slug: &str) -> bool {
     matches!(
         slug.trim().to_ascii_lowercase().as_str(),
-        "openai" | "chatgpt" | "chat-gpt" | "chat_gpt" | "gpt" | "gpt4" | "gpt-4"
+        "openai" | "codex" | "chatgpt" | "chat-gpt" | "chat_gpt" | "gpt" | "gpt4" | "gpt-4"
     )
 }
 
@@ -147,12 +171,12 @@ impl CautError {
             Self::Timeout { timeout_secs } => Remediation::new(format!(
                 "caut did not respond within {timeout_secs}s. Retry or check system load."
             ))
-            .command("Retry usage", "caut usage --service openai --format json")
+            .command("Retry usage", "caut usage --provider codex --format json")
             .alternative("Increase the timeout for caut commands."),
             Self::NonZeroExit { .. } => Remediation::new(
                 "caut exited with an error. Check caut logs or rerun with verbose output.",
             )
-            .command("Retry usage", "caut usage --service openai --format json")
+            .command("Retry usage", "caut usage --provider codex --format json")
             .alternative("Ensure caut is authenticated for the target service."),
             Self::OutputTooLarge { .. } => Remediation::new(
                 "caut output was too large. Reduce output size or tighten the account set.",
@@ -223,32 +247,30 @@ impl CautClient {
 
     /// Fetch usage data via `caut usage`.
     pub async fn usage(&self, service: CautService) -> Result<CautUsage, CautError> {
-        self.run_and_parse("usage", service).await
+        let args = Self::build_args("usage", service);
+        let output = self.run(&args).await?;
+        parse_usage_json(&output, service, self.max_error_bytes)
     }
 
-    /// Refresh usage data via `caut refresh`.
+    /// Refresh usage data via `caut usage`.
+    ///
+    /// Newer caut versions removed the `refresh` subcommand. A provider-scoped
+    /// `usage` call performs the refresh/read in one step and returns the latest
+    /// account snapshot.
     pub async fn refresh(&self, service: CautService) -> Result<CautRefresh, CautError> {
-        self.run_and_parse("refresh", service).await
+        let args = Self::build_args("usage", service);
+        let output = self.run(&args).await?;
+        parse_refresh_json(&output, service, self.max_error_bytes)
     }
 
     fn build_args(subcommand: &str, service: CautService) -> Vec<String> {
         vec![
             subcommand.to_string(),
-            "--service".to_string(),
-            service.as_str().to_string(),
+            "--provider".to_string(),
+            service.provider_arg().to_string(),
             "--format".to_string(),
             "json".to_string(),
         ]
-    }
-
-    async fn run_and_parse<T: DeserializeOwned>(
-        &self,
-        subcommand: &str,
-        service: CautService,
-    ) -> Result<T, CautError> {
-        let args = Self::build_args(subcommand, service);
-        let output = self.run(&args).await?;
-        parse_json(&output, self.max_error_bytes)
     }
 
     async fn run(&self, args: &[String]) -> Result<String, CautError> {
@@ -303,6 +325,284 @@ fn parse_json<T: DeserializeOwned>(input: &str, max_preview: usize) -> Result<T,
     })
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CautV1Envelope {
+    #[serde(rename = "schemaVersion", default)]
+    schema_version: Option<String>,
+    #[serde(rename = "generatedAt", default)]
+    generated_at: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    data: Vec<CautV1UsageEntry>,
+    #[serde(default)]
+    errors: Vec<String>,
+    #[serde(default)]
+    meta: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CautV1UsageEntry {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    status: Option<Value>,
+    #[serde(default)]
+    usage: Option<CautV1UsagePayload>,
+    #[serde(rename = "authWarning", default)]
+    auth_warning: Option<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CautV1UsagePayload {
+    #[serde(default)]
+    primary: Option<Value>,
+    #[serde(default)]
+    secondary: Option<Value>,
+    #[serde(rename = "updatedAt", default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    identity: Option<CautV1Identity>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct CautV1Identity {
+    #[serde(rename = "accountEmail", default)]
+    account_email: Option<String>,
+    #[serde(rename = "accountOrganization", default)]
+    account_organization: Option<String>,
+    #[serde(rename = "loginMethod", default)]
+    login_method: Option<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+fn parse_usage_json(
+    input: &str,
+    service: CautService,
+    max_preview: usize,
+) -> Result<CautUsage, CautError> {
+    if let Ok(mut usage) = parse_json::<CautUsage>(input, max_preview) {
+        if usage.service.is_none() {
+            usage.service = Some(service.as_str().to_string());
+        }
+        return Ok(usage);
+    }
+
+    let envelope: CautV1Envelope = parse_json(input, max_preview)?;
+    Ok(caut_v1_to_usage(envelope, service))
+}
+
+fn parse_refresh_json(
+    input: &str,
+    service: CautService,
+    max_preview: usize,
+) -> Result<CautRefresh, CautError> {
+    if let Ok(mut refresh) = parse_json::<CautRefresh>(input, max_preview) {
+        if refresh.service.is_none() {
+            refresh.service = Some(service.as_str().to_string());
+        }
+        return Ok(refresh);
+    }
+
+    let envelope: CautV1Envelope = parse_json(input, max_preview)?;
+    Ok(caut_v1_to_refresh(envelope, service))
+}
+
+fn caut_v1_to_usage(envelope: CautV1Envelope, service: CautService) -> CautUsage {
+    let accounts = envelope.data.iter().map(caut_v1_entry_to_account).collect();
+    CautUsage {
+        service: Some(service.as_str().to_string()),
+        generated_at: envelope.generated_at.clone(),
+        accounts,
+        extra: caut_v1_extra(envelope),
+    }
+}
+
+fn caut_v1_to_refresh(envelope: CautV1Envelope, service: CautService) -> CautRefresh {
+    let refreshed_at = envelope.generated_at.clone();
+    let accounts = envelope.data.iter().map(caut_v1_entry_to_account).collect();
+    CautRefresh {
+        service: Some(service.as_str().to_string()),
+        refreshed_at,
+        accounts,
+        extra: caut_v1_extra(envelope),
+    }
+}
+
+fn caut_v1_extra(mut envelope: CautV1Envelope) -> HashMap<String, Value> {
+    let mut extra = std::mem::take(&mut envelope.meta);
+    if let Some(schema_version) = envelope.schema_version.take() {
+        extra.insert("schemaVersion".to_string(), Value::String(schema_version));
+    }
+    if let Some(command) = envelope.command.take() {
+        extra.insert("command".to_string(), Value::String(command));
+    }
+    if !envelope.errors.is_empty() {
+        extra.insert(
+            "errors".to_string(),
+            Value::Array(envelope.errors.into_iter().map(Value::String).collect()),
+        );
+    }
+    extra
+}
+
+fn caut_v1_entry_to_account(entry: &CautV1UsageEntry) -> CautAccountUsage {
+    let usage = entry.usage.as_ref();
+    let identity = usage.and_then(|value| value.identity.as_ref());
+
+    let mut extra = entry.extra.clone();
+    if let Some(provider) = &entry.provider {
+        extra.insert("provider".to_string(), Value::String(provider.clone()));
+    }
+    if let Some(source) = &entry.source {
+        extra.insert("source".to_string(), Value::String(source.clone()));
+    }
+    if let Some(status) = &entry.status {
+        extra.insert("status".to_string(), status.clone());
+    }
+    if let Some(auth_warning) = &entry.auth_warning {
+        extra.insert("auth_warning".to_string(), Value::String(auth_warning.clone()));
+    }
+    if let Some(usage) = usage {
+        if let Some(primary) = &usage.primary {
+            extra.insert("primary".to_string(), primary.clone());
+        }
+        if let Some(secondary) = &usage.secondary {
+            extra.insert("secondary".to_string(), secondary.clone());
+        }
+        if let Some(updated_at) = &usage.updated_at {
+            extra.insert("updated_at".to_string(), Value::String(updated_at.clone()));
+        }
+        if !usage.extra.is_empty() {
+            let mut usage_extra = serde_json::Map::new();
+            for (key, value) in &usage.extra {
+                usage_extra.insert(key.clone(), value.clone());
+            }
+            extra.insert("usage_extra".to_string(), Value::Object(usage_extra));
+        }
+    }
+    if let Some(identity) = identity {
+        if let Ok(identity_value) = serde_json::to_value(identity) {
+            extra.insert("identity".to_string(), identity_value);
+        }
+    }
+
+    CautAccountUsage {
+        id: entry
+            .account
+            .clone()
+            .or_else(|| identity.and_then(|value| value.account_email.clone())),
+        name: identity
+            .and_then(|value| value.account_organization.clone())
+            .or_else(|| entry.account.clone()),
+        percent_remaining: usage.and_then(|value| {
+            extract_usage_f64(
+                value,
+                &[
+                    "percentRemaining",
+                    "percent_remaining",
+                    "remainingPercent",
+                    "quotaPercentRemaining",
+                ],
+            )
+        }),
+        limit_hours: usage.and_then(|value| {
+            extract_usage_u64(value, &["limitHours", "limit_hours", "quotaHours", "limit"])
+        }),
+        reset_at: usage.and_then(|value| {
+            extract_usage_string(
+                value,
+                &["resetAt", "reset_at", "reset", "resetsAt", "nextResetAt"],
+            )
+        }),
+        tokens_used: usage.and_then(|value| {
+            extract_usage_u64(
+                value,
+                &["tokensUsed", "tokens_used", "usedTokens", "usageTokens"],
+            )
+        }),
+        tokens_remaining: usage.and_then(|value| {
+            extract_usage_u64(
+                value,
+                &[
+                    "tokensRemaining",
+                    "tokens_remaining",
+                    "remainingTokens",
+                    "availableTokens",
+                ],
+            )
+        }),
+        tokens_limit: usage.and_then(|value| {
+            extract_usage_u64(
+                value,
+                &["tokensLimit", "tokens_limit", "tokenLimit", "quotaLimit"],
+            )
+        }),
+        extra,
+    }
+}
+
+fn extract_usage_f64(usage: &CautV1UsagePayload, keys: &[&str]) -> Option<f64> {
+    extract_usage_value(usage, keys).and_then(value_as_f64)
+}
+
+fn extract_usage_u64(usage: &CautV1UsagePayload, keys: &[&str]) -> Option<u64> {
+    extract_usage_value(usage, keys).and_then(value_as_u64)
+}
+
+fn extract_usage_string(usage: &CautV1UsagePayload, keys: &[&str]) -> Option<String> {
+    extract_usage_value(usage, keys).and_then(value_as_string)
+}
+
+fn extract_usage_value<'a>(usage: &'a CautV1UsagePayload, keys: &[&str]) -> Option<&'a Value> {
+    extract_object_value(usage.primary.as_ref(), keys)
+        .or_else(|| extract_object_value(usage.secondary.as_ref(), keys))
+}
+
+fn extract_object_value<'a>(candidate: Option<&'a Value>, keys: &[&str]) -> Option<&'a Value> {
+    let object = candidate.and_then(Value::as_object)?;
+    for key in keys {
+        let value = object.get(*key)?;
+        if !value.is_null() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|n| n as f64))
+        .or_else(|| value.as_u64().map(|n| n as f64))
+        .or_else(|| value.as_str()?.parse::<f64>().ok())
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+        .or_else(|| value.as_str()?.parse::<u64>().ok())
+}
+
+fn value_as_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or_else(|| value.as_u64().map(|n| n.to_string()))
+        .or_else(|| value.as_i64().map(|n| n.to_string()))
+        .or_else(|| value.as_f64().map(|n| n.to_string()))
+}
+
 fn redact_and_truncate(input: &str, max_len: usize) -> String {
     let redactor = Redactor::new();
     let redacted = redactor.redact(input);
@@ -333,11 +633,81 @@ mod tests {
         let args = CautClient::build_args("usage", CautService::OpenAI);
         assert_eq!(
             args,
-            ["usage", "--service", "openai", "--format", "json"]
+            ["usage", "--provider", "codex", "--format", "json"]
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn parse_usage_supports_caut_v1_schema() {
+        let payload = json!({
+            "schemaVersion": "caut.v1",
+            "generatedAt": "2026-02-27T21:00:00Z",
+            "command": "usage",
+            "data": [
+                {
+                    "provider": "codex",
+                    "account": "acc-primary",
+                    "usage": {
+                        "primary": {
+                            "percentRemaining": 82.5,
+                            "tokensUsed": 1750,
+                            "tokensRemaining": 8250,
+                            "tokensLimit": 10000,
+                            "resetAt": "2026-03-01T00:00:00Z"
+                        },
+                        "updatedAt": "2026-02-27T20:59:59Z",
+                        "identity": {
+                            "accountEmail": "test@example.com",
+                            "accountOrganization": "Personal"
+                        }
+                    }
+                }
+            ],
+            "errors": [],
+            "meta": { "runtime": "cli" }
+        });
+
+        let parsed = parse_usage_json(&payload.to_string(), CautService::OpenAI, 4096)
+            .expect("caut.v1 usage payload should parse");
+        assert_eq!(parsed.service.as_deref(), Some("openai"));
+        assert_eq!(parsed.generated_at.as_deref(), Some("2026-02-27T21:00:00Z"));
+        assert_eq!(parsed.accounts.len(), 1);
+        let account = &parsed.accounts[0];
+        assert_eq!(account.id.as_deref(), Some("acc-primary"));
+        assert_eq!(account.name.as_deref(), Some("Personal"));
+        assert_eq!(account.percent_remaining, Some(82.5));
+        assert_eq!(account.tokens_used, Some(1750));
+        assert_eq!(account.tokens_remaining, Some(8250));
+        assert_eq!(account.tokens_limit, Some(10000));
+        assert_eq!(account.reset_at.as_deref(), Some("2026-03-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn parse_refresh_supports_caut_v1_schema() {
+        let payload = json!({
+            "schemaVersion": "caut.v1",
+            "generatedAt": "2026-02-27T21:05:00Z",
+            "command": "usage",
+            "data": [
+                {
+                    "provider": "codex",
+                    "account": "acc-1",
+                    "usage": { "primary": { "percentRemaining": 50.0 } }
+                }
+            ],
+            "errors": []
+        });
+
+        let parsed = parse_refresh_json(&payload.to_string(), CautService::OpenAI, 4096)
+            .expect("caut.v1 refresh payload should parse");
+        assert_eq!(parsed.service.as_deref(), Some("openai"));
+        assert_eq!(parsed.refreshed_at.as_deref(), Some("2026-02-27T21:05:00Z"));
+        assert_eq!(parsed.accounts.len(), 1);
+        assert_eq!(parsed.accounts[0].id.as_deref(), Some("acc-1"));
+        assert_eq!(parsed.accounts[0].percent_remaining, Some(50.0));
     }
 
     #[test]
@@ -683,6 +1053,23 @@ mod tests {
             Some(CautService::OpenAI)
         );
         assert_eq!(CautService::from_provider(&AgentProvider::Claude), None);
+    }
+
+    #[test]
+    fn caut_service_from_cli_input_aliases() {
+        assert_eq!(
+            CautService::from_cli_input("openai"),
+            Some(CautService::OpenAI)
+        );
+        assert_eq!(
+            CautService::from_cli_input("codex"),
+            Some(CautService::OpenAI)
+        );
+        assert_eq!(
+            CautService::from_cli_input("chat-gpt"),
+            Some(CautService::OpenAI)
+        );
+        assert_eq!(CautService::from_cli_input("anthropic"), None);
     }
 
     #[test]
