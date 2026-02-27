@@ -2055,7 +2055,11 @@ impl MissionLoop {
                 }
             })
             .collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.total_assignments));
+        rows.sort_by(|a, b| {
+            b.total_assignments
+                .cmp(&a.total_assignments)
+                .then_with(|| a.agent_id.cmp(&b.agent_id))
+        });
         rows
     }
 
