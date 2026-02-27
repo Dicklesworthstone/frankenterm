@@ -8,9 +8,10 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["lua", "async-smol"]
+default = ["lua", "async-asupersync"]
 lua = ["dep:luahelper", "dep:mlua", "config/lua", "procinfo/lua"]
 no-lua = ["config/no-lua"]
+# Legacy fallback path kept for staged migration/testing.
 async-smol = ["config/async-smol", "frankenterm-ssh/async-smol"]
 async-asupersync = [
     "config/async-asupersync",
@@ -55,7 +56,9 @@ textwrap.workspace = true
 thiserror.workspace = true
 url.workspace = true
 frankenterm-dynamic.workspace = true
-frankenterm-ssh.workspace = true
+# Keep ssh backend selection explicit here so runtime selection is controlled
+# by mux feature flags instead of frankenterm-ssh defaults.
+frankenterm-ssh = { path = "../ssh", default-features = false, features = ["libssh-rs", "ssh2"] }
 frankenterm-term = { workspace=true, features=["use_serde"] }
 
 [target."cfg(windows)".dependencies]

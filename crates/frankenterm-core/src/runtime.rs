@@ -3892,6 +3892,99 @@ mod tests {
         });
     }
 
+    fn test_capture_event(pane_id: u64, seq: u64, content: &str) -> CaptureEvent {
+        CaptureEvent {
+            segment: crate::ingest::CapturedSegment {
+                pane_id,
+                seq,
+                content: content.to_string(),
+                kind: crate::ingest::CapturedSegmentKind::Delta,
+                captured_at: epoch_ms(),
+            },
+        }
+    }
+
+    #[test]
+    fn capture_relay_drains_pending_events_after_shutdown_signal() {
+        run_async_test(async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let engine = PatternEngine::new();
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage,
+                Arc::new(RwLock::new(engine)),
+            );
+
+            let (ingress_tx, ingress_rx) = mpsc::channel::<CaptureEvent>(8);
+            let (ring_tx, mut consumers) = spmc_channel::<CaptureEvent>(8, 1);
+            let ring_rx = consumers.pop().expect("expected one SPMC consumer");
+            let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
+
+            send_mpsc(&ingress_tx, test_capture_event(42, 0, "alpha")).await;
+            send_mpsc(&ingress_tx, test_capture_event(42, 1, "beta")).await;
+
+            runtime.signal_shutdown();
+            drop(ingress_tx);
+
+            let drained = timeout(Duration::from_secs(1), async move {
+                let mut events = Vec::new();
+                while let Some(event) = ring_rx.recv().await {
+                    events.push(event);
+                }
+                events
+            })
+            .await
+            .expect("relay drain timed out");
+
+            let _ = timeout(Duration::from_secs(1), relay)
+                .await
+                .expect("relay task should exit after drain");
+
+            assert_eq!(
+                drained.len(),
+                2,
+                "expected both pending events to be drained"
+            );
+            assert_eq!(drained[0].segment.seq, 0);
+            assert_eq!(drained[0].segment.content, "alpha");
+            assert_eq!(drained[1].segment.seq, 1);
+            assert_eq!(drained[1].segment.content, "beta");
+        });
+    }
+
+    #[test]
+    fn capture_relay_closes_ring_when_ingress_channel_closes() {
+        run_async_test(async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let engine = PatternEngine::new();
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage,
+                Arc::new(RwLock::new(engine)),
+            );
+
+            let (ingress_tx, ingress_rx) = mpsc::channel::<CaptureEvent>(4);
+            let (ring_tx, mut consumers) = spmc_channel::<CaptureEvent>(4, 1);
+            let ring_rx = consumers.pop().expect("expected one SPMC consumer");
+            let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
+
+            drop(ingress_tx);
+
+            let _ = timeout(Duration::from_secs(1), relay)
+                .await
+                .expect("relay should terminate when ingress channel closes");
+            let next = timeout(Duration::from_secs(1), ring_rx.recv())
+                .await
+                .expect("ring recv should resolve");
+            assert!(
+                next.is_none(),
+                "ring should be closed after ingress channel shutdown"
+            );
+        });
+    }
+
     #[test]
     fn runtime_metrics_records_ingest_lag() {
         let metrics = RuntimeMetrics::default();

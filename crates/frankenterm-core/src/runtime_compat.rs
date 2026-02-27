@@ -11,6 +11,110 @@
 use std::future::Future;
 use std::time::Duration;
 
+/// Migration policy classification for `runtime_compat` APIs.
+///
+/// Bead: `ft-e34d9.10.2.3`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceDisposition {
+    /// Intentional compatibility seam that remains part of the target surface.
+    Keep,
+    /// Transitional helper that should be replaced by a more explicit API.
+    Replace,
+    /// Transitional helper that should be removed after replacement lands.
+    Retire,
+}
+
+/// One contract entry describing an exported compatibility API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceContractEntry {
+    /// Fully-qualified API path (within this module).
+    pub api: &'static str,
+    /// Keep/replace/retire policy.
+    pub disposition: SurfaceDisposition,
+    /// Why the API has this policy.
+    pub rationale: &'static str,
+    /// Explicit replacement path for replace/retire entries.
+    pub replacement: Option<&'static str>,
+}
+
+/// Runtime-compat surface contract (v1).
+///
+/// This catalog keeps the migration seam auditable and intentionally shrinking.
+pub const SURFACE_CONTRACT_V1: &[SurfaceContractEntry] = &[
+    SurfaceContractEntry {
+        api: "RuntimeBuilder",
+        disposition: SurfaceDisposition::Keep,
+        rationale: "Canonical runtime bootstrap seam shared by CLI/watch/test harnesses.",
+        replacement: None,
+    },
+    SurfaceContractEntry {
+        api: "Runtime",
+        disposition: SurfaceDisposition::Keep,
+        rationale: "Owns active runtime instance behind migration boundary.",
+        replacement: None,
+    },
+    SurfaceContractEntry {
+        api: "CompatRuntime::block_on",
+        disposition: SurfaceDisposition::Keep,
+        rationale: "Used by deterministic tests and bridge code while call-graph migration continues.",
+        replacement: None,
+    },
+    SurfaceContractEntry {
+        api: "CompatRuntime::spawn_detached",
+        disposition: SurfaceDisposition::Replace,
+        rationale: "Detached execution masks scope ownership semantics in target asupersync state.",
+        replacement: Some("cx::spawn_with_cx / explicit scope-owned spawn"),
+    },
+    SurfaceContractEntry {
+        api: "sleep",
+        disposition: SurfaceDisposition::Keep,
+        rationale: "Cross-runtime time seam with stable call-site behavior.",
+        replacement: None,
+    },
+    SurfaceContractEntry {
+        api: "timeout",
+        disposition: SurfaceDisposition::Keep,
+        rationale: "Shared timeout boundary used by IPC/web/watchdog call paths.",
+        replacement: None,
+    },
+    SurfaceContractEntry {
+        api: "spawn_blocking",
+        disposition: SurfaceDisposition::Keep,
+        rationale: "Canonical blocking-work seam with normalized error mapping.",
+        replacement: None,
+    },
+    SurfaceContractEntry {
+        api: "task::spawn_blocking",
+        disposition: SurfaceDisposition::Replace,
+        rationale: "JoinHandle-centric blocking helper should be reserved for explicit abortable workflows only.",
+        replacement: Some("spawn_blocking (use task::spawn_blocking only when JoinHandle control is required)"),
+    },
+    SurfaceContractEntry {
+        api: "mpsc_recv_option",
+        disposition: SurfaceDisposition::Replace,
+        rationale: "Option-normalized receive can hide cancellation semantics in asupersync mode.",
+        replacement: Some("mpsc::Receiver::recv with explicit cx/cancellation handling"),
+    },
+    SurfaceContractEntry {
+        api: "mpsc_send",
+        disposition: SurfaceDisposition::Replace,
+        rationale: "Send helper abstracts over reserve/commit vs direct send semantics.",
+        replacement: Some("cx-aware channel send path (reserve/commit where required)"),
+    },
+    SurfaceContractEntry {
+        api: "process::Command",
+        disposition: SurfaceDisposition::Retire,
+        rationale: "Tokio process shim remains temporary and should be replaced by asupersync-native process layer.",
+        replacement: Some("asupersync process abstraction"),
+    },
+    SurfaceContractEntry {
+        api: "signal",
+        disposition: SurfaceDisposition::Retire,
+        rationale: "Tokio-only signal shim is transitional and should be removed after native runtime integration.",
+        replacement: Some("asupersync-native signal handling"),
+    },
+];
+
 #[cfg(feature = "asupersync-runtime")]
 use std::ops::{Deref, DerefMut};
 #[cfg(feature = "asupersync-runtime")]
@@ -855,6 +959,44 @@ pub async fn mpsc_send<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::Se
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn surface_contract_entries_are_unique() {
+        let mut seen = HashSet::new();
+        for entry in SURFACE_CONTRACT_V1 {
+            assert!(
+                seen.insert(entry.api),
+                "duplicate surface contract entry: {}",
+                entry.api
+            );
+        }
+    }
+
+    #[test]
+    fn surface_contract_replacements_are_explicit() {
+        for entry in SURFACE_CONTRACT_V1 {
+            if matches!(
+                entry.disposition,
+                SurfaceDisposition::Replace | SurfaceDisposition::Retire
+            ) {
+                assert!(
+                    entry.replacement.is_some(),
+                    "missing replacement for {}",
+                    entry.api
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn surface_contract_marks_task_spawn_blocking_as_replace() {
+        let entry = SURFACE_CONTRACT_V1
+            .iter()
+            .find(|entry| entry.api == "task::spawn_blocking")
+            .expect("task::spawn_blocking entry must exist");
+        assert_eq!(entry.disposition, SurfaceDisposition::Replace);
+    }
 
     #[test]
     fn runtime_builder_current_thread_builds() {

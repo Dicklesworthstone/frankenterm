@@ -172,19 +172,10 @@ impl SnapshotEngine {
         E: std::fmt::Display + Send + 'static,
         F: FnOnce() -> std::result::Result<T, E> + Send + 'static,
     {
-        #[cfg(feature = "asupersync-runtime")]
-        {
-            asupersync::runtime::spawn_blocking(work)
-                .await
-                .map_err(|e| SnapshotError::Database(e.to_string()))
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            crate::runtime_compat::task::spawn_blocking(work)
-                .await
-                .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
-                .map_err(|e| SnapshotError::Database(e.to_string()))
-        }
+        crate::runtime_compat::spawn_blocking(work)
+            .await
+            .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
+            .map_err(|e| SnapshotError::Database(e.to_string()))
     }
 
     async fn spawn_blocking_db_best_effort<T, E, F>(work: F) -> T

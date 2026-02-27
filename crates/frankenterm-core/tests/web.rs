@@ -6,10 +6,12 @@ mod web_tests {
 
     use frankenterm_core::events::{Event, EventBus};
     use frankenterm_core::patterns::{AgentType, Detection, Severity};
-    use frankenterm_core::runtime_compat::{sleep, task, timeout};
+    use frankenterm_core::runtime_compat::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sleep, task, timeout,
+    };
     use frankenterm_core::storage::{PaneRecord, StorageHandle};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
     use frankenterm_core::web::{WebServerConfig, start_web_server};
 
@@ -355,6 +357,44 @@ mod web_tests {
             status == 404 || status == 405,
             "POST should be rejected (404 or 405), got {status}: {response}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_fetch_prefix_times_out_on_stalled_body()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let server_task = task::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut req_buf = [0_u8; 512];
+            let _ = timeout(Duration::from_millis(250), stream.read(&mut req_buf)).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
+                )
+                .await?;
+            sleep(Duration::from_secs(1)).await;
+            Ok::<(), std::io::Error>(())
+        });
+
+        let req = b"GET /stream/events?channel=detections&max_hz=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let start = Instant::now();
+        let response = fetch_stream_prefix(addr, req, Duration::from_millis(120), 256).await?;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "fetch should return after read timeout, elapsed={elapsed:?}"
+        );
+        assert!(
+            response.contains("HTTP/1.1 200 OK"),
+            "expected partial HTTP response headers: {response}"
+        );
+
+        let _ = timeout(Duration::from_secs(2), server_task).await;
+
         Ok(())
     }
 
