@@ -11,7 +11,7 @@ use std::time::Instant;
 use frankenterm_core::beads_types::{BeadIssueDetail, BeadIssueType, BeadStatus};
 use frankenterm_core::mission_events::{MissionEventLog, MissionEventLogConfig};
 use frankenterm_core::mission_loop::{
-    MissionCycleMetricsSample, MissionLoop, MissionLoopConfig, MissionTrigger,
+    MissionLoop, MissionLoopConfig, MissionTrigger,
     OperatorOverride, OperatorOverrideKind, OperatorStatusReport,
 };
 use frankenterm_core::plan::{MissionAgentAvailability, MissionAgentCapabilityProfile};
@@ -665,7 +665,7 @@ fn perf_should_evaluate_fast() {
 
     let start = Instant::now();
     for i in 0..10_000 {
-        ml.should_evaluate(30_000 + i);
+        let _ = ml.should_evaluate(30_000 + i);
     }
     let elapsed = start.elapsed();
 
