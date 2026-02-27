@@ -30072,6 +30072,60 @@ struct MissionAssignmentCounters {
     unresolved: usize,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct MissionDegradedStateData {
+    is_degraded: bool,
+    code: String,
+    severity: String,
+    summary: String,
+    operator_action: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct MissionDecisionSnapshotData {
+    assignment_id: String,
+    candidate_id: String,
+    assignee: String,
+    run_state: RobotMissionRunState,
+    agent_state: RobotMissionAgentState,
+    action_state: RobotMissionActionState,
+    decision_path: String,
+    approval_state: frankenterm_core::plan::ApprovalState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<frankenterm_core::plan::Outcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct MissionDecisionProvenanceData {
+    assignment: MissionDecisionSnapshotData,
+    activity_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mission_provenance: Option<frankenterm_core::plan::MissionProvenance>,
+    provenance_trace: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch_contract: Option<frankenterm_core::plan::MissionDispatchContract>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch_target: Option<frankenterm_core::plan::MissionDispatchTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_run_execution: Option<frankenterm_core::plan::MissionDispatchExecution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct MissionOperatorViewData {
+    degraded_state: MissionDegradedStateData,
+    active_decisions: Vec<MissionDecisionSnapshotData>,
+    blocked_work: Vec<MissionDecisionSnapshotData>,
+    recent_outcomes: Vec<MissionDecisionSnapshotData>,
+}
+
 const MISSION_EXIT_NOT_FOUND: i32 = 3;
 const MISSION_EXIT_IO: i32 = 4;
 const MISSION_EXIT_VALIDATION: i32 = 5;
@@ -30370,6 +30424,376 @@ fn mission_assignment_counters(
     }
 
     counters
+}
+
+fn mission_outcome_completed_at_ms(outcome: &frankenterm_core::plan::Outcome) -> i64 {
+    match outcome {
+        frankenterm_core::plan::Outcome::Success { completed_at_ms, .. }
+        | frankenterm_core::plan::Outcome::Failed { completed_at_ms, .. }
+        | frankenterm_core::plan::Outcome::Cancelled { completed_at_ms, .. } => *completed_at_ms,
+    }
+}
+
+fn mission_assignment_activity_at_ms(assignment: &frankenterm_core::plan::Assignment) -> i64 {
+    assignment
+        .outcome
+        .as_ref()
+        .map(mission_outcome_completed_at_ms)
+        .or(assignment.updated_at_ms)
+        .unwrap_or(assignment.created_at_ms)
+}
+
+fn mission_assignment_decision_path(assignment: &frankenterm_core::plan::Assignment) -> &'static str {
+    match (&assignment.approval_state, &assignment.outcome) {
+        (_, Some(frankenterm_core::plan::Outcome::Success { .. })) => "outcome_success",
+        (_, Some(frankenterm_core::plan::Outcome::Failed { .. })) => "outcome_failed",
+        (_, Some(frankenterm_core::plan::Outcome::Cancelled { .. })) => "outcome_cancelled",
+        (frankenterm_core::plan::ApprovalState::Pending { .. }, None) => "approval_pending",
+        (frankenterm_core::plan::ApprovalState::Denied { .. }, None) => "approval_denied",
+        (frankenterm_core::plan::ApprovalState::Expired { .. }, None) => "approval_expired",
+        (frankenterm_core::plan::ApprovalState::Approved { .. }, None) => "dispatch_ready",
+        (frankenterm_core::plan::ApprovalState::NotRequired, None) => "dispatch_ready",
+    }
+}
+
+fn mission_assignment_reason_and_error(
+    assignment: &frankenterm_core::plan::Assignment,
+) -> (Option<String>, Option<String>) {
+    if assignment.outcome.is_some() {
+        return robot_mission_reason_and_error(assignment.outcome.as_ref());
+    }
+
+    use frankenterm_core::plan::MissionFailureCode;
+
+    match &assignment.approval_state {
+        frankenterm_core::plan::ApprovalState::Pending { .. } => (
+            Some(MissionFailureCode::ApprovalRequired.reason_code().to_string()),
+            Some(MissionFailureCode::ApprovalRequired.error_code().to_string()),
+        ),
+        frankenterm_core::plan::ApprovalState::Denied { reason_code, .. } => (
+            Some(reason_code.clone()),
+            Some(MissionFailureCode::ApprovalDenied.error_code().to_string()),
+        ),
+        frankenterm_core::plan::ApprovalState::Expired { reason_code, .. } => (
+            Some(reason_code.clone()),
+            Some(MissionFailureCode::ApprovalExpired.error_code().to_string()),
+        ),
+        frankenterm_core::plan::ApprovalState::NotRequired
+        | frankenterm_core::plan::ApprovalState::Approved { .. } => (None, None),
+    }
+}
+
+fn mission_decision_snapshot(
+    assignment: &frankenterm_core::plan::Assignment,
+    candidate_action: Option<&frankenterm_core::plan::CandidateAction>,
+) -> MissionDecisionSnapshotData {
+    let row = robot_mission_assignment_data(assignment, candidate_action);
+    let RobotMissionAssignmentData {
+        assignment_id,
+        candidate_id,
+        assignee,
+        run_state,
+        agent_state,
+        action_state,
+        approval_state,
+        outcome,
+        reason_code,
+        error_code,
+        ..
+    } = row;
+    let (reason_code, error_code) = if reason_code.is_some() || error_code.is_some() {
+        (reason_code, error_code)
+    } else {
+        mission_assignment_reason_and_error(assignment)
+    };
+    let completed_at_ms = outcome.as_ref().map(mission_outcome_completed_at_ms);
+
+    MissionDecisionSnapshotData {
+        assignment_id,
+        candidate_id,
+        assignee,
+        run_state,
+        agent_state,
+        action_state,
+        decision_path: mission_assignment_decision_path(assignment).to_string(),
+        approval_state,
+        outcome,
+        reason_code,
+        error_code,
+        completed_at_ms,
+    }
+}
+
+fn mission_degraded_state_data(
+    mission: &frankenterm_core::plan::Mission,
+    counters: MissionAssignmentCounters,
+    blocked_work_count: usize,
+) -> MissionDegradedStateData {
+    use frankenterm_core::plan::MissionLifecycleState as State;
+
+    match mission.lifecycle_state {
+        State::AwaitingApproval => MissionDegradedStateData {
+            is_degraded: true,
+            code: "lifecycle_awaiting_approval".to_string(),
+            severity: "warning".to_string(),
+            summary: "Mission is waiting on operator approval before dispatch can continue."
+                .to_string(),
+            operator_action: "Resolve pending approvals, then run `ft mission run` or `ft mission resume`."
+                .to_string(),
+        },
+        State::Blocked => MissionDegradedStateData {
+            is_degraded: true,
+            code: "lifecycle_blocked".to_string(),
+            severity: "critical".to_string(),
+            summary: "Mission is blocked and cannot progress automatically.".to_string(),
+            operator_action: "Inspect blocked assignments in `blocked_work`, resolve root cause, and run `ft mission resume`."
+                .to_string(),
+        },
+        State::RetryPending => MissionDegradedStateData {
+            is_degraded: true,
+            code: "lifecycle_retry_pending".to_string(),
+            severity: "warning".to_string(),
+            summary: "Mission is waiting for retry scheduling/backoff window.".to_string(),
+            operator_action: "Inspect recent outcomes and failure codes before resuming execution."
+                .to_string(),
+        },
+        State::Failed => MissionDegradedStateData {
+            is_degraded: true,
+            code: "lifecycle_failed".to_string(),
+            severity: "critical".to_string(),
+            summary: "Mission has entered a terminal failed state.".to_string(),
+            operator_action: "Use `recent_outcomes` + `failure_catalog` to diagnose, then re-plan a new mission."
+                .to_string(),
+        },
+        State::Cancelled => MissionDegradedStateData {
+            is_degraded: true,
+            code: "lifecycle_cancelled".to_string(),
+            severity: "warning".to_string(),
+            summary: "Mission is cancelled and no further dispatch will occur.".to_string(),
+            operator_action: "Create a fresh mission if work should continue.".to_string(),
+        },
+        _ if counters.failed > 0 => MissionDegradedStateData {
+            is_degraded: true,
+            code: "assignment_failures_present".to_string(),
+            severity: "warning".to_string(),
+            summary: format!(
+                "Mission has {} failed assignment(s) that require review.",
+                counters.failed
+            ),
+            operator_action:
+                "Inspect `recent_outcomes` and decide whether to retry, reassign, or abort."
+                    .to_string(),
+        },
+        _ if blocked_work_count > 0
+            || counters.pending_approval > 0
+            || counters.denied > 0
+            || counters.expired > 0 =>
+        {
+            MissionDegradedStateData {
+                is_degraded: true,
+                code: "assignment_approval_or_blockers_present".to_string(),
+                severity: "warning".to_string(),
+                summary: format!(
+                    "Mission has blocked/approval-gated work (blocked={}, pending_approval={}, denied={}, expired={}).",
+                    blocked_work_count, counters.pending_approval, counters.denied, counters.expired
+                ),
+                operator_action:
+                    "Inspect `active_decisions` and `blocked_work` to clear approval/policy blockers."
+                        .to_string(),
+            }
+        }
+        _ => MissionDegradedStateData {
+            is_degraded: false,
+            code: "none".to_string(),
+            severity: "none".to_string(),
+            summary: "Mission has no active degraded-state indicators.".to_string(),
+            operator_action: "Continue monitoring normal execution.".to_string(),
+        },
+    }
+}
+
+fn build_mission_operator_view_data(
+    mission: &frankenterm_core::plan::Mission,
+    limit: usize,
+) -> MissionOperatorViewData {
+    let candidate_lookup: HashMap<&str, &frankenterm_core::plan::CandidateAction> = mission
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.candidate_id.0.as_str(), candidate))
+        .collect();
+
+    let mut snapshots = mission
+        .assignments
+        .iter()
+        .map(|assignment| {
+            let candidate_action = candidate_lookup.get(assignment.candidate_id.0.as_str()).copied();
+            (
+                mission_assignment_activity_at_ms(assignment),
+                mission_decision_snapshot(assignment, candidate_action),
+            )
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.assignment_id.cmp(&right.1.assignment_id))
+    });
+
+    let active_decisions = snapshots
+        .iter()
+        .filter(|(_, snapshot)| snapshot.run_state == RobotMissionRunState::Pending)
+        .map(|(_, snapshot)| snapshot.clone())
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    let lifecycle_forces_blocked = matches!(
+        mission.lifecycle_state,
+        frankenterm_core::plan::MissionLifecycleState::AwaitingApproval
+            | frankenterm_core::plan::MissionLifecycleState::Blocked
+            | frankenterm_core::plan::MissionLifecycleState::RetryPending
+            | frankenterm_core::plan::MissionLifecycleState::Failed
+    );
+    let blocked_work = snapshots
+        .iter()
+        .filter(|(_, snapshot)| {
+            snapshot.action_state == RobotMissionActionState::Blocked
+                || (lifecycle_forces_blocked && snapshot.run_state == RobotMissionRunState::Pending)
+        })
+        .map(|(_, snapshot)| snapshot.clone())
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    let mut recent_outcomes = snapshots
+        .iter()
+        .filter(|(_, snapshot)| snapshot.completed_at_ms.is_some())
+        .map(|(_, snapshot)| snapshot.clone())
+        .collect::<Vec<_>>();
+    recent_outcomes.sort_by(|left, right| {
+        right
+            .completed_at_ms
+            .cmp(&left.completed_at_ms)
+            .then_with(|| left.assignment_id.cmp(&right.assignment_id))
+    });
+    recent_outcomes.truncate(limit);
+
+    let counters = mission_assignment_counters(mission);
+    let degraded_state = mission_degraded_state_data(mission, counters, blocked_work.len());
+    MissionOperatorViewData {
+        degraded_state,
+        active_decisions,
+        blocked_work,
+        recent_outcomes,
+    }
+}
+
+fn build_mission_decision_provenance_data(
+    mission: &frankenterm_core::plan::Mission,
+    focus_assignment_id: Option<&str>,
+    limit: usize,
+) -> Vec<MissionDecisionProvenanceData> {
+    let candidate_lookup: HashMap<&str, &frankenterm_core::plan::CandidateAction> = mission
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.candidate_id.0.as_str(), candidate))
+        .collect();
+    let dry_run_completed_at_ms = mission.updated_at_ms.unwrap_or(mission.created_at_ms);
+
+    let mut assignments = mission
+        .assignments
+        .iter()
+        .map(|assignment| (mission_assignment_activity_at_ms(assignment), assignment))
+        .collect::<Vec<_>>();
+    assignments.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.assignment_id.0.cmp(&right.1.assignment_id.0))
+    });
+
+    let mut traces = Vec::new();
+    for (activity_at_ms, assignment) in assignments {
+        if let Some(expected_assignment_id) = focus_assignment_id
+            && assignment.assignment_id.0 != expected_assignment_id
+        {
+            continue;
+        }
+        if traces.len() >= limit {
+            break;
+        }
+
+        let candidate_action = candidate_lookup.get(assignment.candidate_id.0.as_str()).copied();
+        let snapshot = mission_decision_snapshot(assignment, candidate_action);
+
+        let mut decision_error = None;
+        let dispatch_contract = match mission.dispatch_contract_for_candidate(&assignment.candidate_id) {
+            Ok(contract) => Some(contract),
+            Err(err) => {
+                decision_error = Some(format!("dispatch_contract_error: {err}"));
+                None
+            }
+        };
+        let dispatch_target = match mission.resolve_dispatch_target(&assignment.assignment_id) {
+            Ok(target) => Some(target),
+            Err(err) => {
+                decision_error.get_or_insert_with(|| format!("dispatch_target_resolution_error: {err}"));
+                None
+            }
+        };
+        let dry_run_execution =
+            match mission.dispatch_assignment_dry_run(&assignment.assignment_id, dry_run_completed_at_ms)
+            {
+                Ok(execution) => Some(execution),
+                Err(err) => {
+                    decision_error.get_or_insert_with(|| format!("dispatch_dry_run_error: {err}"));
+                    None
+                }
+            };
+
+        let mut provenance_trace = vec![format!("assignment_decision_path:{}", snapshot.decision_path)];
+        if let Some(provenance) = &mission.provenance {
+            if let Some(bead_id) = provenance.bead_id.as_deref() {
+                provenance_trace.push(format!("bead_id:{bead_id}"));
+            }
+            if let Some(thread_id) = provenance.thread_id.as_deref() {
+                provenance_trace.push(format!("thread_id:{thread_id}"));
+            }
+            if let Some(source_command) = provenance.source_command.as_deref() {
+                provenance_trace.push(format!("source_command:{source_command}"));
+            }
+            if let Some(source_sha) = provenance.source_sha.as_deref() {
+                provenance_trace.push(format!("source_sha:{source_sha}"));
+            }
+        }
+        provenance_trace.push(if dispatch_target.is_some() {
+            "dispatch_target:resolved".to_string()
+        } else {
+            "dispatch_target:missing".to_string()
+        });
+        provenance_trace.push(if dispatch_contract.is_some() {
+            "dispatch_contract:resolved".to_string()
+        } else {
+            "dispatch_contract:missing".to_string()
+        });
+        provenance_trace.push(if dry_run_execution.is_some() {
+            "dispatch_dry_run:resolved".to_string()
+        } else {
+            "dispatch_dry_run:missing".to_string()
+        });
+
+        traces.push(MissionDecisionProvenanceData {
+            assignment: snapshot,
+            activity_at_ms,
+            mission_provenance: mission.provenance.clone(),
+            provenance_trace,
+            dispatch_contract,
+            dispatch_target,
+            dry_run_execution,
+            decision_error,
+        });
+    }
+
+    traces
 }
 
 fn mission_available_transitions(
@@ -31087,6 +31511,48 @@ fn handle_mission_command(
             let mission_id = mission.mission_id.0.clone();
             let mission_title = mission.title.clone();
             let mission_hash = mission.compute_hash();
+            let operator_view = build_mission_operator_view_data(&mission, 10);
+            let degraded_state = operator_view.degraded_state.clone();
+            let active_decisions_count = operator_view.active_decisions.len();
+            let blocked_work_count = operator_view.blocked_work.len();
+            let recent_outcomes_count = operator_view.recent_outcomes.len();
+
+            let mut blocked_preview = operator_view
+                .blocked_work
+                .iter()
+                .take(3)
+                .map(|entry| {
+                    format!(
+                        "{} [{}] assignee={} reason={}",
+                        entry.assignment_id,
+                        entry.decision_path,
+                        entry.assignee,
+                        entry.reason_code.as_deref().unwrap_or("none")
+                    )
+                })
+                .collect::<Vec<_>>();
+            if blocked_preview.is_empty() {
+                blocked_preview.push("none".to_string());
+            }
+
+            let mut outcome_preview = operator_view
+                .recent_outcomes
+                .iter()
+                .take(3)
+                .map(|entry| {
+                    format!(
+                        "{} [{}] reason={} error={}",
+                        entry.assignment_id,
+                        entry.decision_path,
+                        entry.reason_code.as_deref().unwrap_or("none"),
+                        entry.error_code.as_deref().unwrap_or("none")
+                    )
+                })
+                .collect::<Vec<_>>();
+            if outcome_preview.is_empty() {
+                outcome_preview.push("none".to_string());
+            }
+
             let data = serde_json::json!({
                 "command": "status",
                 "mission_file": mission_path.display().to_string(),
@@ -31108,6 +31574,7 @@ fn handle_mission_command(
                     "unresolved": counters.unresolved,
                 },
                 "available_transitions": transitions_json,
+                "operator_view": operator_view,
             });
             let plain_lines = vec![
                 format!("Mission status: {}", mission.mission_id.0.as_str()),
@@ -31119,6 +31586,25 @@ fn handle_mission_command(
                 format!("  Assignments: {} (succeeded={}, failed={}, unresolved={})", mission.assignments.len(), counters.succeeded, counters.failed, counters.unresolved),
                 format!("  Awaiting approval: {}", counters.pending_approval),
                 format!("  Legal transitions from current state: {}", transitions.len()),
+                format!(
+                    "  Degraded: {} ({}, severity={})",
+                    degraded_state.is_degraded,
+                    degraded_state.code.as_str(),
+                    degraded_state.severity.as_str()
+                ),
+                format!("  Degraded summary: {}", degraded_state.summary.as_str()),
+                format!("  Operator action: {}", degraded_state.operator_action.as_str()),
+                format!("  Active decisions: {}", active_decisions_count),
+                format!(
+                    "  Blocked work: {} ({})",
+                    blocked_work_count,
+                    blocked_preview.join("; ")
+                ),
+                format!(
+                    "  Recent outcomes: {} ({})",
+                    recent_outcomes_count,
+                    outcome_preview.join("; ")
+                ),
             ];
             emit_mission_success(output_format, data, &plain_lines)?;
         }
@@ -31145,8 +31631,8 @@ fn handle_mission_command(
                     })
                 })
                 .collect::<Vec<_>>();
-            let assignment_context = if let Some(raw_assignment_id) = assignment_id {
-                let trimmed = raw_assignment_id.trim();
+            let requested_assignment_id = assignment_id.map(|raw_assignment_id| {
+                let trimmed = raw_assignment_id.trim().to_string();
                 if trimmed.is_empty() {
                     emit_mission_error(
                         output_format,
@@ -31158,8 +31644,60 @@ fn handle_mission_command(
                         },
                     );
                 }
-                let assignment_id = frankenterm_core::plan::AssignmentId(trimmed.to_string());
-                let target = match mission.resolve_dispatch_target(&assignment_id) {
+                trimmed
+            });
+            let candidate_lookup: HashMap<&str, &frankenterm_core::plan::CandidateAction> = mission
+                .candidates
+                .iter()
+                .map(|candidate| (candidate.candidate_id.0.as_str(), candidate))
+                .collect();
+            let assignment_context = if let Some(requested_assignment_id) =
+                requested_assignment_id.as_deref()
+            {
+                let assignment = match mission
+                    .assignments
+                    .iter()
+                    .find(|assignment| assignment.assignment_id.0 == requested_assignment_id)
+                {
+                    Some(assignment) => assignment,
+                    None => emit_mission_error(
+                        output_format,
+                        MissionCommandError {
+                            exit_code: MISSION_EXIT_INVALID_INPUT,
+                            error_code: "mission.assignment_not_found",
+                            message: format!(
+                                "Unable to resolve assignment dispatch target for {}",
+                                requested_assignment_id
+                            ),
+                            hint: Some(
+                                "Use `ft mission status` to inspect known assignment IDs.".to_string(),
+                            ),
+                        },
+                    ),
+                };
+                let candidate_action = candidate_lookup.get(assignment.candidate_id.0.as_str()).copied();
+                let assignment_snapshot = mission_decision_snapshot(assignment, candidate_action);
+                let assignment_decision_path = assignment_snapshot.decision_path.clone();
+                let dispatch_contract = match mission.dispatch_contract_for_candidate(&assignment.candidate_id)
+                {
+                    Ok(contract) => contract,
+                    Err(err) => emit_mission_error(
+                        output_format,
+                        MissionCommandError {
+                            exit_code: MISSION_EXIT_VALIDATION,
+                            error_code: "mission.dispatch_contract_failed",
+                            message: format!(
+                                "Unable to build dispatch contract for assignment {}: {err}",
+                                assignment.assignment_id.0
+                            ),
+                            hint: Some(
+                                "Verify candidate action payload and mission provenance."
+                                    .to_string(),
+                            ),
+                        },
+                    ),
+                };
+                let target = match mission.resolve_dispatch_target(&assignment.assignment_id) {
                     Ok(target) => target,
                     Err(err) => emit_mission_error(
                         output_format,
@@ -31168,7 +31706,7 @@ fn handle_mission_command(
                             error_code: "mission.assignment_not_found",
                             message: format!(
                                 "Unable to resolve assignment dispatch target for {}: {err}",
-                                assignment_id.0
+                                assignment.assignment_id.0
                             ),
                             hint: Some(
                                 "Use `ft mission status` to inspect known assignment IDs.".to_string(),
@@ -31176,7 +31714,9 @@ fn handle_mission_command(
                         },
                     ),
                 };
-                let dry_run = match mission.dispatch_assignment_dry_run(&assignment_id, mission_now_ms()) {
+                let dry_run = match mission
+                    .dispatch_assignment_dry_run(&assignment.assignment_id, mission_now_ms())
+                {
                     Ok(execution) => execution,
                     Err(err) => emit_mission_error(
                         output_format,
@@ -31185,15 +31725,19 @@ fn handle_mission_command(
                             error_code: "mission.dispatch_dry_run_failed",
                             message: format!(
                                 "Unable to generate dry-run dispatch envelope for {}: {err}",
-                                assignment_id.0
+                                assignment.assignment_id.0
                             ),
                             hint: None,
                         },
                     ),
                 };
                 Some(serde_json::json!({
-                    "assignment_id": assignment_id.0,
+                    "assignment_id": assignment.assignment_id.0.clone(),
+                    "candidate_id": assignment.candidate_id.0.clone(),
+                    "decision_path": assignment_decision_path,
+                    "assignment_state": assignment_snapshot,
                     "target": target,
+                    "dispatch_contract": dispatch_contract,
                     "dry_run_execution": dry_run,
                 }))
             } else {
@@ -31219,6 +31763,14 @@ fn handle_mission_command(
             })
             .collect::<Vec<_>>();
             let mission_id = mission.mission_id.0.clone();
+            let operator_view = build_mission_operator_view_data(&mission, 10);
+            let degraded_state = operator_view.degraded_state.clone();
+            let decision_provenance =
+                build_mission_decision_provenance_data(&mission, requested_assignment_id.as_deref(), 10);
+            let active_decisions_count = operator_view.active_decisions.len();
+            let blocked_work_count = operator_view.blocked_work.len();
+            let recent_outcomes_count = operator_view.recent_outcomes.len();
+            let decision_provenance_count = decision_provenance.len();
 
             let data = serde_json::json!({
                 "command": "explain",
@@ -31228,11 +31780,25 @@ fn handle_mission_command(
                 "available_transitions": transitions_json,
                 "failure_catalog": failure_catalog,
                 "assignment_context": assignment_context,
+                "operator_view": operator_view,
+                "decision_provenance": decision_provenance,
             });
             let mut plain_lines = vec![
                 format!("Mission explain: {}", mission.mission_id.0.as_str()),
                 format!("  File: {}", mission_path.display()),
                 format!("  Lifecycle: {}", mission.lifecycle_state),
+                format!(
+                    "  Degraded: {} ({}, severity={})",
+                    degraded_state.is_degraded,
+                    degraded_state.code.as_str(),
+                    degraded_state.severity.as_str()
+                ),
+                format!("  Degraded summary: {}", degraded_state.summary.as_str()),
+                format!("  Operator action: {}", degraded_state.operator_action.as_str()),
+                format!("  Active decisions: {}", active_decisions_count),
+                format!("  Blocked work: {}", blocked_work_count),
+                format!("  Recent outcomes: {}", recent_outcomes_count),
+                format!("  Decision provenance traces: {}", decision_provenance_count),
                 "  Legal transitions:".to_string(),
             ];
             for (kind, to) in &transitions {
@@ -31249,6 +31815,33 @@ fn handle_mission_command(
                     .and_then(serde_json::Value::as_str)
                 {
                     plain_lines.push(format!("    - assignment_id: {assignment}"));
+                }
+                if let Some(decision_path) = context
+                    .get("decision_path")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    plain_lines.push(format!("    - decision_path: {decision_path}"));
+                }
+            }
+            if let Some(traces) = data
+                .get("decision_provenance")
+                .and_then(serde_json::Value::as_array)
+            {
+                for trace in traces.iter().take(3) {
+                    let assignment_id = trace
+                        .get("assignment")
+                        .and_then(|value| value.get("assignment_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let decision_path = trace
+                        .get("assignment")
+                        .and_then(|value| value.get("decision_path"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    plain_lines.push(format!(
+                        "  Provenance trace: {} [{}]",
+                        assignment_id, decision_path
+                    ));
                 }
             }
             emit_mission_success(output_format, data, &plain_lines)?;
@@ -35591,6 +36184,71 @@ mod tests {
             transitions
                 .iter()
                 .any(|(kind, to)| kind.to_string() == "approval_granted" && to.to_string() == "running")
+        );
+    }
+
+    #[test]
+    fn mission_operator_view_reports_active_blocked_and_recent_outcomes() {
+        let mission = sample_robot_mission();
+        let report = build_mission_operator_view_data(&mission, 10);
+
+        assert_eq!(report.active_decisions.len(), 2);
+        assert!(
+            report
+                .active_decisions
+                .iter()
+                .any(|entry| entry.assignment_id == "assignment:cli-a")
+        );
+        assert!(
+            report
+                .blocked_work
+                .iter()
+                .any(|entry| entry.assignment_id == "assignment:robot-c")
+        );
+        assert!(
+            report
+                .recent_outcomes
+                .iter()
+                .any(|entry| entry.assignment_id == "assignment:robot-b")
+        );
+        assert!(report.degraded_state.is_degraded);
+        assert_eq!(
+            report.degraded_state.code.as_str(),
+            "assignment_approval_or_blockers_present"
+        );
+    }
+
+    #[test]
+    fn mission_operator_view_marks_blocked_lifecycle_explicitly() {
+        use frankenterm_core::plan::MissionLifecycleState;
+
+        let mut mission = sample_cli_mission();
+        mission.lifecycle_state = MissionLifecycleState::Blocked;
+
+        let report = build_mission_operator_view_data(&mission, 10);
+        assert!(report.degraded_state.is_degraded);
+        assert_eq!(report.degraded_state.code.as_str(), "lifecycle_blocked");
+        assert!(!report.degraded_state.summary.is_empty());
+        assert!(!report.degraded_state.operator_action.is_empty());
+    }
+
+    #[test]
+    fn mission_decision_provenance_includes_dispatch_contract_and_target() {
+        let mission = sample_robot_mission();
+
+        let traces = build_mission_decision_provenance_data(&mission, Some("assignment:cli-a"), 10);
+        assert_eq!(traces.len(), 1);
+        let trace = &traces[0];
+        assert_eq!(trace.assignment.assignment_id, "assignment:cli-a");
+        assert!(trace.mission_provenance.is_some());
+        assert!(trace.dispatch_contract.is_some());
+        assert!(trace.dispatch_target.is_some());
+        assert!(trace.dry_run_execution.is_some());
+        assert!(
+            trace
+                .provenance_trace
+                .iter()
+                .any(|entry| entry == "dispatch_target:resolved")
         );
     }
 
