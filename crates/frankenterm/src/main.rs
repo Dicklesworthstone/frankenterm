@@ -36212,9 +36212,10 @@ mod tests {
                 .any(|entry| entry.assignment_id == "assignment:robot-b")
         );
         assert!(report.degraded_state.is_degraded);
+        // Failures take priority over blockers in degraded-state match ordering.
         assert_eq!(
             report.degraded_state.code.as_str(),
-            "assignment_approval_or_blockers_present"
+            "assignment_failures_present"
         );
     }
 
