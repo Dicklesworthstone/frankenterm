@@ -385,16 +385,28 @@ struct CautV1Identity {
     extra: HashMap<String, Value>,
 }
 
+/// Returns true if the JSON input looks like a caut.v1 envelope
+/// (contains a `schemaVersion` field). This discriminator must be
+/// checked before attempting a direct parse into CautUsage/CautRefresh,
+/// because those types have `#[serde(flatten)]` which absorbs any
+/// unknown fields and always succeeds — causing the v1 fallback path
+/// to never execute.
+fn is_caut_v1_envelope(input: &str) -> bool {
+    input.contains("\"schemaVersion\"")
+}
+
 fn parse_usage_json(
     input: &str,
     service: CautService,
     max_preview: usize,
 ) -> Result<CautUsage, CautError> {
-    if let Ok(mut usage) = parse_json::<CautUsage>(input, max_preview) {
-        if usage.service.is_none() {
-            usage.service = Some(service.as_str().to_string());
+    if !is_caut_v1_envelope(input) {
+        if let Ok(mut usage) = parse_json::<CautUsage>(input, max_preview) {
+            if usage.service.is_none() {
+                usage.service = Some(service.as_str().to_string());
+            }
+            return Ok(usage);
         }
-        return Ok(usage);
     }
 
     let envelope: CautV1Envelope = parse_json(input, max_preview)?;
@@ -406,11 +418,13 @@ fn parse_refresh_json(
     service: CautService,
     max_preview: usize,
 ) -> Result<CautRefresh, CautError> {
-    if let Ok(mut refresh) = parse_json::<CautRefresh>(input, max_preview) {
-        if refresh.service.is_none() {
-            refresh.service = Some(service.as_str().to_string());
+    if !is_caut_v1_envelope(input) {
+        if let Ok(mut refresh) = parse_json::<CautRefresh>(input, max_preview) {
+            if refresh.service.is_none() {
+                refresh.service = Some(service.as_str().to_string());
+            }
+            return Ok(refresh);
         }
-        return Ok(refresh);
     }
 
     let envelope: CautV1Envelope = parse_json(input, max_preview)?;
