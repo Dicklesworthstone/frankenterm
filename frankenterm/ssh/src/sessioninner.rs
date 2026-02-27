@@ -22,6 +22,13 @@ use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
 use std::time::{Duration, Instant};
 
+/// Maximum per-descriptor buffer size (4 MiB). Prevents unbounded memory
+/// growth when the write side cannot keep up with the read side (e.g.,
+/// network congestion or a slow consumer). When the buffer reaches this
+/// limit, reads are paused until data is drained, providing natural
+/// backpressure to the SSH channel.
+const MAX_DESCRIPTOR_BUF_SIZE: usize = 4 * 1024 * 1024;
+
 #[derive(Debug)]
 pub(crate) struct DescriptorState {
     pub fd: Option<FileDescriptor>,
@@ -1087,6 +1094,11 @@ fn write_from_buf<W: Write>(w: &mut W, buf: &mut VecDeque<u8>) -> std::io::Resul
 }
 
 fn read_into_buf<R: Read>(r: &mut R, buf: &mut VecDeque<u8>) -> std::io::Result<()> {
+    if buf.len() >= MAX_DESCRIPTOR_BUF_SIZE {
+        // Buffer is full — apply backpressure by not reading more data.
+        // The caller will drain via write_from_buf, then resume reads.
+        return Ok(());
+    }
     let current_len = buf.len();
     buf.resize(buf.capacity(), 0);
     let target_buf = &mut buf.make_contiguous()[current_len..];
