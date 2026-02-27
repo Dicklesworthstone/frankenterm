@@ -241,11 +241,16 @@ proptest! {
         let mut tracker = RateLimitTracker::new();
         let now = Instant::now();
 
-        let mut expected_types = std::collections::HashSet::new();
+        // Track the final agent_type per pane (last write wins).
+        let mut final_type_per_pane = std::collections::HashMap::new();
         for &(pid, agent_type) in &events {
             tracker.record_at(pid, agent_type, "rule".into(), None, now);
-            expected_types.insert(agent_type.to_string());
+            final_type_per_pane.insert(pid, agent_type);
         }
+        let expected_types: std::collections::HashSet<_> = final_type_per_pane
+            .values()
+            .map(|at| at.to_string())
+            .collect();
 
         let summaries = tracker.all_provider_statuses_at(now);
         let actual_types: std::collections::HashSet<_> = summaries
