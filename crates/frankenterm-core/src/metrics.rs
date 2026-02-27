@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::Result;
 use crate::events::EventBus;
 use crate::runtime::RuntimeHandle;
-use crate::runtime_compat::io::AsyncWriteExt;
+use crate::runtime_compat::io::{AsyncReadExt, AsyncWriteExt};
 use crate::runtime_compat::net::{TcpListener, TcpStream};
 use crate::runtime_compat::task::JoinHandle;
 use tracing::{debug, warn};

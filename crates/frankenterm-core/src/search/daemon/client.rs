@@ -45,6 +45,7 @@ impl EmbedClient {
     }
 
     /// Set the request timeout in milliseconds.
+    #[must_use]
     pub fn with_timeout_ms(mut self, ms: u64) -> Self {
         self.timeout_ms = ms;
         self
@@ -123,7 +124,9 @@ impl EmbedClient {
                 operation: "ping",
                 message,
             }),
-            _ => Err(EmbedClientError::UnexpectedResponse { operation: "ping" }),
+            DaemonResponse::Embed(_) => {
+                Err(EmbedClientError::UnexpectedResponse { operation: "ping" })
+            }
         }
     }
 
@@ -138,7 +141,7 @@ impl EmbedClient {
                 operation: "shutdown",
                 message,
             }),
-            _ => Err(EmbedClientError::UnexpectedResponse {
+            DaemonResponse::Embed(_) => Err(EmbedClientError::UnexpectedResponse {
                 operation: "shutdown",
             }),
         }
@@ -166,7 +169,9 @@ impl EmbedClient {
                 operation: "embed",
                 message,
             }),
-            _ => Err(EmbedClientError::UnexpectedResponse { operation: "embed" }),
+            DaemonResponse::Pong => {
+                Err(EmbedClientError::UnexpectedResponse { operation: "embed" })
+            }
         }
     }
 }

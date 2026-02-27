@@ -449,9 +449,9 @@ impl AppendLogReader {
         // Guard against corrupt files with impossibly large payload lengths
         const MAX_RECORD_PAYLOAD: u64 = 64 * 1024 * 1024; // 64 MiB
         if payload_len > MAX_RECORD_PAYLOAD {
-            return Err(LogReadError::Deserialize {
+            return Err(LogReadError::Corrupt {
                 byte_offset: record_start,
-                message: format!(
+                reason: format!(
                     "record payload too large: {payload_len} bytes (max {MAX_RECORD_PAYLOAD})"
                 ),
             });
@@ -583,7 +583,7 @@ impl crate::recorder_storage::RecorderEventReader for AppendLogEventSource {
             .map_err(|e| EventCursorError::Io(e.to_string()))?;
         loop {
             match reader.next_record() {
-                Ok(Some(_)) => continue,
+                Ok(Some(_)) => {},
                 Ok(None) => break,
                 Err(e) => return Err(EventCursorError::Io(e.to_string())),
             }
@@ -714,7 +714,7 @@ impl IndexerConfig {
             crate::recorder_storage::RecorderSourceDescriptor::AppendLog { data_path } => {
                 Some(data_path)
             }
-            _ => None,
+            crate::recorder_storage::RecorderSourceDescriptor::FrankenSqlite { .. } => None,
         }
     }
 
@@ -993,17 +993,11 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
         let mut cursor = match &checkpoint {
             Some(cp) => {
                 let mut c = reader.open_cursor(cp.upto_offset.clone()).map_err(|e| {
-                    IndexerError::LogRead(LogReadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    )))
+                    IndexerError::LogRead(LogReadError::Io(std::io::Error::other(e.to_string())))
                 })?;
                 // Skip the checkpointed record itself
                 let _ = c.next_batch(1).map_err(|e| {
-                    IndexerError::LogRead(LogReadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    )))
+                    IndexerError::LogRead(LogReadError::Io(std::io::Error::other(e.to_string())))
                 })?;
                 tracing::debug!(
                     cursor = "resume",
@@ -1015,10 +1009,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
             None => {
                 tracing::debug!(cursor = "cold_start", "cursor opened from start");
                 reader.open_cursor_from_start().map_err(|e| {
-                    IndexerError::LogRead(LogReadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    )))
+                    IndexerError::LogRead(LogReadError::Io(std::io::Error::other(e.to_string())))
                 })?
             }
         };
@@ -1041,10 +1032,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
             }
 
             let batch = cursor.next_batch(self.config.batch_size).map_err(|e| {
-                IndexerError::LogRead(LogReadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )))
+                IndexerError::LogRead(LogReadError::Io(std::io::Error::other(e.to_string())))
             })?;
             if batch.is_empty() {
                 result.caught_up = true;
@@ -1065,9 +1053,9 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
 
                 let doc = map_event_to_document(&record.event, record.offset.ordinal);
 
-                if self.config.dedup_on_replay
-                    && self.writer.delete_by_event_id(&doc.event_id).is_err()
-                {}
+                if self.config.dedup_on_replay {
+                    let _ = self.writer.delete_by_event_id(&doc.event_id);
+                }
 
                 match self.writer.add_document(&doc) {
                     Ok(()) => result.events_indexed += 1,

@@ -57,24 +57,28 @@ impl Default for FastEmbedConfig {
 
 impl FastEmbedConfig {
     /// Create config with a specific model.
+    #[must_use]
     pub fn with_model(mut self, model: EmbeddingModel) -> Self {
         self.model = model;
         self
     }
 
     /// Override the cache directory.
+    #[must_use]
     pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = dir.into();
         self
     }
 
     /// Set maximum token length.
+    #[must_use]
     pub fn with_max_length(mut self, max_length: usize) -> Self {
         self.max_length = max_length;
         self
     }
 
     /// Enable or disable download progress display.
+    #[must_use]
     pub fn with_show_download_progress(mut self, show: bool) -> Self {
         self.show_download_progress = show;
         self

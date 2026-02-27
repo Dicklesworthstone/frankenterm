@@ -2102,11 +2102,11 @@ fn mcp_build_mission_assignments(
         let reason_code = assignment.outcome.as_ref().and_then(|o| match o {
             Outcome::Failed { reason_code, .. } => Some(reason_code.clone()),
             Outcome::Cancelled { reason_code, .. } => Some(reason_code.clone()),
-            _ => None,
+            Outcome::Success { .. } => None,
         });
         let error_code = assignment.outcome.as_ref().and_then(|o| match o {
             Outcome::Failed { error_code, .. } => Some(error_code.clone()),
-            _ => None,
+            Outcome::Success { .. } | Outcome::Cancelled { .. } => None,
         });
 
         matched.push(McpMissionAssignmentData {

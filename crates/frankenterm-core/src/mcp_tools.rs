@@ -3073,7 +3073,7 @@ impl ToolHandler for WaMissionStateTool {
         // Check mission_state filter
         if let Some(ref filter_state) = params.mission_state {
             let current = mission.lifecycle_state.to_string();
-            if current.to_ascii_lowercase() != filter_state.to_ascii_lowercase() {
+            if !current.eq_ignore_ascii_case(filter_state) {
                 let data = McpMissionStateData {
                     mission_file: mission_path.display().to_string(),
                     mission_id: mission.mission_id.0.clone(),

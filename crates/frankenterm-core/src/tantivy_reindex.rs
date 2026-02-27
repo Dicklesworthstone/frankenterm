@@ -58,7 +58,7 @@ fn create_event_reader(
 /// Convert [`EventCursorError`] to [`IndexerError`].
 fn cursor_err(e: EventCursorError) -> IndexerError {
     IndexerError::LogRead(crate::tantivy_ingest::LogReadError::Io(
-        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+        std::io::Error::other(e.to_string()),
     ))
 }
 
@@ -504,7 +504,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     /// after each committed batch and `observer.on_complete()` when done.
     /// Emits operator-facing `info!` logs at batch boundaries.
     #[allow(clippy::too_many_arguments)]
-    pub async fn reindex_range_observed<S: RecorderStorage, O: ReindexObserver>(
+    pub async fn reindex_range_observed<S: RecorderStorage, O: ReindexObserver + Sync>(
         &mut self,
         storage: &S,
         source: &RecorderSourceDescriptor,
