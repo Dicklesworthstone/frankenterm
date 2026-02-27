@@ -4358,7 +4358,7 @@ mod tests {
     fn mpsc_queue_depth_computation_is_correct() {
         // Validates queue depth accounting for a fixed-capacity channel.
         let (tx, _rx) = mpsc::channel::<u8>(16);
-        let max_cap = 16usize;
+        let max_cap = mpsc_max_capacity(&tx);
         assert_eq!(max_cap, 16);
 
         // Empty queue: depth should be 0
@@ -4370,7 +4370,7 @@ mod tests {
     fn mpsc_queue_depth_increases_with_sends() {
         run_async_test(async {
             let (tx, mut rx) = mpsc::channel::<u8>(16);
-            let max_cap = 16usize;
+            let max_cap = mpsc_max_capacity(&tx);
 
             // Send some items
             send_mpsc(&tx, 1).await;
@@ -4384,6 +4384,55 @@ mod tests {
             let _ = recv_mpsc(&mut rx).await;
             let depth = max_cap - tx.capacity();
             assert_eq!(depth, 2);
+        });
+    }
+
+    #[test]
+    fn watch_helpers_detect_and_consume_updates() {
+        run_async_test(async {
+            let (tx, mut rx) = watch::channel(1u8);
+            assert!(
+                !watch_has_changed(&rx),
+                "fresh receiver should not report pending updates"
+            );
+
+            tx.send(2).expect("send watch update");
+            assert!(
+                watch_has_changed(&rx),
+                "receiver should observe pending update"
+            );
+
+            let latest = watch_borrow_and_update_clone(&mut rx);
+            assert_eq!(latest, 2);
+            assert_eq!(*rx.borrow(), 2);
+            assert!(
+                !watch_has_changed(&rx),
+                "borrow+update helper should consume pending update"
+            );
+        });
+    }
+
+    #[test]
+    fn watch_has_changed_treats_closed_sender_as_no_change() {
+        let (tx, rx) = watch::channel(7u8);
+        drop(tx);
+        assert!(
+            !watch_has_changed(&rx),
+            "closed watch sender should not be treated as a config update"
+        );
+    }
+
+    #[test]
+    fn mpsc_recv_option_round_trips_and_returns_none_when_closed() {
+        run_async_test(async {
+            let (tx, mut rx) = mpsc::channel::<u8>(4);
+            send_mpsc(&tx, 1).await;
+            send_mpsc(&tx, 2).await;
+            drop(tx);
+
+            assert_eq!(mpsc_recv_option(&mut rx).await, Some(1));
+            assert_eq!(mpsc_recv_option(&mut rx).await, Some(2));
+            assert_eq!(mpsc_recv_option(&mut rx).await, None);
         });
     }
 
