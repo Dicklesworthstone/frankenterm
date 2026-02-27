@@ -1912,7 +1912,16 @@ mod tests {
         adapter.capture_lifecycle(1, RecorderLifecyclePhase::PaneOpened, None, json!({}));
 
         let events = sink.events();
-        let mut keys: Vec<_> = events.iter().map(|(_, mk)| mk.clone()).collect();
+        // Normalize timestamps to isolate stream_kind ordering from timing
+        // (epoch_ms_now() may return different values between the two captures)
+        let mut keys: Vec<_> = events
+            .iter()
+            .map(|(_, mk)| {
+                let mut k = mk.clone();
+                k.recorded_at_ms = 0;
+                k
+            })
+            .collect();
         keys.sort();
 
         // Lifecycle (rank 0) should sort before Egress (rank 3)
