@@ -28,8 +28,9 @@ use crate::beads_types::{BeadIssueDetail, BeadReadinessReport};
 use crate::plan::MissionAgentCapabilityProfile;
 use crate::planner_features::{
     Assignment, AssignmentSet, PlannerExtractionConfig, PlannerExtractionContext,
-    PlannerExtractionReport, RejectedCandidate, RejectionReason, ScorerConfig, ScorerInput,
-    ScorerReport, SolverConfig, extract_planner_features, score_candidates, solve_assignments,
+    PlannerExtractionReport, RejectedCandidate, RejectionReason, SafetyGate, ScorerConfig,
+    ScorerInput, ScorerReport, SolverConfig, extract_planner_features, score_candidates,
+    solve_assignments,
 };
 
 // ── Loop state ──────────────────────────────────────────────────────────────
@@ -392,6 +393,12 @@ pub struct MissionLoopState {
     /// Total auto-resolved conflicts.
     #[serde(default)]
     pub total_conflicts_auto_resolved: u64,
+    /// Operator override state (pin/exclude/reprioritize controls).
+    #[serde(default)]
+    pub override_state: OperatorOverrideState,
+    /// Summary from last override application (if any overrides were active).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_override_summary: Option<OverrideApplicationSummary>,
 }
 
 // ── Mission loop engine ─────────────────────────────────────────────────────
@@ -426,6 +433,8 @@ impl MissionLoop {
                 conflict_history: Vec::new(),
                 total_conflicts_detected: 0,
                 total_conflicts_auto_resolved: 0,
+                override_state: OperatorOverrideState::default(),
+                last_override_summary: None,
             },
         }
     }
@@ -551,7 +560,7 @@ impl MissionLoop {
             })
             .collect();
 
-        let scorer_report: ScorerReport =
+        let mut scorer_report: ScorerReport =
             score_candidates(&scorer_inputs, &self.config.scorer_config);
 
         let scorer_summary = ScorerSummary {
@@ -564,9 +573,63 @@ impl MissionLoop {
             top_scored_bead: scorer_report.scored.first().map(|s| s.bead_id.clone()),
         };
 
+        // Phase 3.5: Apply operator overrides (pin/exclude/reprioritize).
+        let mut solver_config = self.config.solver_config.clone();
+        let override_summary = self.apply_operator_overrides(
+            current_ms,
+            &mut scorer_report,
+            agents,
+            &mut solver_config,
+        );
+        // Generate pinned assignments from overrides.
+        let pinned: Vec<Assignment> = override_summary
+            .pinned_assignments
+            .iter()
+            .enumerate()
+            .map(|(i, pin)| Assignment {
+                bead_id: pin.bead_id.clone(),
+                agent_id: pin.agent_id.clone(),
+                score: 1.0, // Pinned assignments get maximum score.
+                rank: i + 1,
+            })
+            .collect();
+        self.state.last_override_summary = if override_summary.excluded_beads.is_empty()
+            && override_summary.excluded_agents.is_empty()
+            && override_summary.pinned_assignments.is_empty()
+            && override_summary.reprioritized_beads.is_empty()
+            && override_summary.expired_overrides == 0
+        {
+            None
+        } else {
+            Some(override_summary)
+        };
+
+        // Filter out excluded agents from available agents for solving.
+        let excluded_agents = &self.state.override_state.excluded_agent_ids();
+        let filtered_agents: Vec<MissionAgentCapabilityProfile> = if excluded_agents.is_empty() {
+            agents.to_vec()
+        } else {
+            agents
+                .iter()
+                .filter(|a| !excluded_agents.contains(&a.agent_id.as_str()))
+                .cloned()
+                .collect()
+        };
+
         // Phase 4: Assignment solving.
-        let assignment_set: AssignmentSet =
-            solve_assignments(&scorer_report, agents, &self.config.solver_config);
+        let mut assignment_set: AssignmentSet =
+            solve_assignments(&scorer_report, &filtered_agents, &solver_config);
+        // Prepend pinned assignments (they take priority).
+        if !pinned.is_empty() {
+            let pin_count = pinned.len();
+            // Re-rank solver assignments after pins.
+            for a in &mut assignment_set.assignments {
+                a.rank += pin_count;
+            }
+            let mut combined = pinned;
+            combined.append(&mut assignment_set.assignments);
+            assignment_set.assignments = combined;
+        }
         let assignment_set = self.apply_safety_envelope(assignment_set, issues);
 
         // Update state.
@@ -1428,6 +1491,332 @@ fn generate_conflict_messages(conflict: &AssignmentConflict) -> Vec<Deconflictio
     }
 
     messages
+}
+
+// ── Operator override controls (ft-1i2ge.5.6) ───────────────────────────────
+
+/// Kind of operator override applied to the mission planner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OperatorOverrideKind {
+    /// Pin a bead to a specific agent, bypassing normal assignment.
+    Pin {
+        bead_id: String,
+        target_agent: String,
+    },
+    /// Exclude a bead from all future assignments until cleared.
+    Exclude { bead_id: String },
+    /// Exclude an agent from receiving any assignments until cleared.
+    ExcludeAgent { agent_id: String },
+    /// Manual priority boost or reduction for a bead.
+    Reprioritize {
+        bead_id: String,
+        /// Additive score adjustment (positive = boost, negative = penalize).
+        score_delta: i32,
+    },
+}
+
+/// A single operator override with activation metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorOverride {
+    /// Unique identifier for this override.
+    pub override_id: String,
+    /// The override action.
+    pub kind: OperatorOverrideKind,
+    /// Who activated this override (operator name or system).
+    pub activated_by: String,
+    /// Structured reason code.
+    pub reason_code: String,
+    /// Human-readable rationale.
+    pub rationale: String,
+    /// Activation timestamp (ms since epoch).
+    pub activated_at_ms: i64,
+    /// Optional TTL expiry (ms since epoch). None = permanent until cleared.
+    pub expires_at_ms: Option<i64>,
+    /// Correlation ID for audit trail.
+    pub correlation_id: Option<String>,
+}
+
+impl OperatorOverride {
+    /// Check whether this override has expired at the given timestamp.
+    #[must_use]
+    pub fn is_expired(&self, current_ms: i64) -> bool {
+        self.expires_at_ms.is_some_and(|exp| current_ms >= exp)
+    }
+
+    /// The bead ID targeted by this override, if any.
+    #[must_use]
+    pub fn target_bead_id(&self) -> Option<&str> {
+        match &self.kind {
+            OperatorOverrideKind::Pin { bead_id, .. }
+            | OperatorOverrideKind::Exclude { bead_id }
+            | OperatorOverrideKind::Reprioritize { bead_id, .. } => Some(bead_id.as_str()),
+            OperatorOverrideKind::ExcludeAgent { .. } => None,
+        }
+    }
+}
+
+/// Aggregate operator override state tracked in the mission loop.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OperatorOverrideState {
+    /// Currently active overrides.
+    #[serde(default)]
+    pub active: Vec<OperatorOverride>,
+    /// Historical overrides (bounded, most recent first).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<OperatorOverride>,
+}
+
+impl OperatorOverrideState {
+    const MAX_HISTORY: usize = 100;
+
+    /// Add an override, making it immediately active.
+    pub fn activate(&mut self, ovr: OperatorOverride) {
+        self.active.push(ovr);
+    }
+
+    /// Clear (deactivate) an override by ID, moving it to history.
+    /// Returns `true` if found and cleared.
+    pub fn clear(&mut self, override_id: &str, cleared_at_ms: i64) -> bool {
+        if let Some(pos) = self.active.iter().position(|o| o.override_id == override_id) {
+            let mut cleared = self.active.remove(pos);
+            // Mark expiry as cleared time for audit clarity.
+            cleared.expires_at_ms = Some(cleared_at_ms);
+            self.history.insert(0, cleared);
+            if self.history.len() > Self::MAX_HISTORY {
+                self.history.truncate(Self::MAX_HISTORY);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Evict all expired overrides, moving them to history.
+    pub fn evict_expired(&mut self, current_ms: i64) {
+        let (expired, remaining): (Vec<_>, Vec<_>) = self
+            .active
+            .drain(..)
+            .partition(|o| o.is_expired(current_ms));
+        self.active = remaining;
+        for e in expired {
+            self.history.insert(0, e);
+        }
+        if self.history.len() > Self::MAX_HISTORY {
+            self.history.truncate(Self::MAX_HISTORY);
+        }
+    }
+
+    /// Get all active pin overrides.
+    #[must_use]
+    pub fn active_pins(&self) -> Vec<(&str, &str)> {
+        self.active
+            .iter()
+            .filter_map(|o| match &o.kind {
+                OperatorOverrideKind::Pin {
+                    bead_id,
+                    target_agent,
+                } => Some((bead_id.as_str(), target_agent.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get all active bead exclusions.
+    #[must_use]
+    pub fn excluded_bead_ids(&self) -> Vec<&str> {
+        self.active
+            .iter()
+            .filter_map(|o| match &o.kind {
+                OperatorOverrideKind::Exclude { bead_id } => Some(bead_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get all active agent exclusions.
+    #[must_use]
+    pub fn excluded_agent_ids(&self) -> Vec<&str> {
+        self.active
+            .iter()
+            .filter_map(|o| match &o.kind {
+                OperatorOverrideKind::ExcludeAgent { agent_id } => Some(agent_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get active reprioritization deltas by bead ID.
+    #[must_use]
+    pub fn reprioritize_deltas(&self) -> HashMap<&str, i32> {
+        let mut deltas: HashMap<&str, i32> = HashMap::new();
+        for ovr in &self.active {
+            if let OperatorOverrideKind::Reprioritize {
+                bead_id,
+                score_delta,
+            } = &ovr.kind
+            {
+                *deltas.entry(bead_id.as_str()).or_default() += score_delta;
+            }
+        }
+        deltas
+    }
+}
+
+/// Result of applying operator overrides to the evaluation pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OverrideApplicationSummary {
+    /// Beads excluded by operator override.
+    pub excluded_beads: Vec<String>,
+    /// Agents excluded by operator override.
+    pub excluded_agents: Vec<String>,
+    /// Beads pinned to specific agents.
+    pub pinned_assignments: Vec<PinnedAssignmentRecord>,
+    /// Beads whose scores were adjusted.
+    pub reprioritized_beads: Vec<ReprioritizedBeadRecord>,
+    /// Overrides that were evicted due to TTL expiry this cycle.
+    pub expired_overrides: usize,
+}
+
+/// Record of a pinned assignment produced by an operator override.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinnedAssignmentRecord {
+    pub bead_id: String,
+    pub agent_id: String,
+    pub override_id: String,
+}
+
+/// Record of a reprioritized bead's score adjustment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReprioritizedBeadRecord {
+    pub bead_id: String,
+    pub original_score: f64,
+    pub adjusted_score: f64,
+    pub delta: i32,
+}
+
+impl MissionLoop {
+    /// Apply an operator override, making it immediately active.
+    /// Returns an error string if the override is invalid (e.g., duplicate ID).
+    pub fn apply_override(&mut self, ovr: OperatorOverride) -> Result<(), String> {
+        // Validate: no duplicate override IDs.
+        if self
+            .state
+            .override_state
+            .active
+            .iter()
+            .any(|existing| existing.override_id == ovr.override_id)
+        {
+            return Err(format!(
+                "override ID '{}' already active",
+                ovr.override_id
+            ));
+        }
+        self.state.override_state.activate(ovr);
+        Ok(())
+    }
+
+    /// Clear an operator override by its ID.
+    /// Returns `true` if found and cleared.
+    pub fn clear_override(&mut self, override_id: &str, cleared_at_ms: i64) -> bool {
+        self.state.override_state.clear(override_id, cleared_at_ms)
+    }
+
+    /// List currently active overrides.
+    #[must_use]
+    pub fn active_overrides(&self) -> &[OperatorOverride] {
+        &self.state.override_state.active
+    }
+
+    /// Apply operator overrides to the solver config and scored candidates,
+    /// producing pin assignments and filtering exclusions. Called during evaluate().
+    fn apply_operator_overrides(
+        &mut self,
+        current_ms: i64,
+        scored: &mut ScorerReport,
+        agents: &[MissionAgentCapabilityProfile],
+        solver_config: &mut SolverConfig,
+    ) -> OverrideApplicationSummary {
+        // Evict expired overrides first.
+        let before_count = self.state.override_state.active.len();
+        self.state.override_state.evict_expired(current_ms);
+        let expired_count = before_count - self.state.override_state.active.len();
+
+        let mut summary = OverrideApplicationSummary {
+            expired_overrides: expired_count,
+            ..Default::default()
+        };
+
+        // 1. Exclude beads via safety gates.
+        let excluded_beads = self.state.override_state.excluded_bead_ids();
+        if !excluded_beads.is_empty() {
+            let gate = SafetyGate {
+                name: "operator.override.exclude_bead".to_string(),
+                denied_bead_ids: excluded_beads.iter().map(|s| (*s).to_string()).collect(),
+            };
+            solver_config.safety_gates.push(gate);
+            summary.excluded_beads = excluded_beads.iter().map(|s| (*s).to_string()).collect();
+        }
+
+        // 2. Exclude agents by zeroing their capacity in the agents list.
+        // We can't modify agents directly, so we add exclusion via safety-gate
+        // denial of all beads for excluded agents. Instead, we track excluded
+        // agents and filter them downstream in the solver by injecting conflict
+        // information. The simplest approach: remove scored candidates that would
+        // go to excluded agents (agent selection happens in solver, not here).
+        // We'll record excluded agents and the solver respects them.
+        let excluded_agents = self.state.override_state.excluded_agent_ids();
+        summary.excluded_agents = excluded_agents.iter().map(|s| (*s).to_string()).collect();
+
+        // 3. Apply reprioritization score deltas.
+        let deltas = self.state.override_state.reprioritize_deltas();
+        for candidate in &mut scored.scored {
+            if let Some(&delta) = deltas.get(candidate.bead_id.as_str()) {
+                let original = candidate.final_score;
+                // Apply delta as fraction: +100 = +1.0, -50 = -0.5
+                let adjustment = f64::from(delta) / 100.0;
+                candidate.final_score = (candidate.final_score + adjustment).clamp(0.0, 10.0);
+                summary.reprioritized_beads.push(ReprioritizedBeadRecord {
+                    bead_id: candidate.bead_id.clone(),
+                    original_score: original,
+                    adjusted_score: candidate.final_score,
+                    delta,
+                });
+            }
+        }
+        // Re-sort by adjusted score (descending) to preserve deterministic ordering.
+        scored
+            .scored
+            .sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 4. Generate pin assignments (forced assignments bypass solver).
+        let pins = self.state.override_state.active_pins();
+        for (bead_id, target_agent) in &pins {
+            // Verify the bead is in the scored set (it's a real candidate).
+            let in_scored = scored.scored.iter().any(|c| c.bead_id == *bead_id);
+            // Verify the target agent exists.
+            let agent_exists = agents.iter().any(|a| a.agent_id == *target_agent);
+            if in_scored && agent_exists {
+                // Find the override_id for audit trail.
+                let override_id = self
+                    .state
+                    .override_state
+                    .active
+                    .iter()
+                    .find(|o| matches!(&o.kind, OperatorOverrideKind::Pin { bead_id: b, target_agent: t } if b == bead_id && t == target_agent))
+                    .map(|o| o.override_id.clone())
+                    .unwrap_or_default();
+                summary.pinned_assignments.push(PinnedAssignmentRecord {
+                    bead_id: (*bead_id).to_string(),
+                    agent_id: (*target_agent).to_string(),
+                    override_id,
+                });
+                // Remove from scored set so solver doesn't double-assign.
+                scored.scored.retain(|c| c.bead_id != *bead_id);
+            }
+        }
+
+        summary
+    }
 }
 
 // ── Operator report views (ft-1i2ge.5.5) ────────────────────────────────────
@@ -2591,6 +2980,8 @@ mod tests {
             }],
             total_conflicts_detected: 1,
             total_conflicts_auto_resolved: 1,
+            override_state: OperatorOverrideState::default(),
+            last_override_summary: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: MissionLoopState = serde_json::from_str(&json).unwrap();
@@ -3802,5 +4193,458 @@ mod tests {
             report.health.conflict_rate.abs() < f64::EPSILON,
             "conflict rate should be 0"
         );
+    }
+
+    // ── Operator override control tests (ft-1i2ge.5.6) ──────────────────
+
+    fn make_override(id: &str, kind: OperatorOverrideKind) -> OperatorOverride {
+        OperatorOverride {
+            override_id: id.to_string(),
+            kind,
+            activated_by: "operator".to_string(),
+            reason_code: "test.override".to_string(),
+            rationale: "Test override".to_string(),
+            activated_at_ms: 0,
+            expires_at_ms: None,
+            correlation_id: None,
+        }
+    }
+
+    #[test]
+    fn override_state_activate_and_clear() {
+        let mut state = OperatorOverrideState::default();
+        let ovr = make_override(
+            "ovr-1",
+            OperatorOverrideKind::Exclude {
+                bead_id: "b1".to_string(),
+            },
+        );
+        state.activate(ovr);
+        assert_eq!(state.active.len(), 1);
+        assert!(state.history.is_empty());
+
+        assert!(state.clear("ovr-1", 1000));
+        assert!(state.active.is_empty());
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].override_id, "ovr-1");
+        assert_eq!(state.history[0].expires_at_ms, Some(1000));
+    }
+
+    #[test]
+    fn override_state_clear_nonexistent_returns_false() {
+        let mut state = OperatorOverrideState::default();
+        assert!(!state.clear("nonexistent", 1000));
+    }
+
+    #[test]
+    fn override_state_evict_expired() {
+        let mut state = OperatorOverrideState::default();
+        let mut ovr1 = make_override(
+            "exp-1",
+            OperatorOverrideKind::Exclude {
+                bead_id: "b1".to_string(),
+            },
+        );
+        ovr1.expires_at_ms = Some(500);
+        let ovr2 = make_override(
+            "perm-1",
+            OperatorOverrideKind::Exclude {
+                bead_id: "b2".to_string(),
+            },
+        );
+        state.activate(ovr1);
+        state.activate(ovr2);
+        assert_eq!(state.active.len(), 2);
+
+        state.evict_expired(600);
+        assert_eq!(state.active.len(), 1);
+        assert_eq!(state.active[0].override_id, "perm-1");
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].override_id, "exp-1");
+    }
+
+    #[test]
+    fn override_state_active_pins() {
+        let mut state = OperatorOverrideState::default();
+        state.activate(make_override(
+            "pin-1",
+            OperatorOverrideKind::Pin {
+                bead_id: "b1".to_string(),
+                target_agent: "agent-x".to_string(),
+            },
+        ));
+        state.activate(make_override(
+            "excl-1",
+            OperatorOverrideKind::Exclude {
+                bead_id: "b2".to_string(),
+            },
+        ));
+        let pins = state.active_pins();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0], ("b1", "agent-x"));
+    }
+
+    #[test]
+    fn override_state_excluded_bead_and_agent_ids() {
+        let mut state = OperatorOverrideState::default();
+        state.activate(make_override(
+            "excl-b",
+            OperatorOverrideKind::Exclude {
+                bead_id: "b1".to_string(),
+            },
+        ));
+        state.activate(make_override(
+            "excl-a",
+            OperatorOverrideKind::ExcludeAgent {
+                agent_id: "agent-y".to_string(),
+            },
+        ));
+        assert_eq!(state.excluded_bead_ids(), vec!["b1"]);
+        assert_eq!(state.excluded_agent_ids(), vec!["agent-y"]);
+    }
+
+    #[test]
+    fn override_state_reprioritize_deltas() {
+        let mut state = OperatorOverrideState::default();
+        state.activate(make_override(
+            "rep-1",
+            OperatorOverrideKind::Reprioritize {
+                bead_id: "b1".to_string(),
+                score_delta: 50,
+            },
+        ));
+        state.activate(make_override(
+            "rep-2",
+            OperatorOverrideKind::Reprioritize {
+                bead_id: "b1".to_string(),
+                score_delta: -20,
+            },
+        ));
+        state.activate(make_override(
+            "rep-3",
+            OperatorOverrideKind::Reprioritize {
+                bead_id: "b2".to_string(),
+                score_delta: 100,
+            },
+        ));
+        let deltas = state.reprioritize_deltas();
+        assert_eq!(deltas.get("b1"), Some(&30)); // 50 + (-20) = 30
+        assert_eq!(deltas.get("b2"), Some(&100));
+    }
+
+    #[test]
+    fn override_is_expired() {
+        let mut ovr = make_override(
+            "e1",
+            OperatorOverrideKind::Exclude {
+                bead_id: "x".to_string(),
+            },
+        );
+        assert!(!ovr.is_expired(100));
+
+        ovr.expires_at_ms = Some(500);
+        assert!(!ovr.is_expired(499));
+        assert!(ovr.is_expired(500));
+        assert!(ovr.is_expired(1000));
+    }
+
+    #[test]
+    fn override_target_bead_id() {
+        let pin = make_override(
+            "p",
+            OperatorOverrideKind::Pin {
+                bead_id: "b1".to_string(),
+                target_agent: "a1".to_string(),
+            },
+        );
+        assert_eq!(pin.target_bead_id(), Some("b1"));
+
+        let excl_agent = make_override(
+            "ea",
+            OperatorOverrideKind::ExcludeAgent {
+                agent_id: "a1".to_string(),
+            },
+        );
+        assert_eq!(excl_agent.target_bead_id(), None);
+    }
+
+    #[test]
+    fn apply_override_duplicate_id_rejected() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let ovr = make_override(
+            "dup",
+            OperatorOverrideKind::Exclude {
+                bead_id: "b1".to_string(),
+            },
+        );
+        assert!(ml.apply_override(ovr.clone()).is_ok());
+        assert!(ml.apply_override(ovr).is_err());
+    }
+
+    #[test]
+    fn clear_override_moves_to_history() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let ovr = make_override(
+            "clr",
+            OperatorOverrideKind::Exclude {
+                bead_id: "b1".to_string(),
+            },
+        );
+        ml.apply_override(ovr).unwrap();
+        assert_eq!(ml.active_overrides().len(), 1);
+
+        assert!(ml.clear_override("clr", 5000));
+        assert!(ml.active_overrides().is_empty());
+        assert_eq!(ml.state.override_state.history.len(), 1);
+    }
+
+    #[test]
+    fn evaluate_with_exclude_bead_override() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        ml.apply_override(make_override(
+            "excl-a",
+            OperatorOverrideKind::Exclude {
+                bead_id: "a".to_string(),
+            },
+        ))
+        .unwrap();
+
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 1, &[]),
+            sample_detail("b", BeadStatus::Open, 2, &[]),
+        ];
+        let agents = vec![ready_agent("alpha")];
+        let ctx = PlannerExtractionContext::default();
+        let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        // Bead "a" should be rejected by safety gate.
+        let is_rejected = decision
+            .assignment_set
+            .rejected
+            .iter()
+            .any(|r| r.bead_id == "a");
+        assert!(is_rejected, "excluded bead 'a' should be rejected");
+        // Override summary should record the exclusion.
+        let summary = ml.state.last_override_summary.as_ref().unwrap();
+        assert!(summary.excluded_beads.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn evaluate_with_exclude_agent_override() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        ml.apply_override(make_override(
+            "excl-agent",
+            OperatorOverrideKind::ExcludeAgent {
+                agent_id: "alpha".to_string(),
+            },
+        ))
+        .unwrap();
+
+        let issues = vec![sample_detail("b1", BeadStatus::Open, 1, &[])];
+        let agents = vec![ready_agent("alpha")];
+        let ctx = PlannerExtractionContext::default();
+        let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        // With the only agent excluded, nothing can be assigned.
+        assert!(
+            decision.assignment_set.assignments.is_empty(),
+            "no assignments when only agent is excluded"
+        );
+        let summary = ml.state.last_override_summary.as_ref().unwrap();
+        assert!(summary.excluded_agents.contains(&"alpha".to_string()));
+    }
+
+    #[test]
+    fn evaluate_with_pin_override() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        ml.apply_override(make_override(
+            "pin-b1",
+            OperatorOverrideKind::Pin {
+                bead_id: "b1".to_string(),
+                target_agent: "alpha".to_string(),
+            },
+        ))
+        .unwrap();
+
+        let issues = vec![
+            sample_detail("b1", BeadStatus::Open, 1, &[]),
+            sample_detail("b2", BeadStatus::Open, 2, &[]),
+        ];
+        let agents = vec![ready_agent("alpha"), ready_agent("beta")];
+        let ctx = PlannerExtractionContext::default();
+        let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        // Pinned bead should be assigned to the pinned agent.
+        let pinned = decision
+            .assignment_set
+            .assignments
+            .iter()
+            .find(|a| a.bead_id == "b1");
+        assert!(pinned.is_some(), "pinned bead should be assigned");
+        assert_eq!(pinned.unwrap().agent_id, "alpha");
+        assert_eq!(pinned.unwrap().rank, 1, "pinned assignment should be rank 1");
+    }
+
+    #[test]
+    fn evaluate_with_reprioritize_boost() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        // Give "low" bead a massive boost.
+        ml.apply_override(make_override(
+            "boost-low",
+            OperatorOverrideKind::Reprioritize {
+                bead_id: "low".to_string(),
+                score_delta: 500, // +5.0 added to score
+            },
+        ))
+        .unwrap();
+
+        let issues = vec![
+            sample_detail("high", BeadStatus::Open, 5, &[]),
+            sample_detail("low", BeadStatus::Open, 0, &[]),
+        ];
+        let agents = vec![ready_agent("alpha")];
+        let ctx = PlannerExtractionContext::default();
+        let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        // With a +5.0 boost, "low" should be assigned first.
+        let has_low = decision
+            .assignment_set
+            .assignments
+            .iter()
+            .any(|a| a.bead_id == "low");
+        assert!(has_low, "boosted bead 'low' should be assigned");
+
+        let summary = ml.state.last_override_summary.as_ref().unwrap();
+        assert!(!summary.reprioritized_beads.is_empty());
+        let rep = summary
+            .reprioritized_beads
+            .iter()
+            .find(|r| r.bead_id == "low")
+            .unwrap();
+        assert_eq!(rep.delta, 500);
+        assert!(
+            rep.adjusted_score > rep.original_score,
+            "adjusted score should be higher"
+        );
+    }
+
+    #[test]
+    fn evaluate_with_expired_override_evicted() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let mut ovr = make_override(
+            "expiring",
+            OperatorOverrideKind::Exclude {
+                bead_id: "a".to_string(),
+            },
+        );
+        ovr.expires_at_ms = Some(500);
+        ml.apply_override(ovr).unwrap();
+
+        let issues = vec![sample_detail("a", BeadStatus::Open, 1, &[])];
+        let agents = vec![ready_agent("alpha")];
+        let ctx = PlannerExtractionContext::default();
+
+        // Evaluate at t=1000, override should have expired.
+        let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        // Override expired, so bead "a" should NOT be excluded.
+        assert!(ml.active_overrides().is_empty(), "expired override should be evicted");
+        let summary = ml.state.last_override_summary.as_ref().unwrap();
+        assert_eq!(summary.expired_overrides, 1);
+        // Bead "a" should be assignable.
+        let assigned = decision
+            .assignment_set
+            .assignments
+            .iter()
+            .any(|a| a.bead_id == "a");
+        let is_rejected_by_gate = decision
+            .assignment_set
+            .rejected
+            .iter()
+            .any(|r| {
+                r.bead_id == "a"
+                    && r.reasons.iter().any(|reason| {
+                        matches!(reason, RejectionReason::SafetyGateDenied { .. })
+                    })
+            });
+        assert!(
+            assigned || !is_rejected_by_gate,
+            "expired override should not block bead 'a'"
+        );
+    }
+
+    #[test]
+    fn override_state_serde_roundtrip() {
+        let mut state = OperatorOverrideState::default();
+        state.activate(make_override(
+            "s1",
+            OperatorOverrideKind::Pin {
+                bead_id: "b1".to_string(),
+                target_agent: "a1".to_string(),
+            },
+        ));
+        state.activate(make_override(
+            "s2",
+            OperatorOverrideKind::Reprioritize {
+                bead_id: "b2".to_string(),
+                score_delta: -30,
+            },
+        ));
+        let json = serde_json::to_string(&state).unwrap();
+        let back: OperatorOverrideState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.active.len(), 2);
+        assert_eq!(back.active[0].override_id, "s1");
+        assert_eq!(back.active[1].override_id, "s2");
+    }
+
+    #[test]
+    fn override_no_overrides_produces_no_summary() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let issues = vec![sample_detail("b1", BeadStatus::Open, 1, &[])];
+        let agents = vec![ready_agent("alpha")];
+        let ctx = PlannerExtractionContext::default();
+        ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+
+        assert!(
+            ml.state.last_override_summary.is_none(),
+            "no overrides = no summary"
+        );
+    }
+
+    #[test]
+    fn override_history_bounded() {
+        let mut state = OperatorOverrideState::default();
+        for i in 0..150 {
+            let ovr = make_override(
+                &format!("hist-{i}"),
+                OperatorOverrideKind::Exclude {
+                    bead_id: format!("b{i}"),
+                },
+            );
+            state.activate(ovr);
+            state.clear(&format!("hist-{i}"), (i * 10) as i64);
+        }
+        assert!(
+            state.history.len() <= OperatorOverrideState::MAX_HISTORY,
+            "history should be bounded to {}",
+            OperatorOverrideState::MAX_HISTORY
+        );
+    }
+
+    #[test]
+    fn override_kind_equality() {
+        let pin1 = OperatorOverrideKind::Pin {
+            bead_id: "b1".to_string(),
+            target_agent: "a1".to_string(),
+        };
+        let pin2 = OperatorOverrideKind::Pin {
+            bead_id: "b1".to_string(),
+            target_agent: "a1".to_string(),
+        };
+        let excl = OperatorOverrideKind::Exclude {
+            bead_id: "b1".to_string(),
+        };
+        assert_eq!(pin1, pin2);
+        assert_ne!(pin1, excl);
     }
 }
