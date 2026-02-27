@@ -12,6 +12,8 @@ TARGET_DIR="target-rch-ft-1i2ge-5-2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_5_2_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_5_2_${RUN_ID}.stdout.log"
 PROBE_FILE="${LOG_DIR}/ft_1i2ge_5_2_${RUN_ID}.probe.log"
+STATUS_FILE="${LOG_DIR}/ft_1i2ge_5_2_${RUN_ID}.status.json"
+CHECK_FILE="${LOG_DIR}/ft_1i2ge_5_2_${RUN_ID}.check.log"
 LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
 
 emit_log() {
@@ -77,20 +79,87 @@ fi
 set +e
 (
   cd "${ROOT_DIR}"
-  rch workers probe --all
+  rch check
+) >"${CHECK_FILE}" 2>&1
+check_status=$?
+set -e
+
+if [[ ${check_status} -ne 0 ]]; then
+  emit_log \
+    "failed" \
+    "execution_preflight" \
+    "rch_check_failed" \
+    "rch_health_check_failed" \
+    "$(basename "${CHECK_FILE}")" \
+    "rch check failed; refusing local fallback"
+  echo "rch check failed; refusing local cargo execution." >&2
+  exit 1
+fi
+
+emit_log \
+  "running" \
+  "execution_preflight" \
+  "rch_check_ready" \
+  "none" \
+  "$(basename "${CHECK_FILE}")" \
+  "rch check reported ready"
+
+set +e
+(
+  cd "${ROOT_DIR}"
+  rch workers probe --all --json
 ) >"${PROBE_FILE}" 2>&1
 probe_status=$?
 set -e
 
-if [[ ${probe_status} -ne 0 ]] || grep -q "✗" "${PROBE_FILE}"; then
-  emit_log \
-    "failed" \
-    "execution_preflight" \
-    "rch_workers_unhealthy" \
-    "remote_worker_unavailable" \
-    "$(basename "${PROBE_FILE}")" \
-    "rch workers probe failed; refusing local fallback"
-  echo "rch workers are unavailable; refusing local cargo execution." >&2
+probe_reachable=0
+if [[ ${probe_status} -eq 0 ]]; then
+  probe_reachable=$(jq -r '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${PROBE_FILE}" 2>/dev/null || echo 0)
+fi
+
+if [[ ${probe_status} -ne 0 ]] || [[ "${probe_reachable}" -lt 1 ]]; then
+  set +e
+  (
+    cd "${ROOT_DIR}"
+    rch --json status --workers --jobs
+  ) >"${STATUS_FILE}" 2>&1
+  status_status=$?
+  set -e
+
+  if [[ ${status_status} -ne 0 ]]; then
+    emit_log \
+      "failed" \
+      "execution_preflight" \
+      "rch_status_failed" \
+      "remote_worker_unavailable" \
+      "$(basename "${STATUS_FILE}")" \
+      "rch status fallback failed after probe failure"
+    echo "rch status fallback failed; refusing local cargo execution." >&2
+    exit 1
+  fi
+
+  status_healthy_workers=$(jq '(.data.daemon.workers_healthy // ([.data.workers[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length) // 0)' "${STATUS_FILE}")
+  status_slots_total=$(jq '(.data.daemon.slots_total // ([.data.workers[]? | (.total_slots // 0)] | add) // 0)' "${STATUS_FILE}")
+
+  if [[ "${status_healthy_workers}" -ge 1 ]] && [[ "${status_slots_total}" -ge 1 ]] && grep -q "RCH is ready" "${CHECK_FILE}"; then
+    emit_log \
+      "failed" \
+      "execution_preflight" \
+      "rch_health_probe_mismatch" \
+      "RCH-E101" \
+      "$(basename "${STATUS_FILE}")" \
+      "rch check/status reported healthy but probe had zero reachable workers; refusing local fallback"
+    echo "rch check/status healthy but probe has zero reachable workers; refusing local cargo execution." >&2
+  else
+    emit_log \
+      "failed" \
+      "execution_preflight" \
+      "rch_workers_unhealthy" \
+      "remote_worker_unavailable" \
+      "$(basename "${PROBE_FILE}")" \
+      "rch workers probe/status failed; refusing local fallback"
+    echo "rch workers are unavailable; refusing local cargo execution." >&2
+  fi
   exit 1
 fi
 
@@ -113,6 +182,7 @@ TESTS=(
 
 : >"${STDOUT_FILE}"
 for test_name in "${TESTS[@]}"; do
+  step_log="${LOG_DIR}/ft_1i2ge_5_2_${RUN_ID}_${test_name//[^a-zA-Z0-9_]/_}.log"
   decision_path="state_contract"
   reason_code="robot_mission_contract_validation"
   if [[ "${test_name}" == *"validate_edge_inputs"* ]] || [[ "${test_name}" == *"mismatches"* ]]; then
@@ -137,9 +207,20 @@ for test_name in "${TESTS[@]}"; do
     env TMPDIR=/tmp rch exec -- \
       env CARGO_TARGET_DIR="${TARGET_DIR}" \
       cargo test -p frankenterm --bin ft "${test_name}" -- --nocapture
-  ) 2>&1 | tee -a "${STDOUT_FILE}"
+  ) 2>&1 | tee "${step_log}" | tee -a "${STDOUT_FILE}"
   status=${PIPESTATUS[0]}
   set -e
+
+  if grep -q "\[RCH\] local" "${step_log}"; then
+    emit_log \
+      "failed" \
+      "${decision_path}" \
+      "rch_local_fallback_detected" \
+      "RCH-LOCAL-FALLBACK" \
+      "$(basename "${step_log}")" \
+      "local fallback detected for test=${test_name}; refusing offload violation"
+    exit 3
+  fi
 
   if [[ ${status} -ne 0 ]]; then
     emit_log \
@@ -147,7 +228,7 @@ for test_name in "${TESTS[@]}"; do
       "${decision_path}" \
       "test_failure" \
       "cargo_test_failed" \
-      "$(basename "${STDOUT_FILE}")" \
+      "$(basename "${step_log}")" \
       "exit=${status}; test=${test_name}"
     exit "${status}"
   fi

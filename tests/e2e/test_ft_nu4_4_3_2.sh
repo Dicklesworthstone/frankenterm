@@ -157,26 +157,56 @@ if ! command -v rch >/dev/null 2>&1; then
     "rch is required; cargo must not run locally for this bead"
 fi
 
+probe_has_reachable_workers() {
+  local probe_log="$1"
+  jq -e '[.data[]? | (.status // "" | ascii_downcase) | select(. == "ok" or . == "healthy" or . == "reachable")] | length > 0' \
+    "${probe_log}" >/dev/null
+}
+
+status_has_remote_capacity() {
+  local status_log="$1"
+  jq -e '(.data.daemon.workers_healthy // 0) > 0 and (.data.daemon.slots_total // 0) > 0' \
+    "${status_log}" >/dev/null
+}
+
 RCH_PROBE_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_rch_workers_probe.json"
-if ! rch workers probe --all --json > "${RCH_PROBE_LOG}" 2>"${RCH_PROBE_LOG}.stderr"; then
-  fail_now \
-    "suite_init" \
-    "preflight_rch_workers_command" \
-    "rch_workers_probe_failed" \
-    "rch_probe_command_failed" \
-    "$(basename "${RCH_PROBE_LOG}.stderr")" \
-    "rch workers probe command failed"
+RCH_STATUS_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_rch_status.json"
+PROBE_REACHABLE="false"
+if rch workers probe --all --json > "${RCH_PROBE_LOG}" 2>"${RCH_PROBE_LOG}.stderr"; then
+  if probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
+    PROBE_REACHABLE="true"
+  fi
 fi
 
-if ! jq -e '[.data[] | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length > 0' \
-  "${RCH_PROBE_LOG}" >/dev/null; then
-  fail_now \
+if [[ "${PROBE_REACHABLE}" != "true" ]]; then
+  if ! rch --json status --workers --jobs > "${RCH_STATUS_LOG}" 2>"${RCH_STATUS_LOG}.stderr"; then
+    fail_now \
+      "suite_init" \
+      "preflight_rch_status_command" \
+      "rch_status_unavailable" \
+      "rch_status_command_failed" \
+      "$(basename "${RCH_STATUS_LOG}.stderr")" \
+      "rch status command failed after workers probe showed no reachable workers"
+  fi
+
+  if ! status_has_remote_capacity "${RCH_STATUS_LOG}"; then
+    fail_now \
+      "suite_init" \
+      "preflight_rch_workers" \
+      "rch_workers_unreachable" \
+      "remote_worker_unavailable" \
+      "$(basename "${RCH_STATUS_LOG}")" \
+      "No remote worker capacity from workers probe or rch status; aborting before cargo invocation"
+  fi
+
+  emit_log \
+    "passed" \
     "suite_init" \
-    "preflight_rch_workers" \
-    "rch_workers_unreachable" \
-    "remote_worker_unavailable" \
-    "$(basename "${RCH_PROBE_LOG}")" \
-    "No reachable rch workers; aborting before any cargo invocation"
+    "preflight_rch_workers_fallback" \
+    "rch_probe_unreachable_but_status_healthy" \
+    "none" \
+    "$(basename "${RCH_STATUS_LOG}")" \
+    "workers probe reported no reachable workers, but rch status reports healthy remote capacity"
 fi
 
 CORE_E2E_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_core_distributed_streaming_e2e.log"
@@ -235,12 +265,14 @@ jq -cn \
   --arg listener_log "$(basename "${LISTENER_E2E_LOG}")" \
   --arg bench_log "$(basename "${BENCH_LOG}")" \
   --arg rch_probe "$(basename "${RCH_PROBE_LOG}")" \
+  --arg rch_status "$(basename "${RCH_STATUS_LOG}")" \
   '{
     run_id: $run_id,
     outcome: $outcome,
     correlation_id: $correlation_id,
     artifacts: {
       rch_probe: $rch_probe,
+      rch_status: $rch_status,
       core_streaming_e2e_log: $core_log,
       listener_stream_e2e_log: $listener_log,
       wa_agent_streaming_bench_log: $bench_log

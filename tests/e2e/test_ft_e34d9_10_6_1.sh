@@ -11,7 +11,7 @@ CORRELATION_ID="ft-e34d9.10.6.1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.stdout.log"
 
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/rch-e2e-ft-e34d9-10-6-1}"
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/rch-e2e-ft-e34d9-10-6-1}-${RUN_ID}"
 export CARGO_TARGET_DIR
 
 LAST_STEP_LOG=""
@@ -102,6 +102,19 @@ require_cmd cargo
 
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
 
+check_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_check.log"
+set +e
+rch check > "${check_log}" 2>&1
+check_rc=$?
+set -e
+cat "${check_log}" >> "${STDOUT_FILE}"
+if [[ ${check_rc} -ne 0 ]]; then
+  emit_log "preflight" "rch_check" "health_check" "failed" "rch_check_failed" "RCH-E100" "$(basename "${check_log}")"
+  echo "rch check failed" >&2
+  exit 2
+fi
+emit_log "preflight" "rch_check" "health_check" "passed" "rch_check_ready" "none" "$(basename "${check_log}")"
+
 probe_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_probe.json"
 set +e
 rch workers probe --all --json > "${probe_log}" 2>>"${STDOUT_FILE}"
@@ -116,12 +129,35 @@ fi
 
 healthy_workers=$(jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${probe_log}")
 if [[ "${healthy_workers}" -lt 1 ]]; then
-  emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_workers_unreachable" "RCH-E100" "$(basename "${probe_log}")"
-  echo "no reachable rch workers; refusing local fallback" >&2
-  exit 2
-fi
+  status_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_status.json"
+  set +e
+  rch --json status --workers --jobs > "${status_log}" 2>>"${STDOUT_FILE}"
+  status_rc=$?
+  set -e
+  if [[ ${status_rc} -ne 0 ]]; then
+    emit_log "preflight" "rch_probe->rch_status" "workers_probe_status_fallback" "failed" "rch_status_failed" "RCH-E100" "$(basename "${status_log}")"
+    echo "rch status fallback failed" >&2
+    exit 2
+  fi
 
-emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
+  status_healthy_workers=$(jq '(.data.daemon.workers_healthy // ([.data.workers[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length) // 0)' "${status_log}")
+  status_slots_total=$(jq '(.data.daemon.slots_total // ([.data.workers[]? | (.total_slots // 0)] | add) // 0)' "${status_log}")
+  if [[ "${status_healthy_workers}" -ge 1 && "${status_slots_total}" -ge 1 ]]; then
+    if grep -q "RCH is ready" "${check_log}"; then
+      emit_log "preflight" "rch_check->rch_probe->rch_status" "workers_probe_status_fallback" "failed" "rch_health_probe_mismatch" "RCH-E101" "$(basename "${status_log}")"
+      echo "rch check/status report healthy but probe shows zero reachable workers; refusing local fallback" >&2
+    else
+      emit_log "preflight" "rch_probe->rch_status" "workers_probe_status_fallback" "failed" "rch_probe_unreachable_but_status_healthy" "RCH-E100" "$(basename "${status_log}")"
+      echo "rch status appears healthy but probe shows zero reachable workers; refusing local fallback" >&2
+    fi
+  else
+    emit_log "preflight" "rch_probe->rch_status" "workers_probe_status_fallback" "failed" "rch_workers_unreachable_probe" "RCH-E100" "$(basename "${status_log}")"
+    echo "no reachable rch workers; refusing local fallback" >&2
+  fi
+  exit 2
+else
+  emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
+fi
 
 run_rch_test_step \
   "tailer_restart_state_machine" \
