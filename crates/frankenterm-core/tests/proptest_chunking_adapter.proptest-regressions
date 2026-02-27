@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 94eb4db8aa1ec0f681708a02f9f617972126722dc4108f542a540f1d530bd2ac # shrinks to chunk = SemanticChunk { chunk_id: "-", policy_version: "ft.recorder.chunking.v1", pane_id: 1, session_id: None, direction: Ingress, start_offset: ChunkSourceOffset { segment_id: 0, ordinal: 0, byte_offset: 0 }, end_offset: ChunkSourceOffset { segment_id: 0, ordinal: 0, byte_offset: 0 }, event_ids: [], event_count: 0, occurred_at_start_ms: 0, occurred_at_end_ms: 0, text_chars: 57, content_hash: "a00aa0a0", text: "\u{a48af}\u{8d5a4}ðt\u{d3ed9}7\u{9413c}\u{361a2}&&\u{7f}\u{c1b3e}\u{10acab}.\u{d5b8e}{\u{fdd68}\u{e09bd}\"\u{a401b}<}v\u{72190}\u{7db26}\\{BT%s\u{be78a}\u{7ce7a}÷\u{10e72c}q\u{b}õ^\u{5479b}/%`\u{cd5b7}`E%<Ⱥ\rT\u{8d0db}Y<\u{7d7da}?<", overlap: Some(ChunkOverlap { from_chunk_id: "xar0-3qs76i5-c-x--k1-", source_end_offset: ChunkSourceOffset { segment_id: 6962620439612235586, ordinal: 7407857798400930753, byte_offset: 11841112541959774121 }, chars: 285, text: "NByGBx5 t9 VDIl K  r4 03l Z  8 GXJ6 24d6W1TRMgAK h W9ORZK8u5 7j Ukq3 r" }) }
