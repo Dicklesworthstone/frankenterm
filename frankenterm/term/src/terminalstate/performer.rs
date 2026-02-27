@@ -366,7 +366,17 @@ impl<'a> Performer<'a> {
     fn print(&mut self, c: char) {
         // We buffer up the chars to increase the chances of correctly grouping graphemes into cells
         if let Some(title) = self.accumulating_title.as_mut() {
-            title.push(c);
+            if title.len() < super::MAX_ACCUMULATING_TITLE_LEN {
+                title.push(c);
+            } else {
+                // Title exceeded cap — discard accumulation to prevent unbounded growth
+                // from malicious or malformed escape sequences.
+                log::warn!(
+                    "accumulating_title exceeded {} byte cap, discarding",
+                    super::MAX_ACCUMULATING_TITLE_LEN
+                );
+                self.accumulating_title.take();
+            }
         } else {
             self.print.push(c);
         }

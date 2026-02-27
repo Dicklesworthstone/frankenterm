@@ -78,6 +78,10 @@ impl SearchDirection {
     }
 }
 
+/// Maximum number of history entries retained.
+/// Prevents unbounded memory growth in long-running sessions.
+const MAX_HISTORY_ENTRIES: usize = 1000;
+
 /// A simple history implementation that holds entries in memory.
 #[derive(Default)]
 pub struct BasicHistory {
@@ -103,6 +107,11 @@ impl History for BasicHistory {
             return;
         }
         self.entries.push_back(line.to_owned());
+        // Evict oldest entries when exceeding the cap to prevent
+        // unbounded memory growth in long-running sessions.
+        while self.entries.len() > MAX_HISTORY_ENTRIES {
+            self.entries.pop_front();
+        }
     }
 
     fn search(
@@ -337,5 +346,35 @@ mod tests {
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    // ── History cap ──────────────────────────────────────────
+
+    #[test]
+    fn history_cap_evicts_oldest_entries() {
+        let mut hist = BasicHistory::default();
+        for i in 0..MAX_HISTORY_ENTRIES + 50 {
+            hist.add(&format!("line-{i}"));
+        }
+        // Should be capped at MAX_HISTORY_ENTRIES
+        assert_eq!(hist.entries.len(), MAX_HISTORY_ENTRIES);
+        // Oldest entries (0..49) should have been evicted
+        assert_eq!(hist.get(0).unwrap(), "line-50");
+        // Most recent entry should be the last one added
+        assert_eq!(
+            hist.get(MAX_HISTORY_ENTRIES - 1).unwrap(),
+            format!("line-{}", MAX_HISTORY_ENTRIES + 49)
+        );
+    }
+
+    #[test]
+    fn history_cap_preserves_entries_under_limit() {
+        let mut hist = BasicHistory::default();
+        for i in 0..100 {
+            hist.add(&format!("entry-{i}"));
+        }
+        assert_eq!(hist.entries.len(), 100);
+        assert_eq!(hist.get(0).unwrap(), "entry-0");
+        assert_eq!(hist.get(99).unwrap(), "entry-99");
     }
 }
