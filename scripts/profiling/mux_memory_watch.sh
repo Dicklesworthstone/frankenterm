@@ -10,10 +10,12 @@ Environment variables:
   MAX_SAMPLES        Max samples before exit; 0 means run until process exits (default: 0)
   VMMAP_EVERY        On macOS, capture `vmmap -summary` every N samples; 0 disables (default: 30)
   CAPTURE_LEAKS_END  On macOS, run `leaks <PID>` once at the end if 1 (default: 1)
+  MAX_GROWTH_MB_HR   Optional RSS growth threshold in MB/hour; script exits non-zero if exceeded
 
 Outputs:
   <out-dir>/rss.csv          CSV timeline with RSS/VSZ samples
   <out-dir>/summary.txt      Human-readable growth summary
+  <out-dir>/summary.json     Machine-readable growth summary
   <out-dir>/vmmap_*.txt      Optional vmmap snapshots (macOS only)
   <out-dir>/leaks.txt        Optional leaks report (macOS only)
 USAGE
@@ -64,6 +66,7 @@ SAMPLE_SECS="${SAMPLE_SECS:-60}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 VMMAP_EVERY="${VMMAP_EVERY:-30}"
 CAPTURE_LEAKS_END="${CAPTURE_LEAKS_END:-1}"
+MAX_GROWTH_MB_HR="${MAX_GROWTH_MB_HR:-}"
 
 if [[ -z "$OUT_DIR" ]]; then
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -73,6 +76,7 @@ fi
 mkdir -p "$OUT_DIR"
 CSV_PATH="${OUT_DIR}/rss.csv"
 SUMMARY_PATH="${OUT_DIR}/summary.txt"
+SUMMARY_JSON_PATH="${OUT_DIR}/summary.json"
 
 echo "timestamp_utc,epoch_s,rss_kb,vsz_kb" > "$CSV_PATH"
 
@@ -116,28 +120,130 @@ if [[ "$platform" == "Darwin" && "$CAPTURE_LEAKS_END" == "1" ]]; then
   leaks "$PID" > "${OUT_DIR}/leaks.txt" 2>&1 || true
 fi
 
-awk -F, '
-  NR==2 { start_epoch=$2; start_rss=$3; next }
-  NR>2  { end_epoch=$2; end_rss=$3 }
-  END {
-    if (NR < 3) {
-      print "Not enough samples to compute growth rate."
-      exit 0
+metrics_csv="$(
+  awk -F, '
+    NR==2 {
+      start_epoch=$2
+      start_rss=$3
+      min_rss=$3
+      max_rss=$3
+      next
     }
-    delta_s = end_epoch - start_epoch
-    delta_kb = end_rss - start_rss
-    if (delta_s <= 0) {
-      print "Invalid sample duration."
-      exit 0
+    NR>2 {
+      end_epoch=$2
+      end_rss=$3
+      if ($3 < min_rss) min_rss=$3
+      if ($3 > max_rss) max_rss=$3
     }
-    growth_mb_per_hour = (delta_kb / 1024.0) * (3600.0 / delta_s)
-    printf("samples=%d\n", NR - 1)
-    printf("duration_seconds=%d\n", delta_s)
-    printf("rss_start_kb=%d\n", start_rss)
-    printf("rss_end_kb=%d\n", end_rss)
-    printf("rss_delta_kb=%d\n", delta_kb)
-    printf("rss_growth_mb_per_hour=%.4f\n", growth_mb_per_hour)
-  }
-' "$CSV_PATH" > "$SUMMARY_PATH"
+    END {
+      if (NR < 3) {
+        print "ERR,not_enough_samples"
+        exit 0
+      }
+      delta_s = end_epoch - start_epoch
+      if (delta_s <= 0) {
+        print "ERR,invalid_duration"
+        exit 0
+      }
+      delta_kb = end_rss - start_rss
+      growth_mb_per_hour = (delta_kb / 1024.0) * (3600.0 / delta_s)
+      printf "OK,%d,%d,%d,%d,%d,%d,%d,%.6f\n", \
+        NR - 1, \
+        delta_s, \
+        start_rss, \
+        end_rss, \
+        delta_kb, \
+        min_rss, \
+        max_rss, \
+        growth_mb_per_hour
+    }
+  ' "$CSV_PATH"
+)"
+
+IFS=',' read -r -a metrics_fields <<< "$metrics_csv"
+metrics_status="${metrics_fields[0]:-ERR}"
+metrics_reason="${metrics_fields[1]:-unknown}"
+samples="${metrics_fields[1]:-0}"
+duration_s="${metrics_fields[2]:-0}"
+start_rss="${metrics_fields[3]:-0}"
+end_rss="${metrics_fields[4]:-0}"
+delta_kb="${metrics_fields[5]:-0}"
+min_rss="${metrics_fields[6]:-0}"
+max_rss="${metrics_fields[7]:-0}"
+growth_mb_per_hour="${metrics_fields[8]:-0}"
+
+exit_code=0
+
+if [[ "$metrics_status" != "OK" ]]; then
+  cat > "$SUMMARY_PATH" <<EOF
+samples=$sample_count
+status=insufficient_data
+reason=${metrics_reason:-unknown}
+EOF
+  cat > "$SUMMARY_JSON_PATH" <<EOF
+{
+  "status": "insufficient_data",
+  "reason": "${metrics_reason:-unknown}",
+  "samples": ${sample_count}
+}
+EOF
+  cat "$SUMMARY_PATH"
+  exit 0
+fi
+
+cat > "$SUMMARY_PATH" <<EOF
+status=ok
+samples=$samples
+duration_seconds=$duration_s
+rss_start_kb=$start_rss
+rss_end_kb=$end_rss
+rss_delta_kb=$delta_kb
+rss_min_kb=$min_rss
+rss_max_kb=$max_rss
+rss_growth_mb_per_hour=$growth_mb_per_hour
+EOF
+
+if [[ -n "$MAX_GROWTH_MB_HR" ]]; then
+  if awk -v observed="$growth_mb_per_hour" -v threshold="$MAX_GROWTH_MB_HR" 'BEGIN { exit !(observed > threshold) }'; then
+    echo "threshold_status=exceeded" >> "$SUMMARY_PATH"
+    echo "threshold_mb_per_hour=$MAX_GROWTH_MB_HR" >> "$SUMMARY_PATH"
+    exit_code=3
+  else
+    echo "threshold_status=pass" >> "$SUMMARY_PATH"
+    echo "threshold_mb_per_hour=$MAX_GROWTH_MB_HR" >> "$SUMMARY_PATH"
+  fi
+fi
+
+if [[ -n "$MAX_GROWTH_MB_HR" ]]; then
+  threshold_value="$MAX_GROWTH_MB_HR"
+else
+  threshold_value="null"
+fi
+
+if [[ "$exit_code" -eq 0 ]]; then
+  threshold_status="not_set"
+  if [[ -n "$MAX_GROWTH_MB_HR" ]]; then
+    threshold_status="pass"
+  fi
+else
+  threshold_status="exceeded"
+fi
+
+cat > "$SUMMARY_JSON_PATH" <<EOF
+{
+  "status": "ok",
+  "samples": $samples,
+  "duration_seconds": $duration_s,
+  "rss_start_kb": $start_rss,
+  "rss_end_kb": $end_rss,
+  "rss_delta_kb": $delta_kb,
+  "rss_min_kb": $min_rss,
+  "rss_max_kb": $max_rss,
+  "rss_growth_mb_per_hour": $growth_mb_per_hour,
+  "threshold_mb_per_hour": $threshold_value,
+  "threshold_status": "$threshold_status"
+}
+EOF
 
 cat "$SUMMARY_PATH"
+exit "$exit_code"

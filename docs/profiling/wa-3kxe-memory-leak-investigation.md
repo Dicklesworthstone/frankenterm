@@ -45,12 +45,25 @@ Key knobs:
 - `MAX_SAMPLES` (default `0` = until process exits)
 - `VMMAP_EVERY` (macOS only, default `30`)
 - `CAPTURE_LEAKS_END` (macOS only, default `1`)
+- `MAX_GROWTH_MB_HR` (optional threshold; script exits non-zero if exceeded)
 
 Outputs:
 - `rss.csv`: timeline (`timestamp_utc,epoch_s,rss_kb,vsz_kb`)
 - `summary.txt`: computed growth rate in MB/hour
+- `summary.json`: machine-readable growth summary + threshold status
 - `vmmap_*.txt`: periodic VM region summaries (macOS)
 - `leaks.txt`: end-of-run leak report (macOS)
+
+Example with explicit gate (target `< 1 MB/hour`):
+
+```bash
+MAX_SAMPLES=30 SAMPLE_SECS=60 MAX_GROWTH_MB_HR=1 \
+  scripts/profiling/mux_memory_watch.sh --pid <MUX_PID> --out-dir tmp/profiling/run_gate
+```
+
+Exit code behavior:
+- `0`: success (including threshold pass, or no threshold configured)
+- `3`: threshold exceeded (`rss_growth_mb_per_hour > MAX_GROWTH_MB_HR`)
 
 ## Patch Set Implemented
 
@@ -105,6 +118,23 @@ Executed:
 
 Workspace gates currently failing due unrelated pre-existing issues:
 - `cargo clippy --all-targets -- -D warnings` (existing clippy debt outside this patch scope)
+
+## E2E Harness Integration
+
+`tests/e2e/test_ft_3kxe_1.sh` now supports optional profiling evidence capture:
+
+```bash
+FT_3KXE1_PROFILE_PID=<MUX_PID> \
+FT_3KXE1_PROFILE_MAX_SAMPLES=30 \
+FT_3KXE1_PROFILE_SAMPLE_SECS=60 \
+FT_3KXE1_MAX_GROWTH_MB_HR=1 \
+rch exec -- bash tests/e2e/test_ft_3kxe_1.sh
+```
+
+Artifacts:
+- JSONL harness log: `tests/e2e/logs/ft-3kxe-1_<timestamp>.jsonl`
+- Profiling output dir: `tests/e2e/logs/ft-3kxe-1_<timestamp>_profile/`
+- Threshold verdict: `summary.json` field `threshold_status` (`pass|exceeded|not_set`)
 
 ## Session Update (2026-02-25, BoldRaven)
 

@@ -4,8 +4,13 @@
 #
 # Validates that memory-leak hardening patches compile and pass all
 # existing tests in the affected crates (term, surface, escape-parser, mux).
+# Optionally captures RSS growth evidence for a running mux PID.
 #
 # Execution: rch exec -- bash tests/e2e/test_ft_3kxe_1.sh
+# Optional profiling:
+#   FT_3KXE1_PROFILE_PID=<pid> FT_3KXE1_PROFILE_MAX_SAMPLES=30 \
+#   FT_3KXE1_PROFILE_SAMPLE_SECS=60 FT_3KXE1_MAX_GROWTH_MB_HR=1 \
+#   rch exec -- bash tests/e2e/test_ft_3kxe_1.sh
 # ────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -15,6 +20,11 @@ SCENARIO_ID="ft-3kxe-1"
 LOG_DIR="$SCRIPT_DIR/logs"
 TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
 LOG_FILE="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}.jsonl"
+PROFILE_PID="${FT_3KXE1_PROFILE_PID:-}"
+PROFILE_MAX_SAMPLES="${FT_3KXE1_PROFILE_MAX_SAMPLES:-0}"
+PROFILE_SAMPLE_SECS="${FT_3KXE1_PROFILE_SAMPLE_SECS:-60}"
+PROFILE_MAX_GROWTH_MB_HR="${FT_3KXE1_MAX_GROWTH_MB_HR:-}"
+PROFILE_OUT_DIR="${FT_3KXE1_PROFILE_OUT_DIR:-$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_profile}"
 
 mkdir -p "$LOG_DIR"
 
@@ -69,6 +79,9 @@ CRATES=(
 )
 TOTAL_CRATES=${#CRATES[@]}
 TOTAL_STEPS=$((TOTAL_CRATES + 2))  # compile check + crate tests + formatting
+if [[ -n "$PROFILE_PID" ]]; then
+    TOTAL_STEPS=$((TOTAL_STEPS + 1)) # optional profiling evidence capture
+fi
 PASSED=0
 FAILED=0
 
@@ -133,6 +146,30 @@ else
     log_event "format" "failure_injection_path" "rustfmt_check" "fail" "format_drift" "FMT-E001"
     echo "  ✗ Format check FAILED"
     FAILED=$((FAILED + 1))
+fi
+
+# ── Step 4 (optional): Capture RSS growth evidence ─────────────────────────
+if [[ -n "$PROFILE_PID" ]]; then
+    STEP=$((TOTAL_STEPS))
+    echo "[$STEP/$TOTAL_STEPS] Profiling evidence capture (PID=$PROFILE_PID)..."
+    PROFILE_CMD=(scripts/profiling/mux_memory_watch.sh --pid "$PROFILE_PID" --out-dir "$PROFILE_OUT_DIR")
+    if SAMPLE_SECS="$PROFILE_SAMPLE_SECS" \
+       MAX_SAMPLES="$PROFILE_MAX_SAMPLES" \
+       MAX_GROWTH_MB_HR="$PROFILE_MAX_GROWTH_MB_HR" \
+       "${PROFILE_CMD[@]}" 2>&1 | tee "$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_profiling.log"; then
+        if [[ -f "$PROFILE_OUT_DIR/summary.json" ]]; then
+            summary_compact="$(tr -d '\n' < "$PROFILE_OUT_DIR/summary.json" | tr -d ' ')"
+        else
+            summary_compact="{}"
+        fi
+        log_event "profiling" "nominal_path" "mux_memory_watch" "pass" "summary=$summary_compact"
+        echo "  ✓ Profiling evidence captured: $PROFILE_OUT_DIR/summary.json"
+        PASSED=$((PASSED + 1))
+    else
+        log_event "profiling" "failure_injection_path" "mux_memory_watch" "fail" "rss_threshold_or_sampling_failure" "PROF-E001"
+        echo "  ✗ Profiling evidence step FAILED"
+        FAILED=$((FAILED + 1))
+    fi
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

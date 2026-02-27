@@ -104,6 +104,18 @@ emit_log \
   "$(basename "${CHECK_FILE}")" \
   "rch check reported ready"
 
+probe_has_reachable_workers() {
+  local probe_log="$1"
+  jq -e '[.data[]? | (.status // "" | ascii_downcase) | select(. == "ok" or . == "healthy" or . == "reachable")] | length > 0' \
+    "${probe_log}" >/dev/null
+}
+
+status_has_remote_capacity() {
+  local status_log="$1"
+  jq -e '((.data.daemon.workers_healthy // ([.data.workers[]? | (.status // "" | ascii_downcase) | select(. == "ok" or . == "healthy" or . == "reachable")] | length) // 0) > 0) and ((.data.daemon.slots_total // ([.data.workers[]? | (.total_slots // 0)] | add) // 0) > 0)' \
+    "${status_log}" >/dev/null
+}
+
 set +e
 (
   cd "${ROOT_DIR}"
@@ -112,12 +124,12 @@ set +e
 probe_status=$?
 set -e
 
-probe_reachable=0
-if [[ ${probe_status} -eq 0 ]]; then
-  probe_reachable=$(jq -r '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${PROBE_FILE}" 2>/dev/null || echo 0)
+probe_reachable="false"
+if [[ ${probe_status} -eq 0 ]] && probe_has_reachable_workers "${PROBE_FILE}"; then
+  probe_reachable="true"
 fi
 
-if [[ ${probe_status} -ne 0 ]] || [[ "${probe_reachable}" -lt 1 ]]; then
+if [[ "${probe_reachable}" != "true" ]]; then
   set +e
   (
     cd "${ROOT_DIR}"
@@ -138,18 +150,14 @@ if [[ ${probe_status} -ne 0 ]] || [[ "${probe_reachable}" -lt 1 ]]; then
     exit 1
   fi
 
-  status_healthy_workers=$(jq '(.data.daemon.workers_healthy // ([.data.workers[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length) // 0)' "${STATUS_FILE}")
-  status_slots_total=$(jq '(.data.daemon.slots_total // ([.data.workers[]? | (.total_slots // 0)] | add) // 0)' "${STATUS_FILE}")
-
-  if [[ "${status_healthy_workers}" -ge 1 ]] && [[ "${status_slots_total}" -ge 1 ]] && grep -q "RCH is ready" "${CHECK_FILE}"; then
+  if status_has_remote_capacity "${STATUS_FILE}" && grep -q "RCH is ready" "${CHECK_FILE}"; then
     emit_log \
-      "failed" \
+      "running" \
       "execution_preflight" \
-      "rch_health_probe_mismatch" \
+      "rch_probe_mismatch_status_capacity" \
       "RCH-E101" \
       "$(basename "${STATUS_FILE}")" \
-      "rch check/status reported healthy but probe had zero reachable workers; refusing local fallback"
-    echo "rch check/status healthy but probe has zero reachable workers; refusing local cargo execution." >&2
+      "workers probe reported no reachable workers, but rch status/check indicates remote capacity; continuing with guarded remote smoke check"
   else
     emit_log \
       "failed" \
@@ -159,17 +167,56 @@ if [[ ${probe_status} -ne 0 ]] || [[ "${probe_reachable}" -lt 1 ]]; then
       "$(basename "${PROBE_FILE}")" \
       "rch workers probe/status failed; refusing local fallback"
     echo "rch workers are unavailable; refusing local cargo execution." >&2
+    exit 1
   fi
-  exit 1
+else
+  emit_log \
+    "running" \
+    "execution_preflight" \
+    "rch_workers_healthy" \
+    "none" \
+    "$(basename "${PROBE_FILE}")" \
+    "offloading tests through rch workers"
+fi
+
+SMOKE_FILE="${LOG_DIR}/ft_1i2ge_5_2_${RUN_ID}.smoke.log"
+set +e
+(
+  cd "${ROOT_DIR}"
+  env TMPDIR=/tmp rch exec -- cargo --version
+) >"${SMOKE_FILE}" 2>&1
+smoke_status=$?
+set -e
+
+if grep -q "\[RCH\] local" "${SMOKE_FILE}"; then
+  emit_log \
+    "failed" \
+    "execution_preflight" \
+    "rch_local_fallback_detected" \
+    "RCH-LOCAL-FALLBACK" \
+    "$(basename "${SMOKE_FILE}")" \
+    "local fallback detected during remote smoke check; refusing to run cargo tests"
+  exit 3
+fi
+
+if [[ ${smoke_status} -ne 0 ]]; then
+  emit_log \
+    "failed" \
+    "execution_preflight" \
+    "rch_remote_smoke_failed" \
+    "rch_remote_exec_failed" \
+    "$(basename "${SMOKE_FILE}")" \
+    "remote smoke command failed; refusing local fallback"
+  exit "${smoke_status}"
 fi
 
 emit_log \
   "running" \
   "execution_preflight" \
-  "rch_workers_healthy" \
+  "rch_remote_smoke_passed" \
   "none" \
-  "$(basename "${PROBE_FILE}")" \
-  "offloading tests through rch workers"
+  "$(basename "${SMOKE_FILE}")" \
+  "verified remote rch exec path before running cargo tests"
 
 TESTS=(
   "mission_robot_command_family_parses_all_subcommands"
