@@ -200,6 +200,7 @@ impl RateLimitTracker {
             .panes
             .entry(pane_id)
             .or_insert_with(|| PaneRateLimitState::new(agent_type));
+        state.agent_type = agent_type;
         state.record_event(event);
         self.touch_pane_order(pane_id);
     }

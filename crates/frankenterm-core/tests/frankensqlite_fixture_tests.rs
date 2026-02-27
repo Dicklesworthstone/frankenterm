@@ -346,50 +346,53 @@ async fn populate_from_fixture(
 // Fixture generation and persistence (writes JSON files to disk)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Write all standard fixtures to disk. Called once by setup test.
+/// Write all standard fixtures to disk (synchronized for parallel tests).
 fn write_standard_fixtures() {
-    let dir = fixtures_dir();
-    std::fs::create_dir_all(&dir).unwrap();
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let dir = fixtures_dir();
+        std::fs::create_dir_all(&dir).unwrap();
 
-    let fixtures = vec![
-        build_fixture("fixture_normal_100_events", generate_normal_100(), vec![]),
-        build_fixture(
-            "fixture_duplicate_batch_ids",
-            generate_duplicate_batch_ids(),
-            vec![],
-        ),
-        build_fixture(
-            "fixture_corrupt_torn_record",
-            generate_corrupt_torn_record(),
-            vec![],
-        ),
-        build_fixture(
-            "fixture_mixed_payload_types",
-            generate_mixed_payload_types(),
-            vec![],
-        ),
-        build_fixture(
-            "fixture_migration_manifest",
-            generate_normal_100(),
-            vec![RecorderCheckpoint {
-                consumer: CheckpointConsumerId("migration-consumer".to_string()),
-                upto_offset: RecorderOffset {
-                    segment_id: 0,
-                    byte_offset: 9900,
-                    ordinal: 99,
-                },
-                schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
-                committed_at_ms: 1_700_000_010_000,
-            }],
-        ),
-        build_fixture("fixture_large_10k_events", generate_large_10k(), vec![]),
-    ];
+        let fixtures = vec![
+            build_fixture("fixture_normal_100_events", generate_normal_100(), vec![]),
+            build_fixture(
+                "fixture_duplicate_batch_ids",
+                generate_duplicate_batch_ids(),
+                vec![],
+            ),
+            build_fixture(
+                "fixture_corrupt_torn_record",
+                generate_corrupt_torn_record(),
+                vec![],
+            ),
+            build_fixture(
+                "fixture_mixed_payload_types",
+                generate_mixed_payload_types(),
+                vec![],
+            ),
+            build_fixture(
+                "fixture_migration_manifest",
+                generate_normal_100(),
+                vec![RecorderCheckpoint {
+                    consumer: CheckpointConsumerId("migration-consumer".to_string()),
+                    upto_offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 9900,
+                        ordinal: 99,
+                    },
+                    schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                    committed_at_ms: 1_700_000_010_000,
+                }],
+            ),
+            build_fixture("fixture_large_10k_events", generate_large_10k(), vec![]),
+        ];
 
-    for fixture in &fixtures {
-        let path = dir.join(format!("{}.json", fixture.name));
-        let json = serde_json::to_string_pretty(fixture).unwrap();
-        std::fs::write(&path, json).unwrap();
-    }
+        for fixture in &fixtures {
+            let path = dir.join(format!("{}.json", fixture.name));
+            let json = serde_json::to_string_pretty(fixture).unwrap();
+            std::fs::write(&path, json).unwrap();
+        }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════
