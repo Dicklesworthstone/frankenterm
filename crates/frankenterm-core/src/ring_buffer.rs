@@ -14,6 +14,62 @@
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the ring buffer.
+///
+/// All counters are plain `u64` because `RingBuffer` uses `&mut self`.
+#[derive(Debug, Clone, Default)]
+pub struct RingBufferTelemetry {
+    /// Total push() calls.
+    pushes: u64,
+    /// Pushes that caused an overwrite (buffer was full).
+    overwrites: u64,
+    /// Total clear() calls.
+    clears: u64,
+    /// Total drain() calls.
+    drains: u64,
+    /// Total items drained across all drain() calls.
+    items_drained: u64,
+}
+
+impl RingBufferTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> RingBufferTelemetrySnapshot {
+        RingBufferTelemetrySnapshot {
+            pushes: self.pushes,
+            overwrites: self.overwrites,
+            clears: self.clears,
+            drains: self.drains,
+            items_drained: self.items_drained,
+        }
+    }
+}
+
+/// Serializable snapshot of ring buffer telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RingBufferTelemetrySnapshot {
+    /// Total push() calls.
+    pub pushes: u64,
+    /// Pushes that caused an overwrite.
+    pub overwrites: u64,
+    /// Total clear() calls.
+    pub clears: u64,
+    /// Total drain() calls.
+    pub drains: u64,
+    /// Total items drained.
+    pub items_drained: u64,
+}
+
+// =============================================================================
 // RingBuffer
 // =============================================================================
 
@@ -40,6 +96,8 @@ pub struct RingBuffer<T> {
     head: usize, // next write position
     len: usize,  // current number of items
     total: u64,  // total items ever pushed
+    /// Operational telemetry counters.
+    telemetry: RingBufferTelemetry,
 }
 
 impl<T> RingBuffer<T> {
@@ -61,6 +119,7 @@ impl<T> RingBuffer<T> {
             head: 0,
             len: 0,
             total: 0,
+            telemetry: RingBufferTelemetry::new(),
         }
     }
 
@@ -72,10 +131,12 @@ impl<T> RingBuffer<T> {
         self.buf[self.head] = Some(item);
         self.head = (self.head + 1) % self.capacity;
         self.total += 1;
+        self.telemetry.pushes += 1;
         if self.len < self.capacity {
             self.len += 1;
             None
         } else {
+            self.telemetry.overwrites += 1;
             evicted
         }
     }
@@ -182,6 +243,7 @@ impl<T> RingBuffer<T> {
         }
         self.head = 0;
         self.len = 0;
+        self.telemetry.clears += 1;
     }
 
     /// Drain all items from oldest to newest, leaving the buffer empty.
@@ -198,6 +260,8 @@ impl<T> RingBuffer<T> {
                 result.push(item);
             }
         }
+        self.telemetry.drains += 1;
+        self.telemetry.items_drained += result.len() as u64;
         self.head = 0;
         self.len = 0;
         result
@@ -289,6 +353,12 @@ pub struct RingBufferStats {
 }
 
 impl<T> RingBuffer<T> {
+    /// Get a snapshot of telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> RingBufferTelemetrySnapshot {
+        self.telemetry.snapshot()
+    }
+
     /// Get statistics.
     #[must_use]
     pub fn stats(&self) -> RingBufferStats {
@@ -791,5 +861,117 @@ mod tests {
         rb.push(99);
         assert_eq!(rb.front(), Some(&99));
         assert_eq!(rb.back(), Some(&99));
+    }
+
+    // ── Telemetry counters ─────────────────────────────────────────────
+
+    #[test]
+    fn telemetry_pushes_counted() {
+        let mut rb = RingBuffer::new(5);
+        for i in 0..10 {
+            rb.push(i);
+        }
+        let t = rb.telemetry();
+        assert_eq!(t.pushes, 10);
+    }
+
+    #[test]
+    fn telemetry_overwrites_counted() {
+        let mut rb = RingBuffer::new(3);
+        for i in 0..10 {
+            rb.push(i);
+        }
+        let t = rb.telemetry();
+        assert_eq!(t.pushes, 10);
+        assert_eq!(t.overwrites, 7); // 10 - 3
+    }
+
+    #[test]
+    fn telemetry_no_overwrites_when_not_full() {
+        let mut rb = RingBuffer::new(10);
+        for i in 0..5 {
+            rb.push(i);
+        }
+        let t = rb.telemetry();
+        assert_eq!(t.pushes, 5);
+        assert_eq!(t.overwrites, 0);
+    }
+
+    #[test]
+    fn telemetry_clears_counted() {
+        let mut rb = RingBuffer::new(3);
+        rb.push(1);
+        rb.push(2);
+        rb.clear();
+        rb.push(3);
+        rb.clear();
+        let t = rb.telemetry();
+        assert_eq!(t.clears, 2);
+        assert_eq!(t.pushes, 3);
+    }
+
+    #[test]
+    fn telemetry_drains_counted() {
+        let mut rb = RingBuffer::new(3);
+        rb.push(1);
+        rb.push(2);
+        rb.push(3);
+        let _ = rb.drain();
+        let t = rb.telemetry();
+        assert_eq!(t.drains, 1);
+        assert_eq!(t.items_drained, 3);
+    }
+
+    #[test]
+    fn telemetry_drain_empty() {
+        let mut rb: RingBuffer<i32> = RingBuffer::new(3);
+        let _ = rb.drain();
+        let t = rb.telemetry();
+        assert_eq!(t.drains, 1);
+        assert_eq!(t.items_drained, 0);
+    }
+
+    #[test]
+    fn telemetry_multiple_drains() {
+        let mut rb = RingBuffer::new(3);
+        rb.push(1);
+        rb.push(2);
+        let _ = rb.drain();
+        rb.push(3);
+        rb.push(4);
+        rb.push(5);
+        let _ = rb.drain();
+        let t = rb.telemetry();
+        assert_eq!(t.drains, 2);
+        assert_eq!(t.items_drained, 5); // 2 + 3
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let snap = RingBufferTelemetrySnapshot {
+            pushes: 100,
+            overwrites: 50,
+            clears: 3,
+            drains: 2,
+            items_drained: 25,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: RingBufferTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn telemetry_survives_clear() {
+        let mut rb = RingBuffer::new(3);
+        rb.push(1);
+        rb.push(2);
+        rb.push(3);
+        rb.push(4); // overwrite
+        rb.clear();
+        let t = rb.telemetry();
+        // Counters are NOT reset by clear
+        assert_eq!(t.pushes, 4);
+        assert_eq!(t.overwrites, 1);
+        assert_eq!(t.clears, 1);
     }
 }

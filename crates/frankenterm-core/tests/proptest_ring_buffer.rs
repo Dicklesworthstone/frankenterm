@@ -14,7 +14,7 @@
 use proptest::prelude::*;
 use std::collections::VecDeque;
 
-use frankenterm_core::ring_buffer::{RingBuffer, RingBufferStats};
+use frankenterm_core::ring_buffer::{RingBuffer, RingBufferStats, RingBufferTelemetrySnapshot};
 
 // ────────────────────────────────────────────────────────────────────
 // Strategies
@@ -823,5 +823,135 @@ proptest! {
             "evicted({}) + len({}) != pushed({})",
             stats.total_evicted, stats.len, stats.total_pushed
         );
+    }
+
+    // ── Telemetry counter invariants ──────────────────────────────────
+
+    #[test]
+    fn prop_telemetry_pushes_equals_items(
+        capacity in arb_capacity(),
+        items in arb_items(50),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+        }
+        let t = rb.telemetry();
+        prop_assert_eq!(
+            t.pushes, items.len() as u64,
+            "pushes counter ({}) != actual pushes ({})",
+            t.pushes, items.len()
+        );
+    }
+
+    #[test]
+    fn prop_telemetry_overwrites_matches_evictions(
+        capacity in arb_capacity(),
+        items in arb_items(50),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+        }
+        let t = rb.telemetry();
+        let expected_overwrites = items.len().saturating_sub(capacity) as u64;
+        prop_assert_eq!(
+            t.overwrites, expected_overwrites,
+            "overwrites ({}) != expected ({})",
+            t.overwrites, expected_overwrites
+        );
+    }
+
+    #[test]
+    fn prop_telemetry_pushes_equals_overwrites_plus_len(
+        capacity in arb_capacity(),
+        items in arb_items(50),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+        }
+        let t = rb.telemetry();
+        prop_assert_eq!(
+            t.pushes, t.overwrites + rb.len() as u64,
+            "pushes ({}) != overwrites ({}) + len ({})",
+            t.pushes, t.overwrites, rb.len()
+        );
+    }
+
+    #[test]
+    fn prop_telemetry_clear_increments(
+        capacity in arb_capacity(),
+        items in arb_items(30),
+        num_clears in 1u32..=5,
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+        }
+        for _ in 0..num_clears {
+            rb.clear();
+        }
+        let t = rb.telemetry();
+        prop_assert_eq!(
+            t.clears, num_clears as u64,
+            "clears ({}) != expected ({})",
+            t.clears, num_clears
+        );
+        // Pushes survive clear
+        prop_assert_eq!(
+            t.pushes, items.len() as u64,
+            "pushes ({}) lost after clear",
+            t.pushes
+        );
+    }
+
+    #[test]
+    fn prop_telemetry_drain_items_counted(
+        capacity in arb_capacity(),
+        items in arb_items(30),
+    ) {
+        let mut rb = RingBuffer::new(capacity);
+        for &item in &items {
+            rb.push(item);
+        }
+        let items_before = rb.len();
+        let drained = rb.drain();
+        let t = rb.telemetry();
+        prop_assert_eq!(
+            t.drains, 1,
+            "drains counter should be 1, got {}",
+            t.drains
+        );
+        prop_assert_eq!(
+            t.items_drained, items_before as u64,
+            "items_drained ({}) != items_before ({})",
+            t.items_drained, items_before
+        );
+        prop_assert_eq!(
+            drained.len(), items_before,
+            "drained vec len ({}) != items_before ({})",
+            drained.len(), items_before
+        );
+    }
+
+    #[test]
+    fn prop_telemetry_snapshot_serde_roundtrip(
+        pushes in any::<u64>(),
+        overwrites in any::<u64>(),
+        clears in any::<u64>(),
+        drains in any::<u64>(),
+        items_drained in any::<u64>(),
+    ) {
+        let snap = RingBufferTelemetrySnapshot {
+            pushes,
+            overwrites,
+            clears,
+            drains,
+            items_drained,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: RingBufferTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap, back);
     }
 }
