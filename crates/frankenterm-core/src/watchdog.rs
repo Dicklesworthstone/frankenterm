@@ -24,6 +24,42 @@ use crate::runtime_compat::task::{self, JoinHandle};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
+// =============================================================================
+// Telemetry types
+// =============================================================================
+
+/// Operational telemetry for [`HeartbeatRegistry`].
+#[derive(Debug, Default)]
+pub struct WatchdogTelemetry {
+    discovery_heartbeats: AtomicU64,
+    capture_heartbeats: AtomicU64,
+    persistence_heartbeats: AtomicU64,
+    maintenance_heartbeats: AtomicU64,
+    health_checks: AtomicU64,
+}
+
+impl WatchdogTelemetry {
+    pub fn snapshot(&self) -> WatchdogTelemetrySnapshot {
+        WatchdogTelemetrySnapshot {
+            discovery_heartbeats: self.discovery_heartbeats.load(Ordering::Relaxed),
+            capture_heartbeats: self.capture_heartbeats.load(Ordering::Relaxed),
+            persistence_heartbeats: self.persistence_heartbeats.load(Ordering::Relaxed),
+            maintenance_heartbeats: self.maintenance_heartbeats.load(Ordering::Relaxed),
+            health_checks: self.health_checks.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Serializable telemetry snapshot for [`HeartbeatRegistry`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchdogTelemetrySnapshot {
+    pub discovery_heartbeats: u64,
+    pub capture_heartbeats: u64,
+    pub persistence_heartbeats: u64,
+    pub maintenance_heartbeats: u64,
+    pub health_checks: u64,
+}
+
 /// Per-component heartbeat timestamps (epoch milliseconds).
 ///
 /// Each subsystem calls the corresponding `record_*` method on every
@@ -37,6 +73,7 @@ pub struct HeartbeatRegistry {
     maintenance: AtomicU64,
     /// Epoch ms when the registry was created (for grace period).
     created_at: u64,
+    telemetry: WatchdogTelemetry,
 }
 
 impl Default for HeartbeatRegistry {
@@ -55,26 +92,39 @@ impl HeartbeatRegistry {
             persistence: AtomicU64::new(0),
             maintenance: AtomicU64::new(0),
             created_at: epoch_ms(),
+            telemetry: WatchdogTelemetry::default(),
         }
     }
 
     /// Record a heartbeat for the discovery subsystem.
     pub fn record_discovery(&self) {
+        self.telemetry
+            .discovery_heartbeats
+            .fetch_add(1, Ordering::Relaxed);
         self.discovery.store(epoch_ms(), Ordering::SeqCst);
     }
 
     /// Record a heartbeat for the capture subsystem.
     pub fn record_capture(&self) {
+        self.telemetry
+            .capture_heartbeats
+            .fetch_add(1, Ordering::Relaxed);
         self.capture.store(epoch_ms(), Ordering::SeqCst);
     }
 
     /// Record a heartbeat for the persistence subsystem.
     pub fn record_persistence(&self) {
+        self.telemetry
+            .persistence_heartbeats
+            .fetch_add(1, Ordering::Relaxed);
         self.persistence.store(epoch_ms(), Ordering::SeqCst);
     }
 
     /// Record a heartbeat for the maintenance subsystem.
     pub fn record_maintenance(&self) {
+        self.telemetry
+            .maintenance_heartbeats
+            .fetch_add(1, Ordering::Relaxed);
         self.maintenance.store(epoch_ms(), Ordering::SeqCst);
     }
 
@@ -94,9 +144,17 @@ impl HeartbeatRegistry {
         }
     }
 
+    /// Returns the telemetry tracker for this registry.
+    pub fn telemetry(&self) -> &WatchdogTelemetry {
+        &self.telemetry
+    }
+
     /// Check all components against their thresholds and return overall health.
     #[must_use]
     pub fn check_health(&self, config: &WatchdogConfig) -> HealthReport {
+        self.telemetry
+            .health_checks
+            .fetch_add(1, Ordering::Relaxed);
         let now = epoch_ms();
         let uptime_ms = now.saturating_sub(self.created_at);
         let components = [

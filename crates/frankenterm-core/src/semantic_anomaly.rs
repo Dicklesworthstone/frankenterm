@@ -36,6 +36,65 @@
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
+// Telemetry types
+// =============================================================================
+
+/// Operational telemetry for [`SemanticAnomalyDetector`].
+#[derive(Debug, Clone, Default)]
+pub struct SemanticAnomalyTelemetry {
+    observations: u64,
+    shocks_detected: u64,
+    resets: u64,
+}
+
+impl SemanticAnomalyTelemetry {
+    pub fn snapshot(&self) -> SemanticAnomalyTelemetrySnapshot {
+        SemanticAnomalyTelemetrySnapshot {
+            observations: self.observations,
+            shocks_detected: self.shocks_detected,
+            resets: self.resets,
+        }
+    }
+}
+
+/// Serializable telemetry snapshot for [`SemanticAnomalyDetector`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticAnomalyTelemetrySnapshot {
+    pub observations: u64,
+    pub shocks_detected: u64,
+    pub resets: u64,
+}
+
+/// Operational telemetry for [`ConformalAnomalyDetector`].
+#[derive(Debug, Clone, Default)]
+pub struct ConformalAnomalyTelemetry {
+    observations: u64,
+    anomalies_detected: u64,
+    dimension_resets: u64,
+    resets: u64,
+}
+
+impl ConformalAnomalyTelemetry {
+    pub fn snapshot(&self) -> ConformalAnomalyTelemetrySnapshot {
+        ConformalAnomalyTelemetrySnapshot {
+            observations: self.observations,
+            anomalies_detected: self.anomalies_detected,
+            dimension_resets: self.dimension_resets,
+            resets: self.resets,
+        }
+    }
+}
+
+/// Serializable telemetry snapshot for [`ConformalAnomalyDetector`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConformalAnomalyTelemetrySnapshot {
+    pub observations: u64,
+    pub anomalies_detected: u64,
+    pub dimension_resets: u64,
+    pub resets: u64,
+}
+
+// =============================================================================
 // SIMD-friendly vector math
 // =============================================================================
 
@@ -263,6 +322,7 @@ pub struct SemanticAnomalyDetector {
     mean_distance: f32,
     variance: f32,
     samples: usize,
+    telemetry: SemanticAnomalyTelemetry,
 }
 
 impl SemanticAnomalyDetector {
@@ -275,11 +335,13 @@ impl SemanticAnomalyDetector {
             mean_distance: 0.0,
             variance: 0.0,
             samples: 0,
+            telemetry: SemanticAnomalyTelemetry::default(),
         }
     }
 
     /// Process a new semantic embedding vector representing terminal output.
     pub fn observe(&mut self, embedding: &[f32]) -> Option<SemanticShock> {
+        self.telemetry.observations += 1;
         if embedding.is_empty() {
             return None;
         }
@@ -331,6 +393,9 @@ impl SemanticAnomalyDetector {
         self.centroid = normalize(&self.centroid);
 
         self.samples += 1;
+        if shock.is_some() {
+            self.telemetry.shocks_detected += 1;
+        }
         shock
     }
 
@@ -340,8 +405,14 @@ impl SemanticAnomalyDetector {
         &self.centroid
     }
 
+    /// Returns the telemetry tracker for this detector.
+    pub fn telemetry(&self) -> &SemanticAnomalyTelemetry {
+        &self.telemetry
+    }
+
     /// Reset the detector's state.
     pub fn reset(&mut self) {
+        self.telemetry.resets += 1;
         self.centroid.clear();
         self.mean_distance = 0.0;
         self.variance = 0.0;
@@ -446,6 +517,7 @@ pub struct ConformalAnomalyDetector {
     total_anomalies: u64,
     /// Most recent p-value.
     last_p_value: f64,
+    telemetry: ConformalAnomalyTelemetry,
 }
 
 impl ConformalAnomalyDetector {
@@ -460,6 +532,7 @@ impl ConformalAnomalyDetector {
             total_observations: 0,
             total_anomalies: 0,
             last_p_value: 1.0,
+            telemetry: ConformalAnomalyTelemetry::default(),
         }
     }
 
@@ -469,6 +542,8 @@ impl ConformalAnomalyDetector {
     /// The non-conformity score is the cosine distance from the running centroid.
     /// The p-value is computed as `(count(calibration >= distance) + 1) / (N + 1)`.
     pub fn observe(&mut self, embedding: &[f32]) -> Option<ConformalShock> {
+        self.telemetry.observations += 1;
+
         if embedding.is_empty() {
             return None;
         }
@@ -482,6 +557,7 @@ impl ConformalAnomalyDetector {
 
         // Handle dimension changes by resetting.
         if self.centroid.len() != embedding.len() {
+            self.telemetry.dimension_resets += 1;
             self.centroid = normalize_simd(embedding);
             self.calibration = SortedCalibrationBuffer::new(self.config.calibration_window);
             self.total_observations += 1;
@@ -503,6 +579,7 @@ impl ConformalAnomalyDetector {
 
             if p_value < self.config.alpha {
                 self.total_anomalies += 1;
+                self.telemetry.anomalies_detected += 1;
                 shock = Some(ConformalShock {
                     distance,
                     p_value,
@@ -549,6 +626,7 @@ impl ConformalAnomalyDetector {
 
     /// Reset the detector (e.g., after an intentional context switch).
     pub fn reset(&mut self) {
+        self.telemetry.resets += 1;
         self.centroid.clear();
         self.calibration = SortedCalibrationBuffer::new(self.config.calibration_window);
         self.last_p_value = 1.0;
@@ -571,6 +649,11 @@ impl ConformalAnomalyDetector {
     #[must_use]
     pub fn total_observations(&self) -> u64 {
         self.total_observations
+    }
+
+    /// Returns the telemetry tracker for this detector.
+    pub fn telemetry(&self) -> &ConformalAnomalyTelemetry {
+        &self.telemetry
     }
 }
 
