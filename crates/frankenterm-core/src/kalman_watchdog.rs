@@ -25,6 +25,82 @@ use std::collections::HashMap;
 use crate::watchdog::{Component, HealthStatus};
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the adaptive watchdog.
+///
+/// All counters are plain `u64` because `AdaptiveWatchdog` uses `&mut self`.
+#[derive(Debug, Clone, Default)]
+pub struct AdaptiveWatchdogTelemetry {
+    /// Total observe() calls (heartbeat observations).
+    observations: u64,
+    /// Observations that hit a registered component.
+    observations_matched: u64,
+    /// Total check_health() calls.
+    health_checks: u64,
+    /// Total classify_component() calls.
+    classifications: u64,
+    /// Total reset() calls.
+    resets: u64,
+    /// Count of Healthy classifications produced.
+    status_healthy: u64,
+    /// Count of Degraded classifications produced.
+    status_degraded: u64,
+    /// Count of Critical classifications produced.
+    status_critical: u64,
+    /// Count of Hung classifications produced.
+    status_hung: u64,
+}
+
+impl AdaptiveWatchdogTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> AdaptiveWatchdogTelemetrySnapshot {
+        AdaptiveWatchdogTelemetrySnapshot {
+            observations: self.observations,
+            observations_matched: self.observations_matched,
+            health_checks: self.health_checks,
+            classifications: self.classifications,
+            resets: self.resets,
+            status_healthy: self.status_healthy,
+            status_degraded: self.status_degraded,
+            status_critical: self.status_critical,
+            status_hung: self.status_hung,
+        }
+    }
+}
+
+/// Serializable snapshot of adaptive watchdog telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdaptiveWatchdogTelemetrySnapshot {
+    /// Total observe() calls.
+    pub observations: u64,
+    /// Observations that hit a registered component.
+    pub observations_matched: u64,
+    /// Total check_health() calls.
+    pub health_checks: u64,
+    /// Total classify_component() calls.
+    pub classifications: u64,
+    /// Total reset() calls.
+    pub resets: u64,
+    /// Count of Healthy classifications from check_health/classify_component.
+    pub status_healthy: u64,
+    /// Count of Degraded classifications.
+    pub status_degraded: u64,
+    /// Count of Critical classifications.
+    pub status_critical: u64,
+    /// Count of Hung classifications.
+    pub status_hung: u64,
+}
+
+// =============================================================================
 // Scalar Kalman Filter
 // =============================================================================
 
@@ -377,6 +453,8 @@ impl ComponentTracker {
 pub struct AdaptiveWatchdog {
     config: AdaptiveWatchdogConfig,
     trackers: HashMap<Component, ComponentTracker>,
+    /// Operational telemetry counters.
+    telemetry: AdaptiveWatchdogTelemetry,
 }
 
 /// Full adaptive health report.
@@ -410,7 +488,11 @@ impl AdaptiveWatchdog {
             .map(|(comp, threshold)| (comp, ComponentTracker::new(&config, threshold)))
             .collect();
 
-        Self { config, trackers }
+        Self {
+            config,
+            trackers,
+            telemetry: AdaptiveWatchdogTelemetry::new(),
+        }
     }
 
     /// Create with custom fallback thresholds per component.
@@ -421,12 +503,18 @@ impl AdaptiveWatchdog {
             .map(|(comp, threshold)| (*comp, ComponentTracker::new(&config, *threshold)))
             .collect();
 
-        Self { config, trackers }
+        Self {
+            config,
+            trackers,
+            telemetry: AdaptiveWatchdogTelemetry::new(),
+        }
     }
 
     /// Record a heartbeat for a component.
     pub fn observe(&mut self, component: Component, heartbeat_ms: u64) {
+        self.telemetry.observations += 1;
         if let Some(tracker) = self.trackers.get_mut(&component) {
+            self.telemetry.observations_matched += 1;
             tracker.observe(heartbeat_ms);
         }
     }
@@ -434,18 +522,25 @@ impl AdaptiveWatchdog {
     /// Classify health of a single component.
     #[must_use]
     pub fn classify_component(
-        &self,
+        &mut self,
         component: Component,
         current_ms: u64,
     ) -> Option<HealthClassification> {
-        self.trackers
+        self.telemetry.classifications += 1;
+        let result = self
+            .trackers
             .get(&component)
-            .map(|t: &ComponentTracker| t.classify(current_ms, &self.config))
+            .map(|t: &ComponentTracker| t.classify(current_ms, &self.config));
+        if let Some(ref c) = result {
+            self.count_status(&c.status);
+        }
+        result
     }
 
     /// Produce a full health report across all components.
     #[must_use]
-    pub fn check_health(&self, current_ms: u64) -> AdaptiveHealthReport {
+    pub fn check_health(&mut self, current_ms: u64) -> AdaptiveHealthReport {
+        self.telemetry.health_checks += 1;
         let mut worst = HealthStatus::Healthy;
         let mut components = Vec::with_capacity(self.trackers.len());
 
@@ -454,6 +549,7 @@ impl AdaptiveWatchdog {
             if classification.status > worst {
                 worst = classification.status;
             }
+            self.count_status(&classification.status);
             components.push(ComponentClassification {
                 component,
                 classification,
@@ -489,8 +585,25 @@ impl AdaptiveWatchdog {
 
     /// Reset all component trackers.
     pub fn reset(&mut self) {
+        self.telemetry.resets += 1;
         for tracker in self.trackers.values_mut() {
             tracker.reset();
+        }
+    }
+
+    /// Access the operational telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &AdaptiveWatchdogTelemetry {
+        &self.telemetry
+    }
+
+    /// Increment the status-specific counter.
+    fn count_status(&mut self, status: &HealthStatus) {
+        match status {
+            HealthStatus::Healthy => self.telemetry.status_healthy += 1,
+            HealthStatus::Degraded => self.telemetry.status_degraded += 1,
+            HealthStatus::Critical => self.telemetry.status_critical += 1,
+            HealthStatus::Hung => self.telemetry.status_hung += 1,
         }
     }
 }
@@ -1097,7 +1210,7 @@ mod tests {
     #[test]
     fn watchdog_classify_nonexistent_component_returns_none() {
         let config = AdaptiveWatchdogConfig::default();
-        let wd = AdaptiveWatchdog::with_fallbacks(config, &[(Component::Discovery, 5_000)]);
+        let mut wd = AdaptiveWatchdog::with_fallbacks(config, &[(Component::Discovery, 5_000)]);
 
         assert!(wd.classify_component(Component::Capture, 1000).is_none());
     }
@@ -1278,7 +1391,7 @@ mod tests {
         let wd = AdaptiveWatchdog::new(config);
         let dbg = format!("{:?}", wd);
         assert!(dbg.contains("AdaptiveWatchdog"));
-        let wd2 = wd.clone();
+        let mut wd2 = wd.clone();
         let _ = wd2.check_health(1000); // Should work on clone
     }
 
