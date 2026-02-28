@@ -11,6 +11,67 @@ use tracing::{error, info, warn};
 
 use crate::degradation::{DegradationManager, Subsystem};
 
+// =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for a circuit breaker.
+///
+/// Uses plain `u64` because `CircuitBreaker` methods take `&mut self`.
+#[derive(Debug, Clone, Default)]
+pub struct CircuitBreakerTelemetry {
+    /// Total times the circuit tripped from Closed/HalfOpen to Open.
+    trips_total: u64,
+    /// Total times the circuit reset from HalfOpen to Closed.
+    resets_total: u64,
+    /// Total half-open probe attempts (allow() returning true in HalfOpen).
+    half_open_probes: u64,
+    /// Total record_success() calls.
+    successes_recorded: u64,
+    /// Total record_failure() calls.
+    failures_recorded: u64,
+    /// Total requests rejected (allow() returning false while Open).
+    requests_rejected: u64,
+}
+
+impl CircuitBreakerTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> CircuitBreakerTelemetrySnapshot {
+        CircuitBreakerTelemetrySnapshot {
+            trips_total: self.trips_total,
+            resets_total: self.resets_total,
+            half_open_probes: self.half_open_probes,
+            successes_recorded: self.successes_recorded,
+            failures_recorded: self.failures_recorded,
+            requests_rejected: self.requests_rejected,
+        }
+    }
+}
+
+/// Serializable snapshot of circuit breaker telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CircuitBreakerTelemetrySnapshot {
+    /// Total times the circuit tripped from Closed/HalfOpen to Open.
+    pub trips_total: u64,
+    /// Total times the circuit reset from HalfOpen to Closed.
+    pub resets_total: u64,
+    /// Total half-open probe attempts.
+    pub half_open_probes: u64,
+    /// Total record_success() calls.
+    pub successes_recorded: u64,
+    /// Total record_failure() calls.
+    pub failures_recorded: u64,
+    /// Total requests rejected while Open.
+    pub requests_rejected: u64,
+}
+
 /// Configuration for a circuit breaker.
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
@@ -229,6 +290,8 @@ pub struct CircuitBreaker {
     config: CircuitBreakerConfig,
     state: CircuitState,
     consecutive_failures: u32,
+    /// Operational telemetry counters.
+    telemetry: CircuitBreakerTelemetry,
 }
 
 impl CircuitBreaker {
@@ -246,6 +309,7 @@ impl CircuitBreaker {
             config,
             state: CircuitState::Closed,
             consecutive_failures: 0,
+            telemetry: CircuitBreakerTelemetry::new(),
         }
     }
 
@@ -258,12 +322,14 @@ impl CircuitBreaker {
             CircuitState::Open { opened_at } => {
                 if opened_at.elapsed() >= self.config.open_cooldown {
                     self.state = CircuitState::HalfOpen { successes: 0 };
+                    self.telemetry.half_open_probes += 1;
                     info!(
                         circuit = %self.name,
                         "Circuit transitioned to half-open after cooldown"
                     );
                     true
                 } else {
+                    self.telemetry.requests_rejected += 1;
                     false
                 }
             }
@@ -273,6 +339,7 @@ impl CircuitBreaker {
 
     /// Record a successful operation.
     pub fn record_success(&mut self) {
+        self.telemetry.successes_recorded += 1;
         match self.state {
             CircuitState::Closed => {
                 self.consecutive_failures = 0;
@@ -282,6 +349,7 @@ impl CircuitBreaker {
                 if successes >= self.config.success_threshold {
                     self.consecutive_failures = 0;
                     self.state = CircuitState::Closed;
+                    self.telemetry.resets_total += 1;
                     info!(circuit = %self.name, "Circuit closed after successful probe");
                     handle_circuit_closed(&self.name);
                 } else {
@@ -296,6 +364,7 @@ impl CircuitBreaker {
 
     /// Record a failed operation.
     pub fn record_failure(&mut self) {
+        self.telemetry.failures_recorded += 1;
         match self.state {
             CircuitState::Closed => {
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
@@ -303,6 +372,7 @@ impl CircuitBreaker {
                     self.state = CircuitState::Open {
                         opened_at: Instant::now(),
                     };
+                    self.telemetry.trips_total += 1;
                     warn!(
                         circuit = %self.name,
                         failures = self.consecutive_failures,
@@ -321,6 +391,7 @@ impl CircuitBreaker {
                 self.state = CircuitState::Open {
                     opened_at: Instant::now(),
                 };
+                self.telemetry.trips_total += 1;
                 warn!(circuit = %self.name, "Circuit re-opened after half-open failure");
                 handle_circuit_opened(
                     &self.name,
@@ -373,6 +444,12 @@ impl CircuitBreaker {
                 half_open_successes: Some(successes),
             },
         }
+    }
+
+    /// Access telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &CircuitBreakerTelemetry {
+        &self.telemetry
     }
 }
 
