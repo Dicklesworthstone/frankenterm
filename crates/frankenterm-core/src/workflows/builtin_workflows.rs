@@ -180,7 +180,7 @@ impl HandleCompaction {
     }
 
     /// Get the agent-specific prompt based on agent type from trigger detection.
-    pub(crate) fn resolve_prompt(&self, ctx: &WorkflowContext) -> String {
+    pub fn resolve_prompt(&self, ctx: &WorkflowContext) -> String {
         let render_ctx = PromptRenderContext::from_context(ctx);
         let template = self.select_prompt_template(&render_ctx);
         render_compaction_prompt(template, &render_ctx, &self.prompt_config)
@@ -227,7 +227,7 @@ impl HandleCompaction {
     /// - Alt-screen mode (vim, less, etc.)
     /// - Recent output gap (unknown pane state)
     /// - Command currently running
-    pub(crate) fn check_pane_guards(ctx: &WorkflowContext) -> Result<(), String> {
+    pub fn check_pane_guards(ctx: &WorkflowContext) -> Result<(), String> {
         let caps = ctx.capabilities();
 
         // Guard: alt-screen blocks sends (Some(true) = definitely in alt-screen)

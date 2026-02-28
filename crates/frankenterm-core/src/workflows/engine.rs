@@ -369,7 +369,7 @@ pub(super) fn build_verification_refs(
     }
 }
 
-pub(crate) fn redact_text_for_log(text: &str, max_len: usize) -> String {
+pub fn redact_text_for_log(text: &str, max_len: usize) -> String {
     let redactor = Redactor::new();
     let redacted = redactor.redact(text);
     if redacted.len() <= max_len {
