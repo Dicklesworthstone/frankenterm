@@ -16,16 +16,11 @@
 //! upstream pipeline. It is zero-cost when no sink is attached.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use regex::Regex;
-use sha2::{Digest, Sha256};
-
 use crate::event_id::{RecorderMergeKey, StreamKind, generate_event_id_v1};
 use crate::ingest::CapturedSegment;
-use crate::policy::Redactor;
 use crate::recording::{
     EgressEvent, EgressTap, GlobalSequence, IngressEvent, IngressOutcome, IngressTap,
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
@@ -69,17 +64,14 @@ impl CollectingCaptureSink {
 
     /// Return a snapshot of all collected events.
     pub fn events(&self) -> Vec<(RecorderEvent, RecorderMergeKey)> {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.events.lock().unwrap().clone()
     }
 
     /// Return just the recorder events without merge keys.
     pub fn recorder_events(&self) -> Vec<RecorderEvent> {
         self.events
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap()
             .iter()
             .map(|(e, _)| e.clone())
             .collect()
@@ -87,10 +79,7 @@ impl CollectingCaptureSink {
 
     /// Return the number of collected events.
     pub fn len(&self) -> usize {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.events.lock().unwrap().len()
     }
 
     /// Return true if no events have been collected.
@@ -100,19 +89,13 @@ impl CollectingCaptureSink {
 
     /// Clear all collected events.
     pub fn clear(&self) {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        self.events.lock().unwrap().clear();
     }
 }
 
 impl CaptureSink for CollectingCaptureSink {
     fn on_event(&self, event: RecorderEvent, merge_key: RecorderMergeKey) {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((event, merge_key));
+        self.events.lock().unwrap().push((event, merge_key));
     }
 }
 
@@ -129,8 +112,6 @@ pub struct CaptureConfig {
     pub default_source: RecorderEventSource,
     /// Whether capture is enabled (can be toggled at runtime).
     pub enabled: bool,
-    /// Capture-stage redaction/sensitivity/retention policy.
-    pub redaction_policy: CaptureRedactionPolicy,
 }
 
 impl Default for CaptureConfig {
@@ -139,468 +120,8 @@ impl Default for CaptureConfig {
             session_id: None,
             default_source: RecorderEventSource::WeztermMux,
             enabled: true,
-            redaction_policy: CaptureRedactionPolicy::default(),
         }
     }
-}
-
-const FNV1A_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-const FNV1A_PRIME: u64 = 0x00000100000001b3;
-const DECISION_INPUT_SUMMARY_MAX_BYTES: usize = 256;
-pub const RETENTION_TOMBSTONE_MARKER: &str = "REDACTED_EXPIRED";
-
-/// Capture-stage sensitivity class used for deterministic replay redaction policy.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CaptureSensitivityTier {
-    #[default]
-    T1,
-    T2,
-    T3,
-}
-
-impl CaptureSensitivityTier {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::T1 => "t1",
-            Self::T2 => "t2",
-            Self::T3 => "t3",
-        }
-    }
-
-    #[must_use]
-    fn retention_days(self, policy: &CaptureRedactionPolicy) -> u64 {
-        match self {
-            Self::T1 => policy.t1_retention_days,
-            Self::T2 => policy.t2_retention_days,
-            Self::T3 => policy.t3_retention_days,
-        }
-    }
-}
-
-/// Redaction mode for capture-stage secret handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CaptureRedactionMode {
-    /// Replace detected sensitive text with deterministic marker text.
-    #[default]
-    Mask,
-    /// Replace sensitive text with a one-way SHA-256 digest.
-    Hash,
-    /// Drop sensitive text entirely.
-    Drop,
-}
-
-impl CaptureRedactionMode {
-    #[must_use]
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Mask => "mask",
-            Self::Hash => "hash",
-            Self::Drop => "drop",
-        }
-    }
-}
-
-/// Capture redaction policy configuration.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct CaptureRedactionPolicy {
-    /// Whether redaction is enabled.
-    pub enabled: bool,
-    /// Redaction mode applied when sensitive content is detected.
-    pub mode: CaptureRedactionMode,
-    /// Retention boundary (days) for T1 content.
-    pub t1_retention_days: u64,
-    /// Retention boundary (days) for T2 content.
-    pub t2_retention_days: u64,
-    /// Retention boundary (days) for T3 content.
-    pub t3_retention_days: u64,
-    /// Additional regex patterns loaded from config (e.g. redaction_rules.toml).
-    pub custom_patterns: Vec<String>,
-}
-
-impl Default for CaptureRedactionPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            mode: CaptureRedactionMode::Mask,
-            t1_retention_days: 90,
-            t2_retention_days: 30,
-            t3_retention_days: 7,
-            custom_patterns: Vec::new(),
-        }
-    }
-}
-
-impl CaptureRedactionPolicy {
-    /// Load capture redaction policy from a TOML file.
-    ///
-    /// Expected keys:
-    /// - `enabled = bool`
-    /// - `mode = "mask"|"hash"|"drop"`
-    /// - `t1_retention_days = int`
-    /// - `t2_retention_days = int`
-    /// - `t3_retention_days = int`
-    /// - `custom_patterns = ["regex", ...]`
-    pub fn from_rules_toml(path: &Path) -> crate::Result<Self> {
-        let raw = std::fs::read_to_string(path)?;
-        toml::from_str(&raw).map_err(|err| {
-            crate::Error::Runtime(format!(
-                "failed to parse capture redaction rules TOML at {}: {err}",
-                path.display()
-            ))
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TextRedactionOutcome {
-    text: String,
-    redaction: RecorderRedactionLevel,
-}
-
-#[derive(Debug, Clone)]
-struct JsonRedactionOutcome {
-    value: serde_json::Value,
-    sensitivity: CaptureSensitivityTier,
-    tombstoned: bool,
-    redacted: bool,
-}
-
-/// Deterministic capture redactor applied before recorder serialization.
-#[derive(Debug, Clone)]
-struct CaptureRedactor {
-    policy: CaptureRedactionPolicy,
-    redactor: Redactor,
-    custom_patterns: Vec<Regex>,
-}
-
-impl CaptureRedactor {
-    fn new(policy: CaptureRedactionPolicy) -> Self {
-        let custom_patterns = policy
-            .custom_patterns
-            .iter()
-            .filter_map(|pattern| Regex::new(pattern).ok())
-            .collect();
-        Self {
-            policy,
-            redactor: Redactor::new(),
-            custom_patterns,
-        }
-    }
-
-    fn mode(&self) -> CaptureRedactionMode {
-        self.policy.mode
-    }
-
-    fn redact_text(&self, text: &str, occurred_at_ms: u64) -> TextRedactionOutcome {
-        let sensitivity = self.classify_text_sensitivity(text);
-        if self.should_tombstone(sensitivity, occurred_at_ms) {
-            return TextRedactionOutcome {
-                text: RETENTION_TOMBSTONE_MARKER.to_string(),
-                redaction: RecorderRedactionLevel::Full,
-            };
-        }
-
-        if !self.policy.enabled || sensitivity == CaptureSensitivityTier::T1 {
-            return TextRedactionOutcome {
-                text: text.to_string(),
-                redaction: RecorderRedactionLevel::None,
-            };
-        }
-
-        let masked = self.redact_with_patterns(text);
-        let (text, redaction) = match self.policy.mode {
-            CaptureRedactionMode::Mask => {
-                let level = if sensitivity == CaptureSensitivityTier::T3 {
-                    RecorderRedactionLevel::Full
-                } else {
-                    RecorderRedactionLevel::Partial
-                };
-                (masked, level)
-            }
-            CaptureRedactionMode::Hash => (
-                format!("sha256:{}", sha256_hex(&masked)),
-                RecorderRedactionLevel::Full,
-            ),
-            CaptureRedactionMode::Drop => (String::new(), RecorderRedactionLevel::Full),
-        };
-
-        TextRedactionOutcome { text, redaction }
-    }
-
-    fn redact_json_details(
-        &self,
-        details: &serde_json::Value,
-        occurred_at_ms: u64,
-    ) -> JsonRedactionOutcome {
-        let details_text = details.to_string();
-        let sensitivity = self.classify_text_sensitivity(&details_text);
-        if self.should_tombstone(sensitivity, occurred_at_ms) {
-            return JsonRedactionOutcome {
-                value: serde_json::json!({
-                    "tombstone": RETENTION_TOMBSTONE_MARKER,
-                }),
-                sensitivity,
-                tombstoned: true,
-                redacted: true,
-            };
-        }
-
-        if !self.policy.enabled || sensitivity == CaptureSensitivityTier::T1 {
-            return JsonRedactionOutcome {
-                value: details.clone(),
-                sensitivity,
-                tombstoned: false,
-                redacted: false,
-            };
-        }
-
-        let mut value = details.clone();
-        let redacted = self.redact_json_value(&mut value);
-        JsonRedactionOutcome {
-            value,
-            sensitivity,
-            tombstoned: false,
-            redacted,
-        }
-    }
-
-    fn should_tombstone(&self, sensitivity: CaptureSensitivityTier, occurred_at_ms: u64) -> bool {
-        let retention_days = sensitivity.retention_days(&self.policy);
-        let max_age_ms = retention_days
-            .saturating_mul(24)
-            .saturating_mul(60)
-            .saturating_mul(60)
-            .saturating_mul(1000);
-        let now_ms = epoch_ms_now();
-        now_ms.saturating_sub(occurred_at_ms) >= max_age_ms
-    }
-
-    fn classify_text_sensitivity(&self, text: &str) -> CaptureSensitivityTier {
-        if contains_bearer_token(text) || contains_jwt_like_token(text) {
-            return CaptureSensitivityTier::T3;
-        }
-
-        if self.redactor.contains_secrets(text)
-            || self
-                .custom_patterns
-                .iter()
-                .any(|pattern| pattern.is_match(text))
-        {
-            return CaptureSensitivityTier::T2;
-        }
-
-        CaptureSensitivityTier::T1
-    }
-
-    fn redact_with_patterns(&self, text: &str) -> String {
-        let mut redacted = text.to_string();
-        for pattern in &self.custom_patterns {
-            redacted = pattern
-                .replace_all(&redacted, crate::policy::REDACTED_MARKER)
-                .to_string();
-        }
-        self.redactor.redact(&redacted)
-    }
-
-    fn redact_json_value(&self, value: &mut serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::String(text) => {
-                let source = text.clone();
-                let redacted = self.redact_with_patterns(&source);
-                if redacted == source {
-                    return false;
-                }
-
-                *text = match self.policy.mode {
-                    CaptureRedactionMode::Mask => redacted,
-                    CaptureRedactionMode::Hash => format!("sha256:{}", sha256_hex(&redacted)),
-                    CaptureRedactionMode::Drop => String::new(),
-                };
-                true
-            }
-            serde_json::Value::Array(values) => values.iter_mut().fold(false, |changed, inner| {
-                self.redact_json_value(inner) || changed
-            }),
-            serde_json::Value::Object(map) => map.values_mut().fold(false, |changed, inner| {
-                self.redact_json_value(inner) || changed
-            }),
-            _ => false,
-        }
-    }
-}
-
-fn contains_bearer_token(text: &str) -> bool {
-    text.to_ascii_lowercase().contains("bearer ")
-}
-
-fn contains_jwt_like_token(text: &str) -> bool {
-    text.split_whitespace().any(|token| {
-        let normalized = normalize_token(token);
-        let parts: Vec<&str> = normalized.split('.').collect();
-        if parts.len() != 3 {
-            return false;
-        }
-        parts.iter().all(|part| {
-            part.len() >= 8
-                && part
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-        })
-    })
-}
-
-fn normalize_token(token: &str) -> String {
-    token
-        .trim_matches(|ch: char| {
-            !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.')
-        })
-        .to_string()
-}
-
-fn with_redaction_meta(
-    details: serde_json::Value,
-    sensitivity: CaptureSensitivityTier,
-    mode: CaptureRedactionMode,
-    tombstoned: bool,
-    redacted: bool,
-) -> serde_json::Value {
-    let redaction_meta = serde_json::json!({
-        "policy_version": "capture_redaction.v1",
-        "sensitivity_tier": sensitivity.as_str(),
-        "mode": mode.as_str(),
-        "applied": redacted,
-        "tombstoned": tombstoned,
-    });
-
-    match details {
-        serde_json::Value::Object(mut object) => {
-            object.insert("redaction_meta".to_string(), redaction_meta);
-            serde_json::Value::Object(object)
-        }
-        value => serde_json::json!({
-            "value": value,
-            "redaction_meta": redaction_meta,
-        }),
-    }
-}
-
-fn max_redaction_level(
-    left: RecorderRedactionLevel,
-    right: RecorderRedactionLevel,
-) -> RecorderRedactionLevel {
-    use RecorderRedactionLevel::{Full, None, Partial};
-    match (left, right) {
-        (Full, _) | (_, Full) => Full,
-        (Partial, _) | (_, Partial) => Partial,
-        (None, None) => None,
-    }
-}
-
-/// Kind of decision recorded for deterministic replay provenance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DecisionType {
-    PatternMatch,
-    WorkflowStep,
-    PolicyEvaluation,
-}
-
-/// First-class decision provenance payload captured into replay artifacts.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct DecisionEvent {
-    pub decision_type: DecisionType,
-    pub rule_id: String,
-    pub definition_hash: u64,
-    pub input_hash: String,
-    pub input_summary: String,
-    pub output: serde_json::Value,
-    pub parent_event_id: Option<String>,
-    pub confidence: Option<f64>,
-    pub timestamp_ms: u64,
-    pub pane_id: u64,
-}
-
-impl DecisionEvent {
-    /// Build a decision event with deterministic definition/input fingerprints.
-    #[allow(clippy::too_many_arguments)]
-    #[must_use]
-    pub fn new(
-        decision_type: DecisionType,
-        pane_id: u64,
-        rule_id: impl Into<String>,
-        definition_text: &str,
-        input_text: &str,
-        output: serde_json::Value,
-        parent_event_id: Option<String>,
-        confidence: Option<f64>,
-        timestamp_ms: u64,
-    ) -> Self {
-        Self {
-            decision_type,
-            rule_id: rule_id.into(),
-            definition_hash: fnv1a_hash_text(definition_text),
-            input_hash: sha256_hex(input_text),
-            input_summary: summarize_decision_input(input_text),
-            output,
-            parent_event_id,
-            confidence,
-            timestamp_ms,
-            pane_id,
-        }
-    }
-}
-
-/// Deterministic FNV-1a hash used for rule/workflow/policy definition fingerprints.
-#[must_use]
-pub fn fnv1a_hash_text(input: &str) -> u64 {
-    let mut hash = FNV1A_OFFSET_BASIS;
-    for byte in input.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV1A_PRIME);
-    }
-    hash
-}
-
-/// Deterministic SHA-256 hex digest for decision input fingerprinting.
-#[must_use]
-pub fn sha256_hex(input: &str) -> String {
-    let digest = Sha256::digest(input.as_bytes());
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-/// Redact and bound decision input to the replay contract summary size (256 bytes).
-#[must_use]
-pub fn summarize_decision_input(input: &str) -> String {
-    let redacted = Redactor::new().redact(input);
-    if redacted.len() <= DECISION_INPUT_SUMMARY_MAX_BYTES {
-        return redacted;
-    }
-
-    let mut end = DECISION_INPUT_SUMMARY_MAX_BYTES;
-    while end > 0 && !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
-    redacted[..end].to_string()
 }
 
 /// Runtime capture adapter that converts pipeline events into
@@ -622,8 +143,6 @@ pub struct CaptureAdapter {
     session_id: Option<String>,
     /// Default source for egress events.
     default_source: RecorderEventSource,
-    /// Capture-stage redaction/sensitivity policy adapter.
-    capture_redactor: CaptureRedactor,
     /// Total events captured (monotonic counter for diagnostics).
     total_captured: AtomicU64,
 }
@@ -631,7 +150,6 @@ pub struct CaptureAdapter {
 impl CaptureAdapter {
     /// Create a new capture adapter with the given sink and configuration.
     pub fn new(sink: Arc<dyn CaptureSink>, config: CaptureConfig) -> Self {
-        let redaction_policy = config.redaction_policy.clone();
         Self {
             sink,
             global_seq: Arc::new(GlobalSequence::new()),
@@ -639,7 +157,6 @@ impl CaptureAdapter {
             enabled: AtomicBool::new(config.enabled),
             session_id: config.session_id,
             default_source: config.default_source,
-            capture_redactor: CaptureRedactor::new(redaction_policy),
             total_captured: AtomicU64::new(0),
         }
     }
@@ -676,73 +193,16 @@ impl CaptureAdapter {
         &self.global_seq
     }
 
-    /// Return a clone of the shared global sequence handle.
+    /// Return a clone of the shared global sequence counter.
     pub fn global_sequence_handle(&self) -> Arc<GlobalSequence> {
         Arc::clone(&self.global_seq)
     }
 
     /// Get or create a per-pane sequence counter, returning the next value.
     fn next_pane_seq(&self, pane_id: u64) -> u64 {
-        let mut map = self
-            .pane_sequences
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self.pane_sequences.lock().unwrap();
         let counter = map.entry(pane_id).or_insert_with(|| AtomicU64::new(0));
         counter.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn capture_ingress_at(
-        &self,
-        pane_id: u64,
-        text: String,
-        ingress_kind: crate::recording::RecorderIngressKind,
-        source: RecorderEventSource,
-        workflow_id: Option<String>,
-        causality: RecorderEventCausality,
-        occurred_at_ms: u64,
-    ) {
-        if !self.is_enabled() {
-            return;
-        }
-
-        let text_outcome = self.capture_redactor.redact_text(&text, occurred_at_ms);
-        let recorded_at_ms = epoch_ms_now();
-        let sequence = self.next_pane_seq(pane_id);
-
-        let payload = RecorderEventPayload::IngressText {
-            text: text_outcome.text,
-            encoding: RecorderTextEncoding::Utf8,
-            redaction: text_outcome.redaction,
-            ingress_kind,
-        };
-
-        let mut event = RecorderEvent {
-            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.into(),
-            event_id: String::new(),
-            pane_id,
-            session_id: self.session_id.clone(),
-            workflow_id,
-            correlation_id: None,
-            source,
-            occurred_at_ms,
-            recorded_at_ms,
-            sequence,
-            causality,
-            payload,
-        };
-
-        event.event_id = generate_event_id_v1(&event);
-
-        let merge_key = RecorderMergeKey {
-            recorded_at_ms: event.recorded_at_ms,
-            pane_id: event.pane_id,
-            stream_kind: StreamKind::from_payload(&event.payload),
-            sequence: event.sequence,
-            event_id: event.event_id.clone(),
-        };
-
-        self.total_captured.fetch_add(1, Ordering::Relaxed);
-        self.sink.on_event(event, merge_key);
     }
 
     // -----------------------------------------------------------------------
@@ -765,16 +225,13 @@ impl CaptureAdapter {
         } else {
             epoch_ms_now()
         };
-        let text_outcome = self
-            .capture_redactor
-            .redact_text(&segment.content, occurred_at_ms);
         let recorded_at_ms = epoch_ms_now();
         let sequence = self.next_pane_seq(segment.pane_id);
 
         let payload = RecorderEventPayload::EgressOutput {
-            text: text_outcome.text,
+            text: segment.content.clone(),
             encoding: RecorderTextEncoding::Utf8,
-            redaction: text_outcome.redaction,
+            redaction: RecorderRedactionLevel::None,
             segment_kind,
             is_gap,
         };
@@ -822,16 +279,13 @@ impl CaptureAdapter {
             return;
         }
 
-        let text_outcome = self
-            .capture_redactor
-            .redact_text(&egress.text, egress.occurred_at_ms);
         let recorded_at_ms = epoch_ms_now();
         let sequence = self.next_pane_seq(egress.pane_id);
 
         let payload = RecorderEventPayload::EgressOutput {
-            text: text_outcome.text,
+            text: egress.text.clone(),
             encoding: egress.encoding,
-            redaction: max_redaction_level(egress.redaction, text_outcome.redaction),
+            redaction: egress.redaction,
             segment_kind: egress.segment_kind,
             is_gap: egress.is_gap,
         };
@@ -888,16 +342,6 @@ impl CaptureAdapter {
         let occurred_at_ms = epoch_ms_now();
         let recorded_at_ms = occurred_at_ms;
         let sequence = self.next_pane_seq(pane_id);
-        let redaction_outcome = self
-            .capture_redactor
-            .redact_json_details(&details, occurred_at_ms);
-        let details = with_redaction_meta(
-            redaction_outcome.value,
-            redaction_outcome.sensitivity,
-            self.capture_redactor.mode(),
-            redaction_outcome.tombstoned,
-            redaction_outcome.redacted,
-        );
 
         let payload = RecorderEventPayload::LifecycleMarker {
             lifecycle_phase: phase,
@@ -956,16 +400,6 @@ impl CaptureAdapter {
         let occurred_at_ms = epoch_ms_now();
         let recorded_at_ms = occurred_at_ms;
         let sequence = self.next_pane_seq(pane_id);
-        let redaction_outcome = self
-            .capture_redactor
-            .redact_json_details(&details, occurred_at_ms);
-        let details = with_redaction_meta(
-            redaction_outcome.value,
-            redaction_outcome.sensitivity,
-            self.capture_redactor.mode(),
-            redaction_outcome.tombstoned,
-            redaction_outcome.redacted,
-        );
 
         let payload = RecorderEventPayload::ControlMarker {
             control_marker_type: marker_type,
@@ -1019,68 +453,25 @@ impl CaptureAdapter {
         workflow_id: Option<String>,
         causality: RecorderEventCausality,
     ) {
-        self.capture_ingress_at(
-            pane_id,
-            text,
-            ingress_kind,
-            source,
-            workflow_id,
-            causality,
-            epoch_ms_now(),
-        );
-    }
-
-    /// Capture a first-class decision provenance event.
-    ///
-    /// Decision provenance is encoded as a control marker with
-    /// `control_marker_type=policy_decision`, preserving compatibility with the
-    /// current recorder payload schema while making decision diffs explainable.
-    pub fn capture_decision(
-        &self,
-        source: RecorderEventSource,
-        workflow_id: Option<String>,
-        decision: DecisionEvent,
-    ) {
         if !self.is_enabled() {
             return;
         }
 
-        let occurred_at_ms = decision.timestamp_ms;
-        let recorded_at_ms = epoch_ms_now();
-        let sequence = self.next_pane_seq(decision.pane_id);
-        let parent_event_id = decision.parent_event_id.clone();
-        let decision_details = serde_json::json!({
-            "decision_type": decision.decision_type,
-            "rule_id": decision.rule_id,
-            "definition_hash": decision.definition_hash,
-            "input_hash": decision.input_hash,
-            "input_summary": decision.input_summary,
-            "output": decision.output,
-            "parent_event_id": decision.parent_event_id,
-            "confidence": decision.confidence,
-            "timestamp_ms": decision.timestamp_ms,
-            "pane_id": decision.pane_id,
-        });
-        let redaction_outcome = self
-            .capture_redactor
-            .redact_json_details(&decision_details, occurred_at_ms);
-        let details = with_redaction_meta(
-            redaction_outcome.value,
-            redaction_outcome.sensitivity,
-            self.capture_redactor.mode(),
-            redaction_outcome.tombstoned,
-            redaction_outcome.redacted,
-        );
+        let occurred_at_ms = epoch_ms_now();
+        let recorded_at_ms = occurred_at_ms;
+        let sequence = self.next_pane_seq(pane_id);
 
-        let payload = RecorderEventPayload::ControlMarker {
-            control_marker_type: crate::recording::RecorderControlMarkerType::PolicyDecision,
-            details,
+        let payload = RecorderEventPayload::IngressText {
+            text,
+            encoding: RecorderTextEncoding::Utf8,
+            redaction: RecorderRedactionLevel::None,
+            ingress_kind,
         };
 
         let mut event = RecorderEvent {
             schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.into(),
             event_id: String::new(),
-            pane_id: decision.pane_id,
+            pane_id,
             session_id: self.session_id.clone(),
             workflow_id,
             correlation_id: None,
@@ -1088,11 +479,7 @@ impl CaptureAdapter {
             occurred_at_ms,
             recorded_at_ms,
             sequence,
-            causality: RecorderEventCausality {
-                parent_event_id,
-                trigger_event_id: None,
-                root_event_id: None,
-            },
+            causality,
             payload,
         };
 
@@ -1121,20 +508,26 @@ impl EgressTap for CaptureAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// IngressTap implementation — allows CaptureAdapter to be used as an IngressTap
+// ---------------------------------------------------------------------------
+
 impl IngressTap for CaptureAdapter {
     fn on_ingress(&self, event: IngressEvent) {
-        self.capture_ingress_at(
+        self.capture_ingress(
             event.pane_id,
             event.text.clone(),
             event.ingress_kind,
             event.source,
             event.workflow_id.clone(),
-            RecorderEventCausality::default(),
-            event.occurred_at_ms,
+            RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
         );
 
         use crate::recording::RecorderControlMarkerType;
-
         let (marker_type, details) = match event.outcome {
             IngressOutcome::Allowed => (
                 RecorderControlMarkerType::PolicyDecision,
@@ -1186,10 +579,7 @@ pub type SharedCaptureAdapter = Arc<CaptureAdapter>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recording::{
-        IngressEvent, IngressOutcome, RecorderControlMarkerType, RecorderIngressKind,
-        RecorderSegmentKind,
-    };
+    use crate::recording::{RecorderControlMarkerType, RecorderIngressKind, RecorderSegmentKind};
     use serde_json::json;
 
     fn make_adapter() -> (Arc<CollectingCaptureSink>, CaptureAdapter) {
@@ -1208,12 +598,8 @@ mod tests {
             seq,
             content: content.to_string(),
             kind: crate::ingest::CapturedSegmentKind::Delta,
-            captured_at: epoch_ms_now() as i64,
+            captured_at: 1700000000000,
         }
-    }
-
-    fn make_segment_recent(pane_id: u64, content: &str, seq: u64) -> CapturedSegment {
-        make_segment(pane_id, content, seq)
     }
 
     fn make_gap_segment(pane_id: u64, reason: &str, seq: u64) -> CapturedSegment {
@@ -1224,7 +610,7 @@ mod tests {
             kind: crate::ingest::CapturedSegmentKind::Gap {
                 reason: reason.to_string(),
             },
-            captured_at: epoch_ms_now() as i64,
+            captured_at: 1700000000000,
         }
     }
 
@@ -1762,7 +1148,7 @@ mod tests {
             gap_reason: None,
             encoding: RecorderTextEncoding::Utf8,
             redaction: RecorderRedactionLevel::None,
-            occurred_at_ms: epoch_ms_now(),
+            occurred_at_ms: 1700000000000,
             sequence: 0,
             global_sequence: 0,
         };
@@ -1781,48 +1167,32 @@ mod tests {
         let config = CaptureConfig::default();
         let adapter = CaptureAdapter::new(sink.clone(), config);
 
-        let ingress = IngressEvent {
-            pane_id: 7,
-            text: "echo hi".to_string(),
-            source: RecorderEventSource::RobotMode,
-            ingress_kind: RecorderIngressKind::SendText,
-            redaction: RecorderRedactionLevel::None,
-            occurred_at_ms: epoch_ms_now(),
-            outcome: IngressOutcome::Denied {
-                reason: "policy gate".to_string(),
+        IngressTap::on_ingress(
+            &adapter,
+            IngressEvent {
+                pane_id: 77,
+                text: "rm -rf /".to_string(),
+                source: RecorderEventSource::OperatorAction,
+                ingress_kind: RecorderIngressKind::SendText,
+                redaction: RecorderRedactionLevel::Partial,
+                occurred_at_ms: 1700000000000,
+                outcome: IngressOutcome::Denied {
+                    reason: "policy deny".to_string(),
+                },
+                workflow_id: Some("wf-77".to_string()),
             },
-            workflow_id: Some("wf-77".to_string()),
-        };
+        );
 
-        IngressTap::on_ingress(&adapter, ingress);
-
-        assert_eq!(sink.len(), 2);
         let events = sink.recorder_events();
-
-        match &events[0].payload {
-            RecorderEventPayload::IngressText {
-                text, ingress_kind, ..
-            } => {
-                assert_eq!(text, "echo hi");
-                assert_eq!(*ingress_kind, RecorderIngressKind::SendText);
-            }
-            other => panic!("expected IngressText, got {other:?}"),
-        }
-
-        match &events[1].payload {
-            RecorderEventPayload::ControlMarker {
-                control_marker_type,
-                details,
-            } => {
-                assert_eq!(
-                    *control_marker_type,
-                    crate::recording::RecorderControlMarkerType::PolicyDecision
-                );
-                assert_eq!(details["outcome"], "deny");
-                assert_eq!(details["reason"], "policy gate");
-            }
-            other => panic!("expected ControlMarker, got {other:?}"),
-        }
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].payload,
+            RecorderEventPayload::IngressText { .. }
+        ));
+        assert!(matches!(
+            events[1].payload,
+            RecorderEventPayload::ControlMarker { .. }
+        ));
     }
 
     // --- Negative timestamp ---
@@ -1912,16 +1282,7 @@ mod tests {
         adapter.capture_lifecycle(1, RecorderLifecyclePhase::PaneOpened, None, json!({}));
 
         let events = sink.events();
-        // Normalize timestamps to isolate stream_kind ordering from timing
-        // (epoch_ms_now() may return different values between the two captures)
-        let mut keys: Vec<_> = events
-            .iter()
-            .map(|(_, mk)| {
-                let mut k = mk.clone();
-                k.recorded_at_ms = 0;
-                k
-            })
-            .collect();
+        let mut keys: Vec<_> = events.iter().map(|(_, mk)| mk.clone()).collect();
         keys.sort();
 
         // Lifecycle (rank 0) should sort before Egress (rank 3)
@@ -2018,312 +1379,5 @@ mod tests {
             adapter.capture_egress(&make_segment(pane_id, &format!("msg{i}"), i));
         }
         assert_eq!(sink.len(), 10);
-    }
-
-    // --- Decision capture ---
-
-    #[test]
-    fn test_definition_hash_stable_for_identical_text() {
-        let text = r#"{"id":"codex.usage.reached","regex":"Usage limit reached"}"#;
-        assert_eq!(fnv1a_hash_text(text), fnv1a_hash_text(text));
-    }
-
-    #[test]
-    fn test_definition_hash_changes_when_text_changes() {
-        let a = r#"{"id":"codex.usage.reached"}"#;
-        let b = r#"{"id":"codex.usage.warning"}"#;
-        assert_ne!(fnv1a_hash_text(a), fnv1a_hash_text(b));
-    }
-
-    #[test]
-    fn test_input_hash_is_deterministic() {
-        let input = "Usage limit reached. Try again in 2h";
-        assert_eq!(sha256_hex(input), sha256_hex(input));
-    }
-
-    #[test]
-    fn test_input_summary_truncates_to_256_bytes() {
-        let summary = summarize_decision_input(&"x".repeat(1024));
-        assert_eq!(summary.len(), 256);
-    }
-
-    #[test]
-    fn test_input_summary_redacts_secrets() {
-        let input = "token=sk-abc123456789012345678901234567890123456789012345678901";
-        let summary = summarize_decision_input(input);
-        assert!(summary.contains("[REDACTED]"));
-        assert!(!summary.contains("sk-abc123"));
-    }
-
-    #[test]
-    fn test_capture_decision_event_records_control_marker() {
-        let (sink, adapter) = make_adapter();
-        let decision = DecisionEvent::new(
-            DecisionType::PatternMatch,
-            42,
-            "codex.usage.reached",
-            r#"{"id":"codex.usage.reached","anchors":["Usage limit reached"]}"#,
-            "Usage limit reached",
-            serde_json::json!({"severity":"high"}),
-            Some("segment:1".to_string()),
-            Some(0.95),
-            epoch_ms_now(),
-        );
-
-        adapter.capture_decision(RecorderEventSource::WeztermMux, None, decision);
-        assert_eq!(sink.len(), 1);
-
-        let evt = &sink.recorder_events()[0];
-        assert_eq!(evt.pane_id, 42);
-        match &evt.payload {
-            RecorderEventPayload::ControlMarker {
-                control_marker_type,
-                details,
-            } => {
-                assert_eq!(
-                    *control_marker_type,
-                    crate::recording::RecorderControlMarkerType::PolicyDecision
-                );
-                assert_eq!(details["decision_type"], "pattern_match");
-                assert_eq!(details["rule_id"], "codex.usage.reached");
-                assert_eq!(details["parent_event_id"], "segment:1");
-                assert_eq!(details["confidence"], 0.95);
-            }
-            other => panic!("expected ControlMarker, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_capture_decision_preserves_parent_causality() {
-        let (sink, adapter) = make_adapter();
-        let decision = DecisionEvent::new(
-            DecisionType::PolicyEvaluation,
-            7,
-            "policy.alt_screen",
-            "policy.alt_screen deny when alt-screen is active",
-            "echo hi",
-            serde_json::json!({"decision":"deny"}),
-            Some("event-parent-9".to_string()),
-            None,
-            1_700_000_124_000,
-        );
-
-        adapter.capture_decision(RecorderEventSource::OperatorAction, None, decision);
-        let evt = &sink.recorder_events()[0];
-        assert_eq!(
-            evt.causality.parent_event_id.as_deref(),
-            Some("event-parent-9")
-        );
-    }
-
-    #[test]
-    fn test_capture_decision_disabled_adapter_is_noop() {
-        let (sink, adapter) = make_adapter();
-        adapter.set_enabled(false);
-        let decision = DecisionEvent::new(
-            DecisionType::WorkflowStep,
-            3,
-            "workflow.handle_usage.step.0",
-            "{\"name\":\"check_prompt\"}",
-            "{\"trigger\":\"usage_reached\"}",
-            serde_json::json!({"result":"continue"}),
-            None,
-            None,
-            1_700_000_125_000,
-        );
-        adapter.capture_decision(
-            RecorderEventSource::WorkflowEngine,
-            Some("wf-1".into()),
-            decision,
-        );
-        assert!(sink.is_empty());
-    }
-
-    #[test]
-    fn test_capture_redaction_mask_mode_marks_partial_for_t2() {
-        let sink = Arc::new(CollectingCaptureSink::new());
-        let config = CaptureConfig {
-            redaction_policy: CaptureRedactionPolicy {
-                mode: CaptureRedactionMode::Mask,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let adapter = CaptureAdapter::new(sink.clone(), config);
-        adapter.capture_egress(&make_segment_recent(
-            1,
-            "api_key=sk-abc123456789012345678901234567890123456",
-            0,
-        ));
-
-        let evt = &sink.recorder_events()[0];
-        match &evt.payload {
-            RecorderEventPayload::EgressOutput {
-                text, redaction, ..
-            } => {
-                assert!(!text.contains("sk-abc123"));
-                assert!(text.contains(crate::policy::REDACTED_MARKER));
-                assert_eq!(*redaction, RecorderRedactionLevel::Partial);
-            }
-            other => panic!("expected EgressOutput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_capture_redaction_hash_mode_hashes_sensitive_text() {
-        let sink = Arc::new(CollectingCaptureSink::new());
-        let config = CaptureConfig {
-            redaction_policy: CaptureRedactionPolicy {
-                mode: CaptureRedactionMode::Hash,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let adapter = CaptureAdapter::new(sink.clone(), config);
-        adapter.capture_egress(&make_segment_recent(
-            1,
-            "api_key=sk-abc123456789012345678901234567890123456",
-            0,
-        ));
-
-        let evt = &sink.recorder_events()[0];
-        match &evt.payload {
-            RecorderEventPayload::EgressOutput {
-                text, redaction, ..
-            } => {
-                assert!(text.starts_with("sha256:"));
-                assert!(!text.contains("sk-abc123"));
-                assert_eq!(*redaction, RecorderRedactionLevel::Full);
-            }
-            other => panic!("expected EgressOutput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_capture_redaction_drop_mode_drops_sensitive_text() {
-        let sink = Arc::new(CollectingCaptureSink::new());
-        let config = CaptureConfig {
-            redaction_policy: CaptureRedactionPolicy {
-                mode: CaptureRedactionMode::Drop,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let adapter = CaptureAdapter::new(sink.clone(), config);
-        adapter.capture_egress(&make_segment_recent(
-            1,
-            "api_key=sk-abc123456789012345678901234567890123456",
-            0,
-        ));
-
-        let evt = &sink.recorder_events()[0];
-        match &evt.payload {
-            RecorderEventPayload::EgressOutput {
-                text, redaction, ..
-            } => {
-                assert_eq!(text, "");
-                assert_eq!(*redaction, RecorderRedactionLevel::Full);
-            }
-            other => panic!("expected EgressOutput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_capture_redaction_t3_retention_zero_tombstones() {
-        let sink = Arc::new(CollectingCaptureSink::new());
-        let config = CaptureConfig {
-            redaction_policy: CaptureRedactionPolicy {
-                t3_retention_days: 0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let adapter = CaptureAdapter::new(sink.clone(), config);
-        adapter.capture_egress(&make_segment(
-            1,
-            "Authorization: Bearer abc.defghijkl.mnopqrstuv",
-            0,
-        ));
-
-        let evt = &sink.recorder_events()[0];
-        match &evt.payload {
-            RecorderEventPayload::EgressOutput {
-                text, redaction, ..
-            } => {
-                assert_eq!(text, RETENTION_TOMBSTONE_MARKER);
-                assert_eq!(*redaction, RecorderRedactionLevel::Full);
-            }
-            other => panic!("expected EgressOutput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_capture_control_includes_redaction_meta_for_sensitive_details() {
-        let (sink, adapter) = make_adapter();
-        adapter.capture_control(
-            9,
-            crate::recording::RecorderControlMarkerType::PolicyDecision,
-            serde_json::json!({
-                "note": "Authorization: Bearer abc.defghijkl.mnopqrstuv"
-            }),
-        );
-
-        let evt = &sink.recorder_events()[0];
-        match &evt.payload {
-            RecorderEventPayload::ControlMarker { details, .. } => {
-                assert_eq!(details["redaction_meta"]["sensitivity_tier"], "t3");
-                assert_eq!(details["redaction_meta"]["mode"], "mask");
-                assert!(
-                    details["redaction_meta"]["applied"]
-                        .as_bool()
-                        .unwrap_or(false)
-                );
-            }
-            other => panic!("expected ControlMarker, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_capture_redaction_policy_loads_custom_patterns_from_toml() {
-        let path = std::env::temp_dir().join(format!(
-            "replay_capture_redaction_rules_{}_{}.toml",
-            std::process::id(),
-            epoch_ms_now()
-        ));
-        std::fs::write(
-            &path,
-            r#"
-mode = "mask"
-custom_patterns = ["TOKEN_[A-Z0-9]{6,}"]
-"#,
-        )
-        .unwrap();
-
-        let policy = CaptureRedactionPolicy::from_rules_toml(&path).unwrap();
-        std::fs::remove_file(path).ok();
-        assert_eq!(policy.mode, CaptureRedactionMode::Mask);
-        assert_eq!(policy.custom_patterns.len(), 1);
-
-        let sink = Arc::new(CollectingCaptureSink::new());
-        let adapter = CaptureAdapter::new(
-            sink.clone(),
-            CaptureConfig {
-                redaction_policy: policy,
-                ..Default::default()
-            },
-        );
-        adapter.capture_egress(&make_segment_recent(1, "custom TOKEN_ABCDEF secret", 0));
-
-        let evt = &sink.recorder_events()[0];
-        match &evt.payload {
-            RecorderEventPayload::EgressOutput {
-                text, redaction, ..
-            } => {
-                assert!(!text.contains("TOKEN_ABCDEF"));
-                assert!(text.contains(crate::policy::REDACTED_MARKER));
-                assert_eq!(*redaction, RecorderRedactionLevel::Partial);
-            }
-            other => panic!("expected EgressOutput, got {other:?}"),
-        }
     }
 }

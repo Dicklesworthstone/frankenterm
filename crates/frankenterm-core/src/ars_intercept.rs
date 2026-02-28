@@ -27,11 +27,15 @@
 //! back to LLM processing.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::ars_blast_radius::{
+    BlastDecision, BlastRadiusConfig, BlastRadiusController, DenyReason, MaturityTier,
+};
 use crate::ars_fst::{FstHandle, FstMatch, ReflexId};
 
 // =============================================================================
@@ -56,6 +60,10 @@ pub struct InterceptConfig {
     pub cooldown_ms: u64,
     /// Maximum concurrent reflex executions globally.
     pub max_concurrent_executions: u32,
+    /// Whether to enforce swarm-wide blast-radius token-bucket limits.
+    pub enable_blast_radius: bool,
+    /// Blast-radius token-bucket configuration.
+    pub blast_radius: BlastRadiusConfig,
 }
 
 impl Default for InterceptConfig {
@@ -68,6 +76,8 @@ impl Default for InterceptConfig {
             verbose_logging: false,
             cooldown_ms: 5000,
             max_concurrent_executions: 3,
+            enable_blast_radius: true,
+            blast_radius: BlastRadiusConfig::default(),
         }
     }
 }
@@ -77,7 +87,7 @@ impl Default for InterceptConfig {
 // =============================================================================
 
 /// Required context bounds for a reflex to be executable.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextBounds {
     /// Required CWD prefix (e.g., `/app/` or `/home/user/project`).
     /// Empty means any CWD is acceptable.
@@ -93,6 +103,17 @@ pub struct ContextBounds {
     pub min_pane_rows: u16,
 }
 
+impl Default for ContextBounds {
+    fn default() -> Self {
+        Self {
+            cwd_prefix: String::new(),
+            required_env: HashMap::new(),
+            required_shell: String::new(),
+            min_pane_cols: 0,
+            min_pane_rows: 0,
+        }
+    }
+}
 
 /// Current pane context for gate evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +250,11 @@ pub enum FallbackReason {
     ConcurrencyLimit { current: u32, max: u32 },
     /// FST lookup timed out.
     Timeout { elapsed_ms: u64, max_ms: u64 },
+    /// Blast-radius controller denied reflex execution.
+    RateLimited {
+        reason: DenyReason,
+        tier: MaturityTier,
+    },
 }
 
 // =============================================================================
@@ -238,6 +264,8 @@ pub enum FallbackReason {
 /// ARS interceptor: queries FST and makes execute/fallback decisions.
 pub struct ArsInterceptor {
     config: InterceptConfig,
+    /// Swarm-wide blast-radius token-bucket controller.
+    blast_radius: BlastRadiusController,
     /// Reflex context bounds registry: reflex_id → bounds.
     context_bounds: HashMap<ReflexId, ContextBounds>,
     /// Per-pane cooldown tracker: pane_id → last_execution_timestamp_ms.
@@ -250,6 +278,14 @@ pub struct ArsInterceptor {
     total_executions: AtomicU64,
     /// Total fallbacks.
     total_fallbacks: AtomicU64,
+    /// Total blast-radius denials.
+    total_rate_limited: AtomicU64,
+    /// Blast-radius denials due to swarm bucket exhaustion.
+    total_rate_limited_swarm: AtomicU64,
+    /// Blast-radius denials due to cluster bucket exhaustion.
+    total_rate_limited_cluster: AtomicU64,
+    /// Blast-radius denials due to reflex bucket exhaustion.
+    total_rate_limited_reflex: AtomicU64,
     /// Whether the interceptor is paused (emergency brake).
     paused: AtomicBool,
 }
@@ -260,6 +296,7 @@ impl ArsInterceptor {
     /// Create an interceptor with the given configuration.
     pub fn new(config: InterceptConfig) -> Self {
         Self {
+            blast_radius: BlastRadiusController::new(config.blast_radius.clone()),
             config,
             context_bounds: HashMap::new(),
             cooldowns: HashMap::new(),
@@ -267,6 +304,10 @@ impl ArsInterceptor {
             total_attempts: AtomicU64::new(0),
             total_executions: AtomicU64::new(0),
             total_fallbacks: AtomicU64::new(0),
+            total_rate_limited: AtomicU64::new(0),
+            total_rate_limited_swarm: AtomicU64::new(0),
+            total_rate_limited_cluster: AtomicU64::new(0),
+            total_rate_limited_reflex: AtomicU64::new(0),
             paused: AtomicBool::new(false),
         }
     }
@@ -366,6 +407,41 @@ impl ArsInterceptor {
             }
         }
 
+        // Blast-radius token-bucket gate.
+        if self.config.enable_blast_radius {
+            self.blast_radius
+                .register_reflex(m.reflex_id, &m.cluster_id);
+            let blast_decision = self.blast_radius.check(m.reflex_id, current_time_ms);
+            if let BlastDecision::Deny { reason, tier } = blast_decision {
+                self.total_fallbacks.fetch_add(1, Ordering::Relaxed);
+                self.total_rate_limited.fetch_add(1, Ordering::Relaxed);
+                match &reason {
+                    DenyReason::SwarmLimit => {
+                        self.total_rate_limited_swarm
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    DenyReason::ClusterLimit { .. } => {
+                        self.total_rate_limited_cluster
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    DenyReason::ReflexLimit { .. } => {
+                        self.total_rate_limited_reflex
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                warn!(
+                    reflex_id = m.reflex_id,
+                    cluster_id = %m.cluster_id,
+                    pane_id = context.pane_id,
+                    ?reason,
+                    "blast radius denied ARS reflex execution"
+                );
+                return InterceptDecision::FallbackToLlm {
+                    reason: FallbackReason::RateLimited { reason, tier },
+                };
+            }
+        }
+
         // All gates passed → execute.
         self.active_executions.fetch_add(1, Ordering::Release);
         self.cooldowns.insert(context.pane_id, current_time_ms);
@@ -389,6 +465,16 @@ impl ArsInterceptor {
     /// Notify that a reflex execution completed (decrements active count).
     pub fn execution_completed(&self) {
         self.active_executions.fetch_sub(1, Ordering::Release);
+    }
+
+    /// Record a successful reflex outcome for maturity tracking.
+    pub fn record_reflex_success(&mut self, reflex_id: ReflexId) {
+        self.blast_radius.record_success(reflex_id);
+    }
+
+    /// Record a failed reflex outcome for maturity tracking.
+    pub fn record_reflex_failure(&mut self, reflex_id: ReflexId) {
+        self.blast_radius.record_failure(reflex_id);
     }
 
     /// Pause the interceptor (emergency brake).
@@ -415,12 +501,18 @@ impl ArsInterceptor {
 
     /// Get intercept statistics.
     pub fn stats(&self) -> InterceptStats {
+        let blast_stats = self.blast_radius.stats();
         InterceptStats {
             total_attempts: self.total_attempts.load(Ordering::Relaxed),
             total_executions: self.total_executions.load(Ordering::Relaxed),
             total_fallbacks: self.total_fallbacks.load(Ordering::Relaxed),
+            total_rate_limited: self.total_rate_limited.load(Ordering::Relaxed),
+            total_rate_limited_swarm: self.total_rate_limited_swarm.load(Ordering::Relaxed),
+            total_rate_limited_cluster: self.total_rate_limited_cluster.load(Ordering::Relaxed),
+            total_rate_limited_reflex: self.total_rate_limited_reflex.load(Ordering::Relaxed),
             active_executions: self.active_executions.load(Ordering::Relaxed),
             is_paused: self.paused.load(Ordering::Relaxed),
+            blast_registered_reflexes: blast_stats.registered_reflexes,
             registered_bounds: self.context_bounds.len(),
             cooldown_entries: self.cooldowns.len(),
         }
@@ -443,10 +535,74 @@ pub struct InterceptStats {
     pub total_attempts: u64,
     pub total_executions: u64,
     pub total_fallbacks: u64,
+    pub total_rate_limited: u64,
+    pub total_rate_limited_swarm: u64,
+    pub total_rate_limited_cluster: u64,
+    pub total_rate_limited_reflex: u64,
     pub active_executions: u32,
     pub is_paused: bool,
+    pub blast_registered_reflexes: usize,
     pub registered_bounds: usize,
     pub cooldown_entries: usize,
+}
+
+impl InterceptStats {
+    /// Render ARS interception counters as Prometheus exposition text.
+    pub fn render_prometheus(&self, prefix: &str) -> String {
+        let sanitized_prefix = sanitize_metric_prefix(prefix);
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "# HELP {p}_ars_rate_limited_total Total ARS reflex executions denied by blast-radius limits.",
+            p = sanitized_prefix
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE {p}_ars_rate_limited_total counter",
+            p = sanitized_prefix
+        );
+        let _ = writeln!(
+            out,
+            "{p}_ars_rate_limited_total {}",
+            self.total_rate_limited,
+            p = sanitized_prefix
+        );
+        let _ = writeln!(
+            out,
+            "{p}_ars_rate_limited_swarm_total {}",
+            self.total_rate_limited_swarm,
+            p = sanitized_prefix
+        );
+        let _ = writeln!(
+            out,
+            "{p}_ars_rate_limited_cluster_total {}",
+            self.total_rate_limited_cluster,
+            p = sanitized_prefix
+        );
+        let _ = writeln!(
+            out,
+            "{p}_ars_rate_limited_reflex_total {}",
+            self.total_rate_limited_reflex,
+            p = sanitized_prefix
+        );
+        out
+    }
+}
+
+fn sanitize_metric_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return "ft".to_string();
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    out
 }
 
 // =============================================================================
@@ -492,6 +648,29 @@ mod tests {
             priority,
             match_len: 10,
             cluster_id: format!("c-{reflex_id}"),
+        }
+    }
+
+    fn blast_limited_config(swarm_burst: f64, swarm_rate_per_min: f64) -> InterceptConfig {
+        InterceptConfig {
+            require_context_gate: false,
+            cooldown_ms: 0,
+            max_concurrent_executions: 128,
+            enable_blast_radius: true,
+            blast_radius: BlastRadiusConfig {
+                swarm_rate_per_min,
+                swarm_burst,
+                cluster_rate_per_min: 10_000.0,
+                cluster_burst: 100.0,
+                incubating_rate_per_min: 10_000.0,
+                incubating_burst: 100.0,
+                graduated_rate_per_min: 10_000.0,
+                graduated_burst: 100.0,
+                veteran_rate_per_min: 10_000.0,
+                veteran_burst: 100.0,
+                ..Default::default()
+            },
+            ..Default::default()
         }
     }
 
@@ -762,6 +941,29 @@ mod tests {
     }
 
     #[test]
+    fn decide_fallback_on_blast_radius_limit() {
+        let mut interceptor = ArsInterceptor::new(blast_limited_config(1.0, 60.0));
+        let m = test_match(1, 0);
+        let mut ctx = test_context();
+
+        let first = interceptor.decide(Some(&m), &ctx, 1_000);
+        assert!(matches!(first, InterceptDecision::Execute { .. }));
+
+        ctx.pane_id = 2;
+        let second = interceptor.decide(Some(&m), &ctx, 1_000);
+        let is_rate_limited = matches!(
+            second,
+            InterceptDecision::FallbackToLlm {
+                reason: FallbackReason::RateLimited {
+                    reason: DenyReason::SwarmLimit,
+                    ..
+                }
+            }
+        );
+        assert!(is_rate_limited);
+    }
+
+    #[test]
     fn context_gate_skipped_when_disabled() {
         let config = InterceptConfig {
             require_context_gate: false,
@@ -798,6 +1000,59 @@ mod tests {
         assert_eq!(stats.total_attempts, 2);
         assert_eq!(stats.total_executions, 1);
         assert_eq!(stats.total_fallbacks, 1);
+    }
+
+    #[test]
+    fn stats_track_rate_limited_denials() {
+        let mut interceptor = ArsInterceptor::new(blast_limited_config(1.0, 60.0));
+        let m = test_match(1, 0);
+        let mut ctx = test_context();
+
+        assert!(matches!(
+            interceptor.decide(Some(&m), &ctx, 1_000),
+            InterceptDecision::Execute { .. }
+        ));
+        for pane_id in 2..=4 {
+            ctx.pane_id = pane_id;
+            let d = interceptor.decide(Some(&m), &ctx, 1_000);
+            assert!(matches!(
+                d,
+                InterceptDecision::FallbackToLlm {
+                    reason: FallbackReason::RateLimited { .. }
+                }
+            ));
+        }
+
+        let stats = interceptor.stats();
+        assert_eq!(stats.total_rate_limited, 3);
+        assert_eq!(stats.total_rate_limited_swarm, 3);
+        assert_eq!(stats.total_rate_limited_cluster, 0);
+        assert_eq!(stats.total_rate_limited_reflex, 0);
+    }
+
+    #[test]
+    fn swarm_blast_radius_allows_exactly_five_of_fifty() {
+        let mut interceptor = ArsInterceptor::new(blast_limited_config(5.0, 300.0));
+        let m = test_match(7, 0);
+        let mut ctx = test_context();
+
+        let mut execute_count = 0usize;
+        let mut fallback_count = 0usize;
+        for pane_id in 1..=50 {
+            ctx.pane_id = pane_id;
+            match interceptor.decide(Some(&m), &ctx, 1_000) {
+                InterceptDecision::Execute { .. } => execute_count += 1,
+                InterceptDecision::FallbackToLlm {
+                    reason: FallbackReason::RateLimited { .. },
+                } => fallback_count += 1,
+                other => panic!("unexpected decision: {other:?}"),
+            }
+        }
+
+        assert_eq!(execute_count, 5);
+        assert_eq!(fallback_count, 45);
+        let stats = interceptor.stats();
+        assert_eq!(stats.total_rate_limited, 45);
     }
 
     #[test]
@@ -915,6 +1170,7 @@ mod tests {
         let decoded: InterceptConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.enabled, config.enabled);
         assert_eq!(decoded.cooldown_ms, config.cooldown_ms);
+        assert_eq!(decoded.enable_blast_radius, config.enable_blast_radius);
     }
 
     #[test]
@@ -947,8 +1203,13 @@ mod tests {
             total_attempts: 10,
             total_executions: 5,
             total_fallbacks: 5,
+            total_rate_limited: 3,
+            total_rate_limited_swarm: 2,
+            total_rate_limited_cluster: 1,
+            total_rate_limited_reflex: 0,
             active_executions: 1,
             is_paused: false,
+            blast_registered_reflexes: 4,
             registered_bounds: 3,
             cooldown_entries: 2,
         };
@@ -963,6 +1224,38 @@ mod tests {
         let json = serde_json::to_string(&reason).unwrap();
         let decoded: FallbackReason = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, reason);
+    }
+
+    #[test]
+    fn fallback_reason_rate_limited_serde_roundtrip() {
+        let reason = FallbackReason::RateLimited {
+            reason: DenyReason::ReflexLimit { reflex_id: 99 },
+            tier: MaturityTier::Incubating,
+        };
+        let json = serde_json::to_string(&reason).unwrap();
+        let decoded: FallbackReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, reason);
+    }
+
+    #[test]
+    fn intercept_stats_render_prometheus_includes_ars_rate_limited_metric() {
+        let stats = InterceptStats {
+            total_attempts: 50,
+            total_executions: 5,
+            total_fallbacks: 45,
+            total_rate_limited: 45,
+            total_rate_limited_swarm: 45,
+            total_rate_limited_cluster: 0,
+            total_rate_limited_reflex: 0,
+            active_executions: 0,
+            is_paused: false,
+            blast_registered_reflexes: 1,
+            registered_bounds: 1,
+            cooldown_entries: 0,
+        };
+        let rendered = stats.render_prometheus("ft");
+        assert!(rendered.contains("ft_ars_rate_limited_total 45"));
+        assert!(rendered.contains("ft_ars_rate_limited_swarm_total 45"));
     }
 
     #[test]

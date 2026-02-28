@@ -450,8 +450,13 @@ proptest! {
             total_attempts: attempts,
             total_executions: executions,
             total_fallbacks: fallbacks,
+            total_rate_limited: 0,
+            total_rate_limited_swarm: 0,
+            total_rate_limited_cluster: 0,
+            total_rate_limited_reflex: 0,
             active_executions: 0,
             is_paused: false,
+            blast_registered_reflexes: 0,
             registered_bounds: 5,
             cooldown_entries: 3,
         };

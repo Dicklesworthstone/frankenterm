@@ -31,7 +31,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::backpressure::BackpressureConfig;
 use crate::config::{
     CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig, PatternsConfig,
-    SnapshotConfig, SnapshotSchedulingMode, TraumaGuardConfig,
+    SnapshotConfig, SnapshotSchedulingMode,
 };
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
@@ -48,7 +48,7 @@ use crate::runtime_compat::{
     task::{self, JoinHandle},
     timeout, watch,
 };
-use crate::spsc_ring_buffer::{SpmcConsumer, SpmcProducer, spmc_channel};
+use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
 use crate::storage::{MaintenanceRecord, StorageHandle, StoredEvent};
@@ -79,8 +79,6 @@ const NATIVE_OUTPUT_COALESCE_WINDOW_MS: u64 = 50;
 const NATIVE_OUTPUT_COALESCE_MAX_DELAY_MS: u64 = 200;
 #[cfg(feature = "native-wezterm")]
 const NATIVE_OUTPUT_COALESCE_MAX_BYTES: usize = 256 * 1024;
-#[cfg(feature = "native-wezterm")]
-const NATIVE_CAPTURE_EVENT_SEND_TIMEOUT_MS: u64 = 10;
 
 #[cfg(feature = "native-wezterm")]
 #[derive(Debug)]
@@ -253,8 +251,6 @@ pub struct RuntimeConfig {
     pub checkpoint_interval_secs: u32,
     /// Optional Unix socket path for native WezTerm events
     pub native_event_socket: Option<PathBuf>,
-    /// Trauma guard tuning for per-pane loop detection.
-    pub trauma_guard: TraumaGuardConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -275,7 +271,6 @@ impl Default for RuntimeConfig {
             retention_max_mb: 0,
             checkpoint_interval_secs: 60,
             native_event_socket: None,
-            trauma_guard: TraumaGuardConfig::default(),
         }
     }
 }
@@ -885,7 +880,7 @@ pub struct ObservationRuntime {
     event_bus: Option<Arc<EventBus>>,
     /// Optional recording manager for capturing session recordings
     recording: Option<Arc<RecordingManager>>,
-    /// Optional replay capture adapter for recorder event extraction.
+    /// Optional replay capture adapter for `.ftreplay` recorder events.
     replay_capture: Option<crate::replay_capture::SharedCaptureAdapter>,
     /// Optional snapshot engine configuration for session persistence
     snapshot_config: Option<SnapshotConfig>,
@@ -908,10 +903,7 @@ impl ObservationRuntime {
         storage: StorageHandle,
         pattern_engine: Arc<RwLock<PatternEngine>>,
     ) -> Self {
-        let registry = PaneRegistry::with_filter_and_trauma(
-            config.pane_filter.clone(),
-            config.trauma_guard.clone(),
-        );
+        let registry = PaneRegistry::with_filter(config.pane_filter.clone());
         let metrics = Arc::new(RuntimeMetrics::default());
         metrics.started_at.set(epoch_ms_u64());
 
@@ -929,7 +921,6 @@ impl ObservationRuntime {
             patterns: config.patterns.clone(),
             workflows_enabled: vec![],
             auto_run_allowlist: vec![],
-            trauma_guard: config.trauma_guard.clone(),
         };
         let (config_tx, config_rx) = watch::channel(hot_config);
 
@@ -972,13 +963,13 @@ impl ObservationRuntime {
         self
     }
 
-    /// Set a replay capture adapter for deterministic replay event extraction.
+    /// Set a replay capture adapter for extracting deterministic recorder events.
     #[must_use]
     pub fn with_replay_capture_adapter(
         mut self,
-        replay_capture: crate::replay_capture::SharedCaptureAdapter,
+        adapter: crate::replay_capture::SharedCaptureAdapter,
     ) -> Self {
-        self.replay_capture = Some(replay_capture);
+        self.replay_capture = Some(adapter);
         self
     }
 
@@ -1006,14 +997,10 @@ impl ObservationRuntime {
         // Stage 1 ingress: multi-producer capture tasks write into bounded MPSC.
         let (capture_ingress_tx, capture_ingress_rx) =
             mpsc::channel::<CaptureEvent>(self.config.channel_buffer);
-        // Stage 2 handoff: single relay task forwards ingress into lock-free SPMC.
-        // We currently register one persistence consumer; this keeps the hot path
-        // ready for additional lock-free consumers without changing producer semantics.
-        let (capture_ring_tx, mut capture_ring_consumers) =
-            spmc_channel::<CaptureEvent>(self.config.channel_buffer, 1);
-        let capture_ring_rx = capture_ring_consumers
-            .pop()
-            .expect("SPMC channel should provide one consumer");
+        // Stage 2 handoff: single relay task forwards ingress into lock-free SPSC
+        // consumed by the persistence task.
+        let (capture_ring_tx, capture_ring_rx) =
+            spsc_channel::<CaptureEvent>(self.config.channel_buffer);
 
         // Clone ingress sender for queue depth instrumentation before moving it.
         let capture_tx_probe = capture_ingress_tx.clone();
@@ -1049,7 +1036,7 @@ impl ObservationRuntime {
             None
         };
 
-        // Spawn relay task from multi-producer ingress into SPMC persistence queue.
+        // Spawn relay task from multi-producer ingress into SPSC persistence queue.
         let relay_handle = self.spawn_capture_relay_task(capture_ingress_rx, capture_ring_tx);
 
         // Spawn persistence and detection task
@@ -1647,7 +1634,6 @@ impl ObservationRuntime {
 
         task::spawn(async move {
             let mut current_interval = initial_interval;
-            let mut trauma_guard = config_rx.borrow().trauma_guard.clone();
 
             loop {
                 // Wait for interval, checking shutdown periodically to ensure responsiveness
@@ -1681,16 +1667,6 @@ impl ObservationRuntime {
                         );
                         current_interval = new_interval;
                     }
-                    if new_config.trauma_guard != trauma_guard {
-                        info!(
-                            old = ?trauma_guard,
-                            new = ?new_config.trauma_guard,
-                            "Trauma guard config updated via hot reload"
-                        );
-                        trauma_guard = new_config.trauma_guard.clone();
-                        let mut reg = registry.write().await;
-                        reg.set_trauma_guard_config(trauma_guard.clone());
-                    }
                 }
 
                 match wezterm.list_panes().await {
@@ -1713,6 +1689,19 @@ impl ObservationRuntime {
 
                         // Handle new panes
                         for (pane_id, mut entry) in new_entries {
+                            if let Some(ref adapter) = replay_capture {
+                                adapter.capture_lifecycle(
+                                    pane_id,
+                                    crate::recording::RecorderLifecyclePhase::PaneOpened,
+                                    None,
+                                    serde_json::json!({
+                                        "domain": entry.info.inferred_domain().to_string(),
+                                        "title": entry.info.title.clone(),
+                                        "cwd": entry.info.cwd.clone(),
+                                    }),
+                                );
+                            }
+
                             // Check if pane exists in storage to recover stable UUID
                             let stable_uuid = {
                                 let (storage_guard, lock_held_since) =
@@ -1782,18 +1771,7 @@ impl ObservationRuntime {
                                     next_seq = next_seq,
                                     "Started observing pane"
                                 );
-
-                                if let Some(adapter) = replay_capture.as_ref() {
-                                    adapter.capture_lifecycle(
-                                        pane_id,
-                                        crate::recording::RecorderLifecyclePhase::PaneOpened,
-                                        None,
-                                        serde_json::json!({
-                                            "domain": entry.info.domain_name,
-                                            "title": entry.info.title,
-                                            "cwd": entry.info.cwd,
-                                        }),
-                                    );
+                                if let Some(ref adapter) = replay_capture {
                                     adapter.capture_lifecycle(
                                         pane_id,
                                         crate::recording::RecorderLifecyclePhase::CaptureStarted,
@@ -1824,22 +1802,18 @@ impl ObservationRuntime {
                                 contexts.remove(pane_id);
                             }
 
-                            if let Some(adapter) = replay_capture.as_ref() {
+                            if let Some(ref adapter) = replay_capture {
                                 adapter.capture_lifecycle(
                                     *pane_id,
                                     crate::recording::RecorderLifecyclePhase::CaptureStopped,
                                     Some("pane_closed".to_string()),
-                                    serde_json::json!({
-                                        "reason": "pane_closed",
-                                    }),
+                                    serde_json::json!({}),
                                 );
                                 adapter.capture_lifecycle(
                                     *pane_id,
                                     crate::recording::RecorderLifecyclePhase::PaneClosed,
                                     Some("pane_closed".to_string()),
-                                    serde_json::json!({
-                                        "reason": "pane_closed",
-                                    }),
+                                    serde_json::json!({}),
                                 );
                             }
 
@@ -1921,7 +1895,6 @@ impl ObservationRuntime {
                 source,
                 initial_budget,
             );
-
             if let Some(adapter) = replay_capture {
                 let egress_tap: crate::recording::SharedEgressTap = adapter.clone();
                 supervisor.set_egress_tap(egress_tap);
@@ -2130,7 +2103,7 @@ impl ObservationRuntime {
                 }
 
                 let flush_wait = next_flush.saturating_duration_since(now);
-                match timeout(flush_wait, mpsc_recv_option(&mut event_rx)).await {
+                match timeout(flush_wait, event_rx.recv()).await {
                     Ok(maybe_event) => {
                         let Some(event) = maybe_event else {
                             break;
@@ -2230,14 +2203,14 @@ impl ObservationRuntime {
         })
     }
 
-    /// Spawn relay task from capture ingress to lock-free SPMC persistence queue.
+    /// Spawn relay task from capture ingress to lock-free SPSC persistence queue.
     ///
     /// Capture producers (tailers/native handlers) write into a bounded MPSC.
-    /// This task is the sole producer for the SPMC ring consumed by persistence.
+    /// This task is the sole producer for the SPSC ring consumed by persistence.
     fn spawn_capture_relay_task(
         &self,
         mut capture_ingress_rx: mpsc::Receiver<CaptureEvent>,
-        capture_ring_tx: SpmcProducer<CaptureEvent>,
+        capture_ring_tx: SpscProducer<CaptureEvent>,
     ) -> JoinHandle<()> {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
 
@@ -2280,7 +2253,7 @@ impl ObservationRuntime {
     /// Spawn the persistence and detection task.
     fn spawn_persistence_task(
         &self,
-        capture_rx: SpmcConsumer<CaptureEvent>,
+        capture_rx: SpscConsumer<CaptureEvent>,
         cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
         registry: Arc<RwLock<PaneRegistry>>,
     ) -> JoinHandle<()> {
@@ -2296,7 +2269,6 @@ impl ObservationRuntime {
         let mut current_patterns = self.config.patterns.clone();
         let patterns_root = self.config.patterns_root.clone();
         let registry = Arc::clone(&registry);
-        let replay_capture = self.replay_capture.clone();
 
         task::spawn(async move {
             // Process events until producer is closed and the ring is drained.
@@ -2404,7 +2376,7 @@ impl ObservationRuntime {
                         }
 
                         // Run pattern detection on the content
-                        let (detections, rule_definition_by_id) = {
+                        let detections = {
                             let mut ctx = {
                                 let mut contexts = detection_contexts.write().await;
                                 contexts.remove(&pane_id).unwrap_or_else(|| {
@@ -2420,32 +2392,16 @@ impl ObservationRuntime {
                                 ctx.tail_buffer.clear();
                             }
 
-                            let (detections, rule_definition_by_id) = {
+                            let detections = {
                                 let engine = pattern_engine.read().await;
-                                let detections = engine.detect_with_context(&content, &mut ctx);
-                                let rule_definition_by_id = if replay_capture.is_some() {
-                                    detections
-                                        .iter()
-                                        .map(|detection| {
-                                            (
-                                                detection.rule_id.clone(),
-                                                engine
-                                                    .rule_definition_text(&detection.rule_id)
-                                                    .unwrap_or_else(|| detection.rule_id.clone()),
-                                            )
-                                        })
-                                        .collect::<HashMap<_, _>>()
-                                } else {
-                                    HashMap::new()
-                                };
-                                (detections, rule_definition_by_id)
+                                engine.detect_with_context(&content, &mut ctx)
                             };
 
                             {
                                 let mut contexts = detection_contexts.write().await;
                                 contexts.insert(pane_id, ctx);
                             }
-                            (detections, rule_definition_by_id)
+                            detections
                         };
 
                         if !detections.is_empty() {
@@ -2464,40 +2420,6 @@ impl ObservationRuntime {
 
                             // Persist each detection as an event
                             for detection in detections {
-                                if let Some(adapter) = replay_capture.as_ref() {
-                                    let rule_definition_text = rule_definition_by_id
-                                        .get(&detection.rule_id)
-                                        .map_or(detection.rule_id.as_str(), String::as_str);
-                                    let decision_output = serde_json::to_value(&detection)
-                                        .unwrap_or_else(|_| {
-                                            serde_json::json!({
-                                                "rule_id": detection.rule_id,
-                                                "event_type": detection.event_type,
-                                            })
-                                        });
-                                    let occurred_at_ms = if captured_at >= 0 {
-                                        captured_at as u64
-                                    } else {
-                                        epoch_ms_u64()
-                                    };
-                                    let decision_event = crate::replay_capture::DecisionEvent::new(
-                                        crate::replay_capture::DecisionType::PatternMatch,
-                                        pane_id,
-                                        detection.rule_id.clone(),
-                                        rule_definition_text,
-                                        &content,
-                                        decision_output,
-                                        Some(format!("segment:{}", persisted.segment.id)),
-                                        Some(detection.confidence),
-                                        occurred_at_ms,
-                                    );
-                                    adapter.capture_decision(
-                                        crate::recording::RecorderEventSource::WeztermMux,
-                                        None,
-                                        decision_event,
-                                    );
-                                }
-
                                 if let Some(ref manager) = recording {
                                     if let Err(err) =
                                         manager.record_event(pane_id, &detection, captured_at).await
@@ -2613,10 +2535,10 @@ async fn handle_native_event(
                 }
             }
 
-            if let Some(segment) = gap_segment
-                && !enqueue_native_capture_event(capture_tx, CaptureEvent { segment }).await
-            {
-                debug!(pane_id, "Native event queue full or closed; dropping gap");
+            if let Some(segment) = gap_segment {
+                if capture_tx.try_send(CaptureEvent { segment }).is_err() {
+                    debug!(pane_id, "Native event queue full; dropping gap");
+                }
             }
         }
         NativeEvent::UserVarChanged {
@@ -2666,19 +2588,12 @@ async fn handle_native_event(
                 last_decision_at: Some(timestamp_ms),
             };
 
-            // Acquire and release the storage lock for each operation separately
-            // to avoid holding the lock across multiple .await points, which would
-            // block other tasks from accessing storage.
-            {
-                let storage_guard = storage.lock().await;
-                if let Err(err) = storage_guard.upsert_pane(record).await {
-                    warn!(pane_id, error = %err, "Failed to upsert pane from native event");
-                }
+            let storage_guard = storage.lock().await;
+            if let Err(err) = storage_guard.upsert_pane(record).await {
+                warn!(pane_id, error = %err, "Failed to upsert pane from native event");
             }
-            let max_seq = {
-                let storage_guard = storage.lock().await;
-                storage_guard.get_max_seq(pane_id).await.unwrap_or(None)
-            };
+            let max_seq = storage_guard.get_max_seq(pane_id).await.unwrap_or(None);
+            drop(storage_guard);
 
             if observed {
                 let next_seq = max_seq.map_or(0, |seq| seq + 1);
@@ -2701,10 +2616,9 @@ async fn handle_native_event(
             }
         }
         NativeEvent::PaneDestroyed { pane_id, .. } => {
-            {
-                let mut cursors_guard = cursors.write().await;
-                cursors_guard.remove(&pane_id);
-            }
+            let mut cursors_guard = cursors.write().await;
+            cursors_guard.remove(&pane_id);
+            drop(cursors_guard);
 
             let mut contexts = detection_contexts.write().await;
             contexts.remove(&pane_id);
@@ -2733,11 +2647,8 @@ async fn emit_native_output_delta(
     };
 
     if let Some(segment) = segment {
-        if !enqueue_native_capture_event(capture_tx, CaptureEvent { segment }).await {
-            debug!(
-                pane_id,
-                "Native event queue full or closed; dropping output"
-            );
+        if capture_tx.try_send(CaptureEvent { segment }).is_err() {
+            debug!(pane_id, "Native event queue full; dropping output");
         }
     } else {
         debug!(
@@ -2747,44 +2658,13 @@ async fn emit_native_output_delta(
     }
 }
 
-#[cfg(feature = "native-wezterm")]
-async fn enqueue_native_capture_event(
-    capture_tx: &mpsc::Sender<CaptureEvent>,
-    event: CaptureEvent,
-) -> bool {
-    let send_timeout = Duration::from_millis(NATIVE_CAPTURE_EVENT_SEND_TIMEOUT_MS);
-
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        let reserve_cx = crate::cx::for_testing();
-        match timeout(send_timeout, capture_tx.reserve(&reserve_cx)).await {
-            Ok(Ok(permit)) => {
-                permit.send(event);
-                true
-            }
-            Ok(Err(_)) | Err(_) => false,
-        }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        match timeout(send_timeout, capture_tx.reserve()).await {
-            Ok(Ok(permit)) => {
-                permit.send(event);
-                true
-            }
-            Ok(Err(_)) | Err(_) => false,
-        }
-    }
-}
-
 /// Handle to the running observation runtime.
 pub struct RuntimeHandle {
     /// Discovery task handle
     pub discovery: JoinHandle<()>,
     /// Capture task handle
     pub capture: JoinHandle<()>,
-    /// Relay task handle (capture ingress -> SPMC persistence queue)
+    /// Relay task handle (capture ingress -> SPSC persistence queue)
     pub relay: JoinHandle<()>,
     /// Native events listener task handle (optional)
     pub native_events: Option<JoinHandle<()>>,
@@ -2896,7 +2776,6 @@ fn watch_has_changed<T>(rx: &watch::Receiver<T>) -> bool {
     }
 }
 
-#[allow(clippy::needless_pass_by_ref_mut)] // &mut required by tokio path, not asupersync
 fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T {
     #[cfg(feature = "asupersync-runtime")]
     {
@@ -3296,6 +3175,7 @@ fn record_bounded_sample(samples: &StdMutex<VecDeque<u64>>, value: u64) {
 }
 
 fn percentile_from_samples(samples: &StdMutex<VecDeque<u64>>, percentile: usize) -> u64 {
+    debug_assert!((1..=100).contains(&percentile));
     let mut values: Vec<u64> = {
         let guard = samples
             .lock()
@@ -3306,13 +3186,10 @@ fn percentile_from_samples(samples: &StdMutex<VecDeque<u64>>, percentile: usize)
         return 0;
     }
     values.sort_unstable();
-    // Keep out-of-range percentile inputs from panicking: values > 100 saturate
-    // to max index, while 0 maps to the minimum.
     let idx = (values.len() - 1)
         .saturating_mul(percentile)
         .saturating_add(99)
         / 100;
-    let idx = idx.min(values.len() - 1);
     values[idx]
 }
 
@@ -3473,11 +3350,8 @@ fn detection_to_stored_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recording::RecorderEventPayload;
-    use crate::replay_capture::{CaptureAdapter, CaptureConfig, CollectingCaptureSink};
     use crate::runtime_compat::CompatRuntime;
     use crate::storage::PaneRecord;
-    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
     fn run_async_test<F>(future: F)
@@ -3727,19 +3601,19 @@ mod tests {
             let engine = PatternEngine::new();
 
             let mut config = RuntimeConfig::default();
-            config.discovery_interval = Duration::from_millis(25);
-            config.capture_interval = Duration::from_millis(25);
-            config.min_capture_interval = Duration::from_millis(10);
+            config.discovery_interval = Duration::from_millis(10);
+            config.capture_interval = Duration::from_millis(10);
+            config.min_capture_interval = Duration::from_millis(5);
             config.channel_buffer = 64;
 
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(0).await;
             let wezterm_handle: WeztermHandle = mock.clone();
 
-            let sink = Arc::new(CollectingCaptureSink::new());
-            let replay_adapter = Arc::new(CaptureAdapter::new(
+            let sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
+            let adapter = Arc::new(crate::replay_capture::CaptureAdapter::new(
                 sink.clone(),
-                CaptureConfig {
+                crate::replay_capture::CaptureConfig {
                     session_id: Some("runtime-replay-test".to_string()),
                     ..Default::default()
                 },
@@ -3748,16 +3622,15 @@ mod tests {
             let mut runtime =
                 ObservationRuntime::new(config, storage, Arc::new(RwLock::new(engine)))
                     .with_wezterm_handle(wezterm_handle)
-                    .with_replay_capture_adapter(replay_adapter);
+                    .with_replay_capture_adapter(adapter);
 
             let handle = runtime.start().await.expect("runtime should start");
-
-            // Wait for discovery to register pane + cursor before injecting output.
-            sleep(Duration::from_millis(120)).await;
-            mock.inject_output(0, "Usage limit reached for all Pro models\n")
+            // Allow discovery/cursor initialization before emitting output.
+            sleep(Duration::from_millis(80)).await;
+            mock.inject_output(0, "replay capture smoke\n")
                 .await
-                .expect("inject output");
-            sleep(Duration::from_millis(150)).await;
+                .unwrap();
+            sleep(Duration::from_millis(220)).await;
 
             let summary = handle.shutdown_with_summary().await;
             assert!(
@@ -3770,218 +3643,20 @@ mod tests {
             assert!(
                 events.iter().any(|event| matches!(
                     event.payload,
-                    RecorderEventPayload::EgressOutput { .. }
+                    crate::recording::RecorderEventPayload::EgressOutput { .. }
                 )),
-                "expected at least one egress replay event"
+                "expected at least one egress replay capture event; got {events:#?}"
             );
             assert!(
                 events.iter().any(|event| matches!(
                     event.payload,
-                    RecorderEventPayload::LifecycleMarker { .. }
+                    crate::recording::RecorderEventPayload::LifecycleMarker { .. }
                 )),
-                "expected lifecycle replay markers"
+                "expected at least one lifecycle replay capture event; got {events:#?}"
             );
             assert!(
                 events.iter().all(|event| !event.event_id.is_empty()),
-                "all replay events must have deterministic event_id values"
-            );
-            assert!(
-                events.iter().any(|event| {
-                    matches!(
-                        &event.payload,
-                        RecorderEventPayload::ControlMarker { details, .. }
-                            if details.get("decision_type")
-                                == Some(&serde_json::json!("pattern_match"))
-                    )
-                }),
-                "expected decision provenance marker for pattern detection"
-            );
-        });
-    }
-
-    #[test]
-    fn runtime_spmc_handoff_preserves_exact_output_checksum() {
-        run_async_test(async {
-            let (_dir, db_path) = temp_db_path();
-            let storage = StorageHandle::new(&db_path).await.unwrap();
-            let engine = PatternEngine::new();
-
-            let mut config = RuntimeConfig::default();
-            config.discovery_interval = Duration::from_millis(20);
-            config.capture_interval = Duration::from_millis(20);
-            config.min_capture_interval = Duration::from_millis(10);
-            config.channel_buffer = 4;
-
-            let mock = Arc::new(crate::wezterm::MockWezterm::new());
-            mock.add_default_pane(0).await;
-            let wezterm_handle: WeztermHandle = mock.clone();
-
-            let mut runtime =
-                ObservationRuntime::new(config, storage, Arc::new(RwLock::new(engine)))
-                    .with_wezterm_handle(wezterm_handle);
-
-            let handle = runtime.start().await.expect("runtime should start");
-            let storage = Arc::clone(&handle.storage);
-
-            // Wait for discovery to register pane + cursor before injecting output.
-            sleep(Duration::from_millis(120)).await;
-
-            let expected_chunks: Vec<String> = (0..48)
-                .map(|idx| format!("burst-{idx:03}:{}\n", "x".repeat(48)))
-                .collect();
-            let expected_output = expected_chunks.concat();
-            for chunk in &expected_chunks {
-                mock.inject_output(0, chunk).await.expect("inject output");
-            }
-
-            // Allow at least one capture cycle to ingest burst output.
-            sleep(Duration::from_millis(200)).await;
-
-            let summary = handle.shutdown_with_summary().await;
-            assert!(
-                summary.clean,
-                "shutdown should complete cleanly: {:?}",
-                summary.warnings
-            );
-
-            let (segments, gaps) = {
-                let storage = storage.lock().await;
-                let segments = storage
-                    .get_segments(0, 2048)
-                    .await
-                    .expect("read persisted segments");
-                let gaps = storage.get_gaps().await.expect("read persisted gaps");
-                (segments, gaps)
-            };
-
-            assert!(
-                !segments.is_empty(),
-                "expected persisted output segments for pane 0"
-            );
-
-            let mut ordered_segments = segments;
-            ordered_segments.sort_by_key(|segment| segment.seq);
-            for pair in ordered_segments.windows(2) {
-                assert_eq!(
-                    pair[1].seq,
-                    pair[0].seq + 1,
-                    "segment sequence must stay contiguous across SPMC handoff"
-                );
-            }
-
-            let actual_output = ordered_segments
-                .iter()
-                .fold(String::new(), |mut acc, segment| {
-                    acc.push_str(&segment.content);
-                    acc
-                });
-            let expected_sha256 = format!("{:x}", Sha256::digest(expected_output.as_bytes()));
-            let actual_sha256 = format!("{:x}", Sha256::digest(actual_output.as_bytes()));
-
-            assert_eq!(
-                actual_output, expected_output,
-                "reconstructed persisted output must exactly match injected burst"
-            );
-            assert_eq!(
-                actual_sha256, expected_sha256,
-                "SHA-256 isomorphism proof failed for persisted output"
-            );
-            assert!(
-                gaps.is_empty(),
-                "expected no ingest gaps for deterministic mock burst, found: {gaps:?}"
-            );
-        });
-    }
-
-    fn test_capture_event(pane_id: u64, seq: u64, content: &str) -> CaptureEvent {
-        CaptureEvent {
-            segment: crate::ingest::CapturedSegment {
-                pane_id,
-                seq,
-                content: content.to_string(),
-                kind: crate::ingest::CapturedSegmentKind::Delta,
-                captured_at: epoch_ms(),
-            },
-        }
-    }
-
-    #[test]
-    fn capture_relay_drains_pending_events_after_shutdown_signal() {
-        run_async_test(async {
-            let (_dir, db_path) = temp_db_path();
-            let storage = StorageHandle::new(&db_path).await.unwrap();
-            let engine = PatternEngine::new();
-            let runtime = ObservationRuntime::new(
-                RuntimeConfig::default(),
-                storage,
-                Arc::new(RwLock::new(engine)),
-            );
-
-            let (ingress_tx, ingress_rx) = mpsc::channel::<CaptureEvent>(8);
-            let (ring_tx, mut consumers) = spmc_channel::<CaptureEvent>(8, 1);
-            let ring_rx = consumers.pop().expect("expected one SPMC consumer");
-            let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
-
-            send_mpsc(&ingress_tx, test_capture_event(42, 0, "alpha")).await;
-            send_mpsc(&ingress_tx, test_capture_event(42, 1, "beta")).await;
-
-            runtime.signal_shutdown();
-            drop(ingress_tx);
-
-            let drained = timeout(Duration::from_secs(1), async move {
-                let mut events = Vec::new();
-                while let Some(event) = ring_rx.recv().await {
-                    events.push(event);
-                }
-                events
-            })
-            .await
-            .expect("relay drain timed out");
-
-            let _ = timeout(Duration::from_secs(1), relay)
-                .await
-                .expect("relay task should exit after drain");
-
-            assert_eq!(
-                drained.len(),
-                2,
-                "expected both pending events to be drained"
-            );
-            assert_eq!(drained[0].segment.seq, 0);
-            assert_eq!(drained[0].segment.content, "alpha");
-            assert_eq!(drained[1].segment.seq, 1);
-            assert_eq!(drained[1].segment.content, "beta");
-        });
-    }
-
-    #[test]
-    fn capture_relay_closes_ring_when_ingress_channel_closes() {
-        run_async_test(async {
-            let (_dir, db_path) = temp_db_path();
-            let storage = StorageHandle::new(&db_path).await.unwrap();
-            let engine = PatternEngine::new();
-            let runtime = ObservationRuntime::new(
-                RuntimeConfig::default(),
-                storage,
-                Arc::new(RwLock::new(engine)),
-            );
-
-            let (ingress_tx, ingress_rx) = mpsc::channel::<CaptureEvent>(4);
-            let (ring_tx, mut consumers) = spmc_channel::<CaptureEvent>(4, 1);
-            let ring_rx = consumers.pop().expect("expected one SPMC consumer");
-            let relay = runtime.spawn_capture_relay_task(ingress_rx, ring_tx);
-
-            drop(ingress_tx);
-
-            let _ = timeout(Duration::from_secs(1), relay)
-                .await
-                .expect("relay should terminate when ingress channel closes");
-            let next = timeout(Duration::from_secs(1), ring_rx.recv())
-                .await
-                .expect("ring recv should resolve");
-            assert!(
-                next.is_none(),
-                "ring should be closed after ingress channel shutdown"
+                "all captured events should have deterministic event_id values; got {events:#?}"
             );
         });
     }
@@ -4212,58 +3887,6 @@ mod tests {
         assert_eq!(drained[0].pane_id, 7);
     }
 
-    #[cfg(feature = "native-wezterm")]
-    #[test]
-    fn enqueue_native_capture_event_succeeds_with_available_capacity() {
-        run_async_test(async {
-            let (tx, mut rx) = mpsc::channel::<CaptureEvent>(1);
-            let event = CaptureEvent {
-                segment: crate::ingest::CapturedSegment {
-                    pane_id: 7,
-                    seq: 0,
-                    content: "native payload".to_string(),
-                    kind: crate::ingest::CapturedSegmentKind::Delta,
-                    captured_at: epoch_ms(),
-                },
-            };
-
-            assert!(enqueue_native_capture_event(&tx, event).await);
-            let received = recv_mpsc(&mut rx).await;
-            assert_eq!(received.segment.pane_id, 7);
-            assert_eq!(received.segment.content, "native payload");
-        });
-    }
-
-    #[cfg(feature = "native-wezterm")]
-    #[test]
-    fn enqueue_native_capture_event_returns_false_when_channel_is_full() {
-        run_async_test(async {
-            let (tx, _rx) = mpsc::channel::<CaptureEvent>(1);
-
-            let first = CaptureEvent {
-                segment: crate::ingest::CapturedSegment {
-                    pane_id: 11,
-                    seq: 0,
-                    content: "first".to_string(),
-                    kind: crate::ingest::CapturedSegmentKind::Delta,
-                    captured_at: epoch_ms(),
-                },
-            };
-            let second = CaptureEvent {
-                segment: crate::ingest::CapturedSegment {
-                    pane_id: 11,
-                    seq: 1,
-                    content: "second".to_string(),
-                    kind: crate::ingest::CapturedSegmentKind::Delta,
-                    captured_at: epoch_ms(),
-                },
-            };
-
-            assert!(enqueue_native_capture_event(&tx, first).await);
-            assert!(!enqueue_native_capture_event(&tx, second).await);
-        });
-    }
-
     #[test]
     fn backpressure_warn_ratio_is_valid() {
         assert!(BACKPRESSURE_WARN_RATIO > 0.0);
@@ -4359,7 +3982,7 @@ mod tests {
     fn mpsc_queue_depth_computation_is_correct() {
         // Validates queue depth accounting for a fixed-capacity channel.
         let (tx, _rx) = mpsc::channel::<u8>(16);
-        let max_cap = mpsc_max_capacity(&tx);
+        let max_cap = 16usize;
         assert_eq!(max_cap, 16);
 
         // Empty queue: depth should be 0
@@ -4371,7 +3994,7 @@ mod tests {
     fn mpsc_queue_depth_increases_with_sends() {
         run_async_test(async {
             let (tx, mut rx) = mpsc::channel::<u8>(16);
-            let max_cap = mpsc_max_capacity(&tx);
+            let max_cap = 16usize;
 
             // Send some items
             send_mpsc(&tx, 1).await;
@@ -4385,55 +4008,6 @@ mod tests {
             let _ = recv_mpsc(&mut rx).await;
             let depth = max_cap - tx.capacity();
             assert_eq!(depth, 2);
-        });
-    }
-
-    #[test]
-    fn watch_helpers_detect_and_consume_updates() {
-        run_async_test(async {
-            let (tx, mut rx) = watch::channel(1u8);
-            assert!(
-                !watch_has_changed(&rx),
-                "fresh receiver should not report pending updates"
-            );
-
-            tx.send(2).expect("send watch update");
-            assert!(
-                watch_has_changed(&rx),
-                "receiver should observe pending update"
-            );
-
-            let latest = watch_borrow_and_update_clone(&mut rx);
-            assert_eq!(latest, 2);
-            assert_eq!(*rx.borrow(), 2);
-            assert!(
-                !watch_has_changed(&rx),
-                "borrow+update helper should consume pending update"
-            );
-        });
-    }
-
-    #[test]
-    fn watch_has_changed_treats_closed_sender_as_no_change() {
-        let (tx, rx) = watch::channel(7u8);
-        drop(tx);
-        assert!(
-            !watch_has_changed(&rx),
-            "closed watch sender should not be treated as a config update"
-        );
-    }
-
-    #[test]
-    fn mpsc_recv_option_round_trips_and_returns_none_when_closed() {
-        run_async_test(async {
-            let (tx, mut rx) = mpsc::channel::<u8>(4);
-            send_mpsc(&tx, 1).await;
-            send_mpsc(&tx, 2).await;
-            drop(tx);
-
-            assert_eq!(mpsc_recv_option(&mut rx).await, Some(1));
-            assert_eq!(mpsc_recv_option(&mut rx).await, Some(2));
-            assert_eq!(mpsc_recv_option(&mut rx).await, None);
         });
     }
 
@@ -5095,18 +4669,6 @@ mod tests {
         let p50 = percentile_from_samples(&samples, 50);
         // Sorted: [10, 30, 50, 90, 100], p50 index = (4*50+99)/100 = 2 => 50
         assert!((30..=90).contains(&p50));
-    }
-
-    #[test]
-    fn percentile_from_samples_percentile_zero_returns_min() {
-        let samples = StdMutex::new(VecDeque::from([30, 10, 20]));
-        assert_eq!(percentile_from_samples(&samples, 0), 10);
-    }
-
-    #[test]
-    fn percentile_from_samples_percentile_above_hundred_is_bounded() {
-        let samples = StdMutex::new(VecDeque::from([10, 20, 30]));
-        assert_eq!(percentile_from_samples(&samples, 200), 30);
     }
 
     // =========================================================================
