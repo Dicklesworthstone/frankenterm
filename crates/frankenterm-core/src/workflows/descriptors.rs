@@ -14,8 +14,8 @@ use super::*;
 // ============================================================================
 
 const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
-pub(crate) const DESCRIPTOR_MAX_STEPS: usize = 32;
-pub(crate) const DESCRIPTOR_MAX_WAIT_TIMEOUT_MS: u64 = 120_000;
+pub const DESCRIPTOR_MAX_STEPS: usize = 32;
+pub const DESCRIPTOR_MAX_WAIT_TIMEOUT_MS: u64 = 120_000;
 const DESCRIPTOR_MAX_SLEEP_MS: u64 = 30_000;
 const DESCRIPTOR_MAX_TEXT_LEN: usize = 8_192;
 const DESCRIPTOR_MAX_MATCH_LEN: usize = 1_024;

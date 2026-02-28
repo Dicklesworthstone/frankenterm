@@ -64,7 +64,7 @@ impl std::error::Error for AccountSelectionStepError {}
 /// This function does NOT update `last_used_at` - that should only happen
 /// after the failover is actually successful.
 #[allow(dead_code)]
-pub(crate) async fn refresh_and_select_account(
+pub async fn refresh_and_select_account(
     caut_client: &crate::caut::CautClient,
     storage: &StorageHandle,
     config: &crate::accounts::AccountSelectionConfig,
@@ -104,7 +104,7 @@ pub(crate) async fn refresh_and_select_account(
     })
 }
 
-pub(crate) async fn persist_caut_refresh_accounts(
+pub async fn persist_caut_refresh_accounts(
     storage: &StorageHandle,
     service: crate::caut::CautService,
     refresh: &crate::caut::CautRefresh,
@@ -192,7 +192,7 @@ pub(crate) async fn persist_caut_refresh_accounts(
 ///
 /// This should only be called after the failover workflow completes successfully.
 #[allow(dead_code)]
-pub(crate) async fn mark_account_used(
+pub async fn mark_account_used(
     storage: &StorageHandle,
     service: &str,
     account_id: &str,
@@ -275,7 +275,7 @@ pub(super) static DEVICE_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// - "Your code is ABCD-12345"
 /// - "code: WXYZ-5678"
 #[allow(dead_code)]
-pub(crate) fn parse_device_code(tail: &str) -> Result<DeviceCode, DeviceCodeParseError> {
+pub fn parse_device_code(tail: &str) -> Result<DeviceCode, DeviceCodeParseError> {
     let tail_hash = stable_hash(tail.as_bytes());
     let tail_len = tail.len();
 
@@ -302,7 +302,7 @@ pub(crate) fn parse_device_code(tail: &str) -> Result<DeviceCode, DeviceCodePars
 ///
 /// Returns true if the code matches the expected pattern (4+ chars, dash, 4+ chars).
 #[allow(dead_code)]
-pub(crate) fn validate_device_code(code: &str) -> bool {
+pub fn validate_device_code(code: &str) -> bool {
     let parts: Vec<&str> = code.split('-').collect();
     if parts.len() != 2 {
         return false;

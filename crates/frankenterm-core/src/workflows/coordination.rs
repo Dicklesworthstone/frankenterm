@@ -9,9 +9,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // Multi-Pane Coordination Primitives (wa-nu4.4.4.1)
@@ -134,7 +131,7 @@ pub fn build_pane_groups(
 }
 
 /// Simple agent inference from pane title.
-fn infer_agent_from_title(title: &str) -> Option<&'static str> {
+pub fn infer_agent_from_title(title: &str) -> Option<&'static str> {
     let lower = title.to_lowercase();
     if lower.contains("codex") {
         Some("codex")
@@ -882,7 +879,7 @@ impl UnstickReport {
 }
 
 /// Truncate a snippet to a max length, adding "..." if needed.
-fn truncate_snippet(s: &str, max_len: usize) -> String {
+pub fn truncate_snippet(s: &str, max_len: usize) -> String {
     let trimmed = s.trim();
     if trimmed.len() <= max_len {
         trimmed.to_string()
@@ -910,7 +907,7 @@ fn truncate_snippet(s: &str, max_len: usize) -> String {
 /// Regex patterns for text-based scanning (fallback when ast-grep is not available).
 ///
 /// Hoisted into `LazyLock` statics so each regex is compiled exactly once.
-pub(crate) struct TextScanPatterns {
+pub struct TextScanPatterns {
     todo: &'static regex::Regex,
     panic_site: &'static regex::Regex,
     suppressed_error: &'static regex::Regex,
@@ -924,8 +921,8 @@ static TEXT_SCAN_SUPPRESSED_ERROR: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"let\s+_\s*=.*\?|let\s+_\s*=.*\.unwrap").expect("valid regex")
 });
 
-impl TextScanPatterns {
-    fn new() -> Self {
+impl Default for TextScanPatterns {
+    fn default() -> Self {
         Self {
             todo: &TEXT_SCAN_TODO,
             panic_site: &TEXT_SCAN_PANIC_SITE,
@@ -934,8 +931,15 @@ impl TextScanPatterns {
     }
 }
 
+impl TextScanPatterns {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Scan a single file for findings using text-based patterns.
-pub(crate) fn scan_file_text(
+#[allow(clippy::implicit_hasher)]
+pub fn scan_file_text(
     path: &std::path::Path,
     root: &std::path::Path,
     patterns: &TextScanPatterns,

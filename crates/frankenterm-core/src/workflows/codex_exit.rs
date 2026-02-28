@@ -44,7 +44,7 @@ pub struct CodexExitOutcome {
 
 /// Convert an injection result into a success/error for Ctrl-C handling.
 #[allow(dead_code)]
-pub(crate) fn ctrl_c_injection_ok(result: InjectionResult) -> Result<(), String> {
+pub fn ctrl_c_injection_ok(result: InjectionResult) -> Result<(), String> {
     match result {
         InjectionResult::Allowed { .. } => Ok(()),
         InjectionResult::Denied { decision, .. } => match decision {
@@ -71,7 +71,7 @@ pub(crate) fn ctrl_c_injection_ok(result: InjectionResult) -> Result<(), String>
 ///
 /// Returns the number of Ctrl-C injections performed and the summary wait result.
 #[allow(dead_code)]
-pub(crate) async fn codex_exit_and_wait_for_summary<S, F, Fut>(
+pub async fn codex_exit_and_wait_for_summary<S, F, Fut>(
     pane_id: u64,
     source: &S,
     mut send_ctrl_c: F,
@@ -154,7 +154,7 @@ pub struct CodexTokenUsage {
 
 #[allow(dead_code)]
 impl CodexTokenUsage {
-    pub(crate) fn has_any(&self) -> bool {
+    pub fn has_any(&self) -> bool {
         self.total.is_some()
             || self.input.is_some()
             || self.output.is_some()
@@ -275,7 +275,7 @@ pub(super) fn find_reset_time(tail: &str) -> Option<String> {
 /// Optional fields:
 /// - reset_time ("try again at ...")
 #[allow(dead_code)]
-pub(crate) fn parse_codex_session_summary(
+pub fn parse_codex_session_summary(
     tail: &str,
 ) -> Result<CodexSessionSummary, CodexSessionParseError> {
     let tail_hash = stable_hash(tail.as_bytes());
@@ -311,7 +311,7 @@ pub(crate) fn parse_codex_session_summary(
 
 /// Build an agent session record from a parsed Codex summary.
 #[allow(dead_code)]
-pub(crate) fn codex_session_record_from_summary(
+pub fn codex_session_record_from_summary(
     pane_id: u64,
     summary: &CodexSessionSummary,
 ) -> crate::storage::AgentSessionRecord {
@@ -327,7 +327,7 @@ pub(crate) fn codex_session_record_from_summary(
 
 /// Persist parsed Codex summary data into agent_sessions.
 #[allow(dead_code)]
-pub(crate) async fn persist_codex_session_summary(
+pub async fn persist_codex_session_summary(
     storage: &StorageHandle,
     pane_id: u64,
     summary: &CodexSessionSummary,
