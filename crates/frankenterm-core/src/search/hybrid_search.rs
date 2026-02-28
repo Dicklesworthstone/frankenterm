@@ -174,6 +174,7 @@ fn rrf_fuse_with_frankensearch(
                 doc_id: id.to_string(),
                 score: *score,
                 source: frankensearch::ScoreSource::Lexical,
+                index: None,
                 fast_score: None,
                 quality_score: None,
                 lexical_score: Some(*score),

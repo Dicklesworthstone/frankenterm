@@ -546,6 +546,7 @@ mod tests {
             doc_id: doc_id.to_string(),
             score,
             source: ScoreSource::Hybrid,
+            index: None,
             fast_score: None,
             quality_score: None,
             lexical_score: None,
