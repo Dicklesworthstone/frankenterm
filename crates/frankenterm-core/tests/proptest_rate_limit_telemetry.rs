@@ -360,7 +360,7 @@ proptest! {
         let mut expected_gc = 0u64;
 
         for (i, (op, pane_id)) in ops.iter().enumerate() {
-            match op.as_str() {
+            match *op {
                 "record" => {
                     tracker.record_at(
                         *pane_id,

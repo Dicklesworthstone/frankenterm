@@ -1,3 +1,5 @@
+// Requires the `disk-pressure` feature flag.
+#![cfg(feature = "disk-pressure")]
 //! Property-based tests for disk pressure monitor telemetry counters (ft-3kxe.20).
 //!
 //! Validates:

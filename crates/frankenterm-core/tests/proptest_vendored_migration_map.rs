@@ -1,3 +1,5 @@
+// Requires the `vendored` feature flag.
+#![cfg(feature = "vendored")]
 //! Property-based tests for vendored_migration_map.
 //!
 //! Covers:

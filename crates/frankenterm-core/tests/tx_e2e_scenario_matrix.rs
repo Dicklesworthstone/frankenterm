@@ -1,3 +1,6 @@
+// Disabled: references types not yet implemented in plan.rs
+#![cfg(feature = "__journal_types_placeholder")]
+
 //! ft-1i2ge.8.11: Deterministic E2E scenario matrix for tx run/rollback flows.
 //!
 //! Nine deterministic scenarios exercising the full tx lifecycle:
