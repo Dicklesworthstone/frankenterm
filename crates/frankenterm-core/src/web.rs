@@ -51,6 +51,10 @@ mod sse;
 mod websocket;
 
 use error::{json_err, json_ok};
+use extractors::{
+    parse_bool, parse_i64, parse_limit, parse_u64, redact_json_value, require_event_bus,
+    require_storage, require_storage_and_event_bus,
+};
 #[cfg(test)]
 use handlers::{
     BookmarkView, BookmarksResponse, EventAnnotationsView, EventView, EventsResponse,
@@ -200,94 +204,6 @@ impl WebServerHandle {
     }
 }
 
-fn require_storage(req: &Request) -> std::result::Result<(StorageHandle, Arc<Redactor>), Response> {
-    let state = req.get_extension::<AppState>().ok_or_else(|| {
-        json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "App state not configured",
-        )
-    })?;
-    let storage = state.storage.clone().ok_or_else(|| {
-        json_err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no_storage",
-            "No database connected",
-        )
-    })?;
-    Ok((storage, Arc::clone(&state.redactor)))
-}
-
-fn require_event_bus(
-    req: &Request,
-) -> std::result::Result<(Arc<EventBus>, Arc<Redactor>), Response> {
-    let state = req.get_extension::<AppState>().ok_or_else(|| {
-        json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "App state not configured",
-        )
-    })?;
-    let event_bus = state.event_bus.clone().ok_or_else(|| {
-        json_err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no_event_bus",
-            "No event bus configured",
-        )
-    })?;
-    Ok((event_bus, Arc::clone(&state.redactor)))
-}
-
-fn require_storage_and_event_bus(
-    req: &Request,
-) -> std::result::Result<(StorageHandle, Arc<EventBus>, Arc<Redactor>), Response> {
-    let state = req.get_extension::<AppState>().ok_or_else(|| {
-        json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "App state not configured",
-        )
-    })?;
-    let storage = state.storage.clone().ok_or_else(|| {
-        json_err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no_storage",
-            "No database connected",
-        )
-    })?;
-    let event_bus = state.event_bus.clone().ok_or_else(|| {
-        json_err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no_event_bus",
-            "No event bus configured",
-        )
-    })?;
-    Ok((storage, event_bus, Arc::clone(&state.redactor)))
-}
-
-// =============================================================================
-// Query parameter helpers
-// =============================================================================
-
-fn parse_limit(qs: &QueryString<'_>) -> usize {
-    qs.get("limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_LIMIT)
-        .min(MAX_LIMIT)
-}
-
-fn parse_u64(qs: &QueryString<'_>, key: &str) -> Option<u64> {
-    qs.get(key).and_then(|v| v.parse::<u64>().ok())
-}
-
-fn parse_i64(qs: &QueryString<'_>, key: &str) -> Option<i64> {
-    qs.get(key).and_then(|v| v.parse::<i64>().ok())
-}
-
-fn parse_bool(qs: &QueryString<'_>, key: &str) -> bool {
-    matches!(qs.get(key), Some("1" | "true" | "yes"))
-}
-
 #[cfg(test)]
 fn parse_stream_max_hz(qs: &QueryString<'_>) -> u64 {
     sse::parse_stream_max_hz(qs)
@@ -309,25 +225,6 @@ fn epoch_ms_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     i64::try_from(ts.as_millis()).unwrap_or(0)
-}
-
-fn redact_json_value(value: &mut serde_json::Value, redactor: &Redactor) {
-    match value {
-        serde_json::Value::String(s) => {
-            *s = redactor.redact(s);
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                redact_json_value(item, redactor);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for v in map.values_mut() {
-                redact_json_value(v, redactor);
-            }
-        }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
-    }
 }
 
 #[cfg(test)]
