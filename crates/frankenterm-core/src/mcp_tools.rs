@@ -3629,3 +3629,450 @@ impl ToolHandler for WaMissionAbortTool {
         envelope_to_content(envelope)
     }
 }
+
+// wa.events_annotate tool (bd-2gce) — extracted from mcp.rs [ft-1fv0u]
+pub(super) struct WaEventsAnnotateTool {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaEventsAnnotateTool {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ToolHandler for WaEventsAnnotateTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.events_annotate".to_string(),
+            description: Some("Set or clear an event note (robot parity)".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "event_id": { "type": "integer", "minimum": 1, "description": "Event ID" },
+                    "note": { "type": "string", "description": "Note text to set" },
+                    "clear": { "type": "boolean", "default": false, "description": "Clear the note" },
+                    "by": { "type": "string", "description": "Actor identifier (optional)" }
+                },
+                "required": ["event_id"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "events".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: EventsAnnotateParams = match serde_json::from_value(arguments) {
+            Ok(p) => p,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    Some("Expected { event_id, note? | clear=true, by? }".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        if params.clear == params.note.is_some() {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "Invalid params: specify exactly one of note or clear".to_string(),
+                Some("Example: {\"event_id\":123,\"note\":\"Investigating\"}".to_string()),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
+        let db_path = Arc::clone(&self.db_path);
+        let runtime = CompatRuntimeBuilder::current_thread()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
+
+        let result: crate::Result<McpEventMutationData> = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
+
+            storage
+                .set_event_note(params.event_id, params.note.clone(), params.by.clone())
+                .await?;
+
+            let ts = i64::try_from(now_ms()).unwrap_or(0);
+            let audit = crate::storage::AuditActionRecord {
+                id: 0,
+                ts,
+                actor_kind: "robot".to_string(),
+                actor_id: params.by.clone(),
+                correlation_id: None,
+                pane_id: None,
+                domain: None,
+                action_kind: "event.annotate".to_string(),
+                policy_decision: "allow".to_string(),
+                decision_reason: Some("MCP updated event note".to_string()),
+                rule_id: None,
+                input_summary: Some(if params.clear {
+                    format!("wa.events_annotate event_id={} clear=true", params.event_id)
+                } else {
+                    format!(
+                        "wa.events_annotate event_id={} note=<redacted>",
+                        params.event_id
+                    )
+                }),
+                verification_summary: None,
+                decision_context: None,
+                result: "success".to_string(),
+            };
+            let _ = storage.record_audit_action_redacted(audit).await;
+
+            let annotations = storage
+                .get_event_annotations(params.event_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::Error::Storage(crate::StorageError::Database(format!(
+                        "Event {} not found",
+                        params.event_id
+                    )))
+                })?;
+            Ok(McpEventMutationData {
+                event_id: params.event_id,
+                changed: None,
+                annotations,
+            })
+        });
+
+        match result {
+            Ok(data) => {
+                let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Err(err) => {
+                let (code, hint) = map_mcp_error(&err);
+                let envelope =
+                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+        }
+    }
+}
+
+// wa.events_triage tool — extracted from mcp.rs [ft-1fv0u]
+pub(super) struct WaEventsTriageTool {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaEventsTriageTool {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ToolHandler for WaEventsTriageTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.events_triage".to_string(),
+            description: Some("Set or clear an event triage state (robot parity)".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "event_id": { "type": "integer", "minimum": 1, "description": "Event ID" },
+                    "state": { "type": "string", "description": "Triage state to set" },
+                    "clear": { "type": "boolean", "default": false, "description": "Clear the triage state" },
+                    "by": { "type": "string", "description": "Actor identifier (optional)" }
+                },
+                "required": ["event_id"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "events".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: EventsTriageParams = match serde_json::from_value(arguments) {
+            Ok(p) => p,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    Some("Expected { event_id, state? | clear=true, by? }".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        if params.clear == params.state.is_some() {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "Invalid params: specify exactly one of state or clear".to_string(),
+                Some("Example: {\"event_id\":123,\"state\":\"investigating\"}".to_string()),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
+        let db_path = Arc::clone(&self.db_path);
+        let runtime = CompatRuntimeBuilder::current_thread()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
+
+        let result: crate::Result<McpEventMutationData> = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
+
+            let changed = storage
+                .set_event_triage_state(params.event_id, params.state.clone(), params.by.clone())
+                .await?;
+
+            let ts = i64::try_from(now_ms()).unwrap_or(0);
+            let audit = crate::storage::AuditActionRecord {
+                id: 0,
+                ts,
+                actor_kind: "robot".to_string(),
+                actor_id: params.by.clone(),
+                correlation_id: None,
+                pane_id: None,
+                domain: None,
+                action_kind: "event.triage".to_string(),
+                policy_decision: "allow".to_string(),
+                decision_reason: Some("MCP updated event triage".to_string()),
+                rule_id: None,
+                input_summary: Some(if params.clear {
+                    format!("wa.events_triage event_id={} clear=true", params.event_id)
+                } else {
+                    format!(
+                        "wa.events_triage event_id={} state={}",
+                        params.event_id,
+                        params.state.clone().unwrap_or_default()
+                    )
+                }),
+                verification_summary: None,
+                decision_context: None,
+                result: if changed {
+                    "success".to_string()
+                } else {
+                    "noop".to_string()
+                },
+            };
+            let _ = storage.record_audit_action_redacted(audit).await;
+
+            let annotations = storage
+                .get_event_annotations(params.event_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::Error::Storage(crate::StorageError::Database(format!(
+                        "Event {} not found",
+                        params.event_id
+                    )))
+                })?;
+            Ok(McpEventMutationData {
+                event_id: params.event_id,
+                changed: Some(changed),
+                annotations,
+            })
+        });
+
+        match result {
+            Ok(data) => {
+                let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Err(err) => {
+                let (code, hint) = map_mcp_error(&err);
+                let envelope =
+                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+        }
+    }
+}
+
+// wa.events_label tool — extracted from mcp.rs [ft-1fv0u]
+pub(super) struct WaEventsLabelTool {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaEventsLabelTool {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+impl ToolHandler for WaEventsLabelTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.events_label".to_string(),
+            description: Some("Add/remove/list event labels (robot parity)".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "event_id": { "type": "integer", "minimum": 1, "description": "Event ID" },
+                    "add": { "type": "string", "description": "Label to add" },
+                    "remove": { "type": "string", "description": "Label to remove" },
+                    "list": { "type": "boolean", "default": false, "description": "List labels only" },
+                    "by": { "type": "string", "description": "Actor identifier (optional; applies to add)" }
+                },
+                "required": ["event_id"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec!["wa".to_string(), "robot".to_string(), "events".to_string()],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: EventsLabelParams = match serde_json::from_value(arguments) {
+            Ok(p) => p,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    Some("Expected { event_id, add? | remove? | list=true, by? }".to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        let mut ops = 0;
+        if params.add.is_some() {
+            ops += 1;
+        }
+        if params.remove.is_some() {
+            ops += 1;
+        }
+        if params.list {
+            ops += 1;
+        }
+        if ops != 1 {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "Invalid params: specify exactly one of add/remove/list".to_string(),
+                Some("Example: {\"event_id\":123,\"add\":\"urgent\"}".to_string()),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
+        let db_path = Arc::clone(&self.db_path);
+        let runtime = CompatRuntimeBuilder::current_thread()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
+
+        let result: crate::Result<McpEventMutationData> = runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
+            let ts = i64::try_from(now_ms()).unwrap_or(0);
+
+            let changed = if let Some(label) = params.add.clone() {
+                let inserted = storage
+                    .add_event_label(params.event_id, label.clone(), params.by.clone())
+                    .await?;
+
+                let audit = crate::storage::AuditActionRecord {
+                    id: 0,
+                    ts,
+                    actor_kind: "robot".to_string(),
+                    actor_id: params.by.clone(),
+                    correlation_id: None,
+                    pane_id: None,
+                    domain: None,
+                    action_kind: "event.label.add".to_string(),
+                    policy_decision: "allow".to_string(),
+                    decision_reason: Some("MCP added event label".to_string()),
+                    rule_id: None,
+                    input_summary: Some(format!(
+                        "wa.events_label event_id={} add={label}",
+                        params.event_id
+                    )),
+                    verification_summary: None,
+                    decision_context: None,
+                    result: if inserted {
+                        "success".to_string()
+                    } else {
+                        "noop".to_string()
+                    },
+                };
+                let _ = storage.record_audit_action_redacted(audit).await;
+
+                Some(inserted)
+            } else if let Some(label) = params.remove.clone() {
+                let removed = storage
+                    .remove_event_label(params.event_id, label.clone())
+                    .await?;
+
+                let audit = crate::storage::AuditActionRecord {
+                    id: 0,
+                    ts,
+                    actor_kind: "robot".to_string(),
+                    actor_id: params.by.clone(),
+                    correlation_id: None,
+                    pane_id: None,
+                    domain: None,
+                    action_kind: "event.label.remove".to_string(),
+                    policy_decision: "allow".to_string(),
+                    decision_reason: Some("MCP removed event label".to_string()),
+                    rule_id: None,
+                    input_summary: Some(format!(
+                        "wa.events_label event_id={} remove={label}",
+                        params.event_id
+                    )),
+                    verification_summary: None,
+                    decision_context: None,
+                    result: if removed {
+                        "success".to_string()
+                    } else {
+                        "noop".to_string()
+                    },
+                };
+                let _ = storage.record_audit_action_redacted(audit).await;
+
+                Some(removed)
+            } else {
+                None
+            };
+
+            let annotations = storage
+                .get_event_annotations(params.event_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::Error::Storage(crate::StorageError::Database(format!(
+                        "Event {} not found",
+                        params.event_id
+                    )))
+                })?;
+            Ok(McpEventMutationData {
+                event_id: params.event_id,
+                changed,
+                annotations,
+            })
+        });
+
+        match result {
+            Ok(data) => {
+                let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+            Err(err) => {
+                let (code, hint) = map_mcp_error(&err);
+                let envelope =
+                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                envelope_to_content(envelope)
+            }
+        }
+    }
+}
