@@ -45,6 +45,82 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the completion tracker.
+///
+/// All counters are plain `u64` because `CompletionTracker` uses `&mut self`.
+#[derive(Debug, Clone, Default)]
+pub struct CompletionTrackerTelemetry {
+    /// Total begin() calls (successful + rejected).
+    tokens_requested: u64,
+    /// Tokens successfully created.
+    tokens_created: u64,
+    /// Tokens rejected (at capacity).
+    tokens_rejected: u64,
+    /// Total advance() / advance_with_metadata() calls.
+    advances: u64,
+    /// Tokens that reached Completed state.
+    completions: u64,
+    /// Tokens that reached Failed state.
+    failures: u64,
+    /// Tokens that reached TimedOut state.
+    timeouts: u64,
+    /// Tokens that reached PartialFailure state.
+    partial_failures: u64,
+    /// Total tokens evicted via evict_completed().
+    evictions: u64,
+}
+
+impl CompletionTrackerTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> CompletionTrackerTelemetrySnapshot {
+        CompletionTrackerTelemetrySnapshot {
+            tokens_requested: self.tokens_requested,
+            tokens_created: self.tokens_created,
+            tokens_rejected: self.tokens_rejected,
+            advances: self.advances,
+            completions: self.completions,
+            failures: self.failures,
+            timeouts: self.timeouts,
+            partial_failures: self.partial_failures,
+            evictions: self.evictions,
+        }
+    }
+}
+
+/// Serializable snapshot of completion tracker telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionTrackerTelemetrySnapshot {
+    /// Total begin() calls (successful + rejected).
+    pub tokens_requested: u64,
+    /// Tokens successfully created.
+    pub tokens_created: u64,
+    /// Tokens rejected (at capacity).
+    pub tokens_rejected: u64,
+    /// Total advance() calls.
+    pub advances: u64,
+    /// Tokens that reached Completed state.
+    pub completions: u64,
+    /// Tokens that reached Failed state.
+    pub failures: u64,
+    /// Tokens that reached TimedOut state.
+    pub timeouts: u64,
+    /// Tokens that reached PartialFailure state.
+    pub partial_failures: u64,
+    /// Total tokens evicted.
+    pub evictions: u64,
+}
+
+// =============================================================================
 // Token identity
 // =============================================================================
 
@@ -386,6 +462,8 @@ pub struct CompletionTracker {
     config: CompletionTrackerConfig,
     tokens: HashMap<TokenId, CompletionToken>,
     counter: u64,
+    /// Operational telemetry counters.
+    telemetry: CompletionTrackerTelemetry,
 }
 
 impl CompletionTracker {
@@ -396,6 +474,7 @@ impl CompletionTracker {
             config,
             tokens: HashMap::new(),
             counter: 0,
+            telemetry: CompletionTrackerTelemetry::new(),
         }
     }
 
@@ -415,9 +494,12 @@ impl CompletionTracker {
         timeout_ms: Option<u64>,
         pane_id: Option<u64>,
     ) -> Option<TokenId> {
+        self.telemetry.tokens_requested += 1;
         if self.active_count() >= self.config.max_active_tokens {
+            self.telemetry.tokens_rejected += 1;
             return None;
         }
+        self.telemetry.tokens_created += 1;
 
         self.counter += 1;
         let id = TokenId::generate(self.counter);
@@ -465,12 +547,15 @@ impl CompletionTracker {
         message: impl Into<String>,
         metadata: HashMap<String, String>,
     ) -> Option<CompletionState> {
+        self.telemetry.advances += 1;
         let token = self.tokens.get_mut(token_id)?;
 
         // Don't modify terminal tokens.
         if token.state().is_terminal() {
             return Some(token.state());
         }
+
+        let prev_state = token.state();
 
         // Record the step.
         token.cause_chain.push(CauseStep {
@@ -523,6 +608,17 @@ impl CompletionTracker {
         };
 
         token.set_state(new_state);
+
+        // Count terminal transitions (only when state actually changes).
+        if !prev_state.is_terminal() && new_state.is_terminal() {
+            match new_state {
+                CompletionState::Completed => self.telemetry.completions += 1,
+                CompletionState::Failed => self.telemetry.failures += 1,
+                CompletionState::PartialFailure => self.telemetry.partial_failures += 1,
+                _ => {}
+            }
+        }
+
         Some(new_state)
     }
 
@@ -539,6 +635,7 @@ impl CompletionTracker {
                 .cause_chain
                 .record("_system", StepOutcome::Error, "operation timed out");
             token.set_state(CompletionState::TimedOut);
+            self.telemetry.timeouts += 1;
         }
         Some(token.state())
     }
@@ -571,7 +668,9 @@ impl CompletionTracker {
         let before = self.tokens.len();
         self.tokens
             .retain(|_, t| !t.state().is_terminal() || t.created_at_ms > cutoff);
-        before - self.tokens.len()
+        let evicted = before - self.tokens.len();
+        self.telemetry.evictions += evicted as u64;
+        evicted
     }
 
     /// Current state of a token.
@@ -636,6 +735,12 @@ impl CompletionTracker {
                 pane_id: t.pane_id,
             })
             .collect()
+    }
+
+    /// Access the operational telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &CompletionTrackerTelemetry {
+        &self.telemetry
     }
 }
 
