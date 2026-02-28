@@ -17,12 +17,106 @@
 //! then delegates actual deletion to a [`SegmentStore`] trait implementor.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use crate::memory_pressure::MemoryPressureTier;
 use crate::pane_tiers::PaneTier;
 use crate::patterns::{PatternEngine, Severity};
+
+// =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for scrollback eviction.
+///
+/// Uses `AtomicU64` because `ScrollbackEvictor` methods take `&self`.
+pub struct ScrollbackEvictionTelemetry {
+    /// Number of eviction plans computed.
+    plans_computed: AtomicU64,
+    /// Number of plan executions run.
+    executions_run: AtomicU64,
+    /// Total panes evaluated across all plan() calls.
+    panes_evaluated: AtomicU64,
+    /// Total eviction targets generated (panes needing trimming).
+    targets_generated: AtomicU64,
+    /// Total segments planned for removal across all plans.
+    segments_planned: AtomicU64,
+    /// Total segments actually removed across all executions.
+    segments_removed: AtomicU64,
+    /// Total errors encountered during execution.
+    execution_errors: AtomicU64,
+}
+
+impl ScrollbackEvictionTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            plans_computed: AtomicU64::new(0),
+            executions_run: AtomicU64::new(0),
+            panes_evaluated: AtomicU64::new(0),
+            targets_generated: AtomicU64::new(0),
+            segments_planned: AtomicU64::new(0),
+            segments_removed: AtomicU64::new(0),
+            execution_errors: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> ScrollbackEvictionTelemetrySnapshot {
+        ScrollbackEvictionTelemetrySnapshot {
+            plans_computed: self.plans_computed.load(Ordering::Relaxed),
+            executions_run: self.executions_run.load(Ordering::Relaxed),
+            panes_evaluated: self.panes_evaluated.load(Ordering::Relaxed),
+            targets_generated: self.targets_generated.load(Ordering::Relaxed),
+            segments_planned: self.segments_planned.load(Ordering::Relaxed),
+            segments_removed: self.segments_removed.load(Ordering::Relaxed),
+            execution_errors: self.execution_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for ScrollbackEvictionTelemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for ScrollbackEvictionTelemetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScrollbackEvictionTelemetry")
+            .field("plans_computed", &self.plans_computed.load(Ordering::Relaxed))
+            .field("executions_run", &self.executions_run.load(Ordering::Relaxed))
+            .field("panes_evaluated", &self.panes_evaluated.load(Ordering::Relaxed))
+            .field("targets_generated", &self.targets_generated.load(Ordering::Relaxed))
+            .field("segments_planned", &self.segments_planned.load(Ordering::Relaxed))
+            .field("segments_removed", &self.segments_removed.load(Ordering::Relaxed))
+            .field("execution_errors", &self.execution_errors.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+/// Serializable snapshot of scrollback eviction telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrollbackEvictionTelemetrySnapshot {
+    /// Number of eviction plans computed.
+    pub plans_computed: u64,
+    /// Number of plan executions run.
+    pub executions_run: u64,
+    /// Total panes evaluated across all plan() calls.
+    pub panes_evaluated: u64,
+    /// Total eviction targets generated (panes needing trimming).
+    pub targets_generated: u64,
+    /// Total segments planned for removal across all plans.
+    pub segments_planned: u64,
+    /// Total segments actually removed across all executions.
+    pub segments_removed: u64,
+    /// Total errors encountered during execution.
+    pub execution_errors: u64,
+}
 
 // =============================================================================
 // Configuration
@@ -571,6 +665,7 @@ pub struct ScrollbackEvictor<S: SegmentStore, T: PaneTierSource> {
     config: EvictionConfig,
     store: S,
     tier_source: T,
+    telemetry: ScrollbackEvictionTelemetry,
 }
 
 impl<S: SegmentStore, T: PaneTierSource> ScrollbackEvictor<S, T> {
@@ -580,12 +675,19 @@ impl<S: SegmentStore, T: PaneTierSource> ScrollbackEvictor<S, T> {
             config,
             store,
             tier_source,
+            telemetry: ScrollbackEvictionTelemetry::new(),
         }
     }
 
     /// Compute an eviction plan without executing it.
     pub fn plan(&self, pressure: MemoryPressureTier) -> Result<EvictionPlan, String> {
+        self.telemetry.plans_computed.fetch_add(1, Ordering::Relaxed);
+
         let pane_ids = self.store.list_pane_ids()?;
+        self.telemetry
+            .panes_evaluated
+            .fetch_add(pane_ids.len() as u64, Ordering::Relaxed);
+
         let mut targets = Vec::new();
         let mut total_to_remove = 0usize;
 
@@ -611,6 +713,13 @@ impl<S: SegmentStore, T: PaneTierSource> ScrollbackEvictor<S, T> {
             }
         }
 
+        self.telemetry
+            .targets_generated
+            .fetch_add(targets.len() as u64, Ordering::Relaxed);
+        self.telemetry
+            .segments_planned
+            .fetch_add(total_to_remove as u64, Ordering::Relaxed);
+
         let panes_affected = targets.len();
 
         Ok(EvictionPlan {
@@ -623,6 +732,10 @@ impl<S: SegmentStore, T: PaneTierSource> ScrollbackEvictor<S, T> {
 
     /// Execute an eviction plan, deleting excess segments.
     pub fn execute(&self, plan: &EvictionPlan) -> EvictionReport {
+        self.telemetry
+            .executions_run
+            .fetch_add(1, Ordering::Relaxed);
+
         let mut report = EvictionReport::default();
 
         for target in &plan.targets {
@@ -632,11 +745,17 @@ impl<S: SegmentStore, T: PaneTierSource> ScrollbackEvictor<S, T> {
             {
                 Ok(deleted) => {
                     report.segments_removed += deleted;
+                    self.telemetry
+                        .segments_removed
+                        .fetch_add(deleted as u64, Ordering::Relaxed);
                     if deleted > 0 {
                         report.panes_trimmed += 1;
                     }
                 }
                 Err(e) => {
+                    self.telemetry
+                        .execution_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     report.errors.push(format!(
                         "pane {}: failed to delete {} segments: {}",
                         target.pane_id, target.segments_to_remove, e
@@ -652,6 +771,12 @@ impl<S: SegmentStore, T: PaneTierSource> ScrollbackEvictor<S, T> {
     pub fn evict(&self, pressure: MemoryPressureTier) -> Result<EvictionReport, String> {
         let plan = self.plan(pressure)?;
         Ok(self.execute(&plan))
+    }
+
+    /// Access the operational telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &ScrollbackEvictionTelemetry {
+        &self.telemetry
     }
 
     /// Get the current config.
