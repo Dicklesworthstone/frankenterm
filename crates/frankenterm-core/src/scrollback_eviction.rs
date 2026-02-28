@@ -1924,7 +1924,7 @@ mod tests {
     #[test]
     fn telemetry_plan_counted() {
         let ev = default_evictor(&[(1, 500), (2, 50)], &[(1, PaneTier::Active)]);
-        ev.plan(MemoryPressureTier::Normal).unwrap();
+        ev.plan(MemoryPressureTier::Green).unwrap();
 
         let snap = ev.telemetry().snapshot();
         assert_eq!(snap.plans_computed, 1);
@@ -1935,7 +1935,7 @@ mod tests {
     fn telemetry_execute_counted() {
         // Create a pane with segments exceeding the dormant limit (100)
         let ev = default_evictor(&[(1, 200)], &[(1, PaneTier::Dormant)]);
-        let plan = ev.plan(MemoryPressureTier::Normal).unwrap();
+        let plan = ev.plan(MemoryPressureTier::Green).unwrap();
         ev.execute(&plan);
 
         let snap = ev.telemetry().snapshot();
@@ -1946,7 +1946,7 @@ mod tests {
     #[test]
     fn telemetry_snapshot_serde_roundtrip() {
         let ev = default_evictor(&[(1, 500)], &[]);
-        ev.plan(MemoryPressureTier::Normal).unwrap();
+        ev.plan(MemoryPressureTier::Green).unwrap();
 
         let snap = ev.telemetry().snapshot();
         let json = serde_json::to_string(&snap).unwrap();

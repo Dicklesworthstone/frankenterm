@@ -27,7 +27,7 @@ impl HandleSessionEnd {
     }
 
     /// Build an [`AgentSessionRecord`] from a detection trigger's extracted fields.
-    fn record_from_detection(
+    pub(crate) fn record_from_detection(
         pane_id: u64,
         detection: &serde_json::Value,
     ) -> crate::storage::AgentSessionRecord {
@@ -777,7 +777,7 @@ impl Workflow for HandleProcessTriageLifecycle {
 
 /// Default cooldown window in milliseconds (5 minutes).
 /// Auth events within this window for the same pane are suppressed.
-const AUTH_COOLDOWN_MS: i64 = 5 * 60 * 1000;
+pub(crate) const AUTH_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 const AUTH_CASS_HINT_LIMIT: usize = 3;
 const AUTH_CASS_TIMEOUT_SECS: u64 = 8;
 const AUTH_CASS_LOOKBACK_DAYS: u32 = 30;
@@ -785,11 +785,11 @@ const AUTH_CASS_QUERY_MAX_CHARS: usize = 160;
 const AUTH_CASS_HINT_MAX_CHARS: usize = 140;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct AuthCassHintsLookup {
-    query: Option<String>,
-    workspace: Option<String>,
-    hints: Vec<String>,
-    error: Option<String>,
+pub(crate) struct AuthCassHintsLookup {
+    pub(crate) query: Option<String>,
+    pub(crate) workspace: Option<String>,
+    pub(crate) hints: Vec<String>,
+    pub(crate) error: Option<String>,
 }
 
 /// Recovery strategy for an auth-required event.
@@ -895,7 +895,7 @@ impl HandleAuthRequired {
         input.chars().take(max_chars).collect()
     }
 
-    fn normalized_cass_query(trigger: &serde_json::Value) -> Option<String> {
+    pub(crate) fn normalized_cass_query(trigger: &serde_json::Value) -> Option<String> {
         let candidates = [
             trigger.get("matched_text").and_then(|v| v.as_str()),
             trigger
@@ -1019,7 +1019,7 @@ impl HandleAuthRequired {
         }
     }
 
-    fn build_recovery_prompt(
+    pub(crate) fn build_recovery_prompt(
         strategy: &AuthRecoveryStrategy,
         trigger: &serde_json::Value,
         cass_lookup: &AuthCassHintsLookup,
@@ -1324,7 +1324,7 @@ const CLAUDE_CODE_LIMITS_COOLDOWN_MS: i64 = 10 * 60 * 1000;
 ///   4. Persists an audit record and produces a recovery plan the operator
 ///      can act on (wait for reset, switch accounts manually, etc.).
 pub struct HandleClaudeCodeLimits {
-    cooldown_ms: i64,
+    pub(crate) cooldown_ms: i64,
 }
 
 impl HandleClaudeCodeLimits {
@@ -1343,7 +1343,7 @@ impl HandleClaudeCodeLimits {
     }
 
     /// Classify the limit type from a detection trigger.
-    fn classify_limit(trigger: &serde_json::Value) -> (&'static str, Option<String>) {
+    pub(crate) fn classify_limit(trigger: &serde_json::Value) -> (&'static str, Option<String>) {
         let event_type = trigger
             .get("event_type")
             .and_then(|v| v.as_str())
@@ -1365,7 +1365,7 @@ impl HandleClaudeCodeLimits {
     }
 
     /// Build a recovery plan JSON object for the operator.
-    fn build_recovery_plan(
+    pub(crate) fn build_recovery_plan(
         limit_type: &str,
         reset_time: Option<&str>,
         pane_id: u64,
@@ -1615,7 +1615,7 @@ const GEMINI_QUOTA_COOLDOWN_MS: i64 = 10 * 60 * 1000;
 ///   3. Classifies the quota type (warning vs reached).
 ///   4. Persists an audit record and produces a recovery plan.
 pub struct HandleGeminiQuota {
-    cooldown_ms: i64,
+    pub(crate) cooldown_ms: i64,
 }
 
 impl HandleGeminiQuota {
@@ -1632,7 +1632,7 @@ impl HandleGeminiQuota {
         Self { cooldown_ms }
     }
 
-    fn classify_quota(trigger: &serde_json::Value) -> (&'static str, Option<String>) {
+    pub(crate) fn classify_quota(trigger: &serde_json::Value) -> (&'static str, Option<String>) {
         let event_type = trigger
             .get("event_type")
             .and_then(|v| v.as_str())
@@ -1653,7 +1653,7 @@ impl HandleGeminiQuota {
         (quota_type, remaining)
     }
 
-    fn build_recovery_plan(
+    pub(crate) fn build_recovery_plan(
         quota_type: &str,
         remaining_pct: Option<&str>,
         pane_id: u64,

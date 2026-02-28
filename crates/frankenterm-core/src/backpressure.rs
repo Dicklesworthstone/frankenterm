@@ -990,7 +990,7 @@ mod tests {
 
     #[test]
     fn telemetry_initial_zero() {
-        let monitor = BackpressureMonitor::new(BackpressureConfig::default());
+        let monitor = BackpressureManager::new(BackpressureConfig::default());
         let snap = monitor.telemetry().snapshot();
         assert_eq!(snap.evaluations, 0);
         assert_eq!(snap.classifications, 0);
@@ -1002,7 +1002,7 @@ mod tests {
 
     #[test]
     fn telemetry_classify_counted() {
-        let monitor = BackpressureMonitor::new(BackpressureConfig::default());
+        let monitor = BackpressureManager::new(BackpressureConfig::default());
         let depths = QueueDepths {
             capture_depth: 0,
             capture_capacity: 100,
@@ -1017,7 +1017,7 @@ mod tests {
 
     #[test]
     fn telemetry_pause_resume_counted() {
-        let monitor = BackpressureMonitor::new(BackpressureConfig::default());
+        let monitor = BackpressureManager::new(BackpressureConfig::default());
         monitor.pause_pane(1);
         monitor.pause_pane(2);
         monitor.resume_pane(1);
@@ -1030,7 +1030,7 @@ mod tests {
 
     #[test]
     fn telemetry_snapshot_serde_roundtrip() {
-        let monitor = BackpressureMonitor::new(BackpressureConfig::default());
+        let monitor = BackpressureManager::new(BackpressureConfig::default());
         let depths = QueueDepths {
             capture_depth: 0,
             capture_capacity: 100,

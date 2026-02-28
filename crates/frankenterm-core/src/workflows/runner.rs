@@ -195,7 +195,7 @@ pub struct WorkflowRunner {
     /// Registered workflows
     workflows: std::sync::RwLock<Vec<Arc<dyn Workflow>>>,
     /// Workflow engine for persistence
-    engine: WorkflowEngine,
+    pub(crate) engine: WorkflowEngine,
     /// Per-pane lock manager
     lock_manager: Arc<PaneWorkflowLockManager>,
     /// Storage handle for persistence

@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::time::{Duration, Instant};
+    use crate::patterns::{PatternEngine, DetectionContext};
 
     // Mocking time is hard in Rust without a crate, but we can test the logic
     // by exposing a "clear_expired" method or similar.
