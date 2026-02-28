@@ -30,6 +30,67 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+// =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the differential snapshot engine.
+///
+/// Uses plain `u64` because `DiffSnapshotEngine` methods take `&mut self`.
+#[derive(Debug, Clone, Default)]
+pub struct DiffSnapshotTelemetry {
+    /// Successful capture_diff() calls that produced a diff.
+    diffs_captured: u64,
+    /// capture_diff() calls skipped because tracker was clean.
+    clean_skips: u64,
+    /// Auto-compactions triggered by exceeding max_chain_len.
+    auto_compactions: u64,
+    /// Explicit compact() calls.
+    manual_compactions: u64,
+    /// Total individual diff entries across all captured snapshots.
+    total_diff_entries: u64,
+    /// Layout change diffs captured.
+    layout_diffs: u64,
+}
+
+impl DiffSnapshotTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> DiffSnapshotTelemetrySnapshot {
+        DiffSnapshotTelemetrySnapshot {
+            diffs_captured: self.diffs_captured,
+            clean_skips: self.clean_skips,
+            auto_compactions: self.auto_compactions,
+            manual_compactions: self.manual_compactions,
+            total_diff_entries: self.total_diff_entries,
+            layout_diffs: self.layout_diffs,
+        }
+    }
+}
+
+/// Serializable snapshot of differential snapshot engine telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffSnapshotTelemetrySnapshot {
+    /// Successful capture_diff() calls that produced a diff.
+    pub diffs_captured: u64,
+    /// capture_diff() calls skipped because tracker was clean.
+    pub clean_skips: u64,
+    /// Auto-compactions triggered by exceeding max_chain_len.
+    pub auto_compactions: u64,
+    /// Explicit compact() calls.
+    pub manual_compactions: u64,
+    /// Total individual diff entries across all captured snapshots.
+    pub total_diff_entries: u64,
+    /// Layout change diffs captured.
+    pub layout_diffs: u64,
+}
+
 use crate::session_pane_state::PaneStateSnapshot;
 use crate::session_topology::TopologySnapshot;
 
@@ -406,6 +467,8 @@ pub struct DiffSnapshotEngine {
     chain: Option<DiffChain>,
     /// Maximum chain length before auto-compaction.
     max_chain_len: usize,
+    /// Operational telemetry counters.
+    telemetry: DiffSnapshotTelemetry,
 }
 
 impl DiffSnapshotEngine {
@@ -418,6 +481,7 @@ impl DiffSnapshotEngine {
             tracker: DirtyTracker::new(),
             chain: None,
             max_chain_len,
+            telemetry: DiffSnapshotTelemetry::new(),
         }
     }
 
@@ -462,6 +526,7 @@ impl DiffSnapshotEngine {
         let chain = self.chain.as_mut()?;
 
         if self.tracker.is_clean() {
+            self.telemetry.clean_skips += 1;
             return None;
         }
 
@@ -509,6 +574,7 @@ impl DiffSnapshotEngine {
                 diffs.push(SnapshotDiff::LayoutChanged {
                     new_topology: topo.clone(),
                 });
+                self.telemetry.layout_diffs += 1;
             }
         }
 
@@ -516,6 +582,9 @@ impl DiffSnapshotEngine {
             self.tracker.clear();
             return None;
         }
+
+        self.telemetry.diffs_captured += 1;
+        self.telemetry.total_diff_entries += diffs.len() as u64;
 
         let diff = DiffSnapshot {
             seq: 0, // will be set by push_diff
@@ -529,6 +598,7 @@ impl DiffSnapshotEngine {
         // Auto-compact if chain is too long
         if self.max_chain_len > 0 && chain.chain_len() > self.max_chain_len {
             chain.compact();
+            self.telemetry.auto_compactions += 1;
         }
 
         Some(diff)
@@ -544,7 +614,17 @@ impl DiffSnapshotEngine {
     ///
     /// Returns the number of diffs merged, or `None` if not initialized.
     pub fn compact(&mut self) -> Option<usize> {
-        self.chain.as_mut().map(DiffChain::compact)
+        let result = self.chain.as_mut().map(DiffChain::compact);
+        if result.is_some() {
+            self.telemetry.manual_compactions += 1;
+        }
+        result
+    }
+
+    /// Access telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &DiffSnapshotTelemetry {
+        &self.telemetry
     }
 
     /// Returns the current chain length (number of diffs since last base).
