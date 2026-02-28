@@ -37,6 +37,67 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 // ============================================================================
+// Telemetry
+// ============================================================================
+
+/// Operational telemetry counters for the command guard.
+///
+/// All counters are plain `u64` because `CommandGuard` uses `&mut self`.
+#[derive(Debug, Clone, Default)]
+pub struct CommandGuardTelemetry {
+    /// Total evaluate() calls.
+    evaluations: u64,
+    /// Total commands allowed (including quick-reject and read-only).
+    allowed: u64,
+    /// Total commands blocked (destructive pattern matched + Strict trust).
+    blocked: u64,
+    /// Total commands warned (destructive pattern matched + Permissive trust).
+    warned: u64,
+    /// Total commands quick-rejected (no keyword match, bypassed regex scan).
+    quick_rejects: u64,
+    /// Total clear_audit_log() calls.
+    audit_clears: u64,
+}
+
+impl CommandGuardTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> CommandGuardTelemetrySnapshot {
+        CommandGuardTelemetrySnapshot {
+            evaluations: self.evaluations,
+            allowed: self.allowed,
+            blocked: self.blocked,
+            warned: self.warned,
+            quick_rejects: self.quick_rejects,
+            audit_clears: self.audit_clears,
+        }
+    }
+}
+
+/// Serializable snapshot of command guard telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandGuardTelemetrySnapshot {
+    /// Total evaluate() calls.
+    pub evaluations: u64,
+    /// Total commands allowed.
+    pub allowed: u64,
+    /// Total commands blocked.
+    pub blocked: u64,
+    /// Total commands warned.
+    pub warned: u64,
+    /// Total quick-reject bypasses.
+    pub quick_rejects: u64,
+    /// Total audit log clears.
+    pub audit_clears: u64,
+}
+
+// ============================================================================
 // Trust Levels
 // ============================================================================
 
@@ -681,6 +742,8 @@ pub struct CommandGuard {
     /// Ring buffer of audit entries.
     audit_log: Vec<AuditEntry>,
     audit_write_idx: usize,
+    /// Operational telemetry counters.
+    telemetry: CommandGuardTelemetry,
 }
 
 impl CommandGuard {
@@ -693,6 +756,7 @@ impl CommandGuard {
             pane_allowlists: HashMap::new(),
             audit_log: Vec::with_capacity(capacity.min(1024)),
             audit_write_idx: 0,
+            telemetry: CommandGuardTelemetry::new(),
         }
     }
 
@@ -704,6 +768,7 @@ impl CommandGuard {
 
     /// Evaluate a command for a specific pane.
     pub fn evaluate(&mut self, command: &str, pane_id: u64) -> GuardDecision {
+        self.telemetry.evaluations += 1;
         let start = Instant::now();
         let pane_config = self.pane_config(pane_id);
         let trust = pane_config.trust_level;
@@ -711,6 +776,7 @@ impl CommandGuard {
         // ReadOnly panes skip evaluation entirely.
         if trust == TrustLevel::ReadOnly {
             self.record(pane_id, command, "allow", None, None, 0);
+            self.telemetry.allowed += 1;
             return GuardDecision::Allow;
         }
 
@@ -718,6 +784,7 @@ impl CommandGuard {
         if self.matches_pane_allowlist(command, pane_id) {
             let elapsed = start.elapsed().as_micros() as u64;
             self.record(pane_id, command, "allow", None, None, elapsed);
+            self.telemetry.allowed += 1;
             return GuardDecision::Allow;
         }
 
@@ -726,6 +793,8 @@ impl CommandGuard {
         if relevant_packs.is_empty() {
             let elapsed = start.elapsed().as_micros() as u64;
             self.record(pane_id, command, "allow", None, None, elapsed);
+            self.telemetry.allowed += 1;
+            self.telemetry.quick_rejects += 1;
             return GuardDecision::Allow;
         }
 
@@ -743,6 +812,12 @@ impl CommandGuard {
             }
         };
         self.record(pane_id, command, dec_str, rule, pack, elapsed);
+
+        match &decision {
+            GuardDecision::Allow => self.telemetry.allowed += 1,
+            GuardDecision::Block { .. } => self.telemetry.blocked += 1,
+            GuardDecision::Warn { .. } => self.telemetry.warned += 1,
+        }
 
         decision
     }
@@ -790,6 +865,13 @@ impl CommandGuard {
     pub fn clear_audit_log(&mut self) {
         self.audit_log.clear();
         self.audit_write_idx = 0;
+        self.telemetry.audit_clears += 1;
+    }
+
+    /// Get the telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &CommandGuardTelemetry {
+        &self.telemetry
     }
 
     /// Get the policy.
@@ -1852,5 +1934,115 @@ mod tests {
         let (rule_id, pack, _reason, _suggestions) = result.unwrap();
         assert!(!rule_id.is_empty());
         assert!(!pack.is_empty());
+    }
+
+    // ── Telemetry tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let guard = CommandGuard::with_defaults();
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(snap.evaluations, 0);
+        assert_eq!(snap.allowed, 0);
+        assert_eq!(snap.blocked, 0);
+        assert_eq!(snap.warned, 0);
+        assert_eq!(snap.quick_rejects, 0);
+        assert_eq!(snap.audit_clears, 0);
+    }
+
+    #[test]
+    fn telemetry_evaluations_counted() {
+        let mut guard = strict_guard();
+        guard.evaluate("ls -la", 1);
+        guard.evaluate("echo hello", 2);
+        assert_eq!(guard.telemetry().snapshot().evaluations, 2);
+    }
+
+    #[test]
+    fn telemetry_allowed_counted() {
+        let mut guard = strict_guard();
+        guard.evaluate("ls -la", 1);
+        guard.evaluate("echo hello", 2);
+        guard.evaluate("cat /etc/hosts", 3);
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(snap.allowed, 3);
+    }
+
+    #[test]
+    fn telemetry_blocked_counted() {
+        let mut guard = strict_guard();
+        guard.evaluate("rm -rf /tmp/data", 1);
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(snap.blocked, 1);
+        assert_eq!(snap.evaluations, 1);
+    }
+
+    #[test]
+    fn telemetry_warned_counted() {
+        let mut guard = permissive_guard();
+        guard.evaluate("rm -rf /tmp/data", 1);
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(snap.warned, 1);
+    }
+
+    #[test]
+    fn telemetry_quick_rejects_counted() {
+        let mut guard = strict_guard();
+        // Benign commands with no destructive keywords → quick reject
+        guard.evaluate("ls -la", 1);
+        guard.evaluate("echo hello", 2);
+        let snap = guard.telemetry().snapshot();
+        assert!(snap.quick_rejects >= 2, "quick_rejects={}", snap.quick_rejects);
+    }
+
+    #[test]
+    fn telemetry_audit_clears_counted() {
+        let mut guard = strict_guard();
+        guard.evaluate("ls", 1);
+        guard.clear_audit_log();
+        guard.clear_audit_log();
+        assert_eq!(guard.telemetry().snapshot().audit_clears, 2);
+    }
+
+    #[test]
+    fn telemetry_allowed_plus_blocked_plus_warned_equals_evaluations() {
+        let mut guard = strict_guard();
+        guard.evaluate("ls -la", 1);
+        guard.evaluate("rm -rf /tmp/data", 2);
+        guard.evaluate("echo hello", 3);
+
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(
+            snap.allowed + snap.blocked + snap.warned,
+            snap.evaluations,
+            "allowed({}) + blocked({}) + warned({}) != evaluations({})",
+            snap.allowed, snap.blocked, snap.warned, snap.evaluations,
+        );
+    }
+
+    #[test]
+    fn telemetry_readonly_pane_counted_as_allowed() {
+        let mut guard = readonly_guard();
+        guard.evaluate("rm -rf /", 1);
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(snap.evaluations, 1);
+        assert_eq!(snap.allowed, 1);
+        assert_eq!(snap.blocked, 0);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let snap = CommandGuardTelemetrySnapshot {
+            evaluations: 100,
+            allowed: 80,
+            blocked: 15,
+            warned: 5,
+            quick_rejects: 70,
+            audit_clears: 3,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CommandGuardTelemetrySnapshot =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
     }
 }
