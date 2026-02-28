@@ -230,7 +230,7 @@ toml_edit = "0.24.0"
 serde_yaml = "0.9.34"
 
 # Serialization
-toon_rust = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/toon_rust", branch = "master", package = "tru" }
+toon_rust = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/toon_rust", rev = "d48c5b55caeedc99368a1461535b7e0c143afe06", package = "tru" }
 
 # FrankenTerm crates (in-tree, ex-WezTerm)
 async_ossl = { path = "frankenterm/async_ossl" }
@@ -392,12 +392,12 @@ getrandom = "0.3"
 trybuild = { version = "1", default-features = false }
 rustls = "0.23"
 rustls-pemfile = "2"
-fastmcp = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", package = "fastmcp-rust" }
-fastapi = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "9fe499ee03f39126f042d46af4eb710509c630ec", package = "fastapi-rust" }
+fastmcp = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "884d45b173f691682d23e20aa6089bf4115705b8", package = "fastmcp-rust" }
+fastapi = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "38ada79c3c3071f2ac149c534988264e5a8d58bf", package = "fastapi-rust" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
 # Pinned to a specific rev of the upstream GitHub repo for reproducibility.
-frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3ad4326fd63a3f53d0d90d48f0e5ea1c74c2a4da", package = "frankensearch", default-features = false, features = ["hybrid"] }
+frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "b47c6b40e3885fb81c09b121c0a612a794c9c7e8", package = "frankensearch", default-features = false, features = ["hybrid"] }
 # Agent detection (optional integration, enabled via frankenterm-core feature flag)
 franken-agent-detection = "0.1.0"
 
@@ -417,15 +417,15 @@ strip = true        # Remove debug symbols
 # the upstream repos as git dependencies.
 [patch.crates-io]
 # Pin git revs to avoid branch drift and to keep the dependency graph single-sourced.
-rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "f58a4e5e437aa564286729c0e2ec50b1e62c1f0e" }
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "662710bf6f53b0300eb9e6bcf60e5cc93b0cac41" }
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "478c1be6bb701d583608057e1f1b882119fbaf56" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "9d4e91789f95b0f154acfb2000ce69c2a3556be5" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "662710bf6f53b0300eb9e6bcf60e5cc93b0cac41" }
-rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "f58a4e5e437aa564286729c0e2ec50b1e62c1f0e" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "9d4e91789f95b0f154acfb2000ce69c2a3556be5" }
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "478c1be6bb701d583608057e1f1b882119fbaf56" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "662710bf6f53b0300eb9e6bcf60e5cc93b0cac41" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "9d4e91789f95b0f154acfb2000ce69c2a3556be5" }
 
 [patch."https://github.com/Dicklesworthstone/frankensearch"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "662710bf6f53b0300eb9e6bcf60e5cc93b0cac41" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "9d4e91789f95b0f154acfb2000ce69c2a3556be5" }
