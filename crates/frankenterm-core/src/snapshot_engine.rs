@@ -18,7 +18,7 @@
 //! See `wa-29k1` bead for the full design.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
@@ -32,6 +32,120 @@ use crate::runtime_compat::{Mutex, RwLock, mpsc, timeout, watch};
 use crate::session_pane_state::PaneStateSnapshot;
 use crate::session_topology::TopologySnapshot;
 use crate::wezterm::PaneInfo;
+
+// =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the snapshot engine.
+///
+/// Uses `AtomicU64` because `SnapshotEngine` methods take `&self`.
+pub struct SnapshotEngineTelemetry {
+    /// Total capture() attempts.
+    captures_attempted: AtomicU64,
+    /// Captures that completed successfully.
+    captures_succeeded: AtomicU64,
+    /// Captures skipped due to dedup (NoChanges).
+    dedup_skips: AtomicU64,
+    /// Captures that failed with an error.
+    capture_errors: AtomicU64,
+    /// Number of cleanup() calls.
+    cleanup_runs: AtomicU64,
+    /// Checkpoints removed by cleanup.
+    cleanup_removed: AtomicU64,
+    /// Total emit_trigger() calls.
+    triggers_emitted: AtomicU64,
+    /// Triggers accepted (not dropped due to full queue).
+    triggers_accepted: AtomicU64,
+    /// Total panes captured across all successful snapshots.
+    panes_captured: AtomicU64,
+    /// Total bytes persisted across all successful snapshots.
+    bytes_persisted: AtomicU64,
+}
+
+impl SnapshotEngineTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            captures_attempted: AtomicU64::new(0),
+            captures_succeeded: AtomicU64::new(0),
+            dedup_skips: AtomicU64::new(0),
+            capture_errors: AtomicU64::new(0),
+            cleanup_runs: AtomicU64::new(0),
+            cleanup_removed: AtomicU64::new(0),
+            triggers_emitted: AtomicU64::new(0),
+            triggers_accepted: AtomicU64::new(0),
+            panes_captured: AtomicU64::new(0),
+            bytes_persisted: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> SnapshotEngineTelemetrySnapshot {
+        SnapshotEngineTelemetrySnapshot {
+            captures_attempted: self.captures_attempted.load(Ordering::Relaxed),
+            captures_succeeded: self.captures_succeeded.load(Ordering::Relaxed),
+            dedup_skips: self.dedup_skips.load(Ordering::Relaxed),
+            capture_errors: self.capture_errors.load(Ordering::Relaxed),
+            cleanup_runs: self.cleanup_runs.load(Ordering::Relaxed),
+            cleanup_removed: self.cleanup_removed.load(Ordering::Relaxed),
+            triggers_emitted: self.triggers_emitted.load(Ordering::Relaxed),
+            triggers_accepted: self.triggers_accepted.load(Ordering::Relaxed),
+            panes_captured: self.panes_captured.load(Ordering::Relaxed),
+            bytes_persisted: self.bytes_persisted.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for SnapshotEngineTelemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for SnapshotEngineTelemetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotEngineTelemetry")
+            .field("captures_attempted", &self.captures_attempted.load(Ordering::Relaxed))
+            .field("captures_succeeded", &self.captures_succeeded.load(Ordering::Relaxed))
+            .field("dedup_skips", &self.dedup_skips.load(Ordering::Relaxed))
+            .field("capture_errors", &self.capture_errors.load(Ordering::Relaxed))
+            .field("cleanup_runs", &self.cleanup_runs.load(Ordering::Relaxed))
+            .field("cleanup_removed", &self.cleanup_removed.load(Ordering::Relaxed))
+            .field("triggers_emitted", &self.triggers_emitted.load(Ordering::Relaxed))
+            .field("triggers_accepted", &self.triggers_accepted.load(Ordering::Relaxed))
+            .field("panes_captured", &self.panes_captured.load(Ordering::Relaxed))
+            .field("bytes_persisted", &self.bytes_persisted.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+/// Serializable snapshot of snapshot engine telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotEngineTelemetrySnapshot {
+    /// Total capture() attempts.
+    pub captures_attempted: u64,
+    /// Captures that completed successfully.
+    pub captures_succeeded: u64,
+    /// Captures skipped due to dedup (NoChanges).
+    pub dedup_skips: u64,
+    /// Captures that failed with an error.
+    pub capture_errors: u64,
+    /// Number of cleanup() calls.
+    pub cleanup_runs: u64,
+    /// Checkpoints removed by cleanup.
+    pub cleanup_removed: u64,
+    /// Total emit_trigger() calls.
+    pub triggers_emitted: u64,
+    /// Triggers accepted (not dropped due to full queue).
+    pub triggers_accepted: u64,
+    /// Total panes captured across all successful snapshots.
+    pub panes_captured: u64,
+    /// Total bytes persisted across all successful snapshots.
+    pub bytes_persisted: u64,
+}
 
 // =============================================================================
 // Types
@@ -141,6 +255,8 @@ pub struct SnapshotEngine {
     trigger_tx: mpsc::Sender<SnapshotTrigger>,
     /// Runtime-owned receiver, taken by `run_periodic`.
     trigger_rx: Mutex<Option<mpsc::Receiver<SnapshotTrigger>>>,
+    /// Operational telemetry counters.
+    telemetry: SnapshotEngineTelemetry,
 }
 
 impl SnapshotEngine {
@@ -155,6 +271,7 @@ impl SnapshotEngine {
             in_progress: AtomicBool::new(false),
             trigger_tx,
             trigger_rx: Mutex::new(Some(trigger_rx)),
+            telemetry: SnapshotEngineTelemetry::new(),
         }
     }
 
@@ -163,7 +280,16 @@ impl SnapshotEngine {
     /// Returns `false` when the trigger queue is full or no receiver is active.
     #[must_use]
     pub fn emit_trigger(&self, trigger: SnapshotTrigger) -> bool {
-        self.trigger_tx.try_send(trigger).is_ok()
+        self.telemetry
+            .triggers_emitted
+            .fetch_add(1, Ordering::Relaxed);
+        let accepted = self.trigger_tx.try_send(trigger).is_ok();
+        if accepted {
+            self.telemetry
+                .triggers_accepted
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        accepted
     }
 
     async fn spawn_blocking_db<T, E, F>(work: F) -> std::result::Result<T, SnapshotError>
@@ -202,8 +328,15 @@ impl SnapshotEngine {
         panes: &[PaneInfo],
         trigger: SnapshotTrigger,
     ) -> std::result::Result<SnapshotResult, SnapshotError> {
+        self.telemetry
+            .captures_attempted
+            .fetch_add(1, Ordering::Relaxed);
+
         // 1. Guard: prevent concurrent captures
         if self.in_progress.swap(true, Ordering::SeqCst) {
+            self.telemetry
+                .capture_errors
+                .fetch_add(1, Ordering::Relaxed);
             return Err(SnapshotError::InProgress);
         }
         // Reset guard on all exit paths via Drop
@@ -216,6 +349,9 @@ impl SnapshotEngine {
         let _guard = InProgressGuard(&self.in_progress);
 
         if panes.is_empty() {
+            self.telemetry
+                .capture_errors
+                .fetch_add(1, Ordering::Relaxed);
             return Err(SnapshotError::NoPanes);
         }
 
@@ -272,6 +408,9 @@ impl SnapshotEngine {
         ) {
             let last = self.last_state_hash.read().await;
             if last.as_deref() == Some(&state_hash) {
+                self.telemetry
+                    .dedup_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(SnapshotError::NoChanges);
             }
         }
@@ -302,6 +441,17 @@ impl SnapshotEngine {
         // 8. Update last hash
         *self.last_state_hash.write().await = Some(state_hash);
 
+        // 9. Record success telemetry
+        self.telemetry
+            .captures_succeeded
+            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .panes_captured
+            .fetch_add(pane_count as u64, Ordering::Relaxed);
+        self.telemetry
+            .bytes_persisted
+            .fetch_add(result.2 as u64, Ordering::Relaxed);
+
         Ok(SnapshotResult {
             session_id: result.0,
             checkpoint_id: result.1,
@@ -313,12 +463,21 @@ impl SnapshotEngine {
 
     /// Run retention cleanup: remove old checkpoints exceeding limits.
     pub async fn cleanup(&self) -> std::result::Result<usize, SnapshotError> {
+        self.telemetry
+            .cleanup_runs
+            .fetch_add(1, Ordering::Relaxed);
+
         let db_path = Arc::clone(&self.db_path);
         let retention_count = self.config.retention_count;
         let retention_days = self.config.retention_days;
 
-        Self::spawn_blocking_db(move || cleanup_sync(&db_path, retention_count, retention_days))
-            .await
+        let removed =
+            Self::spawn_blocking_db(move || cleanup_sync(&db_path, retention_count, retention_days))
+                .await?;
+        self.telemetry
+            .cleanup_removed
+            .fetch_add(removed as u64, Ordering::Relaxed);
+        Ok(removed)
     }
 
     /// Configured value contribution for a trigger type.
@@ -629,6 +788,12 @@ impl SnapshotEngine {
                 Ok(None)
             }
         }
+    }
+
+    /// Access the operational telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &SnapshotEngineTelemetry {
+        &self.telemetry
     }
 
     /// Mark current session as cleanly shut down.
