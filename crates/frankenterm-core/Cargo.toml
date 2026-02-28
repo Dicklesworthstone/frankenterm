@@ -480,6 +480,8 @@ redis-session = [
 ]
 # Feature gate for cross_agent_session_resumer integration (vendored IR types).
 session-resume = []
+# Placeholder feature gate for test files referencing unimplemented types (journal, tx, etc.)
+__journal_types_placeholder = []
 # Feature gate for generic subprocess bridge foundation.
 subprocess-bridge = []
 # Feature gate for mcp_agent_mail_rust coordination bridge.

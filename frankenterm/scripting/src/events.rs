@@ -140,10 +140,10 @@ impl EventBus {
     /// Hooks are executed in tier order, then priority order within each tier.
     pub fn fire(&self, event: &str, payload: &Value) -> Result<Vec<Action>> {
         // Update fire count (capped to prevent unbounded growth)
-        if let Ok(mut counts) = self.fire_counts.lock() {
-            if counts.contains_key(event) || counts.len() < Self::MAX_FIRE_COUNT_ENTRIES {
-                *counts.entry(event.to_string()).or_default() += 1;
-            }
+        if let Ok(mut counts) = self.fire_counts.lock()
+            && (counts.contains_key(event) || counts.len() < Self::MAX_FIRE_COUNT_ENTRIES)
+        {
+            *counts.entry(event.to_string()).or_default() += 1;
         }
 
         // Collect matching hooks (sorted by tier then priority)
