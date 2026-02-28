@@ -70,8 +70,6 @@ pub(crate) fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7748,6 +7746,22 @@ Try again at 3:00 PM UTC.
     }
 
     #[test]
+    fn handle_claude_code_limits_handles_rate_limit_detected() {
+        let wf = HandleClaudeCodeLimits::new();
+        let detection = Detection {
+            rule_id: "claude_code.rate_limit.detected".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "rate_limit.detected".to_string(),
+            severity: Severity::Critical,
+            confidence: 0.95,
+            extracted: serde_json::json!({"retry_after": "15 minutes"}),
+            matched_text: "rate limit detected".to_string(),
+            span: (0, 19),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
     fn handle_claude_code_limits_ignores_codex_usage() {
         let wf = HandleClaudeCodeLimits::new();
         let detection = Detection {
@@ -7785,6 +7799,7 @@ Try again at 3:00 PM UTC.
         let types = wf.trigger_event_types();
         assert!(types.contains(&"usage.warning"));
         assert!(types.contains(&"usage.reached"));
+        assert!(types.contains(&"rate_limit.detected"));
     }
 
     #[test]
@@ -7822,6 +7837,17 @@ Try again at 3:00 PM UTC.
         let (limit_type, reset_time) = HandleClaudeCodeLimits::classify_limit(&trigger);
         assert_eq!(limit_type, "usage_reached");
         assert_eq!(reset_time.as_deref(), Some("30 minutes"));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_classify_rate_limit_detected() {
+        let trigger = serde_json::json!({
+            "event_type": "rate_limit.detected",
+            "extracted": { "retry_after": "15 minutes" }
+        });
+        let (limit_type, reset_time) = HandleClaudeCodeLimits::classify_limit(&trigger);
+        assert_eq!(limit_type, "rate_limit_detected");
+        assert_eq!(reset_time.as_deref(), Some("15 minutes"));
     }
 
     #[test]
@@ -7897,6 +7923,22 @@ Try again at 3:00 PM UTC.
     }
 
     #[test]
+    fn handle_gemini_quota_handles_rate_limit_detected() {
+        let wf = HandleGeminiQuota::default();
+        let detection = Detection {
+            rule_id: "gemini.rate_limit.detected".to_string(),
+            agent_type: AgentType::Gemini,
+            event_type: "rate_limit.detected".to_string(),
+            severity: Severity::Critical,
+            confidence: 0.95,
+            extracted: serde_json::json!({"retry_after": "10 minutes"}),
+            matched_text: "resource exhausted".to_string(),
+            span: (0, 18),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
     fn handle_gemini_quota_ignores_codex_usage() {
         let wf = HandleGeminiQuota::default();
         let detection = Detection {
@@ -7948,7 +7990,9 @@ Try again at 3:00 PM UTC.
     fn handle_gemini_quota_trigger_event_types() {
         let wf = HandleGeminiQuota::default();
         let types = wf.trigger_event_types();
-        assert_eq!(types, &["usage.warning", "usage.reached"]);
+        assert!(types.contains(&"usage.warning"));
+        assert!(types.contains(&"usage.reached"));
+        assert!(types.contains(&"rate_limit.detected"));
     }
 
     #[test]
@@ -7985,6 +8029,17 @@ Try again at 3:00 PM UTC.
         let (quota_type, remaining) = HandleGeminiQuota::classify_quota(&trigger);
         assert_eq!(quota_type, "quota_reached");
         assert_eq!(remaining, Some("0".to_string()));
+    }
+
+    #[test]
+    fn handle_gemini_quota_classify_rate_limit_detected() {
+        let trigger = serde_json::json!({
+            "event_type": "rate_limit.detected",
+            "extracted": { "retry_after": "10 minutes" }
+        });
+        let (quota_type, remaining) = HandleGeminiQuota::classify_quota(&trigger);
+        assert_eq!(quota_type, "quota_reached");
+        assert!(remaining.is_none());
     }
 
     #[test]
@@ -9569,6 +9624,25 @@ Try again at 3:00 PM UTC.
             confidence: 1.0,
             extracted: serde_json::Value::Null,
             matched_text: "You've hit your usage limit".to_string(),
+            span: (0, 0),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn usage_limit_workflow_handles_codex_rate_limit_events() {
+        let wf = HandleUsageLimits::new();
+
+        let detection = Detection {
+            rule_id: "codex.rate_limit.detected".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "rate_limit.detected".to_string(),
+            severity: Severity::Critical,
+            confidence: 1.0,
+            extracted: serde_json::json!({
+                "retry_after": "5 minutes"
+            }),
+            matched_text: "rate limit exceeded; retry after 5 minutes".to_string(),
             span: (0, 0),
         };
         assert!(wf.handles(&detection));

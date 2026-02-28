@@ -586,6 +586,45 @@ impl Workflow for HandleCompaction {
 }
 
 /// Handle usage limits workflow: exit agent, persist session, and select new account.
+static RATE_LIMIT_TRACKER: LazyLock<
+    crate::runtime_compat::Mutex<crate::rate_limit_tracker::RateLimitTracker>,
+> = LazyLock::new(|| {
+    crate::runtime_compat::Mutex::new(crate::rate_limit_tracker::RateLimitTracker::new())
+});
+
+fn trigger_agent_type(trigger: &serde_json::Value) -> crate::patterns::AgentType {
+    match trigger
+        .get("agent_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+    {
+        "codex" => crate::patterns::AgentType::Codex,
+        "claude_code" => crate::patterns::AgentType::ClaudeCode,
+        "gemini" => crate::patterns::AgentType::Gemini,
+        "wezterm" => crate::patterns::AgentType::Wezterm,
+        _ => crate::patterns::AgentType::Unknown,
+    }
+}
+
+fn trigger_is_rate_limit(trigger: &serde_json::Value) -> bool {
+    trigger
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|event| event == "rate_limit.detected")
+        || trigger
+            .get("rule_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|rule_id| rule_id.contains("rate_limit"))
+}
+
+fn trigger_retry_after(trigger: &serde_json::Value) -> Option<String> {
+    trigger
+        .get("extracted")
+        .and_then(|v| v.get("retry_after"))
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
 pub struct HandleUsageLimits;
 
 impl HandleUsageLimits {
@@ -611,8 +650,10 @@ impl Workflow for HandleUsageLimits {
     }
 
     fn handles(&self, detection: &crate::patterns::Detection) -> bool {
-        detection.rule_id.contains("usage")
-            && detection.agent_type == crate::patterns::AgentType::Codex
+        detection.agent_type == crate::patterns::AgentType::Codex
+            && (detection.rule_id.contains("usage")
+                || detection.event_type == "rate_limit.detected"
+                || detection.rule_id.contains("rate_limit"))
     }
 
     fn steps(&self) -> Vec<WorkflowStep> {
@@ -650,6 +691,7 @@ impl Workflow for HandleUsageLimits {
                         .get("extracted")
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
+                    let is_rate_limit = trigger_is_rate_limit(&trigger);
 
                     if let Err(err) = storage
                         .record_usage_metric(crate::storage::UsageMetricRecord {
@@ -680,6 +722,31 @@ impl Workflow for HandleUsageLimits {
                             error = %err,
                             "handle_usage_limits: failed to record rate limit metric"
                         );
+                    }
+
+                    if is_rate_limit {
+                        let tracker_agent_type = trigger_agent_type(&trigger);
+                        if tracker_agent_type != crate::patterns::AgentType::Unknown {
+                            let retry_after = trigger_retry_after(&trigger);
+                            let mut tracker = RATE_LIMIT_TRACKER.lock().await;
+                            tracker.record(
+                                pane_id,
+                                tracker_agent_type,
+                                rule_id.unwrap_or("unknown").to_string(),
+                                retry_after,
+                            );
+                            tracker.gc();
+                            let summary = tracker.provider_status(tracker_agent_type);
+                            tracing::info!(
+                                pane_id,
+                                agent_type = %summary.agent_type,
+                                status = ?summary.status,
+                                limited_panes = summary.limited_pane_count,
+                                total_panes = summary.total_pane_count,
+                                earliest_clear_secs = summary.earliest_clear_secs,
+                                "handle_usage_limits: updated provider rate-limit tracker"
+                            );
+                        }
                     }
 
                     let caps = ctx_clone.capabilities();
@@ -737,6 +804,23 @@ impl Workflow for HandleUsageLimits {
                     }
                 }
                 2 => {
+                    let trigger = ctx_clone
+                        .trigger()
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let rate_limit_summary = if trigger_is_rate_limit(&trigger) {
+                        let tracker_agent_type = trigger_agent_type(&trigger);
+                        if tracker_agent_type == crate::patterns::AgentType::Unknown {
+                            None
+                        } else {
+                            let mut tracker = RATE_LIMIT_TRACKER.lock().await;
+                            tracker.gc();
+                            Some(tracker.provider_status(tracker_agent_type))
+                        }
+                    } else {
+                        None
+                    };
+
                     let caut_client = crate::caut::CautClient::new();
                     let config = crate::accounts::AccountSelectionConfig::default();
                     let result = refresh_and_select_account(&caut_client, &storage, &config).await;
@@ -756,8 +840,30 @@ impl Workflow for HandleUsageLimits {
                                         "handle_usage_limits: selected account has low remaining quota"
                                     );
                                 }
+                                if let Some(summary) = rate_limit_summary.as_ref() {
+                                    if matches!(
+                                        summary.status,
+                                        crate::rate_limit_tracker::ProviderRateLimitStatus::FullyLimited
+                                    ) {
+                                        tracing::warn!(
+                                            pane_id,
+                                            limited_panes = summary.limited_pane_count,
+                                            total_panes = summary.total_pane_count,
+                                            earliest_clear_secs = summary.earliest_clear_secs,
+                                            "handle_usage_limits: selected account while provider remains fully rate-limited"
+                                        );
+                                    }
+                                }
                                 // Account available — proceed with failover
-                                let json = serde_json::to_value(&selection).unwrap_or_default();
+                                let mut json = serde_json::to_value(&selection).unwrap_or_default();
+                                if let Some(summary) = rate_limit_summary {
+                                    if let Some(obj) = json.as_object_mut() {
+                                        obj.insert(
+                                            "provider_rate_limit_status".to_string(),
+                                            serde_json::to_value(summary).unwrap_or_default(),
+                                        );
+                                    }
+                                }
                                 StepResult::done(json)
                             } else {
                                 // All accounts exhausted — enter safe fallback path (wa-4r7)
@@ -776,12 +882,20 @@ impl Workflow for HandleUsageLimits {
                                     &accounts,
                                     selection.explanation,
                                 );
+                                let tracker_retry_after_ms = rate_limit_summary
+                                    .as_ref()
+                                    .and_then(|summary| {
+                                        i64::try_from(summary.earliest_clear_secs)
+                                            .ok()
+                                            .and_then(|secs| secs.checked_mul(1000))
+                                    })
+                                    .and_then(|delta_ms| now_ms().checked_add(delta_ms));
 
                                 let plan = build_all_accounts_exhausted_plan(
                                     pane_id,
                                     exhaustion.accounts_checked,
                                     None, // resume_session_id not available at this step
-                                    exhaustion.earliest_reset_ms,
+                                    exhaustion.earliest_reset_ms.or(tracker_retry_after_ms),
                                     now_ms(),
                                 );
 
@@ -792,8 +906,18 @@ impl Workflow for HandleUsageLimits {
                                     earliest_reset_account = ?exhaustion.earliest_reset_account,
                                     "handle_usage_limits: built fallback plan"
                                 );
-
-                                fallback_plan_to_step_result(&plan)
+                                let mut result = fallback_plan_to_step_result(&plan);
+                                if let Some(summary) = rate_limit_summary {
+                                    if let StepResult::Done { result: payload } = &mut result {
+                                        if let Some(obj) = payload.as_object_mut() {
+                                            obj.insert(
+                                                "provider_rate_limit_status".to_string(),
+                                                serde_json::to_value(summary).unwrap_or_default(),
+                                            );
+                                        }
+                                    }
+                                }
+                                result
                             }
                         }
                         Err(e) => {

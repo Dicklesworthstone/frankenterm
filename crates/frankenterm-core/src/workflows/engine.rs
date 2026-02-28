@@ -402,7 +402,9 @@ pub(super) fn step_error_code_from_result(step_result: &StepResult) -> Option<St
     }
 }
 
-pub(super) fn policy_summary_from_injection(result: &crate::policy::InjectionResult) -> Option<String> {
+pub(super) fn policy_summary_from_injection(
+    result: &crate::policy::InjectionResult,
+) -> Option<String> {
     use crate::policy::InjectionResult;
 
     let mut obj = serde_json::Map::new();
@@ -498,7 +500,9 @@ fn policy_error_code_from_decision(
     }
 }
 
-pub(super) fn policy_error_code_from_injection(result: &crate::policy::InjectionResult) -> Option<String> {
+pub(super) fn policy_error_code_from_injection(
+    result: &crate::policy::InjectionResult,
+) -> Option<String> {
     match result {
         crate::policy::InjectionResult::Denied { decision, .. }
         | crate::policy::InjectionResult::RequiresApproval { decision, .. } => {
@@ -718,6 +722,3 @@ pub(super) async fn record_workflow_terminal_action(
         }
     }
 }
-
-
-

@@ -1353,11 +1353,18 @@ impl HandleClaudeCodeLimits {
         let reset_time = extracted
             .and_then(|e| e.get("reset_time"))
             .and_then(|v| v.as_str())
-            .map(ToString::to_string);
+            .map(ToString::to_string)
+            .or_else(|| {
+                extracted
+                    .and_then(|e| e.get("retry_after"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+            });
 
         let limit_type = match event_type {
             "usage.warning" => "usage_warning",
             "usage.reached" => "usage_reached",
+            "rate_limit.detected" => "rate_limit_detected",
             _ => "unknown_limit",
         };
 
@@ -1385,6 +1392,17 @@ impl HandleClaudeCodeLimits {
                     steps.push("Wait for the limit to reset (see reset_time)");
                 }
                 steps.push("Or start a new Claude Code session manually");
+                steps
+            }
+            "rate_limit_detected" => {
+                let mut steps = vec![
+                    "Provider rate limit detected for this session",
+                    "Do not send further input until throttling clears",
+                ];
+                if reset_time.is_some() {
+                    steps.push("Wait until retry window expires (see reset_time)");
+                }
+                steps.push("Or switch to another account/session manually");
                 steps
             }
             _ => vec!["Unknown limit type; check pane output for details"],
@@ -1419,12 +1437,12 @@ impl Workflow for HandleClaudeCodeLimits {
         detection.agent_type == crate::patterns::AgentType::ClaudeCode
             && matches!(
                 detection.event_type.as_str(),
-                "usage.warning" | "usage.reached"
+                "usage.warning" | "usage.reached" | "rate_limit.detected"
             )
     }
 
     fn trigger_event_types(&self) -> &'static [&'static str] {
-        &["usage.warning", "usage.reached"]
+        &["usage.warning", "usage.reached", "rate_limit.detected"]
     }
 
     fn supported_agent_types(&self) -> &'static [&'static str] {
@@ -1612,7 +1630,7 @@ const GEMINI_QUOTA_COOLDOWN_MS: i64 = 10 * 60 * 1000;
 /// automated account rotation. It:
 ///   1. Guards against unsafe pane states.
 ///   2. Applies a cooldown to avoid spamming on repeated events.
-///   3. Classifies the quota type (warning vs reached).
+///   3. Classifies the quota type (warning vs reached/rate-limited).
 ///   4. Persists an audit record and produces a recovery plan.
 pub struct HandleGeminiQuota {
     pub cooldown_ms: i64,
@@ -1647,6 +1665,7 @@ impl HandleGeminiQuota {
         let quota_type = match event_type {
             "usage.warning" => "quota_warning",
             "usage.reached" => "quota_reached",
+            "rate_limit.detected" => "quota_reached",
             _ => "unknown_quota",
         };
 
@@ -1702,12 +1721,12 @@ impl Workflow for HandleGeminiQuota {
         detection.agent_type == crate::patterns::AgentType::Gemini
             && matches!(
                 detection.event_type.as_str(),
-                "usage.warning" | "usage.reached"
+                "usage.warning" | "usage.reached" | "rate_limit.detected"
             )
     }
 
     fn trigger_event_types(&self) -> &'static [&'static str] {
-        &["usage.warning", "usage.reached"]
+        &["usage.warning", "usage.reached", "rate_limit.detected"]
     }
 
     fn supported_agent_types(&self) -> &'static [&'static str] {
