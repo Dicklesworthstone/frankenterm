@@ -26,6 +26,77 @@ use crate::process_tree::{PaneActivity, ProcessTree, infer_activity};
 use crate::process_triage::{ClassifiedProcess, ProcessContext, TriagePlan, build_plan, classify};
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the pane lifecycle engine.
+///
+/// Uses plain `u64` because `PaneLifecycleEngine` methods take `&mut self`.
+#[derive(Debug, Clone, Default)]
+pub struct PaneLifecycleTelemetry {
+    /// Total health_check() invocations.
+    health_checks: u64,
+    /// New panes registered (first health_check for a pane ID).
+    panes_registered: u64,
+    /// Total panes removed via remove_pane().
+    panes_removed: u64,
+    /// health_check actions recommending None.
+    actions_none: u64,
+    /// health_check actions recommending Warn.
+    actions_warn: u64,
+    /// health_check actions recommending Review.
+    actions_review: u64,
+    /// health_check actions recommending GracefulKill.
+    actions_graceful_kill: u64,
+    /// health_check actions recommending ForceKill.
+    actions_force_kill: u64,
+}
+
+impl PaneLifecycleTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> PaneLifecycleTelemetrySnapshot {
+        PaneLifecycleTelemetrySnapshot {
+            health_checks: self.health_checks,
+            panes_registered: self.panes_registered,
+            panes_removed: self.panes_removed,
+            actions_none: self.actions_none,
+            actions_warn: self.actions_warn,
+            actions_review: self.actions_review,
+            actions_graceful_kill: self.actions_graceful_kill,
+            actions_force_kill: self.actions_force_kill,
+        }
+    }
+}
+
+/// Serializable snapshot of pane lifecycle engine telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneLifecycleTelemetrySnapshot {
+    /// Total health_check() invocations.
+    pub health_checks: u64,
+    /// New panes registered.
+    pub panes_registered: u64,
+    /// Total panes removed.
+    pub panes_removed: u64,
+    /// Actions recommending None.
+    pub actions_none: u64,
+    /// Actions recommending Warn.
+    pub actions_warn: u64,
+    /// Actions recommending Review.
+    pub actions_review: u64,
+    /// Actions recommending GracefulKill.
+    pub actions_graceful_kill: u64,
+    /// Actions recommending ForceKill.
+    pub actions_force_kill: u64,
+}
+
+// =============================================================================
 // Health Status
 // =============================================================================
 
@@ -215,6 +286,8 @@ struct PaneState {
 pub struct PaneLifecycleEngine {
     config: LifecycleConfig,
     pane_states: Vec<PaneState>,
+    /// Operational telemetry counters.
+    telemetry: PaneLifecycleTelemetry,
 }
 
 impl PaneLifecycleEngine {
@@ -224,6 +297,7 @@ impl PaneLifecycleEngine {
         Self {
             config,
             pane_states: Vec::new(),
+            telemetry: PaneLifecycleTelemetry::new(),
         }
     }
 
@@ -274,6 +348,8 @@ impl PaneLifecycleEngine {
         cpu_percent: f64,
         tree: Option<&ProcessTree>,
     ) -> (PaneHealthSample, LifecycleAction) {
+        self.telemetry.health_checks += 1;
+
         let health = self.classify_health(age, cpu_percent);
 
         let (rss_kb, child_count, activity) = tree
@@ -300,6 +376,12 @@ impl PaneLifecycleEngine {
         // Capture config before mutable borrow.
         let trend_window = self.config.trend_window;
 
+        // Track new pane registration.
+        let is_new = !self.pane_states.iter().any(|s| s.pane_id == pane_id);
+        if is_new {
+            self.telemetry.panes_registered += 1;
+        }
+
         // Get or create pane state.
         let state = self.ensure_pane_state(pane_id, root_pid, age);
         state.last_health = health;
@@ -313,6 +395,16 @@ impl PaneLifecycleEngine {
 
         // Determine action.
         let action = self.recommend_action(pane_id, health, &sample);
+
+        // Track action type.
+        match &action {
+            LifecycleAction::None => self.telemetry.actions_none += 1,
+            LifecycleAction::Warn { .. } => self.telemetry.actions_warn += 1,
+            LifecycleAction::Review { .. } => self.telemetry.actions_review += 1,
+            LifecycleAction::Renice { .. } => {} // tracked elsewhere if needed
+            LifecycleAction::GracefulKill { .. } => self.telemetry.actions_graceful_kill += 1,
+            LifecycleAction::ForceKill { .. } => self.telemetry.actions_force_kill += 1,
+        }
 
         (sample, action)
     }
@@ -408,7 +500,11 @@ impl PaneLifecycleEngine {
 
     /// Remove tracking state for a pane (e.g., when closed).
     pub fn remove_pane(&mut self, pane_id: u64) {
+        let before = self.pane_states.len();
         self.pane_states.retain(|s| s.pane_id != pane_id);
+        if self.pane_states.len() < before {
+            self.telemetry.panes_removed += 1;
+        }
     }
 
     /// Get all panes currently classified as reapable.
@@ -430,6 +526,12 @@ impl PaneLifecycleEngine {
             .filter(|s| s.last_health.needs_review())
             .map(|s| s.pane_id)
             .collect()
+    }
+
+    /// Access telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &PaneLifecycleTelemetry {
+        &self.telemetry
     }
 
     // ========================================================================
