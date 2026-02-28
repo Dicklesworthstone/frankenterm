@@ -1082,6 +1082,90 @@ mod tests {
         }
     }
 
+    // -- Telemetry --
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let c = PriorityClassifier::new(make_config());
+        let snap = c.telemetry();
+        assert_eq!(snap.panes_registered, 0);
+        assert_eq!(snap.panes_unregistered, 0);
+        assert_eq!(snap.classifications, 0);
+        assert_eq!(snap.signals_observed, 0);
+        assert_eq!(snap.overrides_set, 0);
+        assert_eq!(snap.overrides_cleared, 0);
+    }
+
+    #[test]
+    fn telemetry_register_counted() {
+        let c = PriorityClassifier::new(make_config());
+        c.register_pane(1);
+        c.register_pane(2);
+        let snap = c.telemetry();
+        assert_eq!(snap.panes_registered, 2);
+    }
+
+    #[test]
+    fn telemetry_unregister_counted() {
+        let c = PriorityClassifier::new(make_config());
+        c.register_pane(1);
+        c.unregister_pane(1);
+        let snap = c.telemetry();
+        assert_eq!(snap.panes_unregistered, 1);
+    }
+
+    #[test]
+    fn telemetry_classify_counted() {
+        let c = PriorityClassifier::new(make_config());
+        c.register_pane(1);
+        c.classify(1);
+        let snap = c.telemetry();
+        assert!(snap.classifications >= 1);
+    }
+
+    #[test]
+    fn telemetry_signal_counted() {
+        let c = PriorityClassifier::new(make_config());
+        c.register_pane(1);
+        c.observe_signal(
+            1,
+            &PrioritySignal {
+                event_type: "error".to_string(),
+                severity: 2,
+                observed_at: Instant::now(),
+            },
+        );
+        let snap = c.telemetry();
+        assert_eq!(snap.signals_observed, 1);
+    }
+
+    #[test]
+    fn telemetry_override_counted() {
+        let c = PriorityClassifier::new(make_config());
+        c.register_pane(1);
+        c.set_override(1, PanePriority::Critical);
+        c.clear_override(1);
+        let snap = c.telemetry();
+        assert_eq!(snap.overrides_set, 1);
+        assert_eq!(snap.overrides_cleared, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let snap = PriorityClassifierTelemetrySnapshot {
+            panes_registered: 10,
+            panes_unregistered: 3,
+            classifications: 50,
+            signals_observed: 20,
+            overrides_set: 5,
+            overrides_cleared: 2,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: PriorityClassifierTelemetrySnapshot =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
     // -- Proptest --
 
     #[cfg(test)]

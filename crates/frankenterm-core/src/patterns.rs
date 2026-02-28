@@ -5588,4 +5588,55 @@ rules:
         );
         assert_eq!(detections[0].matched_text, "foo");
     }
+
+    // -- Telemetry ----------------------------------------------------------
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let engine = PatternEngine::new();
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans_total, 0);
+        assert_eq!(snap.matches_total, 0);
+        assert_eq!(snap.quick_rejects, 0);
+        assert_eq!(snap.bloom_checks, 0);
+        assert_eq!(snap.bloom_positives, 0);
+        assert_eq!(snap.bloom_rejects, 0);
+        assert_eq!(snap.candidate_rules_evaluated, 0);
+        assert_eq!(snap.regex_evaluations, 0);
+    }
+
+    #[test]
+    fn telemetry_scan_counted() {
+        let engine = PatternEngine::new();
+        engine.detect("hello world");
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans_total, 1);
+    }
+
+    #[test]
+    fn telemetry_multiple_scans_counted() {
+        let engine = PatternEngine::new();
+        engine.detect("hello");
+        engine.detect("world");
+        engine.detect("test");
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans_total, 3);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let snap = PatternTelemetrySnapshot {
+            scans_total: 100,
+            matches_total: 50,
+            quick_rejects: 20,
+            bloom_checks: 80,
+            bloom_positives: 30,
+            bloom_rejects: 50,
+            candidate_rules_evaluated: 45,
+            regex_evaluations: 40,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: PatternTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
 }

@@ -881,4 +881,65 @@ mod tests {
         tracker.gc_at(now + Duration::from_secs(15));
         assert_eq!(tracker.tracked_pane_count(), 0);
     }
+
+    // -- Telemetry ----------------------------------------------------------
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let tracker = RateLimitTracker::new();
+        let snap = tracker.telemetry().snapshot();
+        assert_eq!(snap.events_recorded, 0);
+        assert_eq!(snap.panes_evicted_lru, 0);
+        assert_eq!(snap.panes_removed, 0);
+        assert_eq!(snap.gc_runs, 0);
+        assert_eq!(snap.gc_panes_collected, 0);
+        assert_eq!(snap.events_pruned, 0);
+    }
+
+    #[test]
+    fn telemetry_record_counted() {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+        tracker.record_at(1, AgentType::ClaudeCode, "r1".into(), None, now);
+        tracker.record_at(2, AgentType::ClaudeCode, "r1".into(), None, now);
+        let snap = tracker.telemetry().snapshot();
+        assert_eq!(snap.events_recorded, 2);
+    }
+
+    #[test]
+    fn telemetry_remove_pane_counted() {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+        tracker.record_at(1, AgentType::ClaudeCode, "r1".into(), None, now);
+        tracker.remove_pane(1);
+        let snap = tracker.telemetry().snapshot();
+        assert_eq!(snap.panes_removed, 1);
+    }
+
+    #[test]
+    fn telemetry_gc_counted() {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+        tracker.record_at(1, AgentType::ClaudeCode, "r1".into(), None, now);
+        // GC after cooldown expires
+        tracker.gc_at(now + Duration::from_secs(600));
+        let snap = tracker.telemetry().snapshot();
+        assert_eq!(snap.gc_runs, 1);
+        assert!(snap.gc_panes_collected >= 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let snap = RateLimitTelemetrySnapshot {
+            events_recorded: 100,
+            panes_evicted_lru: 5,
+            panes_removed: 10,
+            gc_runs: 3,
+            gc_panes_collected: 8,
+            events_pruned: 20,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: RateLimitTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
 }

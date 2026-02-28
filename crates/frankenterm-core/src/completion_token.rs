@@ -1574,4 +1574,149 @@ mod tests {
         let ms = now_ms();
         assert!(ms > 0, "epoch ms should be positive");
     }
+
+    // -- Telemetry ----------------------------------------------------------
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let tracker = CompletionTracker::new(test_config());
+        let snap = tracker.telemetry().snapshot();
+        assert_eq!(snap.tokens_requested, 0);
+        assert_eq!(snap.tokens_created, 0);
+        assert_eq!(snap.tokens_rejected, 0);
+        assert_eq!(snap.advances, 0);
+        assert_eq!(snap.completions, 0);
+        assert_eq!(snap.failures, 0);
+        assert_eq!(snap.timeouts, 0);
+        assert_eq!(snap.partial_failures, 0);
+        assert_eq!(snap.evictions, 0);
+    }
+
+    #[test]
+    fn telemetry_begin_counted() {
+        let mut tracker = CompletionTracker::new(test_config());
+        let boundary = CompletionBoundary::new(&["a"]);
+        tracker.begin("op1", boundary);
+        let snap = tracker.telemetry().snapshot();
+        assert_eq!(snap.tokens_requested, 1);
+        assert_eq!(snap.tokens_created, 1);
+        assert_eq!(snap.tokens_rejected, 0);
+    }
+
+    #[test]
+    fn telemetry_rejection_counted() {
+        let mut tracker = CompletionTracker::new(CompletionTrackerConfig {
+            max_active_tokens: 1,
+            ..test_config()
+        });
+        let b1 = CompletionBoundary::new(&["a"]);
+        let b2 = CompletionBoundary::new(&["a"]);
+        tracker.begin("op1", b1);
+        tracker.begin("op2", b2); // should be rejected
+        let snap = tracker.telemetry().snapshot();
+        assert_eq!(snap.tokens_requested, 2);
+        assert_eq!(snap.tokens_created, 1);
+        assert_eq!(snap.tokens_rejected, 1);
+    }
+
+    #[test]
+    fn telemetry_advance_counted() {
+        let mut tracker = CompletionTracker::new(test_config());
+        let boundary = CompletionBoundary::new(&["a", "b"]);
+        let id = tracker.begin("op1", boundary).unwrap();
+        tracker.advance(&id, "a", StepOutcome::Ok, "done");
+        let snap = tracker.telemetry().snapshot();
+        assert_eq!(snap.advances, 1);
+    }
+
+    #[test]
+    fn telemetry_completion_counted() {
+        let mut tracker = CompletionTracker::new(test_config());
+        let boundary = CompletionBoundary::new(&["a"]);
+        let id = tracker.begin("op1", boundary).unwrap();
+        tracker.advance(&id, "a", StepOutcome::Ok, "done");
+        let snap = tracker.telemetry().snapshot();
+        assert_eq!(snap.completions, 1);
+    }
+
+    #[test]
+    fn telemetry_failure_counted() {
+        let mut tracker = CompletionTracker::new(test_config());
+        let boundary = CompletionBoundary::new(&["a"]);
+        let id = tracker.begin("op1", boundary).unwrap();
+        tracker.fail(&id, "broken");
+        let snap = tracker.telemetry().snapshot();
+        assert_eq!(snap.failures, 1);
+    }
+
+    #[test]
+    fn telemetry_timeout_counted() {
+        let mut tracker = CompletionTracker::new(test_config());
+        let boundary = CompletionBoundary::new(&["a"]);
+        let id = tracker.begin("op1", boundary).unwrap();
+        tracker.timeout(&id);
+        let snap = tracker.telemetry().snapshot();
+        assert_eq!(snap.timeouts, 1);
+    }
+
+    #[test]
+    fn telemetry_eviction_counted() {
+        let mut tracker = CompletionTracker::new(CompletionTrackerConfig {
+            retention_ms: 0,
+            ..test_config()
+        });
+        let boundary = CompletionBoundary::new(&["a"]);
+        let id = tracker.begin("op1", boundary).unwrap();
+        tracker.advance(&id, "a", StepOutcome::Ok, "done");
+        // completed token with 0 retention should be evicted
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let evicted = tracker.evict_completed();
+        assert!(evicted >= 1);
+        let snap = tracker.telemetry().snapshot();
+        assert!(snap.evictions >= 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let snap = CompletionTrackerTelemetrySnapshot {
+            tokens_requested: 100,
+            tokens_created: 90,
+            tokens_rejected: 10,
+            advances: 200,
+            completions: 50,
+            failures: 5,
+            timeouts: 3,
+            partial_failures: 2,
+            evictions: 30,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CompletionTrackerTelemetrySnapshot =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn telemetry_combined_operations() {
+        let mut tracker = CompletionTracker::new(test_config());
+
+        // 2 tokens: one completes, one times out
+        let b1 = CompletionBoundary::new(&["a"]);
+        let b2 = CompletionBoundary::new(&["x"]);
+        let id1 = tracker.begin("op1", b1).unwrap();
+        let id2 = tracker.begin("op2", b2).unwrap();
+        tracker.advance(&id1, "a", StepOutcome::Ok, "done");
+        tracker.timeout(&id2);
+
+        let snap = tracker.telemetry().snapshot();
+        assert_eq!(snap.tokens_requested, 2);
+        assert_eq!(snap.tokens_created, 2);
+        assert_eq!(snap.advances, 1);
+        assert_eq!(snap.completions, 1);
+        assert_eq!(snap.timeouts, 1);
+        assert_eq!(
+            snap.completions + snap.failures + snap.timeouts + snap.partial_failures,
+            2,
+            "terminal states should sum to 2"
+        );
+    }
 }
