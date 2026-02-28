@@ -462,6 +462,79 @@ fn bench_telemetry_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+use frankenterm_core::events::EventDeduplicator;
+use frankenterm_core::patterns::AgentType;
+use frankenterm_core::rate_limit_tracker::RateLimitTracker;
+use frankenterm_core::ring_buffer::RingBuffer;
+use std::time::{Duration, Instant};
+
+/// Benchmark cap enforcement overhead for EventDeduplicator under sustained
+/// churn: insert N unique keys into a cap-C deduplicator, measuring throughput
+/// of check() calls including eviction overhead.
+fn bench_cap_enforcement(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fork_hardening/cap_enforcement");
+
+    // EventDeduplicator: measure overhead of LRU eviction at capacity
+    for &cap in &[100_usize, 500, 2000] {
+        group.throughput(Throughput::Elements(10_000));
+        group.bench_with_input(
+            BenchmarkId::new("dedup_churn", cap),
+            &cap,
+            |b, &cap| {
+                b.iter(|| {
+                    let mut dedup = EventDeduplicator::with_config(
+                        Duration::from_secs(3600),
+                        cap,
+                    );
+                    for i in 0u64..10_000 {
+                        let key = format!("evt_{i}");
+                        black_box(dedup.check(&key));
+                    }
+                });
+            },
+        );
+    }
+
+    // RateLimitTracker: measure overhead of pane LRU eviction at 256 cap
+    group.throughput(Throughput::Elements(500));
+    group.bench_function("rate_tracker_pane_churn", |b| {
+        b.iter(|| {
+            let mut tracker = RateLimitTracker::new();
+            let now = Instant::now();
+            for i in 0u64..500 {
+                tracker.record_at(
+                    i,
+                    AgentType::ClaudeCode,
+                    format!("r_{}", i % 10),
+                    None,
+                    now + Duration::from_millis(i),
+                );
+            }
+            black_box(tracker.tracked_pane_count());
+        });
+    });
+
+    // RingBuffer: measure throughput including eviction at various capacities
+    for &cap in &[64_usize, 256, 1024] {
+        group.throughput(Throughput::Elements(50_000));
+        group.bench_with_input(
+            BenchmarkId::new("ring_buffer_churn", cap),
+            &cap,
+            |b, &cap| {
+                b.iter(|| {
+                    let mut ring = RingBuffer::new(cap);
+                    for i in 0u32..50_000 {
+                        black_box(ring.push(i));
+                    }
+                    black_box(ring.total_evicted());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("fork_hardening_benchmarks", BUDGETS);
     Criterion::default().configure_from_args()
@@ -475,6 +548,7 @@ criterion_group!(
         bench_spsc_throughput,
         bench_diff_capture,
         bench_snapshot_save_cycle,
-        bench_telemetry_overhead
+        bench_telemetry_overhead,
+        bench_cap_enforcement
 );
 criterion_main!(benches);
