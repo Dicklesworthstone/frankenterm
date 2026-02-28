@@ -20,6 +20,7 @@ workspace = true
 
 [dependencies]
 frankenterm-core.workspace = true
+frankenterm-alloc = { workspace = true, optional = true }
 clap.workspace = true
 chrono.workspace = true
 serde.workspace = true
@@ -59,6 +60,7 @@ sync = ["frankenterm-core/sync"]
 asupersync-runtime = ["frankenterm-core/asupersync-runtime"]
 semantic-search = ["frankenterm-core/semantic-search"]
 redis-session = ["frankenterm-core/redis-session"]
+jemalloc = ["dep:frankenterm-alloc", "frankenterm-alloc/jemalloc"]
 
 [dev-dependencies]
 assert_cmd = "2.1.2"

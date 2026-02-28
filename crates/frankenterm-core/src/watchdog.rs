@@ -406,6 +406,12 @@ pub struct MuxHealthSample {
     pub ping_latency_ms: Option<u64>,
     /// Resident set size in bytes (None if unavailable).
     pub rss_bytes: Option<u64>,
+    /// Backend-specific warning lines surfaced by `WeztermInterface::watchdog_warnings`.
+    #[serde(default)]
+    pub watchdog_warnings: Vec<String>,
+    /// Number of warning lines captured during this check.
+    #[serde(default)]
+    pub warning_count: usize,
     /// Health status derived from this sample.
     pub status: HealthStatus,
 }
@@ -430,6 +436,54 @@ pub struct MuxWatchdog {
     consecutive_failures: u32,
     total_checks: u64,
     total_failures: u64,
+}
+
+#[derive(Debug, Clone)]
+enum WarningProbeOutcome {
+    Ok(Vec<String>),
+    Error(String),
+}
+
+fn warning_status_from_line(line: &str) -> Option<HealthStatus> {
+    let normalized = line.to_ascii_lowercase();
+
+    if normalized.contains("hung")
+        || normalized.contains("unresponsive")
+        || normalized.contains("deadlock")
+    {
+        return Some(HealthStatus::Hung);
+    }
+
+    if normalized.contains("critical")
+        || normalized.contains("fatal")
+        || normalized.contains("circuit open")
+        || normalized.contains("panic")
+    {
+        return Some(HealthStatus::Critical);
+    }
+
+    if normalized.contains("degraded")
+        || normalized.contains("warning")
+        || normalized.contains("half-open")
+        || normalized.contains("failed")
+        || normalized.contains("timeout")
+    {
+        return Some(HealthStatus::Degraded);
+    }
+
+    None
+}
+
+fn warning_status_from_lines(lines: &[String]) -> Option<HealthStatus> {
+    if lines.is_empty() {
+        return None;
+    }
+
+    let mut derived = HealthStatus::Degraded;
+    for line in lines {
+        derived = derived.max(warning_status_from_line(line).unwrap_or(HealthStatus::Degraded));
+    }
+    Some(derived)
 }
 
 impl MuxWatchdog {
@@ -471,8 +525,31 @@ impl MuxWatchdog {
         // Memory check: get mux server RSS
         let rss_bytes = get_mux_server_rss().await;
 
-        // Determine status
-        let status = if !ping_ok {
+        // Query backend-specific warning lines (e.g., shard health warnings).
+        let warning_probe = match crate::runtime_compat::timeout(
+            self.config.ping_timeout,
+            self.wezterm.watchdog_warnings(),
+        )
+        .await
+        {
+            Ok(Ok(lines)) => WarningProbeOutcome::Ok(lines),
+            Ok(Err(err)) => WarningProbeOutcome::Error(format!(
+                "failed to query backend watchdog warnings: {err}"
+            )),
+            Err(_) => WarningProbeOutcome::Error(format!(
+                "timed out querying backend watchdog warnings after {} ms",
+                self.config.ping_timeout.as_millis()
+            )),
+        };
+
+        let mut watchdog_warnings = match warning_probe {
+            WarningProbeOutcome::Ok(lines) => lines,
+            WarningProbeOutcome::Error(err) => vec![err],
+        };
+        watchdog_warnings.retain(|line| !line.trim().is_empty());
+
+        // Determine baseline status from ping/memory checks.
+        let mut status = if !ping_ok {
             self.consecutive_failures += 1;
             self.total_failures += 1;
             if self.consecutive_failures >= self.config.failure_threshold {
@@ -489,11 +566,20 @@ impl MuxWatchdog {
             }
         };
 
+        // Fold warning severity into the final status.
+        if let Some(warning_status) = warning_status_from_lines(&watchdog_warnings) {
+            status = status.max(warning_status);
+        }
+
+        let warning_count = watchdog_warnings.len();
+
         let sample = MuxHealthSample {
             timestamp_ms: now,
             ping_ok,
             ping_latency_ms,
             rss_bytes,
+            watchdog_warnings,
+            warning_count,
             status,
         };
 
@@ -552,6 +638,8 @@ pub fn spawn_mux_watchdog(
                         info!(
                             ping_ms = sample.ping_latency_ms,
                             rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                            warning_count = sample.warning_count,
+                            warning_details = sample.watchdog_warnings.join(" | "),
                             "Mux watchdog: healthy"
                         );
                     }
@@ -561,13 +649,15 @@ pub fn spawn_mux_watchdog(
                         consecutive_failures = watchdog.consecutive_failures,
                         rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
                         ping_ok = sample.ping_ok,
+                        warning_count = sample.warning_count,
+                        warning_details = sample.watchdog_warnings.join(" | "),
                         "Mux watchdog: degraded"
                     );
                     crate::degradation::enter_degraded(
                         crate::degradation::Subsystem::WeztermCli,
                         format!(
-                            "Mux health degraded: {} consecutive failures",
-                            watchdog.consecutive_failures
+                            "Mux health degraded: {} consecutive failures, warnings={}",
+                            watchdog.consecutive_failures, sample.warning_count
                         ),
                     );
                 }
@@ -577,14 +667,17 @@ pub fn spawn_mux_watchdog(
                         rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
                         ping_ok = sample.ping_ok,
                         threshold = failure_threshold,
+                        warning_count = sample.warning_count,
+                        warning_details = sample.watchdog_warnings.join(" | "),
                         "Mux watchdog: CRITICAL — mux server unresponsive or memory critical"
                     );
                     crate::degradation::enter_degraded(
                         crate::degradation::Subsystem::WeztermCli,
                         format!(
-                            "Mux health critical: {} consecutive failures, RSS={} MB",
+                            "Mux health critical: {} consecutive failures, RSS={} MB, warnings={}",
                             watchdog.consecutive_failures,
-                            sample.rss_bytes.map_or(0, |b| b / (1024 * 1024))
+                            sample.rss_bytes.map_or(0, |b| b / (1024 * 1024)),
+                            sample.warning_count
                         ),
                     );
                 }
@@ -868,6 +961,8 @@ mod tests {
             ping_ok: true,
             ping_latency_ms: Some(5),
             rss_bytes: Some(1024 * 1024 * 100),
+            watchdog_warnings: vec![],
+            warning_count: 0,
             status: HealthStatus::Healthy,
         };
         let json = serde_json::to_string(&sample).unwrap();
@@ -913,6 +1008,8 @@ mod tests {
         let sample = watchdog.check().await;
         assert!(sample.ping_ok);
         assert_eq!(sample.status, HealthStatus::Healthy);
+        assert_eq!(sample.warning_count, 0);
+        assert!(sample.watchdog_warnings.is_empty());
         assert_eq!(watchdog.consecutive_failures, 0);
         assert_eq!(watchdog.total_checks, 1);
         assert_eq!(watchdog.history.len(), 1);
@@ -1243,6 +1340,8 @@ mod tests {
             ping_ok: false,
             ping_latency_ms: None,
             rss_bytes: Some(1024 * 1024),
+            watchdog_warnings: vec!["warning".to_string()],
+            warning_count: 1,
             status: HealthStatus::Degraded,
         };
         let report = MuxHealthReport {
@@ -1427,12 +1526,61 @@ mod tests {
             ping_ok: true,
             ping_latency_ms: Some(5),
             rss_bytes: Some(1024),
+            watchdog_warnings: vec![],
+            warning_count: 0,
             status: HealthStatus::Healthy,
         };
         let dbg = format!("{:?}", sample);
         assert!(dbg.contains("MuxHealthSample"), "got: {}", dbg);
         let cloned = sample.clone();
         assert_eq!(cloned.ping_ok, true);
+    }
+
+    #[test]
+    fn warning_status_parser_maps_expected_tokens() {
+        assert_eq!(
+            warning_status_from_line("Shard 0 degraded due to half-open circuit"),
+            Some(HealthStatus::Degraded)
+        );
+        assert_eq!(
+            warning_status_from_line("Shard 1 critical circuit open state"),
+            Some(HealthStatus::Critical)
+        );
+        assert_eq!(
+            warning_status_from_line("Mux appears hung and unresponsive"),
+            Some(HealthStatus::Hung)
+        );
+        assert_eq!(warning_status_from_line("plain note"), None);
+    }
+
+    #[tokio::test]
+    async fn mux_watchdog_escalates_on_critical_watchdog_warning() {
+        let mock = Arc::new(crate::wezterm::MockWezterm::new());
+        mock.set_watchdog_warnings(vec!["critical: shard 2 circuit open".to_string()])
+            .await;
+        let wezterm: crate::wezterm::WeztermHandle = mock;
+        let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
+
+        let sample = watchdog.check().await;
+        assert!(sample.ping_ok);
+        assert_eq!(sample.status, HealthStatus::Critical);
+        assert_eq!(sample.warning_count, 1);
+        assert!(sample.watchdog_warnings[0].contains("critical"));
+    }
+
+    #[tokio::test]
+    async fn mux_watchdog_warning_probe_failure_marks_degraded() {
+        let mock = Arc::new(crate::wezterm::MockWezterm::new());
+        mock.set_watchdog_warning_error(Some("probe transport unavailable".to_string()))
+            .await;
+        let wezterm: crate::wezterm::WeztermHandle = mock;
+        let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
+
+        let sample = watchdog.check().await;
+        assert!(sample.ping_ok);
+        assert_eq!(sample.status, HealthStatus::Degraded);
+        assert_eq!(sample.warning_count, 1);
+        assert!(sample.watchdog_warnings[0].contains("failed to query"));
     }
 
     // -- MuxHealthReport --

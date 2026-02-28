@@ -4312,7 +4312,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0].payload {
             crate::recording::RecorderEventPayload::ControlMarker { details, .. } => {
-                assert_eq!(details["decision_type"], "policy_evaluation");
+                assert_eq!(details["decision_type"], "PolicyEvaluation");
                 assert_eq!(details["rule_id"], "policy.alt_screen");
             }
             other => panic!("expected control marker, got {other:?}"),

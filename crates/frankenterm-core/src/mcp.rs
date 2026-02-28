@@ -83,8 +83,6 @@ mod mcp_bridge;
 mod mcp_middleware;
 #[path = "mcp_missions.rs"]
 mod mcp_missions;
-#[path = "mcp_types.rs"]
-mod mcp_types;
 #[cfg(feature = "mcp-client")]
 #[path = "mcp_proxy.rs"]
 mod mcp_proxy;
@@ -92,6 +90,8 @@ mod mcp_proxy;
 mod mcp_resources;
 #[path = "mcp_tools.rs"]
 mod mcp_tools;
+#[path = "mcp_types.rs"]
+mod mcp_types;
 
 pub use mcp_bridge::{build_server, build_server_with_db, run_stdio_server};
 use mcp_middleware::{AuditedToolHandler, FormatAwareToolHandler};
@@ -110,7 +110,6 @@ use mcp_missions::{
     mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,
     mcp_tx_transition_info,
 };
-use mcp_types::*;
 use mcp_resources::{
     WaAccountsByServiceTemplateResource, WaAccountsResource, WaEventsResource,
     WaEventsTemplateResource, WaEventsUnhandledTemplateResource, WaPanesResource,
@@ -125,6 +124,7 @@ use mcp_tools::{
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
     WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
 };
+use mcp_types::*;
 
 fn effective_search_rrf_k(config: &Config) -> u32 {
     config.search.rrf_k.max(1)
@@ -152,8 +152,6 @@ fn effective_search_fusion_weights(config: &Config) -> (f32, f32) {
 fn effective_search_fusion_backend(config: &Config) -> crate::search::FusionBackend {
     crate::search::FusionBackend::parse(&config.search.fusion_backend)
 }
-
-
 
 /// Convert a PaneReservation to MCP info format
 fn reservation_to_mcp_info(r: &PaneReservation) -> McpReservationInfo {
@@ -250,8 +248,8 @@ fn resolve_workspace_id(config: &Config) -> Result<String> {
 
 fn parse_caut_service(service: &str) -> Option<CautService> {
     let normalized = service.trim();
-    if normalized.eq_ignore_ascii_case("openai") {
-        return Some(CautService::OpenAI);
+    if let Some(parsed) = CautService::from_cli_input(normalized) {
+        return Some(parsed);
     }
     let provider = AgentProvider::from_slug(normalized);
     CautService::from_provider(&provider)
@@ -1497,13 +1495,29 @@ mod tests {
             parse_caut_service("chat-gpt"),
             Some(CautService::OpenAI)
         ));
+        assert!(matches!(
+            parse_caut_service("claude"),
+            Some(CautService::Anthropic)
+        ));
+        assert!(matches!(
+            parse_caut_service("anthropic"),
+            Some(CautService::Anthropic)
+        ));
+        assert!(matches!(
+            parse_caut_service("gemini"),
+            Some(CautService::Google)
+        ));
+        assert!(matches!(
+            parse_caut_service("google"),
+            Some(CautService::Google)
+        ));
     }
 
     #[test]
     fn parse_caut_service_unknown_returns_none() {
-        assert!(parse_caut_service("google").is_none());
-        assert!(parse_caut_service("anthropic").is_none());
+        assert!(parse_caut_service("copilot").is_none());
         assert!(parse_caut_service("").is_none());
+        assert!(parse_caut_service("x-ai").is_none());
     }
 
     // ── check_refresh_cooldown tests ─────────────────────────────────────
@@ -2811,9 +2825,7 @@ mod tests {
         let kinds: Vec<&str> = transitions.iter().map(|t| t.kind.as_str()).collect();
         // Running should allow block (pause) and cancel (abort) at minimum
         assert!(
-            kinds
-                .iter()
-                .any(|k| k.contains("block")),
+            kinds.iter().any(|k| k.contains("block")),
             "Running state should have block transition, got: {kinds:?}"
         );
     }

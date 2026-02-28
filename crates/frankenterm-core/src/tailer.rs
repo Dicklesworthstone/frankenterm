@@ -1151,6 +1151,11 @@ pub struct StreamingBridge {
     dirty_range_total: u64,
     /// Aggregate dirty row count observed from render-change deltas.
     dirty_row_total: u64,
+    /// Last observed mux seqno per pane for anomaly detection.
+    #[cfg(feature = "vendored")]
+    last_mux_seqno: HashMap<u64, u64>,
+    /// Number of out-of-order or jumped seqno anomalies detected.
+    seq_anomaly_count: u64,
 }
 
 static GLOBAL_STREAMING_HEALTH: OnceLock<StdRwLock<Option<StreamingHealth>>> = OnceLock::new();
@@ -1165,6 +1170,9 @@ impl StreamingBridge {
             fallback_count: 0,
             dirty_range_total: 0,
             dirty_row_total: 0,
+            #[cfg(feature = "vendored")]
+            last_mux_seqno: HashMap::new(),
+            seq_anomaly_count: 0,
         }
     }
 
@@ -1184,12 +1192,13 @@ impl StreamingBridge {
         let event = match delta {
             crate::vendored::PaneDelta::Output {
                 pane_id,
-                seqno: _,
+                seqno,
                 delta_text,
                 title,
                 dirty_range_count,
                 dirty_row_count,
             } => {
+                let seq_anomaly = self.note_output_seqno(pane_id, seqno);
                 self.dirty_range_total = self
                     .dirty_range_total
                     .saturating_add(u64::try_from(dirty_range_count).unwrap_or(u64::MAX));
@@ -1207,10 +1216,13 @@ impl StreamingBridge {
                     pane_id,
                     data,
                     received_at: now_ms,
-                    overflow: false,
+                    overflow: seq_anomaly,
                 }
             }
             crate::vendored::PaneDelta::Gap { pane_id, reason: _ } => {
+                // After an explicit upstream gap we reset local seq tracking so
+                // the next output delta establishes a fresh baseline.
+                self.last_mux_seqno.remove(&pane_id);
                 // A gap from the subscription → treat as overflow so ingester
                 // emits a proper GAP segment.
                 StreamEvent::OutputData {
@@ -1221,6 +1233,7 @@ impl StreamingBridge {
                 }
             }
             crate::vendored::PaneDelta::Ended { pane_id, reason: _ } => {
+                self.last_mux_seqno.remove(&pane_id);
                 StreamEvent::PaneClosed { pane_id }
             }
         };
@@ -1260,10 +1273,37 @@ impl StreamingBridge {
         self.dirty_row_total
     }
 
+    /// Number of seqno anomalies detected from output deltas.
+    #[must_use]
+    pub fn seq_anomaly_count(&self) -> u64 {
+        self.seq_anomaly_count
+    }
+
     /// Access the underlying ingester for diagnostics.
     #[must_use]
     pub fn ingester(&self) -> &crate::ingest::StreamIngester {
         &self.ingester
+    }
+
+    #[cfg(feature = "vendored")]
+    fn note_output_seqno(&mut self, pane_id: u64, seqno: u64) -> bool {
+        if let Some(prev) = self.last_mux_seqno.insert(pane_id, seqno) {
+            let out_of_order = seqno <= prev;
+            let jumped = seqno > prev.saturating_add(1);
+            if out_of_order || jumped {
+                self.seq_anomaly_count = self.seq_anomaly_count.saturating_add(1);
+                debug!(
+                    pane_id,
+                    previous_seqno = prev,
+                    current_seqno = seqno,
+                    out_of_order,
+                    jumped,
+                    "streaming seq anomaly detected; emitting overflow GAP"
+                );
+                return true;
+            }
+        }
+        false
     }
 
     fn snapshot_health(&self) -> StreamingHealth {
@@ -2568,6 +2608,7 @@ mod tests {
         assert_eq!(bridge.fallback_count(), 0);
         assert_eq!(bridge.dirty_range_total(), 0);
         assert_eq!(bridge.dirty_row_total(), 0);
+        assert_eq!(bridge.seq_anomaly_count(), 0);
         assert_eq!(bridge.ingester().active_panes(), 0);
     }
 
@@ -2579,6 +2620,7 @@ mod tests {
         assert_eq!(a.fallback_count(), b.fallback_count());
         assert_eq!(a.dirty_range_total(), b.dirty_range_total());
         assert_eq!(a.dirty_row_total(), b.dirty_row_total());
+        assert_eq!(a.seq_anomaly_count(), b.seq_anomaly_count());
     }
 
     #[test]
@@ -2614,6 +2656,105 @@ mod tests {
         assert_eq!(bridge.events_processed(), 1);
         assert_eq!(bridge.dirty_range_total(), 2);
         assert_eq!(bridge.dirty_row_total(), 8);
+        assert_eq!(bridge.seq_anomaly_count(), 0);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_seq_jump_emits_gap_before_delta() {
+        use crate::ingest::CapturedSegmentKind;
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        bridge.process_delta(PaneDelta::Output {
+            pane_id: 7,
+            seqno: 10,
+            delta_text: "base".to_string(),
+            title: "bash".to_string(),
+            dirty_range_count: 1,
+            dirty_row_count: 2,
+        });
+
+        let segments = bridge.process_delta(PaneDelta::Output {
+            pane_id: 7,
+            seqno: 13,
+            delta_text: "jump".to_string(),
+            title: "bash".to_string(),
+            dirty_range_count: 1,
+            dirty_row_count: 2,
+        });
+
+        assert_eq!(segments.len(), 2);
+        assert!(matches!(segments[0].kind, CapturedSegmentKind::Gap { .. }));
+        assert_eq!(segments[1].content, "jump");
+        assert_eq!(bridge.seq_anomaly_count(), 1);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_seq_regression_emits_gap_before_delta() {
+        use crate::ingest::CapturedSegmentKind;
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        bridge.process_delta(PaneDelta::Output {
+            pane_id: 11,
+            seqno: 50,
+            delta_text: "newest".to_string(),
+            title: "bash".to_string(),
+            dirty_range_count: 1,
+            dirty_row_count: 1,
+        });
+
+        let segments = bridge.process_delta(PaneDelta::Output {
+            pane_id: 11,
+            seqno: 49,
+            delta_text: "older".to_string(),
+            title: "bash".to_string(),
+            dirty_range_count: 1,
+            dirty_row_count: 1,
+        });
+
+        assert_eq!(segments.len(), 2);
+        assert!(matches!(segments[0].kind, CapturedSegmentKind::Gap { .. }));
+        assert_eq!(segments[1].content, "older");
+        assert_eq!(bridge.seq_anomaly_count(), 1);
+    }
+
+    #[cfg(feature = "vendored")]
+    #[test]
+    fn streaming_bridge_gap_resets_seq_tracking_baseline() {
+        use crate::ingest::CapturedSegmentKind;
+        use crate::vendored::PaneDelta;
+
+        let mut bridge = StreamingBridge::new();
+        bridge.process_delta(PaneDelta::Output {
+            pane_id: 23,
+            seqno: 3,
+            delta_text: "before-gap".to_string(),
+            title: "bash".to_string(),
+            dirty_range_count: 1,
+            dirty_row_count: 1,
+        });
+
+        let _ = bridge.process_delta(PaneDelta::Gap {
+            pane_id: 23,
+            reason: "seqno jump".to_string(),
+        });
+
+        let segments = bridge.process_delta(PaneDelta::Output {
+            pane_id: 23,
+            seqno: 100,
+            delta_text: "after-gap".to_string(),
+            title: "bash".to_string(),
+            dirty_range_count: 1,
+            dirty_row_count: 1,
+        });
+
+        assert_eq!(segments.len(), 1);
+        assert!(matches!(segments[0].kind, CapturedSegmentKind::Delta));
+        assert_eq!(segments[0].content, "after-gap");
+        assert_eq!(bridge.seq_anomaly_count(), 0);
     }
 
     #[cfg(feature = "vendored")]

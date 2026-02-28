@@ -1,0 +1,24 @@
+[package]
+name = "frankenterm-alloc"
+description = "Allocator and per-pane arena helpers for FrankenTerm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["allocator", "jemalloc", "frankenterm"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+
+[dependencies]
+thiserror.workspace = true
+tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }

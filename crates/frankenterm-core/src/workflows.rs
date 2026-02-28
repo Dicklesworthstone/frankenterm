@@ -11895,7 +11895,7 @@ steps:
                     &event.payload,
                     crate::recording::RecorderEventPayload::ControlMarker { details, .. }
                         if details.get("decision_type")
-                            == Some(&serde_json::json!("workflow_step"))
+                            == Some(&serde_json::json!("WorkflowStep"))
                 )
             }),
             "expected workflow_step decision provenance event"
@@ -11906,7 +11906,7 @@ steps:
                     &event.payload,
                     crate::recording::RecorderEventPayload::ControlMarker { details, .. }
                         if details.get("decision_type")
-                            == Some(&serde_json::json!("policy_evaluation"))
+                            == Some(&serde_json::json!("PolicyEvaluation"))
                 )
             }),
             "expected policy_evaluation decision provenance event"

@@ -14,6 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand, ValueEnum};
 use frankenterm_core::logging::{LogConfig, LogError, init_logging};
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
+#[cfg(feature = "jemalloc")]
+use frankenterm_alloc as _;
 
 /// Build metadata captured at compile time.
 mod build_meta {

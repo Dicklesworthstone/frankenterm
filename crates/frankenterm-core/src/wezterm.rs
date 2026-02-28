@@ -3704,6 +3704,8 @@ impl WeztermInterface for UnifiedClient {
 pub struct MockWezterm {
     panes: crate::runtime_compat::RwLock<std::collections::HashMap<u64, MockPane>>,
     next_pane_id: std::sync::atomic::AtomicU64,
+    watchdog_warnings: crate::runtime_compat::RwLock<Vec<String>>,
+    watchdog_warning_error: crate::runtime_compat::RwLock<Option<String>>,
 }
 
 /// State of a single mock pane.
@@ -3770,6 +3772,8 @@ impl MockWezterm {
         Self {
             panes: crate::runtime_compat::RwLock::new(std::collections::HashMap::new()),
             next_pane_id: std::sync::atomic::AtomicU64::new(0),
+            watchdog_warnings: crate::runtime_compat::RwLock::new(Vec::new()),
+            watchdog_warning_error: crate::runtime_compat::RwLock::new(None),
         }
     }
 
@@ -3836,6 +3840,17 @@ impl MockWezterm {
     /// Get the number of panes.
     pub async fn pane_count(&self) -> usize {
         self.panes.read().await.len()
+    }
+
+    /// Override watchdog warnings returned by this mock.
+    pub async fn set_watchdog_warnings(&self, warnings: Vec<String>) {
+        *self.watchdog_warnings.write().await = warnings;
+        *self.watchdog_warning_error.write().await = None;
+    }
+
+    /// Configure watchdog warning probe failure behavior for this mock.
+    pub async fn set_watchdog_warning_error(&self, error: Option<String>) {
+        *self.watchdog_warning_error.write().await = error;
     }
 }
 
@@ -3997,6 +4012,15 @@ impl WeztermInterface for MockWezterm {
 
     fn circuit_status(&self) -> CircuitBreakerStatus {
         CircuitBreakerStatus::default()
+    }
+
+    fn watchdog_warnings(&self) -> WeztermFuture<'_, Vec<String>> {
+        Box::pin(async move {
+            if let Some(err) = self.watchdog_warning_error.read().await.clone() {
+                return Err(crate::Error::Runtime(err));
+            }
+            Ok(self.watchdog_warnings.read().await.clone())
+        })
     }
 }
 

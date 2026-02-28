@@ -25,6 +25,45 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the BOCPD manager.
+#[derive(Debug, Clone, Default)]
+pub struct BocpdTelemetry {
+    /// Total register_pane() calls.
+    panes_registered: u64,
+    /// Total unregister_pane() calls.
+    panes_unregistered: u64,
+    /// Total observe()/observe_text_chunk() calls.
+    observations: u64,
+    /// Change points detected across all observations.
+    change_points_detected: u64,
+}
+
+impl BocpdTelemetry {
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> BocpdTelemetrySnapshot {
+        BocpdTelemetrySnapshot {
+            panes_registered: self.panes_registered,
+            panes_unregistered: self.panes_unregistered,
+            observations: self.observations,
+            change_points_detected: self.change_points_detected,
+        }
+    }
+}
+
+/// Serializable snapshot of BOCPD telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BocpdTelemetrySnapshot {
+    pub panes_registered: u64,
+    pub panes_unregistered: u64,
+    pub observations: u64,
+    pub change_points_detected: u64,
+}
+
+// =============================================================================
 // Configuration
 // =============================================================================
 
@@ -509,6 +548,8 @@ pub struct BocpdManager {
     config: BocpdConfig,
     panes: HashMap<u64, PaneBocpd>,
     total_change_points: u64,
+    /// Operational telemetry.
+    telemetry: BocpdTelemetry,
 }
 
 impl BocpdManager {
@@ -519,11 +560,18 @@ impl BocpdManager {
             config,
             panes: HashMap::new(),
             total_change_points: 0,
+            telemetry: BocpdTelemetry::default(),
         }
+    }
+
+    /// Snapshot the current telemetry counters.
+    pub fn telemetry(&self) -> &BocpdTelemetry {
+        &self.telemetry
     }
 
     /// Register a pane for monitoring.
     pub fn register_pane(&mut self, pane_id: u64) {
+        self.telemetry.panes_registered += 1;
         self.panes
             .entry(pane_id)
             .or_insert_with(|| PaneBocpd::new(pane_id, self.config.clone()));
@@ -531,11 +579,13 @@ impl BocpdManager {
 
     /// Remove a pane.
     pub fn unregister_pane(&mut self, pane_id: u64) {
+        self.telemetry.panes_unregistered += 1;
         self.panes.remove(&pane_id);
     }
 
     /// Feed features for a pane. Returns a change-point event if detected.
     pub fn observe(&mut self, pane_id: u64, features: OutputFeatures) -> Option<PaneChangePoint> {
+        self.telemetry.observations += 1;
         let pane = self
             .panes
             .entry(pane_id)
@@ -544,6 +594,7 @@ impl BocpdManager {
         let result = pane.observe(features);
         if result.is_some() {
             self.total_change_points += 1;
+            self.telemetry.change_points_detected += 1;
         }
         result
     }
@@ -556,6 +607,7 @@ impl BocpdManager {
         text: &str,
         elapsed: std::time::Duration,
     ) -> Option<PaneChangePoint> {
+        self.telemetry.observations += 1;
         let pane = self
             .panes
             .entry(pane_id)
@@ -564,6 +616,7 @@ impl BocpdManager {
         let result = pane.observe_text_chunk(text, elapsed);
         if result.is_some() {
             self.total_change_points += 1;
+            self.telemetry.change_points_detected += 1;
         }
         result
     }

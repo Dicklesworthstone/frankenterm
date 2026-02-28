@@ -2138,6 +2138,562 @@ pub struct MissionDispatchExecution {
 }
 
 // ============================================================================
+// Mission Transaction (Tx) Types
+// ============================================================================
+
+/// Current schema version for mission transaction contracts.
+pub const MISSION_TX_SCHEMA_VERSION: u32 = 1;
+
+/// Transaction state within a mission lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionTxState {
+    Planned,
+    Prepared,
+    Committing,
+    Committed,
+    Failed,
+    Compensating,
+    Compensated,
+}
+
+impl fmt::Display for MissionTxState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Planned => f.write_str("planned"),
+            Self::Prepared => f.write_str("prepared"),
+            Self::Committing => f.write_str("committing"),
+            Self::Committed => f.write_str("committed"),
+            Self::Failed => f.write_str("failed"),
+            Self::Compensating => f.write_str("compensating"),
+            Self::Compensated => f.write_str("compensated"),
+        }
+    }
+}
+
+/// Kill switch severity for mission execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionKillSwitchLevel {
+    Off,
+    SafeMode,
+    HardStop,
+}
+
+/// Outcome of the overall mission transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxOutcome {
+    Pending,
+    Committed,
+    Failed,
+    Compensated,
+}
+
+/// Outcome of the transaction prepare phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxPrepareOutcome {
+    AllReady,
+    Denied,
+    Deferred,
+}
+
+impl TxPrepareOutcome {
+    /// Whether commit is eligible after prepare.
+    #[must_use]
+    pub fn commit_eligible(&self) -> bool {
+        matches!(self, Self::AllReady)
+    }
+}
+
+/// Outcome of the transaction commit phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxCommitOutcome {
+    FullyCommitted,
+    PartialFailure,
+}
+
+impl TxCommitOutcome {
+    /// Target tx state after this commit outcome.
+    #[must_use]
+    pub fn target_tx_state(&self) -> MissionTxState {
+        match self {
+            Self::FullyCommitted => MissionTxState::Committed,
+            Self::PartialFailure => MissionTxState::Failed,
+        }
+    }
+}
+
+/// Outcome of a single commit step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxCommitStepOutcome {
+    Committed { reason_code: String },
+    Failed { reason_code: String },
+    Skipped { reason_code: String },
+}
+
+impl TxCommitStepOutcome {
+    /// Whether this step was committed successfully.
+    #[must_use]
+    pub fn is_committed(&self) -> bool {
+        matches!(self, Self::Committed { .. })
+    }
+}
+
+/// Outcome of the compensation phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxCompensationOutcome {
+    FullyRolledBack,
+    CompensationFailed,
+    NothingToCompensate,
+}
+
+impl TxCompensationOutcome {
+    /// Target tx state after compensation.
+    #[must_use]
+    pub fn target_tx_state(&self) -> MissionTxState {
+        match self {
+            Self::FullyRolledBack | Self::NothingToCompensate => MissionTxState::Compensated,
+            Self::CompensationFailed => MissionTxState::Failed,
+        }
+    }
+}
+
+/// Unique transaction identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TxId(pub String);
+
+/// Unique step identifier within a transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TxStepId(pub String);
+
+/// Unique plan identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TxPlanId(pub String);
+
+/// Intent describing a mission transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxIntent {
+    pub tx_id: TxId,
+    pub requested_by: MissionActorRole,
+    pub summary: String,
+    pub correlation_id: String,
+    pub created_at_ms: i64,
+}
+
+/// A single step in a transaction plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxStep {
+    pub step_id: TxStepId,
+    pub ordinal: usize,
+    pub action: StepAction,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Precondition that must hold before a transaction step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxPrecondition {
+    PromptActive { pane_id: u64 },
+    Custom { check: String },
+}
+
+/// Compensation action for a step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxCompensation {
+    pub for_step_id: TxStepId,
+    pub action: StepAction,
+}
+
+/// Complete transaction plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxPlan {
+    pub plan_id: TxPlanId,
+    pub tx_id: TxId,
+    pub steps: Vec<TxStep>,
+    #[serde(default)]
+    pub preconditions: Vec<TxPrecondition>,
+    #[serde(default)]
+    pub compensations: Vec<TxCompensation>,
+}
+
+/// Full mission transaction contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionTxContract {
+    pub tx_version: u32,
+    pub intent: TxIntent,
+    pub plan: TxPlan,
+    pub lifecycle_state: MissionTxState,
+    pub outcome: TxOutcome,
+    #[serde(default)]
+    pub receipts: Vec<serde_json::Value>,
+}
+
+impl MissionTxContract {
+    /// Validate contract consistency.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.plan.steps.is_empty() {
+            return Err("Transaction plan has no steps".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Input for a single prepare-phase gate evaluation.
+#[derive(Debug, Clone)]
+pub struct TxPrepareGateInput {
+    pub step_id: TxStepId,
+    pub policy_passed: bool,
+    pub policy_reason_code: Option<String>,
+    pub reservation_available: bool,
+    pub reservation_reason_code: Option<String>,
+    pub approval_satisfied: bool,
+    pub approval_reason_code: Option<String>,
+    pub target_liveness: bool,
+    pub liveness_reason_code: Option<String>,
+}
+
+/// Input for a single commit step.
+#[derive(Debug, Clone)]
+pub struct TxCommitStepInput {
+    pub step_id: TxStepId,
+    pub success: bool,
+    pub reason_code: String,
+    pub error_code: Option<String>,
+    pub completed_at_ms: i64,
+}
+
+/// Input for a single compensation step.
+#[derive(Debug, Clone)]
+pub struct TxCompensationStepInput {
+    pub for_step_id: TxStepId,
+    pub success: bool,
+    pub reason_code: String,
+    pub error_code: Option<String>,
+    pub completed_at_ms: i64,
+}
+
+/// Result of a single commit step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxCommitStepResult {
+    pub step_id: TxStepId,
+    pub ordinal: usize,
+    pub outcome: TxCommitStepOutcome,
+    pub decision_path: String,
+    pub completed_at_ms: i64,
+}
+
+/// Report from the prepare phase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxPrepareReport {
+    pub outcome: TxPrepareOutcome,
+}
+
+/// Report from the commit phase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxCommitReport {
+    pub tx_id: TxId,
+    pub plan_id: TxPlanId,
+    pub outcome: TxCommitOutcome,
+    pub step_results: Vec<TxCommitStepResult>,
+    pub failure_boundary: Option<String>,
+    pub committed_count: usize,
+    pub failed_count: usize,
+    pub skipped_count: usize,
+    pub decision_path: String,
+    pub reason_code: String,
+    pub error_code: Option<String>,
+    pub completed_at_ms: i64,
+    #[serde(default)]
+    pub receipts: Vec<serde_json::Value>,
+}
+
+/// Report from the compensation phase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxCompensationReport {
+    pub outcome: TxCompensationOutcome,
+}
+
+/// Evaluate prepare phase gates and produce a report.
+pub fn evaluate_prepare_phase(
+    _tx_id: &TxId,
+    plan: &TxPlan,
+    gate_inputs: &[TxPrepareGateInput],
+    kill_switch: MissionKillSwitchLevel,
+    _now_ms: i64,
+) -> Result<TxPrepareReport, String> {
+    if kill_switch == MissionKillSwitchLevel::HardStop {
+        return Ok(TxPrepareReport {
+            outcome: TxPrepareOutcome::Denied,
+        });
+    }
+    let all_ready = gate_inputs.iter().all(|g| {
+        g.policy_passed && g.reservation_available && g.approval_satisfied && g.target_liveness
+    });
+    if !all_ready && gate_inputs.len() < plan.steps.len() {
+        return Ok(TxPrepareReport {
+            outcome: TxPrepareOutcome::Deferred,
+        });
+    }
+    Ok(TxPrepareReport {
+        outcome: if all_ready {
+            TxPrepareOutcome::AllReady
+        } else {
+            TxPrepareOutcome::Denied
+        },
+    })
+}
+
+/// Execute commit phase from step inputs.
+pub fn execute_commit_phase(
+    contract: &MissionTxContract,
+    commit_inputs: &[TxCommitStepInput],
+    kill_switch: MissionKillSwitchLevel,
+    _paused: bool,
+    _now_ms: i64,
+) -> Result<TxCommitReport, String> {
+    if kill_switch == MissionKillSwitchLevel::HardStop {
+        return Err("Kill switch active".to_string());
+    }
+    let mut step_results = Vec::new();
+    let mut committed = 0usize;
+    let mut failed = 0usize;
+    let skipped = 0usize;
+    for input in commit_inputs {
+        let outcome = if input.success {
+            committed += 1;
+            TxCommitStepOutcome::Committed {
+                reason_code: input.reason_code.clone(),
+            }
+        } else {
+            failed += 1;
+            TxCommitStepOutcome::Failed {
+                reason_code: input.reason_code.clone(),
+            }
+        };
+        step_results.push(TxCommitStepResult {
+            step_id: input.step_id.clone(),
+            ordinal: step_results.len(),
+            outcome,
+            decision_path: "commit".to_string(),
+            completed_at_ms: input.completed_at_ms,
+        });
+    }
+    let overall = if failed == 0 {
+        TxCommitOutcome::FullyCommitted
+    } else {
+        TxCommitOutcome::PartialFailure
+    };
+    Ok(TxCommitReport {
+        tx_id: contract.intent.tx_id.clone(),
+        plan_id: contract.plan.plan_id.clone(),
+        outcome: overall,
+        step_results,
+        failure_boundary: None,
+        committed_count: committed,
+        failed_count: failed,
+        skipped_count: skipped,
+        decision_path: "commit_phase".to_string(),
+        reason_code: "completed".to_string(),
+        error_code: None,
+        completed_at_ms: _now_ms,
+        receipts: Vec::new(),
+    })
+}
+
+/// Execute compensation phase after a failed commit.
+pub fn execute_compensation_phase(
+    _contract: &MissionTxContract,
+    _commit_report: &TxCommitReport,
+    comp_inputs: &[TxCompensationStepInput],
+    _now_ms: i64,
+) -> Result<TxCompensationReport, String> {
+    if comp_inputs.is_empty() {
+        return Ok(TxCompensationReport {
+            outcome: TxCompensationOutcome::NothingToCompensate,
+        });
+    }
+    let all_ok = comp_inputs.iter().all(|c| c.success);
+    Ok(TxCompensationReport {
+        outcome: if all_ok {
+            TxCompensationOutcome::FullyRolledBack
+        } else {
+            TxCompensationOutcome::CompensationFailed
+        },
+    })
+}
+
+// ============================================================================
+// Mission Tx State Machine
+// ============================================================================
+
+/// Transition kind for mission transaction states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MissionTxTransitionKind {
+    Prepare,
+    Commit,
+    Fail,
+    Compensate,
+    Complete,
+}
+
+impl fmt::Display for MissionTxTransitionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Prepare => f.write_str("prepare"),
+            Self::Commit => f.write_str("commit"),
+            Self::Fail => f.write_str("fail"),
+            Self::Compensate => f.write_str("compensate"),
+            Self::Complete => f.write_str("complete"),
+        }
+    }
+}
+
+/// A row in the mission tx transition table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissionTxTransitionRule {
+    pub from: MissionTxState,
+    pub via: MissionTxTransitionKind,
+    pub to: MissionTxState,
+}
+
+const MISSION_TX_TRANSITIONS: &[MissionTxTransitionRule] = &[
+    MissionTxTransitionRule {
+        from: MissionTxState::Planned,
+        via: MissionTxTransitionKind::Prepare,
+        to: MissionTxState::Prepared,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Prepared,
+        via: MissionTxTransitionKind::Commit,
+        to: MissionTxState::Committing,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Committing,
+        via: MissionTxTransitionKind::Complete,
+        to: MissionTxState::Committed,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Committing,
+        via: MissionTxTransitionKind::Fail,
+        to: MissionTxState::Failed,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Failed,
+        via: MissionTxTransitionKind::Compensate,
+        to: MissionTxState::Compensating,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Compensating,
+        via: MissionTxTransitionKind::Complete,
+        to: MissionTxState::Compensated,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Compensating,
+        via: MissionTxTransitionKind::Fail,
+        to: MissionTxState::Failed,
+    },
+];
+
+/// Free function returning the mission tx transition table.
+#[must_use]
+pub fn mission_tx_transition_table() -> &'static [MissionTxTransitionRule] {
+    MISSION_TX_TRANSITIONS
+}
+
+// ============================================================================
+// Mission Lifecycle Decision (pause/resume/abort)
+// ============================================================================
+
+/// Result of a lifecycle control operation (pause, resume, abort).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionLifecycleDecision {
+    pub lifecycle_from: MissionLifecycleState,
+    pub lifecycle_to: MissionLifecycleState,
+    pub decision_path: String,
+    pub reason_code: String,
+    pub error_code: Option<String>,
+    pub checkpoint_id: Option<String>,
+}
+
+impl Mission {
+    /// Pause a running mission.
+    pub fn pause_mission(
+        &mut self,
+        _requested_by: &str,
+        reason: &str,
+        _requested_at_ms: i64,
+        checkpoint_id: Option<String>,
+    ) -> Result<MissionLifecycleDecision, MissionLifecycleError> {
+        let from = self.lifecycle_state;
+        let to = self
+            .lifecycle_state
+            .apply_transition(MissionLifecycleTransitionKind::Block)?;
+        self.lifecycle_state = to;
+        Ok(MissionLifecycleDecision {
+            lifecycle_from: from,
+            lifecycle_to: to,
+            decision_path: "pause".to_string(),
+            reason_code: reason.to_string(),
+            error_code: None,
+            checkpoint_id,
+        })
+    }
+
+    /// Resume a paused (blocked) mission.
+    pub fn resume_mission(
+        &mut self,
+        _requested_by: &str,
+        _reason_label: &str,
+        _requested_at_ms: i64,
+        checkpoint_id: Option<String>,
+    ) -> Result<MissionLifecycleDecision, MissionLifecycleError> {
+        let from = self.lifecycle_state;
+        let to = self
+            .lifecycle_state
+            .apply_transition(MissionLifecycleTransitionKind::Unblock)?;
+        self.lifecycle_state = to;
+        Ok(MissionLifecycleDecision {
+            lifecycle_from: from,
+            lifecycle_to: to,
+            decision_path: "resume".to_string(),
+            reason_code: "resumed".to_string(),
+            error_code: None,
+            checkpoint_id,
+        })
+    }
+
+    /// Abort a mission (cancel with error context).
+    pub fn abort_mission(
+        &mut self,
+        _requested_by: &str,
+        reason: &str,
+        error_code: Option<String>,
+        _requested_at_ms: i64,
+        checkpoint_id: Option<String>,
+    ) -> Result<MissionLifecycleDecision, MissionLifecycleError> {
+        let from = self.lifecycle_state;
+        let to = self
+            .lifecycle_state
+            .apply_transition(MissionLifecycleTransitionKind::Cancel)?;
+        self.lifecycle_state = to;
+        Ok(MissionLifecycleDecision {
+            lifecycle_from: from,
+            lifecycle_to: to,
+            decision_path: "abort".to_string(),
+            reason_code: reason.to_string(),
+            error_code,
+            checkpoint_id,
+        })
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

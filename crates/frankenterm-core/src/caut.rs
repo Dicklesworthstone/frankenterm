@@ -22,6 +22,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CautService {
     OpenAI,
+    Anthropic,
+    Google,
 }
 
 impl CautService {
@@ -29,6 +31,8 @@ impl CautService {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::OpenAI => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Google => "google",
         }
     }
 
@@ -37,6 +41,8 @@ impl CautService {
     pub fn provider_arg(self) -> &'static str {
         match self {
             Self::OpenAI => "codex",
+            Self::Anthropic => "claude",
+            Self::Google => "gemini",
         }
     }
 
@@ -44,16 +50,21 @@ impl CautService {
     #[must_use]
     pub fn from_cli_input(input: &str) -> Option<Self> {
         if is_openai_slug(input) {
-            Some(Self::OpenAI)
-        } else {
-            None
+            return Some(Self::OpenAI);
         }
+        if is_anthropic_slug(input) {
+            return Some(Self::Anthropic);
+        }
+        if is_google_slug(input) {
+            return Some(Self::Google);
+        }
+        None
     }
 
     /// Supported service values for CLI/UI hints.
     #[must_use]
     pub fn supported_cli_inputs() -> &'static [&'static str] {
-        &["openai", "codex"]
+        &["openai", "codex", "anthropic", "claude", "google", "gemini"]
     }
 
     /// Map a canonical agent provider to the corresponding caut service.
@@ -61,7 +72,11 @@ impl CautService {
     pub fn from_provider(provider: &AgentProvider) -> Option<Self> {
         match provider {
             AgentProvider::Codex => Some(Self::OpenAI),
+            AgentProvider::Claude => Some(Self::Anthropic),
+            AgentProvider::Gemini => Some(Self::Google),
             AgentProvider::Unknown(slug) if is_openai_slug(slug) => Some(Self::OpenAI),
+            AgentProvider::Unknown(slug) if is_anthropic_slug(slug) => Some(Self::Anthropic),
+            AgentProvider::Unknown(slug) if is_google_slug(slug) => Some(Self::Google),
             _ => None,
         }
     }
@@ -71,6 +86,8 @@ impl CautService {
     pub fn provider_hint(self) -> AgentProvider {
         match self {
             Self::OpenAI => AgentProvider::Codex,
+            Self::Anthropic => AgentProvider::Claude,
+            Self::Google => AgentProvider::Gemini,
         }
     }
 }
@@ -79,6 +96,20 @@ fn is_openai_slug(slug: &str) -> bool {
     matches!(
         slug.trim().to_ascii_lowercase().as_str(),
         "openai" | "codex" | "chatgpt" | "chat-gpt" | "chat_gpt" | "gpt" | "gpt4" | "gpt-4"
+    )
+}
+
+fn is_anthropic_slug(slug: &str) -> bool {
+    matches!(
+        slug.trim().to_ascii_lowercase().as_str(),
+        "anthropic" | "claude" | "claude-code" | "claude_code"
+    )
+}
+
+fn is_google_slug(slug: &str) -> bool {
+    matches!(
+        slug.trim().to_ascii_lowercase().as_str(),
+        "google" | "google-ai" | "google_ai" | "gemini" | "gemini-cli" | "gemini_cli"
     )
 }
 
@@ -484,7 +515,10 @@ fn caut_v1_entry_to_account(entry: &CautV1UsageEntry) -> CautAccountUsage {
         extra.insert("status".to_string(), status.clone());
     }
     if let Some(auth_warning) = &entry.auth_warning {
-        extra.insert("auth_warning".to_string(), Value::String(auth_warning.clone()));
+        extra.insert(
+            "auth_warning".to_string(),
+            Value::String(auth_warning.clone()),
+        );
     }
     if let Some(usage) = usage {
         if let Some(primary) = &usage.primary {
@@ -1049,7 +1083,11 @@ mod tests {
     #[test]
     fn caut_service_display() {
         assert_eq!(CautService::OpenAI.as_str(), "openai");
+        assert_eq!(CautService::Anthropic.as_str(), "anthropic");
+        assert_eq!(CautService::Google.as_str(), "google");
         assert_eq!(format!("{}", CautService::OpenAI), "openai");
+        assert_eq!(format!("{}", CautService::Anthropic), "anthropic");
+        assert_eq!(format!("{}", CautService::Google), "google");
     }
 
     #[test]
@@ -1059,6 +1097,14 @@ mod tests {
             Some(CautService::OpenAI)
         );
         assert_eq!(
+            CautService::from_provider(&AgentProvider::Claude),
+            Some(CautService::Anthropic)
+        );
+        assert_eq!(
+            CautService::from_provider(&AgentProvider::Gemini),
+            Some(CautService::Google)
+        );
+        assert_eq!(
             CautService::from_provider(&AgentProvider::Unknown("openai".to_string())),
             Some(CautService::OpenAI)
         );
@@ -1066,7 +1112,26 @@ mod tests {
             CautService::from_provider(&AgentProvider::Unknown("chat-gpt".to_string())),
             Some(CautService::OpenAI)
         );
-        assert_eq!(CautService::from_provider(&AgentProvider::Claude), None);
+        assert_eq!(
+            CautService::from_provider(&AgentProvider::Unknown("anthropic".to_string())),
+            Some(CautService::Anthropic)
+        );
+        assert_eq!(
+            CautService::from_provider(&AgentProvider::Unknown("claude-code".to_string())),
+            Some(CautService::Anthropic)
+        );
+        assert_eq!(
+            CautService::from_provider(&AgentProvider::Unknown("google".to_string())),
+            Some(CautService::Google)
+        );
+        assert_eq!(
+            CautService::from_provider(&AgentProvider::Unknown("gemini-cli".to_string())),
+            Some(CautService::Google)
+        );
+        assert_eq!(
+            CautService::from_provider(&AgentProvider::Unknown("copilot".to_string())),
+            None
+        );
     }
 
     #[test]
@@ -1083,12 +1148,44 @@ mod tests {
             CautService::from_cli_input("chat-gpt"),
             Some(CautService::OpenAI)
         );
-        assert_eq!(CautService::from_cli_input("anthropic"), None);
+        assert_eq!(
+            CautService::from_cli_input("anthropic"),
+            Some(CautService::Anthropic)
+        );
+        assert_eq!(
+            CautService::from_cli_input("claude"),
+            Some(CautService::Anthropic)
+        );
+        assert_eq!(
+            CautService::from_cli_input("google"),
+            Some(CautService::Google)
+        );
+        assert_eq!(
+            CautService::from_cli_input("gemini"),
+            Some(CautService::Google)
+        );
+        assert_eq!(CautService::from_cli_input("unknown"), None);
     }
 
     #[test]
     fn caut_service_provider_hint_bridge() {
         assert_eq!(CautService::OpenAI.provider_hint(), AgentProvider::Codex);
+        assert_eq!(
+            CautService::Anthropic.provider_hint(),
+            AgentProvider::Claude
+        );
+        assert_eq!(CautService::Google.provider_hint(), AgentProvider::Gemini);
+    }
+
+    #[test]
+    fn caut_service_provider_args_and_supported_inputs() {
+        assert_eq!(CautService::OpenAI.provider_arg(), "codex");
+        assert_eq!(CautService::Anthropic.provider_arg(), "claude");
+        assert_eq!(CautService::Google.provider_arg(), "gemini");
+        let supported = CautService::supported_cli_inputs();
+        assert!(supported.contains(&"openai"));
+        assert!(supported.contains(&"anthropic"));
+        assert!(supported.contains(&"google"));
     }
 
     #[test]
