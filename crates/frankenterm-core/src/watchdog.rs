@@ -1658,4 +1658,75 @@ mod tests {
         let cloned = report.clone();
         assert_eq!(cloned.consecutive_failures, 0);
     }
+
+    // ── Telemetry counter tests ──────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let reg = HeartbeatRegistry::new();
+        let snap = reg.telemetry().snapshot();
+        assert_eq!(snap.discovery_heartbeats, 0);
+        assert_eq!(snap.capture_heartbeats, 0);
+        assert_eq!(snap.persistence_heartbeats, 0);
+        assert_eq!(snap.maintenance_heartbeats, 0);
+        assert_eq!(snap.health_checks, 0);
+    }
+
+    #[test]
+    fn telemetry_discovery_counted() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_discovery();
+        reg.record_discovery();
+        let snap = reg.telemetry().snapshot();
+        assert_eq!(snap.discovery_heartbeats, 2);
+    }
+
+    #[test]
+    fn telemetry_capture_counted() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_capture();
+        let snap = reg.telemetry().snapshot();
+        assert_eq!(snap.capture_heartbeats, 1);
+    }
+
+    #[test]
+    fn telemetry_persistence_counted() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_persistence();
+        reg.record_persistence();
+        reg.record_persistence();
+        let snap = reg.telemetry().snapshot();
+        assert_eq!(snap.persistence_heartbeats, 3);
+    }
+
+    #[test]
+    fn telemetry_maintenance_counted() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_maintenance();
+        let snap = reg.telemetry().snapshot();
+        assert_eq!(snap.maintenance_heartbeats, 1);
+    }
+
+    #[test]
+    fn telemetry_health_check_counted() {
+        let reg = HeartbeatRegistry::new();
+        let config = WatchdogConfig::default();
+        let _ = reg.check_health(&config);
+        let _ = reg.check_health(&config);
+        let snap = reg.telemetry().snapshot();
+        assert_eq!(snap.health_checks, 2);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let reg = HeartbeatRegistry::new();
+        reg.record_discovery();
+        reg.record_capture();
+        let config = WatchdogConfig::default();
+        let _ = reg.check_health(&config);
+        let snap = reg.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: WatchdogTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
 }

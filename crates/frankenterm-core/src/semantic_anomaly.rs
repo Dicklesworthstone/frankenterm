@@ -1995,4 +1995,96 @@ mod tests {
         assert!(!processed_anomaly.was_skipped());
         assert!(processed_anomaly.is_anomaly());
     }
+
+    // ── SemanticAnomalyDetector telemetry counter tests ──────────────────
+
+    #[test]
+    fn semantic_telemetry_initial_zero() {
+        let det = SemanticAnomalyDetector::new(SemanticAnomalyConfig::default());
+        let snap = det.telemetry().snapshot();
+        assert_eq!(snap.observations, 0);
+        assert_eq!(snap.shocks_detected, 0);
+        assert_eq!(snap.resets, 0);
+    }
+
+    #[test]
+    fn semantic_telemetry_observe_counted() {
+        let mut det = SemanticAnomalyDetector::new(SemanticAnomalyConfig::default());
+        det.observe(&[1.0, 2.0, 3.0]);
+        det.observe(&[1.1, 2.1, 3.1]);
+        det.observe(&[1.0, 2.0, 3.0]);
+        let snap = det.telemetry().snapshot();
+        assert_eq!(snap.observations, 3);
+    }
+
+    #[test]
+    fn semantic_telemetry_reset_counted() {
+        let mut det = SemanticAnomalyDetector::new(SemanticAnomalyConfig::default());
+        det.observe(&[1.0, 2.0]);
+        det.reset();
+        det.reset();
+        let snap = det.telemetry().snapshot();
+        assert_eq!(snap.resets, 2);
+    }
+
+    #[test]
+    fn semantic_telemetry_snapshot_serde_roundtrip() {
+        let mut det = SemanticAnomalyDetector::new(SemanticAnomalyConfig::default());
+        det.observe(&[1.0, 2.0]);
+        det.reset();
+        let snap = det.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SemanticAnomalyTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    // ── ConformalAnomalyDetector telemetry counter tests ──────────────────
+
+    #[test]
+    fn conformal_telemetry_initial_zero() {
+        let det = ConformalAnomalyDetector::new(ConformalAnomalyConfig::default());
+        let snap = det.telemetry().snapshot();
+        assert_eq!(snap.observations, 0);
+        assert_eq!(snap.anomalies_detected, 0);
+        assert_eq!(snap.dimension_resets, 0);
+        assert_eq!(snap.resets, 0);
+    }
+
+    #[test]
+    fn conformal_telemetry_observe_counted() {
+        let mut det = ConformalAnomalyDetector::new(ConformalAnomalyConfig::default());
+        det.observe(&[1.0, 2.0, 3.0]);
+        det.observe(&[1.1, 2.1, 3.1]);
+        let snap = det.telemetry().snapshot();
+        assert_eq!(snap.observations, 2);
+    }
+
+    #[test]
+    fn conformal_telemetry_dimension_reset_counted() {
+        let mut det = ConformalAnomalyDetector::new(ConformalAnomalyConfig::default());
+        det.observe(&[1.0, 2.0]);
+        det.observe(&[1.0, 2.0, 3.0]); // dimension change triggers reset
+        let snap = det.telemetry().snapshot();
+        assert_eq!(snap.dimension_resets, 1);
+    }
+
+    #[test]
+    fn conformal_telemetry_reset_counted() {
+        let mut det = ConformalAnomalyDetector::new(ConformalAnomalyConfig::default());
+        det.observe(&[1.0]);
+        det.reset();
+        let snap = det.telemetry().snapshot();
+        assert_eq!(snap.resets, 1);
+    }
+
+    #[test]
+    fn conformal_telemetry_snapshot_serde_roundtrip() {
+        let mut det = ConformalAnomalyDetector::new(ConformalAnomalyConfig::default());
+        det.observe(&[1.0, 2.0]);
+        det.reset();
+        let snap = det.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ConformalAnomalyTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
 }
