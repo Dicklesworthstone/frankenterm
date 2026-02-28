@@ -153,6 +153,72 @@ impl DiskPressureConfig {
 }
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the disk pressure monitor.
+///
+/// All counters are plain `u64` because `DiskPressureMonitor` uses `&mut self`.
+#[derive(Debug, Clone, Default)]
+pub struct DiskPressureTelemetry {
+    /// Total update() / update_with_sample() calls.
+    updates: u64,
+    /// Updates skipped because monitoring is disabled.
+    updates_disabled: u64,
+    /// Tier classifications that resulted in Green.
+    tier_green: u64,
+    /// Tier classifications that resulted in Yellow.
+    tier_yellow: u64,
+    /// Tier classifications that resulted in Red.
+    tier_red: u64,
+    /// Tier classifications that resulted in Black.
+    tier_black: u64,
+    /// Number of tier transitions (tier changed from previous).
+    tier_transitions: u64,
+}
+
+impl DiskPressureTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> DiskPressureTelemetrySnapshot {
+        DiskPressureTelemetrySnapshot {
+            updates: self.updates,
+            updates_disabled: self.updates_disabled,
+            tier_green: self.tier_green,
+            tier_yellow: self.tier_yellow,
+            tier_red: self.tier_red,
+            tier_black: self.tier_black,
+            tier_transitions: self.tier_transitions,
+        }
+    }
+}
+
+/// Serializable snapshot of disk pressure telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskPressureTelemetrySnapshot {
+    /// Total update() / update_with_sample() calls.
+    pub updates: u64,
+    /// Updates skipped because monitoring is disabled.
+    pub updates_disabled: u64,
+    /// Tier classifications that resulted in Green.
+    pub tier_green: u64,
+    /// Tier classifications that resulted in Yellow.
+    pub tier_yellow: u64,
+    /// Tier classifications that resulted in Red.
+    pub tier_red: u64,
+    /// Tier classifications that resulted in Black.
+    pub tier_black: u64,
+    /// Number of tier transitions (tier changed from previous).
+    pub tier_transitions: u64,
+}
+
+// =============================================================================
 // Core sample + snapshot types
 // =============================================================================
 
@@ -334,6 +400,8 @@ pub struct DiskPressureMonitor {
     last_pid_output: f64,
     last_effective_usage: f64,
     update_count: u64,
+    /// Operational telemetry counters.
+    telemetry: DiskPressureTelemetry,
 }
 
 impl DiskPressureMonitor {
@@ -361,6 +429,7 @@ impl DiskPressureMonitor {
             last_pid_output: 0.0,
             last_effective_usage: 0.0,
             update_count: 0,
+            telemetry: DiskPressureTelemetry::new(),
         }
     }
 
@@ -406,10 +475,28 @@ impl DiskPressureMonitor {
     /// Sample + smooth + control + classify; returns the new tier.
     pub fn update(&mut self) -> DiskPressureTier {
         if !self.config.enabled {
+            self.telemetry.updates_disabled += 1;
             return self.current_tier();
         }
 
         let sample = self.sample();
+        self.update_inner(sample)
+    }
+
+    /// Update with a synthetic sample (for testing without real disk I/O).
+    pub fn update_with_sample(&mut self, sample: DiskSample) -> DiskPressureTier {
+        if !self.config.enabled {
+            self.telemetry.updates_disabled += 1;
+            return self.current_tier();
+        }
+        self.update_inner(sample)
+    }
+
+    /// Shared update logic used by both update() and update_with_sample().
+    fn update_inner(&mut self, sample: DiskSample) -> DiskPressureTier {
+        self.telemetry.updates += 1;
+        let prev_tier = self.current_tier();
+
         let smoothed_usage = self.ewma.update(sample.usage_fraction);
 
         let dt_secs = self.last_sample.map_or_else(
@@ -427,6 +514,16 @@ impl DiskPressureMonitor {
         let pid_output = self.pid.update(pid_error, dt_secs);
         let effective_usage = (smoothed_usage + pid_output).clamp(0.0, 1.0);
         let tier = classify_tier(effective_usage, self.config.thresholds);
+
+        match tier {
+            DiskPressureTier::Green => self.telemetry.tier_green += 1,
+            DiskPressureTier::Yellow => self.telemetry.tier_yellow += 1,
+            DiskPressureTier::Red => self.telemetry.tier_red += 1,
+            DiskPressureTier::Black => self.telemetry.tier_black += 1,
+        }
+        if tier != prev_tier {
+            self.telemetry.tier_transitions += 1;
+        }
 
         self.latest_tier
             .store(tier.as_u8() as u64, Ordering::Relaxed);
@@ -466,6 +563,12 @@ impl DiskPressureMonitor {
             effective_usage_fraction: self.last_effective_usage,
             update_count: self.update_count,
         }
+    }
+
+    /// Access the operational telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &DiskPressureTelemetry {
+        &self.telemetry
     }
 }
 
