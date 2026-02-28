@@ -31,7 +31,7 @@ use proptest::prelude::*;
 
 use frankenterm_core::cross_pane_correlation::{
     ChiSquaredResult, CoOccurrenceMatrix, Correlation, CorrelationConfig, CorrelationEngine,
-    EventRecord, chi_squared_test,
+    CorrelationEngineTelemetrySnapshot, EventRecord, chi_squared_test,
 };
 
 // =============================================================================
@@ -1000,5 +1000,159 @@ proptest! {
     fn config_debug_nonempty(config in arb_config()) {
         let debug = format!("{:?}", config);
         prop_assert!(!debug.is_empty());
+    }
+
+    // ── Telemetry property tests ─────────────────────────────────────────
+
+    /// events_ingested equals the number of events added via ingest().
+    #[test]
+    fn prop_telemetry_ingest_equals_count(
+        count in 1usize..50,
+    ) {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            retention_ms: 1_000_000,
+            ..CorrelationConfig::default()
+        });
+        for i in 0..count {
+            engine.ingest(EventRecord {
+                pane_id: i as u64,
+                event_type: format!("type_{}", i % 5),
+                timestamp_ms: 1000 + i as u64 * 100,
+            });
+        }
+        let snap = engine.telemetry().snapshot();
+        prop_assert_eq!(snap.events_ingested, count as u64);
+    }
+
+    /// events_ingested equals the batch size for ingest_batch().
+    #[test]
+    fn prop_telemetry_ingest_batch_equals_count(
+        count in 1usize..50,
+    ) {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            retention_ms: 1_000_000,
+            ..CorrelationConfig::default()
+        });
+        let records: Vec<EventRecord> = (0..count)
+            .map(|i| EventRecord {
+                pane_id: i as u64,
+                event_type: format!("t_{}", i % 3),
+                timestamp_ms: 1000 + i as u64 * 10,
+            })
+            .collect();
+        engine.ingest_batch(records);
+        prop_assert_eq!(engine.telemetry().snapshot().events_ingested, count as u64);
+    }
+
+    /// prunes counter equals number of prune() calls.
+    #[test]
+    fn prop_telemetry_prunes_equals_call_count(
+        n_prunes in 1usize..10,
+    ) {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            retention_ms: 1_000_000,
+            ..CorrelationConfig::default()
+        });
+        for i in 0..n_prunes {
+            engine.prune(1000 + i as u64 * 100);
+        }
+        prop_assert_eq!(engine.telemetry().snapshot().prunes, n_prunes as u64);
+    }
+
+    /// scans counter equals number of scan() calls.
+    #[test]
+    fn prop_telemetry_scans_equals_call_count(
+        n_scans in 1usize..10,
+    ) {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            retention_ms: 1_000_000,
+            ..CorrelationConfig::default()
+        });
+        for i in 0..n_scans {
+            engine.scan(1000 + i as u64 * 1000);
+        }
+        let snap = engine.telemetry().snapshot();
+        prop_assert_eq!(snap.scans, n_scans as u64);
+        // scan() internally calls prune()
+        prop_assert!(snap.prunes >= n_scans as u64);
+    }
+
+    /// events_pruned <= events_ingested always holds.
+    #[test]
+    fn prop_telemetry_pruned_le_ingested(
+        n_events in 1usize..30,
+        retention_ms in 100u64..5000,
+    ) {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            retention_ms,
+            ..CorrelationConfig::default()
+        });
+        for i in 0..n_events {
+            engine.ingest(EventRecord {
+                pane_id: 1,
+                event_type: "x".into(),
+                timestamp_ms: i as u64 * 100,
+            });
+        }
+        engine.prune(n_events as u64 * 100 + retention_ms);
+        let snap = engine.telemetry().snapshot();
+        prop_assert!(
+            snap.events_pruned <= snap.events_ingested,
+            "pruned ({}) > ingested ({})", snap.events_pruned, snap.events_ingested,
+        );
+    }
+
+    /// Telemetry snapshot serde roundtrip with arbitrary values.
+    #[test]
+    fn prop_telemetry_snapshot_serde_roundtrip(
+        events_ingested in 0u64..100000,
+        scans in 0u64..50000,
+        correlations_found in 0u64..50000,
+        prunes in 0u64..50000,
+        events_pruned in 0u64..100000,
+    ) {
+        let snap = CorrelationEngineTelemetrySnapshot {
+            events_ingested,
+            scans,
+            correlations_found,
+            prunes,
+            events_pruned,
+        };
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: CorrelationEngineTelemetrySnapshot =
+            serde_json::from_str(&json).expect("deserialize");
+        prop_assert_eq!(snap, back);
+    }
+
+    /// Counters are monotonically non-decreasing through operations.
+    #[test]
+    fn prop_telemetry_monotonic(
+        n_events in 5usize..20,
+    ) {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            retention_ms: 50_000,
+            ..CorrelationConfig::default()
+        });
+
+        let mut prev = engine.telemetry().snapshot();
+
+        // Ingest phase
+        for i in 0..n_events {
+            engine.ingest(EventRecord {
+                pane_id: (i % 3) as u64,
+                event_type: format!("t_{}", i % 4),
+                timestamp_ms: 1000 + i as u64 * 500,
+            });
+            let snap = engine.telemetry().snapshot();
+            prop_assert!(snap.events_ingested >= prev.events_ingested);
+            prev = snap;
+        }
+
+        // Scan phase
+        engine.scan(100_000);
+        let snap = engine.telemetry().snapshot();
+        prop_assert!(snap.scans >= prev.scans);
+        prop_assert!(snap.prunes >= prev.prunes);
+        prop_assert!(snap.correlations_found >= prev.correlations_found);
     }
 }

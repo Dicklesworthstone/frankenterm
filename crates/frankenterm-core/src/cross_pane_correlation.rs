@@ -26,6 +26,62 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the correlation engine.
+///
+/// All counters are plain `u64` because `CorrelationEngine` uses `&mut self`.
+#[derive(Debug, Clone, Default)]
+pub struct CorrelationEngineTelemetry {
+    /// Total events ingested via `ingest()` or `ingest_batch()`.
+    events_ingested: u64,
+    /// Total `scan()` calls.
+    scans: u64,
+    /// Total correlations found across all scans.
+    correlations_found: u64,
+    /// Total `prune()` calls (including those triggered by scan).
+    prunes: u64,
+    /// Total events removed by pruning.
+    events_pruned: u64,
+}
+
+impl CorrelationEngineTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> CorrelationEngineTelemetrySnapshot {
+        CorrelationEngineTelemetrySnapshot {
+            events_ingested: self.events_ingested,
+            scans: self.scans,
+            correlations_found: self.correlations_found,
+            prunes: self.prunes,
+            events_pruned: self.events_pruned,
+        }
+    }
+}
+
+/// Serializable snapshot of correlation engine telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorrelationEngineTelemetrySnapshot {
+    /// Total events ingested.
+    pub events_ingested: u64,
+    /// Total scan() calls.
+    pub scans: u64,
+    /// Total correlations found.
+    pub correlations_found: u64,
+    /// Total prune() calls.
+    pub prunes: u64,
+    /// Total events removed by pruning.
+    pub events_pruned: u64,
+}
+
+// =============================================================================
 // Configuration
 // =============================================================================
 
@@ -321,6 +377,7 @@ pub struct CorrelationEngine {
     matrix: CoOccurrenceMatrix,
     pane_participation: HashMap<String, Vec<u64>>,
     last_scan_ms: u64,
+    telemetry: CorrelationEngineTelemetry,
 }
 
 impl CorrelationEngine {
@@ -333,23 +390,30 @@ impl CorrelationEngine {
             matrix: CoOccurrenceMatrix::new(),
             pane_participation: HashMap::new(),
             last_scan_ms: 0,
+            telemetry: CorrelationEngineTelemetry::new(),
         }
     }
 
     /// Ingest a new event.
     pub fn ingest(&mut self, record: EventRecord) {
         self.events.push(record);
+        self.telemetry.events_ingested += 1;
     }
 
     /// Ingest a batch of events.
     pub fn ingest_batch(&mut self, records: impl IntoIterator<Item = EventRecord>) {
+        let before = self.events.len();
         self.events.extend(records);
+        self.telemetry.events_ingested += (self.events.len() - before) as u64;
     }
 
     /// Prune events older than the retention window relative to `now_ms`.
     pub fn prune(&mut self, now_ms: u64) {
+        let before = self.events.len();
         let cutoff = now_ms.saturating_sub(self.config.retention_ms);
         self.events.retain(|e| e.timestamp_ms >= cutoff);
+        self.telemetry.prunes += 1;
+        self.telemetry.events_pruned += (before - self.events.len()) as u64;
     }
 
     /// Rebuild the co-occurrence matrix and scan for significant correlations.
@@ -358,6 +422,7 @@ impl CorrelationEngine {
         self.last_scan_ms = now_ms;
         self.matrix.reset();
         self.pane_participation.clear();
+        self.telemetry.scans += 1;
 
         if self.events.is_empty() {
             return Vec::new();
@@ -437,6 +502,9 @@ impl CorrelationEngine {
                 .partial_cmp(&b.p_value)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        self.telemetry.correlations_found += results.len() as u64;
+
         results
     }
 
@@ -462,6 +530,12 @@ impl CorrelationEngine {
     #[must_use]
     pub fn last_scan_ms(&self) -> u64 {
         self.last_scan_ms
+    }
+
+    /// Get the telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &CorrelationEngineTelemetry {
+        &self.telemetry
     }
 }
 
@@ -1104,5 +1178,184 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let parsed: EventRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.pane_id, u64::MAX);
+    }
+
+    // ── Telemetry tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let engine = CorrelationEngine::new(CorrelationConfig::default());
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.events_ingested, 0);
+        assert_eq!(snap.scans, 0);
+        assert_eq!(snap.correlations_found, 0);
+        assert_eq!(snap.prunes, 0);
+        assert_eq!(snap.events_pruned, 0);
+    }
+
+    #[test]
+    fn telemetry_ingest_counted() {
+        let mut engine = CorrelationEngine::new(CorrelationConfig::default());
+        engine.ingest(EventRecord {
+            pane_id: 1,
+            event_type: "rate_limit".into(),
+            timestamp_ms: 1000,
+        });
+        engine.ingest(EventRecord {
+            pane_id: 2,
+            event_type: "error".into(),
+            timestamp_ms: 1001,
+        });
+        assert_eq!(engine.telemetry().snapshot().events_ingested, 2);
+    }
+
+    #[test]
+    fn telemetry_ingest_batch_counted() {
+        let mut engine = CorrelationEngine::new(CorrelationConfig::default());
+        let records = vec![
+            EventRecord { pane_id: 1, event_type: "a".into(), timestamp_ms: 100 },
+            EventRecord { pane_id: 2, event_type: "b".into(), timestamp_ms: 200 },
+            EventRecord { pane_id: 3, event_type: "c".into(), timestamp_ms: 300 },
+        ];
+        engine.ingest_batch(records);
+        assert_eq!(engine.telemetry().snapshot().events_ingested, 3);
+    }
+
+    #[test]
+    fn telemetry_prune_counted() {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            retention_ms: 1000,
+            ..CorrelationConfig::default()
+        });
+        engine.ingest(EventRecord {
+            pane_id: 1,
+            event_type: "old".into(),
+            timestamp_ms: 100,
+        });
+        engine.ingest(EventRecord {
+            pane_id: 2,
+            event_type: "new".into(),
+            timestamp_ms: 5000,
+        });
+        engine.prune(5500);
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.prunes, 1);
+        assert_eq!(snap.events_pruned, 1);
+    }
+
+    #[test]
+    fn telemetry_scan_counted() {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            min_observations: 1,
+            ..CorrelationConfig::default()
+        });
+        engine.ingest(EventRecord {
+            pane_id: 1,
+            event_type: "a".into(),
+            timestamp_ms: 1000,
+        });
+        engine.scan(2000);
+        engine.scan(3000);
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans, 2);
+        // scan() calls prune() internally
+        assert_eq!(snap.prunes, 2);
+    }
+
+    #[test]
+    fn telemetry_correlations_found_counted() {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            window_ms: 1000,
+            min_observations: 2,
+            p_value_threshold: 1.0, // accept all so we get correlations
+            retention_ms: 100_000,
+            ..CorrelationConfig::default()
+        });
+
+        // Produce co-occurring events across multiple windows
+        for w in 0..10 {
+            let base = w * 1000;
+            engine.ingest(EventRecord {
+                pane_id: 1,
+                event_type: "error".into(),
+                timestamp_ms: base,
+            });
+            engine.ingest(EventRecord {
+                pane_id: 2,
+                event_type: "rate_limit".into(),
+                timestamp_ms: base + 100,
+            });
+        }
+
+        let results = engine.scan(15_000);
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans, 1);
+        assert_eq!(snap.correlations_found, results.len() as u64);
+    }
+
+    #[test]
+    fn telemetry_survives_multiple_operations() {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            retention_ms: 5000,
+            ..CorrelationConfig::default()
+        });
+
+        // Ingest
+        for i in 0..5 {
+            engine.ingest(EventRecord {
+                pane_id: i,
+                event_type: format!("type_{i}"),
+                timestamp_ms: 1000 + i * 100,
+            });
+        }
+
+        // Scan (triggers prune internally)
+        engine.scan(2000);
+
+        // Batch ingest
+        engine.ingest_batch(vec![
+            EventRecord { pane_id: 10, event_type: "x".into(), timestamp_ms: 3000 },
+            EventRecord { pane_id: 11, event_type: "y".into(), timestamp_ms: 3100 },
+        ]);
+
+        // Another scan
+        engine.scan(4000);
+
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.events_ingested, 7); // 5 + 2
+        assert_eq!(snap.scans, 2);
+        assert!(snap.prunes >= 2); // at least 2 from scans
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let snap = CorrelationEngineTelemetrySnapshot {
+            events_ingested: 1000,
+            scans: 50,
+            correlations_found: 25,
+            prunes: 100,
+            events_pruned: 500,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CorrelationEngineTelemetrySnapshot =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn telemetry_prune_no_removal_still_counted() {
+        let mut engine = CorrelationEngine::new(CorrelationConfig {
+            retention_ms: 100_000,
+            ..CorrelationConfig::default()
+        });
+        engine.ingest(EventRecord {
+            pane_id: 1,
+            event_type: "recent".into(),
+            timestamp_ms: 50_000,
+        });
+        engine.prune(50_100);
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.prunes, 1);
+        assert_eq!(snap.events_pruned, 0);
     }
 }
