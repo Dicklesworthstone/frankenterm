@@ -134,6 +134,7 @@ impl CxRuntimeBuilder {
     }
 
     /// Build the configured runtime.
+    #[allow(clippy::result_large_err)] // asupersync::Error is externally defined
     pub fn build(self) -> Result<Runtime, asupersync::Error> {
         self.inner.build()
     }
