@@ -1,7 +1,7 @@
 # asupersync Migration Baseline (ft-e34d9.10.1)
 
 Status: in progress  
-Last updated: 2026-02-25  
+Last updated: 2026-02-28  
 Owners: SageHawk (current), asupersync migration swarm
 
 This document is the canonical baseline for the asupersync migration program. It defines:
@@ -30,6 +30,9 @@ This document is the canonical baseline for the asupersync migration program. It
 - Doctrine e2e validator: `tests/e2e/test_asupersync_runtime_doctrine.sh`
 - Doctrine pack validator: `scripts/validate_asupersync_doctrine_pack.sh`
 - Doctrine pack e2e validator: `tests/e2e/test_ft_e34d9_10_1_2_doctrine_pack.sh`
+- Cutover runtime guard policy: `docs/asupersync-cutover-runtime-guardrails.json`
+- Cutover runtime guard validator: `scripts/validate_asupersync_cutover_runtime_guards.sh`
+- Cutover runtime guard e2e validator: `tests/e2e/test_ft_e34d9_10_8_2_cutover_runtime_guards.sh`
 
 ## Inventory Snapshot (2026-02-22)
 
@@ -152,6 +155,9 @@ This baseline intentionally records both current evidence and required automatio
 6. Doctrine validation artifacts from `tests/e2e/test_asupersync_runtime_doctrine.sh`.
 7. Scoreboard validation artifacts from `tests/e2e/test_asupersync_migration_scoreboard.sh`.
 8. rch policy validation artifacts from `tests/e2e/test_asupersync_rch_execution_policy.sh`.
+9. Cutover runtime guard artifacts:
+   - `docs/asupersync-cutover-runtime-guard-validation.json`
+   - `tests/e2e/logs/ft_e34d9_10_8_2_cutover_runtime_guards_*.jsonl`
 
 ### Minimum validation cadence
 
@@ -180,6 +186,10 @@ bash tests/e2e/test_asupersync_runtime_doctrine.sh
 # Validate rch-only heavy compute policy + evidence contract guardrails
 bash scripts/validate_asupersync_rch_execution_policy.sh --self-test
 bash tests/e2e/test_asupersync_rch_execution_policy.sh
+
+# Validate cutover runtime dependency/import regression guardrails
+bash scripts/validate_asupersync_cutover_runtime_guards.sh --self-test
+bash tests/e2e/test_ft_e34d9_10_8_2_cutover_runtime_guards.sh
 
 # For heavy compile/test/clippy runs, offload with rch
 rch exec -- cargo check --workspace --all-targets
