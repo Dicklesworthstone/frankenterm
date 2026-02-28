@@ -18,6 +18,42 @@ use crate::edit_distance::jaro_winkler_str;
 use crate::patterns::Detection;
 use crate::sliding_window::{SlidingWindow, SlidingWindowConfig};
 
+// =============================================================================
+// Telemetry types
+// =============================================================================
+
+/// Operational telemetry for [`TraumaState`].
+#[derive(Debug, Clone, Default)]
+pub struct TraumaTelemetry {
+    commands_recorded: u64,
+    interventions: u64,
+    mutations_recorded: u64,
+    functional_mutations: u64,
+    history_trims: u64,
+}
+
+impl TraumaTelemetry {
+    pub fn snapshot(&self) -> TraumaTelemetrySnapshot {
+        TraumaTelemetrySnapshot {
+            commands_recorded: self.commands_recorded,
+            interventions: self.interventions,
+            mutations_recorded: self.mutations_recorded,
+            functional_mutations: self.functional_mutations,
+            history_trims: self.history_trims,
+        }
+    }
+}
+
+/// Serializable telemetry snapshot for [`TraumaState`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraumaTelemetrySnapshot {
+    pub commands_recorded: u64,
+    pub interventions: u64,
+    pub mutations_recorded: u64,
+    pub functional_mutations: u64,
+    pub history_trims: u64,
+}
+
 const REASON_RECURRING_FAILURE_LOOP: &str = "recurring_failure_loop";
 const DEFAULT_COMMAND_SIMILARITY_THRESHOLD: f64 = 0.88;
 const DEFAULT_TOKEN_JACCARD_THRESHOLD: f64 = 0.60;
@@ -170,6 +206,7 @@ pub struct TraumaState {
     signature_bloom: BloomFilter,
     mutation_epoch: u64,
     last_mutation_timestamp_ms: Option<u64>,
+    telemetry: TraumaTelemetry,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +246,7 @@ impl TraumaState {
             config: sanitized,
             mutation_epoch: 0,
             last_mutation_timestamp_ms: None,
+            telemetry: TraumaTelemetry::default(),
         }
     }
 
@@ -243,6 +281,11 @@ impl TraumaState {
     #[must_use]
     pub const fn last_mutation_timestamp_ms(&self) -> Option<u64> {
         self.last_mutation_timestamp_ms
+    }
+
+    /// Returns the telemetry tracker for this state.
+    pub fn telemetry(&self) -> &TraumaTelemetry {
+        &self.telemetry
     }
 
     /// Check whether a signature appears in recent-memory membership state.
@@ -291,7 +334,9 @@ impl TraumaState {
         let should_intervene =
             !recurring_signatures.is_empty() && repeat_count >= self.config.loop_threshold;
 
+        self.telemetry.commands_recorded += 1;
         if should_intervene {
+            self.telemetry.interventions += 1;
             TraumaDecision::intervene(command_hash, repeat_count, recurring_signatures)
         } else {
             TraumaDecision::allow(command_hash, repeat_count, recurring_signatures)
@@ -315,9 +360,11 @@ impl TraumaState {
     /// edits). Returns `false` for scratchpad/docs mutations (`.beads/`, `*.md`,
     /// `*.txt`).
     pub fn record_mutation(&mut self, timestamp_ms: u64, path: &str) -> bool {
+        self.telemetry.mutations_recorded += 1;
         if !is_functional_mutation_path(path) {
             return false;
         }
+        self.telemetry.functional_mutations += 1;
         self.mutation_epoch = self.mutation_epoch.saturating_add(1);
         self.last_mutation_timestamp_ms = Some(timestamp_ms);
         true
@@ -443,6 +490,9 @@ impl TraumaState {
     }
 
     fn trim_history(&mut self) {
+        if self.history.len() > self.config.history_limit {
+            self.telemetry.history_trims += 1;
+        }
         while self.history.len() > self.config.history_limit {
             let _ = self.history.pop_front();
         }
@@ -950,6 +1000,63 @@ mod tests {
 
         assert_eq!(decision.repeat_count, 3);
         assert!(decision.should_intervene);
+    }
+
+    // ── Telemetry counter tests ──────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let state = TraumaState::with_config(test_config());
+        let snap = state.telemetry().snapshot();
+        assert_eq!(snap.commands_recorded, 0);
+        assert_eq!(snap.interventions, 0);
+        assert_eq!(snap.mutations_recorded, 0);
+        assert_eq!(snap.functional_mutations, 0);
+        assert_eq!(snap.history_trims, 0);
+    }
+
+    #[test]
+    fn telemetry_command_counted() {
+        let mut state = TraumaState::with_config(test_config());
+        let sigs: Vec<String> = vec![];
+        let _ = state.record_command_result(1000, "cargo test", &sigs);
+        let _ = state.record_command_result(2000, "cargo build", &sigs);
+        let snap = state.telemetry().snapshot();
+        assert_eq!(snap.commands_recorded, 2);
+    }
+
+    #[test]
+    fn telemetry_mutation_counted() {
+        let mut state = TraumaState::with_config(test_config());
+        state.record_mutation(1000, "src/main.rs");
+        state.record_mutation(2000, "AGENT_TODO.md"); // non-functional
+        let snap = state.telemetry().snapshot();
+        assert_eq!(snap.mutations_recorded, 2);
+        assert_eq!(snap.functional_mutations, 1);
+    }
+
+    #[test]
+    fn telemetry_intervention_counted() {
+        let mut state = TraumaState::with_config(test_config());
+        let sigs = vec!["core.codex:error_loop".to_string()];
+        // Need loop_threshold (3) repetitions to trigger intervention
+        for i in 0..4 {
+            let _ = state.record_command_result(1000 + i * 100, "cargo test", &sigs);
+        }
+        let snap = state.telemetry().snapshot();
+        assert_eq!(snap.commands_recorded, 4);
+        assert!(snap.interventions >= 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let mut state = TraumaState::with_config(test_config());
+        let _ = state.record_command_result(1000, "cargo test", &[]);
+        state.record_mutation(2000, "src/lib.rs");
+        let snap = state.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: TraumaTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
     }
 
     proptest! {

@@ -30,6 +30,39 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
+// Telemetry types
+// =============================================================================
+
+/// Operational telemetry for [`BayesianClassifier`].
+#[derive(Debug, Clone, Default)]
+pub struct LedgerTelemetry {
+    updates: u64,
+    feedbacks: u64,
+    panes_reset: u64,
+    panes_removed: u64,
+}
+
+impl LedgerTelemetry {
+    pub fn snapshot(&self) -> LedgerTelemetrySnapshot {
+        LedgerTelemetrySnapshot {
+            updates: self.updates,
+            feedbacks: self.feedbacks,
+            panes_reset: self.panes_reset,
+            panes_removed: self.panes_removed,
+        }
+    }
+}
+
+/// Serializable telemetry snapshot for [`BayesianClassifier`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerTelemetrySnapshot {
+    pub updates: u64,
+    pub feedbacks: u64,
+    pub panes_reset: u64,
+    pub panes_removed: u64,
+}
+
+// =============================================================================
 // Configuration
 // =============================================================================
 
@@ -369,6 +402,7 @@ pub struct BayesianClassifier {
     dirichlet_counts: [f64; PaneState::COUNT],
     /// Total feedback observations received.
     feedback_count: u64,
+    telemetry: LedgerTelemetry,
 }
 
 impl BayesianClassifier {
@@ -387,11 +421,13 @@ impl BayesianClassifier {
             panes: HashMap::new(),
             dirichlet_counts,
             feedback_count: 0,
+            telemetry: LedgerTelemetry::default(),
         }
     }
 
     /// Update a pane with new evidence.
     pub fn update(&mut self, pane_id: u64, evidence: Evidence) {
+        self.telemetry.updates += 1;
         let max_entries = self.config.max_ledger_entries;
         let pane = self
             .panes
@@ -408,6 +444,7 @@ impl BayesianClassifier {
 
     /// Record user feedback (manual override) to update the prior.
     pub fn record_feedback(&mut self, _pane_id: u64, true_state: PaneState) {
+        self.telemetry.feedbacks += 1;
         self.dirichlet_counts[true_state.index()] += 1.0;
         self.feedback_count += 1;
 
@@ -422,6 +459,7 @@ impl BayesianClassifier {
 
     /// Reset a pane's classifier (e.g., after manual override).
     pub fn reset_pane(&mut self, pane_id: u64) {
+        self.telemetry.panes_reset += 1;
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             *pane = PaneClassifier::new(&self.log_prior);
         }
@@ -429,6 +467,7 @@ impl BayesianClassifier {
 
     /// Remove a pane from tracking.
     pub fn remove_pane(&mut self, pane_id: u64) {
+        self.telemetry.panes_removed += 1;
         self.panes.remove(&pane_id);
     }
 
@@ -442,6 +481,11 @@ impl BayesianClassifier {
     #[must_use]
     pub fn feedback_count(&self) -> u64 {
         self.feedback_count
+    }
+
+    /// Returns the telemetry tracker for this classifier.
+    pub fn telemetry(&self) -> &LedgerTelemetry {
+        &self.telemetry
     }
 
     /// Current log-prior (for inspection/debugging).
@@ -1388,5 +1432,67 @@ mod tests {
         assert_eq!(snap.pane_count, 1);
         assert_eq!(snap.panes.len(), 1);
         assert_eq!(snap.panes[0].pane_id, 1);
+    }
+
+    // ── Telemetry counter tests ──────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let clf = BayesianClassifier::new(LedgerConfig::default());
+        let snap = clf.telemetry().snapshot();
+        assert_eq!(snap.updates, 0);
+        assert_eq!(snap.feedbacks, 0);
+        assert_eq!(snap.panes_reset, 0);
+        assert_eq!(snap.panes_removed, 0);
+    }
+
+    #[test]
+    fn telemetry_update_counted() {
+        let mut clf = BayesianClassifier::new(LedgerConfig::default());
+        clf.update(1, Evidence::OutputRate(15.0));
+        clf.update(1, Evidence::OutputRate(16.0));
+        clf.update(2, Evidence::Entropy(5.0));
+        let snap = clf.telemetry().snapshot();
+        assert_eq!(snap.updates, 3);
+    }
+
+    #[test]
+    fn telemetry_feedback_counted() {
+        let mut clf = BayesianClassifier::new(LedgerConfig::default());
+        clf.record_feedback(1, PaneState::Active);
+        clf.record_feedback(2, PaneState::Stuck);
+        let snap = clf.telemetry().snapshot();
+        assert_eq!(snap.feedbacks, 2);
+    }
+
+    #[test]
+    fn telemetry_reset_pane_counted() {
+        let mut clf = BayesianClassifier::new(LedgerConfig::default());
+        clf.update(1, Evidence::OutputRate(10.0));
+        clf.reset_pane(1);
+        clf.reset_pane(999); // nonexistent — still counts
+        let snap = clf.telemetry().snapshot();
+        assert_eq!(snap.panes_reset, 2);
+    }
+
+    #[test]
+    fn telemetry_remove_pane_counted() {
+        let mut clf = BayesianClassifier::new(LedgerConfig::default());
+        clf.update(1, Evidence::OutputRate(10.0));
+        clf.remove_pane(1);
+        let snap = clf.telemetry().snapshot();
+        assert_eq!(snap.panes_removed, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let mut clf = BayesianClassifier::new(LedgerConfig::default());
+        clf.update(1, Evidence::OutputRate(15.0));
+        clf.record_feedback(1, PaneState::Active);
+        clf.reset_pane(1);
+        let snap = clf.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: LedgerTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
     }
 }
