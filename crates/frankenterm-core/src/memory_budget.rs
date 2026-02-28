@@ -19,6 +19,57 @@ use crate::runtime_compat::sleep;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the memory budget manager.
+///
+/// Uses `AtomicU64` because `MemoryBudgetManager` methods take `&self`.
+#[derive(Debug, Default)]
+pub struct MemoryBudgetTelemetry {
+    /// Total register_pane() / register_pane_with_budget() calls.
+    panes_registered: AtomicU64,
+    /// Total unregister_pane() calls (including misses).
+    panes_unregistered: AtomicU64,
+    /// Total sample_all() calls.
+    samples: AtomicU64,
+    /// sample_all() calls that detected pressure (throttled > 0 or over_budget > 0).
+    samples_with_pressure: AtomicU64,
+}
+
+impl MemoryBudgetTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> MemoryBudgetTelemetrySnapshot {
+        MemoryBudgetTelemetrySnapshot {
+            panes_registered: self.panes_registered.load(Ordering::Relaxed),
+            panes_unregistered: self.panes_unregistered.load(Ordering::Relaxed),
+            samples: self.samples.load(Ordering::Relaxed),
+            samples_with_pressure: self.samples_with_pressure.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Serializable snapshot of memory budget telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryBudgetTelemetrySnapshot {
+    /// Total register_pane() calls.
+    pub panes_registered: u64,
+    /// Total unregister_pane() calls.
+    pub panes_unregistered: u64,
+    /// Total sample_all() calls.
+    pub samples: u64,
+    /// Samples that detected pressure.
+    pub samples_with_pressure: u64,
+}
+
+// =============================================================================
 // Budget enforcement level
 // =============================================================================
 
@@ -193,6 +244,8 @@ pub struct MemoryBudgetManager {
     panes: Mutex<HashMap<u64, PaneBudget>>,
     /// Worst (highest) budget level across all panes, as atomic u8.
     worst_level: Arc<AtomicU64>,
+    /// Operational telemetry counters.
+    telemetry: MemoryBudgetTelemetry,
 }
 
 impl MemoryBudgetManager {
@@ -202,6 +255,7 @@ impl MemoryBudgetManager {
             config,
             panes: Mutex::new(HashMap::new()),
             worst_level: Arc::new(AtomicU64::new(0)),
+            telemetry: MemoryBudgetTelemetry::new(),
         }
     }
 
@@ -236,6 +290,7 @@ impl MemoryBudgetManager {
         pid: Option<u32>,
         budget_bytes: u64,
     ) -> PaneBudget {
+        self.telemetry.panes_registered.fetch_add(1, Ordering::Relaxed);
         let mut budget = PaneBudget::new(pane_id, budget_bytes, self.config.high_ratio);
         budget.pid = pid;
 
@@ -258,6 +313,7 @@ impl MemoryBudgetManager {
 
     /// Unregister a pane and clean up its cgroup (if applicable).
     pub fn unregister_pane(&self, pane_id: u64) -> Option<PaneBudget> {
+        self.telemetry.panes_unregistered.fetch_add(1, Ordering::Relaxed);
         let mut panes = self.panes.lock().unwrap_or_else(|e| e.into_inner());
         let removed = panes.remove(&pane_id);
 
@@ -274,6 +330,7 @@ impl MemoryBudgetManager {
 
     /// Sample current memory usage for all tracked panes and update levels.
     pub fn sample_all(&self) -> BudgetSummary {
+        self.telemetry.samples.fetch_add(1, Ordering::Relaxed);
         let mut panes = self.panes.lock().unwrap_or_else(|e| e.into_inner());
 
         for budget in panes.values_mut() {
@@ -287,6 +344,9 @@ impl MemoryBudgetManager {
         }
 
         let summary = compute_summary(&panes);
+        if summary.throttled_count > 0 || summary.over_budget_count > 0 {
+            self.telemetry.samples_with_pressure.fetch_add(1, Ordering::Relaxed);
+        }
         self.update_worst_level_from(&panes);
         summary
     }
@@ -309,6 +369,12 @@ impl MemoryBudgetManager {
     #[must_use]
     pub fn config(&self) -> &MemoryBudgetConfig {
         &self.config
+    }
+
+    /// Get a reference to the operational telemetry.
+    #[must_use]
+    pub fn telemetry(&self) -> &MemoryBudgetTelemetry {
+        &self.telemetry
     }
 
     /// Update the worst level atomic from the current pane map.
