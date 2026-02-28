@@ -26,6 +26,48 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // =============================================================================
+// Telemetry types
+// =============================================================================
+
+/// Operational telemetry for [`DriftMonitor`].
+#[derive(Debug, Clone, Default)]
+pub struct DriftTelemetry {
+    rules_registered: u64,
+    rules_unregistered: u64,
+    observations: u64,
+    drifts_detected: u64,
+    rate_drops: u64,
+    rate_spikes: u64,
+    resets: u64,
+}
+
+impl DriftTelemetry {
+    pub fn snapshot(&self) -> DriftTelemetrySnapshot {
+        DriftTelemetrySnapshot {
+            rules_registered: self.rules_registered,
+            rules_unregistered: self.rules_unregistered,
+            observations: self.observations,
+            drifts_detected: self.drifts_detected,
+            rate_drops: self.rate_drops,
+            rate_spikes: self.rate_spikes,
+            resets: self.resets,
+        }
+    }
+}
+
+/// Serializable telemetry snapshot for [`DriftMonitor`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftTelemetrySnapshot {
+    pub rules_registered: u64,
+    pub rules_unregistered: u64,
+    pub observations: u64,
+    pub drifts_detected: u64,
+    pub rate_drops: u64,
+    pub rate_spikes: u64,
+    pub resets: u64,
+}
+
+// =============================================================================
 // ADWIN Window
 // =============================================================================
 
@@ -419,6 +461,7 @@ impl RuleMonitor {
 pub struct DriftMonitor {
     config: DriftConfig,
     monitors: HashMap<String, RuleMonitor>,
+    telemetry: DriftTelemetry,
 }
 
 /// Summary of all monitored rules.
@@ -447,14 +490,19 @@ impl DriftMonitor {
         Self {
             config,
             monitors: HashMap::new(),
+            telemetry: DriftTelemetry::default(),
         }
     }
 
     /// Register a rule for drift monitoring.
     pub fn register_rule(&mut self, rule_id: &str) {
+        let is_new = !self.monitors.contains_key(rule_id);
         self.monitors
             .entry(rule_id.to_string())
             .or_insert_with(|| RuleMonitor::new(rule_id.to_string(), self.config.confidence));
+        if is_new {
+            self.telemetry.rules_registered += 1;
+        }
     }
 
     /// Record a detection rate observation for a rule.
@@ -462,16 +510,30 @@ impl DriftMonitor {
     /// Auto-registers the rule if not already tracked.
     /// Returns `Some(DriftEvent)` if drift was detected.
     pub fn observe(&mut self, rule_id: &str, rate: f64) -> Option<DriftEvent> {
+        self.telemetry.observations += 1;
+
         if !self.config.enabled {
             return None;
         }
 
+        let is_new = !self.monitors.contains_key(rule_id);
         let monitor = self
             .monitors
             .entry(rule_id.to_string())
             .or_insert_with(|| RuleMonitor::new(rule_id.to_string(), self.config.confidence));
+        if is_new {
+            self.telemetry.rules_registered += 1;
+        }
 
-        monitor.observe(rate, &self.config)
+        let event = monitor.observe(rate, &self.config);
+        if let Some(ref ev) = event {
+            self.telemetry.drifts_detected += 1;
+            match ev.drift_type {
+                DriftType::RateDrop => self.telemetry.rate_drops += 1,
+                DriftType::RateSpike => self.telemetry.rate_spikes += 1,
+            }
+        }
+        event
     }
 
     /// Get the monitor for a specific rule.
@@ -518,8 +580,14 @@ impl DriftMonitor {
         &self.config
     }
 
+    /// Returns the telemetry tracker for this drift monitor.
+    pub fn telemetry(&self) -> &DriftTelemetry {
+        &self.telemetry
+    }
+
     /// Reset all rule monitors.
     pub fn reset(&mut self) {
+        self.telemetry.resets += 1;
         for monitor in self.monitors.values_mut() {
             monitor.reset();
         }
@@ -527,7 +595,11 @@ impl DriftMonitor {
 
     /// Remove a rule from monitoring.
     pub fn unregister_rule(&mut self, rule_id: &str) -> bool {
-        self.monitors.remove(rule_id).is_some()
+        let removed = self.monitors.remove(rule_id).is_some();
+        if removed {
+            self.telemetry.rules_unregistered += 1;
+        }
+        removed
     }
 }
 
@@ -1383,5 +1455,97 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
         let back: DriftSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(back.total_rules, 2);
+    }
+
+    // ── Telemetry counter tests ──────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let dm = DriftMonitor::new(DriftConfig::default());
+        let snap = dm.telemetry().snapshot();
+        assert_eq!(snap.rules_registered, 0);
+        assert_eq!(snap.rules_unregistered, 0);
+        assert_eq!(snap.observations, 0);
+        assert_eq!(snap.drifts_detected, 0);
+        assert_eq!(snap.rate_drops, 0);
+        assert_eq!(snap.rate_spikes, 0);
+        assert_eq!(snap.resets, 0);
+    }
+
+    #[test]
+    fn telemetry_register_counted() {
+        let mut dm = DriftMonitor::new(DriftConfig::default());
+        dm.register_rule("r1");
+        dm.register_rule("r2");
+        dm.register_rule("r2"); // duplicate — should not increment
+        let snap = dm.telemetry().snapshot();
+        assert_eq!(snap.rules_registered, 2);
+    }
+
+    #[test]
+    fn telemetry_observe_counted() {
+        let mut dm = DriftMonitor::new(DriftConfig::default());
+        dm.observe("r1", 1.0);
+        dm.observe("r1", 2.0);
+        dm.observe("r1", 3.0);
+        let snap = dm.telemetry().snapshot();
+        assert_eq!(snap.observations, 3);
+        // r1 auto-registered on first observe
+        assert_eq!(snap.rules_registered, 1);
+    }
+
+    #[test]
+    fn telemetry_drift_and_rate_type_counted() {
+        let config = DriftConfig {
+            min_window_size: 3,
+            confidence: 0.5,
+            min_mean_diff: 0.0,
+            ..DriftConfig::default()
+        };
+        let mut dm = DriftMonitor::new(config);
+        // Build baseline near 100
+        for _ in 0..5 {
+            dm.observe("r1", 100.0);
+        }
+        // Inject a massive spike
+        let event = dm.observe("r1", 10_000.0);
+        let snap = dm.telemetry().snapshot();
+        if event.is_some() {
+            assert!(snap.drifts_detected >= 1);
+            assert!(snap.rate_drops + snap.rate_spikes >= 1);
+        }
+    }
+
+    #[test]
+    fn telemetry_reset_counted() {
+        let mut dm = DriftMonitor::new(DriftConfig::default());
+        dm.observe("r1", 1.0);
+        dm.reset();
+        dm.reset();
+        let snap = dm.telemetry().snapshot();
+        assert_eq!(snap.resets, 2);
+    }
+
+    #[test]
+    fn telemetry_unregister_counted() {
+        let mut dm = DriftMonitor::new(DriftConfig::default());
+        dm.register_rule("r1");
+        dm.register_rule("r2");
+        dm.unregister_rule("r1");
+        dm.unregister_rule("r999"); // nonexistent — should not increment
+        let snap = dm.telemetry().snapshot();
+        assert_eq!(snap.rules_unregistered, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let mut dm = DriftMonitor::new(DriftConfig::default());
+        dm.register_rule("r1");
+        dm.observe("r1", 5.0);
+        dm.reset();
+        let snap = dm.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: DriftTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
     }
 }

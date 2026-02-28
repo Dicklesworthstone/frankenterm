@@ -30,6 +30,45 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // =============================================================================
+// Telemetry types
+// =============================================================================
+
+/// Operational telemetry for [`VoiScheduler`].
+#[derive(Debug, Clone, Default)]
+pub struct VoiTelemetry {
+    panes_registered: u64,
+    panes_unregistered: u64,
+    belief_updates: u64,
+    drift_applications: u64,
+    schedules_computed: u64,
+    backpressure_changes: u64,
+}
+
+impl VoiTelemetry {
+    pub fn snapshot(&self) -> VoiTelemetrySnapshot {
+        VoiTelemetrySnapshot {
+            panes_registered: self.panes_registered,
+            panes_unregistered: self.panes_unregistered,
+            belief_updates: self.belief_updates,
+            drift_applications: self.drift_applications,
+            schedules_computed: self.schedules_computed,
+            backpressure_changes: self.backpressure_changes,
+        }
+    }
+}
+
+/// Serializable telemetry snapshot for [`VoiScheduler`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiTelemetrySnapshot {
+    pub panes_registered: u64,
+    pub panes_unregistered: u64,
+    pub belief_updates: u64,
+    pub drift_applications: u64,
+    pub schedules_computed: u64,
+    pub backpressure_changes: u64,
+}
+
+// =============================================================================
 // Configuration
 // =============================================================================
 
@@ -250,6 +289,7 @@ pub struct VoiScheduler {
     config: VoiConfig,
     beliefs: HashMap<u64, PaneBelief>,
     current_backpressure: BackpressureTierInput,
+    telemetry: VoiTelemetry,
 }
 
 impl VoiScheduler {
@@ -259,11 +299,13 @@ impl VoiScheduler {
             config,
             beliefs: HashMap::new(),
             current_backpressure: BackpressureTierInput::Green,
+            telemetry: VoiTelemetry::default(),
         }
     }
 
     /// Register a pane for tracking with optional importance and cost.
     pub fn register_pane(&mut self, pane_id: u64, now_ms: u64) {
+        let is_new = !self.beliefs.contains_key(&pane_id);
         self.beliefs.entry(pane_id).or_insert_with(|| {
             PaneBelief::uniform(
                 now_ms,
@@ -271,11 +313,16 @@ impl VoiScheduler {
                 self.config.default_cost_ms,
             )
         });
+        if is_new {
+            self.telemetry.panes_registered += 1;
+        }
     }
 
     /// Remove a pane.
     pub fn unregister_pane(&mut self, pane_id: u64) {
-        self.beliefs.remove(&pane_id);
+        if self.beliefs.remove(&pane_id).is_some() {
+            self.telemetry.panes_unregistered += 1;
+        }
     }
 
     /// Set importance weight for a pane.
@@ -294,6 +341,9 @@ impl VoiScheduler {
 
     /// Update backpressure tier.
     pub fn set_backpressure(&mut self, tier: BackpressureTierInput) {
+        if self.current_backpressure != tier {
+            self.telemetry.backpressure_changes += 1;
+        }
         self.current_backpressure = tier;
     }
 
@@ -307,12 +357,14 @@ impl VoiScheduler {
         now_ms: u64,
     ) {
         if let Some(belief) = self.beliefs.get_mut(&pane_id) {
+            self.telemetry.belief_updates += 1;
             belief.update(log_likelihoods, now_ms);
         }
     }
 
     /// Apply entropy drift to all panes based on elapsed time.
     pub fn apply_drift(&mut self, now_ms: u64) {
+        self.telemetry.drift_applications += 1;
         let drift_rate = self.config.entropy_drift_rate;
         let max_entropy = self.config.max_entropy;
 
@@ -470,6 +522,11 @@ impl VoiScheduler {
             self.config.min_poll_interval_ms,
             self.config.max_poll_interval_ms,
         )
+    }
+
+    /// Returns the telemetry tracker for this scheduler.
+    pub fn telemetry(&self) -> &VoiTelemetry {
+        &self.telemetry
     }
 }
 
@@ -1151,5 +1208,83 @@ mod tests {
         assert!(sched.compute_voi(1, 2000).is_some());
         sched.unregister_pane(1);
         assert!(sched.compute_voi(1, 2000).is_none());
+    }
+
+    // ── Telemetry counter tests ──────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let sched = VoiScheduler::new(VoiConfig::default());
+        let snap = sched.telemetry().snapshot();
+        assert_eq!(snap.panes_registered, 0);
+        assert_eq!(snap.panes_unregistered, 0);
+        assert_eq!(snap.belief_updates, 0);
+        assert_eq!(snap.drift_applications, 0);
+        assert_eq!(snap.schedules_computed, 0);
+        assert_eq!(snap.backpressure_changes, 0);
+    }
+
+    #[test]
+    fn telemetry_register_counted() {
+        let mut sched = VoiScheduler::new(VoiConfig::default());
+        sched.register_pane(1, 1000);
+        sched.register_pane(2, 1000);
+        sched.register_pane(1, 2000); // duplicate — should not increment
+        let snap = sched.telemetry().snapshot();
+        assert_eq!(snap.panes_registered, 2);
+    }
+
+    #[test]
+    fn telemetry_unregister_counted() {
+        let mut sched = VoiScheduler::new(VoiConfig::default());
+        sched.register_pane(1, 1000);
+        sched.unregister_pane(1);
+        sched.unregister_pane(999); // nonexistent — should not increment
+        let snap = sched.telemetry().snapshot();
+        assert_eq!(snap.panes_unregistered, 1);
+    }
+
+    #[test]
+    fn telemetry_belief_update_counted() {
+        let mut sched = VoiScheduler::new(VoiConfig::default());
+        sched.register_pane(1, 1000);
+        let likelihoods = [0.0; PaneState::COUNT];
+        sched.update_belief(1, &likelihoods, 2000);
+        sched.update_belief(1, &likelihoods, 3000);
+        sched.update_belief(999, &likelihoods, 3000); // unknown pane — no increment
+        let snap = sched.telemetry().snapshot();
+        assert_eq!(snap.belief_updates, 2);
+    }
+
+    #[test]
+    fn telemetry_drift_application_counted() {
+        let mut sched = VoiScheduler::new(VoiConfig::default());
+        sched.register_pane(1, 1000);
+        sched.apply_drift(2000);
+        sched.apply_drift(3000);
+        let snap = sched.telemetry().snapshot();
+        assert_eq!(snap.drift_applications, 2);
+    }
+
+    #[test]
+    fn telemetry_backpressure_change_counted() {
+        let mut sched = VoiScheduler::new(VoiConfig::default());
+        sched.set_backpressure(BackpressureTierInput::Yellow);
+        sched.set_backpressure(BackpressureTierInput::Yellow); // same — no increment
+        sched.set_backpressure(BackpressureTierInput::Red);
+        let snap = sched.telemetry().snapshot();
+        assert_eq!(snap.backpressure_changes, 2);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let mut sched = VoiScheduler::new(VoiConfig::default());
+        sched.register_pane(1, 1000);
+        sched.apply_drift(2000);
+        sched.set_backpressure(BackpressureTierInput::Yellow);
+        let snap = sched.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: VoiTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
     }
 }

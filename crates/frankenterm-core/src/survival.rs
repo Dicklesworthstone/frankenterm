@@ -31,6 +31,44 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 // =============================================================================
+// Telemetry types
+// =============================================================================
+
+/// Operational telemetry for [`SurvivalModel`].
+///
+/// Uses `AtomicU64` for lock-free `&self` access.
+#[derive(Debug, Default)]
+pub struct SurvivalTelemetry {
+    observations_recorded: AtomicU64,
+    parameter_updates: AtomicU64,
+    reports_generated: AtomicU64,
+    hazard_evaluations: AtomicU64,
+    shutdowns: AtomicU64,
+}
+
+impl SurvivalTelemetry {
+    pub fn snapshot(&self) -> SurvivalTelemetrySnapshot {
+        SurvivalTelemetrySnapshot {
+            observations_recorded: self.observations_recorded.load(Ordering::Relaxed),
+            parameter_updates: self.parameter_updates.load(Ordering::Relaxed),
+            reports_generated: self.reports_generated.load(Ordering::Relaxed),
+            hazard_evaluations: self.hazard_evaluations.load(Ordering::Relaxed),
+            shutdowns: self.shutdowns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Serializable telemetry snapshot for [`SurvivalModel`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurvivalTelemetrySnapshot {
+    pub observations_recorded: u64,
+    pub parameter_updates: u64,
+    pub reports_generated: u64,
+    pub hazard_evaluations: u64,
+    pub shutdowns: u64,
+}
+
+// =============================================================================
 // Configuration
 // =============================================================================
 
@@ -724,6 +762,7 @@ pub struct SurvivalModel {
     observations: RwLock<Vec<Observation>>,
     shutdown: AtomicBool,
     observation_count: AtomicU64,
+    telemetry: SurvivalTelemetry,
 }
 
 impl SurvivalModel {
@@ -736,6 +775,7 @@ impl SurvivalModel {
             observations: RwLock::new(Vec::new()),
             shutdown: AtomicBool::new(false),
             observation_count: AtomicU64::new(0),
+            telemetry: SurvivalTelemetry::default(),
         }
     }
 
@@ -748,11 +788,16 @@ impl SurvivalModel {
             observations: RwLock::new(Vec::new()),
             shutdown: AtomicBool::new(false),
             observation_count: AtomicU64::new(0),
+            telemetry: SurvivalTelemetry::default(),
         }
     }
 
     /// Record a new observation and update model parameters.
     pub fn observe(&self, obs: Observation) {
+        self.telemetry
+            .observations_recorded
+            .fetch_add(1, Ordering::Relaxed);
+
         {
             let mut observations = self.observations.write().unwrap_or_else(|e| e.into_inner());
             observations.push(obs);
@@ -768,6 +813,9 @@ impl SurvivalModel {
 
         // Only update parameters if we have enough data
         if self.observation_count() as usize >= self.config.warmup_observations {
+            self.telemetry
+                .parameter_updates
+                .fetch_add(1, Ordering::Relaxed);
             self.update_parameters();
         }
     }
@@ -795,6 +843,9 @@ impl SurvivalModel {
     /// Determine the recommended action for current hazard level.
     #[must_use]
     pub fn evaluate_action(&self, t: f64, covariates: &Covariates) -> HazardAction {
+        self.telemetry
+            .hazard_evaluations
+            .fetch_add(1, Ordering::Relaxed);
         let hazard = self.hazard_rate(t, covariates);
         self.classify_hazard(hazard)
     }
@@ -816,6 +867,9 @@ impl SurvivalModel {
     /// Produce a comprehensive hazard report.
     #[must_use]
     pub fn report(&self, t: f64, covariates: &Covariates) -> HazardReport {
+        self.telemetry
+            .reports_generated
+            .fetch_add(1, Ordering::Relaxed);
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -904,6 +958,7 @@ impl SurvivalModel {
 
     /// Signal shutdown.
     pub fn shutdown(&self) {
+        self.telemetry.shutdowns.fetch_add(1, Ordering::Relaxed);
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
@@ -911,6 +966,11 @@ impl SurvivalModel {
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Returns the telemetry tracker for this model.
+    pub fn telemetry(&self) -> &SurvivalTelemetry {
+        &self.telemetry
     }
 
     /// Run the model update loop (call from async context).
@@ -2344,5 +2404,110 @@ mod tests {
         assert!(h1 > 0.0);
         assert!(h1 > h2, "h(1)={} should be > h(10)={} when k<1", h1, h2);
         assert!(h2 > h3, "h(10)={} should be > h(100)={} when k<1", h2, h3);
+    }
+
+    // ── Telemetry counter tests ──────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let model = SurvivalModel::new(SurvivalConfig::default());
+        let snap = model.telemetry().snapshot();
+        assert_eq!(snap.observations_recorded, 0);
+        assert_eq!(snap.parameter_updates, 0);
+        assert_eq!(snap.reports_generated, 0);
+        assert_eq!(snap.hazard_evaluations, 0);
+        assert_eq!(snap.shutdowns, 0);
+    }
+
+    #[test]
+    fn telemetry_observe_counted() {
+        let model = SurvivalModel::new(SurvivalConfig {
+            warmup_observations: 100, // keep in warmup
+            ..SurvivalConfig::default()
+        });
+        model.observe(Observation {
+            time: 10.0,
+            event_observed: true,
+            covariates: Covariates::default(),
+            timestamp_secs: 0,
+        });
+        model.observe(Observation {
+            time: 20.0,
+            event_observed: false,
+            covariates: Covariates::default(),
+            timestamp_secs: 1,
+        });
+        let snap = model.telemetry().snapshot();
+        assert_eq!(snap.observations_recorded, 2);
+        // Still in warmup — no parameter updates
+        assert_eq!(snap.parameter_updates, 0);
+    }
+
+    #[test]
+    fn telemetry_parameter_update_after_warmup() {
+        let model = SurvivalModel::new(SurvivalConfig {
+            warmup_observations: 2,
+            ..SurvivalConfig::default()
+        });
+        // First two observations exit warmup; the second triggers update
+        model.observe(Observation {
+            time: 10.0,
+            event_observed: true,
+            covariates: Covariates::default(),
+            timestamp_secs: 0,
+        });
+        model.observe(Observation {
+            time: 20.0,
+            event_observed: true,
+            covariates: Covariates::default(),
+            timestamp_secs: 1,
+        });
+        let snap = model.telemetry().snapshot();
+        assert_eq!(snap.observations_recorded, 2);
+        assert_eq!(snap.parameter_updates, 1);
+    }
+
+    #[test]
+    fn telemetry_hazard_eval_counted() {
+        let model = SurvivalModel::new(SurvivalConfig::default());
+        let covs = Covariates::default();
+        let _ = model.evaluate_action(10.0, &covs);
+        let _ = model.evaluate_action(20.0, &covs);
+        let snap = model.telemetry().snapshot();
+        assert_eq!(snap.hazard_evaluations, 2);
+    }
+
+    #[test]
+    fn telemetry_report_counted() {
+        let model = SurvivalModel::new(SurvivalConfig::default());
+        let covs = Covariates::default();
+        let _ = model.report(10.0, &covs);
+        let snap = model.telemetry().snapshot();
+        assert_eq!(snap.reports_generated, 1);
+    }
+
+    #[test]
+    fn telemetry_shutdown_counted() {
+        let model = SurvivalModel::new(SurvivalConfig::default());
+        model.shutdown();
+        model.shutdown(); // idempotent but still counts
+        let snap = model.telemetry().snapshot();
+        assert_eq!(snap.shutdowns, 2);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let model = SurvivalModel::new(SurvivalConfig::default());
+        model.observe(Observation {
+            time: 10.0,
+            event_observed: true,
+            covariates: Covariates::default(),
+            timestamp_secs: 0,
+        });
+        let _ = model.evaluate_action(10.0, &Covariates::default());
+        let snap = model.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SurvivalTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
     }
 }

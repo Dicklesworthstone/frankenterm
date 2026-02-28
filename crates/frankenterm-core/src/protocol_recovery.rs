@@ -21,6 +21,96 @@ use serde::{Deserialize, Serialize};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitStateKind};
 
+// =============================================================================
+// Telemetry types
+// =============================================================================
+
+/// Operational telemetry for [`RecoveryEngine`].
+///
+/// Uses the existing `RecoveryCounters` (AtomicU64) internally.
+/// Call [`RecoveryEngine::telemetry_snapshot`] to get a serializable snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryTelemetrySnapshot {
+    pub total_operations: u64,
+    pub first_try_successes: u64,
+    pub retry_successes: u64,
+    pub total_retries: u64,
+    pub recoverable_failures: u64,
+    pub transient_failures: u64,
+    pub permanent_failures: u64,
+    pub circuit_rejections: u64,
+}
+
+/// Operational telemetry for [`FrameCorruptionDetector`].
+#[derive(Debug, Clone, Default)]
+pub struct FrameCorruptionTelemetry {
+    successes_recorded: u64,
+    errors_recorded: u64,
+    corruption_detections: u64,
+    window_rotations: u64,
+    resets: u64,
+}
+
+impl FrameCorruptionTelemetry {
+    pub fn snapshot(&self) -> FrameCorruptionTelemetrySnapshot {
+        FrameCorruptionTelemetrySnapshot {
+            successes_recorded: self.successes_recorded,
+            errors_recorded: self.errors_recorded,
+            corruption_detections: self.corruption_detections,
+            window_rotations: self.window_rotations,
+            resets: self.resets,
+        }
+    }
+}
+
+/// Serializable telemetry snapshot for [`FrameCorruptionDetector`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameCorruptionTelemetrySnapshot {
+    pub successes_recorded: u64,
+    pub errors_recorded: u64,
+    pub corruption_detections: u64,
+    pub window_rotations: u64,
+    pub resets: u64,
+}
+
+/// Operational telemetry for [`ConnectionHealthTracker`].
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionHealthTelemetry {
+    successes_recorded: u64,
+    errors_recorded: u64,
+    healthy_transitions: u64,
+    degraded_transitions: u64,
+    corrupted_transitions: u64,
+    dead_transitions: u64,
+    resets: u64,
+}
+
+impl ConnectionHealthTelemetry {
+    pub fn snapshot(&self) -> ConnectionHealthTelemetrySnapshot {
+        ConnectionHealthTelemetrySnapshot {
+            successes_recorded: self.successes_recorded,
+            errors_recorded: self.errors_recorded,
+            healthy_transitions: self.healthy_transitions,
+            degraded_transitions: self.degraded_transitions,
+            corrupted_transitions: self.corrupted_transitions,
+            dead_transitions: self.dead_transitions,
+            resets: self.resets,
+        }
+    }
+}
+
+/// Serializable telemetry snapshot for [`ConnectionHealthTracker`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionHealthTelemetrySnapshot {
+    pub successes_recorded: u64,
+    pub errors_recorded: u64,
+    pub healthy_transitions: u64,
+    pub degraded_transitions: u64,
+    pub corrupted_transitions: u64,
+    pub dead_transitions: u64,
+    pub resets: u64,
+}
+
 /// Classification of protocol errors to drive recovery strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -379,6 +469,21 @@ impl RecoveryEngine {
         self.circuit.allow()
     }
 
+    /// Returns a serializable telemetry snapshot of monotonic counters.
+    #[must_use]
+    pub fn telemetry_snapshot(&self) -> RecoveryTelemetrySnapshot {
+        RecoveryTelemetrySnapshot {
+            total_operations: self.counters.total_operations.load(Ordering::Relaxed),
+            first_try_successes: self.counters.first_try_successes.load(Ordering::Relaxed),
+            retry_successes: self.counters.retry_successes.load(Ordering::Relaxed),
+            total_retries: self.counters.total_retries.load(Ordering::Relaxed),
+            recoverable_failures: self.counters.recoverable_failures.load(Ordering::Relaxed),
+            transient_failures: self.counters.transient_failures.load(Ordering::Relaxed),
+            permanent_failures: self.counters.permanent_failures.load(Ordering::Relaxed),
+            circuit_rejections: self.counters.circuit_rejections.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn reset_permanent_counter(&self) {
         self.counters
             .consecutive_permanent
@@ -533,6 +638,7 @@ pub struct FrameCorruptionDetector {
     window_size: u32,
     corruption_threshold: u32,
     window_ops: u32,
+    telemetry: FrameCorruptionTelemetry,
 }
 
 impl FrameCorruptionDetector {
@@ -544,15 +650,18 @@ impl FrameCorruptionDetector {
             window_size,
             corruption_threshold,
             window_ops: 0,
+            telemetry: FrameCorruptionTelemetry::default(),
         }
     }
 
     pub fn record_success(&mut self) {
+        self.telemetry.successes_recorded += 1;
         self.window_ops += 1;
         self.maybe_rotate_window();
     }
 
     pub fn record_error(&mut self, kind: ProtocolErrorKind, error_msg: &str) -> bool {
+        self.telemetry.errors_recorded += 1;
         self.window_ops += 1;
         if kind == ProtocolErrorKind::Recoverable {
             let lower = error_msg.to_lowercase();
@@ -563,7 +672,11 @@ impl FrameCorruptionDetector {
             }
         }
         self.maybe_rotate_window();
-        self.is_corrupted()
+        let corrupted = self.is_corrupted();
+        if corrupted {
+            self.telemetry.corruption_detections += 1;
+        }
+        corrupted
     }
 
     #[must_use]
@@ -572,6 +685,7 @@ impl FrameCorruptionDetector {
     }
 
     pub fn reset(&mut self) {
+        self.telemetry.resets += 1;
         self.unexpected_count = 0;
         self.codec_error_count = 0;
         self.window_ops = 0;
@@ -582,8 +696,14 @@ impl FrameCorruptionDetector {
         (self.unexpected_count, self.codec_error_count)
     }
 
+    /// Returns the telemetry tracker for this detector.
+    pub fn telemetry(&self) -> &FrameCorruptionTelemetry {
+        &self.telemetry
+    }
+
     fn maybe_rotate_window(&mut self) {
         if self.window_ops >= self.window_size {
+            self.telemetry.window_rotations += 1;
             self.unexpected_count /= 2;
             self.codec_error_count /= 2;
             self.window_ops = 0;
@@ -613,6 +733,7 @@ pub struct ConnectionHealthTracker {
     consecutive_successes: u32,
     consecutive_failures: u32,
     health: ConnectionHealth,
+    telemetry: ConnectionHealthTelemetry,
 }
 
 impl ConnectionHealthTracker {
@@ -623,20 +744,25 @@ impl ConnectionHealthTracker {
             consecutive_successes: 0,
             consecutive_failures: 0,
             health: ConnectionHealth::Healthy,
+            telemetry: ConnectionHealthTelemetry::default(),
         }
     }
 
     pub fn record_success(&mut self) -> ConnectionHealth {
+        self.telemetry.successes_recorded += 1;
         self.detector.record_success();
         self.consecutive_successes += 1;
         self.consecutive_failures = 0;
         if self.health == ConnectionHealth::Degraded && self.consecutive_successes >= 5 {
             self.health = ConnectionHealth::Healthy;
+            self.telemetry.healthy_transitions += 1;
         }
         self.health
     }
 
     pub fn record_error(&mut self, kind: ProtocolErrorKind, msg: &str) -> ConnectionHealth {
+        self.telemetry.errors_recorded += 1;
+        let prev_health = self.health;
         let corrupted = self.detector.record_error(kind, msg);
         self.consecutive_successes = 0;
         self.consecutive_failures += 1;
@@ -655,6 +781,14 @@ impl ConnectionHealthTracker {
                 }
             }
         }
+        if self.health != prev_health {
+            match self.health {
+                ConnectionHealth::Healthy => self.telemetry.healthy_transitions += 1,
+                ConnectionHealth::Degraded => self.telemetry.degraded_transitions += 1,
+                ConnectionHealth::Corrupted => self.telemetry.corrupted_transitions += 1,
+                ConnectionHealth::Dead => self.telemetry.dead_transitions += 1,
+            }
+        }
         self.health
     }
 
@@ -663,7 +797,13 @@ impl ConnectionHealthTracker {
         self.health
     }
 
+    /// Returns the telemetry tracker for this health tracker.
+    pub fn telemetry(&self) -> &ConnectionHealthTelemetry {
+        &self.telemetry
+    }
+
     pub fn reset(&mut self) {
+        self.telemetry.resets += 1;
         self.detector.reset();
         self.consecutive_successes = 0;
         self.consecutive_failures = 0;
