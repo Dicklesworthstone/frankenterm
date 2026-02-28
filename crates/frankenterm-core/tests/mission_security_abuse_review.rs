@@ -340,7 +340,7 @@ fn poison_agent_load_exceeds_capacity() {
 #[test]
 fn poison_agent_u32_max_load_no_crash() {
     let mut ml = MissionLoop::new(MissionLoopConfig::default());
-    let agents = vec![agent_with_load("saturated", u32::MAX, u32::MAX)];
+    let agents = vec![agent_with_load("saturated", usize::MAX, usize::MAX)];
     let issues = vec![issue("bead-1", 1)];
     // Must not overflow or crash.
     let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
@@ -375,11 +375,10 @@ fn poison_degraded_agent_negative_retry_after() {
         max_parallel_assignments: 3,
         availability: MissionAgentAvailability::RateLimited {
             reason_code: "attack".to_string(),
-            retry_after_ms: i64::MIN,
         },
     }];
     let issues = vec![issue("bead-1", 1)];
-    // Must not panic on negative retry_after_ms.
+    // Must not panic on adversarial rate-limit reason.
     let _decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
 }
 
