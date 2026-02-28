@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aho_corasick::AhoCorasick;
@@ -17,6 +18,89 @@ use crate::Result;
 use crate::config::{PackOverride, PatternsConfig};
 use crate::error::PatternError;
 use crate::policy::Redactor;
+
+// =============================================================================
+// Pattern Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the pattern detection engine.
+///
+/// Uses atomics because `PatternEngine::detect()` takes `&self` and may be
+/// called from multiple threads concurrently. All counters are monotonically
+/// increasing with `Ordering::Relaxed` (no synchronization guarantees needed
+/// for diagnostic counters).
+pub struct PatternTelemetry {
+    /// Total `detect()` / `detect_with_context()` calls
+    scans_total: AtomicU64,
+    /// Total individual pattern matches produced
+    matches_total: AtomicU64,
+    /// Total scans rejected early by quick_reject (no anchor byte found)
+    quick_rejects: AtomicU64,
+    /// Total Bloom filter checks performed
+    bloom_checks: AtomicU64,
+    /// Total Bloom filter positive results (possible match)
+    bloom_positives: AtomicU64,
+    /// Total scans where Bloom filter rejected all candidates
+    bloom_rejects: AtomicU64,
+    /// Total candidate rules evaluated (post-anchor-match)
+    candidate_rules_evaluated: AtomicU64,
+    /// Total regex evaluations performed
+    regex_evaluations: AtomicU64,
+}
+
+impl PatternTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    fn new() -> Self {
+        Self {
+            scans_total: AtomicU64::new(0),
+            matches_total: AtomicU64::new(0),
+            quick_rejects: AtomicU64::new(0),
+            bloom_checks: AtomicU64::new(0),
+            bloom_positives: AtomicU64::new(0),
+            bloom_rejects: AtomicU64::new(0),
+            candidate_rules_evaluated: AtomicU64::new(0),
+            regex_evaluations: AtomicU64::new(0),
+        }
+    }
+
+    /// Take a serializable snapshot of current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> PatternTelemetrySnapshot {
+        PatternTelemetrySnapshot {
+            scans_total: self.scans_total.load(Ordering::Relaxed),
+            matches_total: self.matches_total.load(Ordering::Relaxed),
+            quick_rejects: self.quick_rejects.load(Ordering::Relaxed),
+            bloom_checks: self.bloom_checks.load(Ordering::Relaxed),
+            bloom_positives: self.bloom_positives.load(Ordering::Relaxed),
+            bloom_rejects: self.bloom_rejects.load(Ordering::Relaxed),
+            candidate_rules_evaluated: self.candidate_rules_evaluated.load(Ordering::Relaxed),
+            regex_evaluations: self.regex_evaluations.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl std::fmt::Debug for PatternTelemetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PatternTelemetry")
+            .field("scans_total", &self.scans_total.load(Ordering::Relaxed))
+            .field("matches_total", &self.matches_total.load(Ordering::Relaxed))
+            .field("quick_rejects", &self.quick_rejects.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+/// Serializable snapshot of pattern engine telemetry counters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternTelemetrySnapshot {
+    pub scans_total: u64,
+    pub matches_total: u64,
+    pub quick_rejects: u64,
+    pub bloom_checks: u64,
+    pub bloom_positives: u64,
+    pub bloom_rejects: u64,
+    pub candidate_rules_evaluated: u64,
+    pub regex_evaluations: u64,
+}
 
 /// Agent types we support
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1778,6 +1862,8 @@ pub struct PatternEngine {
     index: OnceLock<EngineIndex>,
     /// Enable quick-reject optimization
     quick_reject_enabled: bool,
+    /// Operational telemetry counters (atomic for concurrent access)
+    telemetry: PatternTelemetry,
 }
 
 impl Default for PatternEngine {
@@ -1796,6 +1882,7 @@ impl PatternEngine {
             library,
             index: OnceLock::new(),
             quick_reject_enabled: true,
+            telemetry: PatternTelemetry::new(),
         }
     }
 
@@ -1818,6 +1905,7 @@ impl PatternEngine {
             library,
             index: OnceLock::new(),
             quick_reject_enabled: config.quick_reject_enabled,
+            telemetry: PatternTelemetry::new(),
         })
     }
 
@@ -1831,6 +1919,7 @@ impl PatternEngine {
             library,
             index: OnceLock::new(),
             quick_reject_enabled,
+            telemetry: PatternTelemetry::new(),
         };
         engine
             .index
@@ -1856,13 +1945,18 @@ impl PatternEngine {
     /// Detect patterns in text
     #[must_use]
     pub fn detect(&self, text: &str) -> Vec<Detection> {
+        self.telemetry.scans_total.fetch_add(1, Ordering::Relaxed);
+
         if text.is_empty() {
             return Vec::new();
         }
 
         let index = self.index();
 
-        if self.quick_reject_enabled && !Self::quick_reject_with_index(index, text) {
+        if self.quick_reject_enabled
+            && !Self::quick_reject_with_index(index, text, &self.telemetry)
+        {
+            self.telemetry.quick_rejects.fetch_add(1, Ordering::Relaxed);
             return Vec::new();
         }
 
@@ -1915,6 +2009,10 @@ impl PatternEngine {
         let mut indices: Vec<usize> = candidate_rules.into_iter().collect();
         indices.sort_unstable();
 
+        self.telemetry
+            .candidate_rules_evaluated
+            .fetch_add(indices.len() as u64, Ordering::Relaxed);
+
         let mut detections = Vec::new();
         for idx in indices {
             let compiled = &index.compiled_rules[idx];
@@ -1925,6 +2023,9 @@ impl PatternEngine {
                 .unwrap_or_default();
 
             if let Some(regex) = compiled.regex.as_ref() {
+                self.telemetry
+                    .regex_evaluations
+                    .fetch_add(1, Ordering::Relaxed);
                 for capture_result in regex.captures_iter(text) {
                     let Ok(captures) = capture_result else {
                         continue;
@@ -1969,6 +2070,10 @@ impl PatternEngine {
                 });
             }
         }
+
+        self.telemetry
+            .matches_total
+            .fetch_add(detections.len() as u64, Ordering::Relaxed);
 
         detections
     }
@@ -2112,7 +2217,10 @@ impl PatternEngine {
     ) -> (Vec<Detection>, Vec<MatchTrace>) {
         let index = self.index();
 
-        if self.quick_reject_enabled && !Self::quick_reject_with_index(index, text) {
+        if self.quick_reject_enabled
+            && !Self::quick_reject_with_index(index, text, &self.telemetry)
+        {
+            self.telemetry.quick_rejects.fetch_add(1, Ordering::Relaxed);
             return (Vec::new(), Vec::new());
         }
 
@@ -2632,10 +2740,14 @@ impl PatternEngine {
             return false;
         }
         let index = self.index();
-        Self::quick_reject_with_index(index, text)
+        Self::quick_reject_with_index(index, text, &self.telemetry)
     }
 
-    fn quick_reject_with_index(index: &EngineIndex, text: &str) -> bool {
+    fn quick_reject_with_index(
+        index: &EngineIndex,
+        text: &str,
+        telemetry: &PatternTelemetry,
+    ) -> bool {
         if text.is_empty() || index.quick_bytes.is_empty() {
             return false;
         }
@@ -2673,13 +2785,18 @@ impl PatternEngine {
                         continue;
                     }
                     let window = &text[start..end];
+                    telemetry.bloom_checks.fetch_add(1, Ordering::Relaxed);
                     if bloom.check(window) {
+                        telemetry
+                            .bloom_positives
+                            .fetch_add(1, Ordering::Relaxed);
                         // Bloom says "possibly present" - need full matching
                         return true;
                     }
                 }
             }
             // Bloom filter rejected all candidate substrings - definitely no match
+            telemetry.bloom_rejects.fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
@@ -2713,6 +2830,12 @@ impl PatternEngine {
             .iter()
             .find(|rule| rule.id == rule_id)
             .and_then(|rule| serde_json::to_string(rule).ok())
+    }
+
+    /// Access the operational telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &PatternTelemetry {
+        &self.telemetry
     }
 }
 
