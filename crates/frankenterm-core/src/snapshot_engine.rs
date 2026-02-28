@@ -1881,6 +1881,7 @@ mod tests {
             in_progress: AtomicBool::new(false),
             trigger_tx,
             trigger_rx: Mutex::new(None),
+            telemetry: SnapshotEngineTelemetry::new(),
         };
 
         assert!(engine.emit_trigger(SnapshotTrigger::WorkCompleted));

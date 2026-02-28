@@ -1408,8 +1408,10 @@ impl Outcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MissionLifecycleState {
+    Planned,
     Planning,
     Dispatching,
+    Running,
     Executing,
     RetryPending,
     Blocked,
@@ -1427,8 +1429,10 @@ impl Default for MissionLifecycleState {
 impl fmt::Display for MissionLifecycleState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Planned => f.write_str("planned"),
             Self::Planning => f.write_str("planning"),
             Self::Dispatching => f.write_str("dispatching"),
+            Self::Running => f.write_str("running"),
             Self::Executing => f.write_str("executing"),
             Self::RetryPending => f.write_str("retry_pending"),
             Self::Blocked => f.write_str("blocked"),
@@ -1478,6 +1482,12 @@ impl MissionLifecycleState {
     }
 }
 
+/// Free-function alias for `MissionLifecycleState::transition_table()`.
+#[must_use]
+pub fn mission_lifecycle_transition_table() -> &'static [MissionLifecycleTransition] {
+    MissionLifecycleState::transition_table()
+}
+
 /// Transition event used to move a mission through its lifecycle state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1516,6 +1526,23 @@ pub struct MissionLifecycleTransition {
 }
 
 const MISSION_LIFECYCLE_TRANSITIONS: &[MissionLifecycleTransition] = &[
+    // --- Planned (alias for Planning) ---
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Planned,
+        via: MissionLifecycleTransitionKind::Dispatch,
+        to: MissionLifecycleState::Dispatching,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Planned,
+        via: MissionLifecycleTransitionKind::Block,
+        to: MissionLifecycleState::Blocked,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Planned,
+        via: MissionLifecycleTransitionKind::Cancel,
+        to: MissionLifecycleState::Cancelled,
+    },
+    // --- Planning ---
     MissionLifecycleTransition {
         from: MissionLifecycleState::Planning,
         via: MissionLifecycleTransitionKind::Dispatch,
@@ -1568,6 +1595,32 @@ const MISSION_LIFECYCLE_TRANSITIONS: &[MissionLifecycleTransition] = &[
     },
     MissionLifecycleTransition {
         from: MissionLifecycleState::Executing,
+        via: MissionLifecycleTransitionKind::Cancel,
+        to: MissionLifecycleState::Cancelled,
+    },
+    // --- Running (alias for Executing) ---
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Running,
+        via: MissionLifecycleTransitionKind::Retry,
+        to: MissionLifecycleState::RetryPending,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Running,
+        via: MissionLifecycleTransitionKind::Complete,
+        to: MissionLifecycleState::Completed,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Running,
+        via: MissionLifecycleTransitionKind::Fail,
+        to: MissionLifecycleState::Failed,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Running,
+        via: MissionLifecycleTransitionKind::Block,
+        to: MissionLifecycleState::Blocked,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Running,
         via: MissionLifecycleTransitionKind::Cancel,
         to: MissionLifecycleState::Cancelled,
     },

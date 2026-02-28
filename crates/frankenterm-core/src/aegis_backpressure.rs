@@ -48,6 +48,55 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// ── Telemetry ─────────────────────────────────────────────────────────
+
+/// Operational telemetry counters for the PAC-Bayesian backpressure controller.
+#[derive(Debug, Clone, Default)]
+pub struct PacBayesTelemetry {
+    /// Total observe() calls.
+    observations: u64,
+    /// Observations where frame_dropped was true.
+    frame_drops_observed: u64,
+    /// Observations where severity > 0.01 (throttle activated).
+    throttle_activations: u64,
+    /// Observations where starvation guard fired.
+    starvation_guards: u64,
+    /// Posterior update operations (post-warmup).
+    posterior_updates: u64,
+    /// reset_pane() calls.
+    pane_resets: u64,
+    /// reset() calls.
+    full_resets: u64,
+}
+
+impl PacBayesTelemetry {
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> PacBayesTelemetrySnapshot {
+        PacBayesTelemetrySnapshot {
+            observations: self.observations,
+            frame_drops_observed: self.frame_drops_observed,
+            throttle_activations: self.throttle_activations,
+            starvation_guards: self.starvation_guards,
+            posterior_updates: self.posterior_updates,
+            pane_resets: self.pane_resets,
+            full_resets: self.full_resets,
+        }
+    }
+}
+
+/// Serializable snapshot of PAC-Bayesian backpressure telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PacBayesTelemetrySnapshot {
+    pub observations: u64,
+    pub frame_drops_observed: u64,
+    pub throttle_activations: u64,
+    pub starvation_guards: u64,
+    pub posterior_updates: u64,
+    pub pane_resets: u64,
+    pub full_resets: u64,
+}
+
 // ── Configuration ──────────────────────────────────────────────────────
 
 /// Configuration for PAC-Bayesian adaptive backpressure.
@@ -366,6 +415,8 @@ pub struct PacBayesBackpressure {
     global_frame_drops: usize,
     /// Global total frames.
     global_total_frames: usize,
+    /// Operational telemetry counters.
+    telemetry: PacBayesTelemetry,
 }
 
 impl PacBayesBackpressure {
@@ -379,6 +430,7 @@ impl PacBayesBackpressure {
             global_observations: 0,
             global_frame_drops: 0,
             global_total_frames: 0,
+            telemetry: PacBayesTelemetry::default(),
             config,
         }
     }
@@ -391,6 +443,11 @@ impl PacBayesBackpressure {
     /// Get the current configuration.
     pub fn config(&self) -> &PacBayesConfig {
         &self.config
+    }
+
+    /// Snapshot the current telemetry counters.
+    pub fn telemetry(&self) -> &PacBayesTelemetry {
+        &self.telemetry
     }
 
     /// Number of tracked panes.
@@ -428,8 +485,10 @@ impl PacBayesBackpressure {
 
         self.global_observations += 1;
         self.global_total_frames += 1;
+        self.telemetry.observations += 1;
         if obs.frame_dropped {
             self.global_frame_drops += 1;
+            self.telemetry.frame_drops_observed += 1;
         }
 
         // Update posterior: the "observation" is the queue ratio at which
@@ -442,10 +501,12 @@ impl PacBayesBackpressure {
             if obs.frame_dropped {
                 // Frame drop → threshold should be lower (throttle earlier)
                 state.posterior.update(obs.fill_ratio, obs_variance);
+                self.telemetry.posterior_updates += 1;
             } else if state.smoothed_ratio > state.posterior.mean {
                 // No drop but high load → threshold can be slightly higher
                 let relaxed = obs.fill_ratio * 1.1;
                 state.posterior.update(relaxed, obs_variance * 4.0);
+                self.telemetry.posterior_updates += 1;
             }
         }
 
@@ -463,6 +524,7 @@ impl PacBayesBackpressure {
                     // Reduce severity proportionally to external-cause confidence
                     severity *= 1.0 - ext_prob;
                     starvation_guard_active = true;
+                    self.telemetry.starvation_guards += 1;
                 }
             }
         }
@@ -488,6 +550,9 @@ impl PacBayesBackpressure {
         };
 
         state.throttled = severity > 0.01;
+        if state.throttled {
+            self.telemetry.throttle_activations += 1;
+        }
 
         actions
     }
@@ -573,6 +638,7 @@ impl PacBayesBackpressure {
     /// Reset a specific pane's state back to prior.
     pub fn reset_pane(&mut self, pane_id: u64) {
         self.panes.remove(&pane_id);
+        self.telemetry.pane_resets += 1;
     }
 
     /// Reset all state.
@@ -581,6 +647,7 @@ impl PacBayesBackpressure {
         self.global_observations = 0;
         self.global_frame_drops = 0;
         self.global_total_frames = 0;
+        self.telemetry.full_resets += 1;
     }
 }
 

@@ -87,7 +87,7 @@ pub(super) fn mcp_tx_transition_info(
         .iter()
         .filter(|rule| rule.from == state)
         .map(|rule| McpTxTransitionInfo {
-            kind: rule.kind.to_string(),
+            kind: rule.via.to_string(),
             to: rule.to.to_string(),
         })
         .collect()
@@ -180,7 +180,7 @@ pub(super) fn mcp_mission_lifecycle_transitions(
         .iter()
         .filter(|rule| rule.from == state)
         .map(|rule| McpMissionTransitionInfo {
-            kind: rule.kind.to_string(),
+            kind: rule.via.to_string(),
             from: rule.from.to_string(),
             to: rule.to.to_string(),
         })
