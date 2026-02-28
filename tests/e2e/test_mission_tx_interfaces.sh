@@ -11,8 +11,16 @@ CORRELATION_ID="ft-1i2ge.8.8-${RUN_ID}"
 TARGET_DIR="target-rch-mission-tx-interfaces-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/mission_tx_interfaces_${RUN_ID}.jsonl"
 STDOUT_BASENAME="mission_tx_interfaces_${RUN_ID}"
-WORKSPACE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ft-mission-tx-interfaces.XXXXXX")"
+export TMPDIR="/tmp"
+WORKSPACE_DIR="${ROOT_DIR}/tests/e2e/tmp/${SCENARIO_ID}_${RUN_ID}"
 CONTRACT_PATH="${WORKSPACE_DIR}/.ft/mission/tx-active.json"
+RCH_CHECK_LOG="${LOG_DIR}/${STDOUT_BASENAME}.rch_check.log"
+RCH_STATUS_JSON="${LOG_DIR}/${STDOUT_BASENAME}.rch_status.json"
+RCH_STATUS_ERR="${LOG_DIR}/${STDOUT_BASENAME}.rch_status.stderr.log"
+RCH_PROBE_JSON="${LOG_DIR}/${STDOUT_BASENAME}.rch_probe.json"
+RCH_PROBE_ERR="${LOG_DIR}/${STDOUT_BASENAME}.rch_probe.stderr.log"
+RCH_SMOKE_STDOUT="${LOG_DIR}/${STDOUT_BASENAME}.rch_smoke.stdout.log"
+RCH_SMOKE_STDERR="${LOG_DIR}/${STDOUT_BASENAME}.rch_smoke.stderr.log"
 
 emit_log() {
   local outcome="$1"
@@ -67,16 +75,109 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "validate ft robot tx interfaces and failure/recovery semantics"
 
-if ! rch workers probe --all --json \
-  | jq -e '[.data[] | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length > 0' \
-    >/dev/null 2>&1; then
+mkdir -p "${WORKSPACE_DIR}"
+
+rch_check_rc=0
+if ! rch check >"${RCH_CHECK_LOG}" 2>&1; then
+  rch_check_rc=$?
+  emit_log \
+    "running" \
+    "preflight_rch_check" \
+    "rch_check_nonzero" \
+    "none" \
+    "$(basename "${RCH_CHECK_LOG}")" \
+    "rch check returned non-zero; evaluating status/probe artifacts for final gate decision"
+else
+  emit_log \
+    "passed" \
+    "preflight_rch_check" \
+    "rch_check_ok" \
+    "none" \
+    "$(basename "${RCH_CHECK_LOG}")" \
+    "rch check passed"
+fi
+
+if ! rch status --workers --jobs --json >"${RCH_STATUS_JSON}" 2>"${RCH_STATUS_ERR}"; then
   emit_log \
     "failed" \
-    "preflight_rch_workers" \
-    "rch_workers_unreachable" \
+    "preflight_rch_status" \
+    "rch_status_failed" \
     "remote_worker_unavailable" \
-    "$(basename "${LOG_FILE}")" \
-    "no healthy rch workers available"
+    "$(basename "${RCH_STATUS_ERR}")" \
+    "unable to collect rch status snapshot"
+  exit 1
+fi
+
+if ! rch workers probe --all --json >"${RCH_PROBE_JSON}" 2>"${RCH_PROBE_ERR}"; then
+  emit_log \
+    "failed" \
+    "preflight_rch_probe" \
+    "rch_probe_failed" \
+    "remote_worker_unavailable" \
+    "$(basename "${RCH_PROBE_ERR}")" \
+    "rch workers probe invocation failed"
+  exit 1
+fi
+
+workers_healthy="$(jq -r '.data.daemon.workers_healthy // 0' "${RCH_STATUS_JSON}" 2>/dev/null || echo 0)"
+workers_reachable="$(jq -r '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${RCH_PROBE_JSON}" 2>/dev/null || echo 0)"
+
+if [[ "${workers_reachable}" == "0" ]]; then
+  if [[ "${workers_healthy}" != "0" ]]; then
+    emit_log \
+      "failed" \
+      "preflight_rch_probe" \
+      "rch_health_probe_mismatch" \
+      "RCH-E101" \
+      "$(basename "${RCH_PROBE_JSON}")" \
+      "rch status reported healthy workers but probe found zero reachable workers"
+  else
+    emit_log \
+      "failed" \
+      "preflight_rch_probe" \
+      "rch_workers_unreachable" \
+      "remote_worker_unavailable" \
+      "$(basename "${RCH_PROBE_JSON}")" \
+      "no healthy rch workers available"
+  fi
+  exit 1
+fi
+
+if [[ "${rch_check_rc}" -ne 0 ]]; then
+  emit_log \
+    "running" \
+    "preflight_rch_check" \
+    "rch_check_nonzero_but_probe_passed" \
+    "none" \
+    "$(basename "${RCH_CHECK_LOG}")" \
+    "continuing because probe reported reachable workers despite rch check non-zero"
+fi
+
+set +e
+(
+  cd "${ROOT_DIR}"
+  rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" cargo --version
+) >"${RCH_SMOKE_STDOUT}" 2>"${RCH_SMOKE_STDERR}"
+smoke_rc=$?
+set -e
+if grep -Fq "[RCH] local" "${RCH_SMOKE_STDOUT}" "${RCH_SMOKE_STDERR}"; then
+  emit_log \
+    "failed" \
+    "preflight_rch_smoke" \
+    "rch_local_fallback_detected" \
+    "remote_exec_failed_local_fallback" \
+    "$(basename "${RCH_SMOKE_STDERR}")" \
+    "remote smoke command fell back to local execution"
+  exit 1
+fi
+if [[ "${smoke_rc}" -ne 0 ]]; then
+  emit_log \
+    "failed" \
+    "preflight_rch_smoke" \
+    "rch_smoke_failed" \
+    "remote_worker_unavailable" \
+    "$(basename "${RCH_SMOKE_STDERR}")" \
+    "rch smoke command failed before tx suite execution"
   exit 1
 fi
 
@@ -158,8 +259,10 @@ JSON
 run_robot_json() {
   local label="$1"
   shift
+  local decision_path="$label"
   local stdout_file="${LOG_DIR}/${STDOUT_BASENAME}.${label}.stdout.json"
   local stderr_file="${LOG_DIR}/${STDOUT_BASENAME}.${label}.stderr.log"
+  local detected_local_fallback=0
 
   set +e
   (
@@ -170,13 +273,41 @@ run_robot_json() {
       robot \
       --format json \
       "$@"
-  ) >"${stdout_file}" 2>"${stderr_file}"
+  ) >"${stdout_file}" 2>"${stderr_file}" &
+  local cmd_pid=$!
+
+  while kill -0 "${cmd_pid}" >/dev/null 2>&1; do
+    if grep -Fq "[RCH] local" "${stdout_file}" "${stderr_file}" 2>/dev/null; then
+      detected_local_fallback=1
+      kill "${cmd_pid}" >/dev/null 2>&1 || true
+      pkill -TERM -P "${cmd_pid}" >/dev/null 2>&1 || true
+      break
+    fi
+    sleep 1
+  done
+
+  wait "${cmd_pid}"
   local rc=$?
   set -e
 
   LAST_STDOUT_FILE="${stdout_file}"
   LAST_STDERR_FILE="${stderr_file}"
-  return "${rc}"
+  if [[ "${detected_local_fallback}" -eq 1 ]] || grep -Fq "[RCH] local" "${stdout_file}" "${stderr_file}"; then
+    emit_log "failed" "${decision_path}" "rch_local_fallback_detected" "remote_exec_failed_local_fallback" \
+      "$(basename "${stderr_file}")" "rch emitted local fallback marker"
+    echo "RCH local fallback detected for ${label}; refusing local execution" >&2
+    echo "Stdout: ${stdout_file}" >&2
+    echo "Stderr: ${stderr_file}" >&2
+    exit 1
+  fi
+  if [[ "${rc}" -ne 0 ]]; then
+    emit_log "failed" "${decision_path}" "command_failed" "robot_command_failed" \
+      "$(basename "${stderr_file}")" "robot tx command exited non-zero"
+    echo "Command failed for ${label} (rc=${rc})" >&2
+    echo "Stdout: ${stdout_file}" >&2
+    echo "Stderr: ${stderr_file}" >&2
+    exit 1
+  fi
 }
 
 assert_jq_true() {
@@ -274,4 +405,4 @@ emit_log \
   "$(basename "${LOG_FILE}")" \
   "validated nominal, edge, failure injection, and recovery paths for ft robot tx interfaces"
 
-echo "Mission tx interfaces e2e passed. Logs: ${LOG_FILE#${ROOT_DIR}/}"
+echo "Mission tx interfaces e2e passed. Logs: ${LOG_FILE#"${ROOT_DIR}"/}"
