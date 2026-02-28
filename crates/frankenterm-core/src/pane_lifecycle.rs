@@ -1505,4 +1505,63 @@ mod tests {
         let below = pressure_renice_candidates(&healths, 0.79, &config);
         assert!(below.is_empty(), "Below threshold should return empty");
     }
+
+    // ── Telemetry counter tests ──────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let engine = PaneLifecycleEngine::with_defaults();
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.health_checks, 0);
+        assert_eq!(snap.panes_registered, 0);
+        assert_eq!(snap.panes_removed, 0);
+        assert_eq!(snap.actions_none, 0);
+        assert_eq!(snap.actions_warn, 0);
+        assert_eq!(snap.actions_review, 0);
+        assert_eq!(snap.actions_graceful_kill, 0);
+        assert_eq!(snap.actions_force_kill, 0);
+    }
+
+    #[test]
+    fn telemetry_health_check_counted() {
+        let mut engine = PaneLifecycleEngine::with_defaults();
+        engine.health_check(1, 100, Duration::from_secs(60), 5.0, None);
+        engine.health_check(1, 100, Duration::from_secs(120), 5.0, None);
+
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.health_checks, 2);
+        assert_eq!(snap.panes_registered, 1); // first check registers pane
+    }
+
+    #[test]
+    fn telemetry_remove_pane_counted() {
+        let mut engine = PaneLifecycleEngine::with_defaults();
+        engine.health_check(1, 100, Duration::from_secs(60), 5.0, None);
+        engine.remove_pane(1);
+
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.panes_removed, 1);
+    }
+
+    #[test]
+    fn telemetry_action_counted() {
+        let mut engine = PaneLifecycleEngine::with_defaults();
+        // A young, healthy pane should get LifecycleAction::None
+        engine.health_check(1, 100, Duration::from_secs(10), 5.0, None);
+
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.actions_none, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let mut engine = PaneLifecycleEngine::with_defaults();
+        engine.health_check(1, 100, Duration::from_secs(60), 5.0, None);
+
+        let snap = engine.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: PaneLifecycleTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.health_checks, snap.health_checks);
+        assert_eq!(parsed.panes_registered, snap.panes_registered);
+    }
 }

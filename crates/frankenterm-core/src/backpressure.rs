@@ -985,4 +985,63 @@ mod tests {
             assert_eq!(back.tier, tier);
         }
     }
+
+    // ── Telemetry counter tests ──────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let monitor = BackpressureMonitor::new(BackpressureConfig::default());
+        let snap = monitor.telemetry().snapshot();
+        assert_eq!(snap.evaluations, 0);
+        assert_eq!(snap.classifications, 0);
+        assert_eq!(snap.transitions, 0);
+        assert_eq!(snap.panes_paused, 0);
+        assert_eq!(snap.panes_resumed, 0);
+        assert_eq!(snap.resume_alls, 0);
+    }
+
+    #[test]
+    fn telemetry_classify_counted() {
+        let monitor = BackpressureMonitor::new(BackpressureConfig::default());
+        let depths = QueueDepths {
+            capture_depth: 0,
+            capture_capacity: 100,
+            write_depth: 0,
+            write_capacity: 100,
+        };
+        let _ = monitor.classify(&depths);
+        let _ = monitor.classify(&depths);
+        let snap = monitor.telemetry().snapshot();
+        assert_eq!(snap.classifications, 2);
+    }
+
+    #[test]
+    fn telemetry_pause_resume_counted() {
+        let monitor = BackpressureMonitor::new(BackpressureConfig::default());
+        monitor.pause_pane(1);
+        monitor.pause_pane(2);
+        monitor.resume_pane(1);
+        monitor.resume_all_panes();
+        let snap = monitor.telemetry().snapshot();
+        assert_eq!(snap.panes_paused, 2);
+        assert_eq!(snap.panes_resumed, 1);
+        assert_eq!(snap.resume_alls, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let monitor = BackpressureMonitor::new(BackpressureConfig::default());
+        let depths = QueueDepths {
+            capture_depth: 0,
+            capture_capacity: 100,
+            write_depth: 0,
+            write_capacity: 100,
+        };
+        let _ = monitor.classify(&depths);
+        monitor.pause_pane(1);
+        let snap = monitor.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: BackpressureTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
 }

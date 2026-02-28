@@ -1069,4 +1069,63 @@ mod tests {
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(hash.len(), 64); // SHA-256 = 32 bytes = 64 hex chars
     }
+
+    // ── Telemetry counter tests ──────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let eng = engine();
+        let snap = eng.telemetry().snapshot();
+        assert_eq!(snap.segments_processed, 0);
+        assert_eq!(snap.segments_deduplicated, 0);
+        assert_eq!(snap.segments_inserted, 0);
+        assert_eq!(snap.segments_inline, 0);
+        assert_eq!(snap.releases, 0);
+        assert_eq!(snap.gc_runs, 0);
+    }
+
+    #[test]
+    fn telemetry_process_segment_counted() {
+        let mut eng = engine();
+        let big = vec![0u8; 100];
+        let small = b"x";
+
+        eng.process_segment(&big, 1000).unwrap(); // inserted
+        eng.process_segment(&big, 2000).unwrap(); // deduplicated
+        eng.process_segment(small, 3000).unwrap(); // inline
+
+        let snap = eng.telemetry().snapshot();
+        assert_eq!(snap.segments_processed, 3);
+        assert_eq!(snap.segments_inserted, 1);
+        assert_eq!(snap.segments_deduplicated, 1);
+        assert_eq!(snap.segments_inline, 1);
+    }
+
+    #[test]
+    fn telemetry_release_and_gc_counted() {
+        let mut eng = engine();
+        let content = vec![0u8; 100];
+        eng.process_segment(&content, 1000).unwrap();
+
+        let hash = content_hash(&content);
+        eng.release(&hash).unwrap();
+        eng.gc().unwrap();
+
+        let snap = eng.telemetry().snapshot();
+        assert_eq!(snap.releases, 1);
+        assert_eq!(snap.gc_runs, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let mut eng = engine();
+        let content = vec![0u8; 100];
+        eng.process_segment(&content, 1000).unwrap();
+
+        let snap = eng.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: DedupTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.segments_processed, snap.segments_processed);
+        assert_eq!(parsed.segments_inserted, snap.segments_inserted);
+    }
 }

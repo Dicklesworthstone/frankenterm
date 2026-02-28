@@ -1158,4 +1158,52 @@ mod tests {
         assert_eq!(c.name, "cb");
         let _ = format!("{:?}", snap);
     }
+
+    // ── Telemetry counter tests ──────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig::default());
+        let snap = breaker.telemetry().snapshot();
+        assert_eq!(snap.trips_total, 0);
+        assert_eq!(snap.resets_total, 0);
+        assert_eq!(snap.half_open_probes, 0);
+        assert_eq!(snap.successes_recorded, 0);
+        assert_eq!(snap.failures_recorded, 0);
+        assert_eq!(snap.requests_rejected, 0);
+    }
+
+    #[test]
+    fn telemetry_failure_and_trip_counted() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(2, 1, Duration::from_millis(0)));
+        breaker.record_failure();
+        breaker.record_failure(); // trips the breaker
+        let snap = breaker.telemetry().snapshot();
+        assert_eq!(snap.failures_recorded, 2);
+        assert_eq!(snap.trips_total, 1);
+    }
+
+    #[test]
+    fn telemetry_success_and_reset_counted() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(1, 1, Duration::from_millis(0)));
+        breaker.record_failure(); // trip
+        let _ = breaker.allow(); // transitions to half-open
+        breaker.record_success(); // resets to closed
+        let snap = breaker.telemetry().snapshot();
+        assert_eq!(snap.successes_recorded, 1);
+        assert_eq!(snap.resets_total, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(1, 1, Duration::from_millis(0)));
+        breaker.record_failure();
+        let snap = breaker.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CircuitBreakerTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
 }

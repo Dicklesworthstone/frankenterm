@@ -1182,6 +1182,59 @@ mod tests {
         assert!((b.usage_ratio() - 1.5).abs() < f64::EPSILON);
     }
 
+    // ── Telemetry counter tests ──────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let mgr = MemoryBudgetManager::new(test_config());
+        let snap = mgr.telemetry().snapshot();
+        assert_eq!(snap.panes_registered, 0);
+        assert_eq!(snap.panes_unregistered, 0);
+        assert_eq!(snap.samples, 0);
+        assert_eq!(snap.samples_with_pressure, 0);
+    }
+
+    #[test]
+    fn telemetry_register_counted() {
+        let mgr = MemoryBudgetManager::new(test_config());
+        mgr.register_pane(1, None);
+        mgr.register_pane(2, None);
+
+        let snap = mgr.telemetry().snapshot();
+        assert_eq!(snap.panes_registered, 2);
+    }
+
+    #[test]
+    fn telemetry_unregister_counted() {
+        let mgr = MemoryBudgetManager::new(test_config());
+        mgr.register_pane(1, None);
+        mgr.unregister_pane(1);
+
+        let snap = mgr.telemetry().snapshot();
+        assert_eq!(snap.panes_unregistered, 1);
+    }
+
+    #[test]
+    fn telemetry_sample_counted() {
+        let mgr = MemoryBudgetManager::new(test_config());
+        mgr.register_pane(1, None);
+        mgr.sample_all();
+
+        let snap = mgr.telemetry().snapshot();
+        assert_eq!(snap.samples, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let mgr = MemoryBudgetManager::new(test_config());
+        mgr.register_pane(1, None);
+
+        let snap = mgr.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: MemoryBudgetTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.panes_registered, snap.panes_registered);
+    }
+
     // ---- Linux cgroup filesystem tests (with temp dir) ----
 
     #[cfg(target_os = "linux")]

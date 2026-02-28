@@ -1905,4 +1905,53 @@ mod tests {
         let ev = default_evictor(&[], &[]);
         assert_eq!(ev.config().active_max_segments, 10_000);
     }
+
+    // ── Telemetry counter tests ──────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let ev = default_evictor(&[], &[]);
+        let snap = ev.telemetry().snapshot();
+        assert_eq!(snap.plans_computed, 0);
+        assert_eq!(snap.executions_run, 0);
+        assert_eq!(snap.panes_evaluated, 0);
+        assert_eq!(snap.targets_generated, 0);
+        assert_eq!(snap.segments_planned, 0);
+        assert_eq!(snap.segments_removed, 0);
+        assert_eq!(snap.execution_errors, 0);
+    }
+
+    #[test]
+    fn telemetry_plan_counted() {
+        let ev = default_evictor(&[(1, 500), (2, 50)], &[(1, PaneTier::Active)]);
+        ev.plan(MemoryPressureTier::Normal).unwrap();
+
+        let snap = ev.telemetry().snapshot();
+        assert_eq!(snap.plans_computed, 1);
+        assert_eq!(snap.panes_evaluated, 2);
+    }
+
+    #[test]
+    fn telemetry_execute_counted() {
+        // Create a pane with segments exceeding the dormant limit (100)
+        let ev = default_evictor(&[(1, 200)], &[(1, PaneTier::Dormant)]);
+        let plan = ev.plan(MemoryPressureTier::Normal).unwrap();
+        ev.execute(&plan);
+
+        let snap = ev.telemetry().snapshot();
+        assert_eq!(snap.executions_run, 1);
+        assert!(snap.targets_generated >= 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let ev = default_evictor(&[(1, 500)], &[]);
+        ev.plan(MemoryPressureTier::Normal).unwrap();
+
+        let snap = ev.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: ScrollbackEvictionTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.plans_computed, snap.plans_computed);
+        assert_eq!(parsed.panes_evaluated, snap.panes_evaluated);
+    }
 }

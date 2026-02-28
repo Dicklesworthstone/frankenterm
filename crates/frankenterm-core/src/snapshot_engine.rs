@@ -2977,4 +2977,40 @@ mod tests {
             "retention days should be positive"
         );
     }
+
+    // ── Telemetry counter tests ──────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let engine = SnapshotEngine::new(
+            Arc::new(":memory:".to_string()),
+            SnapshotConfig::default(),
+        );
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.captures_attempted, 0);
+        assert_eq!(snap.captures_succeeded, 0);
+        assert_eq!(snap.dedup_skips, 0);
+        assert_eq!(snap.capture_errors, 0);
+        assert_eq!(snap.cleanup_runs, 0);
+        assert_eq!(snap.cleanup_removed, 0);
+        assert_eq!(snap.triggers_emitted, 0);
+        assert_eq!(snap.triggers_accepted, 0);
+        assert_eq!(snap.panes_captured, 0);
+        assert_eq!(snap.bytes_persisted, 0);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let telem = SnapshotEngineTelemetry::new();
+        telem.captures_attempted.fetch_add(5, Ordering::Relaxed);
+        telem.captures_succeeded.fetch_add(3, Ordering::Relaxed);
+        telem.dedup_skips.fetch_add(2, Ordering::Relaxed);
+
+        let snap = telem.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: SnapshotEngineTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.captures_attempted, 5);
+        assert_eq!(parsed.captures_succeeded, 3);
+        assert_eq!(parsed.dedup_skips, 2);
+    }
 }

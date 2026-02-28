@@ -1084,6 +1084,95 @@ mod tests {
         // Should not panic
         sched.feed_bytes(999, &[1, 2, 3]);
     }
+
+    // ── Telemetry counter tests ──────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        let snap = sched.telemetry().snapshot();
+        assert_eq!(snap.panes_registered, 0);
+        assert_eq!(snap.panes_added, 0);
+        assert_eq!(snap.panes_unregistered, 0);
+        assert_eq!(snap.byte_feeds, 0);
+        assert_eq!(snap.total_bytes_fed, 0);
+        assert_eq!(snap.schedules_computed, 0);
+        assert_eq!(snap.warmup_completions, 0);
+    }
+
+    #[test]
+    fn telemetry_register_counted() {
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        sched.register_pane(1);
+        sched.register_pane(2);
+        sched.register_pane(1); // re-register, not a new add
+
+        let snap = sched.telemetry().snapshot();
+        assert_eq!(snap.panes_registered, 3);
+        assert_eq!(snap.panes_added, 2); // only first-time registrations
+    }
+
+    #[test]
+    fn telemetry_unregister_counted() {
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        sched.register_pane(1);
+        sched.unregister_pane(1);
+        sched.unregister_pane(999); // missing pane, no increment
+
+        let snap = sched.telemetry().snapshot();
+        assert_eq!(snap.panes_unregistered, 1);
+    }
+
+    #[test]
+    fn telemetry_feed_counted() {
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        sched.register_pane(1);
+        sched.feed_bytes(1, &[1, 2, 3]);
+        sched.feed_byte(1, 4);
+
+        let snap = sched.telemetry().snapshot();
+        assert_eq!(snap.byte_feeds, 2);
+        assert_eq!(snap.total_bytes_fed, 4); // 3 + 1
+    }
+
+    #[test]
+    fn telemetry_schedule_counted() {
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        sched.register_pane(1);
+        sched.schedule();
+        sched.schedule();
+
+        let snap = sched.telemetry().snapshot();
+        assert_eq!(snap.schedules_computed, 2);
+    }
+
+    #[test]
+    fn telemetry_warmup_completion_counted() {
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig {
+            min_samples: 10,
+            ..Default::default()
+        });
+        sched.register_pane(1);
+        // Feed enough bytes to exit warmup
+        sched.feed_bytes(1, &[42; 100]);
+
+        let snap = sched.telemetry().snapshot();
+        assert_eq!(snap.warmup_completions, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        sched.register_pane(1);
+        sched.feed_bytes(1, &[1, 2, 3]);
+
+        let snap = sched.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: EntropySchedulerTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.panes_registered, snap.panes_registered);
+        assert_eq!(parsed.byte_feeds, snap.byte_feeds);
+        assert_eq!(parsed.total_bytes_fed, snap.total_bytes_fed);
+    }
 }
 
 // =============================================================================

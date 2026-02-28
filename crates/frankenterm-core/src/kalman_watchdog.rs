@@ -1458,4 +1458,79 @@ mod tests {
         let cc2 = cc.clone();
         assert_eq!(cc2.component, Component::Capture);
     }
+
+    // ── Telemetry counter tests ──────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let wd = AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default());
+        let snap = wd.telemetry().snapshot();
+        assert_eq!(snap.observations, 0);
+        assert_eq!(snap.observations_matched, 0);
+        assert_eq!(snap.health_checks, 0);
+        assert_eq!(snap.classifications, 0);
+        assert_eq!(snap.resets, 0);
+        assert_eq!(snap.status_healthy, 0);
+        assert_eq!(snap.status_degraded, 0);
+        assert_eq!(snap.status_critical, 0);
+        assert_eq!(snap.status_hung, 0);
+    }
+
+    #[test]
+    fn telemetry_observe_counted() {
+        let mut wd = AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default());
+        wd.observe(Component::Capture, 1000);
+        wd.observe(Component::Capture, 2000);
+        wd.observe(Component::Persistence, 1500);
+
+        let snap = wd.telemetry().snapshot();
+        assert_eq!(snap.observations, 3);
+        assert!(snap.observations_matched >= 1); // at least some matched
+    }
+
+    #[test]
+    fn telemetry_health_check_counted() {
+        let mut wd = AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default());
+        wd.observe(Component::Capture, 1000);
+        wd.check_health(2000);
+
+        let snap = wd.telemetry().snapshot();
+        assert_eq!(snap.health_checks, 1);
+        // At least one status bucket should be incremented
+        let total_statuses = snap.status_healthy + snap.status_degraded
+            + snap.status_critical + snap.status_hung;
+        assert!(total_statuses >= 1);
+    }
+
+    #[test]
+    fn telemetry_classify_counted() {
+        let mut wd = AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default());
+        wd.observe(Component::Capture, 1000);
+        wd.classify_component(Component::Capture, 2000);
+
+        let snap = wd.telemetry().snapshot();
+        assert_eq!(snap.classifications, 1);
+    }
+
+    #[test]
+    fn telemetry_reset_counted() {
+        let mut wd = AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default());
+        wd.reset();
+
+        let snap = wd.telemetry().snapshot();
+        assert_eq!(snap.resets, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let mut wd = AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default());
+        wd.observe(Component::Capture, 1000);
+        wd.check_health(2000);
+
+        let snap = wd.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: AdaptiveWatchdogTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.observations, snap.observations);
+        assert_eq!(parsed.health_checks, snap.health_checks);
+    }
 }

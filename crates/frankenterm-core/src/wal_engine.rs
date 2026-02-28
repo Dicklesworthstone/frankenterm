@@ -2265,4 +2265,71 @@ mod tests {
             );
         }
     }
+
+    // ── Telemetry counter tests ──────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let wal = WalEngine::<String>::new(WalConfig::default());
+        let snap = wal.telemetry().snapshot();
+        assert_eq!(snap.appends, 0);
+        assert_eq!(snap.checkpoints, 0);
+        assert_eq!(snap.compactions, 0);
+        assert_eq!(snap.entries_compacted, 0);
+        assert_eq!(snap.truncations, 0);
+        assert_eq!(snap.entries_truncated, 0);
+    }
+
+    #[test]
+    fn telemetry_append_and_checkpoint_counted() {
+        let mut wal = WalEngine::<String>::new(WalConfig::default());
+        wal.append("a".into(), 100);
+        wal.append("b".into(), 200);
+        wal.checkpoint(300);
+
+        let snap = wal.telemetry().snapshot();
+        assert_eq!(snap.appends, 2);
+        assert_eq!(snap.checkpoints, 1);
+    }
+
+    #[test]
+    fn telemetry_compact_counted() {
+        let mut wal = WalEngine::<String>::new(WalConfig::default());
+        wal.append("a".into(), 100);
+        wal.append("b".into(), 200);
+        wal.checkpoint(300);
+        wal.append("c".into(), 400);
+        let removed = wal.compact();
+        assert!(removed > 0);
+
+        let snap = wal.telemetry().snapshot();
+        assert_eq!(snap.compactions, 1);
+        assert_eq!(snap.entries_compacted, removed as u64);
+    }
+
+    #[test]
+    fn telemetry_truncate_counted() {
+        let mut wal = WalEngine::<String>::new(WalConfig::default());
+        let s1 = wal.append("a".into(), 100);
+        wal.append("b".into(), 200);
+        wal.append("c".into(), 300);
+        wal.truncate_after(s1);
+
+        let snap = wal.telemetry().snapshot();
+        assert_eq!(snap.truncations, 1);
+        assert_eq!(snap.entries_truncated, 2);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let mut wal = WalEngine::<String>::new(WalConfig::default());
+        wal.append("a".into(), 100);
+        wal.checkpoint(200);
+
+        let snap = wal.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: WalTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.appends, snap.appends);
+        assert_eq!(parsed.checkpoints, snap.checkpoints);
+    }
 }
