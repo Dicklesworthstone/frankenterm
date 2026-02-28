@@ -18,8 +18,8 @@ use proptest::prelude::*;
 use std::collections::HashSet;
 
 use frankenterm_core::entropy_scheduler::{
-    EntropyScheduler, EntropySchedulerConfig, EntropySchedulerSnapshot, schedule_interval,
-    schedule_interval_default,
+    EntropyScheduler, EntropySchedulerConfig, EntropySchedulerSnapshot,
+    EntropySchedulerTelemetrySnapshot, schedule_interval, schedule_interval_default,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -805,5 +805,300 @@ proptest! {
                 "pane {} total_bytes should be > 0 after feeding data", ps.pane_id
             );
         }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Telemetry counter invariants (ft-3kxe.18)
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Telemetry: panes_registered counts every register_pane call.
+    #[test]
+    fn telemetry_panes_registered_exact(
+        pane_ids in prop::collection::vec(1u64..100, 1..30),
+    ) {
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        for &pid in &pane_ids {
+            sched.register_pane(pid);
+        }
+        let snap = sched.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.panes_registered, pane_ids.len() as u64,
+            "panes_registered={} != calls={}", snap.panes_registered, pane_ids.len()
+        );
+    }
+
+    /// Telemetry: panes_added counts only first-time registrations.
+    #[test]
+    fn telemetry_panes_added_unique(
+        pane_ids in prop::collection::vec(1u64..50, 1..30),
+    ) {
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        for &pid in &pane_ids {
+            sched.register_pane(pid);
+        }
+        let unique: HashSet<_> = pane_ids.iter().collect();
+        let snap = sched.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.panes_added, unique.len() as u64,
+            "panes_added={} != unique_panes={}", snap.panes_added, unique.len()
+        );
+    }
+
+    /// Telemetry: panes_unregistered counts successful removals.
+    #[test]
+    fn telemetry_panes_unregistered_exact(
+        pane_count in 1usize..20,
+        remove_ids in prop::collection::vec(0u64..30, 1..15),
+    ) {
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        for i in 0..pane_count {
+            sched.register_pane(i as u64);
+        }
+
+        let mut removed = HashSet::new();
+        for &pid in &remove_ids {
+            if pid < pane_count as u64 && !removed.contains(&pid) {
+                removed.insert(pid);
+            }
+            sched.unregister_pane(pid);
+        }
+
+        let snap = sched.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.panes_unregistered, removed.len() as u64,
+            "panes_unregistered={} != expected={}", snap.panes_unregistered, removed.len()
+        );
+    }
+
+    /// Telemetry: byte_feeds counts feed_bytes/feed_byte calls.
+    #[test]
+    fn telemetry_byte_feeds_exact(
+        feed_count in 1usize..30,
+        data_len in 1usize..100,
+    ) {
+        let cfg = EntropySchedulerConfig {
+            min_samples: 1,
+            ..Default::default()
+        };
+        let mut sched = EntropyScheduler::new(cfg);
+        sched.register_pane(1);
+
+        let data = vec![0x42u8; data_len];
+        for _ in 0..feed_count {
+            sched.feed_bytes(1, &data);
+        }
+
+        let snap = sched.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.byte_feeds, feed_count as u64,
+            "byte_feeds={} != calls={}", snap.byte_feeds, feed_count
+        );
+    }
+
+    /// Telemetry: total_bytes_fed tracks all bytes accurately.
+    #[test]
+    fn telemetry_total_bytes_fed_exact(
+        feeds in prop::collection::vec(prop::collection::vec(0u8..255, 1..50), 1..20),
+    ) {
+        let cfg = EntropySchedulerConfig {
+            min_samples: 1,
+            ..Default::default()
+        };
+        let mut sched = EntropyScheduler::new(cfg);
+        sched.register_pane(1);
+
+        let mut expected_bytes = 0u64;
+        for feed in &feeds {
+            sched.feed_bytes(1, feed);
+            expected_bytes += feed.len() as u64;
+        }
+
+        let snap = sched.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.total_bytes_fed, expected_bytes,
+            "total_bytes_fed={} != expected={}", snap.total_bytes_fed, expected_bytes
+        );
+    }
+
+    /// Telemetry: warmup_completions fires exactly once per pane.
+    #[test]
+    fn telemetry_warmup_completions_per_pane(
+        pane_count in 1usize..10,
+    ) {
+        let min_samples = 100u64;
+        let cfg = EntropySchedulerConfig {
+            min_samples,
+            ..Default::default()
+        };
+        let mut sched = EntropyScheduler::new(cfg);
+
+        for i in 0..pane_count {
+            sched.register_pane(i as u64);
+        }
+
+        // Feed enough data to exit warmup
+        let data = vec![0x41u8; min_samples as usize + 10];
+        for i in 0..pane_count {
+            sched.feed_bytes(i as u64, &data);
+        }
+
+        let snap = sched.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.warmup_completions, pane_count as u64,
+            "warmup_completions={} != pane_count={}", snap.warmup_completions, pane_count
+        );
+    }
+
+    /// Telemetry: warmup_completions does not fire if still in warmup.
+    #[test]
+    fn telemetry_no_warmup_completion_before_threshold(
+        feed_bytes_count in 1usize..50,
+    ) {
+        let min_samples = 1000u64;
+        let cfg = EntropySchedulerConfig {
+            min_samples,
+            ..Default::default()
+        };
+        let mut sched = EntropyScheduler::new(cfg);
+        sched.register_pane(1);
+
+        // Feed fewer bytes than min_samples
+        let to_feed = feed_bytes_count.min(min_samples as usize - 1);
+        sched.feed_bytes(1, &vec![0x42u8; to_feed]);
+
+        let snap = sched.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.warmup_completions, 0,
+            "should be 0 warmup completions when below min_samples"
+        );
+    }
+
+    /// Telemetry: schedules_computed counts schedule() calls.
+    #[test]
+    fn telemetry_schedules_computed_exact(
+        schedule_count in 1usize..20,
+    ) {
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        sched.register_pane(1);
+        sched.feed_bytes(1, &[0x42u8; 10]);
+
+        for _ in 0..schedule_count {
+            sched.schedule();
+        }
+
+        let snap = sched.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.schedules_computed, schedule_count as u64,
+            "schedules_computed={} != calls={}", snap.schedules_computed, schedule_count
+        );
+    }
+
+    /// Telemetry: counters start at zero.
+    #[test]
+    fn telemetry_starts_at_zero(_dummy in 0u8..1) {
+        let sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        let snap = sched.telemetry().snapshot();
+        prop_assert_eq!(snap.panes_registered, 0);
+        prop_assert_eq!(snap.panes_added, 0);
+        prop_assert_eq!(snap.panes_unregistered, 0);
+        prop_assert_eq!(snap.byte_feeds, 0);
+        prop_assert_eq!(snap.total_bytes_fed, 0);
+        prop_assert_eq!(snap.schedules_computed, 0);
+        prop_assert_eq!(snap.warmup_completions, 0);
+    }
+
+    /// Telemetry: counters are monotonically non-decreasing.
+    #[test]
+    fn telemetry_counters_monotonic(
+        ops in prop::collection::vec(
+            prop_oneof![
+                (1u64..50).prop_map(|p| (0u8, p, vec![])),
+                (1u64..50).prop_map(|p| (1u8, p, vec![])),
+                (1u64..50, prop::collection::vec(0u8..255, 1..50))
+                    .prop_map(|(p, d)| (2u8, p, d)),
+                Just((3u8, 0, vec![])),
+            ],
+            5..30
+        ),
+    ) {
+        let cfg = EntropySchedulerConfig {
+            min_samples: 10,
+            ..Default::default()
+        };
+        let mut sched = EntropyScheduler::new(cfg);
+        let mut prev = sched.telemetry().snapshot();
+
+        for (op, pid, data) in &ops {
+            match op {
+                0 => sched.register_pane(*pid),
+                1 => sched.unregister_pane(*pid),
+                2 => sched.feed_bytes(*pid, data),
+                _ => { sched.schedule(); }
+            }
+
+            let snap = sched.telemetry().snapshot();
+            prop_assert!(snap.panes_registered >= prev.panes_registered,
+                "panes_registered decreased");
+            prop_assert!(snap.panes_added >= prev.panes_added,
+                "panes_added decreased");
+            prop_assert!(snap.panes_unregistered >= prev.panes_unregistered,
+                "panes_unregistered decreased");
+            prop_assert!(snap.byte_feeds >= prev.byte_feeds,
+                "byte_feeds decreased");
+            prop_assert!(snap.total_bytes_fed >= prev.total_bytes_fed,
+                "total_bytes_fed decreased");
+            prop_assert!(snap.schedules_computed >= prev.schedules_computed,
+                "schedules_computed decreased");
+            prop_assert!(snap.warmup_completions >= prev.warmup_completions,
+                "warmup_completions decreased");
+            prev = snap;
+        }
+    }
+
+    /// Telemetry: cross-counter invariant — panes_added <= panes_registered.
+    #[test]
+    fn telemetry_added_lte_registered(
+        pane_ids in prop::collection::vec(1u64..30, 1..40),
+    ) {
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        for &pid in &pane_ids {
+            sched.register_pane(pid);
+        }
+        let snap = sched.telemetry().snapshot();
+        prop_assert!(
+            snap.panes_added <= snap.panes_registered,
+            "panes_added={} > panes_registered={}",
+            snap.panes_added, snap.panes_registered
+        );
+    }
+
+    /// Telemetry: snapshot survives JSON serde roundtrip.
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip(
+        panes_registered in 0u64..1000,
+        panes_added in 0u64..500,
+        panes_unregistered in 0u64..500,
+        byte_feeds in 0u64..10000,
+        total_bytes_fed in 0u64..100000,
+        schedules_computed in 0u64..500,
+        warmup_completions in 0u64..200,
+    ) {
+        let snap = EntropySchedulerTelemetrySnapshot {
+            panes_registered,
+            panes_added,
+            panes_unregistered,
+            byte_feeds,
+            total_bytes_fed,
+            schedules_computed,
+            warmup_completions,
+        };
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored: EntropySchedulerTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(restored, snap);
     }
 }
