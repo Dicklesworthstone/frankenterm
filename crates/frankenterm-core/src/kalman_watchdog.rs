@@ -532,7 +532,7 @@ impl AdaptiveWatchdog {
             .get(&component)
             .map(|t: &ComponentTracker| t.classify(current_ms, &self.config));
         if let Some(ref c) = result {
-            self.count_status(&c.status);
+            self.count_status(c.status);
         }
         result
     }
@@ -549,7 +549,13 @@ impl AdaptiveWatchdog {
             if classification.status > worst {
                 worst = classification.status;
             }
-            self.count_status(&classification.status);
+            // Inline count_status to avoid &mut self borrow conflict with &self.trackers
+            match classification.status {
+                HealthStatus::Healthy => self.telemetry.status_healthy += 1,
+                HealthStatus::Degraded => self.telemetry.status_degraded += 1,
+                HealthStatus::Critical => self.telemetry.status_critical += 1,
+                HealthStatus::Hung => self.telemetry.status_hung += 1,
+            }
             components.push(ComponentClassification {
                 component,
                 classification,
@@ -598,7 +604,7 @@ impl AdaptiveWatchdog {
     }
 
     /// Increment the status-specific counter.
-    fn count_status(&mut self, status: &HealthStatus) {
+    fn count_status(&mut self, status: HealthStatus) {
         match status {
             HealthStatus::Healthy => self.telemetry.status_healthy += 1,
             HealthStatus::Degraded => self.telemetry.status_degraded += 1,
