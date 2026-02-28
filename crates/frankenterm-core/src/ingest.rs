@@ -42,6 +42,79 @@ fn epoch_ms() -> i64 {
 }
 
 // =============================================================================
+// Ingest Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the ingest pipeline.
+///
+/// All counters are monotonically increasing. Use `snapshot()` to read
+/// current values for reporting and serialization.
+#[derive(Debug, Clone, Default)]
+pub struct IngestTelemetry {
+    /// Number of `discovery_tick()` calls
+    discovery_ticks: u64,
+    /// Total panes discovered (first seen)
+    panes_discovered: u64,
+    /// Total panes closed (removed from registry)
+    panes_closed: u64,
+    /// Total generation changes detected (fingerprint drift)
+    generation_changes: u64,
+    /// Total metadata-only changes detected
+    metadata_changes: u64,
+    /// Total panes filtered out by observation rules
+    panes_filtered: u64,
+}
+
+impl IngestTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a completed discovery tick and its diff results.
+    fn record_discovery_tick(&mut self, diff: &DiscoveryDiff) {
+        self.discovery_ticks += 1;
+        self.panes_discovered += diff.new_panes.len() as u64;
+        self.panes_closed += diff.closed_panes.len() as u64;
+        self.generation_changes += diff.new_generations.len() as u64;
+        self.metadata_changes += diff.changed_panes.len() as u64;
+    }
+
+    /// Record a pane being filtered out by observation rules.
+    fn record_pane_filtered(&mut self) {
+        self.panes_filtered += 1;
+    }
+
+    /// Take a serializable snapshot of current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> IngestTelemetrySnapshot {
+        IngestTelemetrySnapshot {
+            discovery_ticks: self.discovery_ticks,
+            panes_discovered: self.panes_discovered,
+            panes_closed: self.panes_closed,
+            generation_changes: self.generation_changes,
+            metadata_changes: self.metadata_changes,
+            panes_filtered: self.panes_filtered,
+        }
+    }
+}
+
+/// Serializable snapshot of ingest telemetry counters.
+///
+/// Produced by [`IngestTelemetry::snapshot()`] for reporting, persistence,
+/// or export to the telemetry pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestTelemetrySnapshot {
+    pub discovery_ticks: u64,
+    pub panes_discovered: u64,
+    pub panes_closed: u64,
+    pub generation_changes: u64,
+    pub metadata_changes: u64,
+    pub panes_filtered: u64,
+}
+
+// =============================================================================
 // Pane UUID
 // =============================================================================
 
@@ -630,6 +703,8 @@ pub struct PaneRegistry {
     trauma_guard_config: TraumaGuardConfig,
     /// Pane filter configuration (cached)
     filter_config: PaneFilterConfig,
+    /// Operational telemetry counters
+    telemetry: IngestTelemetry,
 }
 
 impl Default for PaneRegistry {
@@ -649,6 +724,7 @@ impl PaneRegistry {
             trauma_states: HashMap::new(),
             trauma_guard_config: TraumaGuardConfig::default(),
             filter_config: PaneFilterConfig::default(),
+            telemetry: IngestTelemetry::new(),
         }
     }
 
@@ -671,6 +747,7 @@ impl PaneRegistry {
             trauma_states: HashMap::new(),
             trauma_guard_config,
             filter_config,
+            telemetry: IngestTelemetry::new(),
         }
     }
 
@@ -834,6 +911,8 @@ impl PaneRegistry {
                     .is_some_and(PaneEntry::should_observe)
                 {
                     self.cursors.insert(pane_id, PaneCursor::new(pane_id));
+                } else {
+                    self.telemetry.record_pane_filtered();
                 }
             }
         }
@@ -856,6 +935,8 @@ impl PaneRegistry {
             self.cursors.remove(pane_id);
             self.trauma_states.remove(pane_id);
         }
+
+        self.telemetry.record_discovery_tick(&diff);
 
         diff
     }
@@ -1128,6 +1209,12 @@ impl PaneRegistry {
                 None
             }
         })
+    }
+
+    /// Access the operational telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &IngestTelemetry {
+        &self.telemetry
     }
 }
 
@@ -2196,6 +2283,26 @@ impl StreamIngester {
     pub fn cursor_for(&self, pane_id: u64) -> Option<&PaneCursor> {
         self.cursors.get(&pane_id)
     }
+
+    /// Take a serializable snapshot of stream ingester telemetry.
+    #[must_use]
+    pub fn telemetry_snapshot(&self) -> StreamIngesterTelemetrySnapshot {
+        StreamIngesterTelemetrySnapshot {
+            active_panes: self.cursors.len() as u64,
+            segments_emitted: self.segments_emitted,
+            gaps_emitted: self.gaps_emitted,
+            overflow_pending: self.overflow_pending.len() as u64,
+        }
+    }
+}
+
+/// Serializable snapshot of stream ingester telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamIngesterTelemetrySnapshot {
+    pub active_panes: u64,
+    pub segments_emitted: u64,
+    pub gaps_emitted: u64,
+    pub overflow_pending: u64,
 }
 
 impl Default for StreamIngester {
