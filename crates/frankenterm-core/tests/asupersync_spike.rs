@@ -79,7 +79,7 @@ fn spike_two_phase_channel_send_in_scope() {
         assert_eq!(scope.region_id(), cx.region_id());
         assert_eq!(scope.budget(), cx.budget());
 
-        let (tx, rx) = mpsc::channel::<String>(1);
+        let (tx, mut rx) = mpsc::channel::<String>(1);
         let permit = tx.reserve(&cx).await.expect("reserve permit");
         permit.send("two-phase-send".to_string());
         let received = rx.recv(&cx).await.expect("receive value");

@@ -125,7 +125,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
@@ -169,7 +168,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
                 // Run after each spawn to enforce sequencing.
                 runtime.run_until_quiescent();
@@ -218,7 +216,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
@@ -260,8 +257,7 @@ proptest! {
                     runtime
                         .scheduler
                         .lock()
-                        .expect("lock scheduler")
-                        .schedule(task_id, 0);
+                            .schedule(task_id, 0);
                 }
                 runtime.run_until_quiescent();
             })
@@ -308,7 +304,6 @@ proptest! {
             runtime
                 .scheduler
                 .lock()
-                .expect("lock scheduler")
                 .schedule(task_id, 0);
             runtime.run_until_quiescent();
         });
@@ -378,7 +373,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
@@ -421,7 +415,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
@@ -448,7 +441,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
@@ -497,8 +489,7 @@ proptest! {
                     runtime
                         .scheduler
                         .lock()
-                        .expect("lock scheduler")
-                        .schedule(task_id, 0);
+                            .schedule(task_id, 0);
                 }
                 runtime.run_until_quiescent();
             })
@@ -542,7 +533,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
@@ -585,7 +575,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
@@ -630,7 +619,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
@@ -673,8 +661,7 @@ proptest! {
                     runtime
                         .scheduler
                         .lock()
-                        .expect("lock scheduler")
-                        .schedule(task_id, 0);
+                            .schedule(task_id, 0);
                 }
                 runtime.run_until_quiescent();
             })
@@ -727,7 +714,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
@@ -846,7 +832,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
@@ -883,7 +868,6 @@ proptest! {
             runtime
                 .scheduler
                 .lock()
-                .expect("lock scheduler")
                 .schedule(task_id, 0);
             runtime.run_until_quiescent();
         });
@@ -923,7 +907,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
@@ -967,7 +950,6 @@ proptest! {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
                 runtime.run_until_quiescent();
             }
@@ -1013,8 +995,7 @@ proptest! {
                     runtime
                         .scheduler
                         .lock()
-                        .expect("lock scheduler")
-                        .schedule(task_id, 0);
+                            .schedule(task_id, 0);
                 }
                 runtime.run_until_quiescent();
             });
