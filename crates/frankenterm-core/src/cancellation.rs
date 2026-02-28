@@ -36,6 +36,80 @@ use serde::{Deserialize, Serialize};
 
 use crate::scope_tree::{ScopeId, ScopeState, ScopeTier, ScopeTree, ScopeTreeError};
 
+// ── Telemetry ─────────────────────────────────────────────────────────────
+
+/// Operational telemetry counters for the shutdown coordinator.
+///
+/// All counters are plain `u64` because `ShutdownCoordinator` uses `&mut self`.
+#[derive(Debug, Clone, Default)]
+pub struct ShutdownCoordinatorTelemetry {
+    /// Total register_scope() calls.
+    scopes_registered: u64,
+    /// Total successful request_shutdown() calls.
+    shutdowns_requested: u64,
+    /// Total cascade triggers during shutdown.
+    cascades_triggered: u64,
+    /// Total handle_grace_expiry() calls.
+    escalations: u64,
+    /// Total register_finalizer() calls.
+    finalizers_registered: u64,
+    /// Total mark_finalizer_started() calls.
+    finalizers_started: u64,
+    /// Total mark_finalizer_completed() calls.
+    finalizers_completed: u64,
+    /// Total mark_finalizer_failed() calls.
+    finalizers_failed: u64,
+    /// Total complete_shutdown() calls.
+    shutdowns_completed: u64,
+}
+
+impl ShutdownCoordinatorTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> ShutdownCoordinatorTelemetrySnapshot {
+        ShutdownCoordinatorTelemetrySnapshot {
+            scopes_registered: self.scopes_registered,
+            shutdowns_requested: self.shutdowns_requested,
+            cascades_triggered: self.cascades_triggered,
+            escalations: self.escalations,
+            finalizers_registered: self.finalizers_registered,
+            finalizers_started: self.finalizers_started,
+            finalizers_completed: self.finalizers_completed,
+            finalizers_failed: self.finalizers_failed,
+            shutdowns_completed: self.shutdowns_completed,
+        }
+    }
+}
+
+/// Serializable snapshot of shutdown coordinator telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShutdownCoordinatorTelemetrySnapshot {
+    /// Total register_scope() calls.
+    pub scopes_registered: u64,
+    /// Total successful request_shutdown() calls.
+    pub shutdowns_requested: u64,
+    /// Total cascade triggers.
+    pub cascades_triggered: u64,
+    /// Total escalation events.
+    pub escalations: u64,
+    /// Total register_finalizer() calls.
+    pub finalizers_registered: u64,
+    /// Total mark_finalizer_started() calls.
+    pub finalizers_started: u64,
+    /// Total mark_finalizer_completed() calls.
+    pub finalizers_completed: u64,
+    /// Total mark_finalizer_failed() calls.
+    pub finalizers_failed: u64,
+    /// Total complete_shutdown() calls.
+    pub shutdowns_completed: u64,
+}
+
 // ── Shutdown Reason ────────────────────────────────────────────────────────
 
 /// Why a scope is being shut down.
@@ -526,6 +600,8 @@ pub struct ShutdownCoordinator {
     default_policy: ShutdownPolicy,
     /// Optional correlation ID prefix for event tracing.
     correlation_prefix: Option<String>,
+    /// Operational telemetry counters.
+    telemetry: ShutdownCoordinatorTelemetry,
 }
 
 /// Errors from the shutdown coordinator.
@@ -620,6 +696,7 @@ impl ShutdownCoordinator {
             events: Vec::new(),
             default_policy: ShutdownPolicy::default(),
             correlation_prefix: None,
+            telemetry: ShutdownCoordinatorTelemetry::new(),
         }
     }
 
@@ -630,6 +707,12 @@ impl ShutdownCoordinator {
             default_policy,
             ..Self::new()
         }
+    }
+
+    /// Get the telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &ShutdownCoordinatorTelemetry {
+        &self.telemetry
     }
 
     /// Set the correlation prefix for event tracing.
@@ -667,6 +750,7 @@ impl ShutdownCoordinator {
             .insert(scope_id.clone(), ShutdownPolicy::for_tier(tier));
         self.finalizers.insert(scope_id.clone(), Vec::new());
 
+        self.telemetry.scopes_registered += 1;
         Ok(token)
     }
 
@@ -715,6 +799,7 @@ impl ShutdownCoordinator {
             .position(|f| f.priority < finalizer.priority)
             .unwrap_or(finalizers.len());
         finalizers.insert(pos, finalizer);
+        self.telemetry.finalizers_registered += 1;
         Ok(())
     }
 
@@ -767,6 +852,8 @@ impl ShutdownCoordinator {
         // Transition in tree
         tree.request_shutdown(scope_id, timestamp_ms)?;
 
+        self.telemetry.shutdowns_requested += 1;
+
         // Emit event
         let policy = self.policy(scope_id).clone();
         self.emit_event(
@@ -803,6 +890,7 @@ impl ShutdownCoordinator {
                             .request_shutdown(tree, &child_id, child_reason, timestamp_ms)
                             .is_ok()
                         {
+                            self.telemetry.cascades_triggered += 1;
                             self.emit_event(
                                 scope_id.clone(),
                                 ShutdownEventType::CascadeTriggered {
@@ -848,6 +936,8 @@ impl ShutdownCoordinator {
     ) -> Result<EscalationAction, ShutdownCoordinatorError> {
         let policy = self.policy(scope_id).clone();
         let action = policy.escalation.clone();
+
+        self.telemetry.escalations += 1;
 
         self.emit_event(
             scope_id.clone(),
@@ -999,6 +1089,7 @@ impl ShutdownCoordinator {
             })?;
 
         finalizer.status = FinalizerStatus::Running;
+        self.telemetry.finalizers_started += 1;
         self.emit_event(
             scope_id.clone(),
             ShutdownEventType::FinalizerStarted {
@@ -1032,6 +1123,7 @@ impl ShutdownCoordinator {
             })?;
 
         finalizer.status = FinalizerStatus::Completed { duration_ms };
+        self.telemetry.finalizers_completed += 1;
         self.emit_event(
             scope_id.clone(),
             ShutdownEventType::FinalizerCompleted {
@@ -1070,6 +1162,7 @@ impl ShutdownCoordinator {
             error: error.to_string(),
             duration_ms,
         };
+        self.telemetry.finalizers_failed += 1;
         self.emit_event(
             scope_id.clone(),
             ShutdownEventType::FinalizerFailed {
@@ -1114,6 +1207,8 @@ impl ShutdownCoordinator {
 
         // Close in tree
         tree.close(scope_id, timestamp_ms)?;
+
+        self.telemetry.shutdowns_completed += 1;
 
         let total_elapsed = timestamp_ms - shutdown_requested_at;
 
