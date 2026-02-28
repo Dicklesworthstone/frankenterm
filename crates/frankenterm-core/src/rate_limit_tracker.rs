@@ -24,6 +24,68 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+// =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the rate-limit tracker.
+///
+/// All counters are plain `u64` because `RateLimitTracker` uses `&mut self`
+/// for mutation — no atomic operations needed.
+#[derive(Debug, Clone, Default)]
+pub struct RateLimitTelemetry {
+    /// Total record/record_at calls.
+    events_recorded: u64,
+    /// Panes evicted via LRU when MAX_TRACKED_PANES exceeded.
+    panes_evicted_lru: u64,
+    /// Panes explicitly removed via remove_pane().
+    panes_removed: u64,
+    /// GC cycles executed.
+    gc_runs: u64,
+    /// Panes collected (removed) by GC.
+    gc_panes_collected: u64,
+    /// Per-pane events pruned when MAX_EVENTS_PER_PANE exceeded.
+    events_pruned: u64,
+}
+
+impl RateLimitTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> RateLimitTelemetrySnapshot {
+        RateLimitTelemetrySnapshot {
+            events_recorded: self.events_recorded,
+            panes_evicted_lru: self.panes_evicted_lru,
+            panes_removed: self.panes_removed,
+            gc_runs: self.gc_runs,
+            gc_panes_collected: self.gc_panes_collected,
+            events_pruned: self.events_pruned,
+        }
+    }
+}
+
+/// Serializable snapshot of rate-limit tracker telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitTelemetrySnapshot {
+    /// Total record/record_at calls.
+    pub events_recorded: u64,
+    /// Panes evicted via LRU when MAX_TRACKED_PANES exceeded.
+    pub panes_evicted_lru: u64,
+    /// Panes explicitly removed via remove_pane().
+    pub panes_removed: u64,
+    /// GC cycles executed.
+    pub gc_runs: u64,
+    /// Panes collected (removed) by GC.
+    pub gc_panes_collected: u64,
+    /// Per-pane events pruned when MAX_EVENTS_PER_PANE exceeded.
+    pub events_pruned: u64,
+}
+
 /// Maximum number of tracked panes to prevent unbounded growth.
 const MAX_TRACKED_PANES: usize = 256;
 
@@ -97,17 +159,23 @@ impl PaneRateLimitState {
         }
     }
 
-    fn record_event(&mut self, event: RateLimitEvent) {
+    /// Record an event, returning `true` if an older event was pruned due to
+    /// the per-pane cap.
+    fn record_event(&mut self, event: RateLimitEvent) -> bool {
         let expiry = event.detected_at + event.cooldown;
         match self.cooldown_until {
             Some(existing) if expiry > existing => self.cooldown_until = Some(expiry),
             None => self.cooldown_until = Some(expiry),
             _ => {}
         }
-        if self.events.len() >= MAX_EVENTS_PER_PANE {
+        let pruned = if self.events.len() >= MAX_EVENTS_PER_PANE {
             self.events.remove(0);
-        }
+            true
+        } else {
+            false
+        };
         self.events.push(event);
+        pruned
     }
 
     fn is_rate_limited(&self, now: Instant) -> bool {
@@ -131,6 +199,8 @@ pub struct RateLimitTracker {
     panes: HashMap<u64, PaneRateLimitState>,
     /// Insertion order for LRU eviction when MAX_TRACKED_PANES exceeded.
     pane_order: Vec<u64>,
+    /// Operational telemetry counters.
+    telemetry: RateLimitTelemetry,
 }
 
 impl RateLimitTracker {
@@ -139,6 +209,7 @@ impl RateLimitTracker {
         Self {
             panes: HashMap::new(),
             pane_order: Vec::new(),
+            telemetry: RateLimitTelemetry::new(),
         }
     }
 
@@ -172,11 +243,14 @@ impl RateLimitTracker {
         retry_after_text: Option<String>,
         now: Instant,
     ) {
+        self.telemetry.events_recorded += 1;
+
         // Evict oldest pane if at capacity
         if !self.panes.contains_key(&pane_id) && self.panes.len() >= MAX_TRACKED_PANES {
             while let Some(oldest_id) = self.pane_order.first().copied() {
                 self.pane_order.remove(0);
                 if self.panes.remove(&oldest_id).is_some() {
+                    self.telemetry.panes_evicted_lru += 1;
                     break;
                 }
             }
@@ -201,7 +275,9 @@ impl RateLimitTracker {
             .entry(pane_id)
             .or_insert_with(|| PaneRateLimitState::new(agent_type));
         state.agent_type = agent_type;
-        state.record_event(event);
+        if state.record_event(event) {
+            self.telemetry.events_pruned += 1;
+        }
         self.touch_pane_order(pane_id);
     }
 
@@ -306,7 +382,9 @@ impl RateLimitTracker {
 
     /// Remove a pane from tracking (e.g., when pane is closed).
     pub fn remove_pane(&mut self, pane_id: u64) {
-        self.panes.remove(&pane_id);
+        if self.panes.remove(&pane_id).is_some() {
+            self.telemetry.panes_removed += 1;
+        }
         self.pane_order.retain(|&id| id != pane_id);
     }
 
@@ -317,12 +395,14 @@ impl RateLimitTracker {
 
     /// GC at a given time (for testing).
     pub fn gc_at(&mut self, now: Instant) {
+        self.telemetry.gc_runs += 1;
         let expired: Vec<u64> = self
             .panes
             .iter()
             .filter(|(_, state)| !state.is_rate_limited(now))
             .map(|(&id, _)| id)
             .collect();
+        self.telemetry.gc_panes_collected += expired.len() as u64;
         for id in expired {
             self.panes.remove(&id);
             self.pane_order.retain(|&pid| pid != id);
@@ -337,6 +417,12 @@ impl RateLimitTracker {
     /// Total rate limit events across all panes.
     pub fn total_event_count(&self) -> usize {
         self.panes.values().map(|s| s.events.len()).sum()
+    }
+
+    /// Access the operational telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &RateLimitTelemetry {
+        &self.telemetry
     }
 
     fn touch_pane_order(&mut self, pane_id: u64) {

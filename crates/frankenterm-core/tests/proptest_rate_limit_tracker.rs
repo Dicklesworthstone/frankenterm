@@ -9,10 +9,12 @@
 //! 6. Provider isolation: events for one provider don't affect another
 //! 7. GC safety: gc never removes actively rate-limited panes
 //! 8. Removal completeness: remove_pane fully clears all state
+//! 9. Telemetry counter invariants: monotonic, consistent, and bounded
 
 use frankenterm_core::patterns::AgentType;
 use frankenterm_core::rate_limit_tracker::{
-    ProviderRateLimitStatus, ProviderRateLimitSummary, RateLimitTracker,
+    ProviderRateLimitStatus, ProviderRateLimitSummary, RateLimitTelemetrySnapshot,
+    RateLimitTracker,
 };
 use proptest::prelude::*;
 use std::time::{Duration, Instant};
@@ -532,5 +534,302 @@ proptest! {
         prop_assert_eq!(restored.total_pane_count, summary.total_pane_count);
         prop_assert_eq!(restored.earliest_clear_secs, summary.earliest_clear_secs);
         prop_assert_eq!(restored.total_events, summary.total_events);
+    }
+
+    // =========================================================================
+    // Telemetry counter invariants (ft-3kxe.11)
+    // =========================================================================
+
+    /// Telemetry: events_recorded equals exactly the number of record_at calls.
+    #[test]
+    fn telemetry_events_recorded_exact(
+        event_count in 1usize..100,
+    ) {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+
+        for i in 0..event_count {
+            tracker.record_at(
+                (i % 50) as u64,
+                AgentType::Codex,
+                format!("r{i}"),
+                Some("30 seconds".into()),
+                now + Duration::from_secs(i as u64),
+            );
+        }
+
+        let snap = tracker.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.events_recorded,
+            event_count as u64,
+            "events_recorded={} != calls={}",
+            snap.events_recorded,
+            event_count
+        );
+    }
+
+    /// Telemetry: panes_evicted_lru counts exactly the LRU evictions.
+    #[test]
+    fn telemetry_panes_evicted_lru_exact(
+        total_panes in 257usize..350,
+    ) {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+
+        // Each iteration adds a new unique pane
+        for i in 0..total_panes {
+            tracker.record_at(
+                i as u64,
+                AgentType::Codex,
+                "rule".into(),
+                Some("600 seconds".into()),
+                now,
+            );
+        }
+
+        let snap = tracker.telemetry().snapshot();
+        let expected_evictions = (total_panes - 256) as u64;
+        prop_assert_eq!(
+            snap.panes_evicted_lru,
+            expected_evictions,
+            "evictions={} != expected={}",
+            snap.panes_evicted_lru,
+            expected_evictions
+        );
+    }
+
+    /// Telemetry: panes_removed counts explicit remove_pane calls that succeed.
+    #[test]
+    fn telemetry_panes_removed_exact(
+        pane_count in 1usize..50,
+        removes in prop::collection::vec(0u64..60, 1..30),
+    ) {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+
+        for i in 0..pane_count {
+            tracker.record_at(
+                i as u64,
+                AgentType::Codex,
+                "rule".into(),
+                Some("60 seconds".into()),
+                now,
+            );
+        }
+
+        let mut removed_set = std::collections::HashSet::new();
+        for &pid in &removes {
+            // Only count if the pane actually existed at removal time
+            if pid < pane_count as u64 && !removed_set.contains(&pid) {
+                removed_set.insert(pid);
+            }
+            tracker.remove_pane(pid);
+        }
+
+        let snap = tracker.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.panes_removed,
+            removed_set.len() as u64,
+            "panes_removed={} != expected={}",
+            snap.panes_removed,
+            removed_set.len()
+        );
+    }
+
+    /// Telemetry: gc_runs counts each gc_at call exactly once.
+    #[test]
+    fn telemetry_gc_runs_exact(
+        gc_count in 1usize..20,
+    ) {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+
+        tracker.record_at(1, AgentType::Codex, "rule".into(), Some("10 seconds".into()), now);
+
+        for i in 0..gc_count {
+            tracker.gc_at(now + Duration::from_secs(i as u64));
+        }
+
+        let snap = tracker.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.gc_runs,
+            gc_count as u64,
+            "gc_runs={} != expected={}",
+            snap.gc_runs,
+            gc_count
+        );
+    }
+
+    /// Telemetry: gc_panes_collected counts only actually removed (expired) panes.
+    #[test]
+    fn telemetry_gc_panes_collected_accurate(
+        pane_count in 1usize..30,
+        cooldown_secs in 10u64..120,
+        gc_offset_secs in 0u64..300,
+    ) {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+
+        for i in 0..pane_count {
+            tracker.record_at(
+                i as u64,
+                AgentType::Codex,
+                "rule".into(),
+                Some(format!("{cooldown_secs} seconds")),
+                now,
+            );
+        }
+
+        let gc_time = now + Duration::from_secs(gc_offset_secs);
+        let panes_before = tracker.tracked_pane_count();
+        tracker.gc_at(gc_time);
+        let panes_after = tracker.tracked_pane_count();
+
+        let snap = tracker.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.gc_panes_collected,
+            (panes_before - panes_after) as u64,
+            "gc_panes_collected={} != actual_removed={}",
+            snap.gc_panes_collected,
+            panes_before - panes_after
+        );
+    }
+
+    /// Telemetry: events_pruned counts per-pane overflow evictions exactly.
+    #[test]
+    fn telemetry_events_pruned_exact(
+        event_count in 65usize..200,
+    ) {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+
+        // All events on a single pane to trigger per-pane cap (64)
+        for i in 0..event_count {
+            tracker.record_at(
+                1,
+                AgentType::Codex,
+                format!("r{i}"),
+                Some("600 seconds".into()),
+                now + Duration::from_secs(i as u64),
+            );
+        }
+
+        let snap = tracker.telemetry().snapshot();
+        let expected_pruned = (event_count - 64) as u64;
+        prop_assert_eq!(
+            snap.events_pruned,
+            expected_pruned,
+            "events_pruned={} != expected={}",
+            snap.events_pruned,
+            expected_pruned
+        );
+    }
+
+    /// Telemetry: cross-counter invariant — events_pruned <= events_recorded.
+    #[test]
+    fn telemetry_pruned_lte_recorded(
+        events in prop::collection::vec(
+            (arb_pane_id(), arb_agent_type()),
+            1..200
+        ),
+    ) {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+
+        for (i, &(pid, at)) in events.iter().enumerate() {
+            tracker.record_at(
+                pid,
+                at,
+                format!("r{i}"),
+                Some("60 seconds".into()),
+                now + Duration::from_secs(i as u64),
+            );
+        }
+
+        let snap = tracker.telemetry().snapshot();
+        prop_assert!(
+            snap.events_pruned <= snap.events_recorded,
+            "events_pruned={} > events_recorded={}",
+            snap.events_pruned,
+            snap.events_recorded
+        );
+    }
+
+    /// Telemetry: counters start at zero on a fresh tracker.
+    #[test]
+    fn telemetry_starts_at_zero(_dummy in 0u8..1) {
+        let tracker = RateLimitTracker::new();
+        let snap = tracker.telemetry().snapshot();
+        prop_assert_eq!(snap.events_recorded, 0);
+        prop_assert_eq!(snap.panes_evicted_lru, 0);
+        prop_assert_eq!(snap.panes_removed, 0);
+        prop_assert_eq!(snap.gc_runs, 0);
+        prop_assert_eq!(snap.gc_panes_collected, 0);
+        prop_assert_eq!(snap.events_pruned, 0);
+    }
+
+    /// Telemetry: snapshot survives JSON serde roundtrip.
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip(
+        events_recorded in 0u64..10000,
+        panes_evicted_lru in 0u64..1000,
+        panes_removed in 0u64..1000,
+        gc_runs in 0u64..500,
+        gc_panes_collected in 0u64..5000,
+        events_pruned in 0u64..10000,
+    ) {
+        let snap = RateLimitTelemetrySnapshot {
+            events_recorded,
+            panes_evicted_lru,
+            panes_removed,
+            gc_runs,
+            gc_panes_collected,
+            events_pruned,
+        };
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored: RateLimitTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(restored, snap);
+    }
+
+    /// Telemetry: counters are monotonically non-decreasing across operations.
+    #[test]
+    fn telemetry_counters_monotonic(
+        ops in prop::collection::vec(
+            prop_oneof![
+                (arb_pane_id(), arb_agent_type()).prop_map(|(p, a)| (0u8, p, a)),
+                arb_pane_id().prop_map(|p| (1u8, p, AgentType::Codex)),
+                Just((2u8, 0, AgentType::Codex)),
+            ],
+            5..50
+        ),
+    ) {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+        let mut prev_snap = tracker.telemetry().snapshot();
+
+        for (i, &(op, pid, at)) in ops.iter().enumerate() {
+            let t = now + Duration::from_secs(i as u64);
+            match op {
+                0 => tracker.record_at(pid, at, format!("r{i}"), Some("10 seconds".into()), t),
+                1 => tracker.remove_pane(pid),
+                _ => tracker.gc_at(t),
+            }
+
+            let snap = tracker.telemetry().snapshot();
+            prop_assert!(snap.events_recorded >= prev_snap.events_recorded,
+                "events_recorded decreased");
+            prop_assert!(snap.panes_evicted_lru >= prev_snap.panes_evicted_lru,
+                "panes_evicted_lru decreased");
+            prop_assert!(snap.panes_removed >= prev_snap.panes_removed,
+                "panes_removed decreased");
+            prop_assert!(snap.gc_runs >= prev_snap.gc_runs,
+                "gc_runs decreased");
+            prop_assert!(snap.gc_panes_collected >= prev_snap.gc_panes_collected,
+                "gc_panes_collected decreased");
+            prop_assert!(snap.events_pruned >= prev_snap.events_pruned,
+                "events_pruned decreased");
+            prev_snap = snap;
+        }
     }
 }
