@@ -1492,7 +1492,7 @@ mod tests {
     fn telemetry_health_check_counted() {
         let mut wd = AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default());
         wd.observe(Component::Capture, 1000);
-        wd.check_health(2000);
+        let _ = wd.check_health(2000);
 
         let snap = wd.telemetry().snapshot();
         assert_eq!(snap.health_checks, 1);
@@ -1506,7 +1506,7 @@ mod tests {
     fn telemetry_classify_counted() {
         let mut wd = AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default());
         wd.observe(Component::Capture, 1000);
-        wd.classify_component(Component::Capture, 2000);
+        let _ = wd.classify_component(Component::Capture, 2000);
 
         let snap = wd.telemetry().snapshot();
         assert_eq!(snap.classifications, 1);
@@ -1525,7 +1525,7 @@ mod tests {
     fn telemetry_snapshot_serde_roundtrip() {
         let mut wd = AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default());
         wd.observe(Component::Capture, 1000);
-        wd.check_health(2000);
+        let _ = wd.check_health(2000);
 
         let snap = wd.telemetry().snapshot();
         let json = serde_json::to_string(&snap).unwrap();

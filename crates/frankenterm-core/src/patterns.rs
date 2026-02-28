@@ -5608,7 +5608,7 @@ rules:
     #[test]
     fn telemetry_scan_counted() {
         let engine = PatternEngine::new();
-        engine.detect("hello world");
+        let _ = engine.detect("hello world");
         let snap = engine.telemetry().snapshot();
         assert_eq!(snap.scans_total, 1);
     }
@@ -5616,9 +5616,9 @@ rules:
     #[test]
     fn telemetry_multiple_scans_counted() {
         let engine = PatternEngine::new();
-        engine.detect("hello");
-        engine.detect("world");
-        engine.detect("test");
+        let _ = engine.detect("hello");
+        let _ = engine.detect("world");
+        let _ = engine.detect("test");
         let snap = engine.telemetry().snapshot();
         assert_eq!(snap.scans_total, 3);
     }

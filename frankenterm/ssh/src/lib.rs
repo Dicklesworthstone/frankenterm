@@ -73,3 +73,106 @@ pub mod runtime {
         smol::block_on(future)
     }
 }
+
+#[cfg(test)]
+mod runtime_migration_guards {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
+        let entries = fs::read_dir(dir).expect("read_dir failed");
+        for entry in entries {
+            let entry = entry.expect("failed to read dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_files(&path, files);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    fn rust_source_files() -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        collect_rust_files(&src_dir, &mut files);
+        files
+    }
+
+    fn lib_before_test_module() -> String {
+        let lib_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        let source =
+            fs::read_to_string(&lib_rs).unwrap_or_else(|_| panic!("failed to read {:?}", lib_rs));
+        let marker = "#[cfg(test)]\nmod runtime_migration_guards";
+        source
+            .find(marker)
+            .map_or(source.clone(), |idx| source[..idx].to_owned())
+    }
+
+    fn contains_non_comment_token(line: &str, token: &str) -> bool {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            return false;
+        }
+        line.contains(token)
+    }
+
+    #[test]
+    fn no_direct_tokio_namespace_in_ssh_sources() {
+        for file in rust_source_files() {
+            if file.ends_with("src/lib.rs") {
+                continue;
+            }
+            let source =
+                fs::read_to_string(&file).unwrap_or_else(|_| panic!("failed to read {:?}", file));
+            for (line_no, line) in source.lines().enumerate() {
+                assert!(
+                    !contains_non_comment_token(line, "tokio::"),
+                    "direct tokio usage found at {}:{}",
+                    file.display(),
+                    line_no + 1
+                );
+            }
+        }
+        let lib_prefix = lib_before_test_module();
+        for (line_no, line) in lib_prefix.lines().enumerate() {
+            assert!(
+                !contains_non_comment_token(line, "tokio::"),
+                "direct tokio usage found at src/lib.rs:{}",
+                line_no + 1
+            );
+        }
+
+        let cargo_toml = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let manifest =
+            fs::read_to_string(&cargo_toml).expect("failed to read frankenterm-ssh Cargo.toml");
+        assert!(
+            !manifest.lines().any(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with('#') && trimmed.starts_with("tokio")
+            }),
+            "tokio dependency declaration reintroduced in {}",
+            cargo_toml.display()
+        );
+    }
+
+    #[test]
+    fn smol_references_are_isolated_to_runtime_shim() {
+        for file in rust_source_files() {
+            if file.ends_with("src/lib.rs") {
+                continue;
+            }
+
+            let source =
+                fs::read_to_string(&file).unwrap_or_else(|_| panic!("failed to read {:?}", file));
+            for (line_no, line) in source.lines().enumerate() {
+                assert!(
+                    !contains_non_comment_token(line, "smol::"),
+                    "direct smol usage must stay in runtime shim ({}:{})",
+                    file.display(),
+                    line_no + 1
+                );
+            }
+        }
+    }
+}
