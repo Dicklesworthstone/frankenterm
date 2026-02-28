@@ -13,6 +13,53 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+// ─── Telemetry ──────────────────────────────────────────────────────
+
+/// Operational telemetry counters for the backpressure manager.
+///
+/// All counters are `AtomicU64` because `BackpressureManager` methods take `&self`.
+#[derive(Debug, Default)]
+pub struct BackpressureTelemetry {
+    /// Total evaluate() calls.
+    evaluations: AtomicU64,
+    /// Total classify() calls.
+    classifications: AtomicU64,
+    /// Tier transitions (evaluate() calls that changed tier).
+    transitions: AtomicU64,
+    /// pause_pane() calls.
+    panes_paused: AtomicU64,
+    /// resume_pane() calls.
+    panes_resumed: AtomicU64,
+    /// resume_all_panes() calls.
+    resume_alls: AtomicU64,
+}
+
+impl BackpressureTelemetry {
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> BackpressureTelemetrySnapshot {
+        BackpressureTelemetrySnapshot {
+            evaluations: self.evaluations.load(Ordering::Relaxed),
+            classifications: self.classifications.load(Ordering::Relaxed),
+            transitions: self.transitions.load(Ordering::Relaxed),
+            panes_paused: self.panes_paused.load(Ordering::Relaxed),
+            panes_resumed: self.panes_resumed.load(Ordering::Relaxed),
+            resume_alls: self.resume_alls.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Serializable snapshot of backpressure telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackpressureTelemetrySnapshot {
+    pub evaluations: u64,
+    pub classifications: u64,
+    pub transitions: u64,
+    pub panes_paused: u64,
+    pub panes_resumed: u64,
+    pub resume_alls: u64,
+}
+
 // ─── Tier ────────────────────────────────────────────────────────────
 
 /// Backpressure severity tier.
@@ -190,6 +237,7 @@ pub struct BackpressureManager {
     transition_count: AtomicU64,
     paused_panes: Arc<RwLock<HashSet<u64>>>,
     pub metrics: BackpressureMetrics,
+    telemetry: BackpressureTelemetry,
 }
 
 impl BackpressureManager {
@@ -203,6 +251,7 @@ impl BackpressureManager {
             transition_count: AtomicU64::new(0),
             paused_panes: Arc::new(RwLock::new(HashSet::new())),
             metrics: BackpressureMetrics::default(),
+            telemetry: BackpressureTelemetry::default(),
         }
     }
 
@@ -210,6 +259,11 @@ impl BackpressureManager {
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    /// Snapshot the current telemetry counters.
+    pub fn telemetry(&self) -> &BackpressureTelemetry {
+        &self.telemetry
     }
 
     /// Current tier (lock-free read when only an approximate value is needed).
@@ -221,6 +275,7 @@ impl BackpressureManager {
     /// Classify queue depths into a tier without applying any state change.
     #[must_use]
     pub fn classify(&self, depths: &QueueDepths) -> BackpressureTier {
+        self.telemetry.classifications.fetch_add(1, Ordering::Relaxed);
         let cr = depths.capture_ratio();
         let wr = depths.write_ratio();
 
@@ -245,6 +300,7 @@ impl BackpressureManager {
     ///
     /// Returns `Some((old, new))` when the tier changes, `None` otherwise.
     pub fn evaluate(&self, depths: &QueueDepths) -> Option<(BackpressureTier, BackpressureTier)> {
+        self.telemetry.evaluations.fetch_add(1, Ordering::Relaxed);
         if !self.config.enabled {
             return None;
         }
@@ -276,6 +332,7 @@ impl BackpressureManager {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Instant::now();
         self.transition_count.fetch_add(1, Ordering::Relaxed);
+        self.telemetry.transitions.fetch_add(1, Ordering::Relaxed);
 
         match proposed {
             BackpressureTier::Yellow => {
@@ -309,6 +366,7 @@ impl BackpressureManager {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(pane_id);
+        self.telemetry.panes_paused.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Resume a previously paused pane.
@@ -317,6 +375,7 @@ impl BackpressureManager {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&pane_id);
+        self.telemetry.panes_resumed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Resume all paused panes (e.g. on recovery to Green).
@@ -325,6 +384,7 @@ impl BackpressureManager {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.telemetry.resume_alls.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Check if a pane is currently paused.
