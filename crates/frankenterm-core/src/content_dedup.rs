@@ -23,6 +23,53 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the dedup engine.
+#[derive(Debug, Clone, Default)]
+pub struct DedupTelemetry {
+    /// Total process_segment() calls.
+    segments_processed: u64,
+    /// Segments that were deduplicated (already in store).
+    segments_deduplicated: u64,
+    /// Segments newly inserted into store.
+    segments_inserted: u64,
+    /// Segments stored inline (below min size).
+    segments_inline: u64,
+    /// release() calls.
+    releases: u64,
+    /// gc() calls.
+    gc_runs: u64,
+}
+
+impl DedupTelemetry {
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> DedupTelemetrySnapshot {
+        DedupTelemetrySnapshot {
+            segments_processed: self.segments_processed,
+            segments_deduplicated: self.segments_deduplicated,
+            segments_inserted: self.segments_inserted,
+            segments_inline: self.segments_inline,
+            releases: self.releases,
+            gc_runs: self.gc_runs,
+        }
+    }
+}
+
+/// Serializable snapshot of dedup engine telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedupTelemetrySnapshot {
+    pub segments_processed: u64,
+    pub segments_deduplicated: u64,
+    pub segments_inserted: u64,
+    pub segments_inline: u64,
+    pub releases: u64,
+    pub gc_runs: u64,
+}
+
+// =============================================================================
 // Content Hashing
 // =============================================================================
 
@@ -189,6 +236,8 @@ pub struct DedupEngine<S: ContentStore> {
     total_deduplicated: u64,
     total_inserted: u64,
     total_inline: u64,
+    /// Operational telemetry.
+    telemetry: DedupTelemetry,
 }
 
 impl<S: ContentStore> DedupEngine<S> {
@@ -201,7 +250,13 @@ impl<S: ContentStore> DedupEngine<S> {
             total_deduplicated: 0,
             total_inserted: 0,
             total_inline: 0,
+            telemetry: DedupTelemetry::default(),
         }
+    }
+
+    /// Snapshot the current telemetry counters.
+    pub fn telemetry(&self) -> &DedupTelemetry {
+        &self.telemetry
     }
 
     /// Process a captured segment, storing or deduplicating as appropriate.
@@ -211,12 +266,14 @@ impl<S: ContentStore> DedupEngine<S> {
         timestamp_ms: u64,
     ) -> Result<DedupResult, String> {
         self.total_processed += 1;
+        self.telemetry.segments_processed += 1;
 
         let hash = content_hash(content);
 
         // Small content: skip dedup, store inline
         if !self.config.should_dedup(content.len()) {
             self.total_inline += 1;
+            self.telemetry.segments_inline += 1;
             return Ok(DedupResult {
                 hash,
                 outcome: StoreResult::Inserted,
@@ -228,8 +285,14 @@ impl<S: ContentStore> DedupEngine<S> {
         let outcome = self.store.store(&hash, content, timestamp_ms)?;
 
         match outcome {
-            StoreResult::Inserted => self.total_inserted += 1,
-            StoreResult::Deduplicated => self.total_deduplicated += 1,
+            StoreResult::Inserted => {
+                self.total_inserted += 1;
+                self.telemetry.segments_inserted += 1;
+            }
+            StoreResult::Deduplicated => {
+                self.total_deduplicated += 1;
+                self.telemetry.segments_deduplicated += 1;
+            }
         }
 
         Ok(DedupResult {
@@ -247,11 +310,13 @@ impl<S: ContentStore> DedupEngine<S> {
 
     /// Release a reference to content (e.g., when a segment is deleted).
     pub fn release(&mut self, hash: &str) -> Result<u64, String> {
+        self.telemetry.releases += 1;
         self.store.decrement_ref(hash)
     }
 
     /// Run garbage collection to remove unreferenced content.
     pub fn gc(&mut self) -> Result<usize, String> {
+        self.telemetry.gc_runs += 1;
         self.store.gc()
     }
 
