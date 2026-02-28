@@ -921,6 +921,7 @@ impl ObservationRuntime {
             patterns: config.patterns.clone(),
             workflows_enabled: vec![],
             auto_run_allowlist: vec![],
+            trauma_guard: crate::config::TraumaGuardConfig::default(),
         };
         let (config_tx, config_rx) = watch::channel(hot_config);
 

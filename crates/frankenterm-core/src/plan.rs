@@ -2052,6 +2052,39 @@ fn sha256_hex(input: &str) -> String {
 }
 
 // ============================================================================
+// Mission dispatch stubs (referenced by robot_types::MissionDecisionData)
+// ============================================================================
+
+/// Dispatch contract for a mission assignment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionDispatchContract {
+    /// Assignment being dispatched.
+    pub assignment_id: String,
+    /// Agent receiving the dispatch.
+    pub target_agent: String,
+}
+
+/// Target for a mission dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionDispatchTarget {
+    /// Pane ID for the dispatch.
+    pub pane_id: u64,
+    /// Optional workspace path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+}
+
+/// Execution details for a mission dispatch dry-run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionDispatchExecution {
+    /// Whether the dispatch would succeed.
+    pub would_succeed: bool,
+    /// Reason if the dispatch would fail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

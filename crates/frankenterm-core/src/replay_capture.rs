@@ -19,12 +19,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+// Re-export decision types from replay_decision_graph for callers that
+// reference `crate::replay_capture::DecisionEvent` / `DecisionType`.
+pub use crate::replay_decision_graph::{DecisionEvent, DecisionType};
+
 use crate::event_id::{RecorderMergeKey, StreamKind, generate_event_id_v1};
 use crate::ingest::CapturedSegment;
 use crate::recording::{
     EgressEvent, EgressTap, GlobalSequence, IngressEvent, IngressOutcome, IngressTap,
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
-    RecorderEventSource, RecorderLifecyclePhase, RecorderRedactionLevel, RecorderTextEncoding,
+    RecorderControlMarkerType, RecorderEventSource, RecorderLifecyclePhase,
+    RecorderRedactionLevel, RecorderTextEncoding,
     captured_kind_to_segment, epoch_ms_now,
 };
 
@@ -480,6 +485,65 @@ impl CaptureAdapter {
             recorded_at_ms,
             sequence,
             causality,
+            payload,
+        };
+
+        event.event_id = generate_event_id_v1(&event);
+
+        let merge_key = RecorderMergeKey {
+            recorded_at_ms: event.recorded_at_ms,
+            pane_id: event.pane_id,
+            stream_kind: StreamKind::from_payload(&event.payload),
+            sequence: event.sequence,
+            event_id: event.event_id.clone(),
+        };
+
+        self.total_captured.fetch_add(1, Ordering::Relaxed);
+        self.sink.on_event(event, merge_key);
+    }
+
+    /// Capture a decision event (policy evaluation, workflow step, etc.).
+    ///
+    /// Converts the [`DecisionEvent`] into a [`RecorderEvent`] with a
+    /// `ControlMarker` payload and forwards it to the configured sink.
+    pub fn capture_decision(
+        &self,
+        source: RecorderEventSource,
+        correlation_id: Option<String>,
+        decision: DecisionEvent,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+
+        let pane_id = decision.pane_id;
+        let occurred_at_ms = decision.timestamp_ms;
+        let recorded_at_ms = epoch_ms_now();
+        let sequence = self.next_pane_seq(pane_id);
+
+        let details = serde_json::to_value(&decision).unwrap_or_default();
+
+        let payload = RecorderEventPayload::ControlMarker {
+            control_marker_type: RecorderControlMarkerType::PolicyDecision,
+            details,
+        };
+
+        let mut event = RecorderEvent {
+            schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.into(),
+            event_id: String::new(),
+            pane_id,
+            session_id: self.session_id.clone(),
+            workflow_id: None,
+            correlation_id,
+            source,
+            occurred_at_ms,
+            recorded_at_ms,
+            sequence,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
             payload,
         };
 

@@ -31,6 +31,8 @@ pub enum DecisionType {
     BarrierDecision,
     /// No-op (event processed, no action taken).
     NoOp,
+    /// Policy evaluation (alias for callers in policy.rs).
+    PolicyEvaluation,
 }
 
 // ============================================================================
@@ -147,6 +149,47 @@ pub struct DecisionEvent {
     /// Replay run ID (transient).
     #[serde(default)]
     pub replay_run_id: String,
+}
+
+impl DecisionEvent {
+    /// Convenience constructor that hashes the definition, input, and output texts.
+    #[must_use]
+    pub fn new(
+        decision_type: DecisionType,
+        pane_id: u64,
+        rule_id: impl Into<String>,
+        definition_text: &str,
+        input_text: &str,
+        output: serde_json::Value,
+        _correlation_id: Option<String>,
+        override_node: Option<u64>,
+        timestamp_ms: u64,
+    ) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_str(s: &str) -> String {
+            let mut hasher = DefaultHasher::new();
+            s.hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        }
+
+        let output_str = serde_json::to_string(&output).unwrap_or_default();
+
+        Self {
+            decision_type,
+            rule_id: rule_id.into(),
+            definition_hash: hash_str(definition_text),
+            input_hash: hash_str(input_text),
+            output_hash: hash_str(&output_str),
+            timestamp_ms,
+            pane_id,
+            triggered_by: None,
+            overrides: override_node,
+            wall_clock_ms: timestamp_ms,
+            replay_run_id: String::new(),
+        }
+    }
 }
 
 // ============================================================================
