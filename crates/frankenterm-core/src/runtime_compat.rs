@@ -182,6 +182,7 @@ impl<T> RwLock<T> {
         }
     }
 
+    #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn read(&self) -> RwLockReadGuard<'_, T> {
         let cx = asupersync::Cx::for_testing();
         let guard = self
@@ -192,6 +193,7 @@ impl<T> RwLock<T> {
         RwLockReadGuard { inner: guard }
     }
 
+    #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn write(&self) -> RwLockWriteGuard<'_, T> {
         let cx = asupersync::Cx::for_testing();
         let guard = self

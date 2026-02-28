@@ -2896,6 +2896,7 @@ fn watch_has_changed<T>(rx: &watch::Receiver<T>) -> bool {
     }
 }
 
+#[allow(clippy::needless_pass_by_ref_mut)] // &mut required by tokio path, not asupersync
 fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T {
     #[cfg(feature = "asupersync-runtime")]
     {
