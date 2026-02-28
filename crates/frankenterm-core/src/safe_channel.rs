@@ -598,7 +598,7 @@ impl<T: Send> Reservation<T> {
     }
 }
 
-impl<T: Send> Drop for Reservation<T> {
+impl<T> Drop for Reservation<T> {
     fn drop(&mut self) {
         if !self.resolved {
             if let Some(item) = self.item.take() {
@@ -1105,7 +1105,7 @@ mod tests {
         tx.close();
 
         let result = handle.join().unwrap();
-        assert_eq!(result, Err(SafeChannelError::Closed));
+        assert!(matches!(result, Err(SafeChannelError::Closed)));
     }
 
     #[test]

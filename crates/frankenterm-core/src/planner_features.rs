@@ -690,7 +690,7 @@ pub fn solve_assignments(
             )
         })
         .map(|a| {
-            let cap = a.effective_capacity().saturating_sub(a.current_load);
+            let cap = a.effective_capacity().saturating_sub(a.current_load) as u32;
             (a.agent_id.clone(), cap)
         })
         .collect();

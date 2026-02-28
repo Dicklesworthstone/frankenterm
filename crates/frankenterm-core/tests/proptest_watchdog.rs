@@ -78,6 +78,8 @@ fn arb_mux_health_sample() -> impl Strategy<Value = MuxHealthSample> {
                 ping_ok,
                 ping_latency_ms,
                 rss_bytes,
+                watchdog_warnings: vec![],
+                warning_count: 0,
                 status,
             },
         )
@@ -394,6 +396,8 @@ proptest! {
             ping_ok,
             ping_latency_ms: None,
             rss_bytes: None,
+            watchdog_warnings: vec![],
+            warning_count: 0,
             status,
         };
         let json = serde_json::to_string(&sample).unwrap();
@@ -528,6 +532,8 @@ fn mux_health_sample_all_fields() {
         ping_ok: true,
         ping_latency_ms: Some(42),
         rss_bytes: Some(1024 * 1024 * 512),
+        watchdog_warnings: vec![],
+        warning_count: 0,
         status: HealthStatus::Healthy,
     };
     let json = serde_json::to_string(&sample).unwrap();
@@ -601,6 +607,8 @@ proptest! {
             ping_ok,
             ping_latency_ms: latency,
             rss_bytes: Some(1024 * 1024),
+            watchdog_warnings: vec![],
+            warning_count: 0,
             status,
         };
         let json = serde_json::to_string(&sample).unwrap();

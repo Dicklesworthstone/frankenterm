@@ -2694,6 +2694,57 @@ impl Mission {
 }
 
 // ============================================================================
+// Mission Agent Capability / Availability
+// ============================================================================
+
+/// Availability state of a mission agent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MissionAgentAvailability {
+    Ready,
+    Degraded {
+        reason_code: String,
+        max_parallel_assignments: usize,
+    },
+    Paused {
+        reason_code: String,
+    },
+    RateLimited {
+        reason_code: String,
+    },
+    Offline {
+        reason_code: String,
+    },
+}
+
+/// Capability profile for a mission-eligible agent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MissionAgentCapabilityProfile {
+    pub agent_id: String,
+    pub capabilities: Vec<String>,
+    pub lane_affinity: Vec<String>,
+    pub current_load: usize,
+    pub max_parallel_assignments: usize,
+    pub availability: MissionAgentAvailability,
+}
+
+impl MissionAgentCapabilityProfile {
+    /// Returns the effective parallel capacity, accounting for degraded state.
+    pub fn effective_capacity(&self) -> usize {
+        match &self.availability {
+            MissionAgentAvailability::Degraded {
+                max_parallel_assignments,
+                ..
+            } => *max_parallel_assignments,
+            MissionAgentAvailability::Paused { .. }
+            | MissionAgentAvailability::Offline { .. } => 0,
+            MissionAgentAvailability::Ready | MissionAgentAvailability::RateLimited { .. } => {
+                self.max_parallel_assignments
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

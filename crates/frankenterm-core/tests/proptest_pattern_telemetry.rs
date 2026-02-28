@@ -27,11 +27,11 @@ fn minimal_engine() -> PatternEngine {
         anchors: vec!["ERROR".to_string(), "WARN".to_string()],
         regex: Some(r"(?i)(ERROR|WARN):\s*(.+)".to_string()),
         description: "Test rule for telemetry".to_string(),
-        confidence: 0.9,
-        template: None,
-        preview_command: None,
+        remediation: None,
+        workflow: None,
         manual_fix: None,
-        tags: Vec::new(),
+        preview_command: None,
+        learn_more_url: None,
     };
 
     let pack = PatternPack::new("test-pack", "1.0.0", vec![rule]);

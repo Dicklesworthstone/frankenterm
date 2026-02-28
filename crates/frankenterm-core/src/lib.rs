@@ -47,11 +47,14 @@
 pub mod accounts;
 pub mod adaptive_radix_tree;
 pub mod aegis_backpressure;
+pub mod aegis_diagnostics;
+pub mod aegis_entropy_anomaly;
 pub mod agent_correlator;
 #[cfg(feature = "agent-detection")]
 pub mod agent_detection;
 #[cfg(feature = "agent-mail")]
 pub mod agent_mail_bridge;
+pub mod agent_config_templates;
 pub mod agent_provider;
 pub mod alerts;
 pub mod api_schema;
@@ -87,6 +90,9 @@ pub mod bocpd;
 pub mod build_coord;
 pub mod byte_compression;
 pub mod cancellation;
+pub mod cancellation_safe_channel;
+#[cfg(feature = "subprocess-bridge")]
+pub mod canary_rollout_controller;
 #[cfg(feature = "session-resume")]
 pub mod casr_types;
 pub mod cass;
@@ -122,6 +128,7 @@ pub mod dataflow;
 pub mod degradation;
 pub mod desktop_notify;
 pub mod diagnostic;
+pub mod diagnostic_redaction;
 pub mod diagram_render;
 pub mod differential_snapshot;
 pub mod disjoint_intervals;
@@ -184,6 +191,10 @@ pub mod memory_pressure;
 pub mod merkle_tree;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+#[cfg(feature = "subprocess-bridge")]
+pub mod mission_events;
+#[cfg(feature = "subprocess-bridge")]
+pub mod mission_loop;
 pub mod network_observer;
 pub mod network_reliability;
 pub mod notifications;
@@ -196,9 +207,12 @@ pub mod pairing_heap;
 pub mod pane_lifecycle;
 pub mod pane_tiers;
 pub mod pane_typestate;
+pub mod pattern_trigger;
 pub mod patterns;
 pub mod persistent_ds;
 pub mod plan;
+#[cfg(feature = "subprocess-bridge")]
+pub mod planner_features;
 pub mod policy;
 pub mod pool;
 pub mod priority;
@@ -224,6 +238,29 @@ pub mod replay_decision_graph;
 pub mod replay_fixture_harvest;
 pub mod replay_guide;
 pub mod replay_provenance;
+pub mod replay_artifact_registry;
+pub mod replay_checkpoint;
+pub mod replay_ci_gate;
+pub mod replay_cli;
+pub mod replay_counterfactual;
+pub mod replay_decision_diff;
+pub mod replay_fault_injection;
+pub mod replay_guardrails;
+pub mod replay_guardrails_gate;
+pub mod replay_mcp;
+pub mod replay_merge;
+pub mod replay_performance;
+pub mod replay_post_incident;
+pub mod replay_remediation;
+pub mod replay_report;
+pub mod replay_risk_scoring;
+pub mod replay_robot;
+pub mod replay_scenario_matrix;
+pub mod replay_shadow_rollout;
+pub mod replay_side_effect_barrier;
+pub mod replay_test_orchestrator;
+pub mod replay_usability_pilot;
+pub mod repro_dedup_bug;
 pub mod reports;
 pub mod reservoir_sampler;
 pub mod resize_crash_forensics;
@@ -242,7 +279,12 @@ pub mod rope;
 pub mod rulesets;
 pub mod runtime;
 pub mod runtime_compat;
+pub mod runtime_health;
+pub mod runtime_telemetry;
+pub mod safe_channel;
+pub mod scan_pipeline;
 pub mod scope_tree;
+pub mod scope_watchdog;
 pub mod screen_state;
 pub mod scrollback_eviction;
 pub mod search;
@@ -255,6 +297,7 @@ pub mod self_stabilize;
 pub mod semantic_anomaly;
 pub mod semantic_shock_response;
 pub mod semantic_quality;
+pub mod semantic_anomaly_watchdog;
 pub mod sequence_model;
 pub mod session_correlation;
 pub mod session_dna;
@@ -269,6 +312,8 @@ pub mod session_topology;
 pub mod setup;
 pub mod sharded_counter;
 pub mod sharding;
+#[cfg(feature = "subprocess-bridge")]
+pub mod shadow_mode_evaluator;
 pub mod shortest_path;
 pub mod simd_scan;
 pub mod skip_list;
@@ -306,9 +351,16 @@ pub mod topological_sort;
 pub mod trauma_guard;
 pub mod treap;
 pub mod trie;
+#[cfg(feature = "subprocess-bridge")]
+pub mod tx_idempotency;
+#[cfg(feature = "subprocess-bridge")]
+pub mod tx_observability;
+#[cfg(feature = "subprocess-bridge")]
+pub mod tx_plan_compiler;
 pub mod undo;
 pub mod union_find;
 pub mod user_preferences;
+pub mod utf8_chunked;
 pub mod van_emde_boas;
 #[cfg(feature = "vc-export")]
 pub mod vc_export;
@@ -327,6 +379,8 @@ pub mod xor_filter;
 
 #[cfg(feature = "vendored")]
 pub mod vendored;
+#[cfg(feature = "vendored")]
+pub mod vendored_migration_map;
 
 #[cfg(feature = "vendored")]
 pub mod wezterm_native;
@@ -361,6 +415,8 @@ pub mod tui;
 
 #[cfg(feature = "web")]
 pub mod web;
+#[cfg(feature = "web")]
+pub mod web_framework;
 
 pub mod ui_query;
 

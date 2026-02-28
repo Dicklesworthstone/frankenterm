@@ -214,7 +214,7 @@ fn arb_decision_chain(max_len: usize) -> impl Strategy<Value = DecisionChain> {
             "[a-z][a-z0-9_.:-]{2,24}",
             "[a-z0-9 _-]{0,40}",
             0u64..=500_000,
-            prop::option::of(0.0_f64..1.0_f64),
+            prop::option::of(0u64..=100u64),
         ),
         1..=max_len,
     )
@@ -222,27 +222,34 @@ fn arb_decision_chain(max_len: usize) -> impl Strategy<Value = DecisionChain> {
         let mut event_ids: Vec<String> = Vec::with_capacity(rows.len());
         let mut decisions = Vec::with_capacity(rows.len());
 
-        for (idx, (pane_id, decision_type, rule_id, input_text, timestamp_ms, confidence)) in
+        for (idx, (pane_id, decision_type, rule_id, input_text, timestamp_ms, override_node)) in
             rows.into_iter().enumerate()
         {
             let event_id = format!("recorder-event-{pane_id}-{idx}");
-            let parent_event_id = if idx == 0 {
+            let correlation_id = if idx == 0 {
                 None
             } else {
                 Some(event_ids[idx - 1].clone())
             };
 
-            let decision = DecisionEvent::new(
+            let triggered_by = if idx == 0 {
+                None
+            } else {
+                Some((idx - 1) as u64)
+            };
+
+            let mut decision = DecisionEvent::new(
                 decision_type,
                 pane_id,
                 rule_id.clone(),
                 &format!("rule_definition::{rule_id}"),
                 &input_text,
                 json!({ "idx": idx, "decision_type": format!("{decision_type:?}") }),
-                parent_event_id,
-                confidence,
+                correlation_id,
+                override_node,
                 timestamp_ms.saturating_add(idx as u64),
             );
+            decision.triggered_by = triggered_by;
 
             event_ids.push(event_id);
             decisions.push(decision);
@@ -534,19 +541,16 @@ proptest! {
         );
     }
 
-    /// P-13: Decision event causal references point to known prior recorder event IDs.
+    /// P-13: Decision event causal references point to known prior decision indices.
     #[test]
     fn p13_decision_event_causal_chain(chain in arb_decision_chain(80)) {
-        let mut event_id_to_index = HashMap::new();
-        for (idx, event_id) in chain.event_ids.iter().enumerate() {
-            event_id_to_index.insert(event_id.as_str(), idx);
-        }
+        let total = chain.decisions.len();
 
         for (idx, decision) in chain.decisions.iter().enumerate() {
-            if let Some(parent_event_id) = decision.parent_event_id.as_deref() {
-                let parent_idx = event_id_to_index.get(parent_event_id).copied();
-                prop_assert!(parent_idx.is_some());
-                prop_assert!(parent_idx.expect("checked above") < idx);
+            if let Some(triggered_by) = decision.triggered_by {
+                let parent_idx = triggered_by as usize;
+                prop_assert!(parent_idx < total, "triggered_by index out of bounds");
+                prop_assert!(parent_idx < idx, "triggered_by must reference a prior decision");
             }
         }
     }

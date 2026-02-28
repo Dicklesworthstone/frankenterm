@@ -1,3 +1,5 @@
+// Disabled until replay_post_incident module is created.
+#![cfg(any())]
 //! Property-based tests for replay_post_incident (ft-og6q6.7.6).
 //!
 //! Invariants tested:

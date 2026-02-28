@@ -111,6 +111,8 @@ fn arb_mux_health_sample() -> impl Strategy<Value = MuxHealthSample> {
                 ping_latency_ms,
                 rss_bytes,
                 status,
+                warning_count: 0,
+                watchdog_warnings: vec![],
             },
         )
 }
