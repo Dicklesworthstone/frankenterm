@@ -33,6 +33,72 @@ use std::collections::HashMap;
 const H_MAX: f64 = 8.0;
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the entropy scheduler.
+///
+/// All counters are plain `u64` because `EntropyScheduler` uses `&mut self`.
+#[derive(Debug, Clone, Default)]
+pub struct EntropySchedulerTelemetry {
+    /// Total pane registrations (including re-registrations that are no-ops).
+    panes_registered: u64,
+    /// Panes successfully added (first-time registrations only).
+    panes_added: u64,
+    /// Panes unregistered via unregister_pane().
+    panes_unregistered: u64,
+    /// Total feed_bytes/feed_byte calls.
+    byte_feeds: u64,
+    /// Total bytes fed across all feed_bytes/feed_byte calls.
+    total_bytes_fed: u64,
+    /// Total schedule() computations.
+    schedules_computed: u64,
+    /// Panes that transitioned out of warmup.
+    warmup_completions: u64,
+}
+
+impl EntropySchedulerTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> EntropySchedulerTelemetrySnapshot {
+        EntropySchedulerTelemetrySnapshot {
+            panes_registered: self.panes_registered,
+            panes_added: self.panes_added,
+            panes_unregistered: self.panes_unregistered,
+            byte_feeds: self.byte_feeds,
+            total_bytes_fed: self.total_bytes_fed,
+            schedules_computed: self.schedules_computed,
+            warmup_completions: self.warmup_completions,
+        }
+    }
+}
+
+/// Serializable snapshot of entropy scheduler telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntropySchedulerTelemetrySnapshot {
+    /// Total pane registrations (including re-registrations that are no-ops).
+    pub panes_registered: u64,
+    /// Panes successfully added (first-time registrations only).
+    pub panes_added: u64,
+    /// Panes unregistered via unregister_pane().
+    pub panes_unregistered: u64,
+    /// Total feed_bytes/feed_byte calls.
+    pub byte_feeds: u64,
+    /// Total bytes fed across all feed_bytes/feed_byte calls.
+    pub total_bytes_fed: u64,
+    /// Total schedule() computations.
+    pub schedules_computed: u64,
+    /// Panes that transitioned out of warmup.
+    pub warmup_completions: u64,
+}
+
+// =============================================================================
 // Configuration
 // =============================================================================
 
@@ -151,6 +217,8 @@ pub struct PaneSnapshotEntry {
 pub struct EntropyScheduler {
     config: EntropySchedulerConfig,
     panes: HashMap<u64, PaneEntropyState>,
+    /// Operational telemetry counters.
+    telemetry: EntropySchedulerTelemetry,
 }
 
 impl EntropyScheduler {
@@ -159,6 +227,7 @@ impl EntropyScheduler {
         Self {
             config,
             panes: HashMap::new(),
+            telemetry: EntropySchedulerTelemetry::new(),
         }
     }
 
@@ -166,6 +235,8 @@ impl EntropyScheduler {
     ///
     /// Idempotent — re-registering a pane that already exists is a no-op.
     pub fn register_pane(&mut self, pane_id: u64) {
+        self.telemetry.panes_registered += 1;
+        let was_absent = !self.panes.contains_key(&pane_id);
         self.panes
             .entry(pane_id)
             .or_insert_with(|| PaneEntropyState {
@@ -173,17 +244,29 @@ impl EntropyScheduler {
                 last_interval_ms: self.config.warmup_interval_ms,
                 last_density: 0.0,
             });
+        if was_absent {
+            self.telemetry.panes_added += 1;
+        }
     }
 
     /// Remove a pane from tracking.
     pub fn unregister_pane(&mut self, pane_id: u64) {
-        self.panes.remove(&pane_id);
+        if self.panes.remove(&pane_id).is_some() {
+            self.telemetry.panes_unregistered += 1;
+        }
     }
 
     /// Feed output bytes from a pane into its entropy estimator.
     pub fn feed_bytes(&mut self, pane_id: u64, data: &[u8]) {
         if let Some(state) = self.panes.get_mut(&pane_id) {
+            self.telemetry.byte_feeds += 1;
+            self.telemetry.total_bytes_fed += data.len() as u64;
+            let was_warmup = state.estimator.total_bytes() < self.config.min_samples;
             state.estimator.update_block(data);
+            let is_warmup = state.estimator.total_bytes() < self.config.min_samples;
+            if was_warmup && !is_warmup {
+                self.telemetry.warmup_completions += 1;
+            }
             self.recompute_pane(pane_id);
         }
     }
@@ -191,7 +274,14 @@ impl EntropyScheduler {
     /// Feed a single byte from a pane.
     pub fn feed_byte(&mut self, pane_id: u64, byte: u8) {
         if let Some(state) = self.panes.get_mut(&pane_id) {
+            self.telemetry.byte_feeds += 1;
+            self.telemetry.total_bytes_fed += 1;
+            let was_warmup = state.estimator.total_bytes() < self.config.min_samples;
             state.estimator.update(byte);
+            let is_warmup = state.estimator.total_bytes() < self.config.min_samples;
+            if was_warmup && !is_warmup {
+                self.telemetry.warmup_completions += 1;
+            }
             self.recompute_pane(pane_id);
         }
     }
@@ -238,7 +328,8 @@ impl EntropyScheduler {
     ///
     /// Returns per-pane decisions sorted by interval ascending (most
     /// urgent = shortest interval first).
-    pub fn schedule(&self) -> EntropyScheduleResult {
+    pub fn schedule(&mut self) -> EntropyScheduleResult {
+        self.telemetry.schedules_computed += 1;
         let mut decisions: Vec<EntropyDecision> = self
             .panes
             .iter()
@@ -315,6 +406,12 @@ impl EntropyScheduler {
         let interval = self.config.base_interval_ms as f64 / effective_density;
         state.last_interval_ms =
             (interval as u64).clamp(self.config.min_interval_ms, self.config.max_interval_ms);
+    }
+
+    /// Access the operational telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &EntropySchedulerTelemetry {
+        &self.telemetry
     }
 }
 
@@ -658,7 +755,7 @@ mod tests {
 
     #[test]
     fn schedule_empty_scheduler() {
-        let sched = EntropyScheduler::new(EntropySchedulerConfig::default());
+        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
         let result = sched.schedule();
         assert!(result.decisions.is_empty());
         assert!(result.mean_density.abs() < f64::EPSILON);
