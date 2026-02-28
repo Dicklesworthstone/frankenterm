@@ -37,6 +37,7 @@ fn arb_scored_result(id_prefix: &'static str) -> impl Strategy<Value = ScoredRes
         doc_id: format!("{id_prefix}-{idx}"),
         score: score.abs().clamp(0.0, 1.0),
         source: frankensearch::ScoreSource::Hybrid,
+        index: None,
         fast_score: None,
         quality_score: None,
         lexical_score: None,
