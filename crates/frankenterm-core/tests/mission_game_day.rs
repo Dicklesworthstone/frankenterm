@@ -30,7 +30,7 @@ fn agent(id: &str) -> MissionAgentCapabilityProfile {
     }
 }
 
-fn degraded_agent(id: &str, max: u32) -> MissionAgentCapabilityProfile {
+fn degraded_agent(id: &str, max: usize) -> MissionAgentCapabilityProfile {
     MissionAgentCapabilityProfile {
         agent_id: id.to_string(),
         capabilities: vec!["robot.send".to_string()],

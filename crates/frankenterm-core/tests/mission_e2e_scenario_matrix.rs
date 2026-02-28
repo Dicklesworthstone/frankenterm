@@ -42,7 +42,7 @@ fn ready_agent(id: &str) -> MissionAgentCapabilityProfile {
     }
 }
 
-fn loaded_agent(id: &str, load: u32) -> MissionAgentCapabilityProfile {
+fn loaded_agent(id: &str, load: usize) -> MissionAgentCapabilityProfile {
     MissionAgentCapabilityProfile {
         agent_id: id.to_string(),
         capabilities: vec!["robot.send".to_string()],
