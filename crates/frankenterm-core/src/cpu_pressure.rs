@@ -17,6 +17,51 @@ use crate::runtime_compat::sleep;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the CPU pressure monitor.
+///
+/// All counters are `AtomicU64` because `CpuPressureMonitor` methods take `&self`.
+#[derive(Debug, Default)]
+pub struct CpuPressureTelemetry {
+    /// Total sample() calls.
+    samples_taken: AtomicU64,
+    /// Samples that classified as Green.
+    green_samples: AtomicU64,
+    /// Samples that classified as Yellow.
+    yellow_samples: AtomicU64,
+    /// Samples that classified as Orange.
+    orange_samples: AtomicU64,
+    /// Samples that classified as Red.
+    red_samples: AtomicU64,
+}
+
+impl CpuPressureTelemetry {
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> CpuPressureTelemetrySnapshot {
+        CpuPressureTelemetrySnapshot {
+            samples_taken: self.samples_taken.load(Ordering::Relaxed),
+            green_samples: self.green_samples.load(Ordering::Relaxed),
+            yellow_samples: self.yellow_samples.load(Ordering::Relaxed),
+            orange_samples: self.orange_samples.load(Ordering::Relaxed),
+            red_samples: self.red_samples.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Serializable snapshot of CPU pressure telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuPressureTelemetrySnapshot {
+    pub samples_taken: u64,
+    pub green_samples: u64,
+    pub yellow_samples: u64,
+    pub orange_samples: u64,
+    pub red_samples: u64,
+}
+
+// =============================================================================
 // Pressure tiers
 // =============================================================================
 
@@ -132,6 +177,8 @@ pub struct CpuPressureMonitor {
     latest_tier: Arc<AtomicU64>,
     /// Number of logical CPUs (cached at construction).
     ncpu: u32,
+    /// Operational telemetry counters.
+    telemetry: CpuPressureTelemetry,
 }
 
 impl CpuPressureMonitor {
@@ -141,7 +188,13 @@ impl CpuPressureMonitor {
             config,
             latest_tier: Arc::new(AtomicU64::new(0)),
             ncpu: detect_ncpu(),
+            telemetry: CpuPressureTelemetry::default(),
         }
+    }
+
+    /// Snapshot the current telemetry counters.
+    pub fn telemetry(&self) -> &CpuPressureTelemetry {
+        &self.telemetry
     }
 
     /// Get the latest pressure tier (lock-free read).
@@ -167,6 +220,21 @@ impl CpuPressureMonitor {
         let tier = self.classify(pressure);
         self.latest_tier
             .store(tier.as_u8() as u64, Ordering::Relaxed);
+        self.telemetry.samples_taken.fetch_add(1, Ordering::Relaxed);
+        match tier {
+            CpuPressureTier::Green => {
+                self.telemetry.green_samples.fetch_add(1, Ordering::Relaxed);
+            }
+            CpuPressureTier::Yellow => {
+                self.telemetry.yellow_samples.fetch_add(1, Ordering::Relaxed);
+            }
+            CpuPressureTier::Orange => {
+                self.telemetry.orange_samples.fetch_add(1, Ordering::Relaxed);
+            }
+            CpuPressureTier::Red => {
+                self.telemetry.red_samples.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         CpuSample {
             pressure,
             tier,
