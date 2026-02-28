@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,39 @@ use crate::watchdog::HealthStatus;
 use crate::wezterm::{
     MoveDirection, PaneInfo, SplitDirection, WeztermFuture, WeztermHandle, WeztermInterface,
 };
+
+// =============================================================================
+// Telemetry types
+// =============================================================================
+
+/// Operational telemetry for [`ShardedWeztermClient`].
+#[derive(Debug, Default)]
+pub struct ShardingTelemetry {
+    spawns: AtomicU64,
+    pane_listings: AtomicU64,
+    health_reports: AtomicU64,
+    route_lookups: AtomicU64,
+}
+
+impl ShardingTelemetry {
+    pub fn snapshot(&self) -> ShardingTelemetrySnapshot {
+        ShardingTelemetrySnapshot {
+            spawns: self.spawns.load(Ordering::Relaxed),
+            pane_listings: self.pane_listings.load(Ordering::Relaxed),
+            health_reports: self.health_reports.load(Ordering::Relaxed),
+            route_lookups: self.route_lookups.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Serializable telemetry snapshot for [`ShardedWeztermClient`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardingTelemetrySnapshot {
+    pub spawns: u64,
+    pub pane_listings: u64,
+    pub health_reports: u64,
+    pub route_lookups: u64,
+}
 
 /// Number of high bits reserved for shard id in encoded pane ids.
 pub const SHARD_ID_BITS: u32 = 16;
@@ -395,6 +428,7 @@ pub struct ShardedWeztermClient {
     pane_routes: RwLock<HashMap<u64, PaneRoute>>,
     round_robin_cursor: AtomicUsize,
     hash_ring: Option<HashRing<ShardId>>,
+    telemetry: ShardingTelemetry,
 }
 
 impl ShardedWeztermClient {
@@ -443,6 +477,7 @@ impl ShardedWeztermClient {
             pane_routes: RwLock::new(HashMap::new()),
             round_robin_cursor: AtomicUsize::new(0),
             hash_ring,
+            telemetry: ShardingTelemetry::default(),
         })
     }
 
@@ -454,6 +489,11 @@ impl ShardedWeztermClient {
             .map(|(idx, handle)| ShardBackend::new(ShardId(idx), format!("shard-{idx}"), handle))
             .collect::<Vec<_>>();
         Self::new(backends, strategy)
+    }
+
+    /// Returns the telemetry tracker for this client.
+    pub fn telemetry(&self) -> &ShardingTelemetry {
+        &self.telemetry
     }
 
     /// List configured shard ids in deterministic order.
@@ -529,6 +569,7 @@ impl ShardedWeztermClient {
         domain_name: Option<&str>,
         agent_hint: Option<AgentType>,
     ) -> Result<u64> {
+        self.telemetry.spawns.fetch_add(1, Ordering::Relaxed);
         let shard = self.choose_spawn_shard(domain_name, agent_hint);
         let backend = self.backend_for_id(shard)?;
         let local_id = backend
@@ -583,6 +624,7 @@ impl ShardedWeztermClient {
 
     /// Aggregate panes across all shards and refresh the route index.
     pub async fn list_all_panes(&self) -> Result<Vec<PaneInfo>> {
+        self.telemetry.pane_listings.fetch_add(1, Ordering::Relaxed);
         let (panes, routes) = self.collect_panes().await?;
         let mut guard = self.pane_routes.write().await;
         *guard = routes;
@@ -591,6 +633,9 @@ impl ShardedWeztermClient {
 
     /// Build a shard-level health report for watchdog integration.
     pub async fn shard_health_report(&self) -> ShardHealthReport {
+        self.telemetry
+            .health_reports
+            .fetch_add(1, Ordering::Relaxed);
         let mut overall = HealthStatus::Healthy;
         let mut shards = Vec::with_capacity(self.backends.len());
 
@@ -634,6 +679,9 @@ impl ShardedWeztermClient {
     }
 
     async fn route_for_global_pane_id(&self, pane_id: u64) -> Result<PaneRoute> {
+        self.telemetry
+            .route_lookups
+            .fetch_add(1, Ordering::Relaxed);
         if let Some(route) = self.pane_routes.read().await.get(&pane_id).copied() {
             return Ok(route);
         }

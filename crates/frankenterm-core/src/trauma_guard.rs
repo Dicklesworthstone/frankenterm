@@ -206,6 +206,7 @@ pub struct TraumaState {
     signature_bloom: BloomFilter,
     mutation_epoch: u64,
     last_mutation_timestamp_ms: Option<u64>,
+    #[serde(skip)]
     telemetry: TraumaTelemetry,
 }
 
