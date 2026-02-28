@@ -13,6 +13,7 @@ REMOTE_TMPDIR="${TARGET_DIR}"
 LOG_FILE="${LOG_DIR}/mission_tx_interfaces_${RUN_ID}.jsonl"
 STDOUT_BASENAME="mission_tx_interfaces_${RUN_ID}"
 export TMPDIR="/tmp"
+export RCH_DAEMON_TIMEOUT_MS="${RCH_DAEMON_TIMEOUT_MS:-120000}"
 WORKSPACE_DIR="${ROOT_DIR}/tests/e2e/tmp/${SCENARIO_ID}_${RUN_ID}"
 CONTRACT_PATH="${WORKSPACE_DIR}/.ft/mission/tx-active.json"
 RCH_CHECK_LOG="${LOG_DIR}/${STDOUT_BASENAME}.rch_check.log"
@@ -432,8 +433,25 @@ run_robot_json() {
         local retry_status_err="${LOG_DIR}/${STDOUT_BASENAME}.${label}.retry_preflight.rch_status.stderr.log"
         local retry_probe_json="${LOG_DIR}/${STDOUT_BASENAME}.${label}.retry_preflight.rch_probe.json"
         local retry_probe_err="${LOG_DIR}/${STDOUT_BASENAME}.${label}.retry_preflight.rch_probe.stderr.log"
+        local retry_daemon_restart_log="${LOG_DIR}/${STDOUT_BASENAME}.${label}.retry_preflight.rch_daemon_restart.log"
+        local retry_daemon_restart_err="${LOG_DIR}/${STDOUT_BASENAME}.${label}.retry_preflight.rch_daemon_restart.stderr.log"
         local retry_status_rc=0
         local retry_probe_rc=0
+        local retry_restart_rc=0
+
+        if [[ "${fallback_error_code}" == "RCH-E104" ]]; then
+          if ! rch daemon restart -y >"${retry_daemon_restart_log}" 2>"${retry_daemon_restart_err}"; then
+            retry_restart_rc=$?
+            emit_log "running" "${decision_path}" "rch_daemon_restart_failed" "none" \
+              "$(basename "${retry_daemon_restart_err}")" \
+              "retry remediation: daemon restart failed after ${fallback_reason_code}"
+          else
+            emit_log "running" "${decision_path}" "rch_daemon_restarted" "none" \
+              "$(basename "${retry_daemon_restart_log}")" \
+              "retry remediation: daemon restarted after ${fallback_reason_code}"
+          fi
+        fi
+
         if ! rch status --workers --jobs --json >"${retry_status_json}" 2>"${retry_status_err}"; then
           retry_status_rc=$?
         fi
@@ -450,7 +468,7 @@ run_robot_json() {
           retry_workers_reachable="$(jq -r '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${retry_probe_json}" 2>/dev/null || echo 0)"
         fi
 
-        if [[ "${retry_status_rc}" -eq 0 ]] && [[ "${retry_probe_rc}" -eq 0 ]] && [[ "${retry_workers_healthy}" != "0" ]] && [[ "${retry_workers_reachable}" != "0" ]]; then
+        if [[ "${retry_restart_rc}" -eq 0 ]] && [[ "${retry_status_rc}" -eq 0 ]] && [[ "${retry_probe_rc}" -eq 0 ]] && [[ "${retry_workers_healthy}" != "0" ]] && [[ "${retry_workers_reachable}" != "0" ]]; then
           emit_log "running" "${decision_path}" "rch_retry_preflight_recovered" "none" \
             "$(basename "${retry_probe_json}")" \
             "retry preflight passed after ${fallback_reason_code}; retrying once"
