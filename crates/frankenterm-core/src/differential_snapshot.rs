@@ -1803,6 +1803,75 @@ mod tests {
         assert!(at_base.pane_states.contains_key(&1));
     }
 
+    // ── Telemetry counter tests ──────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let engine = DiffSnapshotEngine::new(10);
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.diffs_captured, 0);
+        assert_eq!(snap.clean_skips, 0);
+        assert_eq!(snap.auto_compactions, 0);
+        assert_eq!(snap.manual_compactions, 0);
+        assert_eq!(snap.total_diff_entries, 0);
+        assert_eq!(snap.layout_diffs, 0);
+    }
+
+    #[test]
+    fn telemetry_clean_skip_counted() {
+        let mut engine = DiffSnapshotEngine::new(10);
+        engine.initialize(make_base(&[1, 2]));
+        // No dirty panes → clean skip
+        let diff = engine.capture_diff(&HashMap::new(), None, 2000);
+        assert!(diff.is_none());
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.clean_skips, 1);
+        assert_eq!(snap.diffs_captured, 0);
+    }
+
+    #[test]
+    fn telemetry_diff_captured_counted() {
+        let mut engine = DiffSnapshotEngine::new(10);
+        engine.initialize(make_base(&[1, 2]));
+        engine.tracker_mut().mark_metadata(1);
+        let mut current = HashMap::new();
+        current.insert(1, make_pane_state(1, 24, 80));
+        current.insert(2, make_pane_state(2, 24, 80));
+        let diff = engine.capture_diff(&current, None, 2000);
+        assert!(diff.is_some());
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.diffs_captured, 1);
+        assert!(snap.total_diff_entries >= 1);
+    }
+
+    #[test]
+    fn telemetry_manual_compaction_counted() {
+        let mut engine = DiffSnapshotEngine::new(10);
+        engine.initialize(make_base(&[1]));
+        // Create a diff so chain exists
+        engine.tracker_mut().mark_metadata(1);
+        let mut current = HashMap::new();
+        current.insert(1, make_pane_state(1, 24, 80));
+        let _ = engine.capture_diff(&current, None, 2000);
+        engine.compact();
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.manual_compactions, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let mut engine = DiffSnapshotEngine::new(10);
+        engine.initialize(make_base(&[1]));
+        engine.tracker_mut().mark_metadata(1);
+        let mut current = HashMap::new();
+        current.insert(1, make_pane_state(1, 24, 80));
+        let _ = engine.capture_diff(&current, None, 2000);
+        let snap = engine.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: DiffSnapshotTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
     // ---- proptest ----
 
     #[cfg(test)]
