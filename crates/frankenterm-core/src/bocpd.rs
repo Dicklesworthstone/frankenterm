@@ -1788,6 +1788,175 @@ mod tests {
         );
     }
 
+    // -- Telemetry counters (ft-3kxe.33) --------------------------------------
+
+    #[test]
+    fn telemetry_starts_at_zero() {
+        let mgr = BocpdManager::new(BocpdConfig::default());
+        let snap = mgr.telemetry().snapshot();
+        assert_eq!(snap.panes_registered, 0);
+        assert_eq!(snap.panes_unregistered, 0);
+        assert_eq!(snap.observations, 0);
+        assert_eq!(snap.change_points_detected, 0);
+    }
+
+    #[test]
+    fn telemetry_register_increments() {
+        let mut mgr = BocpdManager::new(BocpdConfig::default());
+        mgr.register_pane(1);
+        mgr.register_pane(2);
+        mgr.register_pane(1); // duplicate registration still counts
+
+        let snap = mgr.telemetry().snapshot();
+        assert_eq!(snap.panes_registered, 3);
+        assert_eq!(snap.panes_unregistered, 0);
+    }
+
+    #[test]
+    fn telemetry_unregister_increments() {
+        let mut mgr = BocpdManager::new(BocpdConfig::default());
+        mgr.register_pane(1);
+        mgr.unregister_pane(1);
+        mgr.unregister_pane(999); // nonexistent pane still counts
+
+        let snap = mgr.telemetry().snapshot();
+        assert_eq!(snap.panes_registered, 1);
+        assert_eq!(snap.panes_unregistered, 2);
+    }
+
+    #[test]
+    fn telemetry_observe_increments() {
+        let mut mgr = BocpdManager::new(BocpdConfig::default());
+        let features = OutputFeatures {
+            output_rate: 5.0,
+            byte_rate: 200.0,
+            entropy: 4.0,
+            unique_line_ratio: 0.9,
+            ansi_density: 0.05,
+        };
+        mgr.observe(1, features.clone());
+        mgr.observe(1, features.clone());
+        mgr.observe(2, features);
+
+        let snap = mgr.telemetry().snapshot();
+        assert_eq!(snap.observations, 3);
+    }
+
+    #[test]
+    fn telemetry_observe_text_chunk_increments() {
+        let mut mgr = BocpdManager::new(BocpdConfig::default());
+        mgr.observe_text_chunk(1, "hello\n", std::time::Duration::from_secs(1));
+        mgr.observe_text_chunk(1, "world\n", std::time::Duration::from_secs(1));
+
+        let snap = mgr.telemetry().snapshot();
+        assert_eq!(snap.observations, 2);
+    }
+
+    #[test]
+    fn telemetry_change_points_counted() {
+        let mut mgr = BocpdManager::new(BocpdConfig {
+            hazard_rate: 0.1,
+            detection_threshold: 0.3,
+            min_observations: 5,
+            max_run_length: 50,
+        });
+
+        // Regime 1: stable low values
+        for _ in 0..20 {
+            let f = OutputFeatures {
+                output_rate: 1.0,
+                byte_rate: 10.0,
+                entropy: 1.0,
+                unique_line_ratio: 1.0,
+                ansi_density: 0.0,
+            };
+            mgr.observe(1, f);
+        }
+
+        let before = mgr.telemetry().snapshot().change_points_detected;
+
+        // Regime 2: dramatic shift
+        for _ in 0..30 {
+            let f = OutputFeatures {
+                output_rate: 1000.0,
+                byte_rate: 50000.0,
+                entropy: 7.0,
+                unique_line_ratio: 0.1,
+                ansi_density: 0.0,
+            };
+            mgr.observe(1, f);
+        }
+
+        let after = mgr.telemetry().snapshot().change_points_detected;
+        assert!(
+            after >= before,
+            "change_points_detected should not decrease: before={before}, after={after}"
+        );
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let snap = BocpdTelemetrySnapshot {
+            panes_registered: 10,
+            panes_unregistered: 3,
+            observations: 500,
+            change_points_detected: 7,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: BocpdTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn telemetry_snapshot_equality() {
+        let a = BocpdTelemetrySnapshot {
+            panes_registered: 1,
+            panes_unregistered: 2,
+            observations: 3,
+            change_points_detected: 4,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+
+        let c = BocpdTelemetrySnapshot {
+            observations: 99,
+            ..a.clone()
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn telemetry_snapshot_debug_clone() {
+        let snap = BocpdTelemetrySnapshot {
+            panes_registered: 5,
+            panes_unregistered: 1,
+            observations: 100,
+            change_points_detected: 2,
+        };
+        let debug_str = format!("{:?}", snap);
+        assert!(
+            debug_str.contains("BocpdTelemetrySnapshot"),
+            "Debug should contain struct name"
+        );
+        assert!(
+            debug_str.contains("observations"),
+            "Debug should contain field name"
+        );
+
+        let cloned = snap.clone();
+        assert_eq!(cloned, snap);
+    }
+
+    #[test]
+    fn telemetry_default_is_zero() {
+        let t = BocpdTelemetry::default();
+        let snap = t.snapshot();
+        assert_eq!(snap.panes_registered, 0);
+        assert_eq!(snap.panes_unregistered, 0);
+        assert_eq!(snap.observations, 0);
+        assert_eq!(snap.change_points_detected, 0);
+    }
+
     // -- Math helpers edge cases -----------------------------------------------
 
     #[test]

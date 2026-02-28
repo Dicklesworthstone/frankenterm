@@ -47,7 +47,8 @@ if ! rch workers probe --all --json >"${RCH_PROBE_LOG}"; then
   log_event "failed" "rch_probe_failed" "RCH_PROBE_FAILED" "preflight>workers_probe" "rch workers probe command failed" "${RCH_PROBE_LOG}"
   exit 1
 fi
-healthy_workers="$(jq '[.data[] | select(.status == "healthy")] | length' "${RCH_PROBE_LOG}")"
+# rch probe has returned both "healthy" and "ok" across versions; accept either
+healthy_workers="$(jq '[.data[] | select(((.status // "") | ascii_downcase) == "healthy" or ((.status // "") | ascii_downcase) == "ok")] | length' "${RCH_PROBE_LOG}")"
 if [[ "${healthy_workers}" -lt 1 ]]; then
   log_event "failed" "rch_workers_unavailable" "RCH_WORKERS_DOWN" "preflight>workers_probe" "no healthy rch workers; refusing local fallback" "${RCH_PROBE_LOG}"
   exit 1
