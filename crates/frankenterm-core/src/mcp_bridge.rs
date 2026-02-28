@@ -4,9 +4,7 @@
 //! preserving behavior and registration order.
 
 mod mcp_bridge_framework {
-    pub use fastmcp::{
-        Server as FrameworkServer, StdioTransport as FrameworkStdioTransport,
-    };
+    pub use fastmcp::{Server as FrameworkServer, StdioTransport as FrameworkStdioTransport};
 }
 
 use super::{
@@ -58,9 +56,9 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
         .tool(FormatAwareToolHandler::new(WaTxRunTool::new(Arc::clone(
             &config,
         ))))
-        .tool(FormatAwareToolHandler::new(WaTxRollbackTool::new(Arc::clone(
-            &config,
-        ))))
+        .tool(FormatAwareToolHandler::new(WaTxRollbackTool::new(
+            Arc::clone(&config),
+        )))
         .tool(FormatAwareToolHandler::new(WaTxShowTool::new(Arc::clone(
             &config,
         ))))

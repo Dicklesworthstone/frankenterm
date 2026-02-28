@@ -22,7 +22,7 @@ use proptest::prelude::*;
 
 use frankenterm_core::kalman_watchdog::{
     AdaptiveHealthReport, AdaptiveWatchdog, AdaptiveWatchdogConfig, ComponentClassification,
-    ComponentTracker, HealthClassification, KalmanFilter,
+    AdaptiveWatchdogTelemetrySnapshot, ComponentTracker, HealthClassification, KalmanFilter,
 };
 use frankenterm_core::watchdog::{Component, HealthStatus};
 
@@ -616,7 +616,7 @@ proptest! {
         current_ms in 10000u64..100000,
     ) {
         let config = AdaptiveWatchdogConfig::default();
-        let watchdog = AdaptiveWatchdog::new(config);
+        let mut watchdog = AdaptiveWatchdog::new(config);
         let report = watchdog.check_health(current_ms);
 
         prop_assert_eq!(report.components.len(), 4,
@@ -655,7 +655,7 @@ proptest! {
         current_ms in 10000u64..100000,
     ) {
         let config = AdaptiveWatchdogConfig::default();
-        let watchdog = AdaptiveWatchdog::new(config);
+        let mut watchdog = AdaptiveWatchdog::new(config);
         let report = watchdog.check_health(current_ms);
 
         // Components should be sorted: Discovery, Capture, Persistence, Maintenance
@@ -859,7 +859,7 @@ proptest! {
         current_ms in 10000u64..100000,
     ) {
         let config = AdaptiveWatchdogConfig::default();
-        let watchdog = AdaptiveWatchdog::new(config.clone());
+        let mut watchdog = AdaptiveWatchdog::new(config.clone());
         let classification = watchdog.classify_component(component, current_ms);
 
         // Known components should always classify to Some(_).
@@ -999,5 +999,333 @@ proptest! {
         prop_assert_eq!(cloned.classification.status, cc.classification.status);
         prop_assert_eq!(cloned.classification.observations, cc.classification.observations);
         prop_assert_eq!(cloned.classification.adaptive_mode, cc.classification.adaptive_mode);
+    }
+}
+
+// =============================================================================
+// 15. Telemetry counter invariants
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// telemetry().observations counts every observe() call.
+    #[test]
+    fn proptest_telemetry_observations_exact(
+        components in prop::collection::vec(arb_component(), 1..30),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        let mut t = 1000u64;
+        for comp in &components {
+            watchdog.observe(*comp, t);
+            t += 1000;
+        }
+
+        let telem = watchdog.telemetry();
+        prop_assert_eq!(
+            telem.snapshot().observations,
+            components.len() as u64,
+            "observations should equal total observe() calls"
+        );
+    }
+
+    /// telemetry().observations_matched counts observe() calls that hit a registered component.
+    /// Default AdaptiveWatchdog has 4 components; all arb_component() values are registered.
+    #[test]
+    fn proptest_telemetry_observations_matched_all_known(
+        components in prop::collection::vec(arb_component(), 1..30),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        let mut t = 1000u64;
+        for comp in &components {
+            watchdog.observe(*comp, t);
+            t += 1000;
+        }
+
+        let snap = watchdog.telemetry().snapshot();
+        // All components in arb_component() are the 4 default-registered ones
+        prop_assert_eq!(
+            snap.observations_matched,
+            snap.observations,
+            "all standard components should match"
+        );
+    }
+
+    /// observations_matched <= observations always holds.
+    #[test]
+    fn proptest_telemetry_matched_lte_observations(
+        components in prop::collection::vec(arb_component(), 1..30),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        let mut t = 1000u64;
+        for comp in &components {
+            watchdog.observe(*comp, t);
+            t += 1000;
+        }
+
+        let snap = watchdog.telemetry().snapshot();
+        prop_assert!(
+            snap.observations_matched <= snap.observations,
+            "matched {} > observations {}",
+            snap.observations_matched, snap.observations
+        );
+    }
+
+    /// telemetry().health_checks counts every check_health() call.
+    #[test]
+    fn proptest_telemetry_health_checks_exact(
+        n_checks in 1u64..20,
+        n_obs in 0usize..10,
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        // Feed some observations first
+        let mut t = 1000u64;
+        for _ in 0..n_obs {
+            watchdog.observe(Component::Discovery, t);
+            t += 1000;
+        }
+
+        // Call check_health n_checks times
+        for _ in 0..n_checks {
+            t += 100;
+            let _ = watchdog.check_health(t);
+        }
+
+        prop_assert_eq!(
+            watchdog.telemetry().snapshot().health_checks,
+            n_checks,
+            "health_checks should equal check_health() calls"
+        );
+    }
+
+    /// telemetry().classifications counts every classify_component() call.
+    #[test]
+    fn proptest_telemetry_classifications_exact(
+        calls in prop::collection::vec(arb_component(), 1..20),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        let mut t = 10000u64;
+        for comp in &calls {
+            let _ = watchdog.classify_component(*comp, t);
+            t += 100;
+        }
+
+        prop_assert_eq!(
+            watchdog.telemetry().snapshot().classifications,
+            calls.len() as u64,
+            "classifications should equal classify_component() calls"
+        );
+    }
+
+    /// telemetry().resets counts every reset() call.
+    #[test]
+    fn proptest_telemetry_resets_exact(
+        n_resets in 1u64..15,
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        for _ in 0..n_resets {
+            watchdog.reset();
+        }
+
+        prop_assert_eq!(
+            watchdog.telemetry().snapshot().resets,
+            n_resets,
+            "resets should equal reset() calls"
+        );
+    }
+
+    /// Status counters from classify_component match the actual statuses returned.
+    #[test]
+    fn proptest_telemetry_status_counters_from_classify(
+        components in prop::collection::vec(arb_component(), 1..20),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        let mut healthy = 0u64;
+        let mut degraded = 0u64;
+        let mut critical = 0u64;
+        let mut hung = 0u64;
+
+        let mut t = 10000u64;
+        for comp in &components {
+            if let Some(c) = watchdog.classify_component(*comp, t) {
+                match c.status {
+                    HealthStatus::Healthy => healthy += 1,
+                    HealthStatus::Degraded => degraded += 1,
+                    HealthStatus::Critical => critical += 1,
+                    HealthStatus::Hung => hung += 1,
+                }
+            }
+            t += 100;
+        }
+
+        let snap = watchdog.telemetry().snapshot();
+        prop_assert_eq!(snap.status_healthy, healthy, "healthy mismatch");
+        prop_assert_eq!(snap.status_degraded, degraded, "degraded mismatch");
+        prop_assert_eq!(snap.status_critical, critical, "critical mismatch");
+        prop_assert_eq!(snap.status_hung, hung, "hung mismatch");
+    }
+
+    /// Status counters from check_health match actual component statuses.
+    #[test]
+    fn proptest_telemetry_status_counters_from_check_health(
+        n_checks in 1usize..5,
+        n_obs in 0usize..10,
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        let mut healthy = 0u64;
+        let mut degraded = 0u64;
+        let mut critical = 0u64;
+        let mut hung = 0u64;
+
+        let mut t = 1000u64;
+        for _ in 0..n_obs {
+            watchdog.observe(Component::Discovery, t);
+            t += 1000;
+        }
+
+        for _ in 0..n_checks {
+            t += 100;
+            let report = watchdog.check_health(t);
+            for comp in &report.components {
+                match comp.classification.status {
+                    HealthStatus::Healthy => healthy += 1,
+                    HealthStatus::Degraded => degraded += 1,
+                    HealthStatus::Critical => critical += 1,
+                    HealthStatus::Hung => hung += 1,
+                }
+            }
+        }
+
+        let snap = watchdog.telemetry().snapshot();
+        prop_assert_eq!(snap.status_healthy, healthy, "healthy mismatch");
+        prop_assert_eq!(snap.status_degraded, degraded, "degraded mismatch");
+        prop_assert_eq!(snap.status_critical, critical, "critical mismatch");
+        prop_assert_eq!(snap.status_hung, hung, "hung mismatch");
+    }
+
+    /// All telemetry counters start at zero.
+    #[test]
+    fn proptest_telemetry_starts_at_zero(config in arb_adaptive_config()) {
+        let watchdog = AdaptiveWatchdog::new(config);
+        let snap = watchdog.telemetry().snapshot();
+
+        prop_assert_eq!(snap.observations, 0);
+        prop_assert_eq!(snap.observations_matched, 0);
+        prop_assert_eq!(snap.health_checks, 0);
+        prop_assert_eq!(snap.classifications, 0);
+        prop_assert_eq!(snap.resets, 0);
+        prop_assert_eq!(snap.status_healthy, 0);
+        prop_assert_eq!(snap.status_degraded, 0);
+        prop_assert_eq!(snap.status_critical, 0);
+        prop_assert_eq!(snap.status_hung, 0);
+    }
+
+    /// Telemetry counters are monotonically non-decreasing across operations.
+    #[test]
+    fn proptest_telemetry_counters_monotonic(
+        ops in prop::collection::vec(0u8..4, 3..30),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        let mut prev = watchdog.telemetry().snapshot();
+        let mut t = 1000u64;
+
+        for op in &ops {
+            match op % 4 {
+                0 => { watchdog.observe(Component::Discovery, t); t += 1000; }
+                1 => { let _ = watchdog.check_health(t); t += 100; }
+                2 => { let _ = watchdog.classify_component(Component::Capture, t); t += 100; }
+                3 => { watchdog.reset(); }
+                _ => unreachable!(),
+            }
+
+            let curr = watchdog.telemetry().snapshot();
+            prop_assert!(curr.observations >= prev.observations, "observations decreased");
+            prop_assert!(curr.observations_matched >= prev.observations_matched, "matched decreased");
+            prop_assert!(curr.health_checks >= prev.health_checks, "health_checks decreased");
+            prop_assert!(curr.classifications >= prev.classifications, "classifications decreased");
+            prop_assert!(curr.resets >= prev.resets, "resets decreased");
+            prop_assert!(curr.status_healthy >= prev.status_healthy, "healthy decreased");
+            prop_assert!(curr.status_degraded >= prev.status_degraded, "degraded decreased");
+            prop_assert!(curr.status_critical >= prev.status_critical, "critical decreased");
+            prop_assert!(curr.status_hung >= prev.status_hung, "hung decreased");
+            prev = curr;
+        }
+    }
+
+    /// Telemetry snapshot serde roundtrip preserves all fields.
+    #[test]
+    fn proptest_telemetry_snapshot_serde_roundtrip(
+        ops in prop::collection::vec(0u8..4, 1..20),
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        let mut t = 1000u64;
+        for op in &ops {
+            match op % 4 {
+                0 => { watchdog.observe(Component::Discovery, t); t += 1000; }
+                1 => { let _ = watchdog.check_health(t); t += 100; }
+                2 => { let _ = watchdog.classify_component(Component::Persistence, t); t += 100; }
+                3 => { watchdog.reset(); }
+                _ => unreachable!(),
+            }
+        }
+
+        let snap = watchdog.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: AdaptiveWatchdogTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, snap, "snapshot serde roundtrip failed");
+    }
+
+    /// Total status counters == number of per-component classifications produced.
+    /// classify_component produces 1 status count per call (if component exists).
+    /// check_health produces 4 status counts per call (one per default component).
+    #[test]
+    fn proptest_telemetry_status_sum_consistent(
+        n_classify in 0usize..10,
+        n_check in 0usize..5,
+    ) {
+        let config = AdaptiveWatchdogConfig::default();
+        let mut watchdog = AdaptiveWatchdog::new(config);
+
+        let mut t = 10000u64;
+        for _ in 0..n_classify {
+            let _ = watchdog.classify_component(Component::Discovery, t);
+            t += 100;
+        }
+        for _ in 0..n_check {
+            let _ = watchdog.check_health(t);
+            t += 100;
+        }
+
+        let snap = watchdog.telemetry().snapshot();
+        let total_statuses = snap.status_healthy + snap.status_degraded
+            + snap.status_critical + snap.status_hung;
+        // classify_component: 1 status per call for registered component
+        // check_health: 4 statuses per call (4 default components)
+        let expected = n_classify as u64 + (n_check as u64 * 4);
+        prop_assert_eq!(
+            total_statuses, expected,
+            "total status counters {} != expected {} (classify={}, check={})",
+            total_statuses, expected, n_classify, n_check
+        );
     }
 }

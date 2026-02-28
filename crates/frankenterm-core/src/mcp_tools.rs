@@ -3209,7 +3209,10 @@ impl ToolHandler for WaMissionExplainTool {
 
         // Build assignment context if requested
         let assignment_context = if let Some(ref aid) = params.assignment_id {
-            let found = mission.assignments.iter().find(|a| a.assignment_id.0 == *aid);
+            let found = mission
+                .assignments
+                .iter()
+                .find(|a| a.assignment_id.0 == *aid);
             found.map(|a| {
                 serde_json::json!({
                     "assignment_id": a.assignment_id.0,
@@ -3273,11 +3276,7 @@ impl ToolHandler for WaMissionPauseTool {
             output_schema: None,
             icon: None,
             version: Some(crate::VERSION.to_string()),
-            tags: vec![
-                "wa".to_string(),
-                "robot".to_string(),
-                "mission".to_string(),
-            ],
+            tags: vec!["wa".to_string(), "robot".to_string(), "mission".to_string()],
             annotations: None,
         }
     }
@@ -3332,23 +3331,19 @@ impl ToolHandler for WaMissionPauseTool {
         };
 
         let requested_at_ms = i64::try_from(now_ms()).unwrap_or(0);
-        let decision = match mission.pause_mission(
-            &params.requested_by,
-            &reason,
-            requested_at_ms,
-            None,
-        ) {
-            Ok(d) => d,
-            Err(err) => {
-                let envelope = McpEnvelope::<()>::error(
-                    MCP_ERR_INVALID_ARGS,
-                    format!("Cannot pause mission: {err}"),
-                    Some("Use wa.mission_explain to see valid transitions.".to_string()),
-                    elapsed_ms(start),
-                );
-                return envelope_to_content(envelope);
-            }
-        };
+        let decision =
+            match mission.pause_mission(&params.requested_by, &reason, requested_at_ms, None) {
+                Ok(d) => d,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Cannot pause mission: {err}"),
+                        Some("Use wa.mission_explain to see valid transitions.".to_string()),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            };
 
         if let Err(err) = mcp_save_mission_to_path(&mission_path, &mission) {
             let envelope =
@@ -3404,11 +3399,7 @@ impl ToolHandler for WaMissionResumeTool {
             output_schema: None,
             icon: None,
             version: Some(crate::VERSION.to_string()),
-            tags: vec![
-                "wa".to_string(),
-                "robot".to_string(),
-                "mission".to_string(),
-            ],
+            tags: vec!["wa".to_string(), "robot".to_string(), "mission".to_string()],
             annotations: None,
         }
     }
@@ -3454,23 +3445,20 @@ impl ToolHandler for WaMissionResumeTool {
         };
 
         let requested_at_ms = i64::try_from(now_ms()).unwrap_or(0);
-        let decision = match mission.resume_mission(
-            &params.requested_by,
-            "mcp_resume",
-            requested_at_ms,
-            None,
-        ) {
-            Ok(d) => d,
-            Err(err) => {
-                let envelope = McpEnvelope::<()>::error(
-                    MCP_ERR_INVALID_ARGS,
-                    format!("Cannot resume mission: {err}"),
-                    Some("Use wa.mission_explain to see valid transitions.".to_string()),
-                    elapsed_ms(start),
-                );
-                return envelope_to_content(envelope);
-            }
-        };
+        let decision =
+            match mission.resume_mission(&params.requested_by, "mcp_resume", requested_at_ms, None)
+            {
+                Ok(d) => d,
+                Err(err) => {
+                    let envelope = McpEnvelope::<()>::error(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("Cannot resume mission: {err}"),
+                        Some("Use wa.mission_explain to see valid transitions.".to_string()),
+                        elapsed_ms(start),
+                    );
+                    return envelope_to_content(envelope);
+                }
+            };
 
         if let Err(err) = mcp_save_mission_to_path(&mission_path, &mission) {
             let envelope =
@@ -3528,11 +3516,7 @@ impl ToolHandler for WaMissionAbortTool {
             output_schema: None,
             icon: None,
             version: Some(crate::VERSION.to_string()),
-            tags: vec![
-                "wa".to_string(),
-                "robot".to_string(),
-                "mission".to_string(),
-            ],
+            tags: vec!["wa".to_string(), "robot".to_string(), "mission".to_string()],
             annotations: None,
         }
     }
