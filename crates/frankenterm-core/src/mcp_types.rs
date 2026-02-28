@@ -2,6 +2,7 @@
 //!
 //! Extracted from `mcp.rs` as part of Wave 4A migration (ft-1fv0u).
 
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 pub(super) const MCP_VERSION: &str = "v1";
@@ -32,7 +33,7 @@ pub(super) struct GetTextParams {
     pub escapes: bool,
 }
 
-fn default_tail() -> usize {
+pub(super) fn default_tail() -> usize {
     500
 }
 
@@ -85,15 +86,15 @@ pub(super) struct CassSearchParams {
     pub timeout_secs: u64,
 }
 
-fn default_cass_limit() -> usize {
+pub(super) fn default_cass_limit() -> usize {
     10
 }
 
-fn default_cass_offset() -> usize {
+pub(super) fn default_cass_offset() -> usize {
     0
 }
 
-fn default_cass_timeout_secs() -> u64 {
+pub(super) fn default_cass_timeout_secs() -> u64 {
     15
 }
 
@@ -107,7 +108,7 @@ pub(super) struct CassViewParams {
     pub timeout_secs: u64,
 }
 
-fn default_cass_context_lines() -> usize {
+pub(super) fn default_cass_context_lines() -> usize {
     10
 }
 
@@ -169,7 +170,7 @@ pub(super) struct EventsParams {
     pub since: Option<i64>,
 }
 
-fn default_events_limit() -> usize {
+pub(super) fn default_events_limit() -> usize {
     20
 }
 
@@ -240,11 +241,11 @@ pub(super) struct WaitForParams {
     pub regex: bool,
 }
 
-fn default_timeout_secs() -> u64 {
+pub(super) fn default_timeout_secs() -> u64 {
     30
 }
 
-fn default_wait_tail() -> usize {
+pub(super) fn default_wait_tail() -> usize {
     200
 }
 
@@ -622,7 +623,7 @@ pub(super) struct ReserveParams {
     pub ttl_ms: i64,
 }
 
-fn default_ttl_ms() -> i64 {
+pub(super) fn default_ttl_ms() -> i64 {
     300_000 // 5 minutes default
 }
 

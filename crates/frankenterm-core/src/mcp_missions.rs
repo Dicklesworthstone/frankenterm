@@ -4,6 +4,7 @@
 //! Contains file I/O, state resolution, assignment aggregation, and
 //! Tx commit/compensation input builders used by the mission/tx tool handlers.
 
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 // ── Tx contract file resolution and loading ─────────────────────────────
