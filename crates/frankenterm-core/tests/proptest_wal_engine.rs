@@ -869,4 +869,220 @@ proptest! {
             prop_assert_eq!(*r, d);
         }
     }
+
+    // =========================================================================
+    // Telemetry counter invariants (ft-3kxe.16)
+    // =========================================================================
+
+    /// Telemetry: appends equals exactly the number of append() calls.
+    #[test]
+    fn telemetry_appends_exact(
+        append_count in 1usize..100,
+    ) {
+        let mut wal = WalEngine::<String>::new(WalConfig::default());
+        for i in 0..append_count {
+            wal.append(format!("m{i}"), i as u64);
+        }
+        let snap = wal.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.appends, append_count as u64,
+            "appends={} != calls={}", snap.appends, append_count
+        );
+    }
+
+    /// Telemetry: checkpoints equals exactly the number of checkpoint() calls.
+    #[test]
+    fn telemetry_checkpoints_exact(
+        ops in arb_wal_ops(),
+    ) {
+        let wal = build_wal(&ops);
+        let expected_cps = ops.iter()
+            .filter(|op| matches!(op, WalOp::Checkpoint(_)))
+            .count() as u64;
+        let snap = wal.telemetry().snapshot();
+        prop_assert_eq!(
+            snap.checkpoints, expected_cps,
+            "checkpoints={} != expected={}", snap.checkpoints, expected_cps
+        );
+    }
+
+    /// Telemetry: compactions and entries_compacted track compact() calls accurately.
+    #[test]
+    fn telemetry_compaction_accurate(
+        append_count in 10usize..80,
+        cp_at in 3usize..9,
+    ) {
+        let retained = 5;
+        let mut wal = WalEngine::<String>::new(WalConfig {
+            compaction_threshold: 5,
+            max_retained_entries: retained,
+        });
+
+        for i in 0..append_count {
+            if i == cp_at {
+                wal.checkpoint(i as u64);
+            } else {
+                wal.append(format!("m{i}"), i as u64);
+            }
+        }
+
+        let entries_before = wal.len();
+        let removed = wal.compact();
+        let snap = wal.telemetry().snapshot();
+
+        if removed > 0 {
+            prop_assert_eq!(snap.compactions, 1, "compactions should be 1");
+            prop_assert_eq!(
+                snap.entries_compacted, removed as u64,
+                "entries_compacted={} != removed={}", snap.entries_compacted, removed
+            );
+            // Sanity: entries_before = entries_after + removed (plus 1 for compaction marker)
+            prop_assert_eq!(
+                entries_before, wal.len() + removed - 1,
+                "entry count mismatch"
+            );
+        } else {
+            prop_assert_eq!(snap.compactions, 0);
+            prop_assert_eq!(snap.entries_compacted, 0);
+        }
+    }
+
+    /// Telemetry: truncations and entries_truncated track truncate_after() calls.
+    #[test]
+    fn telemetry_truncation_accurate(
+        append_count in 5usize..50,
+        trunc_at_pct in 10u64..90,
+    ) {
+        let mut wal = WalEngine::<String>::new(WalConfig::default());
+        for i in 0..append_count {
+            wal.append(format!("m{i}"), i as u64);
+        }
+
+        let last = wal.last_seq();
+        let trunc_seq = 1 + (last - 1) * trunc_at_pct / 100;
+        let entries_before = wal.len();
+        wal.truncate_after(trunc_seq);
+        let entries_after = wal.len();
+        let removed = entries_before - entries_after;
+
+        let snap = wal.telemetry().snapshot();
+        if removed > 0 {
+            prop_assert_eq!(snap.truncations, 1);
+            prop_assert_eq!(
+                snap.entries_truncated, removed as u64,
+                "entries_truncated={} != removed={}", snap.entries_truncated, removed
+            );
+        } else {
+            prop_assert_eq!(snap.truncations, 0);
+            prop_assert_eq!(snap.entries_truncated, 0);
+        }
+    }
+
+    /// Telemetry: counters start at zero on a fresh engine.
+    #[test]
+    fn telemetry_starts_at_zero(_dummy in 0u8..1) {
+        let wal = WalEngine::<String>::new(WalConfig::default());
+        let snap = wal.telemetry().snapshot();
+        prop_assert_eq!(snap.appends, 0);
+        prop_assert_eq!(snap.checkpoints, 0);
+        prop_assert_eq!(snap.compactions, 0);
+        prop_assert_eq!(snap.entries_compacted, 0);
+        prop_assert_eq!(snap.truncations, 0);
+        prop_assert_eq!(snap.entries_truncated, 0);
+    }
+
+    /// Telemetry: counters are monotonically non-decreasing across mixed operations.
+    #[test]
+    fn telemetry_counters_monotonic(
+        ops in prop::collection::vec(
+            prop_oneof![
+                ("[a-z]{1,5}", 0..1000u64).prop_map(|(s, t)| (0u8, s, t)),
+                (0..1000u64).prop_map(|t| (1u8, String::new(), t)),
+                Just((2u8, String::new(), 0)),
+                (1..50u64).prop_map(|s| (3u8, String::new(), s)),
+            ],
+            5..40
+        ),
+    ) {
+        let mut wal = WalEngine::<String>::new(WalConfig {
+            compaction_threshold: 5,
+            max_retained_entries: 3,
+        });
+        let mut prev = wal.telemetry().snapshot();
+
+        for (op, data, ts) in &ops {
+            match op {
+                0 => { wal.append(data.clone(), *ts); }
+                1 => { wal.checkpoint(*ts); }
+                2 => { wal.compact(); }
+                _ => {
+                    if wal.last_seq() > 0 {
+                        let trunc_to = (*ts).min(wal.last_seq());
+                        wal.truncate_after(trunc_to);
+                    }
+                }
+            }
+
+            let snap = wal.telemetry().snapshot();
+            prop_assert!(snap.appends >= prev.appends, "appends decreased");
+            prop_assert!(snap.checkpoints >= prev.checkpoints, "checkpoints decreased");
+            prop_assert!(snap.compactions >= prev.compactions, "compactions decreased");
+            prop_assert!(snap.entries_compacted >= prev.entries_compacted,
+                "entries_compacted decreased");
+            prop_assert!(snap.truncations >= prev.truncations, "truncations decreased");
+            prop_assert!(snap.entries_truncated >= prev.entries_truncated,
+                "entries_truncated decreased");
+            prev = snap;
+        }
+    }
+
+    /// Telemetry: cross-counter invariant — entries_compacted <= total entries ever appended.
+    #[test]
+    fn telemetry_compacted_lte_total(
+        ops in arb_wal_ops(),
+    ) {
+        let config = WalConfig {
+            compaction_threshold: 5,
+            max_retained_entries: 3,
+        };
+        let mut wal = WalEngine::<String>::new(config);
+        for op in &ops {
+            match op {
+                WalOp::Append(s, t) => { wal.append(s.clone(), *t); }
+                WalOp::Checkpoint(t) => { wal.checkpoint(*t); }
+            }
+        }
+        wal.compact();
+
+        let snap = wal.telemetry().snapshot();
+        let total_entries = snap.appends + snap.checkpoints;
+        prop_assert!(
+            snap.entries_compacted <= total_entries,
+            "entries_compacted={} > total={}", snap.entries_compacted, total_entries
+        );
+    }
+
+    /// Telemetry: snapshot survives JSON serde roundtrip.
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip(
+        appends in 0u64..10000,
+        checkpoints in 0u64..500,
+        compactions in 0u64..100,
+        entries_compacted in 0u64..10000,
+        truncations in 0u64..200,
+        entries_truncated in 0u64..5000,
+    ) {
+        let snap = WalTelemetrySnapshot {
+            appends,
+            checkpoints,
+            compactions,
+            entries_compacted,
+            truncations,
+            entries_truncated,
+        };
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored: WalTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(restored, snap);
+    }
 }
