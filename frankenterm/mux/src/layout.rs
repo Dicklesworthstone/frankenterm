@@ -46,18 +46,16 @@ pub enum LayoutArrangement {
     /// A single slot that holds one or more panes.
     /// If `is_main` is true, the currently focused pane is placed here
     /// during redistribution.
-    Slot {
-        is_main: bool,
-    },
+    Slot { is_main: bool },
 }
 
 impl LayoutArrangement {
     /// Count the number of leaf slots in this arrangement.
     pub fn slot_count(&self) -> usize {
         match self {
-            LayoutArrangement::Split {
-                first, second, ..
-            } => first.slot_count() + second.slot_count(),
+            LayoutArrangement::Split { first, second, .. } => {
+                first.slot_count() + second.slot_count()
+            }
             LayoutArrangement::Slot { .. } => 1,
         }
     }
@@ -65,9 +63,9 @@ impl LayoutArrangement {
     /// Returns true if any slot has `is_main` set.
     pub fn has_main_slot(&self) -> bool {
         match self {
-            LayoutArrangement::Split {
-                first, second, ..
-            } => first.has_main_slot() || second.has_main_slot(),
+            LayoutArrangement::Split { first, second, .. } => {
+                first.has_main_slot() || second.has_main_slot()
+            }
             LayoutArrangement::Slot { is_main } => *is_main,
         }
     }
@@ -205,7 +203,10 @@ pub struct LayoutCycle {
 impl LayoutCycle {
     /// Create a new cycle from a non-empty list of layouts.
     pub fn new(layouts: Vec<SwapLayout>) -> Self {
-        assert!(!layouts.is_empty(), "LayoutCycle requires at least one layout");
+        assert!(
+            !layouts.is_empty(),
+            "LayoutCycle requires at least one layout"
+        );
         Self {
             layouts,
             current: 0,
@@ -381,9 +382,7 @@ fn assign_slot_indices(
     main_idx: &mut Option<usize>,
 ) {
     match arrangement {
-        LayoutArrangement::Split {
-            first, second, ..
-        } => {
+        LayoutArrangement::Split { first, second, .. } => {
             assign_slot_indices(first, counter, main_idx);
             assign_slot_indices(second, counter, main_idx);
         }
@@ -414,8 +413,7 @@ fn build_tree_from_arrangement(
             first,
             second,
         } => {
-            let (first_size, second_size) =
-                compute_split_sizes(*direction, *ratio, available_size);
+            let (first_size, second_size) = compute_split_sizes(*direction, *ratio, available_size);
 
             let left = build_tree_from_arrangement(
                 first,
@@ -690,8 +688,7 @@ mod tests {
             pixel_height: 0,
             dpi: 96,
         };
-        let (first, second) =
-            compute_split_sizes(SplitDirection::Horizontal, 0.5, size);
+        let (first, second) = compute_split_sizes(SplitDirection::Horizontal, 0.5, size);
         // 80 - 1 separator = 79 total cols; 50% = 40 first, 39 second
         assert_eq!(first.cols + second.cols + 1, 80);
         assert_eq!(first.rows, 24);
@@ -707,8 +704,7 @@ mod tests {
             pixel_height: 0,
             dpi: 96,
         };
-        let (first, second) =
-            compute_split_sizes(SplitDirection::Vertical, 0.5, size);
+        let (first, second) = compute_split_sizes(SplitDirection::Vertical, 0.5, size);
         // 24 - 1 separator = 23 total rows; 50% = 12 first, 11 second
         assert_eq!(first.rows + second.rows + 1, 24);
         assert_eq!(first.cols, 80);
@@ -725,13 +721,11 @@ mod tests {
             dpi: 96,
         };
         // Extreme ratio should be clamped to 0.05-0.95.
-        let (first, second) =
-            compute_split_sizes(SplitDirection::Horizontal, 0.0, size);
+        let (first, second) = compute_split_sizes(SplitDirection::Horizontal, 0.0, size);
         assert!(first.cols >= 1);
         assert!(second.cols >= 1);
 
-        let (first, second) =
-            compute_split_sizes(SplitDirection::Horizontal, 1.0, size);
+        let (first, second) = compute_split_sizes(SplitDirection::Horizontal, 1.0, size);
         assert!(first.cols >= 1);
         assert!(second.cols >= 1);
     }

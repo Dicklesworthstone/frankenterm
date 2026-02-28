@@ -131,8 +131,7 @@ fn snapshot_serde_roundtrip() {
         samples_with_pressure: 25,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: MemoryBudgetTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: MemoryBudgetTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 

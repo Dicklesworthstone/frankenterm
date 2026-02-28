@@ -67,23 +67,25 @@ fn arb_valid_search_input() -> impl Strategy<Value = SearchQueryInput> {
         proptest::option::of(arb_search_mode()),
         proptest::option::of(proptest::bool::ANY),
     )
-        .prop_map(|(query, limit, pane, since, until, snippets, mode, explain)| {
-            // Ensure since <= until when both are present
-            let (since, until) = match (since, until) {
-                (Some(s), Some(u)) if s > u => (Some(u), Some(s)),
-                other => other,
-            };
-            SearchQueryInput {
-                query,
-                limit,
-                pane,
-                since,
-                until,
-                snippets,
-                mode,
-                explain,
-            }
-        })
+        .prop_map(
+            |(query, limit, pane, since, until, snippets, mode, explain)| {
+                // Ensure since <= until when both are present
+                let (since, until) = match (since, until) {
+                    (Some(s), Some(u)) if s > u => (Some(u), Some(s)),
+                    other => other,
+                };
+                SearchQueryInput {
+                    query,
+                    limit,
+                    pane,
+                    since,
+                    until,
+                    snippets,
+                    mode,
+                    explain,
+                }
+            },
+        )
 }
 
 fn arb_unified_search_query() -> impl Strategy<Value = UnifiedSearchQuery> {
@@ -97,22 +99,24 @@ fn arb_unified_search_query() -> impl Strategy<Value = UnifiedSearchQuery> {
         arb_search_mode(),
         proptest::bool::ANY,
     )
-        .prop_map(|(query, limit, pane, since, until, snippets, mode, explain)| {
-            let (since, until) = match (since, until) {
-                (Some(s), Some(u)) if s > u => (Some(u), Some(s)),
-                other => other,
-            };
-            UnifiedSearchQuery {
-                query,
-                limit,
-                pane,
-                since,
-                until,
-                snippets,
-                mode,
-                explain,
-            }
-        })
+        .prop_map(
+            |(query, limit, pane, since, until, snippets, mode, explain)| {
+                let (since, until) = match (since, until) {
+                    (Some(s), Some(u)) if s > u => (Some(u), Some(s)),
+                    other => other,
+                };
+                UnifiedSearchQuery {
+                    query,
+                    limit,
+                    pane,
+                    since,
+                    until,
+                    snippets,
+                    mode,
+                    explain,
+                }
+            },
+        )
 }
 
 // ── Parse validation invariants ───────────────────────────────────────

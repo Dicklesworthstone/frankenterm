@@ -45,15 +45,16 @@ impl PlannerFeatureVector {
     /// Composite score with caller-supplied weights.
     #[must_use]
     pub fn composite_score_with_weights(&self, w: &PlannerWeights) -> f64 {
-        let raw = w
-            .confidence
-            .mul_add(self.confidence, w.fit.mul_add(
+        let raw = w.confidence.mul_add(
+            self.confidence,
+            w.fit.mul_add(
                 self.fit,
                 w.risk.mul_add(
                     1.0 - self.risk, // invert: low risk is good
                     w.impact.mul_add(self.impact, w.urgency * self.urgency),
                 ),
-            ));
+            ),
+        );
         raw.clamp(0.0, 1.0)
     }
 }
@@ -294,9 +295,10 @@ fn extract_urgency(
         .map(|h| (h / config.max_staleness_hours).min(1.0))
         .unwrap_or(0.0);
 
-    let urgency = config
-        .urgency_priority_weight
-        .mul_add(priority_norm, config.urgency_staleness_weight * staleness_norm);
+    let urgency = config.urgency_priority_weight.mul_add(
+        priority_norm,
+        config.urgency_staleness_weight * staleness_norm,
+    );
     urgency.clamp(0.0, 1.0)
 }
 
@@ -885,9 +887,7 @@ pub fn explain_decisions(
             .iter()
             .find(|s| s.bead_id == rejected.bead_id);
 
-        let mut factors = scored
-            .map(build_factors_for_scored)
-            .unwrap_or_default();
+        let mut factors = scored.map(build_factors_for_scored).unwrap_or_default();
 
         for reason in &rejected.reasons {
             factors.push(ExplanationFactor {

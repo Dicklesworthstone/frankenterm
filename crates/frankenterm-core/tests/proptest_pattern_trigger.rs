@@ -5,9 +5,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::pattern_trigger::{
-    TriggerCategory, TriggerPattern, TriggerScanner,
-};
+use frankenterm_core::pattern_trigger::{TriggerCategory, TriggerPattern, TriggerScanner};
 
 // =============================================================================
 // Strategies

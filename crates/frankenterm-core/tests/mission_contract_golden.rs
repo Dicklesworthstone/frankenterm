@@ -26,13 +26,12 @@
 
 use std::collections::HashMap;
 
-use frankenterm_core::mission_loop::{
-    MissionLoop, MissionLoopConfig, MissionLoopState, MissionTrigger,
-    OperatorOverride, OperatorOverrideKind, OperatorOverrideState,
-    OperatorStatusReport, OverrideApplicationSummary, PinnedAssignmentRecord,
-    ReprioritizedBeadRecord,
-};
 use frankenterm_core::beads_types::{BeadIssueDetail, BeadIssueType, BeadStatus};
+use frankenterm_core::mission_loop::{
+    MissionLoop, MissionLoopConfig, MissionLoopState, MissionTrigger, OperatorOverride,
+    OperatorOverrideKind, OperatorOverrideState, OperatorStatusReport, OverrideApplicationSummary,
+    PinnedAssignmentRecord, ReprioritizedBeadRecord,
+};
 use frankenterm_core::plan::{MissionAgentAvailability, MissionAgentCapabilityProfile};
 use frankenterm_core::planner_features::{
     Assignment, AssignmentSet, PlannerExtractionContext, RejectedCandidate, RejectionReason,
@@ -77,7 +76,10 @@ fn contract_mission_trigger_cadence_tick_serde() {
     let json = serde_json::to_string(&trigger).expect("serialize");
     let back: MissionTrigger = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(trigger, back);
-    assert!(json.contains("cadence_tick"), "expected snake_case variant name");
+    assert!(
+        json.contains("cadence_tick"),
+        "expected snake_case variant name"
+    );
 }
 
 #[test]
@@ -154,7 +156,10 @@ fn contract_mission_loop_config_serde_roundtrip() {
 #[test]
 fn contract_solver_config_defaults() {
     let config = SolverConfig::default();
-    assert!((config.min_score - 0.05).abs() < f64::EPSILON, "min_score default = 0.05");
+    assert!(
+        (config.min_score - 0.05).abs() < f64::EPSILON,
+        "min_score default = 0.05"
+    );
     assert_eq!(config.max_assignments, 10, "max_assignments default = 10");
     assert!(config.safety_gates.is_empty());
     assert!(config.conflicts.is_empty());
@@ -628,7 +633,9 @@ fn golden_mission_decision_json_shape() {
     assert!(aset.contains_key("solver_config"));
 
     // Extraction summary sub-fields.
-    let ext = obj["extraction_summary"].as_object().expect("extraction_summary");
+    let ext = obj["extraction_summary"]
+        .as_object()
+        .expect("extraction_summary");
     assert!(ext.contains_key("total_candidates"));
     assert!(ext.contains_key("ready_candidates"));
 
@@ -656,7 +663,10 @@ fn contract_determinism_decision_repeat() {
 
     let j1 = serde_json::to_string(&d1).expect("j1");
     let j2 = serde_json::to_string(&d2).expect("j2");
-    assert_eq!(j1, j2, "decisions must be deterministic for identical inputs");
+    assert_eq!(
+        j1, j2,
+        "decisions must be deterministic for identical inputs"
+    );
 }
 
 #[test]
@@ -704,7 +714,10 @@ fn contract_apply_override_rejects_duplicate_id() {
             },
         ))
         .unwrap_err();
-    assert!(err.contains("already active"), "error should mention 'already active'");
+    assert!(
+        err.contains("already active"),
+        "error should mention 'already active'"
+    );
 }
 
 #[test]

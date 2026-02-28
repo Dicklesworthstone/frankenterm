@@ -27,10 +27,9 @@ use crate::event_id::{RecorderMergeKey, StreamKind, generate_event_id_v1};
 use crate::ingest::CapturedSegment;
 use crate::recording::{
     EgressEvent, EgressTap, GlobalSequence, IngressEvent, IngressOutcome, IngressTap,
-    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
-    RecorderControlMarkerType, RecorderEventSource, RecorderLifecyclePhase,
-    RecorderRedactionLevel, RecorderTextEncoding,
-    captured_kind_to_segment, epoch_ms_now,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+    RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderLifecyclePhase,
+    RecorderRedactionLevel, RecorderTextEncoding, captured_kind_to_segment, epoch_ms_now,
 };
 
 // ---------------------------------------------------------------------------

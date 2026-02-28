@@ -177,8 +177,7 @@ fn snapshot_serde_roundtrip() {
         requests_rejected: 25,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: CircuitBreakerTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: CircuitBreakerTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 

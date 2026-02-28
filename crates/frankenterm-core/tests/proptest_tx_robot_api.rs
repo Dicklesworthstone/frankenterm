@@ -5,8 +5,8 @@ use proptest::prelude::*;
 use frankenterm_core::robot_types::{
     RobotResponse, TxBundleClassification, TxChainVerificationData, TxCompensatingActionData,
     TxCompensationKind, TxPhaseState, TxPlanData, TxPreconditionData, TxPreconditionKind,
-    TxResumeData, TxResumeRecommendation, TxRiskSummaryData, TxRollbackData,
-    TxRunData, TxShowData, TxStepData, TxStepOutcome, TxStepRecordData, TxStepRisk,
+    TxResumeData, TxResumeRecommendation, TxRiskSummaryData, TxRollbackData, TxRunData, TxShowData,
+    TxStepData, TxStepOutcome, TxStepRecordData, TxStepRisk,
 };
 
 // ---------------------------------------------------------------------------
@@ -98,12 +98,14 @@ fn arb_chain_verification() -> impl Strategy<Value = TxChainVerificationData> {
         proptest::collection::vec(0..100u64, 0..3),
         0..50usize,
     )
-        .prop_map(|(intact, first_break, missing, total)| TxChainVerificationData {
-            chain_intact: intact,
-            first_break_at: first_break,
-            missing_ordinals: missing,
-            total_records: total,
-        })
+        .prop_map(
+            |(intact, first_break, missing, total)| TxChainVerificationData {
+                chain_intact: intact,
+                first_break_at: first_break,
+                missing_ordinals: missing,
+                total_records: total,
+            },
+        )
 }
 
 fn arb_step_record() -> impl Strategy<Value = TxStepRecordData> {

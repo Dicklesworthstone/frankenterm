@@ -1,8 +1,8 @@
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::storage::mmap_store::{
-    build_offsets_from_lengths, page_align_down, MmapScrollbackStore, MmapStoreConfig,
+    MmapScrollbackStore, MmapStoreConfig, build_offsets_from_lengths, page_align_down,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::hint::black_box;
 use std::path::Path;
 

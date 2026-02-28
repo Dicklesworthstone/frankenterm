@@ -48,16 +48,14 @@ fn arb_redaction_policy() -> impl Strategy<Value = CaptureRedactionPolicy> {
         1..=365u64,
         1..=365u64,
     )
-        .prop_map(
-            |(enabled, mode, t1, t2, t3)| CaptureRedactionPolicy {
-                enabled,
-                mode,
-                t1_retention_days: t1,
-                t2_retention_days: t2,
-                t3_retention_days: t3,
-                custom_patterns: Vec::new(),
-            },
-        )
+        .prop_map(|(enabled, mode, t1, t2, t3)| CaptureRedactionPolicy {
+            enabled,
+            mode,
+            t1_retention_days: t1,
+            t2_retention_days: t2,
+            t3_retention_days: t3,
+            custom_patterns: Vec::new(),
+        })
 }
 
 fn arb_decision_event() -> impl Strategy<Value = DecisionEvent> {
@@ -72,7 +70,16 @@ fn arb_decision_event() -> impl Strategy<Value = DecisionEvent> {
         1..=100u64,
     )
         .prop_map(
-            |(decision_type, rule_id, definition_text, input_text, parent_event_id, confidence, timestamp_ms, pane_id)| {
+            |(
+                decision_type,
+                rule_id,
+                definition_text,
+                input_text,
+                parent_event_id,
+                confidence,
+                timestamp_ms,
+                pane_id,
+            )| {
                 DecisionEvent::new(
                     decision_type,
                     pane_id,

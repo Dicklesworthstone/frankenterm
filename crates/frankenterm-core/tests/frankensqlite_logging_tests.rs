@@ -675,10 +675,7 @@ fn test_rollback_no_trigger_logs_info() {
 
     let events = captured.lock().unwrap();
     let has_info = events.iter().any(|e| e.level == Level::INFO);
-    assert!(
-        has_info,
-        "no-trigger classifier should log at info level"
-    );
+    assert!(has_info, "no-trigger classifier should log at info level");
 }
 
 #[test]
@@ -694,10 +691,7 @@ fn test_rollback_trigger_logs_warn() {
 
     let events = captured.lock().unwrap();
     let has_warn = events.iter().any(|e| e.level == Level::WARN);
-    assert!(
-        has_warn,
-        "triggered rollback should log at warn level"
-    );
+    assert!(has_warn, "triggered rollback should log at warn level");
 }
 
 // ===========================================================================
@@ -795,15 +789,13 @@ fn test_events_with_field_filters_correctly() {
             level: Level::INFO,
             target: "test".to_string(),
             message: "msg".to_string(),
-            fields: std::iter::once(("key1".to_string(), "val1".to_string()))
-                .collect(),
+            fields: std::iter::once(("key1".to_string(), "val1".to_string())).collect(),
         },
         CapturedEvent {
             level: Level::INFO,
             target: "test".to_string(),
             message: "msg".to_string(),
-            fields: std::iter::once(("key2".to_string(), "val2".to_string()))
-                .collect(),
+            fields: std::iter::once(("key2".to_string(), "val2".to_string())).collect(),
         },
     ];
 
@@ -818,15 +810,13 @@ fn test_events_with_field_value_filters_correctly() {
             level: Level::INFO,
             target: "test".to_string(),
             message: "msg".to_string(),
-            fields: std::iter::once(("stage".to_string(), "M0".to_string()))
-                .collect(),
+            fields: std::iter::once(("stage".to_string(), "M0".to_string())).collect(),
         },
         CapturedEvent {
             level: Level::INFO,
             target: "test".to_string(),
             message: "msg".to_string(),
-            fields: std::iter::once(("stage".to_string(), "M1".to_string()))
-                .collect(),
+            fields: std::iter::once(("stage".to_string(), "M1".to_string())).collect(),
         },
     ];
 
@@ -1000,10 +990,7 @@ fn test_bootstrap_logs_at_info_level() {
 
     let events = captured.lock().unwrap();
     let has_info = events.iter().any(|e| e.level == Level::INFO);
-    assert!(
-        has_info,
-        "bootstrap should log at INFO level"
-    );
+    assert!(has_info, "bootstrap should log at INFO level");
 }
 
 #[test]

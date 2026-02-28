@@ -419,7 +419,10 @@ fn metrics_latency_recorded() {
 
     let latest = ml.latest_metrics().unwrap();
     // Latency should be >= 0 (nanosecond precision means it could be 0)
-    assert!(latest.evaluation_latency_ms < 10_000, "Latency sanity check");
+    assert!(
+        latest.evaluation_latency_ms < 10_000,
+        "Latency sanity check"
+    );
 }
 
 #[test]
@@ -539,10 +542,7 @@ fn report_json_stable_schema() {
         "planner_churn_rate",
         "policy_deny_rate",
     ] {
-        assert!(
-            health.get(field).is_some(),
-            "Missing health field: {field}"
-        );
+        assert!(health.get(field).is_some(), "Missing health field: {field}");
     }
 }
 

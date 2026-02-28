@@ -1690,8 +1690,7 @@ mod tests {
             evictions: 30,
         };
         let json = serde_json::to_string(&snap).unwrap();
-        let back: CompletionTrackerTelemetrySnapshot =
-            serde_json::from_str(&json).unwrap();
+        let back: CompletionTrackerTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
     }
 

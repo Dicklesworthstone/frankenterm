@@ -128,13 +128,11 @@ fn adv_01_envelope_at_exact_cap_allows_all() {
     // With 3 beads, 3 agents, and cap=3, all should pass.
     assert_eq!(decision.assignment_set.assignment_count(), 3);
     // No envelope rejections.
-    assert!(
-        !decision.assignment_set.rejected.iter().any(|r| {
-            r.reasons
-                .iter()
-                .any(|reason| matches!(reason, RejectionReason::SafetyGateDenied { .. }))
-        })
-    );
+    assert!(!decision.assignment_set.rejected.iter().any(|r| {
+        r.reasons
+            .iter()
+            .any(|reason| matches!(reason, RejectionReason::SafetyGateDenied { .. }))
+    }));
 }
 
 // ── ADV-02: Safety envelope — one over cap rejects exactly one ──────────────
@@ -537,19 +535,15 @@ fn adv_12_mixed_risky_non_risky_independent_caps() {
     // Max total = 5, max risky = 1.
     // 2 safe + 1 risky = 3 assigned, 1 risky rejected.
     assert!(decision.assignment_set.assignment_count() <= 3);
-    let has_risky_rejections = decision
-        .assignment_set
-        .rejected
-        .iter()
-        .any(|r| {
-            r.reasons.iter().any(|reason| {
-                matches!(
-                    reason,
-                    RejectionReason::SafetyGateDenied { gate_name }
-                    if gate_name == "mission.envelope.max_risky_assignments_per_cycle"
-                )
-            })
-        });
+    let has_risky_rejections = decision.assignment_set.rejected.iter().any(|r| {
+        r.reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                RejectionReason::SafetyGateDenied { gate_name }
+                if gate_name == "mission.envelope.max_risky_assignments_per_cycle"
+            )
+        })
+    });
     assert!(has_risky_rejections);
 }
 

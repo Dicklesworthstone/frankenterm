@@ -1,8 +1,8 @@
 //! Property tests for mmap scrollback offset/index helpers and store operations.
 
 use frankenterm_core::storage::mmap_store::{
-    build_offsets_from_lengths, page_align_down, LineOffset, MmapScrollbackStore, MmapStoreConfig,
-    PaneStorageMode,
+    LineOffset, MmapScrollbackStore, MmapStoreConfig, PaneStorageMode, build_offsets_from_lengths,
+    page_align_down,
 };
 use proptest::prelude::*;
 

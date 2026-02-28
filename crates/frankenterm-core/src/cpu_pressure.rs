@@ -226,10 +226,14 @@ impl CpuPressureMonitor {
                 self.telemetry.green_samples.fetch_add(1, Ordering::Relaxed);
             }
             CpuPressureTier::Yellow => {
-                self.telemetry.yellow_samples.fetch_add(1, Ordering::Relaxed);
+                self.telemetry
+                    .yellow_samples
+                    .fetch_add(1, Ordering::Relaxed);
             }
             CpuPressureTier::Orange => {
-                self.telemetry.orange_samples.fetch_add(1, Ordering::Relaxed);
+                self.telemetry
+                    .orange_samples
+                    .fetch_add(1, Ordering::Relaxed);
             }
             CpuPressureTier::Red => {
                 self.telemetry.red_samples.fetch_add(1, Ordering::Relaxed);

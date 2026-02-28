@@ -270,8 +270,7 @@ impl ContentIndexingPipeline {
         let mut all_docs: Vec<IndexableDocument> = Vec::new();
 
         // Process each pane up to the per-tick pane limit.
-        for (pane_id, session_id, lines) in
-            pane_content.iter().take(self.config.max_panes_per_tick)
+        for (pane_id, session_id, lines) in pane_content.iter().take(self.config.max_panes_per_tick)
         {
             let watermark_ms = self
                 .watermarks
@@ -291,7 +290,10 @@ impl ContentIndexingPipeline {
                 continue;
             }
 
-            let was_truncated = lines.iter().filter(|l| l.captured_at_ms > watermark_ms).count()
+            let was_truncated = lines
+                .iter()
+                .filter(|l| l.captured_at_ms > watermark_ms)
+                .count()
                 > self.config.max_lines_per_pane_tick;
             if was_truncated {
                 report.panes_truncated += 1;
@@ -311,8 +313,7 @@ impl ContentIndexingPipeline {
                 .collect();
 
             // Extract documents using multiple strategies.
-            let scrollback_docs =
-                chunk_scrollback_lines(&annotated, self.config.scrollback_gap_ms);
+            let scrollback_docs = chunk_scrollback_lines(&annotated, self.config.scrollback_gap_ms);
             let command_docs =
                 extract_command_output_blocks(&annotated, &self.config.command_block_config);
 
@@ -321,8 +322,11 @@ impl ContentIndexingPipeline {
 
             // Extract agent artifacts from the combined text.
             if self.config.extract_artifacts {
-                let combined_text: String =
-                    annotated.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+                let combined_text: String = annotated
+                    .iter()
+                    .map(|l| l.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let max_ts = annotated
                     .iter()
                     .map(|l| l.captured_at_ms)
@@ -343,12 +347,15 @@ impl ContentIndexingPipeline {
                 .map(|l| l.captured_at_ms)
                 .max()
                 .unwrap_or(watermark_ms);
-            let entry = self.watermarks.entry(*pane_id).or_insert_with(|| PaneWatermark {
-                pane_id: *pane_id,
-                last_indexed_at_ms: i64::MIN,
-                total_docs_indexed: 0,
-                session_id: session_id.clone(),
-            });
+            let entry = self
+                .watermarks
+                .entry(*pane_id)
+                .or_insert_with(|| PaneWatermark {
+                    pane_id: *pane_id,
+                    last_indexed_at_ms: i64::MIN,
+                    total_docs_indexed: 0,
+                    session_id: session_id.clone(),
+                });
             if max_processed_ts > entry.last_indexed_at_ms {
                 entry.last_indexed_at_ms = max_processed_ts;
             }
@@ -357,10 +364,12 @@ impl ContentIndexingPipeline {
 
         // Ingest all extracted documents into the search index.
         if !all_docs.is_empty() {
-            let ingest_report = match self
-                .index
-                .ingest_documents(&all_docs, now_ms, resize_storm_active, cass_hashes)
-            {
+            let ingest_report = match self.index.ingest_documents(
+                &all_docs,
+                now_ms,
+                resize_storm_active,
+                cass_hashes,
+            ) {
                 Ok(r) => r,
                 Err(_) => {
                     // On ingest error, return partial report with what we have so far.
@@ -696,13 +705,7 @@ mod tests {
         let mut pipeline = ContentIndexingPipeline::new(config, index);
 
         let panes: Vec<(u64, Option<String>, Vec<ScrollbackLine>)> = (0..5)
-            .map(|i| {
-                (
-                    i as u64,
-                    None,
-                    make_lines(&["content"], 1000 + i * 100, 10),
-                )
-            })
+            .map(|i| (i as u64, None, make_lines(&["content"], 1000 + i * 100, 10)))
             .collect();
 
         let report = pipeline.tick(&panes, 2000, false, None);

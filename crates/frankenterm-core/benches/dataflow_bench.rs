@@ -7,7 +7,7 @@
 //! - `bench_200_node_graph`: < 200us
 //! - `bench_concurrent_updates`: < 100us total
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use frankenterm_core::dataflow::{DataflowGraph, NodeId, Value};
 use std::hint::black_box;
 

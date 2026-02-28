@@ -9,8 +9,7 @@
 use std::collections::BTreeSet;
 
 use frankenterm_core::cancellation_safe_channel::{
-    tx_channel, ChannelMetadata, ReserveGuard, TxChannelError, TxChannelMetrics,
-    TxChannelRegistry,
+    ChannelMetadata, ReserveGuard, TxChannelError, TxChannelMetrics, TxChannelRegistry, tx_channel,
 };
 use proptest::prelude::*;
 
@@ -47,13 +46,15 @@ fn arb_channel_metadata() -> impl Strategy<Value = ChannelMetadata> {
         0..=1_000_000i64,
         "[a-z ]{5,30}",
     )
-        .prop_map(|(channel_id, name, capacity, created_at_ms, purpose)| ChannelMetadata {
-            channel_id,
-            name,
-            capacity,
-            created_at_ms,
-            purpose,
-        })
+        .prop_map(
+            |(channel_id, name, capacity, created_at_ms, purpose)| ChannelMetadata {
+                channel_id,
+                name,
+                capacity,
+                created_at_ms,
+                purpose,
+            },
+        )
 }
 
 fn arb_error() -> impl Strategy<Value = TxChannelError> {

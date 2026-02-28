@@ -919,12 +919,12 @@ mod tests {
     #[test]
     fn telemetry_combined_operations() {
         let mut b = TokenBucket::with_time(5.0, 2.0, 0);
-        b.try_acquire(3, 0);           // granted, no refill (t=0)
-        b.try_acquire(3, 0);           // denied (only 2 left), no refill
-        b.set_refill_rate(10.0);       // rate change
-        b.try_acquire(1, 1000);        // granted, refill at t=1000
-        b.reset(2000);                 // reset
-        b.try_acquire(5, 2000);        // granted, no refill (same t)
+        b.try_acquire(3, 0); // granted, no refill (t=0)
+        b.try_acquire(3, 0); // denied (only 2 left), no refill
+        b.set_refill_rate(10.0); // rate change
+        b.try_acquire(1, 1000); // granted, refill at t=1000
+        b.reset(2000); // reset
+        b.try_acquire(5, 2000); // granted, no refill (same t)
         let t = b.telemetry();
         assert_eq!(t.acquires, 4);
         assert_eq!(t.acquires_granted, 3);

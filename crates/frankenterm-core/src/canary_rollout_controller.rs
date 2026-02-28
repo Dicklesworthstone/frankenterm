@@ -378,7 +378,12 @@ impl CanaryRolloutController {
             CanaryAction::Advance => {
                 let next_phase = self.phase.next().unwrap_or(self.phase);
                 if next_phase != self.phase {
-                    Some(self.transition_to(next_phase, cycle_id, timestamp_ms, "health_criteria_met"))
+                    Some(self.transition_to(
+                        next_phase,
+                        cycle_id,
+                        timestamp_ms,
+                        "health_criteria_met",
+                    ))
                 } else {
                     None
                 }
@@ -475,11 +480,9 @@ impl CanaryRolloutController {
                     rejected.push(RejectedCandidate {
                         bead_id: assignment.bead_id.clone(),
                         score: assignment.score,
-                        reasons: vec![
-                            crate::planner_features::RejectionReason::SafetyGateDenied {
-                                gate_name: "canary_shadow_phase".to_string(),
-                            },
-                        ],
+                        reasons: vec![crate::planner_features::RejectionReason::SafetyGateDenied {
+                            gate_name: "canary_shadow_phase".to_string(),
+                        }],
                     });
                 }
                 AssignmentSet {
@@ -696,7 +699,9 @@ mod tests {
     fn make_warmed_metrics(cycles: u64) -> ShadowModeMetrics {
         use crate::shadow_mode_evaluator::{ShadowEvaluationConfig, ShadowModeEvaluator};
 
-        use crate::mission_events::{MissionEventBuilder, MissionEventKind, MissionEventLog, MissionEventLogConfig};
+        use crate::mission_events::{
+            MissionEventBuilder, MissionEventKind, MissionEventLog, MissionEventLogConfig,
+        };
 
         let mut eval = ShadowModeEvaluator::new(ShadowEvaluationConfig {
             warmup_cycles: 0,
@@ -705,9 +710,24 @@ mod tests {
         for i in 1..=cycles {
             let recs = AssignmentSet {
                 assignments: vec![
-                    Assignment { bead_id: format!("b{i}a"), agent_id: "a1".to_string(), score: 0.9, rank: 1 },
-                    Assignment { bead_id: format!("b{i}b"), agent_id: "a2".to_string(), score: 0.8, rank: 2 },
-                    Assignment { bead_id: format!("b{i}c"), agent_id: "a3".to_string(), score: 0.7, rank: 3 },
+                    Assignment {
+                        bead_id: format!("b{i}a"),
+                        agent_id: "a1".to_string(),
+                        score: 0.9,
+                        rank: 1,
+                    },
+                    Assignment {
+                        bead_id: format!("b{i}b"),
+                        agent_id: "a2".to_string(),
+                        score: 0.8,
+                        rank: 2,
+                    },
+                    Assignment {
+                        bead_id: format!("b{i}c"),
+                        agent_id: "a3".to_string(),
+                        score: 0.7,
+                        rank: 3,
+                    },
                 ],
                 rejected: Vec::new(),
                 solver_config: SolverConfig::default(),
@@ -740,7 +760,6 @@ mod tests {
         // Just return default — total_cycles = 0, below any warmup threshold
         // but set to 2 to show partial warmup
         use crate::shadow_mode_evaluator::{ShadowEvaluationConfig, ShadowModeEvaluator};
-
 
         let mut eval = ShadowModeEvaluator::new(ShadowEvaluationConfig {
             warmup_cycles: 0,
@@ -850,10 +869,12 @@ mod tests {
         let decision = ctrl.evaluate_health(1, 1000, &diff, &metrics);
 
         assert!(!decision.health_check.healthy);
-        assert!(decision
-            .health_check
-            .failure_reasons
-            .contains(&HealthFailureReason::LowFidelity));
+        assert!(
+            decision
+                .health_check
+                .failure_reasons
+                .contains(&HealthFailureReason::LowFidelity)
+        );
     }
 
     #[test]
@@ -865,10 +886,12 @@ mod tests {
         let decision = ctrl.evaluate_health(1, 1000, &diff, &metrics);
 
         assert!(!decision.health_check.healthy);
-        assert!(decision
-            .health_check
-            .failure_reasons
-            .contains(&HealthFailureReason::NotWarmedUp));
+        assert!(
+            decision
+                .health_check
+                .failure_reasons
+                .contains(&HealthFailureReason::NotWarmedUp)
+        );
     }
 
     #[test]
@@ -881,10 +904,12 @@ mod tests {
         let decision = ctrl.evaluate_health(1, 1000, &diff, &metrics);
 
         assert!(!decision.health_check.healthy);
-        assert!(decision
-            .health_check
-            .failure_reasons
-            .contains(&HealthFailureReason::ExcessiveSafetyRejections));
+        assert!(
+            decision
+                .health_check
+                .failure_reasons
+                .contains(&HealthFailureReason::ExcessiveSafetyRejections)
+        );
     }
 
     #[test]
@@ -898,10 +923,12 @@ mod tests {
         let decision = ctrl.evaluate_health(1, 1000, &diff, &metrics);
 
         assert!(!decision.health_check.healthy);
-        assert!(decision
-            .health_check
-            .failure_reasons
-            .contains(&HealthFailureReason::HighConflictRate));
+        assert!(
+            decision
+                .health_check
+                .failure_reasons
+                .contains(&HealthFailureReason::HighConflictRate)
+        );
     }
 
     // ── Auto-advance tests ───────────────────────────────────────────────

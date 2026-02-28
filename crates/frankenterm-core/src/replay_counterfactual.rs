@@ -1158,10 +1158,12 @@ definition_hash = "0000000000000000"
         let manifest = OverrideManifest::build(&pkg, &baseline);
         // Should expand rate_limit_* to two entries.
         assert_eq!(manifest.entries.len(), 2);
-        assert!(manifest
-            .entries
-            .iter()
-            .all(|e| e.action == OverrideAction::Disable));
+        assert!(
+            manifest
+                .entries
+                .iter()
+                .all(|e| e.action == OverrideAction::Disable)
+        );
     }
 
     #[test]

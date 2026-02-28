@@ -679,9 +679,7 @@ impl ShardedWeztermClient {
     }
 
     async fn route_for_global_pane_id(&self, pane_id: u64) -> Result<PaneRoute> {
-        self.telemetry
-            .route_lookups
-            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry.route_lookups.fetch_add(1, Ordering::Relaxed);
         if let Some(route) = self.pane_routes.read().await.get(&pane_id).copied() {
             return Ok(route);
         }

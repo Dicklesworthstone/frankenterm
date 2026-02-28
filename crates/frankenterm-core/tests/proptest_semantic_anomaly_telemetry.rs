@@ -205,8 +205,7 @@ fn conformal_snapshot_serde_roundtrip() {
         resets: 2,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: ConformalAnomalyTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: ConformalAnomalyTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 

@@ -79,9 +79,7 @@ fn arb_assignment_set() -> impl Strategy<Value = AssignmentSet> {
 }
 
 /// Build warmed shadow metrics by running evaluator through cycles.
-fn build_warmed_metrics(
-    cycles: u64,
-) -> frankenterm_core::shadow_mode_evaluator::ShadowModeMetrics {
+fn build_warmed_metrics(cycles: u64) -> frankenterm_core::shadow_mode_evaluator::ShadowModeMetrics {
     use frankenterm_core::mission_events::{
         MissionEventBuilder, MissionEventKind, MissionEventLog, MissionEventLogConfig,
     };

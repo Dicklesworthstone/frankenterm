@@ -36,8 +36,7 @@ impl ContentStore for TestStore {
             entry.1 += 1;
             Ok(StoreResult::Deduplicated)
         } else {
-            self.blocks
-                .insert(hash.to_string(), (content.to_vec(), 1));
+            self.blocks.insert(hash.to_string(), (content.to_vec(), 1));
             Ok(StoreResult::Inserted)
         }
     }

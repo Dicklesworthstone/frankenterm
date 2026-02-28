@@ -2298,9 +2298,7 @@ mod tests {
         coord
             .request_shutdown(&mut tree, &scope, ShutdownReason::UserRequested, 2000)
             .unwrap();
-        coord
-            .handle_grace_expiry(&mut tree, &scope, 2200)
-            .unwrap();
+        coord.handle_grace_expiry(&mut tree, &scope, 2200).unwrap();
         assert_eq!(coord.telemetry().snapshot().escalations, 1);
     }
 
@@ -2417,8 +2415,7 @@ mod tests {
             shutdowns_completed: 8,
         };
         let json = serde_json::to_string(&snap).unwrap();
-        let back: ShutdownCoordinatorTelemetrySnapshot =
-            serde_json::from_str(&json).unwrap();
+        let back: ShutdownCoordinatorTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
     }
 
@@ -2467,12 +2464,7 @@ mod tests {
         // Full lifecycle for both
         for scope in &ids {
             coord
-                .request_shutdown(
-                    &mut tree,
-                    scope,
-                    ShutdownReason::GracefulTermination,
-                    2000,
-                )
+                .request_shutdown(&mut tree, scope, ShutdownReason::GracefulTermination, 2000)
                 .unwrap();
             coord.begin_finalize(&mut tree, scope, 500, 2500).unwrap();
             coord

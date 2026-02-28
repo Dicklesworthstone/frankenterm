@@ -31,7 +31,8 @@ use frankenterm_core::replay_scenario_matrix::{
     RunnerConfig, ScenarioMatrixRunner, ScenarioResult,
 };
 
-type DecisionGenerator = Box<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync>;
+type DecisionGenerator =
+    Box<dyn Fn(&str, Option<&str>) -> Result<Vec<String>, String> + Send + Sync>;
 
 // ── Strategies ────────────────────────────────────────────────────────────
 

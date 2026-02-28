@@ -15,7 +15,7 @@ use proptest::prelude::*;
 use frankenterm_core::memory_pressure::MemoryPressureTier;
 use frankenterm_core::pane_tiers::PaneTier;
 use frankenterm_core::scrollback_eviction::{
-    EvictionConfig, ScrollbackEvictionTelemetrySnapshot, ScrollbackEvictor, PaneTierSource,
+    EvictionConfig, PaneTierSource, ScrollbackEvictionTelemetrySnapshot, ScrollbackEvictor,
     SegmentStore,
 };
 
@@ -99,11 +99,7 @@ impl PaneTierSource for CyclingTierSource {
 #[test]
 fn telemetry_starts_at_zero() {
     let store = MockStore::new(vec![]);
-    let evictor = ScrollbackEvictor::new(
-        EvictionConfig::default(),
-        store,
-        AllDormantTierSource,
-    );
+    let evictor = ScrollbackEvictor::new(EvictionConfig::default(), store, AllDormantTierSource);
     let snap = evictor.telemetry().snapshot();
 
     assert_eq!(snap.plans_computed, 0);
@@ -118,11 +114,7 @@ fn telemetry_starts_at_zero() {
 #[test]
 fn plan_increments_counters() {
     let store = MockStore::new(vec![(1, 500), (2, 50), (3, 200)]);
-    let evictor = ScrollbackEvictor::new(
-        EvictionConfig::default(),
-        store,
-        AllDormantTierSource,
-    );
+    let evictor = ScrollbackEvictor::new(EvictionConfig::default(), store, AllDormantTierSource);
 
     // Default dormant_max_segments = 100, min_segments = 10
     // Pane 1 (500 > 100) → target, remove 400
@@ -141,11 +133,7 @@ fn plan_increments_counters() {
 #[test]
 fn execute_increments_counters() {
     let store = MockStore::new(vec![(1, 500), (2, 200)]);
-    let evictor = ScrollbackEvictor::new(
-        EvictionConfig::default(),
-        store,
-        AllDormantTierSource,
-    );
+    let evictor = ScrollbackEvictor::new(EvictionConfig::default(), store, AllDormantTierSource);
 
     let plan = evictor.plan(MemoryPressureTier::Green).unwrap();
     let report = evictor.execute(&plan);
@@ -159,11 +147,7 @@ fn execute_increments_counters() {
 #[test]
 fn execution_errors_tracked() {
     let store = MockStore::with_failures(vec![(1, 500), (2, 200)]);
-    let evictor = ScrollbackEvictor::new(
-        EvictionConfig::default(),
-        store,
-        AllDormantTierSource,
-    );
+    let evictor = ScrollbackEvictor::new(EvictionConfig::default(), store, AllDormantTierSource);
 
     let plan = evictor.plan(MemoryPressureTier::Green).unwrap();
     let report = evictor.execute(&plan);
@@ -179,11 +163,7 @@ fn execution_errors_tracked() {
 #[test]
 fn evict_combines_plan_and_execute() {
     let store = MockStore::new(vec![(1, 300)]);
-    let evictor = ScrollbackEvictor::new(
-        EvictionConfig::default(),
-        store,
-        AllDormantTierSource,
-    );
+    let evictor = ScrollbackEvictor::new(EvictionConfig::default(), store, AllDormantTierSource);
 
     let _report = evictor.evict(MemoryPressureTier::Green).unwrap();
     let snap = evictor.telemetry().snapshot();
@@ -196,11 +176,7 @@ fn evict_combines_plan_and_execute() {
 #[test]
 fn empty_store_still_counts_plan() {
     let store = MockStore::new(vec![]);
-    let evictor = ScrollbackEvictor::new(
-        EvictionConfig::default(),
-        store,
-        AllDormantTierSource,
-    );
+    let evictor = ScrollbackEvictor::new(EvictionConfig::default(), store, AllDormantTierSource);
 
     let plan = evictor.plan(MemoryPressureTier::Green).unwrap();
     assert!(plan.is_empty());

@@ -443,7 +443,7 @@ mod tests {
         w.record(50); // bucket 0
         w.record(150); // bucket 1
         w.record(250); // bucket 2
-                       // Recent 1 bucket should have 1 event
+        // Recent 1 bucket should have 1 event
         let recent = w.recent_count(250, 1);
         assert!(recent >= 1);
     }

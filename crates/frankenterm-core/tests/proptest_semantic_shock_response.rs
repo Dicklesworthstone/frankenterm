@@ -52,15 +52,13 @@ fn arb_config() -> impl Strategy<Value = SemanticShockConfig> {
         0..=120u64,
     )
         .prop_map(
-            |(enabled, action, p_thresh, max_per_pane, auto_clear, cooldown)| {
-                SemanticShockConfig {
-                    enabled,
-                    action,
-                    p_value_threshold: p_thresh,
-                    max_shocks_per_pane: max_per_pane,
-                    auto_clear_seconds: auto_clear,
-                    notification_cooldown_seconds: cooldown,
-                }
+            |(enabled, action, p_thresh, max_per_pane, auto_clear, cooldown)| SemanticShockConfig {
+                enabled,
+                action,
+                p_value_threshold: p_thresh,
+                max_shocks_per_pane: max_per_pane,
+                auto_clear_seconds: auto_clear,
+                notification_cooldown_seconds: cooldown,
             },
         )
 }

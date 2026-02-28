@@ -275,7 +275,9 @@ impl BackpressureManager {
     /// Classify queue depths into a tier without applying any state change.
     #[must_use]
     pub fn classify(&self, depths: &QueueDepths) -> BackpressureTier {
-        self.telemetry.classifications.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .classifications
+            .fetch_add(1, Ordering::Relaxed);
         let cr = depths.capture_ratio();
         let wr = depths.write_ratio();
 

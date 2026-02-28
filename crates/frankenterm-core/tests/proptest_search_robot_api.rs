@@ -14,21 +14,21 @@ use frankenterm_core::robot_types::{
 
 fn arb_scoring_breakdown() -> impl Strategy<Value = SearchScoringBreakdown> {
     (
-        proptest::option::of(0.0f64..100.0),     // bm25
+        proptest::option::of(0.0f64..100.0),            // bm25
         proptest::collection::vec("[a-z]{2,10}", 0..5), // matching_terms
-        proptest::option::of(0.0f64..1.0),        // semantic_similarity
+        proptest::option::of(0.0f64..1.0),              // semantic_similarity
         proptest::option::of(prop_oneof![
             Just("hash".to_string()),
             Just("model2vec".to_string()),
             Just("fastembed".to_string()),
-        ]),                                        // embedder_tier
-        proptest::option::of(1usize..100),        // rrf_rank
-        proptest::option::of(0.0f64..1.0),        // rrf_score
-        proptest::option::of(0.0f64..1.0),        // reranker_score
-        0.0f64..100.0,                             // final_score
+        ]), // embedder_tier
+        proptest::option::of(1usize..100),              // rrf_rank
+        proptest::option::of(0.0f64..1.0),              // rrf_score
+        proptest::option::of(0.0f64..1.0),              // reranker_score
+        0.0f64..100.0,                                  // final_score
     )
-        .prop_map(
-            |(bm25, terms, sem, tier, rank, rrf, rerank, final_s)| SearchScoringBreakdown {
+        .prop_map(|(bm25, terms, sem, tier, rank, rrf, rerank, final_s)| {
+            SearchScoringBreakdown {
                 bm25_score: bm25,
                 matching_terms: terms,
                 semantic_similarity: sem,
@@ -37,17 +37,17 @@ fn arb_scoring_breakdown() -> impl Strategy<Value = SearchScoringBreakdown> {
                 rrf_score: rrf,
                 reranker_score: rerank,
                 final_score: final_s,
-            },
-        )
+            }
+        })
 }
 
 fn arb_search_hit() -> impl Strategy<Value = SearchHit> {
     (
-        1i64..10_000,       // segment_id
-        1u64..100,          // pane_id
-        1u64..1000,         // seq
+        1i64..10_000,            // segment_id
+        1u64..100,               // pane_id
+        1u64..1000,              // seq
         1_000_000i64..2_000_000, // captured_at
-        0.0f64..100.0,      // score
+        0.0f64..100.0,           // score
     )
         .prop_map(|(seg, pane, seq, cap, score)| SearchHit {
             segment_id: seg,
@@ -64,11 +64,11 @@ fn arb_search_hit() -> impl Strategy<Value = SearchHit> {
 
 fn arb_pipeline_timing() -> impl Strategy<Value = SearchPipelineTiming> {
     (
-        1u64..100_000,                         // total_us
-        proptest::option::of(0u64..50_000),    // lexical_us
-        proptest::option::of(0u64..50_000),    // semantic_us
-        proptest::option::of(0u64..10_000),    // fusion_us
-        proptest::option::of(0u64..30_000),    // rerank_us
+        1u64..100_000,                      // total_us
+        proptest::option::of(0u64..50_000), // lexical_us
+        proptest::option::of(0u64..50_000), // semantic_us
+        proptest::option::of(0u64..10_000), // fusion_us
+        proptest::option::of(0u64..30_000), // rerank_us
     )
         .prop_map(|(total, lex, sem, fuse, rerank)| SearchPipelineTiming {
             total_us: total,
@@ -81,10 +81,10 @@ fn arb_pipeline_timing() -> impl Strategy<Value = SearchPipelineTiming> {
 
 fn arb_watermark_info() -> impl Strategy<Value = PipelineWatermarkInfo> {
     (
-        1u64..1000,                              // pane_id
-        0i64..2_000_000,                         // last_indexed_at_ms
-        0u64..10_000,                            // total_docs_indexed
-        proptest::option::of("[a-z]{4,8}"),      // session_id
+        1u64..1000,                         // pane_id
+        0i64..2_000_000,                    // last_indexed_at_ms
+        0u64..10_000,                       // total_docs_indexed
+        proptest::option::of("[a-z]{4,8}"), // session_id
     )
         .prop_map(|(pane_id, ts, docs, sess)| PipelineWatermarkInfo {
             pane_id,

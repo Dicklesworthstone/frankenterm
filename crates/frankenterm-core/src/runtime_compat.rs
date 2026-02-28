@@ -87,7 +87,9 @@ pub const SURFACE_CONTRACT_V1: &[SurfaceContractEntry] = &[
         api: "task::spawn_blocking",
         disposition: SurfaceDisposition::Replace,
         rationale: "JoinHandle-centric blocking helper should be reserved for explicit abortable workflows only.",
-        replacement: Some("spawn_blocking (use task::spawn_blocking only when JoinHandle control is required)"),
+        replacement: Some(
+            "spawn_blocking (use task::spawn_blocking only when JoinHandle control is required)",
+        ),
     },
     SurfaceContractEntry {
         api: "mpsc_recv_option",

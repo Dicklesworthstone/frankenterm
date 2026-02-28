@@ -88,13 +88,34 @@ impl Default for ScrollbackEvictionTelemetry {
 impl std::fmt::Debug for ScrollbackEvictionTelemetry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScrollbackEvictionTelemetry")
-            .field("plans_computed", &self.plans_computed.load(Ordering::Relaxed))
-            .field("executions_run", &self.executions_run.load(Ordering::Relaxed))
-            .field("panes_evaluated", &self.panes_evaluated.load(Ordering::Relaxed))
-            .field("targets_generated", &self.targets_generated.load(Ordering::Relaxed))
-            .field("segments_planned", &self.segments_planned.load(Ordering::Relaxed))
-            .field("segments_removed", &self.segments_removed.load(Ordering::Relaxed))
-            .field("execution_errors", &self.execution_errors.load(Ordering::Relaxed))
+            .field(
+                "plans_computed",
+                &self.plans_computed.load(Ordering::Relaxed),
+            )
+            .field(
+                "executions_run",
+                &self.executions_run.load(Ordering::Relaxed),
+            )
+            .field(
+                "panes_evaluated",
+                &self.panes_evaluated.load(Ordering::Relaxed),
+            )
+            .field(
+                "targets_generated",
+                &self.targets_generated.load(Ordering::Relaxed),
+            )
+            .field(
+                "segments_planned",
+                &self.segments_planned.load(Ordering::Relaxed),
+            )
+            .field(
+                "segments_removed",
+                &self.segments_removed.load(Ordering::Relaxed),
+            )
+            .field(
+                "execution_errors",
+                &self.execution_errors.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -681,7 +702,9 @@ impl<S: SegmentStore, T: PaneTierSource> ScrollbackEvictor<S, T> {
 
     /// Compute an eviction plan without executing it.
     pub fn plan(&self, pressure: MemoryPressureTier) -> Result<EvictionPlan, String> {
-        self.telemetry.plans_computed.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .plans_computed
+            .fetch_add(1, Ordering::Relaxed);
 
         let pane_ids = self.store.list_pane_ids()?;
         self.telemetry

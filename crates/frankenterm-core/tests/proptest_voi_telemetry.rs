@@ -13,9 +13,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::bayesian_ledger::PaneState;
-use frankenterm_core::voi::{
-    BackpressureTierInput, VoiConfig, VoiScheduler, VoiTelemetrySnapshot,
-};
+use frankenterm_core::voi::{BackpressureTierInput, VoiConfig, VoiScheduler, VoiTelemetrySnapshot};
 
 // =============================================================================
 // Helpers

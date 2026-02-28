@@ -12,12 +12,12 @@ use frankenterm_core::canary_rollout_controller::{
     CanaryAction, CanaryHealthCheck, CanaryMetrics, CanaryPhase, CanaryPhaseTransition,
     CanaryRolloutConfig, CanaryRolloutController,
 };
+use frankenterm_core::mission_events::{
+    MissionEventBuilder, MissionEventKind, MissionEventLog, MissionEventLogConfig,
+};
 use frankenterm_core::planner_features::{Assignment, AssignmentSet, SolverConfig};
 use frankenterm_core::shadow_mode_evaluator::{
     ShadowEvaluationConfig, ShadowModeDiff, ShadowModeEvaluator, ShadowModeMetrics,
-};
-use frankenterm_core::mission_events::{
-    MissionEventBuilder, MissionEventKind, MissionEventLog, MissionEventLogConfig,
 };
 use proptest::prelude::*;
 
@@ -42,15 +42,15 @@ fn arb_bead_id() -> impl Strategy<Value = String> {
 fn arb_config() -> impl Strategy<Value = CanaryRolloutConfig> {
     (
         arb_phase(),
-        0.01..=1.0f64,    // canary_agent_fraction
-        0.1..=0.95f64,    // fidelity_threshold
-        1..=5u32,         // max_consecutive_unhealthy
-        1..=10u32,        // min_healthy_before_advance
-        0..=10u64,        // min_warmup_cycles
-        1..=20usize,      // max_safety_rejections_per_cycle
-        0.05..=0.9f64,    // max_conflict_rate
-        any::<bool>(),    // auto_advance
-        any::<bool>(),    // auto_rollback
+        0.01..=1.0f64, // canary_agent_fraction
+        0.1..=0.95f64, // fidelity_threshold
+        1..=5u32,      // max_consecutive_unhealthy
+        1..=10u32,     // min_healthy_before_advance
+        0..=10u64,     // min_warmup_cycles
+        1..=20usize,   // max_safety_rejections_per_cycle
+        0.05..=0.9f64, // max_conflict_rate
+        any::<bool>(), // auto_advance
+        any::<bool>(), // auto_rollback
     )
         .prop_map(
             |(
@@ -110,13 +110,26 @@ fn make_warmed_metrics(n: u64) -> ShadowModeMetrics {
     for i in 1..=n {
         let recs = AssignmentSet {
             assignments: vec![
-                Assignment { bead_id: format!("b{i}a"), agent_id: "a1".into(), score: 0.9, rank: 1 },
-                Assignment { bead_id: format!("b{i}b"), agent_id: "a2".into(), score: 0.8, rank: 2 },
+                Assignment {
+                    bead_id: format!("b{i}a"),
+                    agent_id: "a1".into(),
+                    score: 0.9,
+                    rank: 1,
+                },
+                Assignment {
+                    bead_id: format!("b{i}b"),
+                    agent_id: "a2".into(),
+                    score: 0.8,
+                    rank: 2,
+                },
             ],
             rejected: Vec::new(),
             solver_config: SolverConfig::default(),
         };
-        let mut log = MissionEventLog::new(MissionEventLogConfig { max_events: 64, enabled: true });
+        let mut log = MissionEventLog::new(MissionEventLogConfig {
+            max_events: 64,
+            enabled: true,
+        });
         for a in &recs.assignments {
             log.emit(
                 MissionEventBuilder::new(

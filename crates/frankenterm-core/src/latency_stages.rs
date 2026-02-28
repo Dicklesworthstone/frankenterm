@@ -15393,9 +15393,11 @@ mod tests {
     #[test]
     fn test_pipeline_stages_complete() {
         assert_eq!(LatencyStage::PIPELINE_STAGES.len(), 8);
-        assert!(!LatencyStage::PIPELINE_STAGES
-            .iter()
-            .any(|s| s.is_aggregate()));
+        assert!(
+            !LatencyStage::PIPELINE_STAGES
+                .iter()
+                .any(|s| s.is_aggregate())
+        );
     }
 
     #[test]
@@ -15523,12 +15525,16 @@ mod tests {
             );
         }
         // Aggregates also have budgets.
-        assert!(budgets
-            .iter()
-            .any(|b| b.stage == LatencyStage::EndToEndCapture));
-        assert!(budgets
-            .iter()
-            .any(|b| b.stage == LatencyStage::EndToEndAction));
+        assert!(
+            budgets
+                .iter()
+                .any(|b| b.stage == LatencyStage::EndToEndCapture)
+        );
+        assert!(
+            budgets
+                .iter()
+                .any(|b| b.stage == LatencyStage::EndToEndAction)
+        );
     }
 
     #[test]
@@ -15774,9 +15780,11 @@ mod tests {
         let result = run.validate();
         assert!(result.is_err());
         let violations = result.unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, InvariantViolation::StageOrdering { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, InvariantViolation::StageOrdering { .. }))
+        );
     }
 
     #[test]
@@ -15787,9 +15795,11 @@ mod tests {
         let result = run.validate();
         assert!(result.is_err());
         let violations = result.unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, InvariantViolation::TimestampRegression { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, InvariantViolation::TimestampRegression { .. }))
+        );
     }
 
     #[test]
@@ -15799,9 +15809,11 @@ mod tests {
         let result = run.validate();
         assert!(result.is_err());
         let violations = result.unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, InvariantViolation::TotalMismatch { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, InvariantViolation::TotalMismatch { .. }))
+        );
     }
 
     #[test]
@@ -15811,9 +15823,11 @@ mod tests {
         let result = run.validate();
         assert!(result.is_err());
         let violations = result.unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, InvariantViolation::OverflowFlagMismatch { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, InvariantViolation::OverflowFlagMismatch { .. }))
+        );
     }
 
     // ── Workload Classes ──
@@ -16567,9 +16581,11 @@ mod tests {
             latency_us: 0.0,
         });
         let errors = ctx.validate();
-        assert!(errors
-            .iter()
-            .any(|e| matches!(e, InstrumentationError::ClockRegression { .. })));
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, InstrumentationError::ClockRegression { .. }))
+        );
     }
 
     #[test]
@@ -17841,16 +17857,20 @@ mod tests {
             format!("{}", AllocatorDegradation::Oscillating { lane_count: 5 })
                 .contains("OSCILLATING")
         );
-        assert!(format!(
-            "{}",
-            AllocatorDegradation::ConservationDrift { drift_us: 1.5 }
-        )
-        .contains("CONSERVATION_DRIFT"));
-        assert!(format!(
-            "{}",
-            AllocatorDegradation::FloorSaturation { lane_count: 4 }
-        )
-        .contains("FLOOR_SATURATION"));
+        assert!(
+            format!(
+                "{}",
+                AllocatorDegradation::ConservationDrift { drift_us: 1.5 }
+            )
+            .contains("CONSERVATION_DRIFT")
+        );
+        assert!(
+            format!(
+                "{}",
+                AllocatorDegradation::FloorSaturation { lane_count: 4 }
+            )
+            .contains("FLOOR_SATURATION")
+        );
     }
 
     #[test]
@@ -20663,7 +20683,7 @@ mod tests {
         mgr.ingest(1, 2000, 20, 0);
         mgr.migrate(50); // hot→warm
         mgr.migrate(200); // warm→cold
-                          // 2000 * 0.5 = 1000 cold bytes, util = 1000/10000 = 0.1
+        // 2000 * 0.5 = 1000 cold bytes, util = 1000/10000 = 0.1
         assert!((mgr.cold_utilization() - 0.1).abs() < 0.01);
     }
 
@@ -23032,40 +23052,52 @@ mod tests {
 
     #[test]
     fn test_scheduler_invariant_epoch_monotonicity() {
-        assert!(SchedulerInvariant::EpochMonotonicity {
-            previous: 5,
-            current: 10
-        }
-        .holds());
-        assert!(SchedulerInvariant::EpochMonotonicity {
-            previous: 5,
-            current: 5
-        }
-        .holds());
-        assert!(!SchedulerInvariant::EpochMonotonicity {
-            previous: 10,
-            current: 5
-        }
-        .holds());
+        assert!(
+            SchedulerInvariant::EpochMonotonicity {
+                previous: 5,
+                current: 10
+            }
+            .holds()
+        );
+        assert!(
+            SchedulerInvariant::EpochMonotonicity {
+                previous: 5,
+                current: 5
+            }
+            .holds()
+        );
+        assert!(
+            !SchedulerInvariant::EpochMonotonicity {
+                previous: 10,
+                current: 5
+            }
+            .holds()
+        );
     }
 
     #[test]
     fn test_scheduler_invariant_item_id_monotonicity() {
-        assert!(SchedulerInvariant::ItemIdMonotonicity {
-            previous: 1,
-            current: 2
-        }
-        .holds());
-        assert!(!SchedulerInvariant::ItemIdMonotonicity {
-            previous: 5,
-            current: 3
-        }
-        .holds());
-        assert!(SchedulerInvariant::ItemIdMonotonicity {
-            previous: 0,
-            current: 0
-        }
-        .holds());
+        assert!(
+            SchedulerInvariant::ItemIdMonotonicity {
+                previous: 1,
+                current: 2
+            }
+            .holds()
+        );
+        assert!(
+            !SchedulerInvariant::ItemIdMonotonicity {
+                previous: 5,
+                current: 3
+            }
+            .holds()
+        );
+        assert!(
+            SchedulerInvariant::ItemIdMonotonicity {
+                previous: 0,
+                current: 0
+            }
+            .holds()
+        );
     }
 
     #[test]
@@ -23124,76 +23156,96 @@ mod tests {
 
     #[test]
     fn test_budget_invariant_non_negative_targets() {
-        assert!(BudgetInvariant::NonNegativeTargets {
-            stage: LatencyStage::EventEmission,
-            min_target: 0.0,
-        }
-        .holds());
-        assert!(!BudgetInvariant::NonNegativeTargets {
-            stage: LatencyStage::EventEmission,
-            min_target: -1.0,
-        }
-        .holds());
+        assert!(
+            BudgetInvariant::NonNegativeTargets {
+                stage: LatencyStage::EventEmission,
+                min_target: 0.0,
+            }
+            .holds()
+        );
+        assert!(
+            !BudgetInvariant::NonNegativeTargets {
+                stage: LatencyStage::EventEmission,
+                min_target: -1.0,
+            }
+            .holds()
+        );
     }
 
     #[test]
     fn test_budget_invariant_observation_consistency() {
-        assert!(BudgetInvariant::ObservationConsistency {
-            total: 50,
-            per_stage_sum: 50
-        }
-        .holds());
-        assert!(!BudgetInvariant::ObservationConsistency {
-            total: 50,
-            per_stage_sum: 49
-        }
-        .holds());
+        assert!(
+            BudgetInvariant::ObservationConsistency {
+                total: 50,
+                per_stage_sum: 50
+            }
+            .holds()
+        );
+        assert!(
+            !BudgetInvariant::ObservationConsistency {
+                total: 50,
+                per_stage_sum: 49
+            }
+            .holds()
+        );
     }
 
     #[test]
     fn test_budget_invariant_overflow_bound() {
-        assert!(BudgetInvariant::OverflowBound {
-            overflow_count: 5,
-            total_observations: 10
-        }
-        .holds());
-        assert!(!BudgetInvariant::OverflowBound {
-            overflow_count: 11,
-            total_observations: 10
-        }
-        .holds());
+        assert!(
+            BudgetInvariant::OverflowBound {
+                overflow_count: 5,
+                total_observations: 10
+            }
+            .holds()
+        );
+        assert!(
+            !BudgetInvariant::OverflowBound {
+                overflow_count: 11,
+                total_observations: 10
+            }
+            .holds()
+        );
     }
 
     #[test]
     fn test_budget_invariant_escalation_monotonicity() {
-        assert!(BudgetInvariant::EscalationMonotonicity {
-            stage: LatencyStage::PatternDetection,
-            previous_level: MitigationLevel::None,
-            current_level: MitigationLevel::Defer,
-        }
-        .holds());
-        assert!(!BudgetInvariant::EscalationMonotonicity {
-            stage: LatencyStage::PatternDetection,
-            previous_level: MitigationLevel::Shed,
-            current_level: MitigationLevel::Defer,
-        }
-        .holds());
+        assert!(
+            BudgetInvariant::EscalationMonotonicity {
+                stage: LatencyStage::PatternDetection,
+                previous_level: MitigationLevel::None,
+                current_level: MitigationLevel::Defer,
+            }
+            .holds()
+        );
+        assert!(
+            !BudgetInvariant::EscalationMonotonicity {
+                stage: LatencyStage::PatternDetection,
+                previous_level: MitigationLevel::Shed,
+                current_level: MitigationLevel::Defer,
+            }
+            .holds()
+        );
     }
 
     #[test]
     fn test_budget_invariant_aggregate_ceiling() {
-        assert!(BudgetInvariant::AggregateCeiling {
-            percentile: Percentile::P99,
-            aggregate_us: 1000.0,
-            stage_sum_us: 900.0,
-        }
-        .holds());
-        assert!(!BudgetInvariant::AggregateCeiling {
-            percentile: Percentile::P99,
-            aggregate_us: 800.0,
-            stage_sum_us: 900.0,
-        }
-        .holds());
+        assert!(
+            BudgetInvariant::AggregateCeiling {
+                percentile: Percentile::P99,
+                aggregate_us: 1000.0,
+                stage_sum_us: 900.0,
+            }
+            .holds()
+        );
+        assert!(
+            !BudgetInvariant::AggregateCeiling {
+                percentile: Percentile::P99,
+                aggregate_us: 800.0,
+                stage_sum_us: 900.0,
+            }
+            .holds()
+        );
     }
 
     #[test]
@@ -23230,62 +23282,80 @@ mod tests {
 
     #[test]
     fn test_recovery_invariant_cooldown_enforced() {
-        assert!(RecoveryInvariant::CooldownEnforced {
-            consecutive_ok: 20,
-            cooldown_required: 20,
-        }
-        .holds());
-        assert!(!RecoveryInvariant::CooldownEnforced {
-            consecutive_ok: 19,
-            cooldown_required: 20,
-        }
-        .holds());
+        assert!(
+            RecoveryInvariant::CooldownEnforced {
+                consecutive_ok: 20,
+                cooldown_required: 20,
+            }
+            .holds()
+        );
+        assert!(
+            !RecoveryInvariant::CooldownEnforced {
+                consecutive_ok: 19,
+                cooldown_required: 20,
+            }
+            .holds()
+        );
     }
 
     #[test]
     fn test_recovery_invariant_timeout_recovery() {
-        assert!(RecoveryInvariant::TimeoutRecovery {
-            degraded_duration_us: 40_000_000,
-            max_duration_us: 30_000_000,
-            recovery_triggered: true,
-        }
-        .holds());
-        assert!(!RecoveryInvariant::TimeoutRecovery {
-            degraded_duration_us: 40_000_000,
-            max_duration_us: 30_000_000,
-            recovery_triggered: false,
-        }
-        .holds());
-        assert!(RecoveryInvariant::TimeoutRecovery {
-            degraded_duration_us: 10_000_000,
-            max_duration_us: 30_000_000,
-            recovery_triggered: false,
-        }
-        .holds());
+        assert!(
+            RecoveryInvariant::TimeoutRecovery {
+                degraded_duration_us: 40_000_000,
+                max_duration_us: 30_000_000,
+                recovery_triggered: true,
+            }
+            .holds()
+        );
+        assert!(
+            !RecoveryInvariant::TimeoutRecovery {
+                degraded_duration_us: 40_000_000,
+                max_duration_us: 30_000_000,
+                recovery_triggered: false,
+            }
+            .holds()
+        );
+        assert!(
+            RecoveryInvariant::TimeoutRecovery {
+                degraded_duration_us: 10_000_000,
+                max_duration_us: 30_000_000,
+                recovery_triggered: false,
+            }
+            .holds()
+        );
     }
 
     #[test]
     fn test_recovery_invariant_count_monotonicity() {
-        assert!(RecoveryInvariant::EscalationCountMonotonic {
-            previous: 5,
-            current: 8
-        }
-        .holds());
-        assert!(!RecoveryInvariant::EscalationCountMonotonic {
-            previous: 10,
-            current: 5
-        }
-        .holds());
-        assert!(RecoveryInvariant::RecoveryCountMonotonic {
-            previous: 3,
-            current: 3
-        }
-        .holds());
-        assert!(!RecoveryInvariant::RecoveryCountMonotonic {
-            previous: 5,
-            current: 2
-        }
-        .holds());
+        assert!(
+            RecoveryInvariant::EscalationCountMonotonic {
+                previous: 5,
+                current: 8
+            }
+            .holds()
+        );
+        assert!(
+            !RecoveryInvariant::EscalationCountMonotonic {
+                previous: 10,
+                current: 5
+            }
+            .holds()
+        );
+        assert!(
+            RecoveryInvariant::RecoveryCountMonotonic {
+                previous: 3,
+                current: 3
+            }
+            .holds()
+        );
+        assert!(
+            !RecoveryInvariant::RecoveryCountMonotonic {
+                previous: 5,
+                current: 2
+            }
+            .holds()
+        );
     }
 
     #[test]
@@ -24198,11 +24268,15 @@ mod tests {
             std::slice::from_ref(&result),
             100,
         );
-        mc.step(TraceAction::EpochAdvance { new_epoch: 2 }, std::slice::from_ref(&result), 200);
+        mc.step(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            std::slice::from_ref(&result),
+            200,
+        );
         assert_eq!(mc.states_explored(), 2);
         mc.new_trace();
         assert_eq!(mc.states_explored(), 2); // preserved
-                                             // depth resets but states don't
+        // depth resets but states don't
     }
 
     #[test]
@@ -24652,8 +24726,16 @@ mod tests {
             timestamp_us: 0,
         };
         // Trace 1: 3 steps then violation
-        mc.step(TraceAction::EpochAdvance { new_epoch: 1 }, std::slice::from_ref(&ok), 0);
-        mc.step(TraceAction::EpochAdvance { new_epoch: 2 }, std::slice::from_ref(&ok), 1);
+        mc.step(
+            TraceAction::EpochAdvance { new_epoch: 1 },
+            std::slice::from_ref(&ok),
+            0,
+        );
+        mc.step(
+            TraceAction::EpochAdvance { new_epoch: 2 },
+            std::slice::from_ref(&ok),
+            1,
+        );
         mc.step(
             TraceAction::EpochAdvance { new_epoch: 3 },
             std::slice::from_ref(&bad),
@@ -24661,7 +24743,11 @@ mod tests {
         );
         mc.new_trace();
         // Trace 2: 1 step then violation
-        mc.step(TraceAction::EpochAdvance { new_epoch: 4 }, std::slice::from_ref(&bad), 3);
+        mc.step(
+            TraceAction::EpochAdvance { new_epoch: 4 },
+            std::slice::from_ref(&bad),
+            3,
+        );
         let shortest = mc.shortest_counterexample().unwrap();
         assert_eq!(shortest.trace.len(), 1);
     }
@@ -29214,9 +29300,11 @@ mod tests {
         };
         let mut guard = QoEGuardrail::new(cfg);
         // Not enough data.
-        assert!(guard
-            .current_percentile(QoEMetric::InputToPaint, 0.50)
-            .is_none());
+        assert!(
+            guard
+                .current_percentile(QoEMetric::InputToPaint, 0.50)
+                .is_none()
+        );
         for i in 0..10 {
             guard.record(QoEMeasurement {
                 metric: QoEMetric::InputToPaint,

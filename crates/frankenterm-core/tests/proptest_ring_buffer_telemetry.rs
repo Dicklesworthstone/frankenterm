@@ -158,8 +158,7 @@ fn snapshot_serde_roundtrip() {
         items_drained: 200,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: RingBufferTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: RingBufferTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 

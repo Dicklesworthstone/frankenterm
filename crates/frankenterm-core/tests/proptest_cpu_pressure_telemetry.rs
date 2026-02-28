@@ -56,7 +56,8 @@ fn tier_counts_sum_to_total() {
     }
 
     let snap = mon.telemetry().snapshot();
-    let tier_sum = snap.green_samples + snap.yellow_samples + snap.orange_samples + snap.red_samples;
+    let tier_sum =
+        snap.green_samples + snap.yellow_samples + snap.orange_samples + snap.red_samples;
     assert_eq!(tier_sum, snap.samples_taken);
 }
 

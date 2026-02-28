@@ -168,7 +168,9 @@ macro_rules! bitfield {
     ($getter:ident, $setter:ident, $enum:ident, $bitmask:expr, $bitshift:expr) => {
         #[inline]
         pub fn $getter(&self) -> $enum {
-            <$enum as BitfieldEnumDecode>::from_bits(((self.attributes >> $bitshift) & $bitmask) as u8)
+            <$enum as BitfieldEnumDecode>::from_bits(
+                ((self.attributes >> $bitshift) & $bitmask) as u8,
+            )
         }
 
         #[inline]

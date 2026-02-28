@@ -1992,7 +1992,11 @@ mod tests {
         guard.evaluate("ls -la", 1);
         guard.evaluate("echo hello", 2);
         let snap = guard.telemetry().snapshot();
-        assert!(snap.quick_rejects >= 2, "quick_rejects={}", snap.quick_rejects);
+        assert!(
+            snap.quick_rejects >= 2,
+            "quick_rejects={}",
+            snap.quick_rejects
+        );
     }
 
     #[test]
@@ -2016,7 +2020,10 @@ mod tests {
             snap.allowed + snap.blocked + snap.warned,
             snap.evaluations,
             "allowed({}) + blocked({}) + warned({}) != evaluations({})",
-            snap.allowed, snap.blocked, snap.warned, snap.evaluations,
+            snap.allowed,
+            snap.blocked,
+            snap.warned,
+            snap.evaluations,
         );
     }
 
@@ -2041,8 +2048,7 @@ mod tests {
             audit_clears: 3,
         };
         let json = serde_json::to_string(&snap).unwrap();
-        let back: CommandGuardTelemetrySnapshot =
-            serde_json::from_str(&json).unwrap();
+        let back: CommandGuardTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
     }
 }

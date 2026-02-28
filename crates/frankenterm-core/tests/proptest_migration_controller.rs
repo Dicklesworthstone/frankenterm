@@ -3,8 +3,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::search::{
-    MigrationController, MigrationControllerConfig, MigrationPhase,
-    RetirementGateResult, run_default_retirement_gate,
+    MigrationController, MigrationControllerConfig, MigrationPhase, RetirementGateResult,
+    run_default_retirement_gate,
 };
 
 // ---------------------------------------------------------------------------

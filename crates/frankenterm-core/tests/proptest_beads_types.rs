@@ -95,7 +95,8 @@ fn arb_dag(max_nodes: usize) -> impl Strategy<Value = Vec<BeadIssueDetail>> {
                     } else {
                         prop::collection::vec(0..i, 0..=2)
                             .prop_map(|v| {
-                                let mut dedup: Vec<usize> = v.into_iter().collect::<HashSet<_>>().into_iter().collect();
+                                let mut dedup: Vec<usize> =
+                                    v.into_iter().collect::<HashSet<_>>().into_iter().collect();
                                 dedup.sort();
                                 dedup
                             })

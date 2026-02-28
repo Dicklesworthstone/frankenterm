@@ -583,7 +583,7 @@ impl crate::recorder_storage::RecorderEventReader for AppendLogEventSource {
             .map_err(|e| EventCursorError::Io(e.to_string()))?;
         loop {
             match reader.next_record() {
-                Ok(Some(_)) => {},
+                Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(e) => return Err(EventCursorError::Io(e.to_string())),
             }

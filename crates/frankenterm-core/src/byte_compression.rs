@@ -325,9 +325,8 @@ impl ByteCompressor {
             return Ok(Vec::new());
         }
         let dict_bytes = self.dictionary.as_deref().unwrap_or(&[]);
-        let mut decompressor =
-            zstd::bulk::Decompressor::with_dictionary(dict_bytes)
-                .map_err(|e| ByteCompressionError::DecompressionFailed(e.to_string()))?;
+        let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict_bytes)
+            .map_err(|e| ByteCompressionError::DecompressionFailed(e.to_string()))?;
         decompressor
             .decompress(data, self.config.max_input_bytes)
             .map_err(|e| ByteCompressionError::DecompressionFailed(e.to_string()))
@@ -495,7 +494,11 @@ mod tests {
         let line = b"   Compiling some-crate v0.1.0 (/path/to/crate)\n";
         let input: Vec<u8> = line.repeat(1000);
         let (compressed, stats) = compressor.compress_with_stats(&input);
-        assert!(stats.ratio > 5.0, "Expected >5:1 ratio on repetitive input, got {}", stats.ratio);
+        assert!(
+            stats.ratio > 5.0,
+            "Expected >5:1 ratio on repetitive input, got {}",
+            stats.ratio
+        );
         let decompressed = compressor.decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }
@@ -530,7 +533,11 @@ mod tests {
             let c = ByteCompressor::new(level);
             let compressed = c.compress(&input);
             let decompressed = c.decompress(&compressed).unwrap();
-            assert_eq!(decompressed, input, "Failed roundtrip for level {:?}", level);
+            assert_eq!(
+                decompressed, input,
+                "Failed roundtrip for level {:?}",
+                level
+            );
         }
     }
 
@@ -546,12 +553,9 @@ mod tests {
         let input = b"test with size prefix\n".repeat(50);
         let compressed = compressor.compress(&input);
         // First 4 bytes should be the original size
-        let stored_size = u32::from_le_bytes([
-            compressed[0],
-            compressed[1],
-            compressed[2],
-            compressed[3],
-        ]) as usize;
+        let stored_size =
+            u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]])
+                as usize;
         assert_eq!(stored_size, input.len());
         let decompressed = compressor.decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
@@ -613,8 +617,8 @@ mod tests {
         // Training may fail with too few/small samples, which is OK
         match train_dictionary(&samples, 4096) {
             Ok(dict) => {
-                let compressor = ByteCompressor::new(CompressionLevel::Default)
-                    .with_dictionary(dict);
+                let compressor =
+                    ByteCompressor::new(CompressionLevel::Default).with_dictionary(dict);
                 assert!(compressor.has_dictionary());
 
                 let input = b"\x1b[32m   Compiling\x1b[0m frankenterm-core v0.1.0\n".repeat(50);
@@ -694,14 +698,20 @@ mod tests {
         let compressor = ByteCompressor::default();
         let mut input = Vec::new();
         for i in 0..200 {
-            input.extend_from_slice(format!(
-                "\x1b[38;5;{}m  Line {} of output with ANSI codes\x1b[0m\n",
-                i % 256,
-                i
-            ).as_bytes());
+            input.extend_from_slice(
+                format!(
+                    "\x1b[38;5;{}m  Line {} of output with ANSI codes\x1b[0m\n",
+                    i % 256,
+                    i
+                )
+                .as_bytes(),
+            );
         }
         let (compressed, stats) = compressor.compress_with_stats(&input);
-        assert!(stats.ratio > 1.5, "Expected some compression for ANSI output");
+        assert!(
+            stats.ratio > 1.5,
+            "Expected some compression for ANSI output"
+        );
         let decompressed = compressor.decompress(&compressed).unwrap();
         assert_eq!(decompressed, input);
     }

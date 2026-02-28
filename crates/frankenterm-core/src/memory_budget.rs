@@ -290,7 +290,9 @@ impl MemoryBudgetManager {
         pid: Option<u32>,
         budget_bytes: u64,
     ) -> PaneBudget {
-        self.telemetry.panes_registered.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .panes_registered
+            .fetch_add(1, Ordering::Relaxed);
         let mut budget = PaneBudget::new(pane_id, budget_bytes, self.config.high_ratio);
         budget.pid = pid;
 
@@ -313,7 +315,9 @@ impl MemoryBudgetManager {
 
     /// Unregister a pane and clean up its cgroup (if applicable).
     pub fn unregister_pane(&self, pane_id: u64) -> Option<PaneBudget> {
-        self.telemetry.panes_unregistered.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .panes_unregistered
+            .fetch_add(1, Ordering::Relaxed);
         let mut panes = self.panes.lock().unwrap_or_else(|e| e.into_inner());
         let removed = panes.remove(&pane_id);
 
@@ -345,7 +349,9 @@ impl MemoryBudgetManager {
 
         let summary = compute_summary(&panes);
         if summary.throttled_count > 0 || summary.over_budget_count > 0 {
-            self.telemetry.samples_with_pressure.fetch_add(1, Ordering::Relaxed);
+            self.telemetry
+                .samples_with_pressure
+                .fetch_add(1, Ordering::Relaxed);
         }
         self.update_worst_level_from(&panes);
         summary

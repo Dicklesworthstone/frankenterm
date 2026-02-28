@@ -163,8 +163,7 @@ fn snapshot_serde_roundtrip() {
         entries_truncated: 15,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: WalTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: WalTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 

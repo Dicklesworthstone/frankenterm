@@ -3,10 +3,10 @@
 use proptest::prelude::*;
 
 use frankenterm_core::agent_config_templates::{
+    AgentConfigKind, AgentConfigTemplate, ConfigAction, ConfigGenerationPlanItem,
+    ConfigGenerationResult, ConfigScope, SECTION_END_MARKER, SECTION_START_MARKER,
     build_generation_plan, config_kind_for_provider, generate_template,
-    generate_templates_for_detected, merge_into_existing, section_is_current, AgentConfigKind,
-    AgentConfigTemplate, ConfigAction, ConfigGenerationPlanItem, ConfigGenerationResult,
-    ConfigScope, SECTION_END_MARKER, SECTION_START_MARKER,
+    generate_templates_for_detected, merge_into_existing, section_is_current,
 };
 use frankenterm_core::agent_provider::AgentProvider;
 

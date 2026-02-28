@@ -99,7 +99,10 @@ fn detector_successes_tracked() {
 #[test]
 fn detector_errors_tracked() {
     let mut det = test_detector();
-    det.record_error(ProtocolErrorKind::Recoverable, "unexpected response from server");
+    det.record_error(
+        ProtocolErrorKind::Recoverable,
+        "unexpected response from server",
+    );
     det.record_error(ProtocolErrorKind::Transient, "timed out");
 
     let snap = det.telemetry().snapshot();
@@ -247,8 +250,7 @@ fn tracker_snapshot_serde_roundtrip() {
         resets: 10,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: ConnectionHealthTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: ConnectionHealthTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 

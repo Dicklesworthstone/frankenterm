@@ -152,9 +152,7 @@ impl HeartbeatRegistry {
     /// Check all components against their thresholds and return overall health.
     #[must_use]
     pub fn check_health(&self, config: &WatchdogConfig) -> HealthReport {
-        self.telemetry
-            .health_checks
-            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry.health_checks.fetch_add(1, Ordering::Relaxed);
         let now = epoch_ms();
         let uptime_ms = now.saturating_sub(self.created_at);
         let components = [

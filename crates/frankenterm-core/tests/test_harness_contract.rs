@@ -86,11 +86,7 @@ fn contract_all_events_have_required_fields() {
 
 #[test]
 fn contract_scenario_id_contains_bead_and_name() {
-    let logger = TestEventLogger::new(
-        "harness.contract",
-        "ft-e34d9.10.6.5",
-        "scenario_id_format",
-    );
+    let logger = TestEventLogger::new("harness.contract", "ft-e34d9.10.6.5", "scenario_id_format");
     let sid = logger.scenario_id();
     assert!(
         sid.contains("ft_e34d9_10_6_5"),
@@ -159,11 +155,8 @@ fn outcome_tracking_started_passed() {
 
 #[test]
 fn outcome_tracking_failure_recorded() {
-    let mut logger = TestEventLogger::new(
-        "harness.tracking",
-        "ft-e34d9.10.6.5",
-        "explicit_failure",
-    );
+    let mut logger =
+        TestEventLogger::new("harness.tracking", "ft-e34d9.10.6.5", "explicit_failure");
     logger.started();
     logger.failed(ReasonCode::TimeoutExpired, ErrorCode::Timeout);
 
@@ -205,11 +198,7 @@ fn outcome_tracking_panic_capture() {
 
 #[test]
 fn json_roundtrip_preserves_all_fields() {
-    let mut logger = TestEventLogger::new(
-        "harness.serde",
-        "ft-e34d9.10.6.5",
-        "json_roundtrip",
-    );
+    let mut logger = TestEventLogger::new("harness.serde", "ft-e34d9.10.6.5", "json_roundtrip");
     logger
         .emit(
             Outcome::Checkpoint,
@@ -238,11 +227,7 @@ fn json_roundtrip_preserves_all_fields() {
 
 #[test]
 fn json_uses_snake_case_enums() {
-    let mut logger = TestEventLogger::new(
-        "harness.serde",
-        "ft-e34d9.10.6.5",
-        "snake_case_check",
-    );
+    let mut logger = TestEventLogger::new("harness.serde", "ft-e34d9.10.6.5", "snake_case_check");
     logger
         .emit(
             Outcome::Checkpoint,
@@ -276,16 +261,12 @@ fn json_uses_snake_case_enums() {
 #[test]
 fn file_artifact_written_as_jsonl() {
     let tmp = tempfile::tempdir().unwrap();
-    let logger = ScenarioRunner::new(
-        "harness.artifact",
-        "ft-e34d9.10.6.5",
-        "jsonl_write",
-    )
-    .artifact_dir(tmp.path())
-    .run(|logger| {
-        logger.checkpoint("step_1");
-        logger.checkpoint("step_2");
-    });
+    let logger = ScenarioRunner::new("harness.artifact", "ft-e34d9.10.6.5", "jsonl_write")
+        .artifact_dir(tmp.path())
+        .run(|logger| {
+            logger.checkpoint("step_1");
+            logger.checkpoint("step_2");
+        });
 
     let path = logger.flush().unwrap();
     assert!(path.exists(), "Artifact file should exist");
@@ -298,7 +279,12 @@ fn file_artifact_written_as_jsonl() {
     let lines: Vec<&str> = content.lines().collect();
 
     // started + 2 checkpoints + passed = 4 events
-    assert_eq!(lines.len(), 4, "Expected 4 JSONL lines, got {}", lines.len());
+    assert_eq!(
+        lines.len(),
+        4,
+        "Expected 4 JSONL lines, got {}",
+        lines.len()
+    );
 
     // Each line is valid JSON conforming to the contract.
     for (i, line) in lines.iter().enumerate() {
@@ -311,15 +297,11 @@ fn file_artifact_written_as_jsonl() {
 #[test]
 fn file_artifact_contains_correct_events() {
     let tmp = tempfile::tempdir().unwrap();
-    let logger = ScenarioRunner::new(
-        "harness.artifact",
-        "ft-e34d9.10.6.5",
-        "event_content",
-    )
-    .artifact_dir(tmp.path())
-    .run(|logger| {
-        logger.checkpoint("verification_step");
-    });
+    let logger = ScenarioRunner::new("harness.artifact", "ft-e34d9.10.6.5", "event_content")
+        .artifact_dir(tmp.path())
+        .run(|logger| {
+            logger.checkpoint("verification_step");
+        });
 
     let path = logger.flush().unwrap();
     let content = std::fs::read_to_string(&path).unwrap();
@@ -407,25 +389,17 @@ fn error_codes_cover_failure_taxonomy() {
 fn multiple_scenarios_produce_independent_evidence() {
     let tmp = tempfile::tempdir().unwrap();
 
-    let l1 = ScenarioRunner::new(
-        "harness.isolation",
-        "ft-e34d9.10.6.5",
-        "scenario_alpha",
-    )
-    .artifact_dir(tmp.path())
-    .run(|logger| {
-        logger.checkpoint("alpha_step");
-    });
+    let l1 = ScenarioRunner::new("harness.isolation", "ft-e34d9.10.6.5", "scenario_alpha")
+        .artifact_dir(tmp.path())
+        .run(|logger| {
+            logger.checkpoint("alpha_step");
+        });
 
-    let l2 = ScenarioRunner::new(
-        "harness.isolation",
-        "ft-e34d9.10.6.5",
-        "scenario_beta",
-    )
-    .artifact_dir(tmp.path())
-    .run(|logger| {
-        logger.checkpoint("beta_step");
-    });
+    let l2 = ScenarioRunner::new("harness.isolation", "ft-e34d9.10.6.5", "scenario_beta")
+        .artifact_dir(tmp.path())
+        .run(|logger| {
+            logger.checkpoint("beta_step");
+        });
 
     // Different correlation IDs.
     assert_ne!(l1.correlation_id(), l2.correlation_id());
@@ -462,11 +436,8 @@ fn e2e_compatible_evidence_structure() {
     // 3. timestamp is ISO-8601.
     // 4. scenario_id format is `{bead}:{name}`.
 
-    let mut logger = TestEventLogger::new(
-        "harness.e2e_compat",
-        "ft-e34d9.10.6.5",
-        "e2e_compat_check",
-    );
+    let mut logger =
+        TestEventLogger::new("harness.e2e_compat", "ft-e34d9.10.6.5", "e2e_compat_check");
     logger.started();
     logger
         .emit(Outcome::Passed, ReasonCode::Completed, ErrorCode::None)
@@ -489,10 +460,7 @@ fn e2e_compatible_evidence_structure() {
 
         // Timestamp starts with a year (basic ISO-8601 check).
         let ts = json["timestamp"].as_str().unwrap();
-        assert!(
-            ts.starts_with("20"),
-            "Timestamp should be ISO-8601: {ts}"
-        );
+        assert!(ts.starts_with("20"), "Timestamp should be ISO-8601: {ts}");
 
         // Scenario ID has colon separator.
         let sid = json["scenario_id"].as_str().unwrap();

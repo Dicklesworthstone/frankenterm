@@ -11,11 +11,11 @@ use frankenterm_core::beads_types::{
 };
 use frankenterm_core::plan::{MissionAgentAvailability, MissionAgentCapabilityProfile};
 use frankenterm_core::planner_features::{
-    extract_planner_features, extract_planner_features_all, score_candidates,
-    solve_assignments, ConflictPair, EffortBucket, GovernorAction, GovernorConfig,
-    MissionProfile, MissionProfileKind, PlannerExtractionConfig, PlannerExtractionContext,
-    PlannerFeatureVector, PlannerWeights, SafetyGate, ScoredCandidate, ScorerConfig,
-    ScorerInput, SolverConfig, ThrashGovernor, UtilityPolicyTuner,
+    ConflictPair, EffortBucket, GovernorAction, GovernorConfig, MissionProfile, MissionProfileKind,
+    PlannerExtractionConfig, PlannerExtractionContext, PlannerFeatureVector, PlannerWeights,
+    SafetyGate, ScoredCandidate, ScorerConfig, ScorerInput, SolverConfig, ThrashGovernor,
+    UtilityPolicyTuner, extract_planner_features, extract_planner_features_all, score_candidates,
+    solve_assignments,
 };
 
 // ── Strategies ────────────────────────────────────────────────────────────────
@@ -76,12 +76,12 @@ fn arb_readiness_report(n: usize) -> impl Strategy<Value = BeadReadinessReport> 
             // Deduplicate
             let unique: Vec<String> = {
                 let mut seen = std::collections::HashSet::new();
-                ids.into_iter().filter(|id| seen.insert(id.clone())).collect()
+                ids.into_iter()
+                    .filter(|id| seen.insert(id.clone()))
+                    .collect()
             };
-            let candidates_strat: Vec<_> = unique
-                .iter()
-                .map(|id| arb_candidate(id.clone()))
-                .collect();
+            let candidates_strat: Vec<_> =
+                unique.iter().map(|id| arb_candidate(id.clone())).collect();
             candidates_strat
         })
         .prop_map(|candidates| {
@@ -99,9 +99,17 @@ fn arb_readiness_report(n: usize) -> impl Strategy<Value = BeadReadinessReport> 
 }
 
 fn arb_extraction_config() -> impl Strategy<Value = PlannerExtractionConfig> {
-    (1usize..20, 1usize..15, 1.0f64..500.0, 0.0f64..1.0, 0.0f64..1.0, 0.0f64..1.0, 0.0f64..1.0)
-        .prop_map(
-            |(max_unblock, max_depth, max_stale, iuw, idw, upw, usw)| PlannerExtractionConfig {
+    (
+        1usize..20,
+        1usize..15,
+        1.0f64..500.0,
+        0.0f64..1.0,
+        0.0f64..1.0,
+        0.0f64..1.0,
+        0.0f64..1.0,
+    )
+        .prop_map(|(max_unblock, max_depth, max_stale, iuw, idw, upw, usw)| {
+            PlannerExtractionConfig {
                 max_unblock_count: max_unblock,
                 max_critical_depth: max_depth,
                 max_staleness_hours: max_stale,
@@ -109,32 +117,46 @@ fn arb_extraction_config() -> impl Strategy<Value = PlannerExtractionConfig> {
                 impact_depth_weight: idw,
                 urgency_priority_weight: upw,
                 urgency_staleness_weight: usw,
-            },
-        )
+            }
+        })
 }
 
 fn arb_planner_weights() -> impl Strategy<Value = PlannerWeights> {
-    (0.0f64..1.0, 0.0f64..1.0, 0.0f64..1.0, 0.0f64..1.0, 0.0f64..1.0).prop_map(
-        |(impact, urgency, risk, fit, confidence)| PlannerWeights {
-            impact,
-            urgency,
-            risk,
-            fit,
-            confidence,
-        },
+    (
+        0.0f64..1.0,
+        0.0f64..1.0,
+        0.0f64..1.0,
+        0.0f64..1.0,
+        0.0f64..1.0,
     )
-}
-
-fn arb_feature_vector() -> impl Strategy<Value = PlannerFeatureVector> {
-    (arb_bead_id(), 0.0f64..=1.0, 0.0f64..=1.0, 0.0f64..=1.0, 0.0f64..=1.0, 0.0f64..=1.0)
-        .prop_map(|(id, impact, urgency, risk, fit, confidence)| PlannerFeatureVector {
-            bead_id: id,
+        .prop_map(|(impact, urgency, risk, fit, confidence)| PlannerWeights {
             impact,
             urgency,
             risk,
             fit,
             confidence,
         })
+}
+
+fn arb_feature_vector() -> impl Strategy<Value = PlannerFeatureVector> {
+    (
+        arb_bead_id(),
+        0.0f64..=1.0,
+        0.0f64..=1.0,
+        0.0f64..=1.0,
+        0.0f64..=1.0,
+        0.0f64..=1.0,
+    )
+        .prop_map(
+            |(id, impact, urgency, risk, fit, confidence)| PlannerFeatureVector {
+                bead_id: id,
+                impact,
+                urgency,
+                risk,
+                fit,
+                confidence,
+            },
+        )
 }
 
 fn arb_effort_bucket() -> impl Strategy<Value = EffortBucket> {
@@ -170,7 +192,14 @@ fn arb_scorer_input() -> impl Strategy<Value = ScorerInput> {
 }
 
 fn arb_scorer_config() -> impl Strategy<Value = ScorerConfig> {
-    (arb_planner_weights(), 0.0f64..0.5, 1.0f64..2.0, 1.0f64..2.0, 0.0f64..0.5, 0.0001f64..0.01)
+    (
+        arb_planner_weights(),
+        0.0f64..0.5,
+        1.0f64..2.0,
+        1.0f64..2.0,
+        0.0f64..0.5,
+        0.0001f64..0.01,
+    )
         .prop_map(|(weights, ew, sb, rb, mct, tbe)| ScorerConfig {
             weights,
             effort_weight: ew,

@@ -4,10 +4,9 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 
 use frankenterm_core::runtime_health::{
-    CheckStatus, HealthCheckData, HealthCheckRegistry, IncidentEnrichment,
-    IncidentEnrichmentData, RemediationEffort, RemediationHint,
-    RuntimeHealthCheck, check_failure_patterns, check_scope_health, check_telemetry_log,
-    check_tier_distribution,
+    CheckStatus, HealthCheckData, HealthCheckRegistry, IncidentEnrichment, IncidentEnrichmentData,
+    RemediationEffort, RemediationHint, RuntimeHealthCheck, check_failure_patterns,
+    check_scope_health, check_telemetry_log, check_tier_distribution,
 };
 use frankenterm_core::runtime_telemetry::{
     FailureClass, HealthTier, RuntimePhase, RuntimeTelemetryEventBuilder, RuntimeTelemetryKind,
@@ -59,21 +58,16 @@ fn arb_runtime_phase() -> impl Strategy<Value = RuntimePhase> {
 }
 
 fn arb_health_check() -> impl Strategy<Value = RuntimeHealthCheck> {
-    (
-        arb_check_status(),
-        arb_health_tier(),
-        "[a-z_]{3,10}",
-    )
-        .prop_map(|(status, tier, id)| {
-            let mut check = match status {
-                CheckStatus::Pass => RuntimeHealthCheck::pass(&id, &id, "test"),
-                CheckStatus::Warn => RuntimeHealthCheck::warn(&id, &id, "test"),
-                CheckStatus::Fail => RuntimeHealthCheck::fail(&id, &id, "test"),
-                CheckStatus::Skip => RuntimeHealthCheck::skip(&id, &id, "test"),
-            };
-            check.tier = tier;
-            check
-        })
+    (arb_check_status(), arb_health_tier(), "[a-z_]{3,10}").prop_map(|(status, tier, id)| {
+        let mut check = match status {
+            CheckStatus::Pass => RuntimeHealthCheck::pass(&id, &id, "test"),
+            CheckStatus::Warn => RuntimeHealthCheck::warn(&id, &id, "test"),
+            CheckStatus::Fail => RuntimeHealthCheck::fail(&id, &id, "test"),
+            CheckStatus::Skip => RuntimeHealthCheck::skip(&id, &id, "test"),
+        };
+        check.tier = tier;
+        check
+    })
 }
 
 // =============================================================================

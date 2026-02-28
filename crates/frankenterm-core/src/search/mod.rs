@@ -56,15 +56,15 @@ pub use hybrid_search::{
     FusedResult, FusionBackend, HybridSearchService, SearchMode, TwoTierMetrics, blend_two_tier,
     kendall_tau, rrf_fuse,
 };
-pub use indexing_pipeline::{
-    ContentIndexingPipeline, PaneWatermark, PipelineConfig, PipelineSkipReason, PipelineState,
-    PipelineStatus, PipelineTickReport,
-};
 pub use indexing::{
     CassContentHashProvider, CommandBlockExtractionConfig, IndexFlushReason, IndexableDocument,
     IndexedDocument, IndexingConfig, IndexingIngestReport, IndexingTickResult, ScrollbackLine,
     SearchDocumentSource, SearchIndex, SearchIndexError, SearchIndexStats, chunk_scrollback_lines,
     extract_agent_artifacts, extract_command_output_blocks,
+};
+pub use indexing_pipeline::{
+    ContentIndexingPipeline, PaneWatermark, PipelineConfig, PipelineSkipReason, PipelineState,
+    PipelineStatus, PipelineTickReport,
 };
 #[cfg(feature = "frankensearch")]
 pub use reranker::{FrankenSearchRerankAdapter, apply_frankensearch_rerank_scores};

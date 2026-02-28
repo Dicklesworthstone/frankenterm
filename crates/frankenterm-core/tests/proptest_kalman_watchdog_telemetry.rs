@@ -70,8 +70,8 @@ fn observe_unmatched_component() {
     let wd_config = AdaptiveWatchdogConfig::default();
     let mut wd = AdaptiveWatchdog::with_fallbacks(wd_config, &[(Component::Capture, 5000)]);
 
-    wd.observe(Component::Capture, 1000);    // matched
-    wd.observe(Component::Discovery, 2000);  // NOT matched (not in fallbacks)
+    wd.observe(Component::Capture, 1000); // matched
+    wd.observe(Component::Discovery, 2000); // NOT matched (not in fallbacks)
 
     let snap = wd.telemetry().snapshot();
     assert_eq!(snap.observations, 2);
@@ -163,8 +163,7 @@ fn snapshot_serde_roundtrip() {
         status_hung: 2,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: AdaptiveWatchdogTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: AdaptiveWatchdogTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 
@@ -193,7 +192,9 @@ fn mixed_operations() {
     assert_eq!(snap.classifications, 1);
     assert_eq!(snap.resets, 1);
     // 4 from check_health + 1 from classify = 5 status counts total
-    assert!(snap.status_healthy + snap.status_degraded + snap.status_critical + snap.status_hung == 5);
+    assert!(
+        snap.status_healthy + snap.status_degraded + snap.status_critical + snap.status_hung == 5
+    );
 }
 
 // =============================================================================

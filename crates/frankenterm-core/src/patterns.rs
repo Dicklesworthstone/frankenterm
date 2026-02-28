@@ -1269,9 +1269,9 @@ fn builtin_codex_pack() -> PatternPack {
                 ),
                 description: "Codex rate limit detected - provider throttling active".to_string(),
                 remediation: Some("Wait for cooldown or switch to alternate account/provider".to_string()),
-                workflow: Some("handle_rate_limit".to_string()),
+                workflow: Some("handle_usage_limits".to_string()),
                 manual_fix: Some("Wait for rate limit cooldown, or switch to a different account".to_string()),
-                preview_command: Some("ft workflow run handle_rate_limit --pane {pane} --dry-run".to_string()),
+                preview_command: Some("ft workflow run handle_usage_limits --pane {pane} --dry-run".to_string()),
                 learn_more_url: None,
             },
         ],
@@ -1411,9 +1411,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 ),
                 description: "Claude Code rate limit detected - Anthropic throttling active".to_string(),
                 remediation: Some("Wait for cooldown or switch to alternate account".to_string()),
-                workflow: Some("handle_rate_limit".to_string()),
+                workflow: Some("handle_claude_code_limits".to_string()),
                 manual_fix: Some("Wait for rate limit cooldown, or switch Anthropic account".to_string()),
-                preview_command: Some("ft workflow run handle_rate_limit --pane {pane} --dry-run".to_string()),
+                preview_command: Some("ft workflow run handle_claude_code_limits --pane {pane} --dry-run".to_string()),
                 learn_more_url: None,
             },
             // Auth login required (browser auth flow)
@@ -1716,9 +1716,9 @@ fn builtin_gemini_pack() -> PatternPack {
                 ),
                 description: "Gemini rate limit detected - Google API throttling active".to_string(),
                 remediation: Some("Wait for cooldown or switch to alternate model/account".to_string()),
-                workflow: Some("handle_rate_limit".to_string()),
+                workflow: Some("handle_gemini_quota".to_string()),
                 manual_fix: Some("Wait for rate limit cooldown, or switch to a different Google account".to_string()),
-                preview_command: Some("ft workflow run handle_rate_limit --pane {pane} --dry-run".to_string()),
+                preview_command: Some("ft workflow run handle_gemini_quota --pane {pane} --dry-run".to_string()),
                 learn_more_url: None,
             },
             // Session summary
@@ -1953,8 +1953,7 @@ impl PatternEngine {
 
         let index = self.index();
 
-        if self.quick_reject_enabled
-            && !Self::quick_reject_with_index(index, text, &self.telemetry)
+        if self.quick_reject_enabled && !Self::quick_reject_with_index(index, text, &self.telemetry)
         {
             self.telemetry.quick_rejects.fetch_add(1, Ordering::Relaxed);
             return Vec::new();
@@ -2217,8 +2216,7 @@ impl PatternEngine {
     ) -> (Vec<Detection>, Vec<MatchTrace>) {
         let index = self.index();
 
-        if self.quick_reject_enabled
-            && !Self::quick_reject_with_index(index, text, &self.telemetry)
+        if self.quick_reject_enabled && !Self::quick_reject_with_index(index, text, &self.telemetry)
         {
             self.telemetry.quick_rejects.fetch_add(1, Ordering::Relaxed);
             return (Vec::new(), Vec::new());
@@ -2787,9 +2785,7 @@ impl PatternEngine {
                     let window = &text[start..end];
                     telemetry.bloom_checks.fetch_add(1, Ordering::Relaxed);
                     if bloom.check(window) {
-                        telemetry
-                            .bloom_positives
-                            .fetch_add(1, Ordering::Relaxed);
+                        telemetry.bloom_positives.fetch_add(1, Ordering::Relaxed);
                         // Bloom says "possibly present" - need full matching
                         return true;
                     }

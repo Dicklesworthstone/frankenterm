@@ -14,9 +14,9 @@ use frankenterm_core::mission_events::{
     MissionEventBuilder, MissionEventKind, MissionEventLog, MissionEventLogConfig,
 };
 use frankenterm_core::mission_loop::{
-    ActiveBeadClaim, ConflictDetectionConfig, DeconflictionStrategy, KnownReservation,
-    MissionLoop, MissionLoopConfig, MissionSafetyEnvelopeConfig, MissionTrigger,
-    OperatorOverride, OperatorOverrideKind, format_operator_report_plain,
+    ActiveBeadClaim, ConflictDetectionConfig, DeconflictionStrategy, KnownReservation, MissionLoop,
+    MissionLoopConfig, MissionSafetyEnvelopeConfig, MissionTrigger, OperatorOverride,
+    OperatorOverrideKind, format_operator_report_plain,
 };
 use frankenterm_core::plan::MissionAgentAvailability;
 use frankenterm_core::plan::MissionAgentCapabilityProfile;
@@ -432,8 +432,7 @@ fn conflict_detection_with_file_reservation_overlap() {
         },
     ];
 
-    let report =
-        ml.detect_conflicts(&decision.assignment_set, &reservations, &[], 1000, &issues);
+    let report = ml.detect_conflicts(&decision.assignment_set, &reservations, &[], 1000, &issues);
 
     assert!(
         !report.conflicts.is_empty(),
@@ -463,8 +462,7 @@ fn conflict_detection_active_claim_collision() {
         claimed_at_ms: 500,
     }];
 
-    let report =
-        ml.detect_conflicts(&decision.assignment_set, &[], &active_claims, 1000, &issues);
+    let report = ml.detect_conflicts(&decision.assignment_set, &[], &active_claims, 1000, &issues);
 
     if decision
         .assignment_set
@@ -786,7 +784,11 @@ fn multiple_triggers_of_same_type_all_queued() {
 fn decision_extraction_summary_populated() {
     let mut ml = MissionLoop::new(MissionLoopConfig::default());
     let agents = vec![ready_agent("agent-a")];
-    let issues = vec![open_bead("b-1", 1), open_bead("b-2", 2), open_bead("b-3", 3)];
+    let issues = vec![
+        open_bead("b-1", 1),
+        open_bead("b-2", 2),
+        open_bead("b-3", 3),
+    ];
 
     let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
 
@@ -838,7 +840,10 @@ fn e2e_operator_journey_monitor_intervene_recover() {
 
     let d2 = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &c);
     for a in &d2.assignment_set.assignments {
-        assert_ne!(a.agent_id, "agent-b", "Excluded agent should not be assigned");
+        assert_ne!(
+            a.agent_id, "agent-b",
+            "Excluded agent should not be assigned"
+        );
     }
 
     // Phase 3: Issue resolved — clear override

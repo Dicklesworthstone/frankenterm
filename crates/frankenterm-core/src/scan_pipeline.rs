@@ -27,7 +27,9 @@ use std::collections::HashMap;
 
 use crate::byte_compression::{ByteCompressor, CompressionLevel, CompressionStats};
 use crate::pattern_trigger::{TriggerCategory, TriggerScanResult, TriggerScanner};
-use crate::simd_scan::{scan_newlines_and_ansi, scan_newlines_and_ansi_with_state, OutputScanMetrics, OutputScanState};
+use crate::simd_scan::{
+    OutputScanMetrics, OutputScanState, scan_newlines_and_ansi, scan_newlines_and_ansi_with_state,
+};
 
 // =============================================================================
 // Configuration
@@ -309,10 +311,13 @@ impl ScanPipeline {
     ///
     /// Returns the incremental metrics for this chunk. Full accumulated
     /// state is available on `state`.
-    pub fn process_chunk(&self, bytes: &[u8], state: &mut ChunkedPipelineState) -> ScanMetricsSummary {
+    pub fn process_chunk(
+        &self,
+        bytes: &[u8],
+        state: &mut ChunkedPipelineState,
+    ) -> ScanMetricsSummary {
         // Stage 1: Stateful SIMD metrics scan (cross-boundary aware)
-        let chunk_metrics =
-            scan_newlines_and_ansi_with_state(bytes, &mut state.scan_state);
+        let chunk_metrics = scan_newlines_and_ansi_with_state(bytes, &mut state.scan_state);
 
         // Accumulate metrics
         state.accumulated_metrics.newline_count += chunk_metrics.newline_count;
@@ -374,7 +379,9 @@ impl ScanPipeline {
             && !state.uncompressed_buffer.is_empty()
             && state.uncompressed_buffer.len() >= self.config.compression_threshold
         {
-            let (blob, comp_stats) = self.compressor.compress_with_stats(&state.uncompressed_buffer);
+            let (blob, comp_stats) = self
+                .compressor
+                .compress_with_stats(&state.uncompressed_buffer);
             (Some(blob), Some(comp_stats))
         } else {
             (None, None)
@@ -532,13 +539,9 @@ mod tests {
 
     #[test]
     fn pipeline_with_custom_triggers() {
-        let scanner = TriggerScanner::new(vec![
-            TriggerPattern::new("XYZZY", TriggerCategory::Custom),
-        ]);
-        let pipeline = ScanPipeline::with_custom_triggers(
-            ScanPipelineConfig::default(),
-            scanner,
-        );
+        let scanner =
+            TriggerScanner::new(vec![TriggerPattern::new("XYZZY", TriggerCategory::Custom)]);
+        let pipeline = ScanPipeline::with_custom_triggers(ScanPipelineConfig::default(), scanner);
         let output = pipeline.process(b"XYZZY detected\n");
         let triggers = output.triggers.as_ref().unwrap();
         let custom = triggers.get(&TriggerCategory::Custom).copied().unwrap_or(0);

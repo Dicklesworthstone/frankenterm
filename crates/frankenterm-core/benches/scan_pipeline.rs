@@ -3,13 +3,9 @@
 //! Measures end-to-end throughput of the 3-stage pipeline (SIMD metrics +
 //! Aho-Corasick triggers + zstd compression) in both batch and chunked modes.
 
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use frankenterm_core::scan_pipeline::{ChunkedPipelineState, ScanPipeline, ScanPipelineConfig};
 use std::hint::black_box;
-use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
-use frankenterm_core::scan_pipeline::{
-    ChunkedPipelineState, ScanPipeline, ScanPipelineConfig,
-};
 
 // =============================================================================
 // Payload generators

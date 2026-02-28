@@ -306,8 +306,7 @@ fn stream_ingester_snapshot_serde_roundtrip() {
         overflow_pending: 1,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: StreamIngesterTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: StreamIngesterTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 

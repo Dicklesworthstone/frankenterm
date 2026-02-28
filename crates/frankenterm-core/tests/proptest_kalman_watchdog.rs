@@ -21,8 +21,9 @@
 use proptest::prelude::*;
 
 use frankenterm_core::kalman_watchdog::{
-    AdaptiveHealthReport, AdaptiveWatchdog, AdaptiveWatchdogConfig, ComponentClassification,
-    AdaptiveWatchdogTelemetrySnapshot, ComponentTracker, HealthClassification, KalmanFilter,
+    AdaptiveHealthReport, AdaptiveWatchdog, AdaptiveWatchdogConfig,
+    AdaptiveWatchdogTelemetrySnapshot, ComponentClassification, ComponentTracker,
+    HealthClassification, KalmanFilter,
 };
 use frankenterm_core::watchdog::{Component, HealthStatus};
 

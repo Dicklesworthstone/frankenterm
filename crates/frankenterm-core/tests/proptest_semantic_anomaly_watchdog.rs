@@ -5,7 +5,9 @@
 //! bytes, shedding under capacity pressure); metrics accounting consistency;
 //! and config default invariants.
 
-use frankenterm_core::semantic_anomaly::{ConformalAnomalyConfig, ConformalShock, EntropyGateConfig};
+use frankenterm_core::semantic_anomaly::{
+    ConformalAnomalyConfig, ConformalShock, EntropyGateConfig,
+};
 use frankenterm_core::semantic_anomaly_watchdog::{
     SemanticAnomalyEvent, WatchdogConfig, WatchdogMetricsSnapshot,
 };
@@ -127,7 +129,7 @@ fn arb_conformal_shock() -> impl Strategy<Value = ConformalShock> {
     (
         (0..=1000u64).prop_map(|v| v as f32 / 1000.0), // distance: 0.0..1.0
         (0..=1000u64).prop_map(|v| v as f64 / 1000.0), // p_value: 0.0..1.0
-        (1..=50u64).prop_map(|v| v as f64 / 100.0),     // alpha: 0.01..0.50
+        (1..=50u64).prop_map(|v| v as f64 / 100.0),    // alpha: 0.01..0.50
         1..=500usize,
         (0..=1000u64).prop_map(|v| v as f32 / 1000.0), // median: 0.0..1.0
     )

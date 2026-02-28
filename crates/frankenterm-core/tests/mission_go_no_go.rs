@@ -8,11 +8,13 @@
 
 use std::collections::HashMap;
 
-use frankenterm_core::beads_types::{BeadDependencyRef, BeadIssueDetail, BeadIssueType, BeadStatus};
+use frankenterm_core::beads_types::{
+    BeadDependencyRef, BeadIssueDetail, BeadIssueType, BeadStatus,
+};
 use frankenterm_core::mission_events::{MissionEventLog, MissionEventLogConfig};
 use frankenterm_core::mission_loop::{
-    MissionLoop, MissionLoopConfig, MissionSafetyEnvelopeConfig, MissionTrigger,
-    OperatorOverride, OperatorOverrideKind,
+    MissionLoop, MissionLoopConfig, MissionSafetyEnvelopeConfig, MissionTrigger, OperatorOverride,
+    OperatorOverrideKind,
 };
 use frankenterm_core::plan::{MissionAgentAvailability, MissionAgentCapabilityProfile};
 use frankenterm_core::planner_features::{MissionRuntimeConfig, PlannerExtractionContext};
@@ -22,7 +24,7 @@ use frankenterm_core::runtime_health::{
 use frankenterm_core::runtime_telemetry::RuntimePhase;
 use frankenterm_core::tx_idempotency::{IdempotencyKey, StepOutcome, TxExecutionLedger, TxPhase};
 use frankenterm_core::tx_observability::{
-    build_forensic_bundle, BundleClassification, RedactionPolicy, TxObservabilityConfig,
+    BundleClassification, RedactionPolicy, TxObservabilityConfig, build_forensic_bundle,
 };
 use frankenterm_core::tx_plan_compiler::{
     CompensatingAction, CompensationKind, StepRisk, TxPlan, TxRiskSummary, TxStep,
@@ -138,10 +140,26 @@ fn obs_config() -> TxObservabilityConfig {
 #[test]
 fn readiness_all_checks_pass_healthy_report() {
     let mut reg = HealthCheckRegistry::new();
-    reg.register(RuntimeHealthCheck::pass("mission.config", "Config", "valid"));
-    reg.register(RuntimeHealthCheck::pass("mission.safety", "Safety", "envelope ok"));
-    reg.register(RuntimeHealthCheck::pass("mission.agents", "Agents", "3 ready"));
-    reg.register(RuntimeHealthCheck::pass("mission.beads", "Beads", "backlog ok"));
+    reg.register(RuntimeHealthCheck::pass(
+        "mission.config",
+        "Config",
+        "valid",
+    ));
+    reg.register(RuntimeHealthCheck::pass(
+        "mission.safety",
+        "Safety",
+        "envelope ok",
+    ));
+    reg.register(RuntimeHealthCheck::pass(
+        "mission.agents",
+        "Agents",
+        "3 ready",
+    ));
+    reg.register(RuntimeHealthCheck::pass(
+        "mission.beads",
+        "Beads",
+        "backlog ok",
+    ));
     let report = reg.build_report();
     assert!(report.overall_healthy(), "all-pass should be healthy");
     assert!(!report.has_warnings());
@@ -152,7 +170,11 @@ fn readiness_all_checks_pass_healthy_report() {
 #[test]
 fn readiness_single_failure_blocks_go() {
     let mut reg = HealthCheckRegistry::new();
-    reg.register(RuntimeHealthCheck::pass("mission.config", "Config", "valid"));
+    reg.register(RuntimeHealthCheck::pass(
+        "mission.config",
+        "Config",
+        "valid",
+    ));
     reg.register(RuntimeHealthCheck::fail(
         "mission.safety",
         "Safety",
@@ -169,7 +191,11 @@ fn readiness_single_failure_blocks_go() {
 #[test]
 fn readiness_warning_does_not_block_go() {
     let mut reg = HealthCheckRegistry::new();
-    reg.register(RuntimeHealthCheck::pass("mission.config", "Config", "valid"));
+    reg.register(RuntimeHealthCheck::pass(
+        "mission.config",
+        "Config",
+        "valid",
+    ));
     reg.register(RuntimeHealthCheck::warn(
         "mission.perf",
         "Performance",
@@ -240,7 +266,14 @@ fn evidence_forensic_bundle_captures_plan_and_ledger() {
 
     let config = obs_config();
     let bundle = build_forensic_bundle(
-        &plan, &ledger, &[], None, "test-gen", "INC-001", 2_000, &config,
+        &plan,
+        &ledger,
+        &[],
+        None,
+        "test-gen",
+        "INC-001",
+        2_000,
+        &config,
     );
 
     assert_eq!(bundle.plan.plan_id, "plan-go-1");
@@ -306,7 +339,14 @@ fn evidence_redaction_policy_maximum_strips_categories() {
     config.redaction_policy = RedactionPolicy::maximum();
     config.default_classification = BundleClassification::ExternalAudit;
     let bundle = build_forensic_bundle(
-        &plan, &ledger, &[], None, "test-gen", "INC-002", 2_000, &config,
+        &plan,
+        &ledger,
+        &[],
+        None,
+        "test-gen",
+        "INC-002",
+        2_000,
+        &config,
     );
 
     assert!(
@@ -348,7 +388,14 @@ fn evidence_no_redaction_preserves_all_data() {
     let mut config = obs_config();
     config.redaction_policy = RedactionPolicy::none();
     let bundle = build_forensic_bundle(
-        &plan, &ledger, &[], None, "test-gen", "INC-003", 2_000, &config,
+        &plan,
+        &ledger,
+        &[],
+        None,
+        "test-gen",
+        "INC-003",
+        2_000,
+        &config,
     );
 
     assert_eq!(bundle.redaction.fields_redacted, 0);
@@ -480,7 +527,10 @@ fn rollback_completed_ledger_reports_already_complete() {
         resume.recommendation,
         frankenterm_core::tx_idempotency::ResumeRecommendation::AlreadyComplete
     );
-    assert!(is_complete, "completed ledger should recommend AlreadyComplete");
+    assert!(
+        is_complete,
+        "completed ledger should recommend AlreadyComplete"
+    );
 }
 
 #[test]
@@ -625,8 +675,10 @@ fn rubric_bead_readiness_resolution() {
         extra: HashMap::new(),
     };
 
-    let report =
-        frankenterm_core::beads_types::resolve_bead_readiness(&[dependent_issue, prerequisite_issue]);
+    let report = frankenterm_core::beads_types::resolve_bead_readiness(&[
+        dependent_issue,
+        prerequisite_issue,
+    ]);
     assert!(
         report.ready_count() >= 1,
         "at least the unblocked bead should be ready"
@@ -743,12 +795,7 @@ fn dedup_guard_prevents_double_execution() {
     let key = IdempotencyKey::new("plan-1", "step-1", "exec-1");
     assert!(guard.check(&key).is_none(), "first check should be none");
 
-    guard.record(
-        &key,
-        "exec-1",
-        StepOutcome::Success { result: None },
-        1_000,
-    );
+    guard.record(&key, "exec-1", StepOutcome::Success { result: None }, 1_000);
     assert!(
         guard.check(&key).is_some(),
         "second check should find entry"
@@ -869,7 +916,14 @@ fn determinism_forensic_bundle_structure_stable() {
             .unwrap();
         let config = obs_config();
         let bundle = build_forensic_bundle(
-            &plan, &ledger, &[], None, "test-gen", "INC-DET", 2_000, &config,
+            &plan,
+            &ledger,
+            &[],
+            None,
+            "test-gen",
+            "INC-DET",
+            2_000,
+            &config,
         );
         (
             bundle.plan.plan_id.clone(),

@@ -3,13 +3,9 @@
 //! Measures throughput of Aho-Corasick pattern scanning across different
 //! payload sizes, pattern counts, and scan modes (count vs. locate).
 
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use frankenterm_core::pattern_trigger::{TriggerCategory, TriggerPattern, TriggerScanner};
 use std::hint::black_box;
-use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
-use frankenterm_core::pattern_trigger::{
-    TriggerCategory, TriggerPattern, TriggerScanner,
-};
 
 // =============================================================================
 // Payload generators
@@ -190,11 +186,31 @@ fn bench_pattern_count_scaling(c: &mut Criterion) {
 
     let pattern_counts: &[usize] = &[1, 5, 10, 25, 50, 100];
     let base_patterns = [
-        "ERROR", "FATAL", "FAILED", "panic", "segfault", "error[E",
-        "error:", "SIGSEGV", "SIGABRT", "Traceback", "WARNING",
-        "WARN", "warning:", "deprecated", "Finished", "Complete",
-        "Done", "PASSED", "test result:", "Compiling", "Downloading",
-        "Building", "Installing", "Resolving", "tests passed",
+        "ERROR",
+        "FATAL",
+        "FAILED",
+        "panic",
+        "segfault",
+        "error[E",
+        "error:",
+        "SIGSEGV",
+        "SIGABRT",
+        "Traceback",
+        "WARNING",
+        "WARN",
+        "warning:",
+        "deprecated",
+        "Finished",
+        "Complete",
+        "Done",
+        "PASSED",
+        "test result:",
+        "Compiling",
+        "Downloading",
+        "Building",
+        "Installing",
+        "Resolving",
+        "tests passed",
     ];
 
     let mut group = c.benchmark_group("pattern_trigger/pattern_count");
@@ -217,13 +233,9 @@ fn bench_pattern_count_scaling(c: &mut Criterion) {
             .collect();
         let scanner = TriggerScanner::new(patterns);
 
-        group.bench_with_input(
-            BenchmarkId::from_parameter(count),
-            &payload,
-            |b, data| {
-                b.iter(|| scanner.scan_counts(black_box(data)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(count), &payload, |b, data| {
+            b.iter(|| scanner.scan_counts(black_box(data)));
+        });
     }
     group.finish();
 }

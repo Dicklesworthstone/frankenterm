@@ -6,9 +6,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::byte_compression::ByteCompressor;
-use frankenterm_core::scan_pipeline::{
-    ChunkedPipelineState, ScanPipeline, ScanPipelineConfig,
-};
+use frankenterm_core::scan_pipeline::{ChunkedPipelineState, ScanPipeline, ScanPipelineConfig};
 
 // =============================================================================
 // Strategies

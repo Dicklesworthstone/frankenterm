@@ -180,8 +180,7 @@ fn snapshot_serde_roundtrip() {
         actions_force_kill: 2,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: PaneLifecycleTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: PaneLifecycleTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 

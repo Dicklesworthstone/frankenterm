@@ -202,8 +202,8 @@ proptest! {
         for (i, op) in ops.iter().enumerate() {
             match op {
                 0 => { model.observe(test_observation((i + 1) as f64)); }
-                1 => { model.evaluate_action(1.0, &test_covariates()); }
-                2 => { model.report(1.0, &test_covariates()); }
+                1 => { let _ = model.evaluate_action(1.0, &test_covariates()); }
+                2 => { let _ = model.report(1.0, &test_covariates()); }
                 3 => { model.observe(test_observation(0.5)); }
                 4 => { /* no-op */ }
                 _ => unreachable!(),

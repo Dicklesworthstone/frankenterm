@@ -13,7 +13,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::entropy_scheduler::{
-    EntropySchedulerConfig, EntropyScheduler, EntropySchedulerTelemetrySnapshot,
+    EntropyScheduler, EntropySchedulerConfig, EntropySchedulerTelemetrySnapshot,
 };
 
 // =============================================================================
@@ -59,7 +59,7 @@ fn register_pane_counts_all_calls() {
 
     let snap = sched.telemetry().snapshot();
     assert_eq!(snap.panes_registered, 3); // counts all calls
-    assert_eq!(snap.panes_added, 2);      // only unique
+    assert_eq!(snap.panes_added, 2); // only unique
 }
 
 #[test]
@@ -68,8 +68,8 @@ fn unregister_pane_counts_only_existing() {
 
     sched.register_pane(1);
     sched.register_pane(2);
-    sched.unregister_pane(1);   // exists → counted
-    sched.unregister_pane(99);  // doesn't exist → not counted
+    sched.unregister_pane(1); // exists → counted
+    sched.unregister_pane(99); // doesn't exist → not counted
 
     let snap = sched.telemetry().snapshot();
     assert_eq!(snap.panes_unregistered, 1);
@@ -171,8 +171,7 @@ fn snapshot_serde_roundtrip() {
         warmup_completions: 45,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: EntropySchedulerTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: EntropySchedulerTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 
@@ -185,8 +184,8 @@ fn mixed_operations() {
     sched.register_pane(3);
 
     sched.feed_bytes(1, &[1, 2, 3, 4, 5]); // crosses warmup
-    sched.feed_bytes(2, &[10, 20]);          // still in warmup
-    sched.feed_byte(3, 42);                  // still in warmup
+    sched.feed_bytes(2, &[10, 20]); // still in warmup
+    sched.feed_byte(3, 42); // still in warmup
 
     sched.schedule();
     sched.unregister_pane(3);

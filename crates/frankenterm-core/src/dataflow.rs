@@ -53,7 +53,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
@@ -1304,8 +1304,8 @@ mod tests {
 
     #[test]
     fn sink_callback_fires_on_change() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut g = DataflowGraph::new();
         let s = g.add_source("s", Value::Bool(false));
@@ -1325,8 +1325,8 @@ mod tests {
 
     #[test]
     fn sink_callback_not_fired_when_value_unchanged() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let mut g = DataflowGraph::new();
         let s = g.add_source("s", Value::Int(1));
@@ -1356,8 +1356,8 @@ mod tests {
 
     #[test]
     fn orchestration_rule_triggers_and_recovers() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let mut g = DataflowGraph::new();
         let has_error = g.add_source("has_error", Value::Bool(false));
@@ -1417,8 +1417,8 @@ mod tests {
 
     #[test]
     fn sink_panic_isolated_from_propagation() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let mut g = DataflowGraph::new();
         let source = g.add_source("source", Value::Int(0));
@@ -1992,8 +1992,8 @@ mod tests {
 
     #[test]
     fn sink_removed_with_node() {
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         let mut g = DataflowGraph::new();
         let s = g.add_source("s", Value::Int(0));

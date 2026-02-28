@@ -355,8 +355,7 @@ impl ScenarioRunner {
     where
         F: FnOnce(&mut TestEventLogger),
     {
-        let mut logger =
-            TestEventLogger::new(&self.component, &self.bead_id, &self.scenario_name);
+        let mut logger = TestEventLogger::new(&self.component, &self.bead_id, &self.scenario_name);
         if let Some(dir) = self.artifact_dir {
             logger = logger.with_artifact_dir(dir);
         }
@@ -416,8 +415,7 @@ mod tests {
 
     #[test]
     fn logger_scenario_id_format() {
-        let logger =
-            TestEventLogger::new("test.unit", "ft-e34d9.10.6.5", "rrf_fusion");
+        let logger = TestEventLogger::new("test.unit", "ft-e34d9.10.6.5", "rrf_fusion");
         assert_eq!(logger.scenario_id(), "ft_e34d9_10_6_5:rrf_fusion");
     }
 
@@ -511,21 +509,16 @@ mod tests {
             "artifact_path",
         ];
         for field in required {
-            assert!(
-                json.get(field).is_some(),
-                "Missing required field: {field}"
-            );
+            assert!(json.get(field).is_some(), "Missing required field: {field}");
         }
     }
 
     #[test]
     fn scenario_runner_success_path() {
-        let logger = ScenarioRunner::new("test.unit", "ft-test", "runner_success").run(
-            |logger| {
-                logger.checkpoint("step_1");
-                logger.checkpoint("step_2");
-            },
-        );
+        let logger = ScenarioRunner::new("test.unit", "ft-test", "runner_success").run(|logger| {
+            logger.checkpoint("step_1");
+            logger.checkpoint("step_2");
+        });
 
         assert!(logger.all_passed());
         // started + 2 checkpoints + passed = 4
@@ -537,11 +530,9 @@ mod tests {
 
     #[test]
     fn scenario_runner_captures_panic() {
-        let logger = ScenarioRunner::new("test.unit", "ft-test", "runner_panic").run(
-            |_logger| {
-                panic!("intentional test panic");
-            },
-        );
+        let logger = ScenarioRunner::new("test.unit", "ft-test", "runner_panic").run(|_logger| {
+            panic!("intentional test panic");
+        });
 
         assert!(!logger.all_passed());
         assert_eq!(logger.count_outcome(Outcome::Failed), 1);
@@ -578,10 +569,10 @@ mod tests {
 
     #[test]
     fn multiple_scenarios_independent_correlation_ids() {
-        let l1 = ScenarioRunner::new("test.unit", "ft-test", "scenario_a")
-            .run(|l| l.checkpoint("a"));
-        let l2 = ScenarioRunner::new("test.unit", "ft-test", "scenario_b")
-            .run(|l| l.checkpoint("b"));
+        let l1 =
+            ScenarioRunner::new("test.unit", "ft-test", "scenario_a").run(|l| l.checkpoint("a"));
+        let l2 =
+            ScenarioRunner::new("test.unit", "ft-test", "scenario_b").run(|l| l.checkpoint("b"));
 
         assert_ne!(l1.correlation_id(), l2.correlation_id());
         // Each has: started + checkpoint + passed = 3

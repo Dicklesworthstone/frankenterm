@@ -477,22 +477,15 @@ fn bench_cap_enforcement(c: &mut Criterion) {
     // EventDeduplicator: measure overhead of LRU eviction at capacity
     for &cap in &[100_usize, 500, 2000] {
         group.throughput(Throughput::Elements(10_000));
-        group.bench_with_input(
-            BenchmarkId::new("dedup_churn", cap),
-            &cap,
-            |b, &cap| {
-                b.iter(|| {
-                    let mut dedup = EventDeduplicator::with_config(
-                        Duration::from_secs(3600),
-                        cap,
-                    );
-                    for i in 0u64..10_000 {
-                        let key = format!("evt_{i}");
-                        black_box(dedup.check(&key));
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("dedup_churn", cap), &cap, |b, &cap| {
+            b.iter(|| {
+                let mut dedup = EventDeduplicator::with_config(Duration::from_secs(3600), cap);
+                for i in 0u64..10_000 {
+                    let key = format!("evt_{i}");
+                    black_box(dedup.check(&key));
+                }
+            });
+        });
     }
 
     // RateLimitTracker: measure overhead of pane LRU eviction at 256 cap

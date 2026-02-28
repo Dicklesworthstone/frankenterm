@@ -55,7 +55,10 @@ fn repetitive_payload(size: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(size);
     let mut i = 0u64;
     while buf.len() < size {
-        let line = format!("Downloading artifacts... {i}/10000 ({:.1}%)\n", i as f64 / 100.0);
+        let line = format!(
+            "Downloading artifacts... {i}/10000 ({:.1}%)\n",
+            i as f64 / 100.0
+        );
         buf.extend_from_slice(line.as_bytes());
         i += 1;
     }
@@ -140,11 +143,9 @@ fn bench_compression_payload_sizes(c: &mut Criterion) {
 
         let compressor = ByteCompressor::new(CompressionLevel::Default);
 
-        group.bench_with_input(
-            BenchmarkId::new("compress", label),
-            &payload,
-            |b, data| b.iter(|| black_box(compressor.compress(black_box(data)))),
-        );
+        group.bench_with_input(BenchmarkId::new("compress", label), &payload, |b, data| {
+            b.iter(|| black_box(compressor.compress(black_box(data))))
+        });
 
         let compressed = compressor.compress(&payload);
         group.bench_with_input(
@@ -172,11 +173,9 @@ fn bench_compression_payload_types(c: &mut Criterion) {
 
         let compressor = ByteCompressor::new(CompressionLevel::Default);
 
-        group.bench_with_input(
-            BenchmarkId::new("compress", label),
-            &payload,
-            |b, data| b.iter(|| black_box(compressor.compress(black_box(data)))),
-        );
+        group.bench_with_input(BenchmarkId::new("compress", label), &payload, |b, data| {
+            b.iter(|| black_box(compressor.compress(black_box(data))))
+        });
 
         let compressed = compressor.compress(&payload);
         let ratio = payload.len() as f64 / compressed.len() as f64;
@@ -220,20 +219,16 @@ fn bench_dictionary_comparison(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(payload.len() as u64));
 
         let no_dict = ByteCompressor::new(CompressionLevel::Default);
-        let with_dict = ByteCompressor::new(CompressionLevel::Default)
-            .with_dictionary(dict.clone());
+        let with_dict =
+            ByteCompressor::new(CompressionLevel::Default).with_dictionary(dict.clone());
 
-        group.bench_with_input(
-            BenchmarkId::new("no_dict", label),
-            &payload,
-            |b, data| b.iter(|| black_box(no_dict.compress(black_box(data)))),
-        );
+        group.bench_with_input(BenchmarkId::new("no_dict", label), &payload, |b, data| {
+            b.iter(|| black_box(no_dict.compress(black_box(data))))
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("with_dict", label),
-            &payload,
-            |b, data| b.iter(|| black_box(with_dict.compress(black_box(data)))),
-        );
+        group.bench_with_input(BenchmarkId::new("with_dict", label), &payload, |b, data| {
+            b.iter(|| black_box(with_dict.compress(black_box(data))))
+        });
     }
 
     group.finish();
@@ -247,9 +242,8 @@ fn bench_batch_compression(c: &mut Criterion) {
         .map(|i| {
             let mut buf = Vec::new();
             for j in 0..100 {
-                let line = format!(
-                    "\x1b[32m[pane-{i}]\x1b[0m Output line {j}: processing task...\n"
-                );
+                let line =
+                    format!("\x1b[32m[pane-{i}]\x1b[0m Output line {j}: processing task...\n");
                 buf.extend_from_slice(line.as_bytes());
             }
             buf

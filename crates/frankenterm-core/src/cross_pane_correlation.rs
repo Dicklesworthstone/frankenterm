@@ -1213,9 +1213,21 @@ mod tests {
     fn telemetry_ingest_batch_counted() {
         let mut engine = CorrelationEngine::new(CorrelationConfig::default());
         let records = vec![
-            EventRecord { pane_id: 1, event_type: "a".into(), timestamp_ms: 100 },
-            EventRecord { pane_id: 2, event_type: "b".into(), timestamp_ms: 200 },
-            EventRecord { pane_id: 3, event_type: "c".into(), timestamp_ms: 300 },
+            EventRecord {
+                pane_id: 1,
+                event_type: "a".into(),
+                timestamp_ms: 100,
+            },
+            EventRecord {
+                pane_id: 2,
+                event_type: "b".into(),
+                timestamp_ms: 200,
+            },
+            EventRecord {
+                pane_id: 3,
+                event_type: "c".into(),
+                timestamp_ms: 300,
+            },
         ];
         engine.ingest_batch(records);
         assert_eq!(engine.telemetry().snapshot().events_ingested, 3);
@@ -1314,8 +1326,16 @@ mod tests {
 
         // Batch ingest
         engine.ingest_batch(vec![
-            EventRecord { pane_id: 10, event_type: "x".into(), timestamp_ms: 3000 },
-            EventRecord { pane_id: 11, event_type: "y".into(), timestamp_ms: 3100 },
+            EventRecord {
+                pane_id: 10,
+                event_type: "x".into(),
+                timestamp_ms: 3000,
+            },
+            EventRecord {
+                pane_id: 11,
+                event_type: "y".into(),
+                timestamp_ms: 3100,
+            },
         ]);
 
         // Another scan
@@ -1337,8 +1357,7 @@ mod tests {
             events_pruned: 500,
         };
         let json = serde_json::to_string(&snap).unwrap();
-        let back: CorrelationEngineTelemetrySnapshot =
-            serde_json::from_str(&json).unwrap();
+        let back: CorrelationEngineTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
     }
 

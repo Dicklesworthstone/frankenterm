@@ -1577,7 +1577,11 @@ impl OperatorOverrideState {
     /// Clear (deactivate) an override by ID, moving it to history.
     /// Returns `true` if found and cleared.
     pub fn clear(&mut self, override_id: &str, cleared_at_ms: i64) -> bool {
-        if let Some(pos) = self.active.iter().position(|o| o.override_id == override_id) {
+        if let Some(pos) = self
+            .active
+            .iter()
+            .position(|o| o.override_id == override_id)
+        {
             let mut cleared = self.active.remove(pos);
             // Mark expiry as cleared time for audit clarity.
             cleared.expires_at_ms = Some(cleared_at_ms);
@@ -1706,10 +1710,7 @@ impl MissionLoop {
             .iter()
             .any(|existing| existing.override_id == ovr.override_id)
         {
-            return Err(format!(
-                "override ID '{}' already active",
-                ovr.override_id
-            ));
+            return Err(format!("override ID '{}' already active", ovr.override_id));
         }
         self.state.override_state.activate(ovr);
         Ok(())
@@ -1784,9 +1785,11 @@ impl MissionLoop {
             }
         }
         // Re-sort by adjusted score (descending) to preserve deterministic ordering.
-        scored
-            .scored
-            .sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.scored.sort_by(|a, b| {
+            b.final_score
+                .partial_cmp(&a.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // 4. Generate pin assignments (forced assignments bypass solver).
         let pins = self.state.override_state.active_pins();
@@ -2081,12 +2084,24 @@ impl MissionLoop {
         }
 
         let n = window.len() as f64;
-        let avg_throughput = window.iter().map(|m| m.throughput_assignments_per_minute).sum::<f64>() / n;
-        let avg_unblock = window.iter().map(|m| m.unblock_velocity_per_minute).sum::<f64>() / n;
+        let avg_throughput = window
+            .iter()
+            .map(|m| m.throughput_assignments_per_minute)
+            .sum::<f64>()
+            / n;
+        let avg_unblock = window
+            .iter()
+            .map(|m| m.unblock_velocity_per_minute)
+            .sum::<f64>()
+            / n;
         let avg_conflict = window.iter().map(|m| m.conflict_rate).sum::<f64>() / n;
         let avg_churn = window.iter().map(|m| m.planner_churn_rate).sum::<f64>() / n;
         let avg_deny = window.iter().map(|m| m.policy_deny_rate).sum::<f64>() / n;
-        let avg_latency = window.iter().map(|m| m.evaluation_latency_ms as f64).sum::<f64>() / n;
+        let avg_latency = window
+            .iter()
+            .map(|m| m.evaluation_latency_ms as f64)
+            .sum::<f64>()
+            / n;
 
         let overall = if avg_conflict > 0.3 || avg_deny > 0.5 {
             "critical"
@@ -2167,8 +2182,14 @@ pub fn format_operator_report_plain(report: &OperatorStatusReport) -> String {
     out.push_str("=== Mission Status ===\n");
     out.push_str(&format!("  Phase:       {}\n", report.status.phase_label));
     out.push_str(&format!("  Cycles:      {}\n", report.status.cycle_count));
-    out.push_str(&format!("  Assignments: {}\n", report.status.total_assignments));
-    out.push_str(&format!("  Rejections:  {}\n", report.status.total_rejections));
+    out.push_str(&format!(
+        "  Assignments: {}\n",
+        report.status.total_assignments
+    ));
+    out.push_str(&format!(
+        "  Rejections:  {}\n",
+        report.status.total_rejections
+    ));
     if let Some(ts) = report.status.last_evaluation_ms {
         out.push_str(&format!("  Last eval:   {}ms\n", ts));
     }
@@ -3798,8 +3819,8 @@ mod tests {
     #[test]
     fn operator_report_with_explainability() {
         use crate::planner_features::{
-            DecisionExplanation, DecisionOutcome, ExplainabilityReport,
-            ExplanationFactor, FactorPolarity,
+            DecisionExplanation, DecisionOutcome, ExplainabilityReport, ExplanationFactor,
+            FactorPolarity,
         };
 
         let ml = MissionLoop::new(MissionLoopConfig::default());
@@ -3990,8 +4011,7 @@ mod tests {
         let ml = MissionLoop::new(MissionLoopConfig::default());
         let report = ml.generate_operator_report(None, None);
         let json = serde_json::to_string(&report).expect("serialize");
-        let deser: OperatorStatusReport =
-            serde_json::from_str(&json).expect("deserialize");
+        let deser: OperatorStatusReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(deser.status.cycle_count, report.status.cycle_count);
         assert_eq!(deser.status.phase_label, report.status.phase_label);
         assert_eq!(deser.health.overall, report.health.overall);
@@ -4016,7 +4036,10 @@ mod tests {
 
         let j1 = serde_json::to_string(&r1).expect("serialize r1");
         let j2 = serde_json::to_string(&r2).expect("serialize r2");
-        assert_eq!(j1, j2, "Reports must be deterministic across repeated calls");
+        assert_eq!(
+            j1, j2,
+            "Reports must be deterministic across repeated calls"
+        );
     }
 
     #[test]
@@ -4070,9 +4093,7 @@ mod tests {
     #[test]
     fn operator_report_retry_storm_beads_listed() {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
-        ml.state
-            .retry_streaks
-            .insert("storm-bead-1".to_string(), 5);
+        ml.state.retry_streaks.insert("storm-bead-1".to_string(), 5);
         ml.state
             .retry_streaks
             .insert("storm-bead-2".to_string(), 10);
@@ -4100,23 +4121,28 @@ mod tests {
 
         let report = ml.generate_operator_report(None, None);
         let json = serde_json::to_string_pretty(&report).expect("serialize");
-        let deser: OperatorStatusReport =
-            serde_json::from_str(&json).expect("deserialize");
+        let deser: OperatorStatusReport = serde_json::from_str(&json).expect("deserialize");
 
         // Full structural comparison
         assert_eq!(deser.status.cycle_count, report.status.cycle_count);
-        assert_eq!(deser.status.total_assignments, report.status.total_assignments);
-        assert_eq!(deser.status.total_rejections, report.status.total_rejections);
+        assert_eq!(
+            deser.status.total_assignments,
+            report.status.total_assignments
+        );
+        assert_eq!(
+            deser.status.total_rejections,
+            report.status.total_rejections
+        );
         assert_eq!(deser.health.overall, report.health.overall);
-        assert_eq!(deser.conflicts.total_detected, report.conflicts.total_detected);
+        assert_eq!(
+            deser.conflicts.total_detected,
+            report.conflicts.total_detected
+        );
         assert_eq!(
             deser.conflicts.total_auto_resolved,
             report.conflicts.total_auto_resolved
         );
-        assert_eq!(
-            deser.assignment_table.len(),
-            report.assignment_table.len()
-        );
+        assert_eq!(deser.assignment_table.len(), report.assignment_table.len());
     }
 
     #[test]
@@ -4125,8 +4151,8 @@ mod tests {
             MissionEventBuilder, MissionEventKind, MissionEventLog, MissionEventLogConfig,
         };
         use crate::planner_features::{
-            DecisionExplanation, DecisionOutcome, ExplainabilityReport,
-            ExplanationFactor, FactorPolarity,
+            DecisionExplanation, DecisionOutcome, ExplainabilityReport, ExplanationFactor,
+            FactorPolarity,
         };
 
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
@@ -4486,7 +4512,11 @@ mod tests {
             .find(|a| a.bead_id == "b1");
         assert!(pinned.is_some(), "pinned bead should be assigned");
         assert_eq!(pinned.unwrap().agent_id, "alpha");
-        assert_eq!(pinned.unwrap().rank, 1, "pinned assignment should be rank 1");
+        assert_eq!(
+            pinned.unwrap().rank,
+            1,
+            "pinned assignment should be rank 1"
+        );
     }
 
     #[test]
@@ -4552,7 +4582,10 @@ mod tests {
         let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
 
         // Override expired, so bead "a" should NOT be excluded.
-        assert!(ml.active_overrides().is_empty(), "expired override should be evicted");
+        assert!(
+            ml.active_overrides().is_empty(),
+            "expired override should be evicted"
+        );
         let summary = ml.state.last_override_summary.as_ref().unwrap();
         assert_eq!(summary.expired_overrides, 1);
         // Bead "a" should be assignable.
@@ -4561,16 +4594,12 @@ mod tests {
             .assignments
             .iter()
             .any(|a| a.bead_id == "a");
-        let is_rejected_by_gate = decision
-            .assignment_set
-            .rejected
-            .iter()
-            .any(|r| {
-                r.bead_id == "a"
-                    && r.reasons.iter().any(|reason| {
-                        matches!(reason, RejectionReason::SafetyGateDenied { .. })
-                    })
-            });
+        let is_rejected_by_gate = decision.assignment_set.rejected.iter().any(|r| {
+            r.bead_id == "a"
+                && r.reasons
+                    .iter()
+                    .any(|reason| matches!(reason, RejectionReason::SafetyGateDenied { .. }))
+        });
         assert!(
             assigned || !is_rejected_by_gate,
             "expired override should not block bead 'a'"

@@ -12,9 +12,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::watchdog::{
-    HeartbeatRegistry, WatchdogConfig, WatchdogTelemetrySnapshot,
-};
+use frankenterm_core::watchdog::{HeartbeatRegistry, WatchdogConfig, WatchdogTelemetrySnapshot};
 
 // =============================================================================
 // Helpers

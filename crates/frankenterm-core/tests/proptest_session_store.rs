@@ -38,21 +38,11 @@ fn arb_config() -> impl Strategy<Value = SessionStoreConfig> {
 }
 
 fn arb_pane_id() -> impl Strategy<Value = u64> {
-    prop_oneof![
-        Just(0u64),
-        Just(u64::MAX),
-        1..=1000u64,
-        any::<u64>(),
-    ]
+    prop_oneof![Just(0u64), Just(u64::MAX), 1..=1000u64, any::<u64>(),]
 }
 
 fn arb_window_id() -> impl Strategy<Value = u64> {
-    prop_oneof![
-        Just(0u64),
-        Just(u64::MAX),
-        1..=1000u64,
-        any::<u64>(),
-    ]
+    prop_oneof![Just(0u64), Just(u64::MAX), 1..=1000u64, any::<u64>(),]
 }
 
 fn arb_session_id() -> impl Strategy<Value = String> {
@@ -61,9 +51,9 @@ fn arb_session_id() -> impl Strategy<Value = String> {
 
 fn arb_payload() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
-        Just(vec![]),                        // empty
-        prop::collection::vec(any::<u8>(), 1..=8),    // tiny
-        prop::collection::vec(any::<u8>(), 8..=256),  // small
+        Just(vec![]),                                   // empty
+        prop::collection::vec(any::<u8>(), 1..=8),      // tiny
+        prop::collection::vec(any::<u8>(), 8..=256),    // small
         prop::collection::vec(any::<u8>(), 256..=4096), // medium
     ]
 }

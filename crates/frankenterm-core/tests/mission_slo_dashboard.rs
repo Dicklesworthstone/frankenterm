@@ -15,10 +15,9 @@ use frankenterm_core::mission_events::{
     MissionEventBuilder, MissionEventKind, MissionEventLog, MissionEventLogConfig,
 };
 use frankenterm_core::mission_loop::{
-    ConflictDetectionConfig, DeconflictionStrategy, KnownReservation,
-    MissionCycleMetricsSample, MissionLoop, MissionLoopConfig, MissionSafetyEnvelopeConfig,
-    MissionTrigger, OperatorOverride, OperatorOverrideKind, OperatorStatusReport,
-    format_operator_report_plain,
+    ConflictDetectionConfig, DeconflictionStrategy, KnownReservation, MissionCycleMetricsSample,
+    MissionLoop, MissionLoopConfig, MissionSafetyEnvelopeConfig, MissionTrigger, OperatorOverride,
+    OperatorOverrideKind, OperatorStatusReport, format_operator_report_plain,
 };
 use frankenterm_core::plan::{MissionAgentAvailability, MissionAgentCapabilityProfile};
 use frankenterm_core::planner_features::PlannerExtractionContext;
@@ -213,19 +212,14 @@ fn slo_health_fields_within_valid_range() {
 
     // All rate fields should be in [0.0, 1.0]
     assert!(report.health.conflict_rate >= 0.0 && report.health.conflict_rate <= 1.0);
-    assert!(
-        report.health.planner_churn_rate >= 0.0 && report.health.planner_churn_rate <= 1.0
-    );
-    assert!(
-        report.health.policy_deny_rate >= 0.0 && report.health.policy_deny_rate <= 1.0
-    );
+    assert!(report.health.planner_churn_rate >= 0.0 && report.health.planner_churn_rate <= 1.0);
+    assert!(report.health.policy_deny_rate >= 0.0 && report.health.policy_deny_rate <= 1.0);
     assert!(report.health.throughput_assignments_per_minute >= 0.0);
     assert!(report.health.avg_evaluation_latency_ms >= 0.0);
 
     // Overall must be one of the known values
     assert!(
-        ["idle", "healthy", "degraded", "critical"]
-            .contains(&report.health.overall.as_str()),
+        ["idle", "healthy", "degraded", "critical"].contains(&report.health.overall.as_str()),
         "Unknown health overall: {}",
         report.health.overall
     );
@@ -277,15 +271,9 @@ fn evidence_report_json_roundtrip_preserves_all_fields() {
             .abs()
             < 1e-10
     );
-    assert!(
-        (report.health.conflict_rate - rt.health.conflict_rate).abs() < 1e-10
-    );
-    assert!(
-        (report.health.planner_churn_rate - rt.health.planner_churn_rate).abs() < 1e-10
-    );
-    assert!(
-        (report.health.policy_deny_rate - rt.health.policy_deny_rate).abs() < 1e-10
-    );
+    assert!((report.health.conflict_rate - rt.health.conflict_rate).abs() < 1e-10);
+    assert!((report.health.planner_churn_rate - rt.health.planner_churn_rate).abs() < 1e-10);
+    assert!((report.health.policy_deny_rate - rt.health.policy_deny_rate).abs() < 1e-10);
     assert!(
         (report.health.avg_evaluation_latency_ms - rt.health.avg_evaluation_latency_ms).abs()
             < 1e-6
@@ -331,10 +319,7 @@ fn evidence_report_json_has_all_sections() {
         "avg_evaluation_latency_ms",
         "overall",
     ] {
-        assert!(
-            health.get(field).is_some(),
-            "Missing health field: {field}"
-        );
+        assert!(health.get(field).is_some(), "Missing health field: {field}");
     }
 }
 
@@ -463,12 +448,7 @@ fn shadow_metrics_accumulate_across_cycles() {
             &agents,
             &c,
         );
-        shadow.evaluate_cycle(
-            i + 1,
-            (i as i64 + 1) * 30_000,
-            &d.assignment_set,
-            &[],
-        );
+        shadow.evaluate_cycle(i + 1, (i as i64 + 1) * 30_000, &d.assignment_set, &[]);
     }
 
     let metrics = shadow.metrics();

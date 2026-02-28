@@ -22,10 +22,7 @@ use std::sync::Arc;
 /// Create a snapshot engine with an in-memory temp path (operations that
 /// don't touch SQLite still work for trigger counters).
 fn test_engine() -> SnapshotEngine {
-    SnapshotEngine::new(
-        Arc::new(":memory:".to_string()),
-        SnapshotConfig::default(),
-    )
+    SnapshotEngine::new(Arc::new(":memory:".to_string()), SnapshotConfig::default())
 }
 
 fn arb_trigger() -> impl Strategy<Value = SnapshotTrigger> {
@@ -108,8 +105,7 @@ fn snapshot_serde_roundtrip() {
         bytes_persisted: 1_000_000,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: SnapshotEngineTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: SnapshotEngineTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 

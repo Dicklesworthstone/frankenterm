@@ -14,9 +14,9 @@ use std::collections::HashSet;
 
 use frankenterm_core::search::{
     ContentIndexingPipeline, FusedResult, HybridSearchService, IndexableDocument, IndexingConfig,
-    PipelineConfig, PipelineSkipReason, PipelineState, PipelineTickReport,
-    ScrollbackLine, SearchDocumentSource, SearchIndex, SearchMode, TwoTierMetrics,
-    blend_two_tier, kendall_tau, rrf_fuse,
+    PipelineConfig, PipelineSkipReason, PipelineState, PipelineTickReport, ScrollbackLine,
+    SearchDocumentSource, SearchIndex, SearchMode, TwoTierMetrics, blend_two_tier, kendall_tau,
+    rrf_fuse,
 };
 
 // ---------------------------------------------------------------------------
@@ -232,7 +232,11 @@ fn integration_rrf_fusion_duplicate_ids() {
     let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
     // Should deduplicate within the list.
     let unique_ids: HashSet<u64> = ids.iter().copied().collect();
-    assert_eq!(unique_ids.len(), ids.len(), "results should have unique IDs");
+    assert_eq!(
+        unique_ids.len(),
+        ids.len(),
+        "results should have unique IDs"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +346,10 @@ fn integration_two_tier_alpha_zero() {
     // alpha=0 means tier1 scores multiplied by 0, tier2 by 1.
     assert_eq!(results.len(), 2);
     let item1 = results.iter().find(|r| r.id == 1).unwrap();
-    assert!((item1.score - 0.0).abs() < f32::EPSILON, "tier1 score should be ~0 with alpha=0");
+    assert!(
+        (item1.score - 0.0).abs() < f32::EPSILON,
+        "tier1 score should be ~0 with alpha=0"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -359,12 +366,16 @@ fn integration_index_dedup_across_ingests() {
     let doc2 = make_doc("Different content", 1001, Some(0));
 
     // First ingest: both accepted.
-    let r1 = index.ingest_documents(&[doc1.clone(), doc2.clone()], 2000, false, None).unwrap();
+    let r1 = index
+        .ingest_documents(&[doc1.clone(), doc2.clone()], 2000, false, None)
+        .unwrap();
     assert_eq!(r1.accepted_docs, 2);
     assert_eq!(r1.skipped_duplicate_docs, 0);
 
     // Second ingest with same content: both should be deduped.
-    let r2 = index.ingest_documents(&[doc1, doc2], 3000, false, None).unwrap();
+    let r2 = index
+        .ingest_documents(&[doc1, doc2], 3000, false, None)
+        .unwrap();
     assert_eq!(r2.accepted_docs, 0);
     assert_eq!(r2.skipped_duplicate_docs, 2);
 }
@@ -381,14 +392,18 @@ fn integration_index_dedup_with_cass() {
     // We need to compute the hash the same way the index does. Use a known string.
     // Since we can't easily replicate the exact hash, test with empty cass set first.
     let doc = make_doc("Unique content not in cass", 1000, Some(0));
-    let r1 = index.ingest_documents(std::slice::from_ref(&doc), 2000, false, Some(&cass_hashes)).unwrap();
+    let r1 = index
+        .ingest_documents(std::slice::from_ref(&doc), 2000, false, Some(&cass_hashes))
+        .unwrap();
     assert_eq!(r1.accepted_docs, 1);
     assert_eq!(r1.skipped_cass_docs, 0);
 
     // Now add a hash to cass (won't match our doc since hashes are implementation-specific).
     cass_hashes.insert("not_a_matching_hash".to_string());
     let doc2 = make_doc("Another unique doc", 1001, Some(0));
-    let r2 = index.ingest_documents(&[doc2], 3000, false, Some(&cass_hashes)).unwrap();
+    let r2 = index
+        .ingest_documents(&[doc2], 3000, false, Some(&cass_hashes))
+        .unwrap();
     assert_eq!(r2.accepted_docs, 1); // Different hash, should be accepted.
 }
 
@@ -460,7 +475,8 @@ fn integration_index_size_limit() {
     let mut total_accepted = 0usize;
     let mut total_evicted = 0usize;
     for i in 0..50 {
-        let text = format!("Document number {i} with some padding content to take up space in the index");
+        let text =
+            format!("Document number {i} with some padding content to take up space in the index");
         let doc = make_doc(&text, i * 1000 + 1000, Some(0));
         let r = index
             .ingest_documents(&[doc], i * 1000 + 1000, false, None)
@@ -567,13 +583,7 @@ fn integration_concurrent_rrf_fusion() {
     use std::sync::Arc;
     use std::thread;
 
-    let lexical = Arc::new(vec![
-        (1u64, 0.9f32),
-        (2, 0.7),
-        (3, 0.5),
-        (4, 0.3),
-        (5, 0.1),
-    ]);
+    let lexical = Arc::new(vec![(1u64, 0.9f32), (2, 0.7), (3, 0.5), (4, 0.3), (5, 0.1)]);
     let semantic = Arc::new(vec![
         (3u64, 0.95f32),
         (1, 0.8),
@@ -707,10 +717,7 @@ fn integration_pipeline_multi_pane_report() {
                 make_scrollback_line("pane 0 line 2", 200),
             ],
         ),
-        make_pane_content(
-            1,
-            vec![make_scrollback_line("pane 1 line 1", 150)],
-        ),
+        make_pane_content(1, vec![make_scrollback_line("pane 1 line 1", 150)]),
         make_pane_content(2, vec![]), // empty pane
     ];
 
@@ -884,7 +891,10 @@ fn integration_pipeline_max_panes_per_tick() {
         .map(|i| {
             make_pane_content(
                 i,
-                vec![make_scrollback_line(&format!("pane {i} content"), i as i64 * 100 + 100)],
+                vec![make_scrollback_line(
+                    &format!("pane {i} content"),
+                    i as i64 * 100 + 100,
+                )],
             )
         })
         .collect();

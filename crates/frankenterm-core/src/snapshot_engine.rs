@@ -108,16 +108,40 @@ impl Default for SnapshotEngineTelemetry {
 impl std::fmt::Debug for SnapshotEngineTelemetry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotEngineTelemetry")
-            .field("captures_attempted", &self.captures_attempted.load(Ordering::Relaxed))
-            .field("captures_succeeded", &self.captures_succeeded.load(Ordering::Relaxed))
+            .field(
+                "captures_attempted",
+                &self.captures_attempted.load(Ordering::Relaxed),
+            )
+            .field(
+                "captures_succeeded",
+                &self.captures_succeeded.load(Ordering::Relaxed),
+            )
             .field("dedup_skips", &self.dedup_skips.load(Ordering::Relaxed))
-            .field("capture_errors", &self.capture_errors.load(Ordering::Relaxed))
+            .field(
+                "capture_errors",
+                &self.capture_errors.load(Ordering::Relaxed),
+            )
             .field("cleanup_runs", &self.cleanup_runs.load(Ordering::Relaxed))
-            .field("cleanup_removed", &self.cleanup_removed.load(Ordering::Relaxed))
-            .field("triggers_emitted", &self.triggers_emitted.load(Ordering::Relaxed))
-            .field("triggers_accepted", &self.triggers_accepted.load(Ordering::Relaxed))
-            .field("panes_captured", &self.panes_captured.load(Ordering::Relaxed))
-            .field("bytes_persisted", &self.bytes_persisted.load(Ordering::Relaxed))
+            .field(
+                "cleanup_removed",
+                &self.cleanup_removed.load(Ordering::Relaxed),
+            )
+            .field(
+                "triggers_emitted",
+                &self.triggers_emitted.load(Ordering::Relaxed),
+            )
+            .field(
+                "triggers_accepted",
+                &self.triggers_accepted.load(Ordering::Relaxed),
+            )
+            .field(
+                "panes_captured",
+                &self.panes_captured.load(Ordering::Relaxed),
+            )
+            .field(
+                "bytes_persisted",
+                &self.bytes_persisted.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -408,9 +432,7 @@ impl SnapshotEngine {
         ) {
             let last = self.last_state_hash.read().await;
             if last.as_deref() == Some(&state_hash) {
-                self.telemetry
-                    .dedup_skips
-                    .fetch_add(1, Ordering::Relaxed);
+                self.telemetry.dedup_skips.fetch_add(1, Ordering::Relaxed);
                 return Err(SnapshotError::NoChanges);
             }
         }
@@ -463,17 +485,16 @@ impl SnapshotEngine {
 
     /// Run retention cleanup: remove old checkpoints exceeding limits.
     pub async fn cleanup(&self) -> std::result::Result<usize, SnapshotError> {
-        self.telemetry
-            .cleanup_runs
-            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry.cleanup_runs.fetch_add(1, Ordering::Relaxed);
 
         let db_path = Arc::clone(&self.db_path);
         let retention_count = self.config.retention_count;
         let retention_days = self.config.retention_days;
 
-        let removed =
-            Self::spawn_blocking_db(move || cleanup_sync(&db_path, retention_count, retention_days))
-                .await?;
+        let removed = Self::spawn_blocking_db(move || {
+            cleanup_sync(&db_path, retention_count, retention_days)
+        })
+        .await?;
         self.telemetry
             .cleanup_removed
             .fetch_add(removed as u64, Ordering::Relaxed);
@@ -2982,10 +3003,8 @@ mod tests {
 
     #[test]
     fn telemetry_initial_zero() {
-        let engine = SnapshotEngine::new(
-            Arc::new(":memory:".to_string()),
-            SnapshotConfig::default(),
-        );
+        let engine =
+            SnapshotEngine::new(Arc::new(":memory:".to_string()), SnapshotConfig::default());
         let snap = engine.telemetry().snapshot();
         assert_eq!(snap.captures_attempted, 0);
         assert_eq!(snap.captures_succeeded, 0);

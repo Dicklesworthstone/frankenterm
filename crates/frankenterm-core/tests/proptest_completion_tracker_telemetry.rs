@@ -24,7 +24,7 @@ fn make_tracker() -> CompletionTracker {
     CompletionTracker::new(CompletionTrackerConfig {
         default_timeout_ms: 0, // no timeout
         max_active_tokens: 100,
-        retention_ms: 0,       // immediate eviction for testing
+        retention_ms: 0, // immediate eviction for testing
     })
 }
 

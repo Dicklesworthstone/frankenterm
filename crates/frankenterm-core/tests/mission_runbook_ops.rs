@@ -218,7 +218,13 @@ fn failure_inject_empty_bead_list_graceful() {
     let c = ctx();
 
     // No beads available should not panic
-    let d = ml.evaluate(1000, MissionTrigger::CadenceTick, &empty_issues, &agents, &c);
+    let d = ml.evaluate(
+        1000,
+        MissionTrigger::CadenceTick,
+        &empty_issues,
+        &agents,
+        &c,
+    );
     assert!(d.assignment_set.assignments.is_empty());
     assert_eq!(d.extraction_summary.total_candidates, 0);
 }
@@ -256,7 +262,13 @@ fn failure_partial_agent_fleet_maintains_throughput() {
 
     // 1 agent goes offline — remaining agents should still get assignments
     let partial_fleet = vec![agent("a1"), offline("a2"), agent("a3")];
-    let d2 = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &partial_fleet, &c);
+    let d2 = ml.evaluate(
+        31_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &partial_fleet,
+        &c,
+    );
     assert!(!d2.assignment_set.assignments.is_empty());
 
     for a in &d2.assignment_set.assignments {

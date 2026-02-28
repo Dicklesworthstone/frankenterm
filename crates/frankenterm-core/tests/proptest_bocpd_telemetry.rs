@@ -12,9 +12,7 @@
 use proptest::prelude::*;
 use std::time::Duration;
 
-use frankenterm_core::bocpd::{
-    BocpdConfig, BocpdManager, BocpdTelemetrySnapshot, OutputFeatures,
-};
+use frankenterm_core::bocpd::{BocpdConfig, BocpdManager, BocpdTelemetrySnapshot, OutputFeatures};
 
 // =============================================================================
 // Helpers

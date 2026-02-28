@@ -67,16 +67,11 @@ fn bench_rrf_fusion(c: &mut Criterion) {
         let lexical = make_ranked_list(size);
         let semantic = make_ranked_list(size);
         // Reverse semantic to create interesting overlap patterns.
-        let semantic_rev: Vec<(u64, f32)> =
-            semantic.iter().rev().copied().collect();
+        let semantic_rev: Vec<(u64, f32)> = semantic.iter().rev().copied().collect();
 
-        group.bench_with_input(
-            BenchmarkId::new("equal_size", size),
-            &size,
-            |b, _| {
-                b.iter(|| rrf_fuse(black_box(&lexical), black_box(&semantic_rev), 60));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("equal_size", size), &size, |b, _| {
+            b.iter(|| rrf_fuse(black_box(&lexical), black_box(&semantic_rev), 60));
+        });
     }
 
     // Asymmetric: large lexical, small semantic.
@@ -162,35 +157,26 @@ fn bench_indexing_throughput(c: &mut Criterion) {
     for doc_count in [10, 50, 100] {
         let docs = make_indexable_docs(doc_count);
 
-        group.bench_with_input(
-            BenchmarkId::new("ingest", doc_count),
-            &doc_count,
-            |b, _| {
-                b.iter_with_setup(
-                    || {
-                        let tmp = tempfile::tempdir().unwrap();
-                        let config = IndexingConfig {
-                            index_dir: tmp.path().to_path_buf(),
-                            max_index_size_bytes: 100 * 1024 * 1024,
-                            ttl_days: 30,
-                            flush_interval_secs: 60,
-                            flush_docs_threshold: 1000,
-                            max_docs_per_second: 100_000,
-                        };
-                        let index = SearchIndex::open(config).unwrap();
-                        (tmp, index)
-                    },
-                    |(_tmp, mut index)| {
-                        let _ = index.ingest_documents(
-                            black_box(&docs),
-                            black_box(99999),
-                            false,
-                            None,
-                        );
-                    },
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("ingest", doc_count), &doc_count, |b, _| {
+            b.iter_with_setup(
+                || {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let config = IndexingConfig {
+                        index_dir: tmp.path().to_path_buf(),
+                        max_index_size_bytes: 100 * 1024 * 1024,
+                        ttl_days: 30,
+                        flush_interval_secs: 60,
+                        flush_docs_threshold: 1000,
+                        max_docs_per_second: 100_000,
+                    };
+                    let index = SearchIndex::open(config).unwrap();
+                    (tmp, index)
+                },
+                |(_tmp, mut index)| {
+                    let _ = index.ingest_documents(black_box(&docs), black_box(99999), false, None);
+                },
+            );
+        });
     }
 
     group.finish();

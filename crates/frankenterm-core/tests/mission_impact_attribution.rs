@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use frankenterm_core::beads_types::{BeadIssueDetail, BeadIssueType, BeadStatus};
 use frankenterm_core::mission_events::{MissionEventLog, MissionEventLogConfig};
 use frankenterm_core::mission_loop::{
-    MissionCycleMetricsSample, MissionLoop, MissionLoopConfig, MissionTrigger,
-    OperatorOverride, OperatorOverrideKind, OperatorStatusReport,
+    MissionCycleMetricsSample, MissionLoop, MissionLoopConfig, MissionTrigger, OperatorOverride,
+    OperatorOverrideKind, OperatorStatusReport,
 };
 use frankenterm_core::plan::{MissionAgentAvailability, MissionAgentCapabilityProfile};
 use frankenterm_core::planner_features::PlannerExtractionContext;
@@ -102,12 +102,24 @@ fn compute_baseline(samples: &[&MissionCycleMetricsSample]) -> BaselineStats {
         };
     }
     let nf = n as f64;
-    let mean_tp = samples.iter().map(|s| s.throughput_assignments_per_minute).sum::<f64>() / nf;
-    let unblock_vel = samples.iter().map(|s| s.unblock_velocity_per_minute).sum::<f64>() / nf;
+    let mean_tp = samples
+        .iter()
+        .map(|s| s.throughput_assignments_per_minute)
+        .sum::<f64>()
+        / nf;
+    let unblock_vel = samples
+        .iter()
+        .map(|s| s.unblock_velocity_per_minute)
+        .sum::<f64>()
+        / nf;
     let conflict = samples.iter().map(|s| s.conflict_rate).sum::<f64>() / nf;
     let churn = samples.iter().map(|s| s.planner_churn_rate).sum::<f64>() / nf;
     let deny = samples.iter().map(|s| s.policy_deny_rate).sum::<f64>() / nf;
-    let latency = samples.iter().map(|s| s.evaluation_latency_ms as f64).sum::<f64>() / nf;
+    let latency = samples
+        .iter()
+        .map(|s| s.evaluation_latency_ms as f64)
+        .sum::<f64>()
+        / nf;
     let tp_var = samples
         .iter()
         .map(|s| (s.throughput_assignments_per_minute - mean_tp).powi(2))
@@ -179,8 +191,14 @@ fn baseline_single_cycle_equals_that_cycle() {
     let stats = compute_baseline(&samples);
 
     let diff = (stats.mean_throughput - history[0].throughput_assignments_per_minute).abs();
-    assert!(diff < f64::EPSILON, "Single sample baseline must equal itself");
-    assert!(stats.throughput_variance.abs() < f64::EPSILON, "Single sample has zero variance");
+    assert!(
+        diff < f64::EPSILON,
+        "Single sample baseline must equal itself"
+    );
+    assert!(
+        stats.throughput_variance.abs() < f64::EPSILON,
+        "Single sample has zero variance"
+    );
 }
 
 #[test]
@@ -269,7 +287,11 @@ fn impact_churn_decreases_with_stable_assignments() {
             .map(|s| s.planner_churn_rate)
             .collect();
         let avg_late_churn = late_churn.iter().sum::<f64>() / late_churn.len() as f64;
-        assert!(avg_late_churn <= 1.0, "Churn rate bounded: {}", avg_late_churn);
+        assert!(
+            avg_late_churn <= 1.0,
+            "Churn rate bounded: {}",
+            avg_late_churn
+        );
     }
 }
 
@@ -308,7 +330,11 @@ fn attribution_per_bead_assignment_tracking() {
         "Assignment table must not be empty"
     );
 
-    let total: u64 = report.assignment_table.iter().map(|r| r.total_assignments).sum();
+    let total: u64 = report
+        .assignment_table
+        .iter()
+        .map(|r| r.total_assignments)
+        .sum();
     assert!(total > 0, "Total assignments should be positive");
 }
 
@@ -332,7 +358,10 @@ fn attribution_per_agent_workload_distribution() {
         .collect();
 
     let has_assignments = agent_attrs.iter().any(|a| a.total_assignments > 0);
-    assert!(has_assignments, "At least one agent should have assignments");
+    assert!(
+        has_assignments,
+        "At least one agent should have assignments"
+    );
 
     assert!(
         report.health.throughput_assignments_per_minute > 0.0,
@@ -384,10 +413,7 @@ fn attribution_pinned_bead_tracked_separately() {
 
     let report = ml.generate_operator_report(Some(&elog()), None);
 
-    let a2_row = report
-        .assignment_table
-        .iter()
-        .find(|r| r.agent_id == "a2");
+    let a2_row = report.assignment_table.iter().find(|r| r.agent_id == "a2");
     assert!(
         a2_row.is_some(),
         "Agent a2 should appear in assignment table"

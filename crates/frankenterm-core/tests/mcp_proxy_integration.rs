@@ -189,7 +189,10 @@ fn wait_for_proxy_audit_row(db_path: &Path, action_kind: &str) -> (String, Strin
         if let Some(found) = row {
             return found;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for audit action {action_kind}");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for audit action {action_kind}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }

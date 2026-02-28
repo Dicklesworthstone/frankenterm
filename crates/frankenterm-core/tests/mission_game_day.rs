@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use frankenterm_core::beads_types::{BeadIssueDetail, BeadIssueType, BeadStatus};
 use frankenterm_core::mission_events::{MissionEventLog, MissionEventLogConfig};
 use frankenterm_core::mission_loop::{
-    MissionLoop, MissionLoopConfig, MissionSafetyEnvelopeConfig, MissionTrigger,
-    OperatorOverride, OperatorOverrideKind,
+    MissionLoop, MissionLoopConfig, MissionSafetyEnvelopeConfig, MissionTrigger, OperatorOverride,
+    OperatorOverrideKind,
 };
 use frankenterm_core::plan::{MissionAgentAvailability, MissionAgentCapabilityProfile};
 use frankenterm_core::planner_features::PlannerExtractionContext;
@@ -166,7 +166,10 @@ fn emergency_exclude_all_agents_halts_dispatch() {
 
     // Normal cycle first.
     let before = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
-    assert!(before.assignment_set.assignment_count() > 0, "normal cycle should produce assignments");
+    assert!(
+        before.assignment_set.assignment_count() > 0,
+        "normal cycle should produce assignments"
+    );
 
     // Emergency: exclude all agents.
     for i in 0..5 {
@@ -177,7 +180,13 @@ fn emergency_exclude_all_agents_halts_dispatch() {
         .unwrap();
     }
 
-    let after = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+    let after = ml.evaluate(
+        31_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents,
+        &ctx(),
+    );
     assert_eq!(
         after.assignment_set.assignment_count(),
         0,
@@ -246,7 +255,13 @@ fn emergency_stop_latency_under_1ms() {
     }
 
     let start = std::time::Instant::now();
-    let decision = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+    let decision = ml.evaluate(
+        31_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents,
+        &ctx(),
+    );
     let elapsed = start.elapsed();
 
     assert_eq!(decision.assignment_set.assignment_count(), 0);
@@ -314,7 +329,11 @@ fn takeover_exclude_then_pin_selective_routing() {
         .iter()
         .find(|a| a.bead_id == "bead-1")
         .map(|a| a.agent_id.as_str());
-    assert_eq!(bead1_agent, Some("a3"), "pinned bead must go to target agent");
+    assert_eq!(
+        bead1_agent,
+        Some("a3"),
+        "pinned bead must go to target agent"
+    );
 }
 
 #[test]
@@ -470,7 +489,13 @@ fn recovery_clear_overrides_restores_normal_dispatch() {
     for i in 0..3 {
         ml.clear_override(&format!("estop-{i}"), 2000);
     }
-    let recovered = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+    let recovered = ml.evaluate(
+        31_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents,
+        &ctx(),
+    );
     assert!(
         recovered.assignment_set.assignment_count() > 0,
         "clearing overrides must restore normal dispatch"
@@ -494,7 +519,13 @@ fn recovery_partial_override_clear_gradual_restore() {
 
     // Gradually restore: clear agent-0 first.
     ml.clear_override("excl-0", 2000);
-    let partial = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+    let partial = ml.evaluate(
+        31_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents,
+        &ctx(),
+    );
     // Only agent-0 is available now.
     let agent0_only = partial
         .assignment_set
@@ -508,7 +539,13 @@ fn recovery_partial_override_clear_gradual_restore() {
     // Restore all.
     ml.clear_override("excl-1", 3000);
     ml.clear_override("excl-2", 3000);
-    let full = ml.evaluate(61_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+    let full = ml.evaluate(
+        61_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents,
+        &ctx(),
+    );
     assert!(
         full.assignment_set.assignment_count() > 0,
         "full restore should produce assignments"
@@ -547,7 +584,13 @@ fn recovery_ttl_based_auto_expiry() {
     assert!(!agent0_during, "agent-0 should be excluded during TTL");
 
     // Evaluate at t=31000 — override expired.
-    let after = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+    let after = ml.evaluate(
+        31_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents,
+        &ctx(),
+    );
     // Override should have expired; agent-0 may now receive work.
     assert!(
         after.assignment_set.assignment_count() > 0,
@@ -580,7 +623,13 @@ fn recovery_report_reflects_override_state() {
     assert_eq!(overrides_after, 0);
 
     // Report should still be generatable.
-    ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+    ml.evaluate(
+        31_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents,
+        &ctx(),
+    );
     let report_after = ml.generate_operator_report(Some(&log), None);
     // Reports should serialize.
     let _json_before = serde_json::to_value(&report_before).unwrap();
@@ -613,10 +662,7 @@ fn audit_override_correlation_id_preserved() {
     assert_eq!(active[0].override_id, "audit-001");
     assert_eq!(active[0].activated_by, "operator-alice");
     assert_eq!(active[0].reason_code, "incident-123");
-    assert_eq!(
-        active[0].correlation_id,
-        Some("INC-2026-001".to_string())
-    );
+    assert_eq!(active[0].correlation_id, Some("INC-2026-001".to_string()));
 }
 
 #[test]
@@ -657,7 +703,11 @@ fn audit_many_overrides_lifecycle() {
     assert_eq!(ml.active_overrides().len(), 10);
 
     // Verify remaining are the right ones (lifecycle-10 through lifecycle-19).
-    let remaining_ids: Vec<&str> = ml.active_overrides().iter().map(|o| o.override_id.as_str()).collect();
+    let remaining_ids: Vec<&str> = ml
+        .active_overrides()
+        .iter()
+        .map(|o| o.override_id.as_str())
+        .collect();
     for i in 10..20 {
         assert!(
             remaining_ids.contains(&format!("lifecycle-{i}").as_str()),
@@ -689,7 +739,13 @@ fn load_takeover_with_10_agents() {
         ))
         .unwrap();
     }
-    let during = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+    let during = ml.evaluate(
+        31_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents,
+        &ctx(),
+    );
     // Assignments should continue but only through remaining agents.
     let during_agents: Vec<&str> = during
         .assignment_set
@@ -705,7 +761,7 @@ fn load_takeover_with_10_agents() {
                 && !agent_id.starts_with("agent-3")
                 && !agent_id.starts_with("agent-4")
                 || *agent_id == "agent-0" // edge: "agent-0" could match "agent-0X" in sorted
-                // Use direct check instead
+                                          // Use direct check instead
         );
     }
     // No excluded agent should appear.
@@ -736,14 +792,26 @@ fn load_full_swarm_emergency_stop_and_recovery() {
         ))
         .unwrap();
     }
-    let stopped = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+    let stopped = ml.evaluate(
+        31_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents,
+        &ctx(),
+    );
     assert_eq!(stopped.assignment_set.assignment_count(), 0);
 
     // Full recovery.
     for i in 0..20 {
         ml.clear_override(&format!("full-estop-{i}"), 60_000);
     }
-    let recovered = ml.evaluate(91_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+    let recovered = ml.evaluate(
+        91_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents,
+        &ctx(),
+    );
     assert!(
         recovered.assignment_set.assignment_count() > 0,
         "full recovery must restore dispatch"
@@ -769,7 +837,13 @@ fn determinism_emergency_stop_reproducible() {
             ))
             .unwrap();
         }
-        let d = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+        let d = ml.evaluate(
+            31_000,
+            MissionTrigger::CadenceTick,
+            &issues,
+            &agents,
+            &ctx(),
+        );
         d.assignment_set.assignment_count()
     };
     let r1 = run();
@@ -792,11 +866,23 @@ fn determinism_takeover_and_recovery_reproducible() {
             .unwrap();
         ml.apply_override(override_pin("det-pin-0", "bead-0", "agent-1"))
             .unwrap();
-        let d2 = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+        let d2 = ml.evaluate(
+            31_000,
+            MissionTrigger::CadenceTick,
+            &issues,
+            &agents,
+            &ctx(),
+        );
         // Recovery.
         ml.clear_override("det-excl-0", 60_000);
         ml.clear_override("det-pin-0", 60_000);
-        let d3 = ml.evaluate(91_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+        let d3 = ml.evaluate(
+            91_000,
+            MissionTrigger::CadenceTick,
+            &issues,
+            &agents,
+            &ctx(),
+        );
 
         let ids: Vec<Vec<String>> = [d1, d2, d3]
             .iter()
@@ -830,9 +916,21 @@ fn determinism_report_after_drill_stable() {
         ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
         ml.apply_override(override_exclude_agent("det-report-excl", "agent-0"))
             .unwrap();
-        ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+        ml.evaluate(
+            31_000,
+            MissionTrigger::CadenceTick,
+            &issues,
+            &agents,
+            &ctx(),
+        );
         ml.clear_override("det-report-excl", 60_000);
-        ml.evaluate(91_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+        ml.evaluate(
+            91_000,
+            MissionTrigger::CadenceTick,
+            &issues,
+            &agents,
+            &ctx(),
+        );
 
         let report = ml.generate_operator_report(Some(&log), None);
         serde_json::to_value(&report).unwrap()

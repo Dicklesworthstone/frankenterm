@@ -18,7 +18,7 @@ use frankenterm_core::differential_snapshot::{
 };
 use frankenterm_core::session_pane_state::{PaneStateSnapshot, TerminalState};
 use frankenterm_core::session_topology::{
-    PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot, TOPOLOGY_SCHEMA_VERSION,
+    PaneNode, TOPOLOGY_SCHEMA_VERSION, TabSnapshot, TopologySnapshot, WindowSnapshot,
 };
 
 // =============================================================================
@@ -184,7 +184,10 @@ fn auto_compaction_tracked() {
 
     let snap = engine.telemetry().snapshot();
     assert_eq!(snap.diffs_captured, 3);
-    assert!(snap.auto_compactions >= 1, "expected auto-compaction after exceeding chain len");
+    assert!(
+        snap.auto_compactions >= 1,
+        "expected auto-compaction after exceeding chain len"
+    );
 }
 
 #[test]
@@ -225,8 +228,7 @@ fn snapshot_serde_roundtrip() {
         layout_diffs: 5,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: DiffSnapshotTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: DiffSnapshotTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 

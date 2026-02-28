@@ -1497,8 +1497,8 @@ mod tests {
         let snap = wd.telemetry().snapshot();
         assert_eq!(snap.health_checks, 1);
         // At least one status bucket should be incremented
-        let total_statuses = snap.status_healthy + snap.status_degraded
-            + snap.status_critical + snap.status_hung;
+        let total_statuses =
+            snap.status_healthy + snap.status_degraded + snap.status_critical + snap.status_hung;
         assert!(total_statuses >= 1);
     }
 

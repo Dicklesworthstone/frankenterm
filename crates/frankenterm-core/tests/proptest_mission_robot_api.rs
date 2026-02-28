@@ -122,7 +122,15 @@ fn arb_filters() -> impl Strategy<Value = MissionStateFilters> {
         1..200usize,
     )
         .prop_map(
-            |(mission_state, run_state, agent_state, action_state, assignment_id, assignee, limit)| {
+            |(
+                mission_state,
+                run_state,
+                agent_state,
+                action_state,
+                assignment_id,
+                assignee,
+                limit,
+            )| {
                 MissionStateFilters {
                     mission_state,
                     run_state,
@@ -148,7 +156,16 @@ fn arb_counters() -> impl Strategy<Value = MissionAssignmentCounters> {
         0..100usize,
     )
         .prop_map(
-            |(pending_approval, approved, denied, expired, succeeded, failed, cancelled, unresolved)| {
+            |(
+                pending_approval,
+                approved,
+                denied,
+                expired,
+                succeeded,
+                failed,
+                cancelled,
+                unresolved,
+            )| {
                 MissionAssignmentCounters {
                     pending_approval,
                     approved,
@@ -220,7 +237,10 @@ fn arb_failure_entry() -> impl Strategy<Value = MissionFailureCatalogEntry> {
         "[a-z_]{4,15}",
         "[A-Z]{2}-[0-9]{4}",
         prop_oneof![Just("terminal".to_string()), Just("transient".to_string())],
-        prop_oneof![Just("retryable".to_string()), Just("non_retryable".to_string())],
+        prop_oneof![
+            Just("retryable".to_string()),
+            Just("non_retryable".to_string())
+        ],
         "[a-z ]{5,25}",
         "[a-z_]{5,25}",
     )

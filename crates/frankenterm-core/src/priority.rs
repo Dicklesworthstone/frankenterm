@@ -355,7 +355,9 @@ impl PriorityClassifier {
 
     /// Register a pane for priority tracking.
     pub fn register_pane(&self, pane_id: u64) {
-        self.telemetry.panes_registered.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .panes_registered
+            .fetch_add(1, Ordering::Relaxed);
         let half_life = Duration::from_secs_f64(self.config.rate_half_life_secs);
         self.panes.insert_if_absent(
             pane_id,
@@ -372,7 +374,9 @@ impl PriorityClassifier {
 
     /// Unregister a pane.
     pub fn unregister_pane(&self, pane_id: u64) {
-        self.telemetry.panes_unregistered.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .panes_unregistered
+            .fetch_add(1, Ordering::Relaxed);
         self.panes.remove(pane_id);
     }
 
@@ -397,7 +401,9 @@ impl PriorityClassifier {
 
     /// Feed a detection signal into the classifier.
     pub fn observe_signal(&self, pane_id: u64, signal: &PrioritySignal) {
-        self.telemetry.signals_observed.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .signals_observed
+            .fetch_add(1, Ordering::Relaxed);
         self.panes.write_with(pane_id, |state| {
             if signal.severity >= 2
                 || signal.event_type == "error"
@@ -421,7 +427,9 @@ impl PriorityClassifier {
 
     /// Clear a manual override, returning to automatic classification.
     pub fn clear_override(&self, pane_id: u64) {
-        self.telemetry.overrides_cleared.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .overrides_cleared
+            .fetch_add(1, Ordering::Relaxed);
         self.panes.write_with(pane_id, |state| {
             state.manual_override = None;
         });
@@ -434,7 +442,9 @@ impl PriorityClassifier {
 
     /// Classify with explicit timestamp (for testing).
     pub fn classify_at(&self, pane_id: u64, now: Instant) -> PanePriority {
-        self.telemetry.classifications.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .classifications
+            .fetch_add(1, Ordering::Relaxed);
         self.panes
             .write_with(pane_id, |state| {
                 let priority = self.compute_priority(state, now);
@@ -453,7 +463,9 @@ impl PriorityClassifier {
     pub fn classify_all_at(&self, now: Instant) -> HashMap<u64, PanePriority> {
         self.panes
             .map_all_mut(|_pane_id, state| {
-                self.telemetry.classifications.fetch_add(1, Ordering::Relaxed);
+                self.telemetry
+                    .classifications
+                    .fetch_add(1, Ordering::Relaxed);
                 let priority = self.compute_priority(state, now);
                 state.priority = priority;
                 priority
@@ -1161,8 +1173,7 @@ mod tests {
             overrides_cleared: 2,
         };
         let json = serde_json::to_string(&snap).unwrap();
-        let back: PriorityClassifierTelemetrySnapshot =
-            serde_json::from_str(&json).unwrap();
+        let back: PriorityClassifierTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
     }
 

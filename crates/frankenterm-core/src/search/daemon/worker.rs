@@ -58,9 +58,7 @@ impl EmbedWorker {
 
 fn build_embedder(model: Option<&str>) -> Result<Box<dyn Embedder>, String> {
     match model.map(str::trim) {
-        None | Some("" | "hash" | "fnv1a-hash") => {
-            Ok(Box::new(HashEmbedder::default()))
-        }
+        None | Some("" | "hash" | "fnv1a-hash") => Ok(Box::new(HashEmbedder::default())),
         Some(raw) => {
             if let Some(dim_raw) = raw.strip_prefix("fnv1a-hash-") {
                 let dim = dim_raw

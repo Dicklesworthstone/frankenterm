@@ -138,7 +138,11 @@ impl TriggerScanResult {
     /// Whether any error triggers were found.
     #[must_use]
     pub fn has_errors(&self) -> bool {
-        self.counts.get(&TriggerCategory::Error).copied().unwrap_or(0) > 0
+        self.counts
+            .get(&TriggerCategory::Error)
+            .copied()
+            .unwrap_or(0)
+            > 0
     }
 
     /// Whether any completion triggers were found.
@@ -411,9 +415,8 @@ mod tests {
     #[test]
     fn default_scanner_detects_completion() {
         let scanner = TriggerScanner::default();
-        let result = scanner.scan_counts(
-            b"    Finished `dev` profile in 2.3s\ntest result: ok. 5 passed\n",
-        );
+        let result =
+            scanner.scan_counts(b"    Finished `dev` profile in 2.3s\ntest result: ok. 5 passed\n");
         assert!(result.has_completions());
     }
 
@@ -454,7 +457,9 @@ mod tests {
         let scanner = TriggerScanner::default();
         let input = b"OK then ERROR here";
         let matches = scanner.scan_locate(input);
-        let error_match = matches.iter().find(|m| m.category == TriggerCategory::Error);
+        let error_match = matches
+            .iter()
+            .find(|m| m.category == TriggerCategory::Error);
         assert!(error_match.is_some());
         let em = error_match.unwrap();
         assert_eq!(&input[em.offset..em.offset + em.length], b"ERROR");
@@ -492,8 +497,7 @@ mod tests {
     #[test]
     fn multiple_categories_detected() {
         let scanner = TriggerScanner::default();
-        let input =
-            b"   Compiling foo\nwarning: unused\nERROR: oops\n    Finished `dev` profile\n";
+        let input = b"   Compiling foo\nwarning: unused\nERROR: oops\n    Finished `dev` profile\n";
         let result = scanner.scan_counts(input);
         assert!(result.get(&TriggerCategory::Progress).unwrap_or(&0) > &0);
         assert!(result.get(&TriggerCategory::Warning).unwrap_or(&0) > &0);
@@ -528,9 +532,8 @@ mod tests {
         let scanner = TriggerScanner::default();
         let mut input = Vec::with_capacity(1024 * 1024);
         for i in 0..10000 {
-            input.extend_from_slice(
-                format!("   Compiling crate-{i} v0.1.{}\n", i % 100).as_bytes(),
-            );
+            input
+                .extend_from_slice(format!("   Compiling crate-{i} v0.1.{}\n", i % 100).as_bytes());
         }
         // Inject a few errors
         input.extend_from_slice(b"ERROR: build failed\n");

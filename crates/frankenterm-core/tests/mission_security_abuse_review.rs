@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use frankenterm_core::beads_types::{BeadIssueDetail, BeadIssueType, BeadStatus};
 use frankenterm_core::mission_events::{MissionEventLog, MissionEventLogConfig};
 use frankenterm_core::mission_loop::{
-    ActiveBeadClaim, ConflictDetectionConfig, DeconflictionStrategy, KnownReservation,
-    MissionLoop, MissionLoopConfig, MissionSafetyEnvelopeConfig, MissionTrigger,
-    OperatorOverride, OperatorOverrideKind,
+    ActiveBeadClaim, ConflictDetectionConfig, DeconflictionStrategy, KnownReservation, MissionLoop,
+    MissionLoopConfig, MissionSafetyEnvelopeConfig, MissionTrigger, OperatorOverride,
+    OperatorOverrideKind,
 };
 use frankenterm_core::plan::{MissionAgentAvailability, MissionAgentCapabilityProfile};
 use frankenterm_core::planner_features::{MissionRuntimeConfig, PlannerExtractionContext};
@@ -214,7 +214,10 @@ fn escalation_reprioritize_extreme_positive_delta() {
     let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
     // Should not crash or produce NaN scores.
     for a in &decision.assignment_set.assignments {
-        assert!(a.score.is_finite(), "extreme reprioritize must not produce NaN/Inf scores");
+        assert!(
+            a.score.is_finite(),
+            "extreme reprioritize must not produce NaN/Inf scores"
+        );
     }
 }
 
@@ -227,7 +230,10 @@ fn escalation_reprioritize_extreme_negative_delta() {
     let issues = vec![issue("bead-1", 1)];
     let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
     for a in &decision.assignment_set.assignments {
-        assert!(a.score.is_finite(), "extreme negative reprioritize must not produce NaN/Inf");
+        assert!(
+            a.score.is_finite(),
+            "extreme negative reprioritize must not produce NaN/Inf"
+        );
         assert!(a.score >= 0.0, "score should be clamped to >= 0");
     }
 }
@@ -267,10 +273,7 @@ fn spam_trigger_flood_bounded_by_batch_size() {
     }
     // Pending count should be bounded.
     let pending = ml.pending_trigger_count();
-    assert!(
-        pending <= 100,
-        "triggers are queued; pending={pending}"
-    );
+    assert!(pending <= 100, "triggers are queued; pending={pending}");
     // A single should_evaluate consumes/batches, not infinite loop.
     let should = ml.should_evaluate(5000);
     assert!(should, "should evaluate after triggers");
@@ -451,7 +454,9 @@ fn bypass_safety_envelope_max_cap_does_not_crash() {
         ..MissionLoopConfig::default()
     });
     let agents: Vec<_> = (0..10).map(|i| agent(&format!("a{i}"))).collect();
-    let issues: Vec<_> = (0..10).map(|i| issue(&format!("b{i}"), (i % 5) as u8)).collect();
+    let issues: Vec<_> = (0..10)
+        .map(|i| issue(&format!("b{i}"), (i % 5) as u8))
+        .collect();
     let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
     // Should not crash with extreme cap values.
     assert!(decision.assignment_set.assignment_count() <= 10);
@@ -503,7 +508,13 @@ fn bypass_consecutive_retry_storm() {
         );
     }
     // After exceeding retry limit, bead should be blocked.
-    let decision = ml.evaluate(200_000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
+    let decision = ml.evaluate(
+        200_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents,
+        &ctx(),
+    );
     // The retry cap should eventually trigger a safety gate denial.
     // We accept either 0 or 1 assignments — the key test is no crash.
     assert!(decision.assignment_set.assignment_count() <= 1);
@@ -764,7 +775,10 @@ fn determinism_adversarial_inputs_stable() {
     };
     let r1 = run();
     let r2 = run();
-    assert_eq!(r1, r2, "adversarial inputs must produce deterministic assignments");
+    assert_eq!(
+        r1, r2,
+        "adversarial inputs must produce deterministic assignments"
+    );
 }
 
 #[test]
@@ -812,7 +826,10 @@ fn determinism_override_order_independent() {
     };
     let a = run_order_a();
     let b = run_order_b();
-    assert_eq!(a, b, "override application order must not affect final assignments");
+    assert_eq!(
+        a, b,
+        "override application order must not affect final assignments"
+    );
 }
 
 #[test]
@@ -832,5 +849,8 @@ fn determinism_report_stable_with_overrides() {
     };
     let r1 = run();
     let r2 = run();
-    assert_eq!(r1, r2, "operator report must be deterministic with overrides");
+    assert_eq!(
+        r1, r2,
+        "operator report must be deterministic with overrides"
+    );
 }

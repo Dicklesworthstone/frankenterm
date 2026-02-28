@@ -12,11 +12,13 @@ use proptest::prelude::*;
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
-use frankenterm_core::events::{CooldownVerdict, DedupeVerdict, EventDeduplicator, NotificationCooldown};
+use frankenterm_core::events::{
+    CooldownVerdict, DedupeVerdict, EventDeduplicator, NotificationCooldown,
+};
 use frankenterm_core::memory_pressure::MemoryPressureTier;
+use frankenterm_core::pane_tiers::PaneTier;
 use frankenterm_core::patterns::{AgentType, Detection, DetectionContext, Severity};
 use frankenterm_core::rate_limit_tracker::RateLimitTracker;
-use frankenterm_core::pane_tiers::PaneTier;
 use frankenterm_core::ring_buffer::RingBuffer;
 use frankenterm_core::scrollback_eviction::{
     EvictionConfig, PaneTierSource, ScrollbackEvictor, SegmentStore,

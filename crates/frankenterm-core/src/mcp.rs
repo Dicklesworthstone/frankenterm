@@ -79,6 +79,8 @@ use crate::workflows::{
 
 #[path = "mcp_bridge.rs"]
 mod mcp_bridge;
+#[path = "mcp_helpers.rs"]
+mod mcp_helpers;
 #[path = "mcp_middleware.rs"]
 mod mcp_middleware;
 #[path = "mcp_missions.rs"]
@@ -92,10 +94,10 @@ mod mcp_resources;
 mod mcp_tools;
 #[path = "mcp_types.rs"]
 mod mcp_types;
-#[path = "mcp_helpers.rs"]
-mod mcp_helpers;
 
 pub use mcp_bridge::{build_server, build_server_with_db, run_stdio_server};
+#[allow(clippy::wildcard_imports)]
+use mcp_helpers::*;
 use mcp_middleware::{AuditedToolHandler, FormatAwareToolHandler};
 #[cfg(test)]
 use mcp_middleware::{
@@ -127,8 +129,6 @@ use mcp_tools::{
 };
 #[allow(clippy::wildcard_imports)]
 use mcp_types::*;
-#[allow(clippy::wildcard_imports)]
-use mcp_helpers::*;
 
 #[cfg(test)]
 mod tests {

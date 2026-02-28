@@ -1,5 +1,5 @@
 use crate::domain::DomainId;
-use crate::layout::{LayoutCycle, PaneStack, SwapLayout, redistribute_panes};
+use crate::layout::{redistribute_panes, LayoutCycle, PaneStack, SwapLayout};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
 use crate::{Mux, MuxNotification, WindowId};
@@ -647,7 +647,10 @@ fn collect_leaf_panes_recursive(tree: &Tree, out: &mut Vec<(PaneId, CollapsePrio
             out.push((pane.pane_id(), pane.collapse_priority()));
         }
         Tree::Node {
-            left, right, data: Some(_), ..
+            left,
+            right,
+            data: Some(_),
+            ..
         } => {
             collect_leaf_panes_recursive(left, out);
             collect_leaf_panes_recursive(right, out);
@@ -741,21 +744,17 @@ fn compute_split_resize_budget(
         SplitDirection::Horizontal => {
             let left_can_shrink = first_size.cols.saturating_sub(left_wc.min);
             let right_can_shrink = second_size.cols.saturating_sub(right_wc.min);
-            let left_can_grow = left_wc
-                .max
-                .map_or(right_can_shrink, |max| {
-                    max.saturating_sub(first_size.cols).min(right_can_shrink)
-                });
+            let left_can_grow = left_wc.max.map_or(right_can_shrink, |max| {
+                max.saturating_sub(first_size.cols).min(right_can_shrink)
+            });
             (-(left_can_shrink as isize), left_can_grow as isize)
         }
         SplitDirection::Vertical => {
             let left_can_shrink = first_size.rows.saturating_sub(left_hc.min);
             let right_can_shrink = second_size.rows.saturating_sub(right_hc.min);
-            let left_can_grow = left_hc
-                .max
-                .map_or(right_can_shrink, |max| {
-                    max.saturating_sub(first_size.rows).min(right_can_shrink)
-                });
+            let left_can_grow = left_hc.max.map_or(right_can_shrink, |max| {
+                max.saturating_sub(first_size.rows).min(right_can_shrink)
+            });
             (-(left_can_shrink as isize), left_can_grow as isize)
         }
     }
@@ -770,9 +769,7 @@ fn replace_pane_recursive(tree: &mut Tree, old_id: PaneId, new_pane: Arc<dyn Pan
                 *pane = new_pane;
             }
         }
-        Tree::Node {
-            left, right, ..
-        } => {
+        Tree::Node { left, right, .. } => {
             replace_pane_recursive(left, old_id, new_pane.clone());
             replace_pane_recursive(right, old_id, new_pane);
         }
@@ -1968,9 +1965,7 @@ impl TabInner {
         // Collect candidates sorted by collapse order (Low first).
         let mut candidates: Vec<(PaneId, u8)> = collect_leaf_panes(tree)
             .into_iter()
-            .filter_map(|(id, priority)| {
-                collapse_order(priority).map(|order| (id, order))
-            })
+            .filter_map(|(id, priority)| collapse_order(priority).map(|order| (id, order)))
             .filter(|(id, _)| !collapsed.contains(id))
             .collect();
         candidates.sort_by_key(|&(_, order)| order);
@@ -1998,9 +1993,8 @@ impl TabInner {
         }
 
         // Build restoration order: High priority panes restore first.
-        let pane_priorities: HashMap<PaneId, CollapsePriority> = collect_leaf_panes(tree)
-            .into_iter()
-            .collect();
+        let pane_priorities: HashMap<PaneId, CollapsePriority> =
+            collect_leaf_panes(tree).into_iter().collect();
         let mut restore_candidates: Vec<PaneId> = self.collapsed_panes.iter().copied().collect();
         restore_candidates.sort_by(|a, b| {
             let a_order = pane_priorities
@@ -2081,12 +2075,7 @@ impl TabInner {
             .map(|p| p.pane_id())
             .unwrap_or_else(|| all_panes[0].pane_id());
 
-        let result = redistribute_panes(
-            &layout.arrangement,
-            all_panes,
-            active_pane_id,
-            self.size,
-        )?;
+        let result = redistribute_panes(&layout.arrangement, all_panes, active_pane_id, self.size)?;
 
         self.pane = Some(result.tree);
         self.pane_stacks = result.stacks;
@@ -2420,12 +2409,10 @@ impl TabInner {
             // If the tree minimum exceeds available space, collapse panes
             // in priority order to make it fit.
             if width_constraints.min > size.cols || height_constraints.min > size.rows {
-                self.collapsed_panes =
-                    self.select_panes_to_collapse(size.cols, size.rows);
+                self.collapsed_panes = self.select_panes_to_collapse(size.cols, size.rows);
             } else if !self.collapsed_panes.is_empty() {
                 // Terminal grew — try to restore previously collapsed panes
-                self.collapsed_panes =
-                    self.select_panes_to_uncollapse(size.cols, size.rows);
+                self.collapsed_panes = self.select_panes_to_uncollapse(size.cols, size.rows);
             }
 
             // Constrain the new size to the minimum possible dimensions
@@ -6431,13 +6418,16 @@ mod test {
         .unwrap();
 
         // Add a floating pane.
-        let float_pane = FakePane::new(10, TerminalSize {
-            rows: 10,
-            cols: 40,
-            pixel_width: 400,
-            pixel_height: 250,
-            dpi: 96,
-        });
+        let float_pane = FakePane::new(
+            10,
+            TerminalSize {
+                rows: 10,
+                cols: 40,
+                pixel_width: 400,
+                pixel_height: 250,
+                dpi: 96,
+            },
+        );
         tab.add_floating_pane(
             float_pane.clone(),
             FloatingPaneRect {
@@ -6473,10 +6463,8 @@ mod test {
             .iter()
             .map(|p| p.pane.pane_id())
             .collect();
-        let stacked_ids: HashSet<PaneId> =
-            tab.all_stacked_pane_ids().into_iter().collect();
-        let all_tiled: HashSet<PaneId> =
-            tree_ids.union(&stacked_ids).copied().collect();
+        let stacked_ids: HashSet<PaneId> = tab.all_stacked_pane_ids().into_iter().collect();
+        let all_tiled: HashSet<PaneId> = tree_ids.union(&stacked_ids).copied().collect();
         assert!(all_tiled.contains(&1));
         assert!(all_tiled.contains(&2));
         assert!(all_tiled.contains(&3));
@@ -6497,10 +6485,8 @@ mod test {
             .iter()
             .map(|p| p.pane.pane_id())
             .collect();
-        let stacked_ids: HashSet<PaneId> =
-            tab.all_stacked_pane_ids().into_iter().collect();
-        let all_final: HashSet<PaneId> =
-            tree_ids.union(&stacked_ids).copied().collect();
+        let stacked_ids: HashSet<PaneId> = tab.all_stacked_pane_ids().into_iter().collect();
+        let all_final: HashSet<PaneId> = tree_ids.union(&stacked_ids).copied().collect();
         assert_eq!(all_final.len(), 3);
     }
 
@@ -6602,8 +6588,7 @@ mod test {
             .iter()
             .map(|p| p.pane.pane_id())
             .collect();
-        let stacked_ids: HashSet<PaneId> =
-            tab.all_stacked_pane_ids().into_iter().collect();
+        let stacked_ids: HashSet<PaneId> = tab.all_stacked_pane_ids().into_iter().collect();
         let all: HashSet<PaneId> = tree_ids.union(&stacked_ids).copied().collect();
         assert_eq!(all.len(), 3, "All 3 panes should survive zoom + swap");
     }

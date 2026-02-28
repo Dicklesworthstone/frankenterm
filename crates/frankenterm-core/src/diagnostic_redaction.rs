@@ -30,9 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use crate::policy::Redactor;
-use crate::runtime_health::{
-    IncidentEnrichment, RuntimeDoctorReport, RuntimeHealthCheck,
-};
+use crate::runtime_health::{IncidentEnrichment, RuntimeDoctorReport, RuntimeHealthCheck};
 use crate::runtime_telemetry::RuntimeTelemetryEvent;
 
 // =============================================================================
@@ -257,10 +255,7 @@ pub struct DiagnosticRedactor {
 impl DiagnosticRedactor {
     /// Create a redactor with custom policies.
     #[must_use]
-    pub fn new(
-        field_policy: DiagnosticFieldPolicy,
-        budget: DiagnosticPrivacyBudget,
-    ) -> Self {
+    pub fn new(field_policy: DiagnosticFieldPolicy, budget: DiagnosticPrivacyBudget) -> Self {
         Self {
             redactor: Redactor::new(),
             field_policy,
@@ -305,7 +300,9 @@ impl DiagnosticRedactor {
 
         // Redact correlation_id if policy requires
         if self.field_policy.redact_correlation_ids && !redacted.correlation_id.is_empty() {
-            redacted.correlation_id.clone_from(&self.field_policy.redaction_marker);
+            redacted
+                .correlation_id
+                .clone_from(&self.field_policy.redaction_marker);
             stats.correlation_ids_redacted += 1;
         }
 
@@ -370,11 +367,7 @@ impl DiagnosticRedactor {
     }
 
     /// Truncate a string value to the budget limit.
-    fn truncate_value(
-        &self,
-        text: &str,
-        stats: &mut RedactionStats,
-    ) -> serde_json::Value {
+    fn truncate_value(&self, text: &str, stats: &mut RedactionStats) -> serde_json::Value {
         if text.len() > self.budget.max_detail_value_len {
             stats.details_truncated += 1;
             let truncated = &text[..self.budget.max_detail_value_len];
@@ -403,8 +396,7 @@ impl DiagnosticRedactor {
             result.push(self.redact_event_with_stats(event, &mut stats));
         }
 
-        stats
-            .output_bytes = serde_json::to_string(&result)
+        stats.output_bytes = serde_json::to_string(&result)
             .map(|s| s.len() as u64)
             .unwrap_or(0);
 
@@ -471,10 +463,7 @@ impl DiagnosticRedactor {
 
     /// Redact a full doctor report.
     #[must_use]
-    pub fn redact_doctor_report(
-        &self,
-        report: &RuntimeDoctorReport,
-    ) -> RuntimeDoctorReport {
+    pub fn redact_doctor_report(&self, report: &RuntimeDoctorReport) -> RuntimeDoctorReport {
         let mut redacted = report.clone();
 
         // Limit and redact checks
@@ -606,12 +595,7 @@ impl DiagnosticRedactionReport {
                 .iter()
                 .cloned()
                 .collect(),
-            always_safe_keys: redactor
-                .field_policy
-                .always_safe
-                .iter()
-                .cloned()
-                .collect(),
+            always_safe_keys: redactor.field_policy.always_safe.iter().cloned().collect(),
         }
     }
 }
@@ -627,8 +611,8 @@ mod tests {
         ActiveFailure, HealthCheckRegistry, RemediationHint, RuntimeHealthCheck,
     };
     use crate::runtime_telemetry::{
-        FailureClass, HealthTier, RuntimePhase, RuntimeTelemetryEventBuilder,
-        RuntimeTelemetryKind, RuntimeTelemetryLog,
+        FailureClass, HealthTier, RuntimePhase, RuntimeTelemetryEventBuilder, RuntimeTelemetryKind,
+        RuntimeTelemetryLog,
     };
 
     // ── Field policy ──
@@ -692,14 +676,12 @@ mod tests {
     fn redact_event_redacts_sensitive_keys() {
         let redactor = DiagnosticRedactor::default();
 
-        let event = RuntimeTelemetryEventBuilder::new(
-            "rt.error",
-            RuntimeTelemetryKind::TransientError,
-        )
-        .detail_str("error_message", "Connection failed: sk-ant-abcdef123456")
-        .detail_str("queue_depth", "42")
-        .reason("test")
-        .build();
+        let event =
+            RuntimeTelemetryEventBuilder::new("rt.error", RuntimeTelemetryKind::TransientError)
+                .detail_str("error_message", "Connection failed: sk-ant-abcdef123456")
+                .detail_str("queue_depth", "42")
+                .reason("test")
+                .build();
 
         let safe = redactor.redact_event(&event);
 
@@ -720,13 +702,10 @@ mod tests {
     fn redact_event_scans_unknown_keys_for_secrets() {
         let redactor = DiagnosticRedactor::default();
 
-        let event = RuntimeTelemetryEventBuilder::new(
-            "rt.test",
-            RuntimeTelemetryKind::Heartbeat,
-        )
-        .detail_str("custom_field", "token=sk-ant-secret123456789012345")
-        .reason("test")
-        .build();
+        let event = RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+            .detail_str("custom_field", "token=sk-ant-secret123456789012345")
+            .reason("test")
+            .build();
 
         let safe = redactor.redact_event(&event);
 
@@ -740,15 +719,12 @@ mod tests {
     fn redact_event_preserves_numeric_details() {
         let redactor = DiagnosticRedactor::default();
 
-        let event = RuntimeTelemetryEventBuilder::new(
-            "rt.test",
-            RuntimeTelemetryKind::Heartbeat,
-        )
-        .detail_u64("count", 42)
-        .detail_f64("ratio", 0.75)
-        .detail_bool("active", true)
-        .reason("test")
-        .build();
+        let event = RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+            .detail_u64("count", 42)
+            .detail_f64("ratio", 0.75)
+            .detail_bool("active", true)
+            .reason("test")
+            .build();
 
         let safe = redactor.redact_event(&event);
 
@@ -761,14 +737,12 @@ mod tests {
     fn redact_event_strict_redacts_ids() {
         let redactor = DiagnosticRedactor::strict();
 
-        let event = RuntimeTelemetryEventBuilder::new(
-            "rt.scope",
-            RuntimeTelemetryKind::ScopeStarted,
-        )
-        .scope_id("daemon:capture:pane_42")
-        .correlation("session-secret-123")
-        .reason("test")
-        .build();
+        let event =
+            RuntimeTelemetryEventBuilder::new("rt.scope", RuntimeTelemetryKind::ScopeStarted)
+                .scope_id("daemon:capture:pane_42")
+                .correlation("session-secret-123")
+                .reason("test")
+                .build();
 
         let safe = redactor.redact_event(&event);
 
@@ -780,14 +754,12 @@ mod tests {
     fn redact_event_default_preserves_ids() {
         let redactor = DiagnosticRedactor::default();
 
-        let event = RuntimeTelemetryEventBuilder::new(
-            "rt.scope",
-            RuntimeTelemetryKind::ScopeStarted,
-        )
-        .scope_id("daemon:capture")
-        .correlation("cycle-42")
-        .reason("test")
-        .build();
+        let event =
+            RuntimeTelemetryEventBuilder::new("rt.scope", RuntimeTelemetryKind::ScopeStarted)
+                .scope_id("daemon:capture")
+                .correlation("cycle-42")
+                .reason("test")
+                .build();
 
         let safe = redactor.redact_event(&event);
 
@@ -803,13 +775,13 @@ mod tests {
         };
         let redactor = DiagnosticRedactor::new(DiagnosticFieldPolicy::default(), budget);
 
-        let event = RuntimeTelemetryEventBuilder::new(
-            "rt.test",
-            RuntimeTelemetryKind::Heartbeat,
-        )
-        .detail_str("scope_tier", "this is a very long value that exceeds the budget limit")
-        .reason("test")
-        .build();
+        let event = RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+            .detail_str(
+                "scope_tier",
+                "this is a very long value that exceeds the budget limit",
+            )
+            .reason("test")
+            .build();
 
         let safe = redactor.redact_event(&event);
         let val = safe.details.get("scope_tier").unwrap().as_str().unwrap();
@@ -969,8 +941,7 @@ mod tests {
     fn redact_enrichment_redacts_failure_errors() {
         let redactor = DiagnosticRedactor::default();
 
-        let mut enrichment =
-            IncidentEnrichment::new(HealthTier::Red, RuntimePhase::Running);
+        let mut enrichment = IncidentEnrichment::new(HealthTier::Red, RuntimePhase::Running);
         enrichment.add_active_failure(ActiveFailure {
             component: "rt.auth".to_string(),
             failure_class: FailureClass::Permanent,
@@ -1011,12 +982,15 @@ mod tests {
             ..Default::default()
         };
 
-        let report =
-            DiagnosticRedactionReport::from_stats(stats, &redactor, "default", "default");
+        let report = DiagnosticRedactionReport::from_stats(stats, &redactor, "default", "default");
 
         assert_eq!(report.schema_version, 1);
         assert_eq!(report.policy_name, "default");
-        assert!(report.always_redact_keys.contains(&"error_message".to_string()));
+        assert!(
+            report
+                .always_redact_keys
+                .contains(&"error_message".to_string())
+        );
         assert!(report.always_safe_keys.contains(&"queue_depth".to_string()));
     }
 
@@ -1024,8 +998,7 @@ mod tests {
     fn redaction_report_serde_roundtrip() {
         let redactor = DiagnosticRedactor::default();
         let stats = RedactionStats::default();
-        let report =
-            DiagnosticRedactionReport::from_stats(stats, &redactor, "test", "test");
+        let report = DiagnosticRedactionReport::from_stats(stats, &redactor, "test", "test");
 
         let json = serde_json::to_string(&report).unwrap();
         let rt: DiagnosticRedactionReport = serde_json::from_str(&json).unwrap();
@@ -1043,10 +1016,8 @@ mod tests {
         };
         let redactor = DiagnosticRedactor::new(DiagnosticFieldPolicy::default(), budget);
 
-        let mut builder = RuntimeTelemetryEventBuilder::new(
-            "rt.test",
-            RuntimeTelemetryKind::Heartbeat,
-        );
+        let mut builder =
+            RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat);
         builder = builder
             .detail_str("scope_tier", "a")
             .detail_str("shutdown_reason", "b")
@@ -1067,13 +1038,10 @@ mod tests {
             DiagnosticPrivacyBudget::default(),
         );
 
-        let event = RuntimeTelemetryEventBuilder::new(
-            "rt.test",
-            RuntimeTelemetryKind::Heartbeat,
-        )
-        .detail_str("custom", "contains sk-ant-secret123456789012345 token")
-        .reason("test")
-        .build();
+        let event = RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+            .detail_str("custom", "contains sk-ant-secret123456789012345 token")
+            .reason("test")
+            .build();
 
         let safe = redactor.redact_event(&event);
 

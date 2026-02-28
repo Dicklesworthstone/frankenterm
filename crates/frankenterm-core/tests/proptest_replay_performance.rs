@@ -10,8 +10,8 @@
 use frankenterm_core::replay_performance::{
     ReplayCapacityGuidance, ReplayPerformanceBaseline, ReplayPerformanceBudgets,
     ReplayPerformanceMetric, ReplayPerformanceReport, ReplayPerformanceSample,
-    ReplayPerformanceStatus, capacity_guidance, classify_metric_result,
-    compare_against_baseline, regression_fraction, runs_within_relative_spread,
+    ReplayPerformanceStatus, capacity_guidance, classify_metric_result, compare_against_baseline,
+    regression_fraction, runs_within_relative_spread,
 };
 use proptest::prelude::*;
 

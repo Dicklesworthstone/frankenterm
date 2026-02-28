@@ -160,8 +160,7 @@ fn snapshot_serde_roundtrip() {
         audit_clears: 10,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: CommandGuardTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: CommandGuardTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 

@@ -207,9 +207,7 @@ impl TmuxDomainState {
                     } else {
                         // the output may come early then pane is ready, in this case we
                         // backlog it
-                        self.backlog
-                            .lock()
-                            .insert(*pane, cap_backlog_payload(text));
+                        self.backlog.lock().insert(*pane, cap_backlog_payload(text));
                         log::debug!("Tmux pane {} havn't been attached", pane);
                     }
                 }
@@ -502,7 +500,10 @@ mod tests {
         let capped = cap_backlog_payload(&large);
         assert_eq!(MAX_BACKLOG_BYTES_PER_PANE, capped.len());
         // The capped output should be the tail of the original
-        assert_eq!(&large[large_len - MAX_BACKLOG_BYTES_PER_PANE..], &capped[..]);
+        assert_eq!(
+            &large[large_len - MAX_BACKLOG_BYTES_PER_PANE..],
+            &capped[..]
+        );
     }
 
     #[test]

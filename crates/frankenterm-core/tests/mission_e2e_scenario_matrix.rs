@@ -421,7 +421,11 @@ fn degraded_safety_envelope_enforced_under_pressure() {
         .iter()
         .filter(|a| a.bead_id.starts_with('r'))
         .count();
-    assert!(risky_count <= 1, "Expected at most 1 risky, got {}", risky_count);
+    assert!(
+        risky_count <= 1,
+        "Expected at most 1 risky, got {}",
+        risky_count
+    );
 }
 
 #[test]
@@ -461,8 +465,7 @@ fn degraded_conflict_detection_under_contention() {
         },
     ];
 
-    let report =
-        ml.detect_conflicts(&d.assignment_set, &reservations, &[], 1000, &issues);
+    let report = ml.detect_conflicts(&d.assignment_set, &reservations, &[], 1000, &issues);
     assert!(!report.conflicts.is_empty());
 
     let (total, _auto) = ml.conflict_stats();
@@ -591,7 +594,10 @@ fn emergency_ttl_override_expires_and_system_recovers() {
 
     // Cycle 2: override expired, b1 available again
     let d2 = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents, &c);
-    assert!(ml.active_overrides().is_empty(), "Override should be evicted");
+    assert!(
+        ml.active_overrides().is_empty(),
+        "Override should be evicted"
+    );
     assert!(
         !d2.assignment_set.assignments.is_empty(),
         "b1 should be assignable after override expiry"
@@ -601,7 +607,7 @@ fn emergency_ttl_override_expires_and_system_recovers() {
 #[test]
 fn emergency_manual_trigger_bypass_cadence() {
     let mut ml = MissionLoop::new(MissionLoopConfig {
-        cadence_ms: 300_000, // Very long cadence
+        cadence_ms: 300_000,  // Very long cadence
         max_trigger_batch: 1, // A single trigger forces evaluation
         ..MissionLoopConfig::default()
     });
@@ -632,12 +638,24 @@ fn emergency_recovery_full_lifecycle() {
 
     // Phase 1: Normal operation
     let agents_normal = vec![ready_agent("a1"), ready_agent("a2")];
-    let d1 = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents_normal, &c);
+    let d1 = ml.evaluate(
+        1000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents_normal,
+        &c,
+    );
     assert!(!d1.assignment_set.assignments.is_empty());
 
     // Phase 2: Crisis — all agents offline
     let agents_crisis = vec![offline_agent("a1"), offline_agent("a2")];
-    let d2 = ml.evaluate(31_000, MissionTrigger::CadenceTick, &issues, &agents_crisis, &c);
+    let d2 = ml.evaluate(
+        31_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents_crisis,
+        &c,
+    );
     assert!(d2.assignment_set.assignments.is_empty());
 
     // Phase 3: Partial recovery — one agent back
@@ -658,7 +676,13 @@ fn emergency_recovery_full_lifecycle() {
 
     // Phase 4: Full recovery
     let agents_full = vec![ready_agent("a1"), ready_agent("a2")];
-    let d4 = ml.evaluate(91_000, MissionTrigger::CadenceTick, &issues, &agents_full, &c);
+    let d4 = ml.evaluate(
+        91_000,
+        MissionTrigger::CadenceTick,
+        &issues,
+        &agents_full,
+        &c,
+    );
     assert!(!d4.assignment_set.assignments.is_empty());
 
     let report = ml.generate_operator_report(Some(&log()), None);

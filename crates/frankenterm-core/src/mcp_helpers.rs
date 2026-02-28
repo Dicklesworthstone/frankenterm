@@ -364,7 +364,9 @@ pub(super) fn builtin_workflows(config: &Config) -> Vec<Arc<dyn Workflow>> {
 
 // ── MCP envelope / serialization helpers ───────────────────────────
 
-pub(super) fn envelope_to_content<T: Serialize>(envelope: McpEnvelope<T>) -> McpResult<Vec<Content>> {
+pub(super) fn envelope_to_content<T: Serialize>(
+    envelope: McpEnvelope<T>,
+) -> McpResult<Vec<Content>> {
     let text = serde_json::to_string(&envelope)
         .map_err(|e| McpError::internal_error(format!("Serialize MCP response: {e}")))?;
     Ok(vec![Content::Text { text }])

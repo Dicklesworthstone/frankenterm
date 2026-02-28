@@ -15,8 +15,8 @@ use proptest::prelude::*;
 use std::time::Instant;
 
 use frankenterm_core::disk_pressure::{
-    DiskPressureConfig, DiskPressureMonitor, DiskPressureTelemetrySnapshot,
-    DiskPressureTier, DiskSample, PressureThresholds,
+    DiskPressureConfig, DiskPressureMonitor, DiskPressureTelemetrySnapshot, DiskPressureTier,
+    DiskSample, PressureThresholds,
 };
 
 // =============================================================================
@@ -177,8 +177,7 @@ fn snapshot_serde_roundtrip() {
         tier_transitions: 15,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: DiskPressureTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: DiskPressureTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 
@@ -186,11 +185,11 @@ fn snapshot_serde_roundtrip() {
 fn tier_counts_sum_to_updates() {
     let mut monitor = make_monitor();
 
-    monitor.update_with_sample(sample_with_usage(0.1));  // Green
+    monitor.update_with_sample(sample_with_usage(0.1)); // Green
     monitor.update_with_sample(sample_with_usage(0.75)); // Yellow
     monitor.update_with_sample(sample_with_usage(0.90)); // Red
     monitor.update_with_sample(sample_with_usage(0.98)); // Black
-    monitor.update_with_sample(sample_with_usage(0.1));  // Green
+    monitor.update_with_sample(sample_with_usage(0.1)); // Green
 
     let snap = monitor.telemetry().snapshot();
     let total_tiers = snap.tier_green + snap.tier_yellow + snap.tier_red + snap.tier_black;

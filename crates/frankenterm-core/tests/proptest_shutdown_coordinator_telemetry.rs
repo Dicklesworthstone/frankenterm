@@ -38,9 +38,7 @@ fn make_finalizer(name: &str, priority: u32) -> Finalizer {
 }
 
 /// Set up a tree with root running + N child scopes running.
-fn setup_tree_and_coord(
-    n_children: usize,
-) -> (ScopeTree, ShutdownCoordinator, Vec<ScopeId>) {
+fn setup_tree_and_coord(n_children: usize) -> (ScopeTree, ShutdownCoordinator, Vec<ScopeId>) {
     let mut tree = ScopeTree::new(100);
     tree.start(&ScopeId::root(), 1000).unwrap();
 
@@ -117,12 +115,7 @@ fn shutdowns_requested_tracked() {
     let (mut tree, mut coord, ids) = setup_tree_and_coord(2);
 
     coord
-        .request_shutdown(
-            &mut tree,
-            &ids[0],
-            ShutdownReason::UserRequested,
-            2000,
-        )
+        .request_shutdown(&mut tree, &ids[0], ShutdownReason::UserRequested, 2000)
         .unwrap();
 
     let snap = coord.telemetry().snapshot();
@@ -285,18 +278,11 @@ fn escalations_tracked() {
 
     // Shutdown
     coord
-        .request_shutdown(
-            &mut tree,
-            &scope,
-            ShutdownReason::UserRequested,
-            2000,
-        )
+        .request_shutdown(&mut tree, &scope, ShutdownReason::UserRequested, 2000)
         .unwrap();
 
     // Grace expired
-    coord
-        .handle_grace_expiry(&mut tree, &scope, 2200)
-        .unwrap();
+    coord.handle_grace_expiry(&mut tree, &scope, 2200).unwrap();
 
     let snap = coord.telemetry().snapshot();
     assert_eq!(snap.escalations, 1);
@@ -313,14 +299,10 @@ fn shutdowns_completed_tracked() {
         .unwrap();
 
     // Begin finalize (no finalizers registered, so nothing to run)
-    coord
-        .begin_finalize(&mut tree, scope, 500, 2500)
-        .unwrap();
+    coord.begin_finalize(&mut tree, scope, 500, 2500).unwrap();
 
     // Complete shutdown
-    let summary = coord
-        .complete_shutdown(&mut tree, scope, 3000)
-        .unwrap();
+    let summary = coord.complete_shutdown(&mut tree, scope, 3000).unwrap();
 
     assert_eq!(summary.scope_id, *scope);
     let snap = coord.telemetry().snapshot();
@@ -341,29 +323,20 @@ fn full_lifecycle_telemetry() {
     // Shutdown both
     for scope in &ids {
         coord
-            .request_shutdown(
-                &mut tree,
-                scope,
-                ShutdownReason::GracefulTermination,
-                2000,
-            )
+            .request_shutdown(&mut tree, scope, ShutdownReason::GracefulTermination, 2000)
             .unwrap();
     }
 
     // Begin finalize, run finalizers, complete shutdown for both
     for scope in &ids {
-        coord
-            .begin_finalize(&mut tree, scope, 500, 2500)
-            .unwrap();
+        coord.begin_finalize(&mut tree, scope, 500, 2500).unwrap();
         coord
             .mark_finalizer_started(scope, "cleanup", 2500)
             .unwrap();
         coord
             .mark_finalizer_completed(scope, "cleanup", 100, 2600)
             .unwrap();
-        coord
-            .complete_shutdown(&mut tree, scope, 3000)
-            .unwrap();
+        coord.complete_shutdown(&mut tree, scope, 3000).unwrap();
     }
 
     let snap = coord.telemetry().snapshot();
@@ -409,12 +382,7 @@ fn failed_shutdown_request_not_counted() {
         .unwrap();
 
     // Second shutdown should fail (already draining)
-    let result = coord.request_shutdown(
-        &mut tree,
-        scope,
-        ShutdownReason::UserRequested,
-        3000,
-    );
+    let result = coord.request_shutdown(&mut tree, scope, ShutdownReason::UserRequested, 3000);
     assert!(result.is_err());
 
     let snap = coord.telemetry().snapshot();

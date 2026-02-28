@@ -187,15 +187,13 @@ fn arb_chunk_entry() -> impl Strategy<Value = ArtifactChunkEntry> {
         "[a-f0-9]{64}",
     )
         .prop_map(
-            |(index, path, event_count, start_event_id, end_event_id, sha256)| {
-                ArtifactChunkEntry {
-                    index,
-                    path,
-                    event_count,
-                    start_event_id,
-                    end_event_id,
-                    sha256,
-                }
+            |(index, path, event_count, start_event_id, end_event_id, sha256)| ArtifactChunkEntry {
+                index,
+                path,
+                event_count,
+                start_event_id,
+                end_event_id,
+                sha256,
             },
         )
 }

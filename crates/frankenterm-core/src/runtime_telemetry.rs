@@ -286,9 +286,7 @@ impl RuntimeTelemetryKind {
             | Self::ThrottleReleased
             | Self::LoadShedding => "backpressure",
 
-            Self::QueueDepthObserved
-            | Self::ChannelClosed
-            | Self::PermitExhausted => "queue",
+            Self::QueueDepthObserved | Self::ChannelClosed | Self::PermitExhausted => "queue",
 
             Self::TransientError
             | Self::PermanentError
@@ -549,9 +547,10 @@ impl RuntimeTelemetryEventBuilder {
     /// Add a string detail.
     #[must_use]
     pub fn detail_str(mut self, key: &str, value: &str) -> Self {
-        self.event
-            .details
-            .insert(key.to_string(), serde_json::Value::String(value.to_string()));
+        self.event.details.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
         self
     }
 
@@ -755,10 +754,7 @@ impl RuntimeTelemetryLog {
     /// Count events matching a health tier.
     #[must_use]
     pub fn count_tier(&self, tier: HealthTier) -> usize {
-        self.events
-            .iter()
-            .filter(|e| e.health_tier == tier)
-            .count()
+        self.events.iter().filter(|e| e.health_tier == tier).count()
     }
 
     /// Count events matching a category.
@@ -1014,22 +1010,15 @@ impl CancellationTelemetryEmitter {
 
     /// Emit a grace period expired event.
     #[must_use]
-    pub fn grace_expired(
-        &self,
-        scope_id: &str,
-        grace_period_ms: u64,
-    ) -> RuntimeTelemetryEvent {
-        RuntimeTelemetryEventBuilder::new(
-            &self.component,
-            RuntimeTelemetryKind::GracePeriodExpired,
-        )
-        .scope_id(scope_id)
-        .phase(RuntimePhase::Draining)
-        .tier(HealthTier::Red)
-        .reason("cancellation.draining.grace_expired")
-        .correlation(&self.correlation_id)
-        .detail_u64("grace_period_ms", grace_period_ms)
-        .build()
+    pub fn grace_expired(&self, scope_id: &str, grace_period_ms: u64) -> RuntimeTelemetryEvent {
+        RuntimeTelemetryEventBuilder::new(&self.component, RuntimeTelemetryKind::GracePeriodExpired)
+            .scope_id(scope_id)
+            .phase(RuntimePhase::Draining)
+            .tier(HealthTier::Red)
+            .reason("cancellation.draining.grace_expired")
+            .correlation(&self.correlation_id)
+            .detail_u64("grace_period_ms", grace_period_ms)
+            .build()
     }
 }
 
@@ -1247,10 +1236,7 @@ mod tests {
             "backpressure"
         );
 
-        assert_eq!(
-            RuntimeTelemetryKind::QueueDepthObserved.category(),
-            "queue"
-        );
+        assert_eq!(RuntimeTelemetryKind::QueueDepthObserved.category(), "queue");
         assert_eq!(RuntimeTelemetryKind::ChannelClosed.category(), "queue");
 
         assert_eq!(RuntimeTelemetryKind::TransientError.category(), "error");
@@ -1432,10 +1418,7 @@ mod tests {
         assert_eq!(roundtripped.reason_code, event.reason_code);
         assert_eq!(roundtripped.correlation_id, event.correlation_id);
         assert_eq!(roundtripped.failure_class, event.failure_class);
-        assert_eq!(
-            roundtripped.details.get("key"),
-            event.details.get("key")
-        );
+        assert_eq!(roundtripped.details.get("key"), event.details.get("key"));
         assert_eq!(
             roundtripped.details.get("count"),
             event.details.get("count")
@@ -1448,11 +1431,10 @@ mod tests {
 
     #[test]
     fn event_json_has_required_fields() {
-        let event =
-            RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
-                .reason("ops.running.heartbeat")
-                .correlation("hb-1")
-                .build();
+        let event = RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+            .reason("ops.running.heartbeat")
+            .correlation("hb-1")
+            .build();
 
         let json: serde_json::Value = serde_json::to_value(&event).unwrap();
 
@@ -1609,12 +1591,18 @@ mod tests {
         let mut log = RuntimeTelemetryLog::with_defaults();
 
         log.emit(
-            RuntimeTelemetryEventBuilder::new("rt.scope.capture", RuntimeTelemetryKind::ScopeStarted)
-                .reason("a"),
+            RuntimeTelemetryEventBuilder::new(
+                "rt.scope.capture",
+                RuntimeTelemetryKind::ScopeStarted,
+            )
+            .reason("a"),
         );
         log.emit(
-            RuntimeTelemetryEventBuilder::new("rt.backpressure", RuntimeTelemetryKind::ThrottleApplied)
-                .reason("b"),
+            RuntimeTelemetryEventBuilder::new(
+                "rt.backpressure",
+                RuntimeTelemetryKind::ThrottleApplied,
+            )
+            .reason("b"),
         );
         log.emit(
             RuntimeTelemetryEventBuilder::new("rt.scope.relay", RuntimeTelemetryKind::ScopeStarted)
@@ -1847,10 +1835,7 @@ mod tests {
         );
 
         let grace = emitter.grace_expired("daemon:capture", 5000);
-        assert_eq!(
-            grace.event_kind,
-            RuntimeTelemetryKind::GracePeriodExpired
-        );
+        assert_eq!(grace.event_kind, RuntimeTelemetryKind::GracePeriodExpired);
         assert_eq!(grace.health_tier, HealthTier::Red);
         assert_eq!(
             grace.details.get("grace_period_ms"),

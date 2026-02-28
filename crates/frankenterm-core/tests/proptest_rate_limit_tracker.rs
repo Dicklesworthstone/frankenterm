@@ -13,8 +13,7 @@
 
 use frankenterm_core::patterns::AgentType;
 use frankenterm_core::rate_limit_tracker::{
-    ProviderRateLimitStatus, ProviderRateLimitSummary, RateLimitTelemetrySnapshot,
-    RateLimitTracker,
+    ProviderRateLimitStatus, ProviderRateLimitSummary, RateLimitTelemetrySnapshot, RateLimitTracker,
 };
 use proptest::prelude::*;
 use std::time::{Duration, Instant};

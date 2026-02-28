@@ -16220,22 +16220,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 RobotTxCommands::Plan { contract_file } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let contract = match load_mission_tx_contract_from_path(
-                                        &contract_path,
-                                    ) {
-                                        Ok(contract) => contract,
-                                        Err(err) => {
-                                            let response =
+                                    let contract =
+                                        match load_mission_tx_contract_from_path(&contract_path) {
+                                            Ok(contract) => contract,
+                                            Err(err) => {
+                                                let response =
                                                 RobotResponse::<RobotTxPlanData>::error_with_code(
                                                     robot_tx_error_code(err.error_code),
                                                     err.message,
                                                     err.hint,
                                                     elapsed_ms(start),
                                                 );
-                                            print_robot_response(&response, format, stats)?;
-                                            return Ok(());
-                                        }
-                                    };
+                                                print_robot_response(&response, format, stats)?;
+                                                return Ok(());
+                                            }
+                                        };
 
                                     let data = RobotTxPlanData {
                                         contract_file: contract_path.display().to_string(),
@@ -16259,22 +16258,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let contract = match load_mission_tx_contract_from_path(
-                                        &contract_path,
-                                    ) {
-                                        Ok(contract) => contract,
-                                        Err(err) => {
-                                            let response =
+                                    let contract =
+                                        match load_mission_tx_contract_from_path(&contract_path) {
+                                            Ok(contract) => contract,
+                                            Err(err) => {
+                                                let response =
                                                 RobotResponse::<RobotTxShowData>::error_with_code(
                                                     robot_tx_error_code(err.error_code),
                                                     err.message,
                                                     err.hint,
                                                     elapsed_ms(start),
                                                 );
-                                            print_robot_response(&response, format, stats)?;
-                                            return Ok(());
-                                        }
-                                    };
+                                                print_robot_response(&response, format, stats)?;
+                                                return Ok(());
+                                            }
+                                        };
 
                                     let data = RobotTxShowData {
                                         contract_file: contract_path.display().to_string(),
@@ -16303,22 +16301,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let contract = match load_mission_tx_contract_from_path(
-                                        &contract_path,
-                                    ) {
-                                        Ok(contract) => contract,
-                                        Err(err) => {
-                                            let response =
+                                    let contract =
+                                        match load_mission_tx_contract_from_path(&contract_path) {
+                                            Ok(contract) => contract,
+                                            Err(err) => {
+                                                let response =
                                                 RobotResponse::<RobotTxRunData>::error_with_code(
                                                     robot_tx_error_code(err.error_code),
                                                     err.message,
                                                     err.hint,
                                                     elapsed_ms(start),
                                                 );
-                                            print_robot_response(&response, format, stats)?;
-                                            return Ok(());
-                                        }
-                                    };
+                                                print_robot_response(&response, format, stats)?;
+                                                return Ok(());
+                                            }
+                                        };
 
                                     if let Some(fail_step_id) = fail_step.as_deref()
                                         && !contract

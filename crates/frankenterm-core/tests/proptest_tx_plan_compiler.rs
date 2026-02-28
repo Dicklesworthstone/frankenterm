@@ -47,10 +47,9 @@ fn arb_compensation_kind() -> impl Strategy<Value = CompensationKind> {
         Just(CompensationKind::NotifyOperator),
         (1u32..10).prop_map(|n| CompensationKind::RetryWithBackoff { max_retries: n }),
         Just(CompensationKind::SkipAndContinue),
-        arb_bead_id()
-            .prop_map(|id| CompensationKind::Alternative {
-                alternative_step_id: id
-            }),
+        arb_bead_id().prop_map(|id| CompensationKind::Alternative {
+            alternative_step_id: id
+        }),
     ]
 }
 
@@ -84,31 +83,25 @@ fn arb_compiler_config() -> impl Strategy<Value = CompilerConfig> {
 /// Generate a set of assignments with valid (acyclic) dependency structure.
 /// Dependencies only reference earlier beads to prevent cycles.
 fn arb_assignments(max_count: usize) -> impl Strategy<Value = Vec<PlannerAssignment>> {
-    (1..=max_count)
-        .prop_flat_map(|count| {
-            let bead_ids: Vec<String> = (0..count).map(|i| format!("b{i}")).collect();
-            let bead_ids_clone = bead_ids.clone();
+    (1..=max_count).prop_flat_map(|count| {
+        let bead_ids: Vec<String> = (0..count).map(|i| format!("b{i}")).collect();
+        let bead_ids_clone = bead_ids.clone();
 
-            prop::collection::vec(
-                (arb_agent_id(), arb_score(), arb_tags()),
-                count..=count,
-            )
-            .prop_map(move |agent_score_tags| {
+        prop::collection::vec((arb_agent_id(), arb_score(), arb_tags()), count..=count).prop_map(
+            move |agent_score_tags| {
                 agent_score_tags
                     .into_iter()
                     .enumerate()
                     .map(|(i, (agent_id, score, tags))| {
                         // Dependencies only reference earlier beads (ensures acyclicity).
-                        let dep_candidates: Vec<String> =
-                            bead_ids_clone[..i].to_vec();
+                        let dep_candidates: Vec<String> = bead_ids_clone[..i].to_vec();
                         let dep_count = if dep_candidates.is_empty() {
                             0
                         } else {
                             // Take a subset of earlier beads as deps.
                             (i % 3).min(dep_candidates.len())
                         };
-                        let dependency_bead_ids =
-                            dep_candidates[..dep_count].to_vec();
+                        let dependency_bead_ids = dep_candidates[..dep_count].to_vec();
 
                         PlannerAssignment {
                             bead_id: bead_ids_clone[i].clone(),
@@ -119,18 +112,20 @@ fn arb_assignments(max_count: usize) -> impl Strategy<Value = Vec<PlannerAssignm
                         }
                     })
                     .collect::<Vec<_>>()
-            })
-        })
+            },
+        )
+    })
 }
 
 /// Generate assignments where some dependencies reference beads not in the plan.
-fn arb_assignments_with_external_deps(max_count: usize) -> impl Strategy<Value = Vec<PlannerAssignment>> {
+fn arb_assignments_with_external_deps(
+    max_count: usize,
+) -> impl Strategy<Value = Vec<PlannerAssignment>> {
     arb_assignments(max_count).prop_map(|mut assignments| {
         // Add an external dep to every other assignment.
         for (i, a) in assignments.iter_mut().enumerate() {
             if i % 2 == 0 {
-                a.dependency_bead_ids
-                    .push(format!("external-{i}"));
+                a.dependency_bead_ids.push(format!("external-{i}"));
             }
         }
         assignments
@@ -159,7 +154,10 @@ fn verify_topological_order(plan: &TxPlan) {
             assert!(
                 dep_pos < step_pos,
                 "dependency {} (pos {}) must come before {} (pos {})",
-                dep, dep_pos, step.id, step_pos
+                dep,
+                dep_pos,
+                step.id,
+                step_pos
             );
         }
     }
@@ -173,8 +171,7 @@ fn verify_parallel_levels(plan: &TxPlan) {
         .flat_map(|(level, ids)| ids.iter().map(move |id| (id.as_str(), level)))
         .collect();
 
-    let _step_map: HashMap<&str, &TxStep> =
-        plan.steps.iter().map(|s| (s.id.as_str(), s)).collect();
+    let _step_map: HashMap<&str, &TxStep> = plan.steps.iter().map(|s| (s.id.as_str(), s)).collect();
 
     for step in &plan.steps {
         let my_level = step_level
@@ -188,7 +185,10 @@ fn verify_parallel_levels(plan: &TxPlan) {
             assert!(
                 dep_level < my_level,
                 "dependency {} (level {}) must be in earlier level than {} (level {})",
-                dep, dep_level, step.id, my_level
+                dep,
+                dep_level,
+                step.id,
+                my_level
             );
         }
     }

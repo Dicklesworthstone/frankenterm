@@ -10,9 +10,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::patterns::{
-    PatternEngine, PatternPack, PatternTelemetrySnapshot, RuleDef,
-};
+use frankenterm_core::patterns::{PatternEngine, PatternPack, PatternTelemetrySnapshot, RuleDef};
 
 // =============================================================================
 // Helpers

@@ -165,12 +165,7 @@ fn i01_perfect_cycles_advance_shadow_to_canary() {
     // Run 3 perfect cycles — should trigger advance to Canary
     for i in 1..=3 {
         let diff = run_perfect_cycle(&mut shadow_eval, i, &recs);
-        let decision = canary.evaluate_health(
-            i,
-            i as i64 * 1000,
-            &diff,
-            shadow_eval.metrics(),
-        );
+        let decision = canary.evaluate_health(i, i as i64 * 1000, &diff, shadow_eval.metrics());
 
         if i < 3 {
             assert_eq!(
@@ -220,7 +215,10 @@ fn i02_canary_filters_assignment_subset() {
     let diff = run_perfect_cycle(&mut shadow_eval, 1, &recs);
     let decision = canary.evaluate_health(1, 1000, &diff, shadow_eval.metrics());
 
-    assert!(decision.health_check.healthy, "perfect cycle should be healthy");
+    assert!(
+        decision.health_check.healthy,
+        "perfect cycle should be healthy"
+    );
     assert_eq!(decision.phase, CanaryPhase::Canary);
 
     // Filter assignments: only a1 should pass in canary phase
@@ -263,7 +261,10 @@ fn i03_degraded_fidelity_triggers_rollback() {
     for i in 1..=3 {
         let diff = run_perfect_cycle(&mut shadow_eval, i, &recs);
         let decision = canary.evaluate_health(i, i as i64 * 1000, &diff, shadow_eval.metrics());
-        assert!(decision.health_check.healthy, "cycle {i}: should be healthy");
+        assert!(
+            decision.health_check.healthy,
+            "cycle {i}: should be healthy"
+        );
     }
     assert_eq!(canary.phase(), CanaryPhase::Canary);
 
@@ -403,9 +404,7 @@ fn i06_metrics_consistency_across_pipeline() {
         ..Default::default()
     });
 
-    let recs = make_assignment_set(vec![
-        make_assignment("b1", "a1", 0.9, 1),
-    ]);
+    let recs = make_assignment_set(vec![make_assignment("b1", "a1", 0.9, 1)]);
 
     let n = 10u64;
     for i in 1..=n {
@@ -479,9 +478,7 @@ fn i08_reset_allows_fresh_pipeline_restart() {
         ..Default::default()
     });
 
-    let recs = make_assignment_set(vec![
-        make_assignment("b1", "a1", 0.9, 1),
-    ]);
+    let recs = make_assignment_set(vec![make_assignment("b1", "a1", 0.9, 1)]);
 
     // Advance through phases
     for i in 1..=4 {
@@ -518,9 +515,7 @@ fn i09_shadow_evaluator_warmup_gates_canary_advance() {
         ..Default::default()
     });
 
-    let recs = make_assignment_set(vec![
-        make_assignment("b1", "a1", 0.9, 1),
-    ]);
+    let recs = make_assignment_set(vec![make_assignment("b1", "a1", 0.9, 1)]);
 
     // During warmup: canary should not advance even with perfect cycles
     for i in 1..=4 {
@@ -624,10 +619,8 @@ fn i11_transition_history_tracks_full_lifecycle() {
     );
 
     // Verify transition ordering
-    let phases: Vec<(CanaryPhase, CanaryPhase)> = transitions
-        .iter()
-        .map(|t| (t.from, t.to))
-        .collect();
+    let phases: Vec<(CanaryPhase, CanaryPhase)> =
+        transitions.iter().map(|t| (t.from, t.to)).collect();
     assert_eq!(phases[0], (CanaryPhase::Shadow, CanaryPhase::Canary));
     assert_eq!(phases[1], (CanaryPhase::Canary, CanaryPhase::Full));
     assert_eq!(phases[2], (CanaryPhase::Full, CanaryPhase::Canary));
@@ -671,10 +664,7 @@ fn i12_canary_agent_update_affects_filtering() {
     assert!(passed1 >= 1 && passed1 <= 4, "should pass canary subset");
 
     // Update agent pool — new agents
-    canary.update_canary_agents(&[
-        "a5".to_string(),
-        "a6".to_string(),
-    ]);
+    canary.update_canary_agents(&["a5".to_string(), "a6".to_string()]);
 
     // Old assignments should now be filtered differently
     let filtered2 = canary.filter_assignments(&recs);

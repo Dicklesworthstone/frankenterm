@@ -477,11 +477,7 @@ impl PlanSnapshot {
             critical_risk_count: plan.risk_summary.critical_risk_count,
             uncompensated_steps: plan.risk_summary.uncompensated_steps,
             overall_risk: plan.risk_summary.overall_risk,
-            step_risks: plan
-                .steps
-                .iter()
-                .map(|s| (s.id.clone(), s.risk))
-                .collect(),
+            step_risks: plan.steps.iter().map(|s| (s.id.clone(), s.risk)).collect(),
         }
     }
 }

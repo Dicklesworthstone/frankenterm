@@ -11,8 +11,8 @@ use std::time::Instant;
 use frankenterm_core::beads_types::{BeadIssueDetail, BeadIssueType, BeadStatus};
 use frankenterm_core::mission_events::{MissionEventLog, MissionEventLogConfig};
 use frankenterm_core::mission_loop::{
-    MissionLoop, MissionLoopConfig, MissionTrigger,
-    OperatorOverride, OperatorOverrideKind, OperatorStatusReport,
+    MissionLoop, MissionLoopConfig, MissionTrigger, OperatorOverride, OperatorOverrideKind,
+    OperatorStatusReport,
 };
 use frankenterm_core::plan::{MissionAgentAvailability, MissionAgentCapabilityProfile};
 use frankenterm_core::planner_features::PlannerExtractionContext;

@@ -518,7 +518,9 @@ fn macos_memory_budget_falls_back_to_advisory_mode() {
 //   - Floating-point:         N/A — no floating-point in cap logic
 //   - Golden outputs:         deterministic assertion below
 
-use frankenterm_core::events::{CooldownVerdict, DedupeVerdict, EventDeduplicator, NotificationCooldown};
+use frankenterm_core::events::{
+    CooldownVerdict, DedupeVerdict, EventDeduplicator, NotificationCooldown,
+};
 use frankenterm_core::patterns::{AgentType, Detection, DetectionContext, Severity};
 use frankenterm_core::rate_limit_tracker::RateLimitTracker;
 use frankenterm_core::ring_buffer::RingBuffer;
@@ -673,7 +675,11 @@ fn eso_rate_tracker_events_per_pane_within_budget() {
         );
     }
 
-    assert_eq!(tracker.total_event_count(), 64, "exactly 64 events should be tracked");
+    assert_eq!(
+        tracker.total_event_count(),
+        64,
+        "exactly 64 events should be tracked"
+    );
 }
 
 /// ESO Proof: RingBuffer — behavioral equivalence within capacity
@@ -775,12 +781,7 @@ fn eso_scrollback_eviction_plan_determinism() {
     use frankenterm_core::scrollback_eviction::ScrollbackEvictor;
 
     let store = FixedStore {
-        segments: HashMap::from([
-            (1, 10_000),
-            (2, 8_000),
-            (3, 3_000),
-            (4, 500),
-        ]),
+        segments: HashMap::from([(1, 10_000), (2, 8_000), (3, 3_000), (4, 500)]),
     };
     let tiers = FixedTierSource {
         tiers: HashMap::from([
@@ -803,22 +804,30 @@ fn eso_scrollback_eviction_plan_determinism() {
     let json_a = serde_json::to_string(&plan_a).expect("serialize A");
     let json_b = serde_json::to_string(&plan_b).expect("serialize B");
 
-    assert_eq!(json_a, json_b, "ESO proof: identical inputs → identical eviction plans");
+    assert_eq!(
+        json_a, json_b,
+        "ESO proof: identical inputs → identical eviction plans"
+    );
 
     // Dormant pane (4) should have a lower max_segments allowance than Active (1)
     if !plan_a.is_empty() {
-        let active_max = plan_a.targets.iter()
+        let active_max = plan_a
+            .targets
+            .iter()
             .find(|t| t.pane_id == 1)
             .map(|t| t.max_segments)
             .unwrap_or(usize::MAX);
-        let dormant_max = plan_a.targets.iter()
+        let dormant_max = plan_a
+            .targets
+            .iter()
             .find(|t| t.pane_id == 4)
             .map(|t| t.max_segments)
             .unwrap_or(usize::MAX);
         assert!(
             dormant_max <= active_max,
             "ESO: dormant max_segments {} > active max_segments {}",
-            dormant_max, active_max
+            dormant_max,
+            active_max
         );
     }
 }

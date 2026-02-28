@@ -176,9 +176,7 @@ impl MuxProtocol {
 
     /// Safety_OrderedDelivery: StrictlyIncreasing(delivered)
     fn safety_ordered_delivery(&self) -> bool {
-        self.delivered
-            .windows(2)
-            .all(|w| w[0] < w[1])
+        self.delivered.windows(2).all(|w| w[0] < w[1])
     }
 }
 
@@ -469,10 +467,7 @@ impl WalModel {
                 true
             }
             WalAction::Compact => {
-                if self.crashed
-                    || self.durable_idx != self.wal.len()
-                    || self.durable_idx == 0
-                {
+                if self.crashed || self.durable_idx != self.wal.len() || self.durable_idx == 0 {
                     return false;
                 }
                 let new_base = Self::apply_ops(&self.compact_base, &self.wal);

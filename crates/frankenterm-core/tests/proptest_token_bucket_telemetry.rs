@@ -134,8 +134,7 @@ fn snapshot_serde_roundtrip() {
         rate_changes: 5,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
-    let back: TokenBucketTelemetrySnapshot =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: TokenBucketTelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(snap, back);
 }
 
