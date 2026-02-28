@@ -9,6 +9,7 @@ RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="mission_tx_interfaces"
 CORRELATION_ID="ft-1i2ge.8.8-${RUN_ID}"
 TARGET_DIR="target-rch-mission-tx-interfaces-${RUN_ID}"
+REMOTE_TMPDIR="${TARGET_DIR}"
 LOG_FILE="${LOG_DIR}/mission_tx_interfaces_${RUN_ID}.jsonl"
 STDOUT_BASENAME="mission_tx_interfaces_${RUN_ID}"
 export TMPDIR="/tmp"
@@ -21,6 +22,9 @@ RCH_PROBE_JSON="${LOG_DIR}/${STDOUT_BASENAME}.rch_probe.json"
 RCH_PROBE_ERR="${LOG_DIR}/${STDOUT_BASENAME}.rch_probe.stderr.log"
 RCH_SMOKE_STDOUT="${LOG_DIR}/${STDOUT_BASENAME}.rch_smoke.stdout.log"
 RCH_SMOKE_STDERR="${LOG_DIR}/${STDOUT_BASENAME}.rch_smoke.stderr.log"
+RCH_DISK_STDOUT="${LOG_DIR}/${STDOUT_BASENAME}.rch_disk.stdout.log"
+RCH_DISK_STDERR="${LOG_DIR}/${STDOUT_BASENAME}.rch_disk.stderr.log"
+RCH_MIN_FREE_KB=2097152
 
 emit_log() {
   local outcome="$1"
@@ -156,7 +160,7 @@ fi
 set +e
 (
   cd "${ROOT_DIR}"
-  rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" cargo --version
+  rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" TMPDIR="${REMOTE_TMPDIR}" cargo --version
 ) >"${RCH_SMOKE_STDOUT}" 2>"${RCH_SMOKE_STDERR}"
 smoke_rc=$?
 set -e
@@ -171,6 +175,36 @@ if grep -Fq "[RCH] local" "${RCH_SMOKE_STDOUT}" "${RCH_SMOKE_STDERR}"; then
   exit 1
 fi
 if [[ "${smoke_rc}" -ne 0 ]]; then
+  if grep -Fq "No space left on device" "${RCH_SMOKE_STDOUT}" "${RCH_SMOKE_STDERR}"; then
+    emit_log \
+      "failed" \
+      "preflight_rch_smoke" \
+      "remote_worker_disk_exhausted" \
+      "RCH-E102" \
+      "$(basename "${RCH_SMOKE_STDERR}")" \
+      "remote smoke command failed due to disk exhaustion while validating TMPDIR"
+    exit 1
+  fi
+  if grep -Fq "no workers with Rust installed" "${RCH_SMOKE_STDOUT}" "${RCH_SMOKE_STDERR}"; then
+    emit_log \
+      "failed" \
+      "preflight_rch_smoke" \
+      "rch_workers_missing_rust" \
+      "RCH-E103" \
+      "$(basename "${RCH_SMOKE_STDERR}")" \
+      "remote smoke command reported no workers with Rust installed"
+    exit 1
+  fi
+  if grep -Fq "Failed to query daemon" "${RCH_SMOKE_STDOUT}" "${RCH_SMOKE_STDERR}"; then
+    emit_log \
+      "failed" \
+      "preflight_rch_smoke" \
+      "rch_daemon_unreachable" \
+      "RCH-E104" \
+      "$(basename "${RCH_SMOKE_STDERR}")" \
+      "remote smoke command could not reach rch daemon"
+    exit 1
+  fi
   emit_log \
     "failed" \
     "preflight_rch_smoke" \
@@ -180,6 +214,84 @@ if [[ "${smoke_rc}" -ne 0 ]]; then
     "rch smoke command failed before tx suite execution"
   exit 1
 fi
+
+set +e
+(
+  cd "${ROOT_DIR}"
+  # shellcheck disable=SC2016
+  rch exec -- env TMPDIR="${REMOTE_TMPDIR}" bash -lc '
+    set -euo pipefail
+    mkdir -p "${TMPDIR}"
+    tmp_free_kb="$(df -Pk "${TMPDIR}" | awk "NR==2 { print \$4 }")"
+    workspace_free_kb="$(df -Pk "." | awk "NR==2 { print \$4 }")"
+    printf "tmp_free_kb=%s\nworkspace_free_kb=%s\n" "${tmp_free_kb}" "${workspace_free_kb}"
+  '
+) >"${RCH_DISK_STDOUT}" 2>"${RCH_DISK_STDERR}"
+disk_rc=$?
+set -e
+if grep -Fq "[RCH] local" "${RCH_DISK_STDOUT}" "${RCH_DISK_STDERR}"; then
+  emit_log \
+    "failed" \
+    "preflight_rch_disk_capacity" \
+    "rch_local_fallback_detected" \
+    "remote_exec_failed_local_fallback" \
+    "$(basename "${RCH_DISK_STDERR}")" \
+    "remote disk-capacity preflight fell back to local execution"
+  exit 1
+fi
+if [[ "${disk_rc}" -ne 0 ]]; then
+  if grep -Fq "No space left on device" "${RCH_DISK_STDOUT}" "${RCH_DISK_STDERR}"; then
+    emit_log \
+      "failed" \
+      "preflight_rch_disk_capacity" \
+      "remote_worker_disk_exhausted" \
+      "RCH-E102" \
+      "$(basename "${RCH_DISK_STDERR}")" \
+      "remote disk-capacity preflight failed with disk exhaustion"
+    exit 1
+  fi
+  emit_log \
+    "failed" \
+    "preflight_rch_disk_capacity" \
+    "rch_disk_preflight_failed" \
+    "remote_worker_unavailable" \
+    "$(basename "${RCH_DISK_STDERR}")" \
+    "remote disk-capacity preflight command failed"
+  exit 1
+fi
+
+tmp_free_kb="$(awk -F= '/^tmp_free_kb=/{print $2}' "${RCH_DISK_STDOUT}" | tail -n1)"
+workspace_free_kb="$(awk -F= '/^workspace_free_kb=/{print $2}' "${RCH_DISK_STDOUT}" | tail -n1)"
+
+if ! [[ "${tmp_free_kb}" =~ ^[0-9]+$ ]] || ! [[ "${workspace_free_kb}" =~ ^[0-9]+$ ]]; then
+  emit_log \
+    "failed" \
+    "preflight_rch_disk_capacity" \
+    "rch_disk_preflight_parse_failed" \
+    "remote_worker_unavailable" \
+    "$(basename "${RCH_DISK_STDOUT}")" \
+    "failed to parse remote disk-capacity preflight output"
+  exit 1
+fi
+
+if (( tmp_free_kb < RCH_MIN_FREE_KB || workspace_free_kb < RCH_MIN_FREE_KB )); then
+  emit_log \
+    "failed" \
+    "preflight_rch_disk_capacity" \
+    "remote_worker_disk_low" \
+    "RCH-E105" \
+    "$(basename "${RCH_DISK_STDOUT}")" \
+    "remote free space below threshold: tmp_free_kb=${tmp_free_kb}, workspace_free_kb=${workspace_free_kb}, min_free_kb=${RCH_MIN_FREE_KB}"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "preflight_rch_disk_capacity" \
+  "rch_disk_capacity_ok" \
+  "none" \
+  "$(basename "${RCH_DISK_STDOUT}")" \
+  "remote free space ok: tmp_free_kb=${tmp_free_kb}, workspace_free_kb=${workspace_free_kb}, min_free_kb=${RCH_MIN_FREE_KB}"
 
 mkdir -p "$(dirname "${CONTRACT_PATH}")"
 cat >"${CONTRACT_PATH}" <<'JSON'
@@ -260,54 +372,121 @@ run_robot_json() {
   local label="$1"
   shift
   local decision_path="$label"
-  local stdout_file="${LOG_DIR}/${STDOUT_BASENAME}.${label}.stdout.json"
-  local stderr_file="${LOG_DIR}/${STDOUT_BASENAME}.${label}.stderr.log"
-  local detected_local_fallback=0
+  local attempt=1
 
-  set +e
-  (
-    cd "${ROOT_DIR}"
-    rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" \
-      cargo run -q -p frankenterm --bin ft -- \
-      --workspace "${WORKSPACE_DIR}" \
-      robot \
-      --format json \
-      "$@"
-  ) >"${stdout_file}" 2>"${stderr_file}" &
-  local cmd_pid=$!
-
-  while kill -0 "${cmd_pid}" >/dev/null 2>&1; do
-    if grep -Fq "[RCH] local" "${stdout_file}" "${stderr_file}" 2>/dev/null; then
-      detected_local_fallback=1
-      kill "${cmd_pid}" >/dev/null 2>&1 || true
-      pkill -TERM -P "${cmd_pid}" >/dev/null 2>&1 || true
-      break
+  while true; do
+    local attempt_suffix=""
+    if [[ "${attempt}" -gt 1 ]]; then
+      attempt_suffix=".retry${attempt}"
     fi
-    sleep 1
+
+    local stdout_file="${LOG_DIR}/${STDOUT_BASENAME}.${label}${attempt_suffix}.stdout.json"
+    local stderr_file="${LOG_DIR}/${STDOUT_BASENAME}.${label}${attempt_suffix}.stderr.log"
+    local detected_local_fallback=0
+
+    set +e
+    (
+      cd "${ROOT_DIR}"
+      rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" TMPDIR="${REMOTE_TMPDIR}" \
+        cargo run -q -p frankenterm --bin ft -- \
+        --workspace "${WORKSPACE_DIR}" \
+        robot \
+        --format json \
+        "$@"
+    ) >"${stdout_file}" 2>"${stderr_file}" &
+    local cmd_pid=$!
+
+    while kill -0 "${cmd_pid}" >/dev/null 2>&1; do
+      if grep -Fq "[RCH] local" "${stdout_file}" "${stderr_file}" 2>/dev/null; then
+        detected_local_fallback=1
+        kill "${cmd_pid}" >/dev/null 2>&1 || true
+        pkill -TERM -P "${cmd_pid}" >/dev/null 2>&1 || true
+        break
+      fi
+      sleep 1
+    done
+
+    wait "${cmd_pid}"
+    local rc=$?
+    set -e
+
+    LAST_STDOUT_FILE="${stdout_file}"
+    LAST_STDERR_FILE="${stderr_file}"
+
+    if [[ "${detected_local_fallback}" -eq 1 ]] || grep -Fq "[RCH] local" "${stdout_file}" "${stderr_file}"; then
+      local fallback_reason_code="rch_local_fallback_detected"
+      local fallback_error_code="remote_exec_failed_local_fallback"
+      local fallback_summary="rch emitted local fallback marker"
+      if grep -Fq "no workers with Rust installed" "${stdout_file}" "${stderr_file}"; then
+        fallback_reason_code="rch_workers_missing_rust"
+        fallback_error_code="RCH-E103"
+        fallback_summary="rch local fallback: no workers with Rust installed"
+      elif grep -Fq "Failed to query daemon" "${stdout_file}" "${stderr_file}"; then
+        fallback_reason_code="rch_daemon_unreachable"
+        fallback_error_code="RCH-E104"
+        fallback_summary="rch local fallback: daemon query failed"
+      fi
+
+      if [[ "${attempt}" -eq 1 ]] && { [[ "${fallback_error_code}" == "RCH-E103" ]] || [[ "${fallback_error_code}" == "RCH-E104" ]]; }; then
+        local retry_status_json="${LOG_DIR}/${STDOUT_BASENAME}.${label}.retry_preflight.rch_status.json"
+        local retry_status_err="${LOG_DIR}/${STDOUT_BASENAME}.${label}.retry_preflight.rch_status.stderr.log"
+        local retry_probe_json="${LOG_DIR}/${STDOUT_BASENAME}.${label}.retry_preflight.rch_probe.json"
+        local retry_probe_err="${LOG_DIR}/${STDOUT_BASENAME}.${label}.retry_preflight.rch_probe.stderr.log"
+        local retry_status_rc=0
+        local retry_probe_rc=0
+        if ! rch status --workers --jobs --json >"${retry_status_json}" 2>"${retry_status_err}"; then
+          retry_status_rc=$?
+        fi
+        if ! rch workers probe --all --json >"${retry_probe_json}" 2>"${retry_probe_err}"; then
+          retry_probe_rc=$?
+        fi
+
+        local retry_workers_healthy=0
+        local retry_workers_reachable=0
+        if [[ "${retry_status_rc}" -eq 0 ]]; then
+          retry_workers_healthy="$(jq -r '.data.daemon.workers_healthy // 0' "${retry_status_json}" 2>/dev/null || echo 0)"
+        fi
+        if [[ "${retry_probe_rc}" -eq 0 ]]; then
+          retry_workers_reachable="$(jq -r '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${retry_probe_json}" 2>/dev/null || echo 0)"
+        fi
+
+        if [[ "${retry_status_rc}" -eq 0 ]] && [[ "${retry_probe_rc}" -eq 0 ]] && [[ "${retry_workers_healthy}" != "0" ]] && [[ "${retry_workers_reachable}" != "0" ]]; then
+          emit_log "running" "${decision_path}" "rch_retry_preflight_recovered" "none" \
+            "$(basename "${retry_probe_json}")" \
+            "retry preflight passed after ${fallback_reason_code}; retrying once"
+          attempt=$((attempt + 1))
+          continue
+        fi
+      fi
+
+      emit_log "failed" "${decision_path}" "${fallback_reason_code}" "${fallback_error_code}" \
+        "$(basename "${stderr_file}")" "${fallback_summary}"
+      echo "RCH local fallback detected for ${label}; refusing local execution" >&2
+      echo "Stdout: ${stdout_file}" >&2
+      echo "Stderr: ${stderr_file}" >&2
+      exit 1
+    fi
+
+    if [[ "${rc}" -ne 0 ]]; then
+      if grep -Fq "No space left on device" "${stdout_file}" "${stderr_file}"; then
+        emit_log "failed" "${decision_path}" "remote_worker_disk_exhausted" "RCH-E102" \
+          "$(basename "${stderr_file}")" \
+          "robot tx command failed due to remote disk exhaustion (TMPDIR/CARGO target path)"
+        echo "Remote worker disk exhaustion detected for ${label}" >&2
+        echo "Stdout: ${stdout_file}" >&2
+        echo "Stderr: ${stderr_file}" >&2
+        exit 1
+      fi
+      emit_log "failed" "${decision_path}" "command_failed" "robot_command_failed" \
+        "$(basename "${stderr_file}")" "robot tx command exited non-zero"
+      echo "Command failed for ${label} (rc=${rc})" >&2
+      echo "Stdout: ${stdout_file}" >&2
+      echo "Stderr: ${stderr_file}" >&2
+      exit 1
+    fi
+
+    break
   done
-
-  wait "${cmd_pid}"
-  local rc=$?
-  set -e
-
-  LAST_STDOUT_FILE="${stdout_file}"
-  LAST_STDERR_FILE="${stderr_file}"
-  if [[ "${detected_local_fallback}" -eq 1 ]] || grep -Fq "[RCH] local" "${stdout_file}" "${stderr_file}"; then
-    emit_log "failed" "${decision_path}" "rch_local_fallback_detected" "remote_exec_failed_local_fallback" \
-      "$(basename "${stderr_file}")" "rch emitted local fallback marker"
-    echo "RCH local fallback detected for ${label}; refusing local execution" >&2
-    echo "Stdout: ${stdout_file}" >&2
-    echo "Stderr: ${stderr_file}" >&2
-    exit 1
-  fi
-  if [[ "${rc}" -ne 0 ]]; then
-    emit_log "failed" "${decision_path}" "command_failed" "robot_command_failed" \
-      "$(basename "${stderr_file}")" "robot tx command exited non-zero"
-    echo "Command failed for ${label} (rc=${rc})" >&2
-    echo "Stdout: ${stdout_file}" >&2
-    echo "Stderr: ${stderr_file}" >&2
-    exit 1
-  fi
 }
 
 assert_jq_true() {
