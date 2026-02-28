@@ -18,6 +18,7 @@ use proptest::prelude::*;
 
 use frankenterm_core::token_bucket::{
     BucketConfig, BucketStats, HierarchicalBucket, HierarchicalResult, TokenBucket,
+    TokenBucketTelemetrySnapshot,
 };
 
 // ────────────────────────────────────────────────────────────────────
@@ -926,5 +927,168 @@ proptest! {
             "total_consumed {} != sum of successful costs {}",
             b.total_consumed(), expected_consumed
         );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Telemetry counter invariants
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// telemetry.acquires == number of try_acquire calls.
+    #[test]
+    fn prop_telemetry_acquires_equals_attempts(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        costs in prop::collection::vec(arb_cost(), 1..30),
+        times in arb_time_sequence(30),
+    ) {
+        let mut b = TokenBucket::with_time(capacity, rate, 0);
+        for (i, &cost) in costs.iter().enumerate() {
+            let t = times.get(i).copied().unwrap_or(0);
+            b.try_acquire(cost, t);
+        }
+        let t = b.telemetry();
+        prop_assert_eq!(
+            t.acquires, costs.len() as u64,
+            "acquires ({}) != attempt count ({})",
+            t.acquires, costs.len()
+        );
+    }
+
+    /// telemetry.acquires_granted + acquires_denied == acquires.
+    #[test]
+    fn prop_telemetry_granted_plus_denied_equals_acquires(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        costs in prop::collection::vec(arb_cost(), 1..20),
+        times in arb_time_sequence(20),
+    ) {
+        let mut b = TokenBucket::with_time(capacity, rate, 0);
+        for (i, &cost) in costs.iter().enumerate() {
+            let t = times.get(i).copied().unwrap_or(0);
+            b.try_acquire(cost, t);
+        }
+        let t = b.telemetry();
+        prop_assert_eq!(
+            t.acquires_granted + t.acquires_denied, t.acquires,
+            "granted ({}) + denied ({}) != acquires ({})",
+            t.acquires_granted, t.acquires_denied, t.acquires
+        );
+    }
+
+    /// telemetry.tokens_consumed == total_consumed from the bucket.
+    #[test]
+    fn prop_telemetry_tokens_consumed_matches_total(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        costs in prop::collection::vec(arb_cost(), 1..20),
+        times in arb_time_sequence(20),
+    ) {
+        let mut b = TokenBucket::with_time(capacity, rate, 0);
+        for (i, &cost) in costs.iter().enumerate() {
+            let t = times.get(i).copied().unwrap_or(0);
+            b.try_acquire(cost, t);
+        }
+        let t = b.telemetry();
+        prop_assert_eq!(
+            t.tokens_consumed, b.total_consumed(),
+            "telemetry.tokens_consumed ({}) != total_consumed ({})",
+            t.tokens_consumed, b.total_consumed()
+        );
+    }
+
+    /// telemetry.resets counts reset() calls.
+    #[test]
+    fn prop_telemetry_resets_counted(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        n_resets in 0u32..10,
+        times in arb_time_sequence(10),
+    ) {
+        let mut b = TokenBucket::with_time(capacity, rate, 0);
+        for i in 0..n_resets as usize {
+            let t = times.get(i).copied().unwrap_or(0);
+            b.reset(t);
+        }
+        let t = b.telemetry();
+        prop_assert_eq!(
+            t.resets, n_resets as u64,
+            "resets ({}) != expected ({})",
+            t.resets, n_resets
+        );
+    }
+
+    /// telemetry.rate_changes counts set_refill_rate() calls.
+    #[test]
+    fn prop_telemetry_rate_changes_counted(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        new_rates in prop::collection::vec(arb_refill_rate(), 0..10),
+    ) {
+        let mut b = TokenBucket::with_time(capacity, rate, 0);
+        for &r in &new_rates {
+            b.set_refill_rate(r);
+        }
+        let t = b.telemetry();
+        prop_assert_eq!(
+            t.rate_changes, new_rates.len() as u64,
+            "rate_changes ({}) != expected ({})",
+            t.rate_changes, new_rates.len()
+        );
+    }
+
+    /// TokenBucketTelemetrySnapshot JSON roundtrip.
+    #[test]
+    fn prop_telemetry_snapshot_serde_roundtrip(
+        acquires in any::<u64>(),
+        acquires_granted in any::<u64>(),
+        acquires_denied in any::<u64>(),
+        tokens_consumed in any::<u64>(),
+        refills in any::<u64>(),
+        resets in any::<u64>(),
+        rate_changes in any::<u64>(),
+    ) {
+        let snap = TokenBucketTelemetrySnapshot {
+            acquires,
+            acquires_granted,
+            acquires_denied,
+            tokens_consumed,
+            refills,
+            resets,
+            rate_changes,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: TokenBucketTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap, back);
+    }
+
+    /// Telemetry counters survive reset (counters are not cleared by reset).
+    #[test]
+    fn prop_telemetry_survives_reset(
+        capacity in arb_capacity(),
+        rate in arb_refill_rate(),
+        costs in prop::collection::vec(arb_cost(), 1..10),
+        times in arb_time_sequence(10),
+    ) {
+        let mut b = TokenBucket::with_time(capacity, rate, 0);
+        for (i, &cost) in costs.iter().enumerate() {
+            let t = times.get(i).copied().unwrap_or(0);
+            b.try_acquire(cost, t);
+        }
+        let before = b.telemetry();
+        b.reset(99999);
+        let after = b.telemetry();
+
+        // All counters preserved except resets (+1)
+        prop_assert_eq!(after.acquires, before.acquires);
+        prop_assert_eq!(after.acquires_granted, before.acquires_granted);
+        prop_assert_eq!(after.acquires_denied, before.acquires_denied);
+        prop_assert_eq!(after.tokens_consumed, before.tokens_consumed);
+        prop_assert_eq!(after.refills, before.refills);
+        prop_assert_eq!(after.resets, before.resets + 1);
+        prop_assert_eq!(after.rate_changes, before.rate_changes);
     }
 }

@@ -22,6 +22,54 @@
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Operational telemetry counters for the token bucket.
+///
+/// Tracks acquire attempts, refill computations, resets, and rate changes.
+/// The existing `total_consumed` / `total_denied` fields on `TokenBucket`
+/// are preserved for backward compatibility; the snapshot combines both.
+#[derive(Debug, Clone, Default)]
+pub struct TokenBucketTelemetry {
+    /// Total try_acquire() calls (granted + denied).
+    acquires: u64,
+    /// Total refill() computations where time advanced.
+    refills: u64,
+    /// Total reset() calls.
+    resets: u64,
+    /// Total set_refill_rate() calls.
+    rate_changes: u64,
+}
+
+impl TokenBucketTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Serializable snapshot of token bucket telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenBucketTelemetrySnapshot {
+    /// Total try_acquire() calls.
+    pub acquires: u64,
+    /// Successful acquisitions (acquires - denied).
+    pub acquires_granted: u64,
+    /// Denied acquisitions.
+    pub acquires_denied: u64,
+    /// Total tokens consumed.
+    pub tokens_consumed: u64,
+    /// Total refill computations where time advanced.
+    pub refills: u64,
+    /// Total reset() calls.
+    pub resets: u64,
+    /// Total set_refill_rate() calls.
+    pub rate_changes: u64,
+}
+
+// =============================================================================
 // TokenBucket
 // =============================================================================
 
@@ -53,6 +101,8 @@ pub struct TokenBucket {
     total_consumed: u64,
     /// Total requests denied.
     total_denied: u64,
+    /// Operational telemetry counters.
+    telemetry: TokenBucketTelemetry,
 }
 
 impl TokenBucket {
@@ -74,6 +124,7 @@ impl TokenBucket {
             last_refill_ms: 0,
             total_consumed: 0,
             total_denied: 0,
+            telemetry: TokenBucketTelemetry::new(),
         }
     }
 
@@ -98,6 +149,7 @@ impl TokenBucket {
         if now_ms <= self.last_refill_ms {
             return;
         }
+        self.telemetry.refills += 1;
         let elapsed_secs = (now_ms - self.last_refill_ms) as f64 / 1000.0;
         let new_tokens = elapsed_secs * self.refill_rate;
         self.tokens = (self.tokens + new_tokens).min(self.capacity);
@@ -108,6 +160,7 @@ impl TokenBucket {
     ///
     /// Non-blocking: if insufficient tokens, returns `false` without waiting.
     pub fn try_acquire(&mut self, cost: u32, now_ms: u64) -> bool {
+        self.telemetry.acquires += 1;
         self.refill(now_ms);
         let cost_f = cost as f64;
         if self.tokens >= cost_f {
@@ -172,6 +225,7 @@ impl TokenBucket {
 
     /// Reset the bucket to full capacity.
     pub fn reset(&mut self, now_ms: u64) {
+        self.telemetry.resets += 1;
         self.tokens = self.capacity;
         self.last_refill_ms = now_ms;
     }
@@ -179,7 +233,22 @@ impl TokenBucket {
     /// Update the refill rate dynamically.
     pub fn set_refill_rate(&mut self, rate: f64) {
         assert!(rate > 0.0, "refill_rate must be positive");
+        self.telemetry.rate_changes += 1;
         self.refill_rate = rate;
+    }
+
+    /// Get a snapshot of operational telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> TokenBucketTelemetrySnapshot {
+        TokenBucketTelemetrySnapshot {
+            acquires: self.telemetry.acquires,
+            acquires_granted: self.telemetry.acquires.saturating_sub(self.total_denied),
+            acquires_denied: self.total_denied,
+            tokens_consumed: self.total_consumed,
+            refills: self.telemetry.refills,
+            resets: self.telemetry.resets,
+            rate_changes: self.telemetry.rate_changes,
+        }
     }
 
     /// Get statistics.
@@ -760,6 +829,110 @@ mod tests {
         hb.try_acquire(3, 0);
         assert_eq!(hb.local().total_consumed(), 3);
         assert_eq!(hb.global().total_consumed(), 3);
+    }
+
+    // ── Telemetry counters ─────────────────────────────────────────────
+
+    #[test]
+    fn telemetry_acquires_counted() {
+        let mut b = TokenBucket::with_time(10.0, 5.0, 0);
+        b.try_acquire_one(0);
+        b.try_acquire(3, 0);
+        b.try_acquire(100, 0); // denied
+        let t = b.telemetry();
+        assert_eq!(t.acquires, 3);
+        assert_eq!(t.acquires_granted, 2);
+        assert_eq!(t.acquires_denied, 1);
+        assert_eq!(t.tokens_consumed, 4);
+    }
+
+    #[test]
+    fn telemetry_refills_counted() {
+        let mut b = TokenBucket::with_time(10.0, 5.0, 0);
+        b.try_acquire_one(100); // refill at t=100
+        b.try_acquire_one(200); // refill at t=200
+        b.try_acquire_one(200); // no refill (same time)
+        let t = b.telemetry();
+        assert_eq!(t.refills, 2);
+    }
+
+    #[test]
+    fn telemetry_no_refill_on_backward_time() {
+        let mut b = TokenBucket::with_time(10.0, 5.0, 1000);
+        b.try_acquire_one(500); // backward time → no refill
+        let t = b.telemetry();
+        assert_eq!(t.refills, 0);
+    }
+
+    #[test]
+    fn telemetry_resets_counted() {
+        let mut b = TokenBucket::with_time(10.0, 5.0, 0);
+        b.reset(100);
+        b.reset(200);
+        b.reset(300);
+        let t = b.telemetry();
+        assert_eq!(t.resets, 3);
+    }
+
+    #[test]
+    fn telemetry_rate_changes_counted() {
+        let mut b = TokenBucket::new(10.0, 5.0);
+        b.set_refill_rate(10.0);
+        b.set_refill_rate(2.0);
+        let t = b.telemetry();
+        assert_eq!(t.rate_changes, 2);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let snap = TokenBucketTelemetrySnapshot {
+            acquires: 100,
+            acquires_granted: 80,
+            acquires_denied: 20,
+            tokens_consumed: 150,
+            refills: 50,
+            resets: 3,
+            rate_changes: 1,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: TokenBucketTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn telemetry_survives_reset() {
+        let mut b = TokenBucket::with_time(10.0, 5.0, 0);
+        b.try_acquire(5, 0);
+        b.try_acquire(100, 0); // denied
+        b.reset(100);
+        b.try_acquire(3, 200);
+        let t = b.telemetry();
+        // Counters accumulate across resets
+        assert_eq!(t.acquires, 3);
+        assert_eq!(t.acquires_granted, 2);
+        assert_eq!(t.acquires_denied, 1);
+        assert_eq!(t.tokens_consumed, 8);
+        assert_eq!(t.resets, 1);
+        assert_eq!(t.refills, 1); // only t=200 advanced from t=100
+    }
+
+    #[test]
+    fn telemetry_combined_operations() {
+        let mut b = TokenBucket::with_time(5.0, 2.0, 0);
+        b.try_acquire(3, 0);           // granted, no refill (t=0)
+        b.try_acquire(3, 0);           // denied (only 2 left), no refill
+        b.set_refill_rate(10.0);       // rate change
+        b.try_acquire(1, 1000);        // granted, refill at t=1000
+        b.reset(2000);                 // reset
+        b.try_acquire(5, 2000);        // granted, no refill (same t)
+        let t = b.telemetry();
+        assert_eq!(t.acquires, 4);
+        assert_eq!(t.acquires_granted, 3);
+        assert_eq!(t.acquires_denied, 1);
+        assert_eq!(t.tokens_consumed, 9);
+        assert_eq!(t.refills, 1);
+        assert_eq!(t.resets, 1);
+        assert_eq!(t.rate_changes, 1);
     }
 
     #[test]
