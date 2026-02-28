@@ -2153,4 +2153,344 @@ mod tests {
             "close-conn(42)"
         );
     }
+
+    // ── Telemetry tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn telemetry_initial_zero() {
+        let coord = ShutdownCoordinator::new();
+        let snap = coord.telemetry().snapshot();
+        assert_eq!(snap.scopes_registered, 0);
+        assert_eq!(snap.shutdowns_requested, 0);
+        assert_eq!(snap.cascades_triggered, 0);
+        assert_eq!(snap.escalations, 0);
+        assert_eq!(snap.finalizers_registered, 0);
+        assert_eq!(snap.finalizers_started, 0);
+        assert_eq!(snap.finalizers_completed, 0);
+        assert_eq!(snap.finalizers_failed, 0);
+        assert_eq!(snap.shutdowns_completed, 0);
+    }
+
+    #[test]
+    fn telemetry_scopes_registered_counted() {
+        let (_, coord) = setup_tree_and_coordinator();
+        let snap = coord.telemetry().snapshot();
+        // root + 5 daemons + 3 watchers = 9
+        assert_eq!(snap.scopes_registered, 9);
+    }
+
+    #[test]
+    fn telemetry_duplicate_scope_not_counted() {
+        let mut coord = ShutdownCoordinator::new();
+        let scope = ScopeId("dup".into());
+        coord
+            .register_scope(&scope, ScopeTier::Worker, None)
+            .unwrap();
+        let _ = coord.register_scope(&scope, ScopeTier::Worker, None);
+        assert_eq!(coord.telemetry().snapshot().scopes_registered, 1);
+    }
+
+    #[test]
+    fn telemetry_shutdowns_requested_counted() {
+        let (mut tree, mut coord) = setup_tree_and_coordinator();
+        let scope = well_known::capture();
+
+        // Set no-cascade policy to isolate the count
+        coord
+            .set_policy(
+                &scope,
+                ShutdownPolicy {
+                    cascade_to_children: false,
+                    ..ShutdownPolicy::for_tier(ScopeTier::Daemon)
+                },
+            )
+            .unwrap();
+
+        coord
+            .request_shutdown(&mut tree, &scope, ShutdownReason::UserRequested, 2000)
+            .unwrap();
+        assert_eq!(coord.telemetry().snapshot().shutdowns_requested, 1);
+    }
+
+    #[test]
+    fn telemetry_cascades_counted() {
+        let mut tree = ScopeTree::new(100);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let mut coord = ShutdownCoordinator::new();
+        coord
+            .register_scope(&ScopeId::root(), ScopeTier::Root, None)
+            .unwrap();
+        coord
+            .set_policy(
+                &ScopeId::root(),
+                ShutdownPolicy {
+                    cascade_to_children: true,
+                    ..ShutdownPolicy::for_tier(ScopeTier::Root)
+                },
+            )
+            .unwrap();
+
+        // Add 2 children
+        for i in 0..2 {
+            let id = ScopeId(format!("daemon:child_{i}"));
+            tree.register(
+                id.clone(),
+                ScopeTier::Daemon,
+                &ScopeId::root(),
+                format!("child_{i}"),
+                1000,
+            )
+            .unwrap();
+            tree.start(&id, 1100).unwrap();
+            coord
+                .register_scope(&id, ScopeTier::Daemon, Some(&ScopeId::root()))
+                .unwrap();
+        }
+
+        let cascaded = coord
+            .request_shutdown(
+                &mut tree,
+                &ScopeId::root(),
+                ShutdownReason::UserRequested,
+                2000,
+            )
+            .unwrap();
+        assert_eq!(cascaded.len(), 2);
+        assert_eq!(coord.telemetry().snapshot().cascades_triggered, 2);
+    }
+
+    #[test]
+    fn telemetry_escalation_counted() {
+        let mut tree = ScopeTree::new(100);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+        let scope = ScopeId("daemon:esc".into());
+        tree.register(
+            scope.clone(),
+            ScopeTier::Daemon,
+            &ScopeId::root(),
+            "esc".to_string(),
+            1000,
+        )
+        .unwrap();
+        tree.start(&scope, 1100).unwrap();
+
+        let mut coord = ShutdownCoordinator::new();
+        coord
+            .register_scope(&ScopeId::root(), ScopeTier::Root, None)
+            .unwrap();
+        coord
+            .register_scope(&scope, ScopeTier::Daemon, Some(&ScopeId::root()))
+            .unwrap();
+        coord
+            .set_policy(
+                &scope,
+                ShutdownPolicy {
+                    grace_period_ms: 100,
+                    escalation: EscalationAction::LogAndWait,
+                    cascade_to_children: false,
+                    run_finalizers: true,
+                    finalizer_timeout_ms: 5000,
+                },
+            )
+            .unwrap();
+
+        coord
+            .request_shutdown(&mut tree, &scope, ShutdownReason::UserRequested, 2000)
+            .unwrap();
+        coord
+            .handle_grace_expiry(&mut tree, &scope, 2200)
+            .unwrap();
+        assert_eq!(coord.telemetry().snapshot().escalations, 1);
+    }
+
+    #[test]
+    fn telemetry_finalizer_lifecycle_counted() {
+        let mut tree = ScopeTree::new(100);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+        let scope = ScopeId("daemon:fin".into());
+        tree.register(
+            scope.clone(),
+            ScopeTier::Daemon,
+            &ScopeId::root(),
+            "fin".to_string(),
+            1000,
+        )
+        .unwrap();
+        tree.start(&scope, 1100).unwrap();
+
+        let mut coord = ShutdownCoordinator::new();
+        coord
+            .register_scope(&ScopeId::root(), ScopeTier::Root, None)
+            .unwrap();
+        coord
+            .register_scope(&scope, ScopeTier::Daemon, Some(&ScopeId::root()))
+            .unwrap();
+
+        // Register 3 finalizers
+        for i in 0..3 {
+            coord
+                .register_finalizer(
+                    &scope,
+                    Finalizer {
+                        name: format!("f{i}"),
+                        priority: i as u32,
+                        action: FinalizerAction::Custom {
+                            action_name: format!("act{i}"),
+                            metadata: HashMap::new(),
+                        },
+                        status: FinalizerStatus::Pending,
+                    },
+                )
+                .unwrap();
+        }
+
+        coord
+            .request_shutdown(&mut tree, &scope, ShutdownReason::UserRequested, 2000)
+            .unwrap();
+        coord.begin_finalize(&mut tree, &scope, 500, 2500).unwrap();
+
+        coord.mark_finalizer_started(&scope, "f0", 2500).unwrap();
+        coord.mark_finalizer_started(&scope, "f1", 2510).unwrap();
+        coord.mark_finalizer_started(&scope, "f2", 2520).unwrap();
+
+        coord
+            .mark_finalizer_completed(&scope, "f0", 50, 2550)
+            .unwrap();
+        coord
+            .mark_finalizer_completed(&scope, "f1", 60, 2570)
+            .unwrap();
+        coord
+            .mark_finalizer_failed(&scope, "f2", "timeout", 100, 2620)
+            .unwrap();
+
+        let snap = coord.telemetry().snapshot();
+        assert_eq!(snap.finalizers_registered, 3);
+        assert_eq!(snap.finalizers_started, 3);
+        assert_eq!(snap.finalizers_completed, 2);
+        assert_eq!(snap.finalizers_failed, 1);
+    }
+
+    #[test]
+    fn telemetry_shutdown_completed_counted() {
+        let mut tree = ScopeTree::new(100);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+        let scope = ScopeId("daemon:done".into());
+        tree.register(
+            scope.clone(),
+            ScopeTier::Daemon,
+            &ScopeId::root(),
+            "done".to_string(),
+            1000,
+        )
+        .unwrap();
+        tree.start(&scope, 1100).unwrap();
+
+        let mut coord = ShutdownCoordinator::new();
+        coord
+            .register_scope(&ScopeId::root(), ScopeTier::Root, None)
+            .unwrap();
+        coord
+            .register_scope(&scope, ScopeTier::Daemon, Some(&ScopeId::root()))
+            .unwrap();
+
+        coord
+            .request_shutdown(&mut tree, &scope, ShutdownReason::GracefulTermination, 2000)
+            .unwrap();
+        coord.begin_finalize(&mut tree, &scope, 500, 2500).unwrap();
+        coord.complete_shutdown(&mut tree, &scope, 3000).unwrap();
+
+        assert_eq!(coord.telemetry().snapshot().shutdowns_completed, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip() {
+        let snap = ShutdownCoordinatorTelemetrySnapshot {
+            scopes_registered: 42,
+            shutdowns_requested: 10,
+            cascades_triggered: 5,
+            escalations: 2,
+            finalizers_registered: 100,
+            finalizers_started: 80,
+            finalizers_completed: 75,
+            finalizers_failed: 5,
+            shutdowns_completed: 8,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ShutdownCoordinatorTelemetrySnapshot =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn telemetry_combined_operations() {
+        let mut tree = ScopeTree::new(100);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let mut coord = ShutdownCoordinator::new();
+        coord
+            .register_scope(&ScopeId::root(), ScopeTier::Root, None)
+            .unwrap();
+
+        // Register 2 children
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let id = ScopeId(format!("daemon:combo_{i}"));
+            tree.register(
+                id.clone(),
+                ScopeTier::Daemon,
+                &ScopeId::root(),
+                format!("combo_{i}"),
+                1000,
+            )
+            .unwrap();
+            tree.start(&id, 1100).unwrap();
+            coord
+                .register_scope(&id, ScopeTier::Daemon, Some(&ScopeId::root()))
+                .unwrap();
+            coord
+                .register_finalizer(
+                    &id,
+                    Finalizer {
+                        name: "cleanup".into(),
+                        priority: 10,
+                        action: FinalizerAction::FlushChannel {
+                            channel_name: "out".into(),
+                        },
+                        status: FinalizerStatus::Pending,
+                    },
+                )
+                .unwrap();
+            ids.push(id);
+        }
+
+        // Full lifecycle for both
+        for scope in &ids {
+            coord
+                .request_shutdown(
+                    &mut tree,
+                    scope,
+                    ShutdownReason::GracefulTermination,
+                    2000,
+                )
+                .unwrap();
+            coord.begin_finalize(&mut tree, scope, 500, 2500).unwrap();
+            coord
+                .mark_finalizer_started(scope, "cleanup", 2500)
+                .unwrap();
+            coord
+                .mark_finalizer_completed(scope, "cleanup", 100, 2600)
+                .unwrap();
+            coord.complete_shutdown(&mut tree, scope, 3000).unwrap();
+        }
+
+        let snap = coord.telemetry().snapshot();
+        assert_eq!(snap.scopes_registered, 3); // root + 2
+        assert_eq!(snap.shutdowns_requested, 2);
+        assert_eq!(snap.finalizers_registered, 2);
+        assert_eq!(snap.finalizers_started, 2);
+        assert_eq!(snap.finalizers_completed, 2);
+        assert_eq!(snap.finalizers_failed, 0);
+        assert_eq!(snap.shutdowns_completed, 2);
+    }
 }
