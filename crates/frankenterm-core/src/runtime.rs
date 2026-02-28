@@ -251,6 +251,8 @@ pub struct RuntimeConfig {
     pub checkpoint_interval_secs: u32,
     /// Optional Unix socket path for native WezTerm events
     pub native_event_socket: Option<PathBuf>,
+    /// Trauma guard configuration for detecting recurring failure loops
+    pub trauma_guard: crate::config::TraumaGuardConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -271,6 +273,7 @@ impl Default for RuntimeConfig {
             retention_max_mb: 0,
             checkpoint_interval_secs: 60,
             native_event_socket: None,
+            trauma_guard: crate::config::TraumaGuardConfig::default(),
         }
     }
 }

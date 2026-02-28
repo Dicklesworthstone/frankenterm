@@ -30251,7 +30251,7 @@ fn robot_tx_transition_info(
         .iter()
         .filter(|rule| rule.from == state)
         .map(|rule| RobotTxTransitionInfo {
-            kind: rule.kind.to_string(),
+            kind: rule.via.to_string(),
             to: rule.to.to_string(),
         })
         .collect()
@@ -30807,7 +30807,7 @@ fn mission_available_transitions(
     frankenterm_core::plan::mission_lifecycle_transition_table()
         .iter()
         .filter(|rule| rule.from == state)
-        .map(|rule| (rule.kind, rule.to))
+        .map(|rule| (rule.via, rule.to))
         .collect()
 }
 

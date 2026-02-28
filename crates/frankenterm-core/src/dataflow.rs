@@ -53,8 +53,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tracing::{debug, trace, warn};
 
 // =============================================================================
 // Value type
@@ -339,6 +341,12 @@ impl DataflowGraph {
         };
         self.nodes.insert(id, node);
         self.invalidate_topo();
+        trace!(
+            node_id = id.0,
+            label,
+            total_nodes = self.nodes.len(),
+            "dataflow added source node"
+        );
         id
     }
 
@@ -352,10 +360,17 @@ impl DataflowGraph {
         compute: impl Fn(&[Value]) -> Value + Send + Sync + 'static,
     ) -> NodeId {
         let id = self.alloc_id();
+        let input_count = inputs.len();
         // Register this node as an output of each input.
         for &inp in &inputs {
             if let Some(n) = self.nodes.get_mut(&inp) {
                 n.outputs.push(id);
+            } else {
+                warn!(
+                    node_id = id.0,
+                    input_node_id = inp.0,
+                    "dataflow add_map input node missing; dependency skipped"
+                );
             }
         }
         let node = Node {
@@ -371,6 +386,13 @@ impl DataflowGraph {
         self.invalidate_topo();
         // Mark as dirty so it computes on first propagation.
         self.dirty.insert(id);
+        trace!(
+            node_id = id.0,
+            label,
+            input_count,
+            total_nodes = self.nodes.len(),
+            "dataflow added compute node"
+        );
         id
     }
 
@@ -397,9 +419,16 @@ impl DataflowGraph {
         compute: impl Fn(&[Value]) -> Value + Send + Sync + 'static,
     ) -> NodeId {
         let id = self.alloc_id();
+        let input_count = inputs.len();
         for &inp in &inputs {
             if let Some(n) = self.nodes.get_mut(&inp) {
                 n.outputs.push(id);
+            } else {
+                warn!(
+                    node_id = id.0,
+                    input_node_id = inp.0,
+                    "dataflow add_debounce input node missing; dependency skipped"
+                );
             }
         }
         let node = Node {
@@ -419,6 +448,14 @@ impl DataflowGraph {
         self.nodes.insert(id, node);
         self.invalidate_topo();
         self.dirty.insert(id);
+        trace!(
+            node_id = id.0,
+            label,
+            input_count,
+            window_ms = window.as_millis(),
+            total_nodes = self.nodes.len(),
+            "dataflow added debounce node"
+        );
         id
     }
 
@@ -435,6 +472,11 @@ impl DataflowGraph {
             return Err(DataflowError::NodeNotFound(node_id));
         }
         self.sinks.insert(node_id, Box::new(callback));
+        trace!(
+            node_id = node_id.0,
+            sink_count = self.sinks.len(),
+            "dataflow registered sink callback"
+        );
         Ok(())
     }
 
@@ -470,6 +512,12 @@ impl DataflowGraph {
         }
         self.invalidate_topo();
         self.dirty.insert(to);
+        trace!(
+            from_node_id = from.0,
+            to_node_id = to.0,
+            edge_count = self.edge_count(),
+            "dataflow added edge"
+        );
         Ok(())
     }
 
@@ -498,6 +546,12 @@ impl DataflowGraph {
         self.sinks.remove(&id);
         self.dirty.remove(&id);
         self.invalidate_topo();
+        trace!(
+            node_id = id.0,
+            total_nodes = self.nodes.len(),
+            edge_count = self.edge_count(),
+            "dataflow removed node"
+        );
         Ok(())
     }
 
@@ -519,11 +573,25 @@ impl DataflowGraph {
             return Err(DataflowError::NotASource(id));
         }
         if node.value != value {
+            let previous = node.value.clone();
             node.value = value;
             // Mark direct dependents as dirty.
             for &out in &node.outputs.clone() {
                 self.dirty.insert(out);
             }
+            trace!(
+                node_id = id.0,
+                previous_value = ?previous,
+                next_value = ?node.value,
+                downstream_count = node.outputs.len(),
+                dirty_count = self.dirty.len(),
+                "dataflow source updated"
+            );
+        } else {
+            trace!(
+                node_id = id.0,
+                "dataflow source update ignored because value is unchanged"
+            );
         }
         Ok(())
     }
@@ -543,6 +611,10 @@ impl DataflowGraph {
         let total_nodes = self.nodes.len();
 
         if self.dirty.is_empty() {
+            trace!(
+                total_nodes,
+                "dataflow propagation skipped because no nodes are dirty"
+            );
             return PropagationStats {
                 nodes_recomputed: 0,
                 nodes_changed: 0,
@@ -550,6 +622,11 @@ impl DataflowGraph {
                 elapsed: start.elapsed(),
             };
         }
+
+        debug!(
+            dirty_count = self.dirty.len(),
+            total_nodes, "dataflow propagation pass started"
+        );
 
         // Ensure topo order is computed.
         self.ensure_topo_order();
@@ -574,6 +651,8 @@ impl DataflowGraph {
         let mut nodes_recomputed = 0;
         let mut nodes_changed = 0;
         let mut changed_nodes: HashSet<NodeId> = HashSet::new();
+        let mut sink_callbacks_fired = 0;
+        let mut sink_callback_panics = 0;
         let now = Instant::now();
 
         for nid in to_recompute {
@@ -601,9 +680,17 @@ impl DataflowGraph {
                     let new_val = compute(&input_values);
                     nodes_recomputed += 1;
                     if new_val != node.value {
+                        let previous = node.value.clone();
                         node.value = new_val;
                         nodes_changed += 1;
                         changed_nodes.insert(nid);
+                        trace!(
+                            node_id = nid.0,
+                            label = node.label.as_str(),
+                            previous_value = ?previous,
+                            next_value = ?node.value,
+                            "dataflow compute node changed"
+                        );
                     }
                 }
                 NodeKind::Debounce {
@@ -620,13 +707,27 @@ impl DataflowGraph {
                             // Still within debounce window — buffer but don't emit.
                             *pending = Some(new_val);
                             *last_change = Some(now);
+                            trace!(
+                                node_id = nid.0,
+                                label = node.label.as_str(),
+                                window_ms = window_dur.as_millis(),
+                                "dataflow debounce buffered pending value"
+                            );
                         }
                         _ => {
                             // Window elapsed or first change — emit.
                             if new_val != node.value {
+                                let previous = node.value.clone();
                                 node.value = new_val;
                                 nodes_changed += 1;
                                 changed_nodes.insert(nid);
+                                trace!(
+                                    node_id = nid.0,
+                                    label = node.label.as_str(),
+                                    previous_value = ?previous,
+                                    next_value = ?node.value,
+                                    "dataflow debounce node emitted value"
+                                );
                             }
                             *last_change = Some(now);
                             *pending = None;
@@ -641,19 +742,48 @@ impl DataflowGraph {
         for sid in sink_ids {
             if changed_nodes.contains(&sid) {
                 if let (Some(node), Some(callback)) = (self.nodes.get(&sid), self.sinks.get(&sid)) {
-                    callback(&node.value);
+                    match catch_unwind(AssertUnwindSafe(|| callback(&node.value))) {
+                        Ok(()) => {
+                            sink_callbacks_fired += 1;
+                            trace!(
+                                node_id = sid.0,
+                                label = node.label.as_str(),
+                                value = ?node.value,
+                                "dataflow sink callback fired"
+                            );
+                        }
+                        Err(_) => {
+                            sink_callback_panics += 1;
+                            warn!(
+                                node_id = sid.0,
+                                label = node.label.as_str(),
+                                "dataflow sink callback panicked; continuing propagation"
+                            );
+                        }
+                    }
                 }
             }
         }
 
         self.dirty.clear();
         self.propagation_count += 1;
+        let elapsed = start.elapsed();
+        debug!(
+            propagation_count = self.propagation_count,
+            nodes_recomputed,
+            nodes_changed,
+            sink_callbacks_fired,
+            sink_callback_panics,
+            total_nodes,
+            elapsed_micros = elapsed.as_micros(),
+            "dataflow propagation pass completed"
+        );
 
         PropagationStats {
             nodes_recomputed,
             nodes_changed,
             total_nodes,
-            elapsed: start.elapsed(),
+            elapsed,
         }
     }
 
@@ -698,6 +828,13 @@ impl DataflowGraph {
                     }
                 }
             }
+        }
+        if flushed > 0 {
+            debug!(
+                flushed_nodes = flushed,
+                dirty_count = self.dirty.len(),
+                "dataflow flushed debounced nodes"
+            );
         }
         flushed
     }
@@ -772,6 +909,11 @@ impl DataflowGraph {
         }
         edges.sort();
 
+        trace!(
+            node_count = nodes.len(),
+            edge_count = edges.len(),
+            "dataflow graph snapshot generated"
+        );
         GraphSnapshot { nodes, edges }
     }
 
@@ -865,6 +1007,12 @@ impl DataflowGraph {
         }
 
         self.invalidate_topo();
+        debug!(
+            merged_nodes = other.nodes.len(),
+            total_nodes = self.nodes.len(),
+            total_edges = self.edge_count(),
+            "dataflow merged graph"
+        );
         id_map
     }
 
@@ -875,6 +1023,11 @@ impl DataflowGraph {
     /// Check if adding an edge from → to would create a cycle.
     fn would_create_cycle(&self, from: NodeId, to: NodeId) -> bool {
         if from == to {
+            trace!(
+                from_node_id = from.0,
+                to_node_id = to.0,
+                "dataflow cycle check rejected self-loop"
+            );
             return true;
         }
         // We're adding from->to, meaning `to` gets `from` as input.
@@ -885,6 +1038,11 @@ impl DataflowGraph {
         queue.push_back(to);
         while let Some(current) = queue.pop_front() {
             if current == from {
+                trace!(
+                    from_node_id = from.0,
+                    to_node_id = to.0,
+                    "dataflow cycle check detected reachable path"
+                );
                 return true;
             }
             if !visited.insert(current) {
@@ -908,6 +1066,10 @@ impl DataflowGraph {
             return;
         }
         self.topo_order = Some(self.compute_topo_order());
+        trace!(
+            node_count = self.nodes.len(),
+            "dataflow recomputed topological order"
+        );
         // Update depths.
         if let Some(ref order) = self.topo_order {
             for &nid in order {
@@ -1142,8 +1304,8 @@ mod tests {
 
     #[test]
     fn sink_callback_fires_on_change() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
         let mut g = DataflowGraph::new();
         let s = g.add_source("s", Value::Bool(false));
@@ -1163,8 +1325,8 @@ mod tests {
 
     #[test]
     fn sink_callback_not_fired_when_value_unchanged() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         let mut g = DataflowGraph::new();
         let s = g.add_source("s", Value::Int(1));
@@ -1190,6 +1352,102 @@ mod tests {
         g.update_source(s, Value::Int(0)).unwrap();
         g.propagate();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn orchestration_rule_triggers_and_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut g = DataflowGraph::new();
+        let has_error = g.add_source("has_error", Value::Bool(false));
+        let cpu_percent = g.add_source("cpu_percent", Value::Float(0.0));
+        let cooldown_elapsed = g.add_source("cooldown_elapsed", Value::Bool(false));
+        let high_load = g.add_map("high_load", vec![cpu_percent], |i| match &i[0] {
+            Value::Float(cpu) => Value::Bool(*cpu > 90.0),
+            _ => Value::Bool(false),
+        });
+        let should_restart = g.add_combine(
+            "should_restart",
+            vec![has_error, high_load, cooldown_elapsed],
+            |i| {
+                let error = matches!(i.first(), Some(Value::Bool(true)));
+                let load = matches!(i.get(1), Some(Value::Bool(true)));
+                let cooled = matches!(i.get(2), Some(Value::Bool(true)));
+                Value::Bool(error && load && cooled)
+            },
+        );
+        g.propagate();
+
+        let restart_count = Arc::new(AtomicUsize::new(0));
+        let recovery_count = Arc::new(AtomicUsize::new(0));
+        let restart_count_clone = Arc::clone(&restart_count);
+        let recovery_count_clone = Arc::clone(&recovery_count);
+        g.add_sink(should_restart, move |val| match val {
+            Value::Bool(true) => {
+                restart_count_clone.fetch_add(1, Ordering::SeqCst);
+            }
+            Value::Bool(false) => {
+                recovery_count_clone.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        })
+        .unwrap();
+
+        g.update_source(has_error, Value::Bool(true)).unwrap();
+        g.update_source(cpu_percent, Value::Float(95.0)).unwrap();
+        g.update_source(cooldown_elapsed, Value::Bool(true))
+            .unwrap();
+        g.propagate();
+        assert_eq!(restart_count.load(Ordering::SeqCst), 1);
+        assert_eq!(recovery_count.load(Ordering::SeqCst), 0);
+
+        g.update_source(cooldown_elapsed, Value::Bool(false))
+            .unwrap();
+        g.propagate();
+        assert_eq!(restart_count.load(Ordering::SeqCst), 1);
+        assert_eq!(recovery_count.load(Ordering::SeqCst), 1);
+
+        g.update_source(cooldown_elapsed, Value::Bool(true))
+            .unwrap();
+        g.propagate();
+        assert_eq!(restart_count.load(Ordering::SeqCst), 2);
+        assert_eq!(recovery_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sink_panic_isolated_from_propagation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut g = DataflowGraph::new();
+        let source = g.add_source("source", Value::Int(0));
+        let mapped = g.add_map("mapped", vec![source], |i| i[0].clone());
+        g.propagate();
+
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let successful_calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls_clone = Arc::clone(&callback_calls);
+        let successful_calls_clone = Arc::clone(&successful_calls);
+        g.add_sink(mapped, move |_val| {
+            let call_index = callback_calls_clone.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                panic!("intentional sink panic for resilience test");
+            }
+            successful_calls_clone.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+
+        g.update_source(source, Value::Int(1)).unwrap();
+        let first_stats = g.propagate();
+        assert_eq!(first_stats.nodes_changed, 1);
+
+        g.update_source(source, Value::Int(2)).unwrap();
+        let second_stats = g.propagate();
+        assert_eq!(second_stats.nodes_changed, 1);
+
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(successful_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1734,8 +1992,8 @@ mod tests {
 
     #[test]
     fn sink_removed_with_node() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
 
         let mut g = DataflowGraph::new();
         let s = g.add_source("s", Value::Int(0));

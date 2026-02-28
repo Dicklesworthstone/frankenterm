@@ -242,6 +242,10 @@ name = "causal_dag"
 harness = false
 
 [[bench]]
+name = "dataflow_bench"
+harness = false
+
+[[bench]]
 name = "kalman_watchdog"
 harness = false
 

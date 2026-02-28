@@ -1411,6 +1411,7 @@ pub enum MissionLifecycleState {
     Planned,
     Planning,
     Dispatching,
+    AwaitingApproval,
     Running,
     Executing,
     RetryPending,
@@ -1432,6 +1433,7 @@ impl fmt::Display for MissionLifecycleState {
             Self::Planned => f.write_str("planned"),
             Self::Planning => f.write_str("planning"),
             Self::Dispatching => f.write_str("dispatching"),
+            Self::AwaitingApproval => f.write_str("awaiting_approval"),
             Self::Running => f.write_str("running"),
             Self::Executing => f.write_str("executing"),
             Self::RetryPending => f.write_str("retry_pending"),
@@ -1493,6 +1495,8 @@ pub fn mission_lifecycle_transition_table() -> &'static [MissionLifecycleTransit
 #[serde(rename_all = "snake_case")]
 pub enum MissionLifecycleTransitionKind {
     Dispatch,
+    RequestApproval,
+    Approve,
     StartExecution,
     Retry,
     Block,
@@ -1506,6 +1510,8 @@ impl fmt::Display for MissionLifecycleTransitionKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Dispatch => f.write_str("dispatch"),
+            Self::RequestApproval => f.write_str("request_approval"),
+            Self::Approve => f.write_str("approve"),
             Self::StartExecution => f.write_str("start_execution"),
             Self::Retry => f.write_str("retry"),
             Self::Block => f.write_str("block"),
@@ -1560,6 +1566,11 @@ const MISSION_LIFECYCLE_TRANSITIONS: &[MissionLifecycleTransition] = &[
     },
     MissionLifecycleTransition {
         from: MissionLifecycleState::Dispatching,
+        via: MissionLifecycleTransitionKind::RequestApproval,
+        to: MissionLifecycleState::AwaitingApproval,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Dispatching,
         via: MissionLifecycleTransitionKind::StartExecution,
         to: MissionLifecycleState::Executing,
     },
@@ -1570,6 +1581,22 @@ const MISSION_LIFECYCLE_TRANSITIONS: &[MissionLifecycleTransition] = &[
     },
     MissionLifecycleTransition {
         from: MissionLifecycleState::Dispatching,
+        via: MissionLifecycleTransitionKind::Cancel,
+        to: MissionLifecycleState::Cancelled,
+    },
+    // --- AwaitingApproval ---
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::AwaitingApproval,
+        via: MissionLifecycleTransitionKind::Approve,
+        to: MissionLifecycleState::Executing,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::AwaitingApproval,
+        via: MissionLifecycleTransitionKind::Fail,
+        to: MissionLifecycleState::Failed,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::AwaitingApproval,
         via: MissionLifecycleTransitionKind::Cancel,
         to: MissionLifecycleState::Cancelled,
     },
@@ -1672,6 +1699,142 @@ impl fmt::Display for MissionLifecycleError {
 }
 
 impl std::error::Error for MissionLifecycleError {}
+
+/// Terminality classification for mission failure codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionFailureTerminality {
+    Terminal,
+    NonTerminal,
+}
+
+/// Retryability classification for mission failure codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionFailureRetryability {
+    Retryable,
+    NotRetryable,
+}
+
+/// Structured failure code for mission-level errors.
+///
+/// Each variant provides stable reason/error codes for machine parsing and
+/// human-readable hints for operator triage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionFailureCode {
+    PolicyDenied,
+    ReservationConflict,
+    RateLimited,
+    StaleState,
+    DispatchError,
+    ApprovalRequired,
+    ApprovalDenied,
+    ApprovalExpired,
+    KillSwitchActivated,
+}
+
+impl MissionFailureCode {
+    /// Stable machine-readable reason code.
+    #[must_use]
+    pub fn reason_code(self) -> &'static str {
+        match self {
+            Self::PolicyDenied => "mission.policy_denied",
+            Self::ReservationConflict => "mission.reservation_conflict",
+            Self::RateLimited => "mission.rate_limited",
+            Self::StaleState => "mission.stale_state",
+            Self::DispatchError => "mission.dispatch_error",
+            Self::ApprovalRequired => "mission.approval_required",
+            Self::ApprovalDenied => "mission.approval_denied",
+            Self::ApprovalExpired => "mission.approval_expired",
+            Self::KillSwitchActivated => "mission.kill_switch_activated",
+        }
+    }
+
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub fn error_code(self) -> &'static str {
+        match self {
+            Self::PolicyDenied => "robot.mission_policy_denied",
+            Self::ReservationConflict => "robot.mission_reservation_conflict",
+            Self::RateLimited => "robot.mission_rate_limited",
+            Self::StaleState => "robot.mission_stale_state",
+            Self::DispatchError => "robot.mission_dispatch_error",
+            Self::ApprovalRequired => "robot.mission_approval_required",
+            Self::ApprovalDenied => "robot.mission_approval_denied",
+            Self::ApprovalExpired => "robot.mission_approval_expired",
+            Self::KillSwitchActivated => "robot.mission_kill_switch_activated",
+        }
+    }
+
+    /// Whether this failure code is terminal (no automatic recovery).
+    #[must_use]
+    pub fn terminality(self) -> MissionFailureTerminality {
+        match self {
+            Self::PolicyDenied
+            | Self::ApprovalDenied
+            | Self::KillSwitchActivated => MissionFailureTerminality::Terminal,
+            Self::ReservationConflict
+            | Self::RateLimited
+            | Self::StaleState
+            | Self::DispatchError
+            | Self::ApprovalRequired
+            | Self::ApprovalExpired => MissionFailureTerminality::NonTerminal,
+        }
+    }
+
+    /// Whether the failure is retryable.
+    #[must_use]
+    pub fn retryability(self) -> MissionFailureRetryability {
+        match self {
+            Self::ReservationConflict
+            | Self::RateLimited
+            | Self::StaleState
+            | Self::DispatchError
+            | Self::ApprovalExpired => MissionFailureRetryability::Retryable,
+            Self::PolicyDenied
+            | Self::ApprovalRequired
+            | Self::ApprovalDenied
+            | Self::KillSwitchActivated => MissionFailureRetryability::NotRetryable,
+        }
+    }
+
+    /// Human-readable triage hint.
+    #[must_use]
+    pub fn human_hint(self) -> &'static str {
+        match self {
+            Self::PolicyDenied => "The action was blocked by a safety policy. Check capability gates.",
+            Self::ReservationConflict => "A file reservation conflict prevented dispatch. Wait or release the conflicting reservation.",
+            Self::RateLimited => "Rate limit exceeded. Wait for the cooldown period before retrying.",
+            Self::StaleState => "Mission state is stale. Refresh state and retry.",
+            Self::DispatchError => "Dispatch failed due to a transient error. Retry after investigating logs.",
+            Self::ApprovalRequired => "This action requires operator approval before proceeding.",
+            Self::ApprovalDenied => "Operator denied the approval request. Review the denial reason.",
+            Self::ApprovalExpired => "The approval window expired. Request a new approval.",
+            Self::KillSwitchActivated => "The kill switch was activated. All mission operations are halted.",
+        }
+    }
+
+    /// Machine-readable triage hint for automated recovery.
+    #[must_use]
+    pub fn machine_hint(self) -> &'static str {
+        match self {
+            Self::PolicyDenied => "check_policy_gates",
+            Self::ReservationConflict => "wait_or_release_reservation",
+            Self::RateLimited => "backoff_and_retry",
+            Self::StaleState => "refresh_state_and_retry",
+            Self::DispatchError => "retry_with_exponential_backoff",
+            Self::ApprovalRequired => "request_operator_approval",
+            Self::ApprovalDenied => "review_denial_and_escalate",
+            Self::ApprovalExpired => "request_new_approval",
+            Self::KillSwitchActivated => "halt_all_operations",
+        }
+    }
+}
+
+impl fmt::Display for MissionFailureCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.reason_code())
+    }
+}
 
 /// Escalation severity for operator routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1946,6 +2109,66 @@ impl Mission {
         Ok(())
     }
 
+    /// Look up the dispatch contract for a given candidate.
+    ///
+    /// Returns the candidate action and its approval requirements, or an error
+    /// if the candidate is not found in this mission.
+    pub fn dispatch_contract_for_candidate(
+        &self,
+        candidate_id: &CandidateActionId,
+    ) -> Result<DispatchContract, MissionDispatchError> {
+        let candidate = self
+            .candidates
+            .iter()
+            .find(|c| c.candidate_id == *candidate_id)
+            .ok_or_else(|| MissionDispatchError::CandidateNotFound(candidate_id.clone()))?;
+        Ok(DispatchContract {
+            candidate_id: candidate.candidate_id.clone(),
+            action: candidate.action.clone(),
+            rationale: candidate.rationale.clone(),
+        })
+    }
+
+    /// Resolve the dispatch target (assignment) for a given assignment ID.
+    pub fn resolve_dispatch_target(
+        &self,
+        assignment_id: &AssignmentId,
+    ) -> Result<DispatchTarget, MissionDispatchError> {
+        let assignment = self
+            .assignments
+            .iter()
+            .find(|a| a.assignment_id == *assignment_id)
+            .ok_or_else(|| MissionDispatchError::AssignmentNotFound(assignment_id.clone()))?;
+        Ok(DispatchTarget {
+            assignment_id: assignment.assignment_id.clone(),
+            assignee: assignment.assignee.clone(),
+            candidate_id: assignment.candidate_id.clone(),
+            approval_state: assignment.approval_state.clone(),
+        })
+    }
+
+    /// Perform a dry-run of dispatching an assignment without side effects.
+    pub fn dispatch_assignment_dry_run(
+        &self,
+        assignment_id: &AssignmentId,
+        completed_at_ms: i64,
+    ) -> Result<DispatchDryRun, MissionDispatchError> {
+        let assignment = self
+            .assignments
+            .iter()
+            .find(|a| a.assignment_id == *assignment_id)
+            .ok_or_else(|| MissionDispatchError::AssignmentNotFound(assignment_id.clone()))?;
+        let would_approve = matches!(
+            assignment.approval_state,
+            ApprovalState::Approved { .. } | ApprovalState::NotRequired
+        );
+        Ok(DispatchDryRun {
+            assignment_id: assignment.assignment_id.clone(),
+            would_dispatch: would_approve,
+            simulated_at_ms: completed_at_ms,
+        })
+    }
+
     fn validate_lifecycle_state(&self) -> Result<(), MissionValidationError> {
         let has_success = self
             .assignments
@@ -1986,6 +2209,49 @@ impl Mission {
         }
     }
 }
+
+/// Dispatch contract returned by `Mission::dispatch_contract_for_candidate`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchContract {
+    pub candidate_id: CandidateActionId,
+    pub action: StepAction,
+    pub rationale: String,
+}
+
+/// Dispatch target returned by `Mission::resolve_dispatch_target`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchTarget {
+    pub assignment_id: AssignmentId,
+    pub assignee: String,
+    pub candidate_id: CandidateActionId,
+    pub approval_state: ApprovalState,
+}
+
+/// Dry-run result returned by `Mission::dispatch_assignment_dry_run`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchDryRun {
+    pub assignment_id: AssignmentId,
+    pub would_dispatch: bool,
+    pub simulated_at_ms: i64,
+}
+
+/// Errors from mission dispatch operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissionDispatchError {
+    CandidateNotFound(CandidateActionId),
+    AssignmentNotFound(AssignmentId),
+}
+
+impl fmt::Display for MissionDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CandidateNotFound(id) => write!(f, "candidate not found: {id}"),
+            Self::AssignmentNotFound(id) => write!(f, "assignment not found: {id}"),
+        }
+    }
+}
+
+impl std::error::Error for MissionDispatchError {}
 
 /// Errors that can occur during mission schema validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
