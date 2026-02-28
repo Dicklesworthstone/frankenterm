@@ -1416,6 +1416,7 @@ pub enum MissionLifecycleState {
     Executing,
     RetryPending,
     Blocked,
+    Paused,
     Completed,
     Cancelled,
     Failed,
@@ -1438,6 +1439,7 @@ impl fmt::Display for MissionLifecycleState {
             Self::Executing => f.write_str("executing"),
             Self::RetryPending => f.write_str("retry_pending"),
             Self::Blocked => f.write_str("blocked"),
+            Self::Paused => f.write_str("paused"),
             Self::Completed => f.write_str("completed"),
             Self::Cancelled => f.write_str("cancelled"),
             Self::Failed => f.write_str("failed"),
@@ -1504,6 +1506,12 @@ pub enum MissionLifecycleTransitionKind {
     Complete,
     Cancel,
     Fail,
+    PlanFinalized,
+    DispatchStarted,
+    ExecutionStarted,
+    RetryResumed,
+    ExecutionBlocked,
+    MissionCancelled,
 }
 
 impl fmt::Display for MissionLifecycleTransitionKind {
@@ -1519,6 +1527,12 @@ impl fmt::Display for MissionLifecycleTransitionKind {
             Self::Complete => f.write_str("complete"),
             Self::Cancel => f.write_str("cancel"),
             Self::Fail => f.write_str("fail"),
+            Self::PlanFinalized => f.write_str("plan_finalized"),
+            Self::DispatchStarted => f.write_str("dispatch_started"),
+            Self::ExecutionStarted => f.write_str("execution_started"),
+            Self::RetryResumed => f.write_str("retry_resumed"),
+            Self::ExecutionBlocked => f.write_str("execution_blocked"),
+            Self::MissionCancelled => f.write_str("mission_cancelled"),
         }
     }
 }
@@ -1676,6 +1690,104 @@ const MISSION_LIFECYCLE_TRANSITIONS: &[MissionLifecycleTransition] = &[
         via: MissionLifecycleTransitionKind::Cancel,
         to: MissionLifecycleState::Cancelled,
     },
+    // --- Paused ---
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Paused,
+        via: MissionLifecycleTransitionKind::RetryResumed,
+        to: MissionLifecycleState::Running,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Paused,
+        via: MissionLifecycleTransitionKind::Cancel,
+        to: MissionLifecycleState::Cancelled,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Paused,
+        via: MissionLifecycleTransitionKind::Fail,
+        to: MissionLifecycleState::Failed,
+    },
+    // --- Extended transitions using new kinds ---
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Planning,
+        via: MissionLifecycleTransitionKind::PlanFinalized,
+        to: MissionLifecycleState::Planned,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Planned,
+        via: MissionLifecycleTransitionKind::DispatchStarted,
+        to: MissionLifecycleState::Dispatching,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::AwaitingApproval,
+        via: MissionLifecycleTransitionKind::DispatchStarted,
+        to: MissionLifecycleState::Dispatching,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Dispatching,
+        via: MissionLifecycleTransitionKind::ExecutionStarted,
+        to: MissionLifecycleState::Running,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Running,
+        via: MissionLifecycleTransitionKind::ExecutionBlocked,
+        to: MissionLifecycleState::Paused,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Blocked,
+        via: MissionLifecycleTransitionKind::RetryResumed,
+        to: MissionLifecycleState::Running,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::RetryPending,
+        via: MissionLifecycleTransitionKind::RetryResumed,
+        to: MissionLifecycleState::Dispatching,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Running,
+        via: MissionLifecycleTransitionKind::MissionCancelled,
+        to: MissionLifecycleState::Cancelled,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Executing,
+        via: MissionLifecycleTransitionKind::MissionCancelled,
+        to: MissionLifecycleState::Cancelled,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Paused,
+        via: MissionLifecycleTransitionKind::MissionCancelled,
+        to: MissionLifecycleState::Cancelled,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Blocked,
+        via: MissionLifecycleTransitionKind::MissionCancelled,
+        to: MissionLifecycleState::Cancelled,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Dispatching,
+        via: MissionLifecycleTransitionKind::MissionCancelled,
+        to: MissionLifecycleState::Cancelled,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::RetryPending,
+        via: MissionLifecycleTransitionKind::MissionCancelled,
+        to: MissionLifecycleState::Cancelled,
+    },
+    // --- Executing (alias for Running) extended transitions ---
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Executing,
+        via: MissionLifecycleTransitionKind::ExecutionBlocked,
+        to: MissionLifecycleState::Paused,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Dispatching,
+        via: MissionLifecycleTransitionKind::ExecutionBlocked,
+        to: MissionLifecycleState::Paused,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::RetryPending,
+        via: MissionLifecycleTransitionKind::ExecutionBlocked,
+        to: MissionLifecycleState::Paused,
+    },
 ];
 
 /// Errors from mission lifecycle state transitions.
@@ -1769,9 +1881,9 @@ impl MissionFailureCode {
     #[must_use]
     pub fn terminality(self) -> MissionFailureTerminality {
         match self {
-            Self::PolicyDenied
-            | Self::ApprovalDenied
-            | Self::KillSwitchActivated => MissionFailureTerminality::Terminal,
+            Self::PolicyDenied | Self::ApprovalDenied | Self::KillSwitchActivated => {
+                MissionFailureTerminality::Terminal
+            }
             Self::ReservationConflict
             | Self::RateLimited
             | Self::StaleState
@@ -1801,15 +1913,27 @@ impl MissionFailureCode {
     #[must_use]
     pub fn human_hint(self) -> &'static str {
         match self {
-            Self::PolicyDenied => "The action was blocked by a safety policy. Check capability gates.",
-            Self::ReservationConflict => "A file reservation conflict prevented dispatch. Wait or release the conflicting reservation.",
-            Self::RateLimited => "Rate limit exceeded. Wait for the cooldown period before retrying.",
+            Self::PolicyDenied => {
+                "The action was blocked by a safety policy. Check capability gates."
+            }
+            Self::ReservationConflict => {
+                "A file reservation conflict prevented dispatch. Wait or release the conflicting reservation."
+            }
+            Self::RateLimited => {
+                "Rate limit exceeded. Wait for the cooldown period before retrying."
+            }
             Self::StaleState => "Mission state is stale. Refresh state and retry.",
-            Self::DispatchError => "Dispatch failed due to a transient error. Retry after investigating logs.",
+            Self::DispatchError => {
+                "Dispatch failed due to a transient error. Retry after investigating logs."
+            }
             Self::ApprovalRequired => "This action requires operator approval before proceeding.",
-            Self::ApprovalDenied => "Operator denied the approval request. Review the denial reason.",
+            Self::ApprovalDenied => {
+                "Operator denied the approval request. Review the denial reason."
+            }
             Self::ApprovalExpired => "The approval window expired. Request a new approval.",
-            Self::KillSwitchActivated => "The kill switch was activated. All mission operations are halted.",
+            Self::KillSwitchActivated => {
+                "The kill switch was activated. All mission operations are halted."
+            }
         }
     }
 
@@ -2109,6 +2233,29 @@ impl Mission {
         Ok(())
     }
 
+    /// Transition the mission lifecycle to a specific target state via a named
+    /// transition kind. Validates that the transition is legal according to the
+    /// lifecycle transition table.
+    pub fn transition_lifecycle(
+        &mut self,
+        to: MissionLifecycleState,
+        kind: MissionLifecycleTransitionKind,
+        transitioned_at_ms: i64,
+    ) -> Result<MissionLifecycleState, MissionLifecycleError> {
+        let valid = MISSION_LIFECYCLE_TRANSITIONS
+            .iter()
+            .any(|rule| rule.from == self.lifecycle_state && rule.via == kind && rule.to == to);
+        if !valid {
+            return Err(MissionLifecycleError::InvalidTransition {
+                from: self.lifecycle_state,
+                transition: kind,
+            });
+        }
+        self.lifecycle_state = to;
+        self.updated_at_ms = Some(transitioned_at_ms);
+        Ok(to)
+    }
+
     /// Look up the dispatch contract for a given candidate.
     ///
     /// Returns the candidate action and its approval requirements, or an error
@@ -2116,16 +2263,15 @@ impl Mission {
     pub fn dispatch_contract_for_candidate(
         &self,
         candidate_id: &CandidateActionId,
-    ) -> Result<DispatchContract, MissionDispatchError> {
+    ) -> Result<MissionDispatchContract, MissionDispatchError> {
         let candidate = self
             .candidates
             .iter()
             .find(|c| c.candidate_id == *candidate_id)
             .ok_or_else(|| MissionDispatchError::CandidateNotFound(candidate_id.clone()))?;
-        Ok(DispatchContract {
-            candidate_id: candidate.candidate_id.clone(),
-            action: candidate.action.clone(),
-            rationale: candidate.rationale.clone(),
+        Ok(MissionDispatchContract {
+            assignment_id: candidate.candidate_id.0.clone(),
+            target_agent: candidate.rationale.clone(),
         })
     }
 
@@ -2133,17 +2279,15 @@ impl Mission {
     pub fn resolve_dispatch_target(
         &self,
         assignment_id: &AssignmentId,
-    ) -> Result<DispatchTarget, MissionDispatchError> {
+    ) -> Result<MissionDispatchTarget, MissionDispatchError> {
         let assignment = self
             .assignments
             .iter()
             .find(|a| a.assignment_id == *assignment_id)
             .ok_or_else(|| MissionDispatchError::AssignmentNotFound(assignment_id.clone()))?;
-        Ok(DispatchTarget {
-            assignment_id: assignment.assignment_id.clone(),
-            assignee: assignment.assignee.clone(),
-            candidate_id: assignment.candidate_id.clone(),
-            approval_state: assignment.approval_state.clone(),
+        Ok(MissionDispatchTarget {
+            pane_id: 0,
+            workspace: Some(assignment.assignee.clone()),
         })
     }
 
@@ -2151,8 +2295,8 @@ impl Mission {
     pub fn dispatch_assignment_dry_run(
         &self,
         assignment_id: &AssignmentId,
-        completed_at_ms: i64,
-    ) -> Result<DispatchDryRun, MissionDispatchError> {
+        _completed_at_ms: i64,
+    ) -> Result<MissionDispatchExecution, MissionDispatchError> {
         let assignment = self
             .assignments
             .iter()
@@ -2162,10 +2306,13 @@ impl Mission {
             assignment.approval_state,
             ApprovalState::Approved { .. } | ApprovalState::NotRequired
         );
-        Ok(DispatchDryRun {
-            assignment_id: assignment.assignment_id.clone(),
-            would_dispatch: would_approve,
-            simulated_at_ms: completed_at_ms,
+        Ok(MissionDispatchExecution {
+            would_succeed: would_approve,
+            reason: if would_approve {
+                None
+            } else {
+                Some(format!("approval state: {:?}", assignment.approval_state))
+            },
         })
     }
 
@@ -3001,8 +3148,7 @@ impl MissionAgentCapabilityProfile {
                 max_parallel_assignments,
                 ..
             } => *max_parallel_assignments,
-            MissionAgentAvailability::Paused { .. }
-            | MissionAgentAvailability::Offline { .. } => 0,
+            MissionAgentAvailability::Paused { .. } | MissionAgentAvailability::Offline { .. } => 0,
             MissionAgentAvailability::Ready | MissionAgentAvailability::RateLimited { .. } => {
                 self.max_parallel_assignments
             }

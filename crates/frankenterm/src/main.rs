@@ -12,10 +12,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use frankenterm_core::logging::{LogConfig, LogError, init_logging};
-use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
+use frankenterm_core::logging::{LogConfig, LogError, init_logging};
+use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 
 /// Build metadata captured at compile time.
 mod build_meta {
@@ -2019,14 +2019,17 @@ enum ReplayCommands {
     },
 
     /// Manage replay artifact registry (list/inspect/add/retire/prune)
-    #[command(subcommand, after_help = r#"EXAMPLES:
+    #[command(
+        subcommand,
+        after_help = r#"EXAMPLES:
     ft replay artifact list
     ft replay artifact list --format json --tier T1
     ft replay artifact inspect path/to/trace.ftreplay
     ft replay artifact add path/to/trace.ftreplay --label auth_login
     ft replay artifact retire path/to/trace.ftreplay --reason "replaced by v2"
     ft replay artifact prune --dry-run --max-age-days 30
-"#)]
+"#
+    )]
     Artifact(ArtifactCommands),
 }
 
@@ -4419,14 +4422,10 @@ fn parse_runtime_worker_threads(value: Option<&str>) -> Result<Option<usize>, St
     }
 
     let parsed = trimmed.parse::<usize>().map_err(|_| {
-        format!(
-            "Invalid FT_RUNTIME_WORKER_THREADS value '{trimmed}': expected positive integer"
-        )
+        format!("Invalid FT_RUNTIME_WORKER_THREADS value '{trimmed}': expected positive integer")
     })?;
     if parsed == 0 {
-        return Err(
-            "Invalid FT_RUNTIME_WORKER_THREADS value '0': value must be >= 1".to_string(),
-        );
+        return Err("Invalid FT_RUNTIME_WORKER_THREADS value '0': value must be >= 1".to_string());
     }
     Ok(Some(parsed))
 }
@@ -8047,10 +8046,7 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 name: "tx show",
                 args: "[--contract-file <path>] [--include-contract]",
                 summary: "Inspect transaction lifecycle, receipts, and legal transitions",
-                examples: vec![
-                    "ft robot tx show",
-                    "ft robot tx show --include-contract",
-                ],
+                examples: vec!["ft robot tx show", "ft robot tx show --include-contract"],
             },
             QuickStartCommand {
                 name: "tx plan",
@@ -16134,8 +16130,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         }
                                     };
 
-                                    let data =
-                                        build_robot_mission_state_data(&mission, &mission_path, filters);
+                                    let data = build_robot_mission_state_data(
+                                        &mission,
+                                        &mission_path,
+                                        filters,
+                                    );
                                     let response = RobotResponse::success(data, elapsed_ms(start));
                                     print_robot_response(&response, format, stats)?;
                                 }
@@ -16221,21 +16220,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 RobotTxCommands::Plan { contract_file } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let contract =
-                                        match load_mission_tx_contract_from_path(&contract_path) {
-                                            Ok(contract) => contract,
-                                            Err(err) => {
-                                                let response =
-                                                    RobotResponse::<RobotTxPlanData>::error_with_code(
-                                                        robot_tx_error_code(err.error_code),
-                                                        err.message,
-                                                        err.hint,
-                                                        elapsed_ms(start),
-                                                    );
-                                                print_robot_response(&response, format, stats)?;
-                                                return Ok(());
-                                            }
-                                        };
+                                    let contract = match load_mission_tx_contract_from_path(
+                                        &contract_path,
+                                    ) {
+                                        Ok(contract) => contract,
+                                        Err(err) => {
+                                            let response =
+                                                RobotResponse::<RobotTxPlanData>::error_with_code(
+                                                    robot_tx_error_code(err.error_code),
+                                                    err.message,
+                                                    err.hint,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
 
                                     let data = RobotTxPlanData {
                                         contract_file: contract_path.display().to_string(),
@@ -16259,21 +16259,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let contract =
-                                        match load_mission_tx_contract_from_path(&contract_path) {
-                                            Ok(contract) => contract,
-                                            Err(err) => {
-                                                let response =
-                                                    RobotResponse::<RobotTxShowData>::error_with_code(
-                                                        robot_tx_error_code(err.error_code),
-                                                        err.message,
-                                                        err.hint,
-                                                        elapsed_ms(start),
-                                                    );
-                                                print_robot_response(&response, format, stats)?;
-                                                return Ok(());
-                                            }
-                                        };
+                                    let contract = match load_mission_tx_contract_from_path(
+                                        &contract_path,
+                                    ) {
+                                        Ok(contract) => contract,
+                                        Err(err) => {
+                                            let response =
+                                                RobotResponse::<RobotTxShowData>::error_with_code(
+                                                    robot_tx_error_code(err.error_code),
+                                                    err.message,
+                                                    err.hint,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
 
                                     let data = RobotTxShowData {
                                         contract_file: contract_path.display().to_string(),
@@ -16302,21 +16303,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let contract =
-                                        match load_mission_tx_contract_from_path(&contract_path) {
-                                            Ok(contract) => contract,
-                                            Err(err) => {
-                                                let response =
-                                                    RobotResponse::<RobotTxRunData>::error_with_code(
-                                                        robot_tx_error_code(err.error_code),
-                                                        err.message,
-                                                        err.hint,
-                                                        elapsed_ms(start),
-                                                    );
-                                                print_robot_response(&response, format, stats)?;
-                                                return Ok(());
-                                            }
-                                        };
+                                    let contract = match load_mission_tx_contract_from_path(
+                                        &contract_path,
+                                    ) {
+                                        Ok(contract) => contract,
+                                        Err(err) => {
+                                            let response =
+                                                RobotResponse::<RobotTxRunData>::error_with_code(
+                                                    robot_tx_error_code(err.error_code),
+                                                    err.message,
+                                                    err.hint,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
 
                                     if let Some(fail_step_id) = fail_step.as_deref()
                                         && !contract
@@ -16385,16 +16387,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             now_ms,
                                         );
 
-                                        let commit = match frankenterm_core::plan::execute_commit_phase(
-                                            &prepared_contract,
-                                            &commit_inputs,
-                                            kill_switch.into(),
-                                            paused,
-                                            now_ms,
-                                        ) {
-                                            Ok(report) => report,
-                                            Err(err) => {
-                                                let response =
+                                        let commit =
+                                            match frankenterm_core::plan::execute_commit_phase(
+                                                &prepared_contract,
+                                                &commit_inputs,
+                                                kill_switch.into(),
+                                                paused,
+                                                now_ms,
+                                            ) {
+                                                Ok(report) => report,
+                                                Err(err) => {
+                                                    let response =
                                                     RobotResponse::<RobotTxRunData>::error_with_code(
                                                         "robot.tx_execution_failed",
                                                         format!(
@@ -16403,23 +16406,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         None,
                                                         elapsed_ms(start),
                                                     );
-                                                print_robot_response(&response, format, stats)?;
-                                                return Ok(());
-                                            }
-                                        };
+                                                    print_robot_response(&response, format, stats)?;
+                                                    return Ok(());
+                                                }
+                                            };
 
                                         final_state = commit.outcome.target_tx_state();
                                         if matches!(
                                             commit.outcome,
                                             frankenterm_core::plan::TxCommitOutcome::PartialFailure
                                         ) {
-                                            let mut compensating_contract = prepared_contract.clone();
+                                            let mut compensating_contract =
+                                                prepared_contract.clone();
                                             compensating_contract.lifecycle_state =
                                                 frankenterm_core::plan::MissionTxState::Compensating;
                                             let comp_inputs = build_robot_tx_compensation_inputs(
-                                                &commit,
-                                                None,
-                                                now_ms,
+                                                &commit, None, now_ms,
                                             );
                                             let compensation =
                                                 match frankenterm_core::plan::execute_compensation_phase(
@@ -24721,16 +24723,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             // Determine report format.
-            let _report_format = if robot {
-                "json"
-            } else {
-                &format
-            };
+            let _report_format = if robot { "json" } else { &format };
 
             // Load budget if provided.
             let regression_budget = if let Some(budget_path) = &budget {
                 let toml_str = std::fs::read_to_string(budget_path).map_err(|e| {
-                    anyhow::anyhow!("Failed to read budget file '{}': {e}", budget_path.display())
+                    anyhow::anyhow!(
+                        "Failed to read budget file '{}': {e}",
+                        budget_path.display()
+                    )
                 })?;
                 RegressionBudget::from_toml(&toml_str)
                     .map_err(|e| anyhow::anyhow!("Invalid budget TOML: {e}"))?
@@ -24747,13 +24748,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             })?;
 
             let baseline_events: Vec<frankenterm_core::replay_decision_graph::DecisionEvent> =
-                serde_json::from_str(&baseline_data).map_err(|e| {
-                    anyhow::anyhow!("Failed to parse baseline events: {e}")
-                })?;
+                serde_json::from_str(&baseline_data)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse baseline events: {e}"))?;
             let candidate_events: Vec<frankenterm_core::replay_decision_graph::DecisionEvent> =
-                serde_json::from_str(&candidate_data).map_err(|e| {
-                    anyhow::anyhow!("Failed to parse candidate events: {e}")
-                })?;
+                serde_json::from_str(&candidate_data)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse candidate events: {e}"))?;
 
             let config = DiffConfig {
                 time_tolerance_ms: tolerance_ms,
@@ -24796,14 +24795,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }) => {
             use frankenterm_core::replay_cli::InspectResult;
 
-            let data = std::fs::read_to_string(&file).map_err(|e| {
-                anyhow::anyhow!("Failed to read trace '{}': {e}", file.display())
-            })?;
+            let data = std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("Failed to read trace '{}': {e}", file.display()))?;
 
             let events: Vec<frankenterm_core::replay_decision_graph::DecisionEvent> =
-                serde_json::from_str(&data).map_err(|e| {
-                    anyhow::anyhow!("Failed to parse trace events: {e}")
-                })?;
+                serde_json::from_str(&data)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse trace events: {e}"))?;
 
             let result = InspectResult::from_events(&file.display().to_string(), &events);
 
@@ -24822,8 +24819,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             ..
         }) => {
             use frankenterm_core::replay_artifact_registry::{
-                ArtifactManifest, ArtifactRegistry, ArtifactSensitivityTier,
-                ArtifactStatus, ListFilter, PruneOptions,
+                ArtifactManifest, ArtifactRegistry, ArtifactSensitivityTier, ArtifactStatus,
+                ListFilter, PruneOptions,
             };
 
             // The manifest lives at tests/regression/replay/manifest.toml
@@ -24845,9 +24842,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let mut registry = ArtifactRegistry::new(manifest, registry_base.clone());
 
             match artifact_cmd {
-                ArtifactCommands::List { format, tier, status } => {
+                ArtifactCommands::List {
+                    format,
+                    tier,
+                    status,
+                } => {
                     let filter = ListFilter {
-                        tier: tier.as_deref().and_then(ArtifactSensitivityTier::from_str_arg),
+                        tier: tier
+                            .as_deref()
+                            .and_then(ArtifactSensitivityTier::from_str_arg),
                         status: match status.as_deref() {
                             Some("active") => Some(ArtifactStatus::Active),
                             Some("retired") => Some(ArtifactStatus::Retired),
@@ -24856,38 +24859,56 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         label_prefix: None,
                     };
                     if format == "json" {
-                        println!("{}", registry.render_json(&filter).unwrap_or_else(|e| {
-                            format!("{{\"error\": \"{e}\"}}")
-                        }));
+                        println!(
+                            "{}",
+                            registry
+                                .render_json(&filter)
+                                .unwrap_or_else(|e| { format!("{{\"error\": \"{e}\"}}") })
+                        );
                     } else {
                         print!("{}", registry.render_table(&filter));
                     }
                 }
-                ArtifactCommands::Inspect { path, json } => {
-                    match registry.inspect(&path) {
-                        Ok(detail) => {
-                            if json {
-                                println!("{}", serde_json::to_string_pretty(&detail)
-                                    .unwrap_or_else(|_| "{}".to_string()));
-                            } else {
-                                println!("Artifact: {}", detail.entry.path);
-                                println!("  Label:      {}", detail.entry.label);
-                                println!("  Tier:       {}", detail.entry.sensitivity_tier.as_str());
-                                println!("  Status:     {:?}", detail.entry.status);
-                                println!("  Events:     {}", detail.entry.event_count);
-                                println!("  Decisions:  {}", detail.entry.decision_count);
-                                println!("  Size:       {} bytes", detail.entry.size_bytes);
-                                println!("  SHA-256:    {}", detail.entry.sha256);
-                                println!("  Integrity:  {}", if detail.integrity_ok { "OK" } else { "MISMATCH" });
-                                println!("  File:       {}", if detail.file_exists { "present" } else { "MISSING" });
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Error: {e}");
-                            std::process::exit(2);
+                ArtifactCommands::Inspect { path, json } => match registry.inspect(&path) {
+                    Ok(detail) => {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&detail)
+                                    .unwrap_or_else(|_| "{}".to_string())
+                            );
+                        } else {
+                            println!("Artifact: {}", detail.entry.path);
+                            println!("  Label:      {}", detail.entry.label);
+                            println!("  Tier:       {}", detail.entry.sensitivity_tier.as_str());
+                            println!("  Status:     {:?}", detail.entry.status);
+                            println!("  Events:     {}", detail.entry.event_count);
+                            println!("  Decisions:  {}", detail.entry.decision_count);
+                            println!("  Size:       {} bytes", detail.entry.size_bytes);
+                            println!("  SHA-256:    {}", detail.entry.sha256);
+                            println!(
+                                "  Integrity:  {}",
+                                if detail.integrity_ok {
+                                    "OK"
+                                } else {
+                                    "MISMATCH"
+                                }
+                            );
+                            println!(
+                                "  File:       {}",
+                                if detail.file_exists {
+                                    "present"
+                                } else {
+                                    "MISSING"
+                                }
+                            );
                         }
                     }
-                }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(2);
+                    }
+                },
                 ArtifactCommands::Add { path, label, tier } => {
                     let sensitivity = ArtifactSensitivityTier::from_str_arg(&tier)
                         .unwrap_or(ArtifactSensitivityTier::T1);
@@ -24898,7 +24919,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     match registry.add(&path, &label, sensitivity, now_ms) {
                         Ok(()) => {
                             // Save manifest
-                            let toml_str = registry.manifest().to_toml()
+                            let toml_str = registry
+                                .manifest()
+                                .to_toml()
                                 .map_err(|e| anyhow::anyhow!("Manifest serialize: {e}"))?;
                             std::fs::create_dir_all(&registry_base).ok();
                             std::fs::write(&manifest_path, &toml_str)
@@ -24918,7 +24941,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         .as_millis() as u64;
                     match registry.retire(&path, &reason, now_ms) {
                         Ok(()) => {
-                            let toml_str = registry.manifest().to_toml()
+                            let toml_str = registry
+                                .manifest()
+                                .to_toml()
                                 .map_err(|e| anyhow::anyhow!("Manifest serialize: {e}"))?;
                             std::fs::write(&manifest_path, &toml_str)
                                 .map_err(|e| anyhow::anyhow!("Write manifest: {e}"))?;
@@ -24930,7 +24955,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
                 }
-                ArtifactCommands::Prune { dry_run, max_age_days } => {
+                ArtifactCommands::Prune {
+                    dry_run,
+                    max_age_days,
+                } => {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -24942,7 +24970,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     });
                     print!("{}", result.render_human());
                     if !dry_run && !result.pruned_paths.is_empty() {
-                        let toml_str = registry.manifest().to_toml()
+                        let toml_str = registry
+                            .manifest()
+                            .to_toml()
                             .map_err(|e| anyhow::anyhow!("Manifest serialize: {e}"))?;
                         std::fs::write(&manifest_path, &toml_str)
                             .map_err(|e| anyhow::anyhow!("Write manifest: {e}"))?;
@@ -30152,14 +30182,18 @@ fn resolve_mission_file_path(
     mission_file.unwrap_or_else(|| default_mission_file_path(layout))
 }
 
-fn load_mission_from_path(path: &Path) -> Result<frankenterm_core::plan::Mission, MissionCommandError> {
+fn load_mission_from_path(
+    path: &Path,
+) -> Result<frankenterm_core::plan::Mission, MissionCommandError> {
     let raw = fs::read_to_string(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             MissionCommandError {
                 exit_code: MISSION_EXIT_NOT_FOUND,
                 error_code: "mission.file_not_found",
                 message: format!("Mission file not found: {}", path.display()),
-                hint: Some("Pass --mission-file <path> or create .ft/mission/active.json.".to_string()),
+                hint: Some(
+                    "Pass --mission-file <path> or create .ft/mission/active.json.".to_string(),
+                ),
             }
         } else {
             MissionCommandError {
@@ -30176,14 +30210,19 @@ fn load_mission_from_path(path: &Path) -> Result<frankenterm_core::plan::Mission
             exit_code: MISSION_EXIT_INVALID_INPUT,
             error_code: "mission.invalid_json",
             message: format!("Invalid mission JSON in {}: {err}", path.display()),
-            hint: Some("Ensure the mission file is valid JSON and matches mission schema.".to_string()),
+            hint: Some(
+                "Ensure the mission file is valid JSON and matches mission schema.".to_string(),
+            ),
         })?;
 
     mission.validate().map_err(|err| MissionCommandError {
         exit_code: MISSION_EXIT_VALIDATION,
         error_code: "mission.validation_failed",
         message: format!("Mission validation failed: {err}"),
-        hint: Some("Use `ft mission explain` to inspect legal transitions and dispatch contracts.".to_string()),
+        hint: Some(
+            "Use `ft mission explain` to inspect legal transitions and dispatch contracts."
+                .to_string(),
+        ),
     })?;
 
     Ok(mission)
@@ -30374,7 +30413,10 @@ fn persist_mission_to_path(
         fs::create_dir_all(parent).map_err(|err| MissionCommandError {
             exit_code: MISSION_EXIT_IO,
             error_code: "mission.file_write_failed",
-            message: format!("Failed to create mission directory {}: {err}", parent.display()),
+            message: format!(
+                "Failed to create mission directory {}: {err}",
+                parent.display()
+            ),
             hint: None,
         })?;
     }
@@ -30430,9 +30472,15 @@ fn mission_assignment_counters(
 
 fn mission_outcome_completed_at_ms(outcome: &frankenterm_core::plan::Outcome) -> i64 {
     match outcome {
-        frankenterm_core::plan::Outcome::Success { completed_at_ms, .. }
-        | frankenterm_core::plan::Outcome::Failed { completed_at_ms, .. }
-        | frankenterm_core::plan::Outcome::Cancelled { completed_at_ms, .. } => *completed_at_ms,
+        frankenterm_core::plan::Outcome::Success {
+            completed_at_ms, ..
+        }
+        | frankenterm_core::plan::Outcome::Failed {
+            completed_at_ms, ..
+        }
+        | frankenterm_core::plan::Outcome::Cancelled {
+            completed_at_ms, ..
+        } => *completed_at_ms,
     }
 }
 
@@ -30445,7 +30493,9 @@ fn mission_assignment_activity_at_ms(assignment: &frankenterm_core::plan::Assign
         .unwrap_or(assignment.created_at_ms)
 }
 
-fn mission_assignment_decision_path(assignment: &frankenterm_core::plan::Assignment) -> &'static str {
+fn mission_assignment_decision_path(
+    assignment: &frankenterm_core::plan::Assignment,
+) -> &'static str {
     match (&assignment.approval_state, &assignment.outcome) {
         (_, Some(frankenterm_core::plan::Outcome::Success { .. })) => "outcome_success",
         (_, Some(frankenterm_core::plan::Outcome::Failed { .. })) => "outcome_failed",
@@ -30469,8 +30519,16 @@ fn mission_assignment_reason_and_error(
 
     match &assignment.approval_state {
         frankenterm_core::plan::ApprovalState::Pending { .. } => (
-            Some(MissionFailureCode::ApprovalRequired.reason_code().to_string()),
-            Some(MissionFailureCode::ApprovalRequired.error_code().to_string()),
+            Some(
+                MissionFailureCode::ApprovalRequired
+                    .reason_code()
+                    .to_string(),
+            ),
+            Some(
+                MissionFailureCode::ApprovalRequired
+                    .error_code()
+                    .to_string(),
+            ),
         ),
         frankenterm_core::plan::ApprovalState::Denied { reason_code, .. } => (
             Some(reason_code.clone()),
@@ -30628,7 +30686,9 @@ fn build_mission_operator_view_data(
         .assignments
         .iter()
         .map(|assignment| {
-            let candidate_action = candidate_lookup.get(assignment.candidate_id.0.as_str()).copied();
+            let candidate_action = candidate_lookup
+                .get(assignment.candidate_id.0.as_str())
+                .copied();
             (
                 mission_assignment_activity_at_ms(assignment),
                 mission_decision_snapshot(assignment, candidate_action),
@@ -30724,35 +30784,42 @@ fn build_mission_decision_provenance_data(
             break;
         }
 
-        let candidate_action = candidate_lookup.get(assignment.candidate_id.0.as_str()).copied();
+        let candidate_action = candidate_lookup
+            .get(assignment.candidate_id.0.as_str())
+            .copied();
         let snapshot = mission_decision_snapshot(assignment, candidate_action);
 
         let mut decision_error = None;
-        let dispatch_contract = match mission.dispatch_contract_for_candidate(&assignment.candidate_id) {
-            Ok(contract) => Some(contract),
-            Err(err) => {
-                decision_error = Some(format!("dispatch_contract_error: {err}"));
-                None
-            }
-        };
-        let dispatch_target = match mission.resolve_dispatch_target(&assignment.assignment_id) {
-            Ok(target) => Some(target),
-            Err(err) => {
-                decision_error.get_or_insert_with(|| format!("dispatch_target_resolution_error: {err}"));
-                None
-            }
-        };
-        let dry_run_execution =
-            match mission.dispatch_assignment_dry_run(&assignment.assignment_id, dry_run_completed_at_ms)
-            {
-                Ok(execution) => Some(execution),
+        let dispatch_contract =
+            match mission.dispatch_contract_for_candidate(&assignment.candidate_id) {
+                Ok(contract) => Some(contract),
                 Err(err) => {
-                    decision_error.get_or_insert_with(|| format!("dispatch_dry_run_error: {err}"));
+                    decision_error = Some(format!("dispatch_contract_error: {err}"));
                     None
                 }
             };
+        let dispatch_target = match mission.resolve_dispatch_target(&assignment.assignment_id) {
+            Ok(target) => Some(target),
+            Err(err) => {
+                decision_error
+                    .get_or_insert_with(|| format!("dispatch_target_resolution_error: {err}"));
+                None
+            }
+        };
+        let dry_run_execution = match mission
+            .dispatch_assignment_dry_run(&assignment.assignment_id, dry_run_completed_at_ms)
+        {
+            Ok(execution) => Some(execution),
+            Err(err) => {
+                decision_error.get_or_insert_with(|| format!("dispatch_dry_run_error: {err}"));
+                None
+            }
+        };
 
-        let mut provenance_trace = vec![format!("assignment_decision_path:{}", snapshot.decision_path)];
+        let mut provenance_trace = vec![format!(
+            "assignment_decision_path:{}",
+            snapshot.decision_path
+        )];
         if let Some(provenance) = &mission.provenance {
             if let Some(bead_id) = provenance.bead_id.as_deref() {
                 provenance_trace.push(format!("bead_id:{bead_id}"));
@@ -31031,13 +31098,19 @@ fn robot_mission_assignment_matches_filters(
         return false;
     }
 
-    if let Some(run_state) = filters.run_state && assignment.run_state != run_state {
+    if let Some(run_state) = filters.run_state
+        && assignment.run_state != run_state
+    {
         return false;
     }
-    if let Some(agent_state) = filters.agent_state && assignment.agent_state != agent_state {
+    if let Some(agent_state) = filters.agent_state
+        && assignment.agent_state != agent_state
+    {
         return false;
     }
-    if let Some(action_state) = filters.action_state && assignment.action_state != action_state {
+    if let Some(action_state) = filters.action_state
+        && assignment.action_state != action_state
+    {
         return false;
     }
 
@@ -31062,7 +31135,9 @@ fn build_robot_mission_state_data(
     let mut matched = Vec::new();
     if mission_matches_filter {
         for assignment in &mission.assignments {
-            let candidate_action = candidate_lookup.get(assignment.candidate_id.0.as_str()).copied();
+            let candidate_action = candidate_lookup
+                .get(assignment.candidate_id.0.as_str())
+                .copied();
             let row = robot_mission_assignment_data(assignment, candidate_action);
             if robot_mission_assignment_matches_filters(&row, &filters) {
                 matched.push(row);
@@ -31111,7 +31186,9 @@ fn build_robot_mission_decisions_data(
     let mut matched_assignment_count = 0usize;
     if mission_matches_filter {
         for assignment in &mission.assignments {
-            let candidate_action = candidate_lookup.get(assignment.candidate_id.0.as_str()).copied();
+            let candidate_action = candidate_lookup
+                .get(assignment.candidate_id.0.as_str())
+                .copied();
             let assignment_row = robot_mission_assignment_data(assignment, candidate_action);
             if !robot_mission_assignment_matches_filters(&assignment_row, &filters) {
                 continue;
@@ -31141,14 +31218,15 @@ fn build_robot_mission_decisions_data(
                     None
                 }
             };
-            let dry_run_execution =
-                match mission.dispatch_assignment_dry_run(&assignment_id, dry_run_completed_at_ms) {
-                    Ok(execution) => Some(execution),
-                    Err(err) => {
-                        decision_error.get_or_insert_with(|| format!("dispatch_dry_run_error: {err}"));
-                        None
-                    }
-                };
+            let dry_run_execution = match mission
+                .dispatch_assignment_dry_run(&assignment_id, dry_run_completed_at_ms)
+            {
+                Ok(execution) => Some(execution),
+                Err(err) => {
+                    decision_error.get_or_insert_with(|| format!("dispatch_dry_run_error: {err}"));
+                    None
+                }
+            };
 
             decisions.push(RobotMissionDecisionData {
                 assignment: assignment_row,
@@ -31256,11 +31334,12 @@ fn mission_run_transition_plan(
         State::RetryPending | State::Blocked | State::Paused => {
             Ok(vec![(State::Running, Kind::RetryResumed)])
         }
-        State::Running => Ok(Vec::new()),
+        State::Running | State::Executing => Ok(Vec::new()),
         State::AwaitingApproval => Err(MissionCommandError {
             exit_code: MISSION_EXIT_TRANSITION,
             error_code: "mission.transition.awaiting_approval",
-            message: "Mission is awaiting approval and cannot enter run state directly.".to_string(),
+            message: "Mission is awaiting approval and cannot enter run state directly."
+                .to_string(),
             hint: Some("Resolve approval first, then retry `ft mission run`.".to_string()),
         }),
         State::Completed | State::Failed | State::Cancelled => Err(MissionCommandError {
@@ -31285,7 +31364,7 @@ fn mission_pause_transition_plan(
     use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
 
     match state {
-        State::Dispatching | State::Running | State::RetryPending => {
+        State::Dispatching | State::Running | State::Executing | State::RetryPending => {
             Ok(vec![(State::Paused, Kind::ExecutionBlocked)])
         }
         State::Blocked | State::Paused => Ok(Vec::new()),
@@ -31319,7 +31398,7 @@ fn mission_resume_transition_plan(
     match state {
         State::Blocked | State::Paused => Ok(vec![(State::Running, Kind::RetryResumed)]),
         State::RetryPending => Ok(vec![(State::Dispatching, Kind::RetryResumed)]),
-        State::Running | State::Dispatching => Ok(Vec::new()),
+        State::Running | State::Executing | State::Dispatching => Ok(Vec::new()),
         State::AwaitingApproval => Err(MissionCommandError {
             exit_code: MISSION_EXIT_TRANSITION,
             error_code: "mission.transition.awaiting_approval",
@@ -31413,11 +31492,10 @@ fn handle_mission_command(
             let mut dispatch_contracts = Vec::new();
             if include_dispatch_contracts {
                 for candidate in &mission.candidates {
-                    let contract = match mission.dispatch_contract_for_candidate(&candidate.candidate_id)
-                    {
-                        Ok(contract) => contract,
-                        Err(err) => {
-                            emit_mission_error(
+                    let contract =
+                        match mission.dispatch_contract_for_candidate(&candidate.candidate_id) {
+                            Ok(contract) => contract,
+                            Err(err) => emit_mission_error(
                                 output_format,
                                 MissionCommandError {
                                     exit_code: MISSION_EXIT_VALIDATION,
@@ -31431,9 +31509,8 @@ fn handle_mission_command(
                                             .to_string(),
                                     ),
                                 },
-                            )
-                        }
-                    };
+                            ),
+                        };
                     dispatch_contracts.push(contract);
                 }
             }
@@ -31483,7 +31560,14 @@ fn handle_mission_command(
                 format!("  Hash: {}", mission_hash),
                 format!("  Candidates: {}", mission.candidates.len()),
                 format!("  Assignments: {}", mission.assignments.len()),
-                format!("  Dispatch contracts: {}", if include_dispatch_contracts { "included" } else { "skipped" }),
+                format!(
+                    "  Dispatch contracts: {}",
+                    if include_dispatch_contracts {
+                        "included"
+                    } else {
+                        "skipped"
+                    }
+                ),
             ];
             emit_mission_success(output_format, data, &plain_lines)?;
         }
@@ -31585,9 +31669,18 @@ fn handle_mission_command(
                 format!("  Terminal: {}", mission.lifecycle_state.is_terminal()),
                 format!("  Hash: {}", mission_hash),
                 format!("  Candidates: {}", mission.candidates.len()),
-                format!("  Assignments: {} (succeeded={}, failed={}, unresolved={})", mission.assignments.len(), counters.succeeded, counters.failed, counters.unresolved),
+                format!(
+                    "  Assignments: {} (succeeded={}, failed={}, unresolved={})",
+                    mission.assignments.len(),
+                    counters.succeeded,
+                    counters.failed,
+                    counters.unresolved
+                ),
                 format!("  Awaiting approval: {}", counters.pending_approval),
-                format!("  Legal transitions from current state: {}", transitions.len()),
+                format!(
+                    "  Legal transitions from current state: {}",
+                    transitions.len()
+                ),
                 format!(
                     "  Degraded: {} ({}, severity={})",
                     degraded_state.is_degraded,
@@ -31595,7 +31688,10 @@ fn handle_mission_command(
                     degraded_state.severity.as_str()
                 ),
                 format!("  Degraded summary: {}", degraded_state.summary.as_str()),
-                format!("  Operator action: {}", degraded_state.operator_action.as_str()),
+                format!(
+                    "  Operator action: {}",
+                    degraded_state.operator_action.as_str()
+                ),
                 format!("  Active decisions: {}", active_decisions_count),
                 format!(
                     "  Blocked work: {} ({})",
@@ -31672,33 +31768,36 @@ fn handle_mission_command(
                                 requested_assignment_id
                             ),
                             hint: Some(
-                                "Use `ft mission status` to inspect known assignment IDs.".to_string(),
-                            ),
-                        },
-                    ),
-                };
-                let candidate_action = candidate_lookup.get(assignment.candidate_id.0.as_str()).copied();
-                let assignment_snapshot = mission_decision_snapshot(assignment, candidate_action);
-                let assignment_decision_path = assignment_snapshot.decision_path.clone();
-                let dispatch_contract = match mission.dispatch_contract_for_candidate(&assignment.candidate_id)
-                {
-                    Ok(contract) => contract,
-                    Err(err) => emit_mission_error(
-                        output_format,
-                        MissionCommandError {
-                            exit_code: MISSION_EXIT_VALIDATION,
-                            error_code: "mission.dispatch_contract_failed",
-                            message: format!(
-                                "Unable to build dispatch contract for assignment {}: {err}",
-                                assignment.assignment_id.0
-                            ),
-                            hint: Some(
-                                "Verify candidate action payload and mission provenance."
+                                "Use `ft mission status` to inspect known assignment IDs."
                                     .to_string(),
                             ),
                         },
                     ),
                 };
+                let candidate_action = candidate_lookup
+                    .get(assignment.candidate_id.0.as_str())
+                    .copied();
+                let assignment_snapshot = mission_decision_snapshot(assignment, candidate_action);
+                let assignment_decision_path = assignment_snapshot.decision_path.clone();
+                let dispatch_contract =
+                    match mission.dispatch_contract_for_candidate(&assignment.candidate_id) {
+                        Ok(contract) => contract,
+                        Err(err) => emit_mission_error(
+                            output_format,
+                            MissionCommandError {
+                                exit_code: MISSION_EXIT_VALIDATION,
+                                error_code: "mission.dispatch_contract_failed",
+                                message: format!(
+                                    "Unable to build dispatch contract for assignment {}: {err}",
+                                    assignment.assignment_id.0
+                                ),
+                                hint: Some(
+                                    "Verify candidate action payload and mission provenance."
+                                        .to_string(),
+                                ),
+                            },
+                        ),
+                    };
                 let target = match mission.resolve_dispatch_target(&assignment.assignment_id) {
                     Ok(target) => target,
                     Err(err) => emit_mission_error(
@@ -31711,7 +31810,8 @@ fn handle_mission_command(
                                 assignment.assignment_id.0
                             ),
                             hint: Some(
-                                "Use `ft mission status` to inspect known assignment IDs.".to_string(),
+                                "Use `ft mission status` to inspect known assignment IDs."
+                                    .to_string(),
                             ),
                         },
                     ),
@@ -31767,8 +31867,11 @@ fn handle_mission_command(
             let mission_id = mission.mission_id.0.clone();
             let operator_view = build_mission_operator_view_data(&mission, 10);
             let degraded_state = operator_view.degraded_state.clone();
-            let decision_provenance =
-                build_mission_decision_provenance_data(&mission, requested_assignment_id.as_deref(), 10);
+            let decision_provenance = build_mission_decision_provenance_data(
+                &mission,
+                requested_assignment_id.as_deref(),
+                10,
+            );
             let active_decisions_count = operator_view.active_decisions.len();
             let blocked_work_count = operator_view.blocked_work.len();
             let recent_outcomes_count = operator_view.recent_outcomes.len();
@@ -31796,11 +31899,17 @@ fn handle_mission_command(
                     degraded_state.severity.as_str()
                 ),
                 format!("  Degraded summary: {}", degraded_state.summary.as_str()),
-                format!("  Operator action: {}", degraded_state.operator_action.as_str()),
+                format!(
+                    "  Operator action: {}",
+                    degraded_state.operator_action.as_str()
+                ),
                 format!("  Active decisions: {}", active_decisions_count),
                 format!("  Blocked work: {}", blocked_work_count),
                 format!("  Recent outcomes: {}", recent_outcomes_count),
-                format!("  Decision provenance traces: {}", decision_provenance_count),
+                format!(
+                    "  Decision provenance traces: {}",
+                    decision_provenance_count
+                ),
                 "  Legal transitions:".to_string(),
             ];
             for (kind, to) in &transitions {
@@ -31863,11 +31972,11 @@ fn handle_mission_command(
                 Ok(plan) => plan,
                 Err(err) => emit_mission_error(output_format, err),
             };
-            let transitions = match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms())
-            {
-                Ok(transitions) => transitions,
-                Err(err) => emit_mission_error(output_format, err),
-            };
+            let transitions =
+                match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms()) {
+                    Ok(transitions) => transitions,
+                    Err(err) => emit_mission_error(output_format, err),
+                };
             if !transitions.is_empty() {
                 if let Err(err) = persist_mission_to_path(&mission_path, &mission) {
                     emit_mission_error(output_format, err);
@@ -31918,11 +32027,11 @@ fn handle_mission_command(
                 Ok(plan) => plan,
                 Err(err) => emit_mission_error(output_format, err),
             };
-            let transitions = match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms())
-            {
-                Ok(transitions) => transitions,
-                Err(err) => emit_mission_error(output_format, err),
-            };
+            let transitions =
+                match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms()) {
+                    Ok(transitions) => transitions,
+                    Err(err) => emit_mission_error(output_format, err),
+                };
             if !transitions.is_empty() {
                 if let Err(err) = persist_mission_to_path(&mission_path, &mission) {
                     emit_mission_error(output_format, err);
@@ -31974,11 +32083,11 @@ fn handle_mission_command(
                 Ok(plan) => plan,
                 Err(err) => emit_mission_error(output_format, err),
             };
-            let transitions = match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms())
-            {
-                Ok(transitions) => transitions,
-                Err(err) => emit_mission_error(output_format, err),
-            };
+            let transitions =
+                match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms()) {
+                    Ok(transitions) => transitions,
+                    Err(err) => emit_mission_error(output_format, err),
+                };
             if !transitions.is_empty() {
                 if let Err(err) = persist_mission_to_path(&mission_path, &mission) {
                     emit_mission_error(output_format, err);
@@ -32029,11 +32138,11 @@ fn handle_mission_command(
                 Ok(plan) => plan,
                 Err(err) => emit_mission_error(output_format, err),
             };
-            let transitions = match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms())
-            {
-                Ok(transitions) => transitions,
-                Err(err) => emit_mission_error(output_format, err),
-            };
+            let transitions =
+                match apply_mission_transition_plan(&mut mission, &plan, mission_now_ms()) {
+                    Ok(transitions) => transitions,
+                    Err(err) => emit_mission_error(output_format, err),
+                };
             if !transitions.is_empty() {
                 if let Err(err) = persist_mission_to_path(&mission_path, &mission) {
                     emit_mission_error(output_format, err);
@@ -35728,12 +35837,18 @@ mod tests {
             runtime_process_role_for_subcommand(Some("status")),
             RuntimeProcessRole::Cli
         );
-        assert_eq!(runtime_process_role_for_subcommand(None), RuntimeProcessRole::Cli);
+        assert_eq!(
+            runtime_process_role_for_subcommand(None),
+            RuntimeProcessRole::Cli
+        );
     }
 
     #[test]
     fn runtime_bootstrap_worker_thread_parser_handles_errors() {
-        assert_eq!(parse_runtime_worker_threads(None).expect("none is valid"), None);
+        assert_eq!(
+            parse_runtime_worker_threads(None).expect("none is valid"),
+            None
+        );
         assert_eq!(
             parse_runtime_worker_threads(Some("")).expect("empty is valid"),
             None
@@ -35761,7 +35876,10 @@ mod tests {
         let watch = runtime_bootstrap_spec_for_role(RuntimeProcessRole::Watch);
         assert_eq!(watch.thread_name, "ft-watch-runtime");
         assert_eq!(watch.startup_reason_code, "runtime.bootstrap.watch.startup");
-        assert_eq!(watch.shutdown_reason_code, "runtime.bootstrap.watch.shutdown");
+        assert_eq!(
+            watch.shutdown_reason_code,
+            "runtime.bootstrap.watch.shutdown"
+        );
 
         let web = runtime_bootstrap_spec_for_role(RuntimeProcessRole::Web);
         assert_eq!(web.thread_name, "ft-web-runtime");
@@ -35771,13 +35889,16 @@ mod tests {
         let robot = runtime_bootstrap_spec_for_role(RuntimeProcessRole::Robot);
         assert_eq!(robot.thread_name, "ft-robot-runtime");
         assert_eq!(robot.startup_reason_code, "runtime.bootstrap.robot.startup");
-        assert_eq!(robot.shutdown_reason_code, "runtime.bootstrap.robot.shutdown");
+        assert_eq!(
+            robot.shutdown_reason_code,
+            "runtime.bootstrap.robot.shutdown"
+        );
     }
 
     fn sample_cli_mission() -> frankenterm_core::plan::Mission {
         use frankenterm_core::plan::{
-            ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId,
-            Mission, MissionActorRole, MissionId, MissionLifecycleState, MissionOwnership,
+            ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId, Mission,
+            MissionActorRole, MissionId, MissionLifecycleState, MissionOwnership,
             MissionProvenance, StepAction,
         };
 
@@ -35940,6 +36061,7 @@ mod tests {
                             text: "/do-step-1".to_string(),
                             paste_mode: Some(false),
                         },
+                        description: String::new(),
                     },
                     TxStep {
                         step_id: TxStepId("tx-step:2".to_string()),
@@ -35949,6 +36071,7 @@ mod tests {
                             text: "/do-step-2".to_string(),
                             paste_mode: Some(true),
                         },
+                        description: String::new(),
                     },
                 ],
                 preconditions: vec![TxPrecondition::PromptActive { pane_id: 7 }],
@@ -36057,12 +36180,7 @@ mod tests {
         .expect("mission pause should parse");
         match pause_cli.command.map(|cmd| *cmd) {
             Some(Commands::Mission {
-                command:
-                    MissionCommands::Pause {
-                        reason,
-                        format,
-                        ..
-                    },
+                command: MissionCommands::Pause { reason, format, .. },
             }) => {
                 assert_eq!(reason.as_deref(), Some("operator_backpressure"));
                 assert_eq!(format, "plain");
@@ -36157,7 +36275,9 @@ mod tests {
             .assignments
             .push(frankenterm_core::plan::Assignment {
                 assignment_id: frankenterm_core::plan::AssignmentId("assignment:cli-b".to_string()),
-                candidate_id: frankenterm_core::plan::CandidateActionId("candidate:cli-a".to_string()),
+                candidate_id: frankenterm_core::plan::CandidateActionId(
+                    "candidate:cli-a".to_string(),
+                ),
                 assigned_by: frankenterm_core::plan::MissionActorRole::Dispatcher,
                 assignee: "executor-2".to_string(),
                 reservation_intent: None,
@@ -36182,11 +36302,9 @@ mod tests {
         assert_eq!(counters.unresolved, 1);
 
         let transitions = mission_available_transitions(mission.lifecycle_state);
-        assert!(
-            transitions
-                .iter()
-                .any(|(kind, to)| kind.to_string() == "approval_granted" && to.to_string() == "running")
-        );
+        assert!(transitions.iter().any(
+            |(kind, to)| kind.to_string() == "approval_granted" && to.to_string() == "running"
+        ));
     }
 
     #[test]
@@ -36430,7 +36548,10 @@ mod tests {
                         },
                 }) => {
                     assert_eq!(contract_file, None);
-                    assert_eq!(fail_compensation_for_step.as_deref(), Some("tx-step:commit"));
+                    assert_eq!(
+                        fail_compensation_for_step.as_deref(),
+                        Some("tx-step:commit")
+                    );
                 }
                 _ => panic!("expected RobotCommands::Tx::Rollback"),
             },
@@ -36462,14 +36583,10 @@ mod tests {
         let contract = sample_robot_tx_contract();
         let prepare_inputs = build_robot_tx_prepare_gate_inputs(&contract);
         assert_eq!(prepare_inputs.len(), contract.plan.steps.len());
-        assert!(
-            prepare_inputs
-                .iter()
-                .all(|input| input.policy_passed
-                    && input.reservation_available
-                    && input.approval_satisfied
-                    && input.target_liveness)
-        );
+        assert!(prepare_inputs.iter().all(|input| input.policy_passed
+            && input.reservation_available
+            && input.approval_satisfied
+            && input.target_liveness));
 
         let commit_inputs = build_robot_tx_commit_step_inputs(&contract, Some("tx-step:2"), 4242);
         assert_eq!(commit_inputs.len(), 2);
@@ -36485,10 +36602,12 @@ mod tests {
             synthetic_commit.outcome,
             frankenterm_core::plan::TxCommitOutcome::FullyCommitted
         );
-        assert!(synthetic_commit
-            .step_results
-            .iter()
-            .all(|result| result.outcome.is_committed()));
+        assert!(
+            synthetic_commit
+                .step_results
+                .iter()
+                .all(|result| result.outcome.is_committed())
+        );
 
         let comp_inputs =
             build_robot_tx_compensation_inputs(&synthetic_commit, Some("tx-step:1"), 6161);
@@ -36510,8 +36629,8 @@ mod tests {
         std::fs::create_dir_all(&temp_root).expect("create temp root");
 
         let missing_path = temp_root.join("missing.json");
-        let missing_err =
-            load_mission_tx_contract_from_path(&missing_path).expect_err("missing path should fail");
+        let missing_err = load_mission_tx_contract_from_path(&missing_path)
+            .expect_err("missing path should fail");
         assert_eq!(missing_err.error_code, "mission.tx.file_not_found");
 
         let invalid_json_path = temp_root.join("invalid.json");
@@ -36559,14 +36678,21 @@ mod tests {
         )
         .expect("valid filters");
 
-        let payload = build_robot_mission_state_data(&mission, Path::new("/tmp/mission.json"), filters);
+        let payload =
+            build_robot_mission_state_data(&mission, Path::new("/tmp/mission.json"), filters);
         assert!(payload.mission_matches_filter);
         assert_eq!(payload.assignment_count, 3);
         assert_eq!(payload.matched_assignment_count, 1);
         assert_eq!(payload.returned_assignment_count, 1);
         assert_eq!(payload.assignments[0].assignment_id, "assignment:robot-b");
-        assert_eq!(payload.assignments[0].run_state, RobotMissionRunState::Failed);
-        assert_eq!(payload.assignments[0].agent_state, RobotMissionAgentState::Approved);
+        assert_eq!(
+            payload.assignments[0].run_state,
+            RobotMissionRunState::Failed
+        );
+        assert_eq!(
+            payload.assignments[0].agent_state,
+            RobotMissionAgentState::Approved
+        );
         assert_eq!(
             payload.assignments[0].action_state,
             RobotMissionActionState::Completed
@@ -36587,7 +36713,8 @@ mod tests {
         )
         .expect("valid filters");
 
-        let payload = build_robot_mission_state_data(&mission, Path::new("/tmp/mission.json"), filters);
+        let payload =
+            build_robot_mission_state_data(&mission, Path::new("/tmp/mission.json"), filters);
         assert!(!payload.mission_matches_filter);
         assert_eq!(payload.matched_assignment_count, 0);
         assert_eq!(payload.returned_assignment_count, 0);
@@ -36628,28 +36755,14 @@ mod tests {
             .expect_err("limit=0 should be rejected");
         assert_eq!(err.error_code, "mission.limit_invalid");
 
-        let err = build_robot_mission_filters(
-            None,
-            None,
-            None,
-            None,
-            Some("   ".to_string()),
-            None,
-            1,
-        )
-        .expect_err("blank assignment should be rejected");
+        let err =
+            build_robot_mission_filters(None, None, None, None, Some("   ".to_string()), None, 1)
+                .expect_err("blank assignment should be rejected");
         assert_eq!(err.error_code, "mission.assignment_id_empty");
 
-        let err = build_robot_mission_filters(
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("  ".to_string()),
-            1,
-        )
-        .expect_err("blank assignee should be rejected");
+        let err =
+            build_robot_mission_filters(None, None, None, None, None, Some("  ".to_string()), 1)
+                .expect_err("blank assignee should be rejected");
         assert_eq!(err.error_code, "mission.assignee_empty");
     }
 
@@ -36667,7 +36780,10 @@ mod tests {
             robot_mission_error_code("mission.assignment_not_found"),
             "robot.assignment_not_found"
         );
-        assert_eq!(robot_mission_error_code("mission.limit_invalid"), ROBOT_ERR_INVALID_ARGS);
+        assert_eq!(
+            robot_mission_error_code("mission.limit_invalid"),
+            ROBOT_ERR_INVALID_ARGS
+        );
         assert_eq!(
             robot_mission_error_code("mission.unmapped"),
             "robot.mission_error"
