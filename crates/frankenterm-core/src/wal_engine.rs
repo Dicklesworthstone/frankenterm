@@ -53,6 +53,65 @@ pub enum EntryKind<T: Clone> {
     CompactionMarker { compacted_through: u64 },
 }
 
+// ── Telemetry ───────────────────────────────────────────────────
+
+/// Operational telemetry counters for the WAL engine.
+///
+/// Uses plain `u64` because `WalEngine` methods take `&mut self`.
+#[derive(Debug, Clone, Default)]
+pub struct WalTelemetry {
+    /// Total mutation entries appended.
+    appends: u64,
+    /// Total checkpoint markers placed.
+    checkpoints: u64,
+    /// Total compaction runs.
+    compactions: u64,
+    /// Total entries removed by compaction.
+    entries_compacted: u64,
+    /// Total truncate operations.
+    truncations: u64,
+    /// Total entries removed by truncation.
+    entries_truncated: u64,
+}
+
+impl WalTelemetry {
+    /// Create a new telemetry instance with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> WalTelemetrySnapshot {
+        WalTelemetrySnapshot {
+            appends: self.appends,
+            checkpoints: self.checkpoints,
+            compactions: self.compactions,
+            entries_compacted: self.entries_compacted,
+            truncations: self.truncations,
+            entries_truncated: self.entries_truncated,
+        }
+    }
+}
+
+/// Serializable snapshot of WAL engine telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalTelemetrySnapshot {
+    /// Total mutation entries appended.
+    pub appends: u64,
+    /// Total checkpoint markers placed.
+    pub checkpoints: u64,
+    /// Total compaction runs.
+    pub compactions: u64,
+    /// Total entries removed by compaction.
+    pub entries_compacted: u64,
+    /// Total truncate operations.
+    pub truncations: u64,
+    /// Total entries removed by truncation.
+    pub entries_truncated: u64,
+}
+
 // ── WAL Engine ───────────────────────────────────────────────────
 
 /// Configuration for the WAL engine.
@@ -90,6 +149,8 @@ pub struct WalEngine<T: Clone> {
     compacted_through: u64,
     /// Configuration.
     config: WalConfig,
+    /// Operational telemetry counters.
+    telemetry: WalTelemetry,
 }
 
 impl<T: Clone> WalEngine<T> {
@@ -101,6 +162,7 @@ impl<T: Clone> WalEngine<T> {
             last_checkpoint_seq: None,
             compacted_through: 0,
             config,
+            telemetry: WalTelemetry::new(),
         }
     }
 
@@ -115,6 +177,7 @@ impl<T: Clone> WalEngine<T> {
             timestamp_ms,
             kind: EntryKind::Mutation(mutation),
         });
+        self.telemetry.appends += 1;
         seq
     }
 
@@ -130,6 +193,7 @@ impl<T: Clone> WalEngine<T> {
             kind: EntryKind::Checkpoint,
         });
         self.last_checkpoint_seq = Some(seq);
+        self.telemetry.checkpoints += 1;
         seq
     }
 
@@ -262,6 +326,8 @@ impl<T: Clone> WalEngine<T> {
                     compacted_through: retain_after,
                 },
             });
+            self.telemetry.compactions += 1;
+            self.telemetry.entries_compacted += removed as u64;
         }
 
         removed
@@ -271,12 +337,18 @@ impl<T: Clone> WalEngine<T> {
     ///
     /// Useful for "rewinding" to a known good state.
     pub fn truncate_after(&mut self, seq: u64) {
+        let before_len = self.entries.len();
         while let Some(back) = self.entries.back() {
             if back.seq > seq {
                 self.entries.pop_back();
             } else {
                 break;
             }
+        }
+        let removed = before_len - self.entries.len();
+        if removed > 0 {
+            self.telemetry.truncations += 1;
+            self.telemetry.entries_truncated += removed as u64;
         }
         self.next_seq = seq + 1;
         // Update last_checkpoint if it was truncated
@@ -298,6 +370,12 @@ impl<T: Clone> WalEngine<T> {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.last_checkpoint_seq = None;
+    }
+
+    /// Access telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> &WalTelemetry {
+        &self.telemetry
     }
 }
 
