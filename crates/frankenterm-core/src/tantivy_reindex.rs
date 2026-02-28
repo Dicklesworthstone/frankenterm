@@ -1204,6 +1204,7 @@ mod tests {
     };
     use crate::tantivy_ingest::{IndexCommitStats, IndexDocumentFields};
     use std::collections::HashMap;
+    use std::path::Path;
     use tempfile::tempdir;
 
     // -- test helpers --

@@ -104,7 +104,7 @@ pub(crate) async fn refresh_and_select_account(
     })
 }
 
-async fn persist_caut_refresh_accounts(
+pub(crate) async fn persist_caut_refresh_accounts(
     storage: &StorageHandle,
     service: crate::caut::CautService,
     refresh: &crate::caut::CautRefresh,

@@ -44,7 +44,7 @@ pub struct CodexExitOutcome {
 
 /// Convert an injection result into a success/error for Ctrl-C handling.
 #[allow(dead_code)]
-fn ctrl_c_injection_ok(result: InjectionResult) -> Result<(), String> {
+pub(crate) fn ctrl_c_injection_ok(result: InjectionResult) -> Result<(), String> {
     match result {
         InjectionResult::Allowed { .. } => Ok(()),
         InjectionResult::Denied { decision, .. } => match decision {
@@ -154,7 +154,7 @@ pub struct CodexTokenUsage {
 
 #[allow(dead_code)]
 impl CodexTokenUsage {
-    fn has_any(&self) -> bool {
+    pub(crate) fn has_any(&self) -> bool {
         self.total.is_some()
             || self.input.is_some()
             || self.output.is_some()
