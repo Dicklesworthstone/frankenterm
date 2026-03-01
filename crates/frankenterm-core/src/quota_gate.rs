@@ -687,6 +687,60 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_latency_under_10ms() {
+        use std::time::Instant;
+
+        let mut gate = QuotaGate::new();
+        // Build a realistic worst-case signal set (all three signals active)
+        let signals = QuotaSignals {
+            budget_alerts: vec![
+                BudgetAlert {
+                    agent_type: "codex".to_string(),
+                    severity: AlertSeverity::Warning,
+                    budget_limit_usd: 100.0,
+                    current_cost_usd: 85.0,
+                    usage_fraction: 0.85,
+                },
+                BudgetAlert {
+                    agent_type: "claude_code".to_string(),
+                    severity: AlertSeverity::Critical,
+                    budget_limit_usd: 50.0,
+                    current_cost_usd: 60.0,
+                    usage_fraction: 1.2,
+                },
+            ],
+            rate_limit_summary: Some(ProviderRateLimitSummary {
+                agent_type: "codex".to_string(),
+                status: ProviderRateLimitStatus::PartiallyLimited,
+                limited_pane_count: 2,
+                total_pane_count: 5,
+                earliest_clear_secs: 120,
+                total_events: 3,
+            }),
+            quota_availability: Some(QuotaAvailability::Low),
+            selected_quota_percent: Some(4.5),
+        };
+
+        // Warm up
+        gate.evaluate(AgentType::Codex, &signals);
+
+        // Measure 1000 evaluations
+        let start = Instant::now();
+        for _ in 0..1000 {
+            let _ = gate.evaluate(AgentType::Codex, &signals);
+        }
+        let elapsed = start.elapsed();
+        let per_eval_us = elapsed.as_micros() as f64 / 1000.0;
+
+        // Acceptance criterion: <10ms per evaluation (generous bound)
+        // In practice this should be <100us
+        assert!(
+            per_eval_us < 10_000.0,
+            "Quota gate evaluation too slow: {per_eval_us:.1}us per eval (limit: 10000us)"
+        );
+    }
+
+    #[test]
     fn quota_gate_snapshot() {
         let mut gate = QuotaGate::new();
         gate.evaluate(AgentType::Codex, &QuotaSignals::default());
