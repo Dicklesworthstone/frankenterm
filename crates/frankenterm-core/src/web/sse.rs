@@ -386,7 +386,7 @@ pub(super) fn handle_stream_events(
             }
 
             loop {
-                let recv_result = tokio::select! {
+                let recv_result = select! {
                     () = tx.closed() => break,
                     recv = timeout(
                         Duration::from_secs(STREAM_KEEPALIVE_SECS),
@@ -514,7 +514,7 @@ pub(super) fn handle_stream_deltas(
             }
 
             loop {
-                let recv_result = tokio::select! {
+                let recv_result = select! {
                     () = tx.closed() => break,
                     recv = timeout(
                         Duration::from_secs(STREAM_KEEPALIVE_SECS),

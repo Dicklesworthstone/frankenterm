@@ -6,7 +6,7 @@
 
 use crate::events::{Event, EventBus, RecvError};
 use crate::policy::Redactor;
-use crate::runtime_compat::{mpsc, sleep, task, timeout};
+use crate::runtime_compat::{mpsc, select, signal, sleep, task, timeout};
 use crate::storage::{
     EventQuery, PaneRecord, SearchOptions, SearchResult, SegmentScanQuery, StorageHandle,
 };

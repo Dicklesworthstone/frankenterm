@@ -81,7 +81,7 @@ pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
 
     println!("ft web listening on http://{bound_addr}");
 
-    tokio::select! {
+    select! {
         result = &mut join => {
             handle_server_exit(result, &server, &app).await?;
         }
@@ -99,20 +99,20 @@ pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
 async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use super::signal::unix::SignalKind;
 
-        let mut term = signal(SignalKind::terminate())
+        let mut term = signal::unix::signal(SignalKind::terminate())
             .map_err(|e| Error::Runtime(format!("SIGTERM handler failed: {e}")))?;
 
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
+        select! {
+            _ = signal::ctrl_c() => {}
             _ = term.recv() => {}
         }
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c()
+        signal::ctrl_c()
             .await
             .map_err(|e| Error::Runtime(format!("Ctrl+C handler failed: {e}")))?;
         Ok(())
@@ -120,7 +120,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 }
 
 pub(super) async fn handle_server_exit(
-    result: std::result::Result<std::result::Result<(), ServerError>, tokio::task::JoinError>,
+    result: std::result::Result<std::result::Result<(), ServerError>, task::JoinError>,
     server: &Arc<TcpServer>,
     app: &Arc<App>,
 ) -> Result<()> {
