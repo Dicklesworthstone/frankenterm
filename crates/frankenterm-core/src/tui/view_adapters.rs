@@ -2837,4 +2837,171 @@ mod tests {
         assert!(label.contains("failover"));
         assert!(label.contains("temporal"));
     }
+
+    // ── Dashboard adapter tests ─────────────────────────────────────
+
+    fn sample_dashboard_state() -> crate::dashboard::DashboardState {
+        use crate::backpressure::{BackpressureSnapshot, BackpressureTier};
+        use crate::cost_tracker::{
+            BudgetAlert, AlertSeverity, CostDashboardSnapshot, PaneCostSummary,
+            ProviderCostSummary,
+        };
+        use crate::dashboard::DashboardManager;
+        use crate::quota_gate::{QuotaGateSnapshot, QuotaGateTelemetrySnapshot};
+        use crate::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
+
+        let mut mgr = DashboardManager::new();
+        mgr.update_costs(CostDashboardSnapshot {
+            providers: vec![ProviderCostSummary {
+                agent_type: "codex".to_string(),
+                total_tokens: 50_000,
+                total_cost_usd: 1.25,
+                pane_count: 3,
+                record_count: 100,
+            }],
+            panes: vec![PaneCostSummary {
+                pane_id: 1,
+                agent_type: "codex".to_string(),
+                total_tokens: 50_000,
+                total_cost_usd: 1.25,
+                record_count: 100,
+                last_updated_ms: 0,
+            }],
+            alerts: vec![BudgetAlert {
+                agent_type: "codex".to_string(),
+                current_cost_usd: 9.0,
+                budget_limit_usd: 10.0,
+                usage_fraction: 0.9,
+                severity: AlertSeverity::Warning,
+            }],
+            grand_total_cost_usd: 1.25,
+            grand_total_tokens: 50_000,
+        });
+        mgr.update_rate_limits(vec![ProviderRateLimitSummary {
+            agent_type: "codex".to_string(),
+            status: ProviderRateLimitStatus::PartiallyLimited,
+            limited_pane_count: 1,
+            total_pane_count: 3,
+            earliest_clear_secs: 30,
+            total_events: 2,
+        }]);
+        mgr.update_backpressure(BackpressureSnapshot {
+            tier: BackpressureTier::Yellow,
+            timestamp_epoch_ms: 0,
+            capture_depth: 500,
+            capture_capacity: 1000,
+            write_depth: 200,
+            write_capacity: 1000,
+            duration_in_tier_ms: 5000,
+            transitions: 2,
+            paused_panes: vec![1],
+        });
+        mgr.update_quota(QuotaGateSnapshot {
+            telemetry: QuotaGateTelemetrySnapshot {
+                evaluations: 100,
+                allowed: 80,
+                warned: 15,
+                blocked: 5,
+            },
+        });
+        mgr.snapshot()
+    }
+
+    #[test]
+    fn adapt_dashboard_health_label() {
+        let state = sample_dashboard_state();
+        let model = adapt_dashboard(&state);
+        assert_eq!(model.health_label, "yellow");
+        assert_eq!(model.health_style.fg, Some(ColorSpec::Yellow));
+    }
+
+    #[test]
+    fn adapt_dashboard_cost_rows() {
+        let state = sample_dashboard_state();
+        let model = adapt_dashboard(&state);
+        assert_eq!(model.cost_rows.len(), 1);
+        assert_eq!(model.cost_rows[0].agent_type, "codex");
+        assert_eq!(model.cost_rows[0].cost_label, "$1.25");
+        assert_eq!(model.cost_rows[0].tokens_label, "50.0K");
+        assert_eq!(model.total_cost_label, "$1.25");
+    }
+
+    #[test]
+    fn adapt_dashboard_alert_rows() {
+        let state = sample_dashboard_state();
+        let model = adapt_dashboard(&state);
+        assert_eq!(model.alert_rows.len(), 1);
+        assert!(model.alert_rows[0].message.contains("$9.00"));
+        assert!(model.alert_rows[0].message.contains("$10.00"));
+    }
+
+    #[test]
+    fn adapt_dashboard_rate_limit_rows() {
+        let state = sample_dashboard_state();
+        let model = adapt_dashboard(&state);
+        assert_eq!(model.rate_limit_rows.len(), 1);
+        assert_eq!(model.rate_limit_rows[0].limited_label, "1/3");
+        assert_eq!(model.rate_limit_rows[0].clear_label, "30s");
+        assert_eq!(model.limited_provider_label, "1/1");
+    }
+
+    #[test]
+    fn adapt_dashboard_backpressure() {
+        let state = sample_dashboard_state();
+        let model = adapt_dashboard(&state);
+        assert_eq!(model.bp_tier_label, "yellow");
+        assert_eq!(model.bp_capture_label, "50%");
+        assert_eq!(model.bp_write_label, "20%");
+        assert_eq!(model.bp_paused_label, "1");
+    }
+
+    #[test]
+    fn adapt_dashboard_quota() {
+        let state = sample_dashboard_state();
+        let model = adapt_dashboard(&state);
+        assert_eq!(model.quota_evaluations_label, "100");
+        assert_eq!(model.quota_block_rate_label, "5%");
+        assert_eq!(model.quota_block_rate_style.fg, Some(ColorSpec::Green));
+    }
+
+    #[test]
+    fn adapt_dashboard_summary_line() {
+        let state = sample_dashboard_state();
+        let model = adapt_dashboard(&state);
+        assert!(model.summary_line.contains("health=yellow"));
+    }
+
+    #[test]
+    fn adapt_dashboard_empty_state() {
+        let mut mgr = crate::dashboard::DashboardManager::new();
+        let state = mgr.snapshot();
+        let model = adapt_dashboard(&state);
+        assert_eq!(model.health_label, "green");
+        assert!(model.cost_rows.is_empty());
+        assert!(model.alert_rows.is_empty());
+        assert!(model.rate_limit_rows.is_empty());
+        assert_eq!(model.bp_paused_label, "0");
+        assert_eq!(model.quota_evaluations_label, "0");
+    }
+
+    #[test]
+    fn format_tokens_units() {
+        assert_eq!(format_tokens(500), "500");
+        assert_eq!(format_tokens(1_500), "1.5K");
+        assert_eq!(format_tokens(2_500_000), "2.5M");
+    }
+
+    #[test]
+    fn health_tier_styles_correct() {
+        let green = health_tier_style(&SystemHealthTier::Green);
+        assert_eq!(green.fg, Some(ColorSpec::Green));
+        assert!(!green.bold);
+
+        let red = health_tier_style(&SystemHealthTier::Red);
+        assert_eq!(red.fg, Some(ColorSpec::Red));
+        assert!(red.bold);
+
+        let black = health_tier_style(&SystemHealthTier::Black);
+        assert!(black.reversed);
+    }
 }
