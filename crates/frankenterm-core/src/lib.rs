@@ -222,6 +222,7 @@ pub mod process_triage;
 pub mod protocol_recovery;
 pub mod quantile_sketch;
 pub mod query_contract;
+pub mod quota_gate;
 pub mod r_tree;
 pub mod rate_limit_tracker;
 pub mod recorder_audit;
