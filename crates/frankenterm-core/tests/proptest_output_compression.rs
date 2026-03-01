@@ -639,27 +639,20 @@ proptest! {
 }
 
 // ============================================================================
-// Regression: lossy decompress with high similarity_threshold
+// Regression: previously lossy with high similarity_threshold (now fixed)
 // ============================================================================
 
-/// BUG: compress/decompress is lossy when similarity_threshold is high (>= 0.7).
+/// Regression test for a fixed bug where compress/decompress was lossy with high
+/// similarity_threshold (>= 0.7).
 ///
-/// When the threshold is very permissive, `group_similar_lines` groups dissimilar
-/// lines together (e.g., "status: OK" with "Processing step 1/100"). The template
-/// extraction then uses the first line as anchor, and `extract_variables` /
-/// `reconstruct_line` cannot faithfully reproduce the other lines because the
-/// template doesn't capture enough structure.
+/// The fix (fa263988) adds a reconstruction verification step in `compress()`:
+/// each line is checked via `reconstruct_line(template, extract_variables(...))`
+/// before encoding as `TemplateInstance`. Lines that can't be faithfully
+/// reconstructed fall back to `Literal` storage.
 ///
-/// Found by proptest with minimal failing input:
+/// Original failing input found by proptest:
 ///   input: "status: OK\nProcessing step 1/100\nProcessing step 1/100\n  A  AAaaLA"
 ///   config: { similarity_threshold: 0.86, min_group_size: 2, max_templates: 1 }
-///   expected: "status: OK\nProcessing step 1/100\nProcessing step 1/100\n  A  AAaaLA"
-///   actual:   "status: OK\nstep 1/100\nstep 1/100\n  A  AAaaLA"
-///
-/// Root cause: `lines_similar("status: OK", "Processing step 1/100", 0.86)` is
-/// true (normalized edit distance < 0.86), so all lines are grouped. Template
-/// extraction from ["status: OK", "Processing step 1/100", ...] produces a
-/// template anchored on "status: OK" that cannot reconstruct "Processing step 1/100".
 #[test]
 fn regression_lossy_high_threshold() {
     let input = "status: OK\nProcessing step 1/100\nProcessing step 1/100\n  A  AAaaLA";
