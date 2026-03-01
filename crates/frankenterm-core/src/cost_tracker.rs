@@ -109,18 +109,10 @@ impl BudgetThreshold {
 }
 
 /// Configuration for the cost tracker.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CostTrackerConfig {
     /// Per-provider budget thresholds.
     pub budgets: Vec<BudgetThreshold>,
-}
-
-impl Default for CostTrackerConfig {
-    fn default() -> Self {
-        Self {
-            budgets: Vec::new(),
-        }
-    }
 }
 
 // =============================================================================

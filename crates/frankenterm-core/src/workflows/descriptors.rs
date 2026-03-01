@@ -856,3 +856,553 @@ pub fn load_workflows_from_dir(
 pub fn default_workflow_dir() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|d| d.join("ft").join("workflows"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_yaml() -> &'static str {
+        r#"
+workflow_schema_version: 1
+name: test_workflow
+steps:
+  - type: send_text
+    id: step1
+    text: "hello\n"
+"#
+    }
+
+    fn minimal_toml() -> &'static str {
+        r#"
+workflow_schema_version = 1
+name = "test_workflow"
+
+[[steps]]
+type = "send_text"
+id = "step1"
+text = "hello\n"
+"#
+    }
+
+    // ========================================================================
+    // WorkflowDescriptor parsing
+    // ========================================================================
+
+    #[test]
+    fn parse_minimal_yaml() {
+        let wf = DescriptorWorkflow::from_yaml_str(minimal_yaml()).unwrap();
+        assert_eq!(wf.name, "test_workflow");
+        assert_eq!(wf.descriptor().steps.len(), 1);
+    }
+
+    #[test]
+    fn parse_minimal_toml() {
+        let wf = DescriptorWorkflow::from_toml_str(minimal_toml()).unwrap();
+        assert_eq!(wf.name, "test_workflow");
+        assert_eq!(wf.descriptor().steps.len(), 1);
+    }
+
+    #[test]
+    fn parse_yaml_with_all_step_types() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: all_steps
+steps:
+  - type: wait_for
+    id: wait1
+    matcher:
+      kind: substring
+      value: "prompt$"
+  - type: sleep
+    id: sleep1
+    duration_ms: 1000
+  - type: send_text
+    id: send1
+    text: "ls\n"
+    wait_for:
+      kind: regex
+      pattern: "\\$"
+    wait_timeout_ms: 5000
+  - type: send_ctrl
+    id: ctrl1
+    key: ctrl_c
+  - type: notify
+    id: notify1
+    message: "Step done"
+  - type: log
+    id: log1
+    message: "Logging"
+  - type: abort
+    id: abort1
+    reason: "bail out"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        assert_eq!(wf.descriptor().steps.len(), 7);
+    }
+
+    // ========================================================================
+    // Validation errors
+    // ========================================================================
+
+    #[test]
+    fn validate_wrong_schema_version() {
+        let yaml = r#"
+workflow_schema_version: 99
+name: bad
+steps:
+  - type: send_text
+    id: s1
+    text: "x"
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("workflow_schema_version"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_empty_steps() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: empty
+steps: []
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("at least one step"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_too_many_steps() {
+        let mut steps = String::new();
+        for i in 0..33 {
+            steps.push_str(&format!(
+                "  - type: send_text\n    id: s{i}\n    text: \"x\"\n"
+            ));
+        }
+        let yaml = format!(
+            "workflow_schema_version: 1\nname: big\nsteps:\n{steps}"
+        );
+        let err = WorkflowDescriptor::from_yaml_str(&yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("too many steps"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_duplicate_step_ids() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: dups
+steps:
+  - type: send_text
+    id: dup
+    text: "a"
+  - type: send_text
+    id: dup
+    text: "b"
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Duplicate step id"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_empty_step_id() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: empty_id
+steps:
+  - type: send_text
+    id: ""
+    text: "x"
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("cannot be empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_sleep_too_long() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: long_sleep
+steps:
+  - type: sleep
+    id: s1
+    duration_ms: 999999
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("sleep duration_ms too large"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_wait_timeout_too_long() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: long_wait
+steps:
+  - type: wait_for
+    id: w1
+    matcher:
+      kind: substring
+      value: "x"
+    timeout_ms: 999999
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("wait_for timeout_ms too large"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_send_text_too_long() {
+        let long_text = "x".repeat(9000);
+        let yaml = format!(
+            r#"
+workflow_schema_version: 1
+name: long_text
+steps:
+  - type: send_text
+    id: s1
+    text: "{long_text}"
+"#
+        );
+        let err = WorkflowDescriptor::from_yaml_str(&yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("send_text too large"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_invalid_regex() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: bad_regex
+steps:
+  - type: wait_for
+    id: w1
+    matcher:
+      kind: regex
+      pattern: "[invalid"
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Invalid regex"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_loop_too_many_iterations() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: big_loop
+steps:
+  - type: loop
+    id: loop1
+    count: 1001
+    body:
+      - type: send_text
+        id: inner
+        text: "x"
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Loop count too large"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_loop_empty_body() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: empty_loop
+steps:
+  - type: loop
+    id: loop1
+    count: 5
+    body: []
+"#;
+        let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("at least one step"), "got: {msg}");
+    }
+
+    // ========================================================================
+    // DescriptorFailureHandler
+    // ========================================================================
+
+    #[test]
+    fn failure_handler_interpolation() {
+        let h = DescriptorFailureHandler::Notify {
+            message: "Step ${failed_step} failed!".to_string(),
+        };
+        let result = h.interpolate_message("step_3");
+        assert_eq!(result, "Step step_3 failed!");
+    }
+
+    #[test]
+    fn failure_handler_no_interpolation() {
+        let h = DescriptorFailureHandler::Log {
+            message: "Something broke".to_string(),
+        };
+        let result = h.interpolate_message("step_1");
+        assert_eq!(result, "Something broke");
+    }
+
+    #[test]
+    fn failure_handler_abort_variant() {
+        let h = DescriptorFailureHandler::Abort {
+            message: "Fatal at ${failed_step}".to_string(),
+        };
+        let result = h.interpolate_message("wait_step");
+        assert_eq!(result, "Fatal at wait_step");
+    }
+
+    // ========================================================================
+    // DescriptorMatcher
+    // ========================================================================
+
+    #[test]
+    fn descriptor_matcher_to_text_match() {
+        let sub = DescriptorMatcher::Substring {
+            value: "hello".to_string(),
+        };
+        let tm = sub.to_text_match();
+        assert_eq!(tm, TextMatch::substring("hello"));
+
+        let re = DescriptorMatcher::Regex {
+            pattern: r"\d+".to_string(),
+        };
+        let tm = re.to_text_match();
+        assert_eq!(tm, TextMatch::regex(r"\d+"));
+    }
+
+    #[test]
+    fn descriptor_matcher_validate_substring_too_long() {
+        let long = "x".repeat(2000);
+        let m = DescriptorMatcher::Substring { value: long };
+        let err = m.validate(&DescriptorLimits::default()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Substring matcher too long"), "got: {msg}");
+    }
+
+    #[test]
+    fn descriptor_matcher_validate_regex_too_long() {
+        let long = "x".repeat(2000);
+        let m = DescriptorMatcher::Regex { pattern: long };
+        let err = m.validate(&DescriptorLimits::default()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Regex matcher too long"), "got: {msg}");
+    }
+
+    // ========================================================================
+    // DescriptorLimits defaults
+    // ========================================================================
+
+    #[test]
+    fn descriptor_limits_defaults() {
+        let limits = DescriptorLimits::default();
+        assert_eq!(limits.max_steps, 32);
+        assert_eq!(limits.max_wait_timeout_ms, 120_000);
+        assert_eq!(limits.max_sleep_ms, 30_000);
+        assert_eq!(limits.max_text_len, 8_192);
+        assert_eq!(limits.max_match_len, 1_024);
+    }
+
+    // ========================================================================
+    // DescriptorStep::id and description
+    // ========================================================================
+
+    #[test]
+    fn descriptor_step_id_all_variants() {
+        let steps: Vec<DescriptorStep> = serde_yaml::from_str(
+            r#"
+- type: send_text
+  id: st1
+  text: "x"
+- type: sleep
+  id: sl1
+  duration_ms: 100
+- type: notify
+  id: n1
+  message: "hi"
+- type: log
+  id: l1
+  message: "log"
+- type: abort
+  id: a1
+  reason: "done"
+"#,
+        )
+        .unwrap();
+        let ids: Vec<&str> = steps.iter().map(|s| s.id()).collect();
+        assert_eq!(ids, vec!["st1", "sl1", "n1", "l1", "a1"]);
+    }
+
+    // ========================================================================
+    // Conditional and Loop compilation
+    // ========================================================================
+
+    #[test]
+    fn conditional_workflow_parses() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: conditional
+steps:
+  - type: conditional
+    id: cond1
+    test_text: "hello world"
+    matcher:
+      kind: substring
+      value: "hello"
+    then_steps:
+      - type: send_text
+        id: then1
+        text: "matched\n"
+    else_steps:
+      - type: send_text
+        id: else1
+        text: "no match\n"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        assert_eq!(wf.descriptor().steps.len(), 1);
+        // Compiled steps should expand conditional into jump instructions + inner steps
+        assert!(wf.step_metadata.len() > 1);
+    }
+
+    #[test]
+    fn loop_workflow_parses() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: loop_test
+steps:
+  - type: loop
+    id: loop1
+    count: 3
+    body:
+      - type: send_text
+        id: inner1
+        text: "tick\n"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        // Loop with count=3 and 1 inner step should compile to 3 steps
+        assert_eq!(wf.step_metadata.len(), 3);
+    }
+
+    // ========================================================================
+    // Workflow triggers
+    // ========================================================================
+
+    #[test]
+    fn workflow_with_triggers() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: triggered
+triggers:
+  - event_types: ["session.compaction"]
+    agent_types: ["codex"]
+    rule_ids: ["compaction.detected"]
+steps:
+  - type: send_text
+    id: s1
+    text: "hello\n"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        assert_eq!(wf.descriptor().triggers.len(), 1);
+        let trigger = &wf.descriptor().triggers[0];
+        assert_eq!(trigger.event_types, vec!["session.compaction"]);
+        assert_eq!(trigger.agent_types, vec!["codex"]);
+    }
+
+    // ========================================================================
+    // Failure handler serde
+    // ========================================================================
+
+    #[test]
+    fn failure_handler_serde_roundtrip() {
+        let handlers = vec![
+            DescriptorFailureHandler::Notify {
+                message: "failed at ${failed_step}".into(),
+            },
+            DescriptorFailureHandler::Log {
+                message: "log msg".into(),
+            },
+            DescriptorFailureHandler::Abort {
+                message: "fatal".into(),
+            },
+        ];
+        for h in &handlers {
+            let json = serde_json::to_string(h).unwrap();
+            let parsed: DescriptorFailureHandler = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    // ========================================================================
+    // Filesystem loading
+    // ========================================================================
+
+    #[test]
+    fn load_workflows_from_dir_reads_yaml_and_toml() {
+        let dir = std::env::temp_dir().join("ft_desc_test_load");
+        let _ = std::fs::create_dir_all(&dir);
+
+        std::fs::write(dir.join("wf1.yaml"), minimal_yaml()).unwrap();
+        std::fs::write(dir.join("wf2.toml"), minimal_toml()).unwrap();
+        // Non-workflow file should be ignored
+        std::fs::write(dir.join("readme.txt"), "not a workflow").unwrap();
+
+        let loaded = load_workflows_from_dir(&dir);
+        assert_eq!(loaded.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_workflows_from_nonexistent_dir() {
+        let loaded = load_workflows_from_dir(std::path::Path::new("/nonexistent_dir_xyz"));
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_workflows_skips_invalid_files() {
+        let dir = std::env::temp_dir().join("ft_desc_test_skip");
+        let _ = std::fs::create_dir_all(&dir);
+
+        std::fs::write(dir.join("bad.yaml"), "not: valid: yaml: [[").unwrap();
+        std::fs::write(dir.join("good.yaml"), minimal_yaml()).unwrap();
+
+        let loaded = load_workflows_from_dir(&dir);
+        assert_eq!(loaded.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ========================================================================
+    // ControlKey serde
+    // ========================================================================
+
+    #[test]
+    fn control_key_serde_roundtrip() {
+        for key in [
+            DescriptorControlKey::CtrlC,
+            DescriptorControlKey::CtrlD,
+            DescriptorControlKey::CtrlZ,
+        ] {
+            let json = serde_json::to_string(&key).unwrap();
+            let parsed: DescriptorControlKey = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    // ========================================================================
+    // WorkflowDescriptor serde roundtrip
+    // ========================================================================
+
+    #[test]
+    fn workflow_descriptor_serde_roundtrip() {
+        let desc = WorkflowDescriptor::from_yaml_str(minimal_yaml()).unwrap();
+        let json = serde_json::to_string(&desc).unwrap();
+        let parsed: WorkflowDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "test_workflow");
+        assert_eq!(parsed.steps.len(), 1);
+    }
+}

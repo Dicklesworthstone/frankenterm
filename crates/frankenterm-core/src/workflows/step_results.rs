@@ -379,3 +379,332 @@ impl WaitCondition {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // StepResult constructors and predicates
+    // ========================================================================
+
+    #[test]
+    fn step_result_continue() {
+        let r = StepResult::cont();
+        assert!(r.is_continue());
+        assert!(!r.is_done());
+        assert!(!r.is_terminal());
+        assert!(!r.is_send_text());
+    }
+
+    #[test]
+    fn step_result_done() {
+        let r = StepResult::done(serde_json::json!({"status": "ok"}));
+        assert!(r.is_done());
+        assert!(r.is_terminal());
+        assert!(!r.is_continue());
+    }
+
+    #[test]
+    fn step_result_done_empty() {
+        let r = StepResult::done_empty();
+        assert!(r.is_done());
+        if let StepResult::Done { result } = &r {
+            assert!(result.is_null());
+        } else {
+            panic!("Expected Done variant");
+        }
+    }
+
+    #[test]
+    fn step_result_retry() {
+        let r = StepResult::retry(5000);
+        if let StepResult::Retry { delay_ms } = r {
+            assert_eq!(delay_ms, 5000);
+        } else {
+            panic!("Expected Retry variant");
+        }
+        assert!(!r.is_terminal());
+    }
+
+    #[test]
+    fn step_result_abort() {
+        let r = StepResult::abort("something failed");
+        assert!(r.is_terminal());
+        assert!(!r.is_done());
+        if let StepResult::Abort { reason } = &r {
+            assert_eq!(reason, "something failed");
+        }
+    }
+
+    #[test]
+    fn step_result_wait_for() {
+        let r = StepResult::wait_for(WaitCondition::pattern("rule1"));
+        if let StepResult::WaitFor {
+            condition,
+            timeout_ms,
+        } = &r
+        {
+            assert!(timeout_ms.is_none());
+            assert!(matches!(condition, WaitCondition::Pattern { .. }));
+        } else {
+            panic!("Expected WaitFor variant");
+        }
+    }
+
+    #[test]
+    fn step_result_wait_for_with_timeout() {
+        let r =
+            StepResult::wait_for_with_timeout(WaitCondition::pane_idle(1000), 5000);
+        if let StepResult::WaitFor {
+            timeout_ms,
+            ..
+        } = &r
+        {
+            assert_eq!(*timeout_ms, Some(5000));
+        }
+    }
+
+    #[test]
+    fn step_result_send_text() {
+        let r = StepResult::send_text("ls -la\n");
+        assert!(r.is_send_text());
+        if let StepResult::SendText {
+            text,
+            wait_for,
+            wait_timeout_ms,
+        } = &r
+        {
+            assert_eq!(text, "ls -la\n");
+            assert!(wait_for.is_none());
+            assert!(wait_timeout_ms.is_none());
+        }
+    }
+
+    #[test]
+    fn step_result_send_text_and_wait() {
+        let r = StepResult::send_text_and_wait(
+            "cargo test\n",
+            WaitCondition::text_match(TextMatch::substring("test result")),
+            30_000,
+        );
+        assert!(r.is_send_text());
+        if let StepResult::SendText {
+            text,
+            wait_for,
+            wait_timeout_ms,
+        } = &r
+        {
+            assert_eq!(text, "cargo test\n");
+            assert!(wait_for.is_some());
+            assert_eq!(*wait_timeout_ms, Some(30_000));
+        }
+    }
+
+    #[test]
+    fn step_result_jump_to() {
+        let r = StepResult::jump_to(5);
+        if let StepResult::JumpTo { step } = r {
+            assert_eq!(step, 5);
+        } else {
+            panic!("Expected JumpTo variant");
+        }
+    }
+
+    // ========================================================================
+    // StepResult serde roundtrip
+    // ========================================================================
+
+    #[test]
+    fn step_result_serde_all_variants() {
+        let variants = vec![
+            StepResult::cont(),
+            StepResult::done(serde_json::json!(42)),
+            StepResult::done_empty(),
+            StepResult::retry(1000),
+            StepResult::abort("error"),
+            StepResult::wait_for(WaitCondition::sleep(500)),
+            StepResult::send_text("hello"),
+            StepResult::jump_to(3),
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            let parsed: StepResult = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(json, json2, "roundtrip failed for variant");
+        }
+    }
+
+    // ========================================================================
+    // TextMatch
+    // ========================================================================
+
+    #[test]
+    fn text_match_substring() {
+        let m = TextMatch::substring("hello");
+        if let TextMatch::Substring { value } = &m {
+            assert_eq!(value, "hello");
+        } else {
+            panic!("Expected Substring variant");
+        }
+    }
+
+    #[test]
+    fn text_match_regex() {
+        let m = TextMatch::regex(r"\d+");
+        if let TextMatch::Regex { pattern } = &m {
+            assert_eq!(pattern, r"\d+");
+        }
+    }
+
+    #[test]
+    fn text_match_serde_roundtrip() {
+        let variants = vec![
+            TextMatch::substring("hello world"),
+            TextMatch::regex(r"^\d{3}-\d{4}$"),
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let parsed: TextMatch = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, &parsed);
+        }
+    }
+
+    #[test]
+    fn text_match_description() {
+        let sub = TextMatch::substring("test");
+        let desc = sub.description();
+        assert!(desc.starts_with("substring("));
+        assert!(desc.contains("len=4"));
+
+        let re = TextMatch::regex(r"\d+");
+        let desc = re.description();
+        assert!(desc.starts_with("regex("));
+    }
+
+    #[test]
+    fn text_match_to_wait_matcher_substring() {
+        let m = TextMatch::substring("prompt$");
+        let wm = m.to_wait_matcher();
+        assert!(wm.is_ok());
+    }
+
+    #[test]
+    fn text_match_to_wait_matcher_valid_regex() {
+        let m = TextMatch::regex(r"^\$ $");
+        let wm = m.to_wait_matcher();
+        assert!(wm.is_ok());
+    }
+
+    #[test]
+    fn text_match_to_wait_matcher_invalid_regex() {
+        let m = TextMatch::regex(r"[invalid");
+        let wm = m.to_wait_matcher();
+        assert!(wm.is_err());
+    }
+
+    // ========================================================================
+    // WaitCondition constructors and pane_id
+    // ========================================================================
+
+    #[test]
+    fn wait_condition_pattern() {
+        let c = WaitCondition::pattern("my_rule");
+        assert!(c.pane_id().is_none());
+        if let WaitCondition::Pattern { rule_id, pane_id } = &c {
+            assert_eq!(rule_id, "my_rule");
+            assert!(pane_id.is_none());
+        }
+    }
+
+    #[test]
+    fn wait_condition_pattern_on_pane() {
+        let c = WaitCondition::pattern_on_pane(42, "rule_x");
+        assert_eq!(c.pane_id(), Some(42));
+    }
+
+    #[test]
+    fn wait_condition_pane_idle() {
+        let c = WaitCondition::pane_idle(2000);
+        assert!(c.pane_id().is_none());
+        if let WaitCondition::PaneIdle {
+            idle_threshold_ms, ..
+        } = &c
+        {
+            assert_eq!(*idle_threshold_ms, 2000);
+        }
+    }
+
+    #[test]
+    fn wait_condition_pane_idle_on() {
+        let c = WaitCondition::pane_idle_on(10, 5000);
+        assert_eq!(c.pane_id(), Some(10));
+    }
+
+    #[test]
+    fn wait_condition_stable_tail() {
+        let c = WaitCondition::stable_tail(3000);
+        assert!(c.pane_id().is_none());
+    }
+
+    #[test]
+    fn wait_condition_stable_tail_on() {
+        let c = WaitCondition::stable_tail_on(7, 1000);
+        assert_eq!(c.pane_id(), Some(7));
+    }
+
+    #[test]
+    fn wait_condition_text_match() {
+        let c = WaitCondition::text_match(TextMatch::substring("done"));
+        assert!(c.pane_id().is_none());
+    }
+
+    #[test]
+    fn wait_condition_text_match_on_pane() {
+        let c = WaitCondition::text_match_on_pane(99, TextMatch::regex(r"\$"));
+        assert_eq!(c.pane_id(), Some(99));
+    }
+
+    #[test]
+    fn wait_condition_sleep() {
+        let c = WaitCondition::sleep(500);
+        assert!(c.pane_id().is_none());
+        if let WaitCondition::Sleep { duration_ms } = &c {
+            assert_eq!(*duration_ms, 500);
+        }
+    }
+
+    #[test]
+    fn wait_condition_external() {
+        let c = WaitCondition::external("signal_key");
+        assert!(c.pane_id().is_none());
+        if let WaitCondition::External { key } = &c {
+            assert_eq!(key, "signal_key");
+        }
+    }
+
+    // ========================================================================
+    // WaitCondition serde roundtrip
+    // ========================================================================
+
+    #[test]
+    fn wait_condition_serde_all_variants() {
+        let variants = vec![
+            WaitCondition::pattern("rule1"),
+            WaitCondition::pattern_on_pane(5, "rule2"),
+            WaitCondition::pane_idle(1000),
+            WaitCondition::pane_idle_on(3, 2000),
+            WaitCondition::stable_tail(500),
+            WaitCondition::stable_tail_on(8, 750),
+            WaitCondition::text_match(TextMatch::substring("hello")),
+            WaitCondition::text_match_on_pane(12, TextMatch::regex(r"\d+")),
+            WaitCondition::sleep(100),
+            WaitCondition::external("my_key"),
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let parsed: WaitCondition = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, &parsed);
+        }
+    }
+}
