@@ -412,16 +412,26 @@ pub fn compress(input: &str, config: &CompressionConfig) -> CompressedOutput {
 
                 let template = extract_template(&group_lines);
                 let template_idx = templates.len();
+                let mut template_used = false;
 
                 for &line in &group_lines {
                     let variables = extract_variables(&template, line);
-                    entries.push(CompressedEntry::TemplateInstance {
-                        template_idx,
-                        variables,
-                    });
+                    let reconstructed = reconstruct_line(&template, &variables);
+                    if reconstructed == line {
+                        entries.push(CompressedEntry::TemplateInstance {
+                            template_idx,
+                            variables,
+                        });
+                        template_used = true;
+                    } else {
+                        // Reconstruction is lossy for this line — store verbatim.
+                        entries.push(CompressedEntry::Literal(line.to_string()));
+                    }
                 }
 
-                templates.push(template);
+                if template_used {
+                    templates.push(template);
+                }
             }
             LineGroup::Unique(idx) => {
                 entries.push(CompressedEntry::Literal(lines[*idx].to_string()));

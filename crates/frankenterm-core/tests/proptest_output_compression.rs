@@ -661,7 +661,6 @@ proptest! {
 /// extraction from ["status: OK", "Processing step 1/100", ...] produces a
 /// template anchored on "status: OK" that cannot reconstruct "Processing step 1/100".
 #[test]
-#[ignore = "documents known lossy bug in output_compression with high similarity_threshold"]
 fn regression_lossy_high_threshold() {
     let input = "status: OK\nProcessing step 1/100\nProcessing step 1/100\n  A  AAaaLA";
     let config = CompressionConfig {
@@ -674,11 +673,9 @@ fn regression_lossy_high_threshold() {
     let decompressed = decompress(&compressed);
     let expected: String = input.lines().collect::<Vec<_>>().join("\n");
 
-    // This assertion FAILS, documenting the bug. When the bug is fixed, remove
-    // the #[ignore] and flip the assertion.
-    assert_ne!(
+    assert_eq!(
         decompressed, expected,
-        "If this passes, the lossy-high-threshold bug has been fixed! Remove #[ignore]."
+        "compress/decompress must be lossless even with high similarity_threshold"
     );
 }
 
