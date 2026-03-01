@@ -300,7 +300,7 @@ impl MdlExtractor {
         // Find the last successful command.
         let last_success_idx = effective_window.iter().rposition(CommandBlock::is_success);
 
-        if last_success_idx.is_none() {
+        let Some(last_success) = last_success_idx else {
             return ExtractionResult {
                 commands: Vec::new(),
                 score: MdlScore {
@@ -315,9 +315,7 @@ impl MdlExtractor {
                 reason_code: ExtractionReason::NoSuccessFound,
                 correlation_id: None,
             };
-        }
-
-        let last_success = last_success_idx.unwrap();
+        };
 
         // Check if all commands are successful.
         let all_success = effective_window.iter().all(CommandBlock::is_success);
@@ -543,7 +541,7 @@ impl WindowBuilder {
         };
         self.next_index += 1;
         self.blocks.push(block);
-        self.blocks.last().unwrap()
+        self.blocks.last().expect("just pushed")
     }
 
     /// Add a command block with output preview.
@@ -565,7 +563,7 @@ impl WindowBuilder {
         };
         self.next_index += 1;
         self.blocks.push(block);
-        self.blocks.last().unwrap()
+        self.blocks.last().expect("just pushed")
     }
 
     /// Get the built window.

@@ -1459,10 +1459,9 @@ impl CrashLoopDetector {
     /// Whether the system is in a crash loop (enough crashes within the window).
     #[must_use]
     pub fn is_crash_loop(&self) -> bool {
-        if self.crash_timestamps.is_empty() {
+        let Some(&now) = self.crash_timestamps.last() else {
             return false;
-        }
-        let now = *self.crash_timestamps.last().unwrap();
+        };
         self.crashes_in_window(now) >= self.config.crash_threshold
     }
 
