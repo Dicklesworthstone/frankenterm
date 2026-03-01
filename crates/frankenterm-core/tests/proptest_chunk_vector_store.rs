@@ -895,10 +895,9 @@ proptest! {
         let (store, _dir) = open_store();
         let query = make_normalized_vec(dim);
         let result = store.semantic_search("p-no", "g-no", &query, 10);
-        match result {
-            Ok(hits) => prop_assert_eq!(hits.len(), 0),
-            Err(_) => {} // error is also acceptable
-        }
+        if let Ok(hits) = result {
+            prop_assert_eq!(hits.len(), 0);
+        } // error is also acceptable
     }
 
     /// Double-registration of same generation id is idempotent.

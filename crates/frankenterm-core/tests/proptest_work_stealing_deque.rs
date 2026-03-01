@@ -428,9 +428,8 @@ proptest! {
                     }
                 }
                 Op::Steal => {
-                    match stealer.steal() {
-                        StealResult::Success(_) => stolen += 1,
-                        _ => {}
+                    if let StealResult::Success(_) = stealer.steal() {
+                        stolen += 1;
                     }
                 }
             }
@@ -465,9 +464,8 @@ proptest! {
                     }
                 }
                 Op::Steal => {
-                    match stealer.steal() {
-                        StealResult::Success(_) => expected_stolen += 1,
-                        _ => {}
+                    if let StealResult::Success(_) = stealer.steal() {
+                        expected_stolen += 1;
                     }
                 }
             }

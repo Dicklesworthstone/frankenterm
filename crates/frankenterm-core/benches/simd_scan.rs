@@ -153,11 +153,9 @@ fn scalar_scan_reference_with_state(bytes: &[u8], state: &mut ScalarState) -> Ou
             }
         }
 
-        if pending_utf8 > 0 {
-            if (b & 0b1100_0000) == 0b1000_0000 {
-                pending_utf8 -= 1;
-                continue;
-            }
+        if pending_utf8 > 0 && (b & 0b1100_0000) == 0b1000_0000 {
+            pending_utf8 -= 1;
+            continue;
         }
 
         pending_utf8 = match b {

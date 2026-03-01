@@ -5314,7 +5314,7 @@ steps:
                     return StepResult::abort("Simulated failure");
                 }
                 match step_idx {
-                    0 | 1 | 2 => StepResult::cont(),
+                    0..=2 => StepResult::cont(),
                     3 => StepResult::done(serde_json::json!({"steps_completed": 4})),
                     _ => StepResult::abort("Unexpected step index"),
                 }
@@ -5736,7 +5736,7 @@ steps:
         let engine = WorkflowEngine::default();
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
         let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let wezterm: crate::wezterm::WeztermHandle = Arc::new(MockWezterm::default());
+        let wezterm: crate::wezterm::WeztermHandle = Arc::new(MockWezterm);
         let injector = Arc::new(crate::runtime_compat::Mutex::new(
             crate::policy::PolicyGatedInjector::with_storage(
                 crate::policy::PolicyEngine::permissive(),
@@ -9820,7 +9820,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn usage_limit_default_impl() {
-        let wf = HandleUsageLimits::default();
+        let wf = HandleUsageLimits;
         assert_eq!(wf.name(), "handle_usage_limits");
     }
 

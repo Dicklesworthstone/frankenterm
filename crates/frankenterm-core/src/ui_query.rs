@@ -161,7 +161,7 @@ mod tests {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
-            .and_then(|d| u128::try_from(d.as_nanos()).ok())
+            .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("wa_ui_query_{label}_{now}"))
     }

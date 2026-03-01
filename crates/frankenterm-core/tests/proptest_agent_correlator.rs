@@ -731,7 +731,7 @@ proptest! {
         agent in arb_agent_type(),
     ) {
         let mut correlator = AgentCorrelator::new();
-        let rule_id = format!("core.test:banner");
+        let rule_id = "core.test:banner".to_string();
         correlator.ingest_detections(pane_id, &[make_detection(&rule_id, agent)]);
 
         let inv = correlator.inventory();

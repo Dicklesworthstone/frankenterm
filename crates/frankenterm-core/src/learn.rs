@@ -2970,7 +2970,7 @@ mod tests {
         for i in 1..=9 {
             engine
                 .handle_event(TutorialEvent::CompleteExercise(
-                    format!("advanced.{i}").into(),
+                    format!("advanced.{i}"),
                 ))
                 .unwrap();
         }
@@ -3045,7 +3045,7 @@ mod tests {
         for i in 1..=8 {
             engine
                 .handle_event(TutorialEvent::CompleteExercise(
-                    format!("advanced.{i}").into(),
+                    format!("advanced.{i}"),
                 ))
                 .unwrap();
         }

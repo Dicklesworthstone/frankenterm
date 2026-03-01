@@ -158,10 +158,8 @@ proptest! {
 
         // Selectively commit based on mask
         for (i, r) in reservations.iter().enumerate() {
-            if i < commit_mask.len() && commit_mask[i] {
-                if tx.commit(r, i as u32).is_ok() {
-                    committed_values.push(i as u32);
-                }
+            if i < commit_mask.len() && commit_mask[i] && tx.commit(r, i as u32).is_ok() {
+                committed_values.push(i as u32);
             }
         }
 

@@ -29,11 +29,8 @@ fn submit_selected_hooks(
     for hook in hooks.iter().filter(|h| h.selected_for_frame) {
         let intent = hook.to_resize_intent(pane_id, seq, submitted_at_ms);
         let outcome = scheduler.submit_intent(intent);
-        match outcome {
-            SubmitOutcome::Accepted { .. } => {
-                submitted.push((seq, hook.work_units));
-            }
-            _ => {}
+        if let SubmitOutcome::Accepted { .. } = outcome {
+            submitted.push((seq, hook.work_units));
         }
         seq += 1;
     }

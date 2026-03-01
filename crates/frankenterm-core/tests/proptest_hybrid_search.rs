@@ -28,7 +28,7 @@ fn arb_ranked_list(max_len: usize) -> impl Strategy<Value = Vec<(u64, f32)>> {
             ids_vec
                 .iter()
                 .copied()
-                .zip(scores.into_iter())
+                .zip(scores)
                 .collect::<Vec<(u64, f32)>>()
         })
     })
@@ -43,7 +43,7 @@ fn arb_fused_results(max_len: usize) -> impl Strategy<Value = Vec<FusedResult>> 
             ids_vec
                 .iter()
                 .copied()
-                .zip(scores.into_iter())
+                .zip(scores)
                 .enumerate()
                 .map(|(i, (id, score))| FusedResult {
                     id,

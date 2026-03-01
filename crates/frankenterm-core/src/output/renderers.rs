@@ -3531,7 +3531,7 @@ mod tests {
         // record_audit_action_redacted) must redact before passing data.
         // This test verifies that a properly redacted record renders cleanly.
         let mut action = sample_audit_action();
-        action.input_summary = Some(format!("ft send 5 '[REDACTED]'"));
+        action.input_summary = Some("ft send 5 '[REDACTED]'".to_string());
 
         let ctx = RenderContext::new(OutputFormat::Plain);
         let output = AuditListRenderer::render(&[action], &ctx);

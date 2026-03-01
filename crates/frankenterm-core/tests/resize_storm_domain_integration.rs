@@ -451,12 +451,8 @@ fn invariants_clean_after_multiple_storm_frames() {
 
     // Frame 2: more storm intents (new sequences)
     for i in 1..=6u64 {
-        let outcome = scheduler.submit_intent(local_intent(i, 2, 1, 200 + i));
-        match outcome {
-            SubmitOutcome::Accepted { .. } => {}
-            // If pane has active, new pending replaces old
-            _ => {}
-        }
+        let _outcome = scheduler.submit_intent(local_intent(i, 2, 1, 200 + i));
+        // If pane has active, new pending replaces old — either outcome is fine
     }
     scheduler.schedule_frame();
 

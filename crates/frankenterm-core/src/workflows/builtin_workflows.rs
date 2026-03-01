@@ -625,18 +625,13 @@ fn trigger_retry_after(trigger: &serde_json::Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[derive(Default)]
 pub struct HandleUsageLimits;
 
 impl HandleUsageLimits {
     #[must_use]
     pub fn new() -> Self {
         Self
-    }
-}
-
-impl Default for HandleUsageLimits {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

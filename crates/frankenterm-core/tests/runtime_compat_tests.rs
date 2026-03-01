@@ -491,10 +491,9 @@ fn timeout_zero_duration_on_ready_future() {
         // (tokio may or may not allow this — test documents actual behavior)
         let result = runtime_compat::timeout(Duration::ZERO, async { 1 }).await;
         // Either Ok(1) or Err — both are valid depending on scheduler
-        match result {
-            Ok(v) => assert_eq!(v, 1),
-            Err(_) => {} // acceptable: zero timeout may expire first
-        }
+        if let Ok(v) = result {
+            assert_eq!(v, 1);
+        } // Err is also acceptable: zero timeout may expire first
     });
 }
 

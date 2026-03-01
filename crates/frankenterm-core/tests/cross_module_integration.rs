@@ -165,12 +165,11 @@ fn high_entropy_segments(count: usize, seg_size: usize, seed: u8) -> Vec<Vec<u8>
             (0..seg_size)
                 .map(|j| {
                     // Simple deterministic pseudo-random via LCG
-                    let val = (i as u8)
+                    (i as u8)
                         .wrapping_mul(37)
                         .wrapping_add(j as u8)
                         .wrapping_mul(seed)
-                        .wrapping_add(131);
-                    val
+                        .wrapping_add(131)
                 })
                 .collect()
         })

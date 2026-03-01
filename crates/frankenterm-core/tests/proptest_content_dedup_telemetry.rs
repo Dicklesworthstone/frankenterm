@@ -253,7 +253,7 @@ proptest! {
                     let _ = eng.process_segment(content.as_bytes(), op_count);
                 }
                 1 => {
-                    let content = format!("repeated segment padded to sufficient length here");
+                    let content = "repeated segment padded to sufficient length here".to_string();
                     let _ = eng.process_segment(content.as_bytes(), op_count);
                 }
                 2 => { let _ = eng.release("nonexistent_hash"); }
