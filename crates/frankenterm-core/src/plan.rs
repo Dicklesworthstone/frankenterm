@@ -1778,16 +1778,10 @@ const MISSION_LIFECYCLE_TRANSITIONS: &[MissionLifecycleTransition] = &[
         via: MissionLifecycleTransitionKind::ExecutionBlocked,
         to: MissionLifecycleState::Paused,
     },
-    MissionLifecycleTransition {
-        from: MissionLifecycleState::Dispatching,
-        via: MissionLifecycleTransitionKind::ExecutionBlocked,
-        to: MissionLifecycleState::Paused,
-    },
-    MissionLifecycleTransition {
-        from: MissionLifecycleState::RetryPending,
-        via: MissionLifecycleTransitionKind::ExecutionBlocked,
-        to: MissionLifecycleState::Paused,
-    },
+    // NOTE: Dispatching/RetryPending → ExecutionBlocked intentionally omitted.
+    // ExecutionBlocked only makes sense from states where execution is active
+    // (Running or Executing). Dispatching hasn't started execution yet, and
+    // RetryPending hasn't retried yet.
 ];
 
 /// Errors from mission lifecycle state transitions.
@@ -2269,9 +2263,18 @@ impl Mission {
             .iter()
             .find(|c| c.candidate_id == *candidate_id)
             .ok_or_else(|| MissionDispatchError::CandidateNotFound(candidate_id.clone()))?;
+        // Find the assignment linked to this candidate, if one exists.
+        let assignment = self
+            .assignments
+            .iter()
+            .find(|a| a.candidate_id == *candidate_id);
         Ok(MissionDispatchContract {
-            assignment_id: candidate.candidate_id.0.clone(),
-            target_agent: candidate.rationale.clone(),
+            assignment_id: assignment
+                .map(|a| a.assignment_id.0.clone())
+                .unwrap_or_else(|| candidate.candidate_id.0.clone()),
+            target_agent: assignment
+                .map(|a| a.assignee.clone())
+                .unwrap_or_default(),
         })
     }
 
@@ -2285,8 +2288,19 @@ impl Mission {
             .iter()
             .find(|a| a.assignment_id == *assignment_id)
             .ok_or_else(|| MissionDispatchError::AssignmentNotFound(assignment_id.clone()))?;
+        // Resolve pane_id from the linked candidate action, falling back to 0.
+        let pane_id = self
+            .candidates
+            .iter()
+            .find(|c| c.candidate_id == assignment.candidate_id)
+            .and_then(|c| match &c.action {
+                StepAction::SendText { pane_id, .. } => Some(*pane_id),
+                StepAction::WaitFor { pane_id, .. } => *pane_id,
+                _ => None,
+            })
+            .unwrap_or(0);
         Ok(MissionDispatchTarget {
-            pane_id: 0,
+            pane_id,
             workspace: Some(assignment.assignee.clone()),
         })
     }
@@ -4929,5 +4943,349 @@ mod tests {
     fn plan_no_preconditions_helper() {
         let plan = ActionPlan::builder("Test", "ws").build();
         assert!(!plan.has_preconditions());
+    }
+
+    // =========================================================================
+    // Mission::transition_lifecycle tests
+    // =========================================================================
+
+    fn planning_mission() -> Mission {
+        Mission::new(
+            MissionId("mission:test".to_string()),
+            "Test mission",
+            "ws-test",
+            MissionOwnership {
+                planner: "planner".to_string(),
+                dispatcher: "dispatcher".to_string(),
+                operator: "operator".to_string(),
+            },
+            1_000_000,
+        )
+    }
+
+    #[test]
+    fn transition_lifecycle_valid_planning_to_dispatching() {
+        let mut mission = planning_mission();
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Planning);
+
+        let result = mission.transition_lifecycle(
+            MissionLifecycleState::Dispatching,
+            MissionLifecycleTransitionKind::Dispatch,
+            2_000_000,
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), MissionLifecycleState::Dispatching);
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Dispatching);
+        assert_eq!(mission.updated_at_ms, Some(2_000_000));
+    }
+
+    #[test]
+    fn transition_lifecycle_valid_dispatching_to_executing() {
+        let mut mission = planning_mission();
+        mission.lifecycle_state = MissionLifecycleState::Dispatching;
+
+        let result = mission.transition_lifecycle(
+            MissionLifecycleState::Executing,
+            MissionLifecycleTransitionKind::StartExecution,
+            3_000_000,
+        );
+        assert!(result.is_ok());
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Executing);
+    }
+
+    #[test]
+    fn transition_lifecycle_valid_executing_to_completed() {
+        let mut mission = planning_mission();
+        mission.lifecycle_state = MissionLifecycleState::Executing;
+
+        let result = mission.transition_lifecycle(
+            MissionLifecycleState::Completed,
+            MissionLifecycleTransitionKind::Complete,
+            4_000_000,
+        );
+        assert!(result.is_ok());
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Completed);
+    }
+
+    #[test]
+    fn transition_lifecycle_invalid_returns_error() {
+        let mut mission = planning_mission();
+        // Planning -> Completed directly is not a valid transition
+        let result = mission.transition_lifecycle(
+            MissionLifecycleState::Completed,
+            MissionLifecycleTransitionKind::Complete,
+            2_000_000,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let is_invalid = matches!(
+            err,
+            MissionLifecycleError::InvalidTransition {
+                from: MissionLifecycleState::Planning,
+                transition: MissionLifecycleTransitionKind::Complete,
+            }
+        );
+        assert!(is_invalid, "expected InvalidTransition, got {:?}", err);
+        // State should not change on error
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Planning);
+        assert_eq!(mission.updated_at_ms, None);
+    }
+
+    #[test]
+    fn transition_lifecycle_wrong_target_state_returns_error() {
+        let mut mission = planning_mission();
+        // Dispatch transition from Planning should go to Dispatching, not Running
+        let result = mission.transition_lifecycle(
+            MissionLifecycleState::Running,
+            MissionLifecycleTransitionKind::Dispatch,
+            2_000_000,
+        );
+        assert!(result.is_err());
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Planning);
+    }
+
+    #[test]
+    fn transition_lifecycle_paused_to_running_via_retry_resumed() {
+        let mut mission = planning_mission();
+        mission.lifecycle_state = MissionLifecycleState::Paused;
+
+        let result = mission.transition_lifecycle(
+            MissionLifecycleState::Running,
+            MissionLifecycleTransitionKind::RetryResumed,
+            5_000_000,
+        );
+        assert!(result.is_ok());
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Running);
+    }
+
+    #[test]
+    fn transition_lifecycle_executing_to_paused_via_execution_blocked() {
+        let mut mission = planning_mission();
+        mission.lifecycle_state = MissionLifecycleState::Executing;
+
+        let result = mission.transition_lifecycle(
+            MissionLifecycleState::Paused,
+            MissionLifecycleTransitionKind::ExecutionBlocked,
+            6_000_000,
+        );
+        assert!(result.is_ok());
+        assert_eq!(mission.lifecycle_state, MissionLifecycleState::Paused);
+    }
+
+    #[test]
+    fn transition_lifecycle_cancel_from_any_non_terminal() {
+        // Cancel should work from most non-terminal states
+        for state in [
+            MissionLifecycleState::Planning,
+            MissionLifecycleState::Dispatching,
+            MissionLifecycleState::Executing,
+            MissionLifecycleState::RetryPending,
+            MissionLifecycleState::Blocked,
+            MissionLifecycleState::Paused,
+        ] {
+            let mut mission = planning_mission();
+            mission.lifecycle_state = state;
+
+            let result = mission.transition_lifecycle(
+                MissionLifecycleState::Cancelled,
+                MissionLifecycleTransitionKind::Cancel,
+                7_000_000,
+            );
+            assert!(
+                result.is_ok(),
+                "Cancel from {state} should succeed but got {:?}",
+                result.unwrap_err()
+            );
+            assert_eq!(mission.lifecycle_state, MissionLifecycleState::Cancelled);
+        }
+    }
+
+    #[test]
+    fn transition_lifecycle_terminal_states_reject_transitions() {
+        for terminal in [
+            MissionLifecycleState::Completed,
+            MissionLifecycleState::Cancelled,
+            MissionLifecycleState::Failed,
+        ] {
+            let mut mission = planning_mission();
+            mission.lifecycle_state = terminal;
+
+            let result = mission.transition_lifecycle(
+                MissionLifecycleState::Running,
+                MissionLifecycleTransitionKind::Retry,
+                8_000_000,
+            );
+            assert!(
+                result.is_err(),
+                "Transition from terminal state {terminal} should fail"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Mission dispatch method tests
+    // =========================================================================
+
+    fn mission_with_dispatch_data() -> Mission {
+        let mut mission = planning_mission();
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:alpha".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::SendText {
+                pane_id: 1,
+                text: "ls -la".to_string(),
+                paste_mode: Some(false),
+            },
+            rationale: "List directory contents".to_string(),
+            score: Some(0.85),
+            created_at_ms: 1_000_100,
+        });
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("assignment:alpha".to_string()),
+            candidate_id: CandidateActionId("candidate:alpha".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "agent-1".to_string(),
+            reservation_intent: None,
+            approval_state: ApprovalState::Approved {
+                approved_by: "operator".to_string(),
+                approved_at_ms: 1_000_200,
+                approval_code_hash: "sha256:test".to_string(),
+            },
+            outcome: None,
+            escalation: None,
+            created_at_ms: 1_000_150,
+            updated_at_ms: None,
+        });
+        // Add a second assignment with Pending approval
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("assignment:beta".to_string()),
+            candidate_id: CandidateActionId("candidate:alpha".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "agent-2".to_string(),
+            reservation_intent: None,
+            approval_state: ApprovalState::Pending {
+                requested_by: "dispatcher".to_string(),
+                requested_at_ms: 1_000_250,
+            },
+            outcome: None,
+            escalation: None,
+            created_at_ms: 1_000_250,
+            updated_at_ms: None,
+        });
+        mission
+    }
+
+    #[test]
+    fn dispatch_contract_for_known_candidate() {
+        let mission = mission_with_dispatch_data();
+        let contract = mission
+            .dispatch_contract_for_candidate(&CandidateActionId("candidate:alpha".to_string()));
+        assert!(contract.is_ok());
+        let contract = contract.unwrap();
+        assert_eq!(contract.assignment_id, "assignment:alpha");
+        assert_eq!(contract.target_agent, "agent-1");
+    }
+
+    #[test]
+    fn dispatch_contract_for_candidate_without_assignment_falls_back() {
+        let mut mission = planning_mission();
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:orphan".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::SendText {
+                pane_id: 5,
+                text: "echo test".to_string(),
+                paste_mode: None,
+            },
+            rationale: "Orphan candidate".to_string(),
+            score: None,
+            created_at_ms: 1_000_100,
+        });
+        // No assignment linked to this candidate
+        let contract = mission
+            .dispatch_contract_for_candidate(&CandidateActionId("candidate:orphan".to_string()))
+            .unwrap();
+        // Falls back to candidate_id for assignment_id
+        assert_eq!(contract.assignment_id, "candidate:orphan");
+        // Falls back to empty string for target_agent
+        assert_eq!(contract.target_agent, "");
+    }
+
+    #[test]
+    fn dispatch_contract_for_unknown_candidate_returns_error() {
+        let mission = mission_with_dispatch_data();
+        let result = mission
+            .dispatch_contract_for_candidate(&CandidateActionId("candidate:unknown".to_string()));
+        assert!(result.is_err());
+        let is_not_found = matches!(
+            result.unwrap_err(),
+            MissionDispatchError::CandidateNotFound(_)
+        );
+        assert!(is_not_found);
+    }
+
+    #[test]
+    fn resolve_dispatch_target_for_known_assignment() {
+        let mission = mission_with_dispatch_data();
+        let target = mission
+            .resolve_dispatch_target(&AssignmentId("assignment:alpha".to_string()));
+        assert!(target.is_ok());
+        let target = target.unwrap();
+        assert_eq!(target.pane_id, 1);
+        assert_eq!(target.workspace, Some("agent-1".to_string()));
+    }
+
+    #[test]
+    fn resolve_dispatch_target_for_unknown_assignment_returns_error() {
+        let mission = mission_with_dispatch_data();
+        let result = mission
+            .resolve_dispatch_target(&AssignmentId("assignment:unknown".to_string()));
+        assert!(result.is_err());
+        let is_not_found = matches!(
+            result.unwrap_err(),
+            MissionDispatchError::AssignmentNotFound(_)
+        );
+        assert!(is_not_found);
+    }
+
+    #[test]
+    fn dispatch_dry_run_approved_succeeds() {
+        let mission = mission_with_dispatch_data();
+        let result = mission
+            .dispatch_assignment_dry_run(&AssignmentId("assignment:alpha".to_string()), 2_000_000);
+        assert!(result.is_ok());
+        let execution = result.unwrap();
+        assert!(execution.would_succeed);
+        assert!(execution.reason.is_none());
+    }
+
+    #[test]
+    fn dispatch_dry_run_pending_fails() {
+        let mission = mission_with_dispatch_data();
+        let result = mission
+            .dispatch_assignment_dry_run(&AssignmentId("assignment:beta".to_string()), 2_000_000);
+        assert!(result.is_ok());
+        let execution = result.unwrap();
+        assert!(!execution.would_succeed);
+        assert!(execution.reason.is_some());
+    }
+
+    #[test]
+    fn dispatch_dry_run_unknown_assignment_returns_error() {
+        let mission = mission_with_dispatch_data();
+        let result = mission
+            .dispatch_assignment_dry_run(&AssignmentId("assignment:unknown".to_string()), 2_000_000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dispatch_dry_run_not_required_succeeds() {
+        let mut mission = mission_with_dispatch_data();
+        // Change first assignment to NotRequired
+        mission.assignments[0].approval_state = ApprovalState::NotRequired;
+        let result = mission
+            .dispatch_assignment_dry_run(&AssignmentId("assignment:alpha".to_string()), 2_000_000);
+        assert!(result.is_ok());
+        assert!(result.unwrap().would_succeed);
     }
 }
