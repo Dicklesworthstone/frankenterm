@@ -930,3 +930,328 @@ impl Workflow for HandleUsageLimits {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // truncate_to_len
+    // ========================================================================
+
+    #[test]
+    fn truncate_to_len_short_string() {
+        assert_eq!(truncate_to_len("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_to_len_exact_boundary() {
+        assert_eq!(truncate_to_len("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_to_len_truncates() {
+        assert_eq!(truncate_to_len("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_to_len_empty() {
+        assert_eq!(truncate_to_len("", 10), "");
+    }
+
+    #[test]
+    fn truncate_to_len_zero_max() {
+        assert_eq!(truncate_to_len("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_to_len_unicode_aware() {
+        // Multi-byte chars — truncation should be char-count-based, not byte-based
+        let s = "héllo wörld";
+        let truncated = truncate_to_len(s, 5);
+        assert_eq!(truncated.chars().count(), 5);
+    }
+
+    // ========================================================================
+    // HandleCompaction construction
+    // ========================================================================
+
+    #[test]
+    fn handle_compaction_default() {
+        let wf = HandleCompaction::default();
+        assert_eq!(wf.stabilization_ms, 2000);
+        assert_eq!(wf.idle_timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn handle_compaction_new_equals_default() {
+        let wf1 = HandleCompaction::new();
+        let wf2 = HandleCompaction::default();
+        assert_eq!(wf1.stabilization_ms, wf2.stabilization_ms);
+        assert_eq!(wf1.idle_timeout_ms, wf2.idle_timeout_ms);
+    }
+
+    #[test]
+    fn handle_compaction_builder_methods() {
+        let wf = HandleCompaction::new()
+            .with_stabilization_ms(5000)
+            .with_idle_timeout_ms(30_000);
+        assert_eq!(wf.stabilization_ms, 5000);
+        assert_eq!(wf.idle_timeout_ms, 30_000);
+    }
+
+    // ========================================================================
+    // HandleCompaction: Workflow trait metadata
+    // ========================================================================
+
+    #[test]
+    fn handle_compaction_name() {
+        let wf = HandleCompaction::new();
+        assert_eq!(wf.name(), "handle_compaction");
+    }
+
+    #[test]
+    fn handle_compaction_description_nonempty() {
+        let wf = HandleCompaction::new();
+        assert!(!wf.description().is_empty());
+    }
+
+    #[test]
+    fn handle_compaction_has_four_steps() {
+        let wf = HandleCompaction::new();
+        let steps = wf.steps();
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[0].name, "check_guards");
+        assert_eq!(steps[1].name, "stabilize");
+        assert_eq!(steps[2].name, "send_prompt");
+        assert_eq!(steps[3].name, "verify_send");
+    }
+
+    #[test]
+    fn handle_compaction_handles_compaction_events() {
+        let wf = HandleCompaction::new();
+        let detection = crate::patterns::Detection {
+            rule_id: "claude_code.compaction".to_string(),
+            event_type: "session.compaction".to_string(),
+            severity: crate::patterns::Severity::Info,
+            agent_type: crate::patterns::AgentType::ClaudeCode,
+            matched_text: "Auto-compact".to_string(),
+            confidence: 1.0,
+            extracted: serde_json::Value::Object(Default::default()),
+            span: (0, 0),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_compaction_does_not_handle_unrelated() {
+        let wf = HandleCompaction::new();
+        let detection = crate::patterns::Detection {
+            rule_id: "codex.usage_limit".to_string(),
+            event_type: "rate_limit.detected".to_string(),
+            severity: crate::patterns::Severity::Warning,
+            agent_type: crate::patterns::AgentType::Codex,
+            matched_text: "rate limit".to_string(),
+            confidence: 1.0,
+            extracted: serde_json::Value::Object(Default::default()),
+            span: (0, 0),
+        };
+        assert!(!wf.handles(&detection));
+    }
+
+    // ========================================================================
+    // HandleUsageLimits: Workflow trait metadata
+    // ========================================================================
+
+    #[test]
+    fn handle_usage_limits_name() {
+        let wf = HandleUsageLimits::new();
+        assert_eq!(wf.name(), "handle_usage_limits");
+    }
+
+    #[test]
+    fn handle_usage_limits_description_nonempty() {
+        let wf = HandleUsageLimits::new();
+        assert!(!wf.description().is_empty());
+    }
+
+    #[test]
+    fn handle_usage_limits_has_three_steps() {
+        let wf = HandleUsageLimits::new();
+        let steps = wf.steps();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].name, "check_guards");
+        assert_eq!(steps[1].name, "exit_and_persist");
+        assert_eq!(steps[2].name, "select_account");
+    }
+
+    #[test]
+    fn handle_usage_limits_handles_codex_usage() {
+        let wf = HandleUsageLimits::new();
+        let detection = crate::patterns::Detection {
+            rule_id: "codex.usage_limit".to_string(),
+            event_type: "rate_limit.detected".to_string(),
+            severity: crate::patterns::Severity::Warning,
+            agent_type: crate::patterns::AgentType::Codex,
+            matched_text: "usage limit".to_string(),
+            confidence: 1.0,
+            extracted: serde_json::Value::Object(Default::default()),
+            span: (0, 0),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_usage_limits_rejects_non_codex() {
+        let wf = HandleUsageLimits::new();
+        let detection = crate::patterns::Detection {
+            rule_id: "claude_code.usage_limit".to_string(),
+            event_type: "rate_limit.detected".to_string(),
+            severity: crate::patterns::Severity::Warning,
+            agent_type: crate::patterns::AgentType::ClaudeCode,
+            matched_text: "usage limit".to_string(),
+            confidence: 1.0,
+            extracted: serde_json::Value::Object(Default::default()),
+            span: (0, 0),
+        };
+        assert!(!wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_usage_limits_rejects_unrelated_rule() {
+        let wf = HandleUsageLimits::new();
+        let detection = crate::patterns::Detection {
+            rule_id: "codex.compaction".to_string(),
+            event_type: "session.compaction".to_string(),
+            severity: crate::patterns::Severity::Info,
+            agent_type: crate::patterns::AgentType::Codex,
+            matched_text: "compaction".to_string(),
+            confidence: 1.0,
+            extracted: serde_json::Value::Object(Default::default()),
+            span: (0, 0),
+        };
+        assert!(!wf.handles(&detection));
+    }
+
+    // ========================================================================
+    // trigger_agent_type
+    // ========================================================================
+
+    #[test]
+    fn trigger_agent_type_codex() {
+        let trigger = serde_json::json!({"agent_type": "codex"});
+        assert_eq!(
+            trigger_agent_type(&trigger),
+            crate::patterns::AgentType::Codex
+        );
+    }
+
+    #[test]
+    fn trigger_agent_type_claude_code() {
+        let trigger = serde_json::json!({"agent_type": "claude_code"});
+        assert_eq!(
+            trigger_agent_type(&trigger),
+            crate::patterns::AgentType::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn trigger_agent_type_gemini() {
+        let trigger = serde_json::json!({"agent_type": "gemini"});
+        assert_eq!(
+            trigger_agent_type(&trigger),
+            crate::patterns::AgentType::Gemini
+        );
+    }
+
+    #[test]
+    fn trigger_agent_type_wezterm() {
+        let trigger = serde_json::json!({"agent_type": "wezterm"});
+        assert_eq!(
+            trigger_agent_type(&trigger),
+            crate::patterns::AgentType::Wezterm
+        );
+    }
+
+    #[test]
+    fn trigger_agent_type_unknown() {
+        let trigger = serde_json::json!({"agent_type": "something_else"});
+        assert_eq!(
+            trigger_agent_type(&trigger),
+            crate::patterns::AgentType::Unknown
+        );
+    }
+
+    #[test]
+    fn trigger_agent_type_missing() {
+        let trigger = serde_json::json!({});
+        assert_eq!(
+            trigger_agent_type(&trigger),
+            crate::patterns::AgentType::Unknown
+        );
+    }
+
+    // ========================================================================
+    // trigger_is_rate_limit
+    // ========================================================================
+
+    #[test]
+    fn trigger_is_rate_limit_by_event_type() {
+        let trigger = serde_json::json!({"event_type": "rate_limit.detected"});
+        assert!(trigger_is_rate_limit(&trigger));
+    }
+
+    #[test]
+    fn trigger_is_rate_limit_by_rule_id() {
+        let trigger = serde_json::json!({"rule_id": "codex.rate_limit"});
+        assert!(trigger_is_rate_limit(&trigger));
+    }
+
+    #[test]
+    fn trigger_is_rate_limit_false() {
+        let trigger = serde_json::json!({"event_type": "session.compaction", "rule_id": "compaction"});
+        assert!(!trigger_is_rate_limit(&trigger));
+    }
+
+    #[test]
+    fn trigger_is_rate_limit_empty() {
+        let trigger = serde_json::json!({});
+        assert!(!trigger_is_rate_limit(&trigger));
+    }
+
+    // ========================================================================
+    // trigger_retry_after
+    // ========================================================================
+
+    #[test]
+    fn trigger_retry_after_present() {
+        let trigger = serde_json::json!({
+            "extracted": {"retry_after": "30s"}
+        });
+        assert_eq!(trigger_retry_after(&trigger), Some("30s".to_string()));
+    }
+
+    #[test]
+    fn trigger_retry_after_missing() {
+        let trigger = serde_json::json!({});
+        assert!(trigger_retry_after(&trigger).is_none());
+    }
+
+    #[test]
+    fn trigger_retry_after_no_extracted() {
+        let trigger = serde_json::json!({"event_type": "rate_limit"});
+        assert!(trigger_retry_after(&trigger).is_none());
+    }
+
+    // ========================================================================
+    // compaction_prompts constants
+    // ========================================================================
+
+    #[test]
+    fn compaction_prompts_are_nonempty() {
+        assert!(!compaction_prompts::CLAUDE_CODE.is_empty());
+        assert!(!compaction_prompts::CODEX.is_empty());
+        assert!(!compaction_prompts::GEMINI.is_empty());
+        assert!(!compaction_prompts::UNKNOWN.is_empty());
+    }
+}

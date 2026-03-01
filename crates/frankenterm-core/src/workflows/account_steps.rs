@@ -314,3 +314,216 @@ pub fn validate_device_code(code: &str) -> bool {
 
 /// The command to send to initiate device auth login.
 pub const DEVICE_AUTH_LOGIN_COMMAND: &str = "cod login --device-auth\n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // DeviceCode / parse_device_code tests
+    // ========================================================================
+
+    #[test]
+    fn parse_device_code_enter_code_pattern() {
+        let result = parse_device_code("Enter code: ABCD-1234").unwrap();
+        assert_eq!(result.code, "ABCD-1234");
+        assert!(result.url.is_none());
+    }
+
+    #[test]
+    fn parse_device_code_code_colon_pattern() {
+        let result = parse_device_code("code: WXYZ-5678").unwrap();
+        assert_eq!(result.code, "WXYZ-5678");
+    }
+
+    #[test]
+    fn parse_device_code_with_5_digit_suffix() {
+        let result = parse_device_code("Enter code: ABCD-12345").unwrap();
+        assert_eq!(result.code, "ABCD-12345");
+    }
+
+    #[test]
+    fn parse_device_code_case_insensitive() {
+        let result = parse_device_code("CODE: abcd-efgh").unwrap();
+        assert_eq!(result.code, "ABCD-EFGH"); // uppercased
+    }
+
+    #[test]
+    fn parse_device_code_with_url() {
+        let input = "Visit https://login.example.com/device to authenticate.\nEnter code: ABCD-1234";
+        let result = parse_device_code(input).unwrap();
+        assert_eq!(result.code, "ABCD-1234");
+        // URL should be extracted if it matches the device URL pattern
+        // (depends on whether "device" appears in the URL)
+        assert!(result.url.is_some());
+        assert!(result.url.unwrap().contains("device"));
+    }
+
+    #[test]
+    fn parse_device_code_no_match() {
+        let result = parse_device_code("no device code here");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Device code not found"));
+    }
+
+    #[test]
+    fn parse_device_code_empty_input() {
+        let result = parse_device_code("");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.tail_len, 0);
+    }
+
+    #[test]
+    fn parse_device_code_error_has_hash_and_len() {
+        let result = parse_device_code("random text without code");
+        let err = result.unwrap_err();
+        assert_eq!(err.tail_len, "random text without code".len());
+        assert_ne!(err.tail_hash, 0); // non-zero hash for non-empty input
+    }
+
+    #[test]
+    fn parse_device_code_numeric_only() {
+        let result = parse_device_code("code: 1234-5678").unwrap();
+        assert_eq!(result.code, "1234-5678");
+    }
+
+    #[test]
+    fn parse_device_code_short_segments_fail() {
+        // Less than 4 chars per segment shouldn't match the regex
+        let result = parse_device_code("code: AB-CD");
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // validate_device_code tests
+    // ========================================================================
+
+    #[test]
+    fn validate_device_code_valid_4_4() {
+        assert!(validate_device_code("ABCD-1234"));
+    }
+
+    #[test]
+    fn validate_device_code_valid_5_5() {
+        assert!(validate_device_code("ABCDE-12345"));
+    }
+
+    #[test]
+    fn validate_device_code_valid_mixed_case() {
+        assert!(validate_device_code("AbCd-1234"));
+    }
+
+    #[test]
+    fn validate_device_code_too_short_first() {
+        assert!(!validate_device_code("ABC-1234"));
+    }
+
+    #[test]
+    fn validate_device_code_too_short_second() {
+        assert!(!validate_device_code("ABCD-123"));
+    }
+
+    #[test]
+    fn validate_device_code_no_dash() {
+        assert!(!validate_device_code("ABCD1234"));
+    }
+
+    #[test]
+    fn validate_device_code_multiple_dashes() {
+        assert!(!validate_device_code("AB-CD-1234"));
+    }
+
+    #[test]
+    fn validate_device_code_special_chars() {
+        assert!(!validate_device_code("AB@D-1234"));
+    }
+
+    #[test]
+    fn validate_device_code_empty() {
+        assert!(!validate_device_code(""));
+    }
+
+    #[test]
+    fn validate_device_code_just_dash() {
+        assert!(!validate_device_code("-"));
+    }
+
+    // ========================================================================
+    // AccountSelectionStepError display tests
+    // ========================================================================
+
+    #[test]
+    fn account_selection_step_error_display_storage() {
+        let err = AccountSelectionStepError::Storage("db locked".to_string());
+        assert_eq!(format!("{err}"), "storage error: db locked");
+    }
+
+    // ========================================================================
+    // DeviceCodeParseError display tests
+    // ========================================================================
+
+    #[test]
+    fn device_code_parse_error_display() {
+        let err = DeviceCodeParseError {
+            expected: "device code",
+            tail_hash: 0x1234_5678_9abc_def0,
+            tail_len: 42,
+        };
+        let display = format!("{err}");
+        assert!(display.contains("device code"));
+        assert!(display.contains("tail_hash="));
+        assert!(display.contains("tail_len=42"));
+    }
+
+    // ========================================================================
+    // DeviceCode equality tests
+    // ========================================================================
+
+    #[test]
+    fn device_code_equality() {
+        let a = DeviceCode {
+            code: "ABCD-1234".to_string(),
+            url: None,
+        };
+        let b = DeviceCode {
+            code: "ABCD-1234".to_string(),
+            url: None,
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn device_code_inequality_different_code() {
+        let a = DeviceCode {
+            code: "ABCD-1234".to_string(),
+            url: None,
+        };
+        let b = DeviceCode {
+            code: "WXYZ-5678".to_string(),
+            url: None,
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn device_code_clone() {
+        let original = DeviceCode {
+            code: "TEST-CODE".to_string(),
+            url: Some("https://example.com/device".to_string()),
+        };
+        let cloned = original.clone();
+        assert_eq!(cloned, original);
+    }
+
+    // ========================================================================
+    // Constants tests
+    // ========================================================================
+
+    #[test]
+    fn device_auth_login_command_ends_with_newline() {
+        assert!(DEVICE_AUTH_LOGIN_COMMAND.ends_with('\n'));
+        assert!(DEVICE_AUTH_LOGIN_COMMAND.contains("device-auth"));
+    }
+}

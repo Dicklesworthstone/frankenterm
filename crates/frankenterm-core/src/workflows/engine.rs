@@ -722,3 +722,444 @@ pub(super) async fn record_workflow_terminal_action(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // ExecutionStatus serde + equality
+    // ========================================================================
+
+    #[test]
+    fn execution_status_serde_roundtrip() {
+        let statuses = [
+            ExecutionStatus::Running,
+            ExecutionStatus::Waiting,
+            ExecutionStatus::Completed,
+            ExecutionStatus::Aborted,
+        ];
+        for status in &statuses {
+            let json = serde_json::to_string(status).unwrap();
+            let parsed: ExecutionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(*status, parsed);
+        }
+    }
+
+    #[test]
+    fn execution_status_rename_all_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ExecutionStatus::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionStatus::Waiting).unwrap(),
+            "\"waiting\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionStatus::Aborted).unwrap(),
+            "\"aborted\""
+        );
+    }
+
+    #[test]
+    fn execution_status_is_copy() {
+        let s = ExecutionStatus::Running;
+        let s2 = s; // copy
+        assert_eq!(s, s2);
+    }
+
+    // ========================================================================
+    // WorkflowExecution serde
+    // ========================================================================
+
+    #[test]
+    fn workflow_execution_serde_roundtrip() {
+        let exec = WorkflowExecution {
+            id: "wf-test-123".to_string(),
+            workflow_name: "handle_compaction".to_string(),
+            pane_id: 42,
+            current_step: 2,
+            status: ExecutionStatus::Running,
+            started_at: 1700000000000,
+            updated_at: 1700000001000,
+        };
+        let json = serde_json::to_string(&exec).unwrap();
+        let parsed: WorkflowExecution = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "wf-test-123");
+        assert_eq!(parsed.workflow_name, "handle_compaction");
+        assert_eq!(parsed.pane_id, 42);
+        assert_eq!(parsed.current_step, 2);
+        assert_eq!(parsed.status, ExecutionStatus::Running);
+        assert_eq!(parsed.started_at, 1700000000000);
+        assert_eq!(parsed.updated_at, 1700000001000);
+    }
+
+    #[test]
+    fn workflow_execution_clone() {
+        let exec = WorkflowExecution {
+            id: "wf-1".to_string(),
+            workflow_name: "test".to_string(),
+            pane_id: 1,
+            current_step: 0,
+            status: ExecutionStatus::Waiting,
+            started_at: 100,
+            updated_at: 200,
+        };
+        let cloned = exec.clone();
+        assert_eq!(cloned.id, exec.id);
+        assert_eq!(cloned.status, exec.status);
+    }
+
+    // ========================================================================
+    // WorkflowEngine construction
+    // ========================================================================
+
+    #[test]
+    fn workflow_engine_default_concurrency() {
+        let engine = WorkflowEngine::default();
+        assert_eq!(engine.max_concurrent(), 3);
+    }
+
+    #[test]
+    fn workflow_engine_custom_concurrency() {
+        let engine = WorkflowEngine::new(10);
+        assert_eq!(engine.max_concurrent(), 10);
+    }
+
+    #[test]
+    fn workflow_engine_zero_concurrency() {
+        let engine = WorkflowEngine::new(0);
+        assert_eq!(engine.max_concurrent(), 0);
+    }
+
+    // ========================================================================
+    // compute_next_step
+    // ========================================================================
+
+    fn make_step_log(
+        step_index: usize,
+        result_type: &str,
+    ) -> crate::storage::WorkflowStepLogRecord {
+        crate::storage::WorkflowStepLogRecord {
+            id: 0,
+            workflow_id: "wf-1".to_string(),
+            audit_action_id: None,
+            step_index,
+            step_name: format!("step_{step_index}"),
+            step_id: None,
+            step_kind: None,
+            result_type: result_type.to_string(),
+            result_data: None,
+            policy_summary: None,
+            verification_refs: None,
+            error_code: None,
+            started_at: 1000,
+            completed_at: 2000,
+            duration_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn compute_next_step_empty_logs() {
+        assert_eq!(compute_next_step(&[]), 0);
+    }
+
+    #[test]
+    fn compute_next_step_single_continue() {
+        let logs = vec![make_step_log(0, "continue")];
+        assert_eq!(compute_next_step(&logs), 1);
+    }
+
+    #[test]
+    fn compute_next_step_multiple_continues() {
+        let logs = vec![
+            make_step_log(0, "continue"),
+            make_step_log(1, "continue"),
+            make_step_log(2, "continue"),
+        ];
+        assert_eq!(compute_next_step(&logs), 3);
+    }
+
+    #[test]
+    fn compute_next_step_done_is_terminal() {
+        let logs = vec![make_step_log(0, "continue"), make_step_log(1, "done")];
+        assert_eq!(compute_next_step(&logs), 2);
+    }
+
+    #[test]
+    fn compute_next_step_retry_re_executes() {
+        let logs = vec![make_step_log(0, "continue"), make_step_log(1, "retry")];
+        assert_eq!(compute_next_step(&logs), 1);
+    }
+
+    #[test]
+    fn compute_next_step_wait_for_re_executes() {
+        let logs = vec![make_step_log(0, "continue"), make_step_log(1, "wait_for")];
+        assert_eq!(compute_next_step(&logs), 1);
+    }
+
+    #[test]
+    fn compute_next_step_only_non_terminal() {
+        let logs = vec![make_step_log(0, "retry"), make_step_log(0, "retry")];
+        assert_eq!(compute_next_step(&logs), 0);
+    }
+
+    #[test]
+    fn compute_next_step_out_of_order_logs() {
+        let logs = vec![
+            make_step_log(2, "continue"),
+            make_step_log(0, "continue"),
+            make_step_log(1, "continue"),
+        ];
+        assert_eq!(compute_next_step(&logs), 3);
+    }
+
+    #[test]
+    fn compute_next_step_mixed_terminal_and_nonterminal() {
+        let logs = vec![
+            make_step_log(0, "continue"),
+            make_step_log(1, "retry"),
+            make_step_log(1, "continue"),
+            make_step_log(2, "wait_for"),
+        ];
+        // Step 0 and 1 have "continue", max completed = 1, next = 2
+        assert_eq!(compute_next_step(&logs), 2);
+    }
+
+    // ========================================================================
+    // generate_workflow_id
+    // ========================================================================
+
+    #[test]
+    fn generate_workflow_id_contains_name() {
+        let id = generate_workflow_id("handle_compaction");
+        assert!(id.starts_with("handle_compaction-"));
+    }
+
+    #[test]
+    fn generate_workflow_id_unique() {
+        let id1 = generate_workflow_id("wf");
+        let id2 = generate_workflow_id("wf");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn generate_workflow_id_format() {
+        let id = generate_workflow_id("test");
+        let parts: Vec<&str> = id.splitn(3, '-').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "test");
+        assert!(parts[1].parse::<i64>().is_ok());
+        assert_eq!(parts[2].len(), 8);
+        assert!(parts[2].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ========================================================================
+    // now_ms
+    // ========================================================================
+
+    #[test]
+    fn now_ms_returns_reasonable_value() {
+        let ms = now_ms();
+        assert!(ms > 1_577_836_800_000); // after 2020-01-01
+        assert!(ms > 0);
+    }
+
+    // ========================================================================
+    // redact_text_for_log
+    // ========================================================================
+
+    #[test]
+    fn redact_text_for_log_short_text() {
+        let result = redact_text_for_log("hello world", 100);
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn redact_text_for_log_truncates() {
+        let result = redact_text_for_log("abcdefghijklmnop", 5);
+        assert_eq!(result, "abcde...");
+    }
+
+    #[test]
+    fn redact_text_for_log_exact_boundary() {
+        let result = redact_text_for_log("12345", 5);
+        assert_eq!(result, "12345");
+    }
+
+    #[test]
+    fn redact_text_for_log_empty() {
+        let result = redact_text_for_log("", 100);
+        assert_eq!(result, "");
+    }
+
+    // ========================================================================
+    // step_error_code_from_result
+    // ========================================================================
+
+    #[test]
+    fn step_error_code_abort_returns_ft5002() {
+        let result = StepResult::abort("failure");
+        assert_eq!(
+            step_error_code_from_result(&result),
+            Some("FT-5002".to_string())
+        );
+    }
+
+    #[test]
+    fn step_error_code_continue_returns_none() {
+        assert_eq!(step_error_code_from_result(&StepResult::Continue), None);
+    }
+
+    #[test]
+    fn step_error_code_done_returns_none() {
+        assert_eq!(step_error_code_from_result(&StepResult::done_empty()), None);
+    }
+
+    #[test]
+    fn step_error_code_retry_returns_none() {
+        assert_eq!(step_error_code_from_result(&StepResult::retry(1000)), None);
+    }
+
+    #[test]
+    fn step_error_code_send_text_returns_none() {
+        assert_eq!(
+            step_error_code_from_result(&StepResult::send_text("hello".to_string())),
+            None
+        );
+    }
+
+    // ========================================================================
+    // redacted_step_result_for_logging
+    // ========================================================================
+
+    #[test]
+    fn redacted_step_result_passes_through_non_send_text() {
+        let result = StepResult::Continue;
+        let redacted = redacted_step_result_for_logging(&result);
+        assert!(redacted.is_continue());
+    }
+
+    #[test]
+    fn redacted_step_result_truncates_send_text() {
+        let long_text = "x".repeat(500);
+        let result = StepResult::send_text(long_text);
+        let redacted = redacted_step_result_for_logging(&result);
+        if let StepResult::SendText { text, .. } = &redacted {
+            assert!(text.len() <= 163); // 160 + "..."
+        } else {
+            panic!("Expected SendText");
+        }
+    }
+
+    #[test]
+    fn redacted_step_result_preserves_short_send_text() {
+        let result = StepResult::send_text("short".to_string());
+        let redacted = redacted_step_result_for_logging(&result);
+        if let StepResult::SendText { text, .. } = &redacted {
+            assert_eq!(text, "short");
+        } else {
+            panic!("Expected SendText");
+        }
+    }
+
+    #[test]
+    fn redacted_step_result_preserves_wait_fields() {
+        let result = StepResult::SendText {
+            text: "cmd".to_string(),
+            wait_for: Some(WaitCondition::sleep(1000)),
+            wait_timeout_ms: Some(5000),
+        };
+        let redacted = redacted_step_result_for_logging(&result);
+        if let StepResult::SendText {
+            text,
+            wait_for,
+            wait_timeout_ms,
+        } = &redacted
+        {
+            assert_eq!(text, "cmd");
+            assert!(wait_for.is_some());
+            assert_eq!(*wait_timeout_ms, Some(5000));
+        } else {
+            panic!("Expected SendText");
+        }
+    }
+
+    // ========================================================================
+    // build_verification_refs
+    // ========================================================================
+
+    #[test]
+    fn build_verification_refs_none_for_continue() {
+        assert!(build_verification_refs(&StepResult::Continue, None).is_none());
+    }
+
+    #[test]
+    fn build_verification_refs_none_for_done() {
+        assert!(build_verification_refs(&StepResult::done_empty(), None).is_none());
+    }
+
+    #[test]
+    fn build_verification_refs_includes_wait_for() {
+        let result =
+            StepResult::wait_for_with_timeout(WaitCondition::pattern("test.rule"), 5000);
+        let refs = build_verification_refs(&result, None);
+        assert!(refs.is_some());
+        let json: serde_json::Value = serde_json::from_str(&refs.unwrap()).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["source"], "wait_for");
+    }
+
+    #[test]
+    fn build_verification_refs_includes_post_send_wait() {
+        let result = StepResult::send_text_and_wait(
+            "cmd".to_string(),
+            WaitCondition::pane_idle(2000),
+            10_000,
+        );
+        let refs = build_verification_refs(&result, None);
+        assert!(refs.is_some());
+        let json: serde_json::Value = serde_json::from_str(&refs.unwrap()).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["source"], "post_send_wait");
+    }
+
+    #[test]
+    fn build_verification_refs_send_text_without_wait_is_none() {
+        let result = StepResult::send_text("hello".to_string());
+        assert!(build_verification_refs(&result, None).is_none());
+    }
+
+    #[test]
+    fn build_verification_refs_with_step_plan() {
+        let step_plan = crate::plan::StepPlan::new(
+            1,
+            crate::plan::StepAction::Custom {
+                action_type: "test".to_string(),
+                payload: serde_json::json!({}),
+            },
+            "test step",
+        )
+        .with_verification(crate::plan::Verification {
+            strategy: crate::plan::VerificationStrategy::PaneIdle {
+                pane_id: None,
+                idle_threshold_ms: 2000,
+            },
+            description: Some("verify idle".to_string()),
+            timeout_ms: Some(5000),
+        });
+        let refs = build_verification_refs(&StepResult::Continue, Some(&step_plan));
+        assert!(refs.is_some());
+        let json: serde_json::Value = serde_json::from_str(&refs.unwrap()).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["source"], "plan");
+    }
+}
