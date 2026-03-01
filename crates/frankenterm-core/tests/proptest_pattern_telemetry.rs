@@ -59,8 +59,8 @@ fn telemetry_starts_at_zero() {
 fn scan_increments_on_detect() {
     let engine = minimal_engine();
 
-    engine.detect("hello world");
-    engine.detect("ERROR: something");
+    let _ = engine.detect("hello world");
+    let _ = engine.detect("ERROR: something");
 
     let snap = engine.telemetry().snapshot();
     assert_eq!(snap.scans_total, 2);
@@ -71,12 +71,12 @@ fn matches_counted_correctly() {
     let engine = minimal_engine();
 
     // No match
-    engine.detect("hello world");
+    let _ = engine.detect("hello world");
     let snap1 = engine.telemetry().snapshot();
     assert_eq!(snap1.matches_total, 0);
 
     // One match
-    engine.detect("ERROR: disk full");
+    let _ = engine.detect("ERROR: disk full");
     let snap2 = engine.telemetry().snapshot();
     assert!(snap2.matches_total >= 1, "should have at least one match");
 }
@@ -84,7 +84,7 @@ fn matches_counted_correctly() {
 #[test]
 fn empty_text_still_counts_scan() {
     let engine = minimal_engine();
-    engine.detect("");
+    let _ = engine.detect("");
     let snap = engine.telemetry().snapshot();
     assert_eq!(snap.scans_total, 1);
     assert_eq!(snap.matches_total, 0);
@@ -123,7 +123,7 @@ proptest! {
         let mut prev_matches = 0u64;
 
         for text in &texts {
-            engine.detect(text);
+            let _ = engine.detect(text);
             let snap = engine.telemetry().snapshot();
 
             prop_assert!(
@@ -184,7 +184,7 @@ proptest! {
         let engine = minimal_engine();
 
         for text in &texts {
-            engine.detect(text);
+            let _ = engine.detect(text);
         }
 
         let snap = engine.telemetry().snapshot();

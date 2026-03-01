@@ -244,9 +244,9 @@ proptest! {
     ) {
         let mut eng = test_engine();
         let mut prev = eng.telemetry().snapshot();
-        let mut op_count = 0u64;
 
-        for op in &ops {
+        for (op_count, op) in ops.iter().enumerate() {
+            let op_count = op_count as u64;
             match op {
                 0 => {
                     let content = format!("segment {} padded to avoid inline storage", op_count);
@@ -260,8 +260,6 @@ proptest! {
                 3 => { let _ = eng.gc(); }
                 _ => unreachable!(),
             }
-            op_count += 1;
-
             let snap = eng.telemetry().snapshot();
             prop_assert!(snap.segments_processed >= prev.segments_processed,
                 "segments_processed decreased");

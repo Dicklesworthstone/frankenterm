@@ -386,7 +386,7 @@ proptest! {
         };
         let result = classify_metric_result(&budgets, metric, val, Some(baseline));
         if let (Some(frac), Some(pct)) = (result.regression_fraction, result.regression_percent) {
-            prop_assert!((pct - frac * 100.0).abs() < 1e-10,
+            prop_assert!(frac.mul_add(-100.0, pct).abs() < 1e-10,
                 "percent {} should equal fraction {} * 100", pct, frac);
         }
     }
@@ -476,10 +476,10 @@ proptest! {
         let g = capacity_guidance(sample);
         let eps = 1e-6;
         if g.replay_seconds_for_1m_events.is_finite() {
-            prop_assert!((g.replay_seconds_for_10m_events - g.replay_seconds_for_1m_events * 10.0).abs() < eps);
+            prop_assert!(g.replay_seconds_for_1m_events.mul_add(-10.0, g.replay_seconds_for_10m_events).abs() < eps);
         }
         if g.artifact_read_seconds_for_1m_events.is_finite() {
-            prop_assert!((g.artifact_read_seconds_for_10m_events - g.artifact_read_seconds_for_1m_events * 10.0).abs() < eps);
+            prop_assert!(g.artifact_read_seconds_for_1m_events.mul_add(-10.0, g.artifact_read_seconds_for_10m_events).abs() < eps);
         }
     }
 

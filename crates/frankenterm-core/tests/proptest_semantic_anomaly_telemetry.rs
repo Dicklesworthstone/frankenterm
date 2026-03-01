@@ -28,7 +28,7 @@ fn test_conformal_detector() -> ConformalAnomalyDetector {
 
 /// Generate a simple embedding vector of given dimension.
 fn make_embedding(dim: usize, base: f32) -> Vec<f32> {
-    (0..dim).map(|i| base + i as f32 * 0.01).collect()
+    (0..dim).map(|i| (i as f32).mul_add(0.01, base)).collect()
 }
 
 /// Generate an extreme outlier embedding (all large values).
@@ -89,7 +89,7 @@ fn zscore_shocks_require_warmup() {
     let mut det = test_zscore_detector();
     // Feed similar embeddings to build baseline (need min_samples=5)
     for i in 0..10 {
-        det.observe(&make_embedding(8, 1.0 + i as f32 * 0.001));
+        det.observe(&make_embedding(8, (i as f32).mul_add(0.001, 1.0)));
     }
 
     let snap = det.telemetry().snapshot();
@@ -170,7 +170,7 @@ fn conformal_anomalies_match_total_anomalies() {
 
     // Build up calibration with similar embeddings
     for i in 0..5 {
-        det.observe(&make_embedding(8, 1.0 + i as f32 * 0.001));
+        det.observe(&make_embedding(8, (i as f32).mul_add(0.001, 1.0)));
     }
     // Feed a very different embedding to try triggering anomaly
     det.observe(&make_outlier(8));
@@ -222,7 +222,7 @@ proptest! {
     ) {
         let mut det = test_zscore_detector();
         for i in 0..count {
-            det.observe(&make_embedding(8, 1.0 + i as f32 * 0.01));
+            det.observe(&make_embedding(8, (i as f32).mul_add(0.01, 1.0)));
         }
         let snap = det.telemetry().snapshot();
         prop_assert_eq!(snap.observations, count as u64);
@@ -234,7 +234,7 @@ proptest! {
     ) {
         let mut det = test_conformal_detector();
         for i in 0..count {
-            det.observe(&make_embedding(8, 1.0 + i as f32 * 0.01));
+            det.observe(&make_embedding(8, (i as f32).mul_add(0.01, 1.0)));
         }
         let snap = det.telemetry().snapshot();
         prop_assert_eq!(snap.observations, count as u64);
@@ -249,7 +249,7 @@ proptest! {
 
         for (i, op) in ops.iter().enumerate() {
             match op {
-                0 => { det.observe(&make_embedding(8, 1.0 + i as f32 * 0.01)); }
+                0 => { det.observe(&make_embedding(8, (i as f32).mul_add(0.01, 1.0))); }
                 1 => { det.observe(&make_outlier(8)); }
                 2 => { det.reset(); }
                 _ => unreachable!(),
@@ -276,7 +276,7 @@ proptest! {
 
         for (i, op) in ops.iter().enumerate() {
             match op {
-                0 => { det.observe(&make_embedding(8, 1.0 + i as f32 * 0.01)); }
+                0 => { det.observe(&make_embedding(8, (i as f32).mul_add(0.01, 1.0))); }
                 1 => { det.observe(&make_outlier(8)); }
                 2 => { det.observe(&make_embedding(16, 1.0)); } // dimension change
                 3 => { det.reset(); }
