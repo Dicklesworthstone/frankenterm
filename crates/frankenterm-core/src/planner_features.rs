@@ -3172,7 +3172,7 @@ mod tests {
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: SolverConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.min_score, 0.1);
+        assert!((back.min_score - 0.1).abs() < f64::EPSILON);
         assert_eq!(back.safety_gates.len(), 1);
         assert_eq!(back.conflicts.len(), 1);
     }
@@ -3588,12 +3588,10 @@ mod tests {
         let expl = &report.explanations[0];
         assert_eq!(expl.outcome, DecisionOutcome::Rejected);
         // Should have rejection factors
-        let rejection_factors: Vec<_> = expl
+        assert!(expl
             .factors
             .iter()
-            .filter(|f| f.dimension == "rejection")
-            .collect();
-        assert!(!rejection_factors.is_empty());
+            .any(|f| f.dimension == "rejection"));
     }
 
     // ── Anti-thrash governor tests (ft-1i2ge.2.7) ───────────────────────────
@@ -3631,7 +3629,7 @@ mod tests {
         assert_eq!(report.verdicts.len(), 2);
         for v in &report.verdicts {
             assert_eq!(v.action, GovernorAction::Allow);
-            assert_eq!(v.adjusted_score, v.original_score);
+            assert!((v.adjusted_score - v.original_score).abs() < f64::EPSILON);
         }
         assert!(report.thrashing_bead_ids.is_empty());
         assert!(report.starving_bead_ids.is_empty());
@@ -3664,7 +3662,7 @@ mod tests {
             "Expected block with 3 remaining, got {:?}",
             v.action
         );
-        assert_eq!(v.adjusted_score, 0.0);
+        assert!(v.adjusted_score.abs() < f64::EPSILON);
         assert_eq!(report.cooldown_bead_ids, vec!["b1"]);
     }
 
@@ -4188,7 +4186,7 @@ mod tests {
     fn tuner_switch_history_bounded() {
         let mut tuner = UtilityPolicyTuner::new(MissionProfile::balanced());
         tuner.max_history = 3;
-        let profiles = vec![
+        let profiles = [
             MissionProfileKind::SafetyFirst,
             MissionProfileKind::Throughput,
             MissionProfileKind::UrgencyDriven,

@@ -653,8 +653,8 @@ mod tests {
         assert!(diff.missing_executions.is_empty());
         assert!(diff.unexpected_executions.is_empty());
         assert!(diff.agent_divergences.is_empty());
-        assert_eq!(diff.dispatch_rate, 1.0);
-        assert_eq!(diff.agent_match_rate, 1.0);
+        assert!((diff.dispatch_rate - 1.0).abs() < f64::EPSILON);
+        assert!((diff.agent_match_rate - 1.0).abs() < f64::EPSILON);
         assert!(diff.fidelity_score >= 0.95);
         assert!(diff.is_healthy());
     }
@@ -676,7 +676,7 @@ mod tests {
 
         assert_eq!(diff.missing_executions.len(), 1);
         assert_eq!(diff.missing_executions[0].0, "b2");
-        assert_eq!(diff.dispatch_rate, 0.5);
+        assert!((diff.dispatch_rate - 0.5).abs() < f64::EPSILON);
         assert!(!diff.is_healthy());
     }
 
@@ -824,8 +824,8 @@ mod tests {
 
         let diff = eval.evaluate_cycle(1, 1000, &recs, &empty);
 
-        assert_eq!(diff.dispatch_rate, 1.0);
-        assert_eq!(diff.fidelity_score, 1.0);
+        assert!((diff.dispatch_rate - 1.0).abs() < f64::EPSILON);
+        assert!((diff.fidelity_score - 1.0).abs() < f64::EPSILON);
         assert!(diff.is_healthy());
     }
 

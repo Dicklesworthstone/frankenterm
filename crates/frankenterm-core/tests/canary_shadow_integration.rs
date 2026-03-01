@@ -561,10 +561,8 @@ fn i10_empty_assignment_cycle_is_safe() {
     let decision = canary.evaluate_health(1, 1000, &diff, shadow_eval.metrics());
 
     // With zero recommendations, dispatch rate is 1.0 (special case)
-    assert!(
-        decision.health_check.healthy || !decision.health_check.healthy,
-        "should produce a valid health check regardless"
-    );
+    // Just verify evaluate_health returned a valid decision (didn't panic)
+    let _ = decision.health_check.healthy;
 
     // Filter empty set
     let filtered = canary.filter_assignments(&empty_recs);
@@ -661,7 +659,7 @@ fn i12_canary_agent_update_affects_filtering() {
     // With 50% fraction, ~2 agents in canary cohort
     let filtered1 = canary.filter_assignments(&recs);
     let passed1 = filtered1.assignments.len();
-    assert!(passed1 >= 1 && passed1 <= 4, "should pass canary subset");
+    assert!((1..=4).contains(&passed1), "should pass canary subset");
 
     // Update agent pool — new agents
     canary.update_canary_agents(&["a5".to_string(), "a6".to_string()]);
