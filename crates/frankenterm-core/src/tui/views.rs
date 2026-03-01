@@ -159,6 +159,8 @@ pub struct ViewState {
     pub triage_items: Vec<TriageItemView>,
     /// Current health status
     pub health: Option<HealthStatus>,
+    /// Unified dashboard state (cost, rate limits, backpressure, quota).
+    pub dashboard: Option<crate::dashboard::DashboardState>,
     /// Search query input
     pub search_query: String,
     /// Free-text pane filter (matches title/cwd/domain/pane id)

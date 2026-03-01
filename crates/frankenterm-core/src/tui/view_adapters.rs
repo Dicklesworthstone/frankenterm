@@ -24,6 +24,7 @@
 //! QueryClient.search()        → adapt_search()    → SearchRow
 //! QueryClient.health()        → adapt_health()    → HealthModel
 //! QueryClient.workflows()     → adapt_workflow()  → WorkflowRow
+//! QueryClient.dashboard()     → adapt_dashboard() → DashboardModel
 //! ```
 
 use super::ftui_compat::{ColorSpec, StyleSpec};
@@ -515,6 +516,227 @@ pub fn adapt_health(health: &HealthStatus) -> HealthModel {
         circuit_style,
         pane_count: health.pane_count.to_string(),
         event_count: health.event_count.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard adapter
+// ---------------------------------------------------------------------------
+
+use crate::dashboard::{DashboardState, SystemHealthTier};
+
+/// Render-ready dashboard model for the Home/Dashboard view.
+#[derive(Debug, Clone)]
+pub struct DashboardModel {
+    /// Overall health label (e.g. "green", "yellow").
+    pub health_label: String,
+    /// Style for the health label.
+    pub health_style: StyleSpec,
+    /// Per-provider cost rows: (agent_type, cost_label, tokens_label, budget_bar_label, budget_style).
+    pub cost_rows: Vec<DashboardCostRow>,
+    /// Grand total cost label.
+    pub total_cost_label: String,
+    /// Grand total tokens label.
+    pub total_tokens_label: String,
+    /// Budget alert rows.
+    pub alert_rows: Vec<DashboardAlertRow>,
+    /// Per-provider rate limit rows.
+    pub rate_limit_rows: Vec<DashboardRateLimitRow>,
+    /// Count of rate-limited providers.
+    pub limited_provider_label: String,
+    /// Backpressure tier label.
+    pub bp_tier_label: String,
+    /// Backpressure tier style.
+    pub bp_tier_style: StyleSpec,
+    /// Capture queue utilization label (e.g. "45%").
+    pub bp_capture_label: String,
+    /// Write queue utilization label.
+    pub bp_write_label: String,
+    /// Paused pane count label.
+    pub bp_paused_label: String,
+    /// Quota evaluations label.
+    pub quota_evaluations_label: String,
+    /// Quota block rate label.
+    pub quota_block_rate_label: String,
+    /// Quota block rate style.
+    pub quota_block_rate_style: StyleSpec,
+    /// Compact summary line for status bars.
+    pub summary_line: String,
+}
+
+/// Render-ready cost row for a single provider.
+#[derive(Debug, Clone)]
+pub struct DashboardCostRow {
+    pub agent_type: String,
+    pub cost_label: String,
+    pub tokens_label: String,
+    pub budget_label: String,
+    pub budget_style: StyleSpec,
+}
+
+/// Render-ready budget alert row.
+#[derive(Debug, Clone)]
+pub struct DashboardAlertRow {
+    pub agent_type: String,
+    pub message: String,
+    pub style: StyleSpec,
+}
+
+/// Render-ready rate limit row for a single provider.
+#[derive(Debug, Clone)]
+pub struct DashboardRateLimitRow {
+    pub agent_type: String,
+    pub status_label: String,
+    pub status_style: StyleSpec,
+    pub limited_label: String,
+    pub clear_label: String,
+}
+
+/// Adapt a `DashboardState` into a render-ready `DashboardModel`.
+#[must_use]
+pub fn adapt_dashboard(state: &DashboardState) -> DashboardModel {
+    let health_label = state.overall_health.to_string();
+    let health_style = health_tier_style(&state.overall_health);
+
+    // Cost rows
+    let cost_rows: Vec<DashboardCostRow> = state
+        .costs
+        .providers
+        .iter()
+        .map(|p| {
+            let budget_label = match p.budget_usage_fraction {
+                Some(f) => format!("{:.0}%", f * 100.0),
+                None => "n/a".to_string(),
+            };
+            let budget_style = match p.budget_usage_fraction {
+                Some(f) if f >= 1.0 => StyleSpec::new().fg(ColorSpec::Red).bold(),
+                Some(f) if f >= 0.8 => StyleSpec::new().fg(ColorSpec::Yellow),
+                _ => StyleSpec::new().fg(ColorSpec::DarkGray),
+            };
+            DashboardCostRow {
+                agent_type: p.agent_type.clone(),
+                cost_label: format!("${:.2}", p.cost_usd),
+                tokens_label: format_tokens(p.tokens),
+                budget_label,
+                budget_style,
+            }
+        })
+        .collect();
+
+    let total_cost_label = format!("${:.2}", state.costs.total_cost_usd);
+    let total_tokens_label = format_tokens(state.costs.total_tokens);
+
+    // Alert rows
+    let alert_rows: Vec<DashboardAlertRow> = state
+        .costs
+        .alerts
+        .iter()
+        .map(|a| {
+            let style = if a.is_blocking {
+                StyleSpec::new().fg(ColorSpec::Red).bold()
+            } else {
+                StyleSpec::new().fg(ColorSpec::Yellow)
+            };
+            DashboardAlertRow {
+                agent_type: a.agent_type.clone(),
+                message: format!(
+                    "${:.2} / ${:.2} ({:.0}%) — {}",
+                    a.current_cost_usd,
+                    a.budget_limit_usd,
+                    a.usage_fraction * 100.0,
+                    a.severity,
+                ),
+                style,
+            }
+        })
+        .collect();
+
+    // Rate limit rows
+    let rate_limit_rows: Vec<DashboardRateLimitRow> = state
+        .rate_limits
+        .providers
+        .iter()
+        .map(|p| {
+            let status_style = if p.is_limited {
+                StyleSpec::new().fg(ColorSpec::Yellow).bold()
+            } else {
+                StyleSpec::new().fg(ColorSpec::Green)
+            };
+            let clear_label = if p.earliest_clear_secs > 0 {
+                format!("{}s", p.earliest_clear_secs)
+            } else {
+                "—".to_string()
+            };
+            DashboardRateLimitRow {
+                agent_type: p.agent_type.clone(),
+                status_label: p.status.clone(),
+                status_style,
+                limited_label: format!("{}/{}", p.limited_pane_count, p.total_pane_count),
+                clear_label,
+            }
+        })
+        .collect();
+
+    let limited_provider_label = format!(
+        "{}/{}",
+        state.rate_limits.limited_provider_count,
+        state.rate_limits.providers.len()
+    );
+
+    // Backpressure
+    let bp_tier_style = health_tier_style(&state.backpressure.health);
+    let bp_capture_label = format!("{:.0}%", state.backpressure.capture_utilization * 100.0);
+    let bp_write_label = format!("{:.0}%", state.backpressure.write_utilization * 100.0);
+    let bp_paused_label = state.backpressure.paused_pane_count.to_string();
+
+    // Quota
+    let quota_block_rate_style = if state.quota.block_rate_percent >= 50 {
+        StyleSpec::new().fg(ColorSpec::Red).bold()
+    } else if state.quota.block_rate_percent >= 20 {
+        StyleSpec::new().fg(ColorSpec::Yellow)
+    } else {
+        StyleSpec::new().fg(ColorSpec::Green)
+    };
+
+    DashboardModel {
+        health_label,
+        health_style,
+        cost_rows,
+        total_cost_label,
+        total_tokens_label,
+        alert_rows,
+        rate_limit_rows,
+        limited_provider_label,
+        bp_tier_label: state.backpressure.tier.clone(),
+        bp_tier_style,
+        bp_capture_label,
+        bp_write_label,
+        bp_paused_label,
+        quota_evaluations_label: state.quota.evaluations.to_string(),
+        quota_block_rate_label: format!("{}%", state.quota.block_rate_percent),
+        quota_block_rate_style,
+        summary_line: state.summary_line(),
+    }
+}
+
+/// Map a `SystemHealthTier` to a consistent style.
+fn health_tier_style(tier: &SystemHealthTier) -> StyleSpec {
+    match tier {
+        SystemHealthTier::Green => StyleSpec::new().fg(ColorSpec::Green),
+        SystemHealthTier::Yellow => StyleSpec::new().fg(ColorSpec::Yellow),
+        SystemHealthTier::Red => StyleSpec::new().fg(ColorSpec::Red).bold(),
+        SystemHealthTier::Black => StyleSpec::new().fg(ColorSpec::Red).bold().reversed(),
+    }
+}
+
+/// Format a token count with K/M suffixes for readability.
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
     }
 }
 

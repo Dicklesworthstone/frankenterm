@@ -278,6 +278,14 @@ pub trait QueryClient: Send + Sync {
             has_more: false,
         })
     }
+
+    /// Get the unified dashboard state snapshot.
+    ///
+    /// Returns `None` when the dashboard subsystem is not yet initialized
+    /// or no data has been collected.
+    fn dashboard_state(&self) -> Result<Option<crate::dashboard::DashboardState>, QueryError> {
+        Ok(None)
+    }
 }
 
 /// Production implementation of QueryClient
