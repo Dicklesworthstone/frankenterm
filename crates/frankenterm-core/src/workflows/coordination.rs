@@ -1127,3 +1127,800 @@ pub fn run_unstick_scan_text(config: &UnstickConfig) -> UnstickReport {
         counts,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::PaneCapabilities;
+    use crate::storage::PaneRecord;
+    use std::collections::HashMap;
+
+    fn make_pane(pane_id: u64, domain: &str, title: Option<&str>, cwd: Option<&str>) -> PaneRecord {
+        PaneRecord {
+            pane_id,
+            pane_uuid: None,
+            domain: domain.to_string(),
+            window_id: None,
+            tab_id: None,
+            title: title.map(|s| s.to_string()),
+            cwd: cwd.map(|s| s.to_string()),
+            tty_name: None,
+            first_seen_at: 0,
+            last_seen_at: 0,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        }
+    }
+
+    fn caps_ready() -> PaneCapabilities {
+        PaneCapabilities {
+            prompt_active: true,
+            command_running: false,
+            alt_screen: Some(false),
+            has_recent_gap: false,
+            is_reserved: false,
+            reserved_by: None,
+        }
+    }
+
+    // ========================================================================
+    // PaneGroupStrategy serde roundtrip
+    // ========================================================================
+
+    #[test]
+    fn pane_group_strategy_serde_roundtrip() {
+        for strategy in [
+            PaneGroupStrategy::ByDomain,
+            PaneGroupStrategy::ByAgent,
+            PaneGroupStrategy::ByProject,
+            PaneGroupStrategy::Explicit {
+                pane_ids: vec![1, 2, 3],
+            },
+        ] {
+            let json = serde_json::to_string(&strategy).unwrap();
+            let parsed: PaneGroupStrategy = serde_json::from_str(&json).unwrap();
+            assert_eq!(strategy, parsed);
+        }
+    }
+
+    // ========================================================================
+    // build_pane_groups
+    // ========================================================================
+
+    #[test]
+    fn build_pane_groups_by_domain() {
+        let panes = vec![
+            make_pane(1, "local", None, None),
+            make_pane(2, "SSH:host1", None, None),
+            make_pane(3, "local", None, None),
+            make_pane(4, "SSH:host1", None, None),
+        ];
+        let groups = build_pane_groups(&panes, &PaneGroupStrategy::ByDomain);
+        assert_eq!(groups.len(), 2);
+        // BTreeMap sorts keys, so "SSH:host1" < "local"
+        assert_eq!(groups[0].name, "SSH:host1");
+        assert_eq!(groups[0].pane_ids, vec![2, 4]);
+        assert_eq!(groups[1].name, "local");
+        assert_eq!(groups[1].pane_ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn build_pane_groups_by_agent() {
+        let panes = vec![
+            make_pane(1, "local", Some("codex-cli session"), None),
+            make_pane(2, "local", Some("Claude Code"), None),
+            make_pane(3, "local", Some("zsh"), None),
+            make_pane(4, "local", Some("Gemini Assistant"), None),
+        ];
+        let groups = build_pane_groups(&panes, &PaneGroupStrategy::ByAgent);
+        assert_eq!(groups.len(), 4);
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(names.contains(&"codex"));
+        assert!(names.contains(&"claude_code"));
+        assert!(names.contains(&"gemini"));
+        assert!(names.contains(&"unknown"));
+    }
+
+    #[test]
+    fn build_pane_groups_by_project() {
+        let panes = vec![
+            make_pane(1, "local", None, Some("/home/user/proj-a")),
+            make_pane(2, "local", None, Some("/home/user/proj-b")),
+            make_pane(3, "local", None, Some("/home/user/proj-a")),
+            make_pane(4, "local", None, None),
+        ];
+        let groups = build_pane_groups(&panes, &PaneGroupStrategy::ByProject);
+        assert_eq!(groups.len(), 3);
+        let a_group = groups.iter().find(|g| g.name == "/home/user/proj-a").unwrap();
+        assert_eq!(a_group.pane_ids, vec![1, 3]);
+        let unknown_group = groups.iter().find(|g| g.name == "unknown").unwrap();
+        assert_eq!(unknown_group.pane_ids, vec![4]);
+    }
+
+    #[test]
+    fn build_pane_groups_explicit() {
+        let panes = vec![
+            make_pane(1, "local", None, None),
+            make_pane(2, "local", None, None),
+        ];
+        let strategy = PaneGroupStrategy::Explicit {
+            pane_ids: vec![5, 3, 1],
+        };
+        let groups = build_pane_groups(&panes, &strategy);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "explicit");
+        assert_eq!(groups[0].pane_ids, vec![1, 3, 5]); // sorted
+    }
+
+    #[test]
+    fn build_pane_groups_empty_input() {
+        let groups = build_pane_groups(&[], &PaneGroupStrategy::ByDomain);
+        assert!(groups.is_empty());
+    }
+
+    // ========================================================================
+    // infer_agent_from_title
+    // ========================================================================
+
+    #[test]
+    fn infer_agent_codex() {
+        assert_eq!(infer_agent_from_title("codex-cli session"), Some("codex"));
+        assert_eq!(infer_agent_from_title("CODEX"), Some("codex"));
+    }
+
+    #[test]
+    fn infer_agent_claude() {
+        assert_eq!(infer_agent_from_title("Claude Code"), Some("claude_code"));
+        assert_eq!(infer_agent_from_title("claude-code v2"), Some("claude_code"));
+    }
+
+    #[test]
+    fn infer_agent_gemini() {
+        assert_eq!(infer_agent_from_title("Gemini Assistant"), Some("gemini"));
+    }
+
+    #[test]
+    fn infer_agent_unknown() {
+        assert_eq!(infer_agent_from_title("zsh"), None);
+        assert_eq!(infer_agent_from_title(""), None);
+    }
+
+    // ========================================================================
+    // BroadcastPrecondition::check
+    // ========================================================================
+
+    #[test]
+    fn precondition_prompt_active() {
+        let mut caps = caps_ready();
+        assert!(BroadcastPrecondition::PromptActive.check(&caps));
+        caps.prompt_active = false;
+        assert!(!BroadcastPrecondition::PromptActive.check(&caps));
+    }
+
+    #[test]
+    fn precondition_not_alt_screen() {
+        let mut caps = caps_ready();
+        assert!(BroadcastPrecondition::NotAltScreen.check(&caps));
+        caps.alt_screen = Some(true);
+        assert!(!BroadcastPrecondition::NotAltScreen.check(&caps));
+        // None => treated as not in alt screen (false)
+        caps.alt_screen = None;
+        assert!(BroadcastPrecondition::NotAltScreen.check(&caps));
+    }
+
+    #[test]
+    fn precondition_no_recent_gap() {
+        let mut caps = caps_ready();
+        assert!(BroadcastPrecondition::NoRecentGap.check(&caps));
+        caps.has_recent_gap = true;
+        assert!(!BroadcastPrecondition::NoRecentGap.check(&caps));
+    }
+
+    #[test]
+    fn precondition_not_reserved() {
+        let mut caps = caps_ready();
+        assert!(BroadcastPrecondition::NotReserved.check(&caps));
+        caps.is_reserved = true;
+        assert!(!BroadcastPrecondition::NotReserved.check(&caps));
+    }
+
+    // ========================================================================
+    // check_preconditions
+    // ========================================================================
+
+    #[test]
+    fn check_preconditions_all_pass() {
+        let caps = caps_ready();
+        let preconds = default_broadcast_preconditions();
+        let failed = check_preconditions(&preconds, &caps);
+        assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn check_preconditions_multiple_failures() {
+        let caps = PaneCapabilities {
+            prompt_active: false,
+            alt_screen: Some(true),
+            has_recent_gap: true,
+            is_reserved: true,
+            ..Default::default()
+        };
+        let preconds = default_broadcast_preconditions();
+        let failed = check_preconditions(&preconds, &caps);
+        assert_eq!(failed.len(), 4);
+        assert!(failed.contains(&"prompt_active"));
+        assert!(failed.contains(&"not_alt_screen"));
+        assert!(failed.contains(&"no_recent_gap"));
+        assert!(failed.contains(&"not_reserved"));
+    }
+
+    // ========================================================================
+    // BroadcastResult counters
+    // ========================================================================
+
+    #[test]
+    fn broadcast_result_counters() {
+        let mut result = BroadcastResult::new("test_action");
+        assert!(result.outcomes.is_empty());
+        assert!(!result.all_allowed()); // empty => not all_allowed
+
+        result.add_outcome(1, PaneBroadcastOutcome::Allowed { elapsed_ms: 10 });
+        result.add_outcome(
+            2,
+            PaneBroadcastOutcome::Denied {
+                reason: "policy".into(),
+            },
+        );
+        result.add_outcome(
+            3,
+            PaneBroadcastOutcome::PreconditionFailed {
+                failed: vec!["prompt_active".into()],
+            },
+        );
+        result.add_outcome(
+            4,
+            PaneBroadcastOutcome::Skipped {
+                reason: "locked".into(),
+            },
+        );
+
+        assert_eq!(result.allowed_count(), 1);
+        assert_eq!(result.denied_count(), 1);
+        assert_eq!(result.precondition_failed_count(), 1);
+        assert_eq!(result.skipped_count(), 1);
+        assert!(!result.all_allowed());
+    }
+
+    #[test]
+    fn broadcast_result_all_allowed() {
+        let mut result = BroadcastResult::new("test");
+        result.add_outcome(1, PaneBroadcastOutcome::Allowed { elapsed_ms: 5 });
+        result.add_outcome(2, PaneBroadcastOutcome::Allowed { elapsed_ms: 10 });
+        assert!(result.all_allowed());
+    }
+
+    // ========================================================================
+    // evaluate_pane_preconditions
+    // ========================================================================
+
+    #[test]
+    fn evaluate_pane_preconditions_mixed() {
+        let mut caps_map: HashMap<u64, PaneCapabilities> = HashMap::new();
+        caps_map.insert(1, caps_ready());
+        caps_map.insert(
+            2,
+            PaneCapabilities {
+                prompt_active: false,
+                alt_screen: Some(true),
+                ..Default::default()
+            },
+        );
+        // Pane 3 has no capabilities entry
+
+        let preconds = default_broadcast_preconditions();
+        let results = evaluate_pane_preconditions(&[1, 2, 3], &caps_map, &preconds);
+
+        assert_eq!(results.len(), 3);
+
+        // Pane 1: passes all preconditions
+        assert!(results[0].1.is_none());
+
+        // Pane 2: fails preconditions
+        match &results[1].1 {
+            Some(PaneBroadcastOutcome::PreconditionFailed { failed }) => {
+                assert!(failed.contains(&"prompt_active".to_string()));
+                assert!(failed.contains(&"not_alt_screen".to_string()));
+            }
+            other => panic!("Expected PreconditionFailed, got {other:?}"),
+        }
+
+        // Pane 3: skipped (no capabilities)
+        match &results[2].1 {
+            Some(PaneBroadcastOutcome::Skipped { reason }) => {
+                assert!(reason.contains("no capabilities"));
+            }
+            other => panic!("Expected Skipped, got {other:?}"),
+        }
+    }
+
+    // ========================================================================
+    // plan_reread_context / plan_pause_all
+    // ========================================================================
+
+    #[test]
+    fn plan_reread_context_basic() {
+        let panes = vec![
+            make_pane(1, "local", Some("codex"), None),
+            make_pane(2, "local", Some("Claude Code"), None),
+        ];
+        let mut caps: HashMap<u64, PaneCapabilities> = HashMap::new();
+        caps.insert(1, caps_ready());
+        caps.insert(2, caps_ready());
+
+        let config = CoordinateAgentsConfig::default();
+        let result = plan_reread_context(&panes, &caps, &config);
+
+        assert_eq!(result.operation, "reread_context");
+        assert_eq!(result.total_acted(), 2);
+        assert_eq!(result.broadcast.allowed_count(), 2);
+    }
+
+    #[test]
+    fn plan_reread_context_with_failing_pane() {
+        let panes = vec![
+            make_pane(1, "local", Some("codex"), None),
+            make_pane(2, "local", Some("Claude Code"), None),
+        ];
+        let mut caps: HashMap<u64, PaneCapabilities> = HashMap::new();
+        caps.insert(1, caps_ready());
+        caps.insert(
+            2,
+            PaneCapabilities {
+                prompt_active: false,
+                ..Default::default()
+            },
+        );
+
+        let config = CoordinateAgentsConfig::default();
+        let result = plan_reread_context(&panes, &caps, &config);
+
+        assert_eq!(result.broadcast.allowed_count(), 1);
+        assert_eq!(result.broadcast.precondition_failed_count(), 1);
+    }
+
+    #[test]
+    fn plan_pause_all_only_checks_alt_screen() {
+        let panes = vec![
+            make_pane(1, "local", None, None),
+            make_pane(2, "local", None, None),
+        ];
+        let mut caps: HashMap<u64, PaneCapabilities> = HashMap::new();
+        // Pane 1: prompt not active, but that's fine for pause
+        caps.insert(
+            1,
+            PaneCapabilities {
+                prompt_active: false,
+                alt_screen: Some(false),
+                ..Default::default()
+            },
+        );
+        // Pane 2: in alt screen — should fail
+        caps.insert(2, PaneCapabilities::alt_screen());
+
+        let config = CoordinateAgentsConfig::default();
+        let result = plan_pause_all(&panes, &caps, &config);
+
+        assert_eq!(result.broadcast.allowed_count(), 1);
+        assert_eq!(result.broadcast.precondition_failed_count(), 1);
+    }
+
+    // ========================================================================
+    // resolve_reread_prompts / resolve_pause_texts
+    // ========================================================================
+
+    #[test]
+    fn resolve_reread_prompts_agent_specific() {
+        let panes = vec![
+            make_pane(1, "local", Some("codex-cli"), None),
+            make_pane(2, "local", Some("Claude Code"), None),
+            make_pane(3, "local", Some("Gemini session"), None),
+            make_pane(4, "local", Some("zsh"), None),
+        ];
+        let prompts = resolve_reread_prompts(&panes);
+        assert!(prompts[&1].contains("AGENTS.md"));
+        assert!(prompts[&2].contains("/read"));
+        assert!(prompts[&3].contains("AGENTS.md"));
+        assert!(prompts[&4].contains("cat"));
+    }
+
+    #[test]
+    fn resolve_pause_texts_are_ctrl_c() {
+        let panes = vec![
+            make_pane(1, "local", Some("codex"), None),
+            make_pane(2, "local", Some("anything"), None),
+        ];
+        let texts = resolve_pause_texts(&panes);
+        // All should be Ctrl-C (\x03)
+        for (_, text) in &texts {
+            assert_eq!(*text, "\x03");
+        }
+    }
+
+    // ========================================================================
+    // agent_reread_prompt / agent_pause_text
+    // ========================================================================
+
+    #[test]
+    fn agent_reread_prompt_coverage() {
+        assert!(agent_reread_prompt("codex").contains("AGENTS.md"));
+        assert!(agent_reread_prompt("claude_code").contains("/read"));
+        assert!(agent_reread_prompt("gemini").contains("AGENTS.md"));
+        assert!(agent_reread_prompt("unknown").contains("cat"));
+    }
+
+    #[test]
+    fn agent_pause_text_all_ctrl_c() {
+        for hint in &["codex", "claude_code", "gemini", "unknown", "random"] {
+            assert_eq!(agent_pause_text(hint), "\x03");
+        }
+    }
+
+    // ========================================================================
+    // truncate_snippet
+    // ========================================================================
+
+    #[test]
+    fn truncate_snippet_short_string() {
+        assert_eq!(truncate_snippet("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_snippet_exact_length() {
+        assert_eq!(truncate_snippet("12345", 5), "12345");
+    }
+
+    #[test]
+    fn truncate_snippet_overflow() {
+        let result = truncate_snippet("hello world", 8);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 8);
+    }
+
+    #[test]
+    fn truncate_snippet_zero_max() {
+        assert_eq!(truncate_snippet("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_snippet_small_max() {
+        assert_eq!(truncate_snippet("hello", 1), ".");
+        assert_eq!(truncate_snippet("hello", 2), "..");
+        assert_eq!(truncate_snippet("hello", 3), "...");
+    }
+
+    #[test]
+    fn truncate_snippet_trims_whitespace() {
+        assert_eq!(truncate_snippet("  hello  ", 100), "hello");
+    }
+
+    #[test]
+    fn truncate_snippet_multibyte_utf8() {
+        // Ensure we don't split in the middle of a UTF-8 character
+        let s = "日本語テスト"; // 6 chars, 18 bytes
+        let result = truncate_snippet(s, 10);
+        assert!(result.ends_with("..."));
+        // Should not panic or produce invalid UTF-8
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    // ========================================================================
+    // UnstickFindingKind serde
+    // ========================================================================
+
+    #[test]
+    fn unstick_finding_kind_serde_roundtrip() {
+        for kind in [
+            UnstickFindingKind::TodoComment,
+            UnstickFindingKind::PanicSite,
+            UnstickFindingKind::SuppressedError,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let parsed: UnstickFindingKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, parsed);
+        }
+    }
+
+    #[test]
+    fn unstick_finding_kind_labels() {
+        assert_eq!(UnstickFindingKind::TodoComment.label(), "TODO/FIXME");
+        assert_eq!(UnstickFindingKind::PanicSite.label(), "panic site");
+        assert_eq!(
+            UnstickFindingKind::SuppressedError.label(),
+            "suppressed error"
+        );
+    }
+
+    // ========================================================================
+    // UnstickReport
+    // ========================================================================
+
+    #[test]
+    fn unstick_report_empty() {
+        let report = UnstickReport::empty("text");
+        assert_eq!(report.total_findings(), 0);
+        assert_eq!(report.human_summary(), "No actionable findings.");
+    }
+
+    #[test]
+    fn unstick_report_human_summary_with_findings() {
+        let mut report = UnstickReport::empty("text");
+        report.files_scanned = 5;
+        report.findings.push(UnstickFinding {
+            kind: UnstickFindingKind::TodoComment,
+            file: "src/main.rs".to_string(),
+            line: 42,
+            snippet: "// TODO: fix this".to_string(),
+            suggestion: "Address this TODO".to_string(),
+        });
+        report
+            .counts
+            .insert("TODO/FIXME".to_string(), 1);
+        let summary = report.human_summary();
+        assert!(summary.contains("Found 1 items"));
+        assert!(summary.contains("src/main.rs:42"));
+    }
+
+    // ========================================================================
+    // TextScanPatterns / scan_file_text
+    // ========================================================================
+
+    #[test]
+    fn scan_file_text_finds_todo() {
+        let dir = std::env::temp_dir().join("ft_coord_test_todo");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test.rs");
+        std::fs::write(&file, "fn main() {\n    // TODO: fix this\n}\n").unwrap();
+
+        let patterns = TextScanPatterns::new();
+        let mut kind_counts = HashMap::new();
+        let findings = scan_file_text(&file, &dir, &patterns, 10, &mut kind_counts);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, UnstickFindingKind::TodoComment);
+        assert_eq!(findings[0].line, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_file_text_finds_panic_site() {
+        let dir = std::env::temp_dir().join("ft_coord_test_panic");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test.rs");
+        std::fs::write(&file, "let x = foo.unwrap();\nlet y = bar.expect(\"msg\");\n").unwrap();
+
+        let patterns = TextScanPatterns::new();
+        let mut kind_counts = HashMap::new();
+        let findings = scan_file_text(&file, &dir, &patterns, 10, &mut kind_counts);
+
+        assert!(findings.iter().any(|f| f.kind == UnstickFindingKind::PanicSite));
+        assert!(findings.len() >= 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_file_text_respects_max_per_kind() {
+        let dir = std::env::temp_dir().join("ft_coord_test_max");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test.rs");
+        let content = (0..20)
+            .map(|i| format!("// TODO item {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file, content).unwrap();
+
+        let patterns = TextScanPatterns::new();
+        let mut kind_counts = HashMap::new();
+        let findings = scan_file_text(&file, &dir, &patterns, 3, &mut kind_counts);
+
+        // Only 3 TODOs should be captured
+        let todo_count = findings
+            .iter()
+            .filter(|f| f.kind == UnstickFindingKind::TodoComment)
+            .count();
+        assert_eq!(todo_count, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ========================================================================
+    // CoordinateAgentsConfig serde
+    // ========================================================================
+
+    #[test]
+    fn coordinate_agents_config_defaults() {
+        let config = CoordinateAgentsConfig::default();
+        assert_eq!(config.strategy, PaneGroupStrategy::ByAgent);
+        assert_eq!(config.preconditions.len(), 4);
+        assert!(!config.abort_on_lock_failure);
+    }
+
+    #[test]
+    fn coordinate_agents_config_serde_roundtrip() {
+        let config = CoordinateAgentsConfig {
+            strategy: PaneGroupStrategy::ByDomain,
+            preconditions: vec![BroadcastPrecondition::PromptActive],
+            abort_on_lock_failure: true,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: CoordinateAgentsConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.strategy, PaneGroupStrategy::ByDomain);
+        assert!(parsed.abort_on_lock_failure);
+        assert_eq!(parsed.preconditions.len(), 1);
+    }
+
+    // ========================================================================
+    // PaneGroup helpers
+    // ========================================================================
+
+    #[test]
+    fn pane_group_len_and_is_empty() {
+        let group = PaneGroup::new("test", vec![1, 2, 3], PaneGroupStrategy::ByDomain);
+        assert_eq!(group.len(), 3);
+        assert!(!group.is_empty());
+
+        let empty = PaneGroup::new("empty", vec![], PaneGroupStrategy::ByDomain);
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+    }
+
+    // ========================================================================
+    // CoordinationResult helpers
+    // ========================================================================
+
+    #[test]
+    fn coordination_result_totals() {
+        let mut result = CoordinationResult::new("test_op");
+        assert_eq!(result.total_panes(), 0);
+        assert_eq!(result.total_acted(), 0);
+
+        result.groups.push(GroupCoordinationEntry {
+            group_name: "group1".to_string(),
+            pane_count: 5,
+            acted_count: 3,
+            precondition_failed_count: 1,
+            skipped_count: 1,
+        });
+        result.groups.push(GroupCoordinationEntry {
+            group_name: "group2".to_string(),
+            pane_count: 2,
+            acted_count: 2,
+            precondition_failed_count: 0,
+            skipped_count: 0,
+        });
+
+        assert_eq!(result.total_panes(), 7);
+        assert_eq!(result.total_acted(), 5);
+    }
+
+    // ========================================================================
+    // GroupLockResult with PaneWorkflowLockManager
+    // ========================================================================
+
+    #[test]
+    fn try_acquire_group_all_free() {
+        let mgr = PaneWorkflowLockManager::new();
+        let result = mgr.try_acquire_group(&[1, 2, 3], "workflow_a", "exec-1");
+        assert!(result.is_acquired());
+        if let GroupLockResult::Acquired { locked_panes } = result {
+            assert_eq!(locked_panes, vec![1, 2, 3]);
+        }
+        // Cleanup
+        mgr.release_group(&[1, 2, 3], "exec-1");
+    }
+
+    #[test]
+    fn try_acquire_group_partial_conflict_rolls_back() {
+        let mgr = PaneWorkflowLockManager::new();
+
+        // Lock pane 2 first
+        assert!(mgr.try_acquire(2, "workflow_x", "exec-x").is_acquired());
+
+        // Now try to acquire group [1, 2, 3] — should fail on pane 2 and roll back
+        let result = mgr.try_acquire_group(&[1, 2, 3], "workflow_a", "exec-1");
+        assert!(!result.is_acquired());
+
+        if let GroupLockResult::PartialFailure {
+            conflicts,
+            would_have_locked,
+        } = &result
+        {
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].pane_id, 2);
+            assert_eq!(conflicts[0].held_by_workflow, "workflow_x");
+            // Pane 1 was acquired then rolled back
+            assert!(would_have_locked.contains(&1));
+        }
+
+        // Pane 1 should be free again (rolled back)
+        assert!(mgr.is_locked(1).is_none());
+        // Pane 2 still locked by original holder
+        assert!(mgr.is_locked(2).is_some());
+
+        mgr.release(2, "exec-x");
+    }
+
+    #[test]
+    fn release_group_returns_count() {
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.try_acquire_group(&[1, 2, 3], "wf", "e1");
+        let released = mgr.release_group(&[1, 2, 3], "e1");
+        assert_eq!(released, 3);
+        // Releasing again returns 0
+        let released = mgr.release_group(&[1, 2, 3], "e1");
+        assert_eq!(released, 0);
+    }
+
+    // ========================================================================
+    // PaneBroadcastOutcome serde
+    // ========================================================================
+
+    #[test]
+    fn pane_broadcast_outcome_serde_roundtrip() {
+        let outcomes = vec![
+            PaneBroadcastOutcome::Allowed { elapsed_ms: 42 },
+            PaneBroadcastOutcome::Denied {
+                reason: "policy".into(),
+            },
+            PaneBroadcastOutcome::PreconditionFailed {
+                failed: vec!["prompt_active".into()],
+            },
+            PaneBroadcastOutcome::Skipped {
+                reason: "locked".into(),
+            },
+            PaneBroadcastOutcome::VerificationFailed {
+                reason: "timeout".into(),
+            },
+        ];
+        for outcome in outcomes {
+            let json = serde_json::to_string(&outcome).unwrap();
+            let parsed: PaneBroadcastOutcome = serde_json::from_str(&json).unwrap();
+            // Just check round-trip doesn't panic; structural equality requires PartialEq
+            let json2 = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    // ========================================================================
+    // BroadcastPrecondition serde
+    // ========================================================================
+
+    #[test]
+    fn broadcast_precondition_serde_roundtrip() {
+        for p in [
+            BroadcastPrecondition::PromptActive,
+            BroadcastPrecondition::NotAltScreen,
+            BroadcastPrecondition::NoRecentGap,
+            BroadcastPrecondition::NotReserved,
+        ] {
+            let json = serde_json::to_string(&p).unwrap();
+            let parsed: BroadcastPrecondition = serde_json::from_str(&json).unwrap();
+            assert_eq!(p.label(), parsed.label());
+        }
+    }
+
+    // ========================================================================
+    // UnstickConfig defaults
+    // ========================================================================
+
+    #[test]
+    fn unstick_config_defaults() {
+        let config = UnstickConfig::default();
+        assert_eq!(config.max_findings_per_kind, 10);
+        assert_eq!(config.max_total_findings, 25);
+        assert!(config.extensions.contains(&"rs".to_string()));
+        assert!(config.extensions.contains(&"py".to_string()));
+    }
+}
