@@ -280,3 +280,275 @@ impl Drop for PaneWorkflowLockGuard<'_> {
         self.manager.release(self.pane_id, &self.execution_id);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // LockAcquisitionResult
+    // ========================================================================
+
+    #[test]
+    fn lock_acquisition_result_predicates() {
+        let acquired = LockAcquisitionResult::Acquired;
+        assert!(acquired.is_acquired());
+        assert!(!acquired.is_already_locked());
+
+        let locked = LockAcquisitionResult::AlreadyLocked {
+            held_by_workflow: "wf".into(),
+            held_by_execution: "e1".into(),
+            locked_since_ms: 1000,
+        };
+        assert!(!locked.is_acquired());
+        assert!(locked.is_already_locked());
+    }
+
+    // ========================================================================
+    // PaneWorkflowLockManager basic operations
+    // ========================================================================
+
+    #[test]
+    fn try_acquire_and_release() {
+        let mgr = PaneWorkflowLockManager::new();
+        let result = mgr.try_acquire(1, "wf_a", "exec-1");
+        assert!(result.is_acquired());
+
+        // Second acquire on same pane should fail
+        let result2 = mgr.try_acquire(1, "wf_b", "exec-2");
+        assert!(result2.is_already_locked());
+        if let LockAcquisitionResult::AlreadyLocked {
+            held_by_workflow,
+            held_by_execution,
+            ..
+        } = result2
+        {
+            assert_eq!(held_by_workflow, "wf_a");
+            assert_eq!(held_by_execution, "exec-1");
+        }
+
+        // Release with correct execution_id
+        assert!(mgr.release(1, "exec-1"));
+
+        // Now should be able to acquire again
+        let result3 = mgr.try_acquire(1, "wf_b", "exec-2");
+        assert!(result3.is_acquired());
+
+        mgr.release(1, "exec-2");
+    }
+
+    #[test]
+    fn release_wrong_execution_id() {
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.try_acquire(1, "wf", "exec-1");
+        // Release with wrong execution_id should fail
+        assert!(!mgr.release(1, "exec-wrong"));
+        // Lock should still be held
+        assert!(mgr.is_locked(1).is_some());
+        mgr.release(1, "exec-1");
+    }
+
+    #[test]
+    fn release_nonexistent_lock() {
+        let mgr = PaneWorkflowLockManager::new();
+        assert!(!mgr.release(999, "exec-1"));
+    }
+
+    #[test]
+    fn different_panes_independent() {
+        let mgr = PaneWorkflowLockManager::new();
+        assert!(mgr.try_acquire(1, "wf_a", "e1").is_acquired());
+        assert!(mgr.try_acquire(2, "wf_b", "e2").is_acquired());
+        assert!(mgr.try_acquire(3, "wf_c", "e3").is_acquired());
+
+        assert!(mgr.is_locked(1).is_some());
+        assert!(mgr.is_locked(2).is_some());
+        assert!(mgr.is_locked(3).is_some());
+        assert!(mgr.is_locked(4).is_none());
+
+        mgr.release(1, "e1");
+        mgr.release(2, "e2");
+        mgr.release(3, "e3");
+    }
+
+    // ========================================================================
+    // is_locked
+    // ========================================================================
+
+    #[test]
+    fn is_locked_returns_info() {
+        let mgr = PaneWorkflowLockManager::new();
+        assert!(mgr.is_locked(1).is_none());
+
+        mgr.try_acquire(1, "my_workflow", "exec-42");
+        let info = mgr.is_locked(1).unwrap();
+        assert_eq!(info.pane_id, 1);
+        assert_eq!(info.workflow_name, "my_workflow");
+        assert_eq!(info.execution_id, "exec-42");
+        assert!(info.locked_at_ms > 0);
+
+        mgr.release(1, "exec-42");
+        assert!(mgr.is_locked(1).is_none());
+    }
+
+    // ========================================================================
+    // active_locks
+    // ========================================================================
+
+    #[test]
+    fn active_locks_empty_initially() {
+        let mgr = PaneWorkflowLockManager::new();
+        assert!(mgr.active_locks().is_empty());
+    }
+
+    #[test]
+    fn active_locks_returns_all() {
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.try_acquire(10, "wf_a", "e1");
+        mgr.try_acquire(20, "wf_b", "e2");
+        mgr.try_acquire(30, "wf_c", "e3");
+
+        let locks = mgr.active_locks();
+        assert_eq!(locks.len(), 3);
+        let pane_ids: Vec<u64> = locks.iter().map(|l| l.pane_id).collect();
+        assert!(pane_ids.contains(&10));
+        assert!(pane_ids.contains(&20));
+        assert!(pane_ids.contains(&30));
+
+        mgr.release(10, "e1");
+        let locks = mgr.active_locks();
+        assert_eq!(locks.len(), 2);
+
+        mgr.release(20, "e2");
+        mgr.release(30, "e3");
+    }
+
+    // ========================================================================
+    // acquire_guard (RAII)
+    // ========================================================================
+
+    #[test]
+    fn acquire_guard_locks_and_drops() {
+        let mgr = PaneWorkflowLockManager::new();
+
+        {
+            let guard = mgr.acquire_guard(1, "wf", "e1");
+            assert!(guard.is_some());
+            let guard = guard.unwrap();
+            assert_eq!(guard.pane_id(), 1);
+            assert_eq!(guard.execution_id(), "e1");
+
+            // Pane should be locked while guard exists
+            assert!(mgr.is_locked(1).is_some());
+
+            // Second acquire should fail
+            assert!(mgr.acquire_guard(1, "wf2", "e2").is_none());
+        }
+        // Guard dropped — pane should be unlocked now
+        assert!(mgr.is_locked(1).is_none());
+    }
+
+    #[test]
+    fn acquire_guard_explicit_release() {
+        let mgr = PaneWorkflowLockManager::new();
+        let guard = mgr.acquire_guard(5, "wf", "e1").unwrap();
+        assert!(mgr.is_locked(5).is_some());
+        guard.release(); // explicit release
+        assert!(mgr.is_locked(5).is_none());
+    }
+
+    #[test]
+    fn acquire_guard_returns_none_when_locked() {
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.try_acquire(1, "wf_a", "e1");
+        assert!(mgr.acquire_guard(1, "wf_b", "e2").is_none());
+        mgr.release(1, "e1");
+    }
+
+    // ========================================================================
+    // force_release
+    // ========================================================================
+
+    #[test]
+    fn force_release_removes_lock() {
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.try_acquire(1, "wf", "e1");
+
+        let info = mgr.force_release(1);
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.execution_id, "e1");
+
+        assert!(mgr.is_locked(1).is_none());
+    }
+
+    #[test]
+    fn force_release_nonexistent() {
+        let mgr = PaneWorkflowLockManager::new();
+        assert!(mgr.force_release(999).is_none());
+    }
+
+    #[test]
+    fn force_release_allows_reacquire() {
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.try_acquire(1, "wf_a", "e1");
+
+        // Can't acquire normally
+        assert!(mgr.try_acquire(1, "wf_b", "e2").is_already_locked());
+
+        // Force release
+        mgr.force_release(1);
+
+        // Now can acquire
+        assert!(mgr.try_acquire(1, "wf_b", "e2").is_acquired());
+        mgr.release(1, "e2");
+    }
+
+    // ========================================================================
+    // PaneLockInfo serde
+    // ========================================================================
+
+    #[test]
+    fn pane_lock_info_serde_roundtrip() {
+        let info = PaneLockInfo {
+            pane_id: 42,
+            workflow_name: "test_workflow".to_string(),
+            execution_id: "exec-123".to_string(),
+            locked_at_ms: 1709328000000,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: PaneLockInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pane_id, 42);
+        assert_eq!(parsed.workflow_name, "test_workflow");
+        assert_eq!(parsed.execution_id, "exec-123");
+        assert_eq!(parsed.locked_at_ms, 1709328000000);
+    }
+
+    // ========================================================================
+    // Default trait
+    // ========================================================================
+
+    #[test]
+    fn default_creates_empty_manager() {
+        let mgr = PaneWorkflowLockManager::default();
+        assert!(mgr.active_locks().is_empty());
+    }
+
+    // ========================================================================
+    // Stress: many panes
+    // ========================================================================
+
+    #[test]
+    fn acquire_release_many_panes() {
+        let mgr = PaneWorkflowLockManager::new();
+        for i in 0..100 {
+            assert!(mgr.try_acquire(i, "wf", &format!("e{i}")).is_acquired());
+        }
+        assert_eq!(mgr.active_locks().len(), 100);
+
+        for i in 0..100 {
+            assert!(mgr.release(i, &format!("e{i}")));
+        }
+        assert!(mgr.active_locks().is_empty());
+    }
+}
