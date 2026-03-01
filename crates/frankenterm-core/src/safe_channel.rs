@@ -902,7 +902,11 @@ mod tests {
 
     #[test]
     fn multiple_consumers_no_duplicates() {
-        let (tx, rx) = safe_channel::<u32>(default_config());
+        let config = SafeChannelConfig {
+            capacity: 128,
+            ..default_config()
+        };
+        let (tx, rx) = safe_channel::<u32>(config);
         for i in 0..100 {
             tx.try_send(i).unwrap();
         }
