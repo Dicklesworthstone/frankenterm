@@ -5288,4 +5288,99 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap().would_succeed);
     }
+
+    // =========================================================================
+    // Transition table completeness test
+    // =========================================================================
+
+    /// Validates that every entry in MISSION_LIFECYCLE_TRANSITIONS is
+    /// individually reachable via `transition_lifecycle()`. This ensures
+    /// the table doesn't contain dead/unreachable transitions and that
+    /// the validation logic accepts every declared (from, via, to) triple.
+    #[test]
+    fn every_transition_in_table_is_reachable() {
+        for (i, rule) in MISSION_LIFECYCLE_TRANSITIONS.iter().enumerate() {
+            let mut mission = planning_mission();
+            mission.lifecycle_state = rule.from;
+
+            let result =
+                mission.transition_lifecycle(rule.to, rule.via, (i as i64 + 1) * 1_000_000);
+            assert!(
+                result.is_ok(),
+                "Transition table entry {i} should be valid: {:?} --{:?}--> {:?}",
+                rule.from,
+                rule.via,
+                rule.to,
+            );
+            assert_eq!(
+                mission.lifecycle_state, rule.to,
+                "Transition {i} should land in {:?}",
+                rule.to,
+            );
+        }
+    }
+
+    /// Validates that transitions NOT in the table are rejected.
+    /// Picks a sample of invalid transitions and confirms they fail.
+    #[test]
+    fn invalid_transitions_not_in_table_are_rejected() {
+        let invalid_cases = [
+            // Terminal states cannot transition out
+            (
+                MissionLifecycleState::Completed,
+                MissionLifecycleTransitionKind::Retry,
+                MissionLifecycleState::RetryPending,
+            ),
+            (
+                MissionLifecycleState::Failed,
+                MissionLifecycleTransitionKind::Dispatch,
+                MissionLifecycleState::Dispatching,
+            ),
+            (
+                MissionLifecycleState::Cancelled,
+                MissionLifecycleTransitionKind::RetryResumed,
+                MissionLifecycleState::Running,
+            ),
+            // Planning cannot directly go to Running
+            (
+                MissionLifecycleState::Planning,
+                MissionLifecycleTransitionKind::Retry,
+                MissionLifecycleState::Running,
+            ),
+            // AwaitingApproval cannot directly Complete
+            (
+                MissionLifecycleState::AwaitingApproval,
+                MissionLifecycleTransitionKind::Complete,
+                MissionLifecycleState::Completed,
+            ),
+        ];
+
+        for (i, (from, via, to)) in invalid_cases.iter().enumerate() {
+            let mut mission = planning_mission();
+            mission.lifecycle_state = *from;
+
+            let result = mission.transition_lifecycle(*to, *via, (i as i64 + 1) * 1_000_000);
+            assert!(
+                result.is_err(),
+                "Invalid transition {i} should be rejected: {:?} --{:?}--> {:?}",
+                from,
+                via,
+                to,
+            );
+        }
+    }
+
+    /// Validates that the transition table has no duplicate entries
+    /// (same from+via+to triple appearing more than once).
+    #[test]
+    fn transition_table_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for (i, rule) in MISSION_LIFECYCLE_TRANSITIONS.iter().enumerate() {
+            let key = format!("{:?}_{:?}_{:?}", rule.from, rule.via, rule.to);
+            assert!(
+                seen.insert(key.clone()),
+                "Duplicate transition at index {i}: {key}",
+            );
+        }
+    }
 }
