@@ -299,3 +299,488 @@ impl WorkflowInfo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::patterns::{AgentType, Detection, Severity};
+
+    // ========================================================================
+    // Mock Workflow for testing trait default methods
+    // ========================================================================
+
+    struct MockWorkflow {
+        trigger_events: &'static [&'static str],
+        trigger_rules: &'static [&'static str],
+        agent_types: &'static [&'static str],
+        needs_pane: bool,
+        needs_approval: bool,
+        abortable: bool,
+        destructive: bool,
+        deps: &'static [&'static str],
+        enabled: bool,
+    }
+
+    impl Default for MockWorkflow {
+        fn default() -> Self {
+            Self {
+                trigger_events: &[],
+                trigger_rules: &[],
+                agent_types: &[],
+                needs_pane: true,
+                needs_approval: false,
+                abortable: true,
+                destructive: false,
+                deps: &[],
+                enabled: true,
+            }
+        }
+    }
+
+    impl Workflow for MockWorkflow {
+        fn name(&self) -> &'static str {
+            "mock_workflow"
+        }
+
+        fn description(&self) -> &'static str {
+            "A mock workflow for testing"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.starts_with("mock.")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![
+                WorkflowStep::new("step_one", "First step"),
+                WorkflowStep::new("step_two", "Second step"),
+                WorkflowStep::new("step_three", "Third step"),
+            ]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::cont(),
+                    1 => StepResult::cont(),
+                    _ => StepResult::done_empty(),
+                }
+            })
+        }
+
+        fn trigger_event_types(&self) -> &'static [&'static str] {
+            self.trigger_events
+        }
+
+        fn trigger_rule_ids(&self) -> &'static [&'static str] {
+            self.trigger_rules
+        }
+
+        fn supported_agent_types(&self) -> &'static [&'static str] {
+            self.agent_types
+        }
+
+        fn requires_pane(&self) -> bool {
+            self.needs_pane
+        }
+
+        fn requires_approval(&self) -> bool {
+            self.needs_approval
+        }
+
+        fn can_abort(&self) -> bool {
+            self.abortable
+        }
+
+        fn is_destructive(&self) -> bool {
+            self.destructive
+        }
+
+        fn dependencies(&self) -> &'static [&'static str] {
+            self.deps
+        }
+
+        fn is_enabled(&self) -> bool {
+            self.enabled
+        }
+    }
+
+    fn make_detection(rule_id: &str) -> Detection {
+        Detection {
+            rule_id: rule_id.to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "test".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: String::new(),
+            span: (0, 0),
+        }
+    }
+
+    // ========================================================================
+    // WorkflowStep tests
+    // ========================================================================
+
+    #[test]
+    fn workflow_step_new() {
+        let step = WorkflowStep::new("init", "Initialize system");
+        assert_eq!(step.name, "init");
+        assert_eq!(step.description, "Initialize system");
+    }
+
+    #[test]
+    fn workflow_step_new_from_string() {
+        let step = WorkflowStep::new(String::from("run"), String::from("Run the task"));
+        assert_eq!(step.name, "run");
+        assert_eq!(step.description, "Run the task");
+    }
+
+    #[test]
+    fn workflow_step_serde_roundtrip() {
+        let step = WorkflowStep::new("send", "Send command to pane");
+        let json = serde_json::to_string(&step).unwrap();
+        let restored: WorkflowStep = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.name, "send");
+        assert_eq!(restored.description, "Send command to pane");
+    }
+
+    #[test]
+    fn workflow_step_clone() {
+        let step = WorkflowStep::new("wait", "Wait for response");
+        let cloned = step.clone();
+        assert_eq!(cloned.name, step.name);
+        assert_eq!(cloned.description, step.description);
+    }
+
+    // ========================================================================
+    // Workflow trait tests (via MockWorkflow)
+    // ========================================================================
+
+    #[test]
+    fn workflow_name_and_description() {
+        let wf = MockWorkflow::default();
+        assert_eq!(wf.name(), "mock_workflow");
+        assert_eq!(wf.description(), "A mock workflow for testing");
+    }
+
+    #[test]
+    fn workflow_handles_matching_detection() {
+        let wf = MockWorkflow::default();
+        let detection = make_detection("mock.test_event");
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn workflow_rejects_non_matching_detection() {
+        let wf = MockWorkflow::default();
+        let detection = make_detection("other.test_event");
+        assert!(!wf.handles(&detection));
+    }
+
+    #[test]
+    fn workflow_steps_count() {
+        let wf = MockWorkflow::default();
+        assert_eq!(wf.steps().len(), 3);
+        assert_eq!(wf.step_count(), 3);
+    }
+
+    #[test]
+    fn workflow_step_names() {
+        let wf = MockWorkflow::default();
+        let steps = wf.steps();
+        assert_eq!(steps[0].name, "step_one");
+        assert_eq!(steps[1].name, "step_two");
+        assert_eq!(steps[2].name, "step_three");
+    }
+
+    #[test]
+    fn workflow_default_trigger_event_types_empty() {
+        let wf = MockWorkflow::default();
+        assert!(wf.trigger_event_types().is_empty());
+    }
+
+    #[test]
+    fn workflow_custom_trigger_event_types() {
+        let wf = MockWorkflow {
+            trigger_events: &["session.compaction", "usage.limit"],
+            ..MockWorkflow::default()
+        };
+        assert_eq!(wf.trigger_event_types().len(), 2);
+        assert_eq!(wf.trigger_event_types()[0], "session.compaction");
+    }
+
+    #[test]
+    fn workflow_default_trigger_rule_ids_empty() {
+        let wf = MockWorkflow::default();
+        assert!(wf.trigger_rule_ids().is_empty());
+    }
+
+    #[test]
+    fn workflow_custom_trigger_rule_ids() {
+        let wf = MockWorkflow {
+            trigger_rules: &["compaction.detected"],
+            ..MockWorkflow::default()
+        };
+        assert_eq!(wf.trigger_rule_ids(), &["compaction.detected"]);
+    }
+
+    #[test]
+    fn workflow_default_supported_agent_types_empty() {
+        let wf = MockWorkflow::default();
+        assert!(wf.supported_agent_types().is_empty());
+    }
+
+    #[test]
+    fn workflow_custom_supported_agent_types() {
+        let wf = MockWorkflow {
+            agent_types: &["codex", "claude_code"],
+            ..MockWorkflow::default()
+        };
+        assert_eq!(wf.supported_agent_types().len(), 2);
+    }
+
+    #[test]
+    fn workflow_default_requires_pane() {
+        let wf = MockWorkflow::default();
+        assert!(wf.requires_pane());
+    }
+
+    #[test]
+    fn workflow_no_pane_required() {
+        let wf = MockWorkflow {
+            needs_pane: false,
+            ..MockWorkflow::default()
+        };
+        assert!(!wf.requires_pane());
+    }
+
+    #[test]
+    fn workflow_default_no_approval_required() {
+        let wf = MockWorkflow::default();
+        assert!(!wf.requires_approval());
+    }
+
+    #[test]
+    fn workflow_requires_approval() {
+        let wf = MockWorkflow {
+            needs_approval: true,
+            ..MockWorkflow::default()
+        };
+        assert!(wf.requires_approval());
+    }
+
+    #[test]
+    fn workflow_default_can_abort() {
+        let wf = MockWorkflow::default();
+        assert!(wf.can_abort());
+    }
+
+    #[test]
+    fn workflow_not_abortable() {
+        let wf = MockWorkflow {
+            abortable: false,
+            ..MockWorkflow::default()
+        };
+        assert!(!wf.can_abort());
+    }
+
+    #[test]
+    fn workflow_default_not_destructive() {
+        let wf = MockWorkflow::default();
+        assert!(!wf.is_destructive());
+    }
+
+    #[test]
+    fn workflow_destructive() {
+        let wf = MockWorkflow {
+            destructive: true,
+            ..MockWorkflow::default()
+        };
+        assert!(wf.is_destructive());
+    }
+
+    #[test]
+    fn workflow_default_no_dependencies() {
+        let wf = MockWorkflow::default();
+        assert!(wf.dependencies().is_empty());
+    }
+
+    #[test]
+    fn workflow_with_dependencies() {
+        let wf = MockWorkflow {
+            deps: &["prereq_workflow", "setup_workflow"],
+            ..MockWorkflow::default()
+        };
+        assert_eq!(wf.dependencies().len(), 2);
+        assert_eq!(wf.dependencies()[0], "prereq_workflow");
+    }
+
+    #[test]
+    fn workflow_default_is_enabled() {
+        let wf = MockWorkflow::default();
+        assert!(wf.is_enabled());
+    }
+
+    #[test]
+    fn workflow_disabled() {
+        let wf = MockWorkflow {
+            enabled: false,
+            ..MockWorkflow::default()
+        };
+        assert!(!wf.is_enabled());
+    }
+
+    // ========================================================================
+    // steps_to_plans tests
+    // ========================================================================
+
+    #[test]
+    fn steps_to_plans_generates_correct_count() {
+        let wf = MockWorkflow::default();
+        let plans = wf.steps_to_plans(42);
+        assert_eq!(plans.len(), 3);
+    }
+
+    #[test]
+    fn steps_to_plans_sequential_step_numbers() {
+        let wf = MockWorkflow::default();
+        let plans = wf.steps_to_plans(42);
+        assert_eq!(plans[0].step_number, 1);
+        assert_eq!(plans[1].step_number, 2);
+        assert_eq!(plans[2].step_number, 3);
+    }
+
+    #[test]
+    fn steps_to_plans_uses_step_description() {
+        let wf = MockWorkflow::default();
+        let plans = wf.steps_to_plans(42);
+        assert_eq!(plans[0].description, "First step");
+        assert_eq!(plans[1].description, "Second step");
+    }
+
+    #[test]
+    fn steps_to_plans_custom_action_type() {
+        let wf = MockWorkflow::default();
+        let plans = wf.steps_to_plans(99);
+        if let crate::plan::StepAction::Custom {
+            action_type,
+            payload,
+        } = &plans[0].action
+        {
+            assert_eq!(action_type, "workflow_step:step_one");
+            assert_eq!(payload["pane_id"], 99);
+            assert_eq!(payload["workflow"], "mock_workflow");
+            assert_eq!(payload["step_name"], "step_one");
+        } else {
+            panic!("Expected StepAction::Custom");
+        }
+    }
+
+    #[test]
+    fn steps_to_plans_unique_step_ids() {
+        let wf = MockWorkflow::default();
+        let plans = wf.steps_to_plans(1);
+        let ids: Vec<_> = plans.iter().map(|p| &p.step_id).collect();
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(ids[i], ids[j], "Step IDs should be unique");
+            }
+        }
+    }
+
+    #[test]
+    fn steps_to_plans_different_pane_id_changes_payload() {
+        let wf = MockWorkflow::default();
+        let plans_a = wf.steps_to_plans(1);
+        let plans_b = wf.steps_to_plans(2);
+        // Payloads should differ due to different pane_id
+        if let (
+            crate::plan::StepAction::Custom {
+                payload: pa, ..
+            },
+            crate::plan::StepAction::Custom {
+                payload: pb, ..
+            },
+        ) = (&plans_a[0].action, &plans_b[0].action)
+        {
+            assert_eq!(pa["pane_id"], 1);
+            assert_eq!(pb["pane_id"], 2);
+        } else {
+            panic!("Expected StepAction::Custom");
+        }
+    }
+
+    // ========================================================================
+    // WorkflowInfo tests
+    // ========================================================================
+
+    #[test]
+    fn workflow_info_from_default_workflow() {
+        let wf = MockWorkflow::default();
+        let info = WorkflowInfo::from_workflow(&wf);
+        assert_eq!(info.name, "mock_workflow");
+        assert_eq!(info.description, "A mock workflow for testing");
+        assert!(info.enabled);
+        assert!(info.trigger_event_types.is_empty());
+        assert!(info.trigger_rule_ids.is_empty());
+        assert!(info.agent_types.is_empty());
+        assert_eq!(info.step_count, 3);
+        assert!(info.requires_pane);
+        assert!(!info.requires_approval);
+        assert!(info.can_abort);
+        assert!(!info.destructive);
+        assert!(info.dependencies.is_empty());
+    }
+
+    #[test]
+    fn workflow_info_from_customized_workflow() {
+        let wf = MockWorkflow {
+            trigger_events: &["session.exit"],
+            trigger_rules: &["exit.detected", "timeout.detected"],
+            agent_types: &["codex"],
+            needs_pane: true,
+            needs_approval: true,
+            abortable: false,
+            destructive: true,
+            deps: &["init_workflow"],
+            enabled: false,
+        };
+        let info = WorkflowInfo::from_workflow(&wf);
+        assert!(!info.enabled);
+        assert_eq!(info.trigger_event_types, vec!["session.exit"]);
+        assert_eq!(
+            info.trigger_rule_ids,
+            vec!["exit.detected", "timeout.detected"]
+        );
+        assert_eq!(info.agent_types, vec!["codex"]);
+        assert!(info.requires_approval);
+        assert!(!info.can_abort);
+        assert!(info.destructive);
+        assert_eq!(info.dependencies, vec!["init_workflow"]);
+    }
+
+    #[test]
+    fn workflow_info_serde_roundtrip() {
+        let wf = MockWorkflow {
+            trigger_events: &["e1"],
+            trigger_rules: &["r1"],
+            agent_types: &["claude_code"],
+            deps: &["dep1"],
+            ..MockWorkflow::default()
+        };
+        let info = WorkflowInfo::from_workflow(&wf);
+        let json = serde_json::to_string(&info).unwrap();
+        let restored: WorkflowInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.name, info.name);
+        assert_eq!(restored.step_count, info.step_count);
+        assert_eq!(restored.trigger_event_types, info.trigger_event_types);
+        assert_eq!(restored.trigger_rule_ids, info.trigger_rule_ids);
+        assert_eq!(restored.agent_types, info.agent_types);
+        assert_eq!(restored.dependencies, info.dependencies);
+    }
+}

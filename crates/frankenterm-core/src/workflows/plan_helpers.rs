@@ -152,3 +152,281 @@ pub async fn check_step_idempotency(
 
     IdempotencyCheckResult::NotExecuted
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::patterns::Detection;
+
+    // ========================================================================
+    // Mock Workflow for plan generation tests
+    // ========================================================================
+
+    struct PlanTestWorkflow;
+
+    impl Workflow for PlanTestWorkflow {
+        fn name(&self) -> &'static str {
+            "plan_test"
+        }
+
+        fn description(&self) -> &'static str {
+            "Plan test workflow"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.starts_with("plan.")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![
+                WorkflowStep::new("check", "Check preconditions"),
+                WorkflowStep::new("execute", "Execute action"),
+            ]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::cont(),
+                    _ => StepResult::done_empty(),
+                }
+            })
+        }
+    }
+
+    struct EmptyStepsWorkflow;
+
+    impl Workflow for EmptyStepsWorkflow {
+        fn name(&self) -> &'static str {
+            "empty_steps"
+        }
+
+        fn description(&self) -> &'static str {
+            "Workflow with no steps"
+        }
+
+        fn handles(&self, _detection: &Detection) -> bool {
+            false
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async { StepResult::done_empty() })
+        }
+    }
+
+    // ========================================================================
+    // workflow_to_action_plan tests
+    // ========================================================================
+
+    #[test]
+    fn action_plan_from_workflow_basic() {
+        let wf = PlanTestWorkflow;
+        let plan = workflow_to_action_plan(&wf, "ws-100", 42, "exec-abc");
+
+        assert_eq!(plan.title, "Plan test workflow");
+        assert_eq!(plan.workspace_id, "ws-100");
+        assert_eq!(plan.steps.len(), 2);
+        assert!(!plan.plan_id.is_placeholder());
+    }
+
+    #[test]
+    fn action_plan_step_numbering() {
+        let wf = PlanTestWorkflow;
+        let plan = workflow_to_action_plan(&wf, "ws-1", 1, "exec-1");
+
+        assert_eq!(plan.steps[0].step_number, 1);
+        assert_eq!(plan.steps[1].step_number, 2);
+    }
+
+    #[test]
+    fn action_plan_step_descriptions() {
+        let wf = PlanTestWorkflow;
+        let plan = workflow_to_action_plan(&wf, "ws-1", 1, "exec-1");
+
+        assert_eq!(plan.steps[0].description, "Check preconditions");
+        assert_eq!(plan.steps[1].description, "Execute action");
+    }
+
+    #[test]
+    fn action_plan_metadata_includes_workflow_name() {
+        let wf = PlanTestWorkflow;
+        let plan = workflow_to_action_plan(&wf, "ws-1", 55, "exec-xyz");
+
+        let meta = plan.metadata.as_ref().unwrap();
+        assert_eq!(meta["workflow_name"], "plan_test");
+        assert_eq!(meta["execution_id"], "exec-xyz");
+        assert_eq!(meta["pane_id"], 55);
+        assert_eq!(meta["generated_by"], "workflow_to_action_plan");
+    }
+
+    #[test]
+    fn action_plan_has_created_at() {
+        let wf = PlanTestWorkflow;
+        let plan = workflow_to_action_plan(&wf, "ws-1", 1, "exec-1");
+
+        // created_at should be set (non-None)
+        assert!(plan.created_at.is_some());
+    }
+
+    #[test]
+    fn action_plan_validates() {
+        let wf = PlanTestWorkflow;
+        let plan = workflow_to_action_plan(&wf, "ws-1", 1, "exec-1");
+
+        // Plan should pass validation
+        assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn action_plan_from_empty_workflow() {
+        let wf = EmptyStepsWorkflow;
+        let plan = workflow_to_action_plan(&wf, "ws-1", 1, "exec-1");
+
+        assert_eq!(plan.steps.len(), 0);
+        assert_eq!(plan.title, "Workflow with no steps");
+        assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn action_plan_deterministic_hash() {
+        let wf = PlanTestWorkflow;
+        let plan_a = workflow_to_action_plan(&wf, "ws-1", 1, "exec-1");
+        let plan_b = workflow_to_action_plan(&wf, "ws-1", 1, "exec-1");
+
+        // Same inputs → same plan ID (hash is content-addressed)
+        assert_eq!(plan_a.plan_id, plan_b.plan_id);
+    }
+
+    #[test]
+    fn action_plan_different_workspace_different_hash() {
+        let wf = PlanTestWorkflow;
+        let plan_a = workflow_to_action_plan(&wf, "ws-A", 1, "exec-1");
+        let plan_b = workflow_to_action_plan(&wf, "ws-B", 1, "exec-1");
+
+        assert_ne!(plan_a.plan_id, plan_b.plan_id);
+    }
+
+    #[test]
+    fn action_plan_different_pane_different_payload() {
+        let wf = PlanTestWorkflow;
+        let plan_a = workflow_to_action_plan(&wf, "ws-1", 10, "exec-1");
+        let plan_b = workflow_to_action_plan(&wf, "ws-1", 20, "exec-1");
+
+        // Different pane_id → different step action payloads → different hash
+        assert_ne!(plan_a.plan_id, plan_b.plan_id);
+    }
+
+    #[test]
+    fn action_plan_step_actions_are_custom() {
+        let wf = PlanTestWorkflow;
+        let plan = workflow_to_action_plan(&wf, "ws-1", 7, "exec-1");
+
+        for (i, step) in plan.steps.iter().enumerate() {
+            match &step.action {
+                crate::plan::StepAction::Custom {
+                    action_type,
+                    payload,
+                } => {
+                    let expected_names = ["check", "execute"];
+                    assert_eq!(
+                        action_type,
+                        &format!("workflow_step:{}", expected_names[i])
+                    );
+                    assert_eq!(payload["pane_id"], 7);
+                }
+                other => panic!("Expected Custom action, got {:?}", other),
+            }
+        }
+    }
+
+    // ========================================================================
+    // IdempotencyCheckResult tests
+    // ========================================================================
+
+    #[test]
+    fn idempotency_not_executed() {
+        let result = IdempotencyCheckResult::NotExecuted;
+        assert!(matches!(result, IdempotencyCheckResult::NotExecuted));
+    }
+
+    #[test]
+    fn idempotency_already_completed() {
+        let result = IdempotencyCheckResult::AlreadyCompleted {
+            completed_at: 1700000000,
+            previous_result: Some("done".to_string()),
+        };
+        if let IdempotencyCheckResult::AlreadyCompleted {
+            completed_at,
+            previous_result,
+        } = result
+        {
+            assert_eq!(completed_at, 1700000000);
+            assert_eq!(previous_result, Some("done".to_string()));
+        } else {
+            panic!("Wrong variant");
+        }
+    }
+
+    #[test]
+    fn idempotency_already_completed_no_result() {
+        let result = IdempotencyCheckResult::AlreadyCompleted {
+            completed_at: 1700000001,
+            previous_result: None,
+        };
+        if let IdempotencyCheckResult::AlreadyCompleted {
+            previous_result, ..
+        } = result
+        {
+            assert!(previous_result.is_none());
+        }
+    }
+
+    #[test]
+    fn idempotency_partially_executed() {
+        let result = IdempotencyCheckResult::PartiallyExecuted {
+            started_at: 1700000002,
+        };
+        if let IdempotencyCheckResult::PartiallyExecuted { started_at } = result {
+            assert_eq!(started_at, 1700000002);
+        } else {
+            panic!("Wrong variant");
+        }
+    }
+
+    #[test]
+    fn idempotency_check_result_clone() {
+        let original = IdempotencyCheckResult::AlreadyCompleted {
+            completed_at: 999,
+            previous_result: Some("test".to_string()),
+        };
+        let cloned = original.clone();
+        if let IdempotencyCheckResult::AlreadyCompleted {
+            completed_at,
+            previous_result,
+        } = cloned
+        {
+            assert_eq!(completed_at, 999);
+            assert_eq!(previous_result, Some("test".to_string()));
+        }
+    }
+
+    #[test]
+    fn idempotency_check_result_debug() {
+        let result = IdempotencyCheckResult::NotExecuted;
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("NotExecuted"));
+    }
+}

@@ -327,3 +327,382 @@ impl WorkflowContext {
         self.action_plan.as_ref().map(|p| p.workspace_id.as_str())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::storage::PaneRecord;
+
+    // ========================================================================
+    // PaneMetadata tests
+    // ========================================================================
+
+    #[test]
+    fn pane_metadata_default_all_none() {
+        let meta = PaneMetadata::default();
+        assert!(meta.domain.is_none());
+        assert!(meta.title.is_none());
+        assert!(meta.cwd.is_none());
+    }
+
+    #[test]
+    fn pane_metadata_from_record() {
+        let record = PaneRecord {
+            pane_id: 1,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: Some(0),
+            tab_id: Some(0),
+            title: Some("vim main.rs".to_string()),
+            cwd: Some("/home/user/project".to_string()),
+            tty_name: None,
+            first_seen_at: 0,
+            last_seen_at: 0,
+            observed: false,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        let meta = PaneMetadata::from_record(&record);
+        assert_eq!(meta.domain, Some("local".to_string()));
+        assert_eq!(meta.title, Some("vim main.rs".to_string()));
+        assert_eq!(meta.cwd, Some("/home/user/project".to_string()));
+    }
+
+    #[test]
+    fn pane_metadata_from_record_with_none_fields() {
+        let record = PaneRecord {
+            pane_id: 2,
+            pane_uuid: None,
+            domain: "ssh:remote".to_string(),
+            window_id: Some(0),
+            tab_id: Some(0),
+            title: None,
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 0,
+            last_seen_at: 0,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: Some(12345),
+        };
+        let meta = PaneMetadata::from_record(&record);
+        assert_eq!(meta.domain, Some("ssh:remote".to_string()));
+        assert!(meta.title.is_none());
+        assert!(meta.cwd.is_none());
+    }
+
+    #[test]
+    fn pane_metadata_clone() {
+        let meta = PaneMetadata {
+            domain: Some("local".into()),
+            title: Some("bash".into()),
+            cwd: Some("/tmp".into()),
+        };
+        let cloned = meta.clone();
+        assert_eq!(cloned.domain, meta.domain);
+        assert_eq!(cloned.title, meta.title);
+        assert_eq!(cloned.cwd, meta.cwd);
+    }
+
+    // ========================================================================
+    // WorkflowConfig tests
+    // ========================================================================
+
+    #[test]
+    fn workflow_config_default_values() {
+        let config = WorkflowConfig::default();
+        assert_eq!(config.default_wait_timeout_ms, 30_000);
+        assert_eq!(config.max_step_retries, 3);
+        assert_eq!(config.retry_delay_ms, 1_000);
+    }
+
+    #[test]
+    fn workflow_config_serde_roundtrip() {
+        let config = WorkflowConfig {
+            default_wait_timeout_ms: 60_000,
+            max_step_retries: 5,
+            retry_delay_ms: 2_500,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: WorkflowConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.default_wait_timeout_ms, 60_000);
+        assert_eq!(restored.max_step_retries, 5);
+        assert_eq!(restored.retry_delay_ms, 2_500);
+    }
+
+    #[test]
+    fn workflow_config_clone() {
+        let config = WorkflowConfig {
+            default_wait_timeout_ms: 10_000,
+            max_step_retries: 1,
+            retry_delay_ms: 500,
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.default_wait_timeout_ms, config.default_wait_timeout_ms);
+        assert_eq!(cloned.max_step_retries, config.max_step_retries);
+        assert_eq!(cloned.retry_delay_ms, config.retry_delay_ms);
+    }
+
+    // ========================================================================
+    // WorkflowContext tests (sync methods only)
+    // ========================================================================
+
+    fn make_storage() -> Arc<StorageHandle> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tmp = std::env::temp_dir().join(format!(
+                "ft_test_ctx_{}_{}.db",
+                std::process::id(),
+                id,
+            ));
+            Arc::new(StorageHandle::new(tmp.to_str().unwrap()).await.unwrap())
+        })
+    }
+
+    #[test]
+    fn workflow_context_new_defaults() {
+        let storage = make_storage();
+        let ctx = WorkflowContext::new(
+            storage,
+            42,
+            PaneCapabilities::prompt(),
+            "exec-001",
+        );
+        assert_eq!(ctx.pane_id(), 42);
+        assert_eq!(ctx.execution_id(), "exec-001");
+        assert!(ctx.trigger().is_none());
+        assert!(!ctx.has_injector());
+        assert!(!ctx.has_action_plan());
+        assert!(ctx.workspace_id().is_none());
+        assert_eq!(ctx.default_wait_timeout_ms(), 30_000);
+    }
+
+    #[test]
+    fn workflow_context_capabilities() {
+        let storage = make_storage();
+        let ctx = WorkflowContext::new(
+            storage,
+            1,
+            PaneCapabilities::running(),
+            "exec-002",
+        );
+        let caps = ctx.capabilities();
+        assert!(caps.command_running);
+    }
+
+    #[test]
+    fn workflow_context_update_capabilities() {
+        let storage = make_storage();
+        let mut ctx = WorkflowContext::new(
+            storage,
+            1,
+            PaneCapabilities::unknown(),
+            "exec-003",
+        );
+        assert!(!ctx.capabilities().prompt_active);
+
+        ctx.update_capabilities(PaneCapabilities::prompt());
+        assert!(ctx.capabilities().prompt_active);
+    }
+
+    #[test]
+    fn workflow_context_with_trigger() {
+        let storage = make_storage();
+        let ctx = WorkflowContext::new(
+            storage,
+            1,
+            PaneCapabilities::unknown(),
+            "exec-004",
+        )
+        .with_trigger(serde_json::json!({"rule_id": "test.detected"}));
+
+        let trigger = ctx.trigger().unwrap();
+        assert_eq!(trigger["rule_id"], "test.detected");
+    }
+
+    #[test]
+    fn workflow_context_with_config() {
+        let storage = make_storage();
+        let custom_config = WorkflowConfig {
+            default_wait_timeout_ms: 120_000,
+            max_step_retries: 10,
+            retry_delay_ms: 5_000,
+        };
+        let ctx = WorkflowContext::new(
+            storage,
+            1,
+            PaneCapabilities::unknown(),
+            "exec-005",
+        )
+        .with_config(custom_config);
+
+        assert_eq!(ctx.config().default_wait_timeout_ms, 120_000);
+        assert_eq!(ctx.config().max_step_retries, 10);
+        assert_eq!(ctx.config().retry_delay_ms, 5_000);
+        assert_eq!(ctx.default_wait_timeout_ms(), 120_000);
+    }
+
+    #[test]
+    fn workflow_context_pane_meta_set_and_get() {
+        let storage = make_storage();
+        let mut ctx = WorkflowContext::new(
+            storage,
+            1,
+            PaneCapabilities::unknown(),
+            "exec-006",
+        );
+
+        // Default metadata is empty
+        assert!(ctx.pane_meta().domain.is_none());
+
+        ctx.set_pane_meta(PaneMetadata {
+            domain: Some("local".to_string()),
+            title: Some("zsh".to_string()),
+            cwd: Some("/usr/local".to_string()),
+        });
+
+        assert_eq!(ctx.pane_meta().domain.as_deref(), Some("local"));
+        assert_eq!(ctx.pane_meta().title.as_deref(), Some("zsh"));
+        assert_eq!(ctx.pane_meta().cwd.as_deref(), Some("/usr/local"));
+    }
+
+    #[test]
+    fn workflow_context_storage_access() {
+        let storage = make_storage();
+        let expected_path = storage.db_path().to_string();
+        let ctx = WorkflowContext::new(
+            storage,
+            1,
+            PaneCapabilities::unknown(),
+            "exec-007",
+        );
+        assert_eq!(ctx.storage().db_path(), expected_path);
+    }
+
+    #[test]
+    fn workflow_context_clone() {
+        let storage = make_storage();
+        let ctx = WorkflowContext::new(
+            storage,
+            99,
+            PaneCapabilities::alt_screen(),
+            "exec-008",
+        )
+        .with_trigger(serde_json::json!({"key": "value"}));
+
+        let cloned = ctx.clone();
+        assert_eq!(cloned.pane_id(), 99);
+        assert_eq!(cloned.execution_id(), "exec-008");
+        assert!(cloned.trigger().is_some());
+    }
+
+    // ========================================================================
+    // Plan-first execution support tests
+    // ========================================================================
+
+    #[test]
+    fn workflow_context_set_action_plan() {
+        let storage = make_storage();
+        let mut ctx = WorkflowContext::new(
+            storage,
+            1,
+            PaneCapabilities::unknown(),
+            "exec-009",
+        );
+
+        assert!(!ctx.has_action_plan());
+        assert!(ctx.action_plan().is_none());
+        assert!(ctx.get_step_plan(0).is_none());
+        assert!(ctx.get_step_idempotency_key(0).is_none());
+
+        let plan = crate::plan::ActionPlan::builder("Test Plan", "ws-1")
+            .add_step(crate::plan::StepPlan::new(
+                1,
+                crate::plan::StepAction::Custom {
+                    action_type: "test".to_string(),
+                    payload: serde_json::json!({}),
+                },
+                "Test step",
+            ))
+            .build();
+
+        ctx.set_action_plan(plan);
+
+        assert!(ctx.has_action_plan());
+        assert!(ctx.action_plan().is_some());
+        assert_eq!(ctx.workspace_id(), Some("ws-1"));
+    }
+
+    #[test]
+    fn workflow_context_get_step_plan() {
+        let storage = make_storage();
+        let mut ctx = WorkflowContext::new(
+            storage,
+            1,
+            PaneCapabilities::unknown(),
+            "exec-010",
+        );
+
+        let plan = crate::plan::ActionPlan::builder("Plan", "ws-2")
+            .add_step(crate::plan::StepPlan::new(
+                1,
+                crate::plan::StepAction::Custom {
+                    action_type: "step_a".to_string(),
+                    payload: serde_json::json!({}),
+                },
+                "Step A",
+            ))
+            .add_step(crate::plan::StepPlan::new(
+                2,
+                crate::plan::StepAction::Custom {
+                    action_type: "step_b".to_string(),
+                    payload: serde_json::json!({}),
+                },
+                "Step B",
+            ))
+            .build();
+
+        ctx.set_action_plan(plan);
+
+        assert!(ctx.get_step_plan(0).is_some());
+        assert_eq!(ctx.get_step_plan(0).unwrap().description, "Step A");
+        assert!(ctx.get_step_plan(1).is_some());
+        assert_eq!(ctx.get_step_plan(1).unwrap().description, "Step B");
+        assert!(ctx.get_step_plan(2).is_none()); // out of bounds
+    }
+
+    #[test]
+    fn workflow_context_get_step_idempotency_key() {
+        let storage = make_storage();
+        let mut ctx = WorkflowContext::new(
+            storage,
+            1,
+            PaneCapabilities::unknown(),
+            "exec-011",
+        );
+
+        let plan = crate::plan::ActionPlan::builder("Plan", "ws-3")
+            .add_step(crate::plan::StepPlan::new(
+                1,
+                crate::plan::StepAction::Custom {
+                    action_type: "test".to_string(),
+                    payload: serde_json::json!({}),
+                },
+                "Test",
+            ))
+            .build();
+
+        ctx.set_action_plan(plan);
+
+        let key = ctx.get_step_idempotency_key(0).unwrap();
+        assert!(key.0.starts_with("step:"));
+        assert!(ctx.get_step_idempotency_key(1).is_none());
+    }
+}
