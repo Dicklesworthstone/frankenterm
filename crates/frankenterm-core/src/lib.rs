@@ -118,6 +118,7 @@ pub mod cooldown_tracker;
 pub mod cost_tracker;
 pub mod count_min_sketch;
 pub mod cpu_pressure;
+pub mod dashboard;
 pub mod crash;
 pub mod crdt;
 pub mod cross_pane_correlation;
