@@ -617,7 +617,7 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 /// column for narrow terminals (< 60 columns).
 fn render_dashboard_panels(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
     // Outer block with health-colored title
-    let health_style: Style = model.health_style.clone().into();
+    let health_style: Style = model.health_style.into();
     let title_spans = Line::from(vec![
         Span::styled("Dashboard", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" "),
@@ -694,7 +694,7 @@ fn render_cost_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
 
     // Cost rows
     for row in &model.cost_rows {
-        let budget_style: Style = row.budget_style.clone().into();
+        let budget_style: Style = row.budget_style.into();
         lines.push(Line::from(vec![
             Span::raw(format!("{:<12} ", row.agent_type)),
             Span::styled(format!("{:>10} ", row.cost_label), Style::default().fg(Color::Green)),
@@ -717,7 +717,7 @@ fn render_cost_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
 
     // Alerts (if any)
     for alert in &model.alert_rows {
-        let alert_style: Style = alert.style.clone().into();
+        let alert_style: Style = alert.style.into();
         lines.push(Line::from(vec![
             Span::styled("  ! ", alert_style),
             Span::styled(&alert.message, alert_style),
@@ -744,7 +744,7 @@ fn render_rate_limit_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer)
         )));
     } else {
         for row in &model.rate_limit_rows {
-            let status_style: Style = row.status_style.clone().into();
+            let status_style: Style = row.status_style.into();
             lines.push(Line::from(vec![
                 Span::raw(format!("{:<12} ", row.agent_type)),
                 Span::styled(format!("{:<14} ", row.status_label), status_style),
@@ -760,7 +760,7 @@ fn render_rate_limit_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer)
 
 /// Render backpressure panel: tier, queue depths, paused panes.
 fn render_backpressure_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
-    let bp_style: Style = model.bp_tier_style.clone().into();
+    let bp_style: Style = model.bp_tier_style.into();
     let title_spans = Line::from(vec![
         Span::raw("Backpressure "),
         Span::styled(&model.bp_tier_label, bp_style),
@@ -794,7 +794,7 @@ fn render_quota_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let block_style: Style = model.quota_block_rate_style.clone().into();
+    let block_style: Style = model.quota_block_rate_style.into();
 
     let lines = vec![
         Line::from(vec![

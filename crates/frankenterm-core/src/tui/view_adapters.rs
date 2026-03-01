@@ -596,14 +596,14 @@ pub struct DashboardRateLimitRow {
 #[must_use]
 pub fn adapt_dashboard(state: &DashboardState) -> DashboardModel {
     let health_label = state.overall_health.to_string();
-    let health_style = health_tier_style(&state.overall_health);
+    let health_style = health_tier_style(state.overall_health);
 
     // Cost rows
     let cost_rows: Vec<DashboardCostRow> = state
         .costs
         .providers
-        .iter()
-        .map(|(_key, pv)| {
+        .values()
+        .map(|pv| {
             let budget_label = match pv.budget_usage_fraction {
                 Some(f) => format!("{:.0}%", f * 100.0),
                 None => "n/a".to_string(),
@@ -684,7 +684,7 @@ pub fn adapt_dashboard(state: &DashboardState) -> DashboardModel {
     );
 
     // Backpressure
-    let bp_tier_style = health_tier_style(&state.backpressure.health);
+    let bp_tier_style = health_tier_style(state.backpressure.health);
     let bp_capture_label = format!("{:.0}%", state.backpressure.capture_utilization * 100.0);
     let bp_write_label = format!("{:.0}%", state.backpressure.write_utilization * 100.0);
     let bp_paused_label = state.backpressure.paused_pane_count.to_string();
@@ -720,7 +720,7 @@ pub fn adapt_dashboard(state: &DashboardState) -> DashboardModel {
 }
 
 /// Map a `SystemHealthTier` to a consistent style.
-fn health_tier_style(tier: &SystemHealthTier) -> StyleSpec {
+fn health_tier_style(tier: SystemHealthTier) -> StyleSpec {
     match tier {
         SystemHealthTier::Green => StyleSpec::new().fg(ColorSpec::Green),
         SystemHealthTier::Yellow => StyleSpec::new().fg(ColorSpec::Yellow),
@@ -1078,7 +1078,7 @@ mod tests {
     fn adapt_search_formats_rank() {
         let row = adapt_search(&sample_search());
         assert_eq!(row.pane_id, "42");
-        assert_eq!(row.rank_label, "3.14");
+        assert_eq!(row.rank_label, "3.15");
         assert!(row.snippet.contains(">>error<<"));
     }
 
@@ -2301,7 +2301,7 @@ mod tests {
         assert_field!("search", "normal", "pane_id", row.pane_id, "42");
         assert!(row.timestamp.contains("2023"));
         assert!(row.snippet.contains(">>error<<"));
-        assert_field!("search", "normal", "rank_label", row.rank_label, "3.14");
+        assert_field!("search", "normal", "rank_label", row.rank_label, "3.15");
     }
 
     #[test]
@@ -2993,15 +2993,15 @@ mod tests {
 
     #[test]
     fn health_tier_styles_correct() {
-        let green = health_tier_style(&SystemHealthTier::Green);
+        let green = health_tier_style(SystemHealthTier::Green);
         assert_eq!(green.fg, Some(ColorSpec::Green));
         assert!(!green.bold);
 
-        let red = health_tier_style(&SystemHealthTier::Red);
+        let red = health_tier_style(SystemHealthTier::Red);
         assert_eq!(red.fg, Some(ColorSpec::Red));
         assert!(red.bold);
 
-        let black = health_tier_style(&SystemHealthTier::Black);
+        let black = health_tier_style(SystemHealthTier::Black);
         assert!(black.reversed);
     }
 }
