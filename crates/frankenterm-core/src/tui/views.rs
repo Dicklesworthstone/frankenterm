@@ -17,6 +17,7 @@ use super::query::{
     SavedSearchView, SearchResultView, TriageItemView, WorkflowProgressView,
 };
 use crate::circuit_breaker::CircuitStateKind;
+use super::view_adapters::{adapt_dashboard, DashboardModel};
 
 /// Available views in the TUI
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -397,16 +398,31 @@ fn aggregate_health_indicator(health: &HealthStatus) -> (&'static str, Style) {
 
 /// Render the home/dashboard view
 pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Title + aggregate health
-            Constraint::Length(9), // Health status detail
-            Constraint::Length(7), // Metrics snapshot
-            Constraint::Min(3),    // Quick help
-            Constraint::Length(3), // Footer
-        ])
-        .split(area);
+    let has_dashboard = state.dashboard.is_some();
+    let chunks = if has_dashboard {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),  // Title + aggregate health
+                Constraint::Length(9),  // Health status detail
+                Constraint::Length(7),  // Metrics snapshot
+                Constraint::Min(10),   // Dashboard panels
+                Constraint::Length(3),  // Quick help
+                Constraint::Length(3),  // Footer
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Title + aggregate health
+                Constraint::Length(9), // Health status detail
+                Constraint::Length(7), // Metrics snapshot
+                Constraint::Min(3),    // Quick help
+                Constraint::Length(3), // Footer
+            ])
+            .split(area)
+    };
 
     // Title + aggregate status
     let (aggregate_label, aggregate_style) = state.health.as_ref().map_or_else(
@@ -565,7 +581,14 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         Paragraph::new(metrics_text).block(Block::default().title("Metrics").borders(Borders::ALL));
     metrics_block.render(chunks[2], buf);
 
-    // Quick help
+    // Dashboard panels (when available)
+    if let Some(ref dashboard_state) = state.dashboard {
+        let model = adapt_dashboard(dashboard_state);
+        render_dashboard_panels(&model, chunks[3], buf);
+    }
+
+    // Quick help — index shifts when dashboard is present
+    let help_idx = if has_dashboard { 4 } else { 3 };
     let instructions = Paragraph::new(vec![
         Line::from(Span::styled(
             "Navigation:",
@@ -574,17 +597,221 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         Line::from("  Tab / Shift+Tab: Switch views   q: Quit   r: Refresh   ?: Help"),
     ])
     .block(Block::default().title("Quick Help").borders(Borders::ALL));
-    instructions.render(chunks[3], buf);
+    instructions.render(chunks[help_idx], buf);
 
     // Footer with error if any
+    let footer_idx = if has_dashboard { 5 } else { 4 };
     if let Some(ref error) = state.error_message {
         let error_widget = Paragraph::new(Span::styled(
             error.as_str(),
             Style::default().fg(Color::Red),
         ))
         .block(Block::default().borders(Borders::TOP));
-        error_widget.render(chunks[4], buf);
+        error_widget.render(chunks[footer_idx], buf);
     }
+}
+
+/// Render the unified dashboard panels (cost, rate limits, backpressure, quota).
+///
+/// Arranges panels in a 2x2 grid when space permits, or falls back to a single
+/// column for narrow terminals (< 60 columns).
+fn render_dashboard_panels(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
+    // Outer block with health-colored title
+    let health_style: Style = model.health_style.clone().into();
+    let title_spans = Line::from(vec![
+        Span::styled("Dashboard", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(&model.health_label, health_style),
+    ]);
+    let outer = Block::default().title(title_spans).borders(Borders::ALL);
+    let inner = outer.inner(area);
+    outer.render(area, buf);
+
+    if inner.height < 2 || inner.width < 20 {
+        // Terminal too small — show summary line only.
+        let summary =
+            Paragraph::new(Span::raw(&model.summary_line)).block(Block::default().borders(Borders::NONE));
+        summary.render(inner, buf);
+        return;
+    }
+
+    // 2x2 grid layout when wide enough, else vertical stack.
+    let use_grid = inner.width >= 60;
+
+    if use_grid {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner);
+        let top_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[0]);
+        let bot_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[1]);
+
+        render_cost_panel(model, top_cols[0], buf);
+        render_rate_limit_panel(model, top_cols[1], buf);
+        render_backpressure_panel(model, bot_cols[0], buf);
+        render_quota_panel(model, bot_cols[1], buf);
+    } else {
+        let panels = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(30),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(20),
+            ])
+            .split(inner);
+
+        render_cost_panel(model, panels[0], buf);
+        render_rate_limit_panel(model, panels[1], buf);
+        render_backpressure_panel(model, panels[2], buf);
+        render_quota_panel(model, panels[3], buf);
+    }
+}
+
+/// Render cost tracker panel: per-provider cost rows + totals + alerts.
+fn render_cost_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
+    let block = Block::default().title("Cost Tracker").borders(Borders::ALL);
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    // Header
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{:<12} {:>10} {:>12} {:>6}", "Provider", "Cost", "Tokens", "Budget"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Cost rows
+    for row in &model.cost_rows {
+        let budget_style: Style = row.budget_style.clone().into();
+        lines.push(Line::from(vec![
+            Span::raw(format!("{:<12} ", row.agent_type)),
+            Span::styled(format!("{:>10} ", row.cost_label), Style::default().fg(Color::Green)),
+            Span::raw(format!("{:>12} ", row.tokens_label)),
+            Span::styled(format!("{:>6}", row.budget_label), budget_style),
+        ]));
+    }
+
+    // Totals
+    lines.push(Line::from(vec![
+        Span::styled("Total:       ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:>10} ", model.total_cost_label),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("{:>12}", model.total_tokens_label), Style::default().add_modifier(Modifier::BOLD)),
+    ]));
+
+    // Alerts (if any)
+    for alert in &model.alert_rows {
+        let alert_style: Style = alert.style.clone().into();
+        lines.push(Line::from(vec![
+            Span::styled("  ! ", alert_style),
+            Span::styled(&alert.message, alert_style),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
+    paragraph.render(inner, buf);
+}
+
+/// Render rate limit panel: per-provider rate limit status.
+fn render_rate_limit_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
+    let title = format!("Rate Limits ({})", model.limited_provider_label);
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    if model.rate_limit_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No rate limit data",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for row in &model.rate_limit_rows {
+            let status_style: Style = row.status_style.clone().into();
+            lines.push(Line::from(vec![
+                Span::raw(format!("{:<12} ", row.agent_type)),
+                Span::styled(format!("{:<14} ", row.status_label), status_style),
+                Span::raw(format!("{} ", row.limited_label)),
+                Span::styled(&row.clear_label, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
+    paragraph.render(inner, buf);
+}
+
+/// Render backpressure panel: tier, queue depths, paused panes.
+fn render_backpressure_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
+    let bp_style: Style = model.bp_tier_style.clone().into();
+    let title_spans = Line::from(vec![
+        Span::raw("Backpressure "),
+        Span::styled(&model.bp_tier_label, bp_style),
+    ]);
+    let block = Block::default().title(title_spans).borders(Borders::ALL);
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("  Capture queue: "),
+            Span::styled(&model.bp_capture_label, Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Write queue:   "),
+            Span::styled(&model.bp_write_label, Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Paused panes:  "),
+            Span::styled(&model.bp_paused_label, Style::default().fg(Color::Magenta)),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
+    paragraph.render(inner, buf);
+}
+
+/// Render quota gate panel: evaluations and block rate.
+fn render_quota_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
+    let block = Block::default().title("Quota Gate").borders(Borders::ALL);
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let block_style: Style = model.quota_block_rate_style.clone().into();
+
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("  Evaluations: "),
+            Span::styled(
+                &model.quota_evaluations_label,
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  Block rate:  "),
+            Span::styled(&model.quota_block_rate_label, block_style),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
+    paragraph.render(inner, buf);
 }
 
 /// Render the panes list view
@@ -2827,6 +3054,158 @@ mod tests {
         let area = Rect::new(0, 0, 80, 30);
         let mut buf = Buffer::empty(area);
         render_home_view(&state, area, &mut buf);
+    }
+
+    // --- Dashboard panel rendering (ft-3hbv9) ---
+
+    fn make_dashboard_state() -> crate::dashboard::DashboardState {
+        use crate::backpressure::{BackpressureSnapshot, BackpressureTier};
+        use crate::cost_tracker::{
+            AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary, ProviderCostSummary,
+        };
+        use crate::dashboard::DashboardManager;
+        use crate::quota_gate::{QuotaGateSnapshot, QuotaGateTelemetrySnapshot};
+        use crate::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
+
+        let mut mgr = DashboardManager::new();
+        mgr.update_costs(CostDashboardSnapshot {
+            providers: vec![
+                ProviderCostSummary {
+                    agent_type: "codex".to_string(),
+                    total_tokens: 50_000,
+                    total_cost_usd: 25.0,
+                    pane_count: 3,
+                    record_count: 100,
+                },
+                ProviderCostSummary {
+                    agent_type: "claude_code".to_string(),
+                    total_tokens: 80_000,
+                    total_cost_usd: 40.0,
+                    pane_count: 5,
+                    record_count: 200,
+                },
+            ],
+            panes: vec![PaneCostSummary {
+                pane_id: 1,
+                agent_type: "codex".to_string(),
+                total_tokens: 10_000,
+                total_cost_usd: 5.0,
+                record_count: 20,
+                last_updated_ms: 1_700_000_000_000,
+            }],
+            alerts: vec![BudgetAlert {
+                agent_type: "codex".to_string(),
+                current_cost_usd: 25.0,
+                budget_limit_usd: 30.0,
+                usage_fraction: 0.83,
+                severity: AlertSeverity::Warning,
+            }],
+            grand_total_cost_usd: 65.0,
+            grand_total_tokens: 130_000,
+        });
+        mgr.update_rate_limits(vec![ProviderRateLimitSummary {
+            agent_type: "codex".to_string(),
+            status: ProviderRateLimitStatus::PartiallyLimited,
+            limited_pane_count: 2,
+            total_pane_count: 5,
+            earliest_clear_secs: 30,
+            total_events: 3,
+        }]);
+        mgr.update_backpressure(BackpressureSnapshot {
+            tier: BackpressureTier::Yellow,
+            timestamp_epoch_ms: 1_700_000_000_000,
+            capture_depth: 500,
+            capture_capacity: 1000,
+            write_depth: 200,
+            write_capacity: 1000,
+            duration_in_tier_ms: 5000,
+            transitions: 3,
+            paused_panes: vec![1, 2],
+        });
+        mgr.update_quota(QuotaGateSnapshot {
+            telemetry: QuotaGateTelemetrySnapshot {
+                evaluations: 1000,
+                allowed: 800,
+                warned: 150,
+                blocked: 50,
+            },
+        });
+        mgr.snapshot()
+    }
+
+    #[test]
+    fn render_home_view_with_dashboard() {
+        let mut state = ViewState::default();
+        state.health = Some(make_health(true, true, true));
+        state.dashboard = Some(make_dashboard_state());
+        let area = Rect::new(0, 0, 100, 50);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should render without panic, includes dashboard panels
+    }
+
+    #[test]
+    fn render_home_view_with_dashboard_narrow_terminal() {
+        let mut state = ViewState::default();
+        state.health = Some(make_health(true, true, true));
+        state.dashboard = Some(make_dashboard_state());
+        // Narrow terminal: single-column layout for dashboard panels
+        let area = Rect::new(0, 0, 50, 40);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+    }
+
+    #[test]
+    fn render_home_view_with_dashboard_tiny_terminal() {
+        let mut state = ViewState::default();
+        state.health = Some(make_health(true, true, true));
+        state.dashboard = Some(make_dashboard_state());
+        // Very small terminal: falls back to summary line
+        let area = Rect::new(0, 0, 30, 25);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+    }
+
+    #[test]
+    fn render_dashboard_panels_directly() {
+        let ds = make_dashboard_state();
+        let model = adapt_dashboard(&ds);
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buf = Buffer::empty(area);
+        render_dashboard_panels(&model, area, &mut buf);
+        // Should render 2x2 grid at 100 columns
+    }
+
+    #[test]
+    fn render_dashboard_panels_narrow() {
+        let ds = make_dashboard_state();
+        let model = adapt_dashboard(&ds);
+        let area = Rect::new(0, 0, 50, 20);
+        let mut buf = Buffer::empty(area);
+        render_dashboard_panels(&model, area, &mut buf);
+        // Should fall back to vertical stack at 50 columns
+    }
+
+    #[test]
+    fn render_dashboard_panels_minimal() {
+        let ds = make_dashboard_state();
+        let model = adapt_dashboard(&ds);
+        // Extremely small area: summary-only fallback
+        let area = Rect::new(0, 0, 25, 4);
+        let mut buf = Buffer::empty(area);
+        render_dashboard_panels(&model, area, &mut buf);
+    }
+
+    #[test]
+    fn render_home_view_dashboard_with_error() {
+        let mut state = ViewState::default();
+        state.health = Some(make_health(true, true, true));
+        state.dashboard = Some(make_dashboard_state());
+        state.set_error("Connection lost");
+        let area = Rect::new(0, 0, 100, 50);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&state, area, &mut buf);
+        // Should render dashboard panels AND error footer
     }
 
     // --- Small terminal size rendering ---
