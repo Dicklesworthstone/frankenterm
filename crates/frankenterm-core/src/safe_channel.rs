@@ -1223,13 +1223,18 @@ mod tests {
             let committed = Arc::clone(&committed);
             let drop_count = Arc::clone(&drop_count);
             consumers.push(thread::spawn(move || {
+                let mut local_drops = 0u32;
                 loop {
                     match rx.reserve() {
                         Ok(res) => {
-                            // Every 3rd item from thread 0 and 1: drop (rollback)
-                            if t < 2 && *res.peek() % 3 == 0 {
+                            // Threads 0/1 drop every 3rd item, but only up to
+                            // a bounded number of times to avoid livelock when
+                            // push_front keeps recycling the same items.
+                            if t < 2 && *res.peek() % 3 == 0 && local_drops < 50 {
+                                local_drops += 1;
                                 drop_count.fetch_add(1, Ordering::Relaxed);
                                 drop(res); // auto-rollback
+                                thread::yield_now();
                             } else {
                                 let val = res.commit();
                                 committed.lock().unwrap().push(val);
