@@ -1501,7 +1501,7 @@ mod test {
     #[test]
     fn bitfield_invalid_enum_values_fall_back_to_defaults() {
         let mut a = CellAttributes::blank();
-        a.attributes = (3 << 0) | (6 << 2) | (3 << 5) | (3 << 13) | (3 << 15);
+        a.attributes = 3 | (6 << 2) | (3 << 5) | (3 << 13) | (3 << 15);
 
         assert_eq!(a.intensity(), Intensity::Normal);
         assert_eq!(a.underline(), Underline::None);

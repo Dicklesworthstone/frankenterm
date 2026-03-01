@@ -70,9 +70,7 @@ fn tmux_title_exceeding_cap_is_discarded() {
     let mut seq = vec![0x1Bu8, b'k'];
 
     // Push 9000 bytes of printable characters (exceeds 8192 cap)
-    for _ in 0..9000 {
-        seq.push(b'A');
-    }
+    seq.resize(seq.len() + 9000, b'A');
 
     // String Terminator: ESC backslash
     seq.push(0x1B);
@@ -99,9 +97,7 @@ fn terminal_recovers_after_overlong_title_discard() {
 
     // First: send an overlong title that exceeds the cap
     let mut overlong = vec![0x1Bu8, b'k'];
-    for _ in 0..9000 {
-        overlong.push(b'X');
-    }
+    overlong.resize(overlong.len() + 9000, b'X');
     overlong.push(0x1B);
     overlong.push(b'\\');
     term.advance_bytes(&overlong);
