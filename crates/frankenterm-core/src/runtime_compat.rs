@@ -122,6 +122,31 @@ use std::ops::{Deref, DerefMut};
 #[cfg(feature = "asupersync-runtime")]
 use std::sync::Arc;
 
+// Thread-local storage for the asupersync `RuntimeHandle`, installed by
+// `Runtime::block_on` and consumed by `task::spawn` to provide ambient
+// runtime context (analogous to tokio's internal CONTEXT thread-local).
+#[cfg(feature = "asupersync-runtime")]
+thread_local! {
+    static ASUPERSYNC_HANDLE: std::cell::RefCell<Option<asupersync::runtime::RuntimeHandle>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install an asupersync `RuntimeHandle` into thread-local storage for
+/// ambient `task::spawn` access.
+///
+/// The `runtime_compat::Runtime::block_on` wrapper calls this automatically.
+/// Test fixtures using the raw asupersync runtime should call this manually.
+#[cfg(feature = "asupersync-runtime")]
+pub fn install_runtime_handle(handle: asupersync::runtime::RuntimeHandle) {
+    ASUPERSYNC_HANDLE.with(|cell| cell.replace(Some(handle)));
+}
+
+/// Remove the asupersync `RuntimeHandle` from thread-local storage.
+#[cfg(feature = "asupersync-runtime")]
+pub fn clear_runtime_handle() {
+    ASUPERSYNC_HANDLE.with(|cell| cell.replace(None));
+}
+
 #[cfg(feature = "asupersync-runtime")]
 #[derive(Debug)]
 pub struct Mutex<T> {
@@ -455,8 +480,10 @@ pub mod notify {
 
 /// Task primitives used during runtime migration.
 ///
-/// Note: this remains tokio-backed while call sites are normalized through
-/// `runtime_compat`.
+/// When `asupersync-runtime` is enabled, spawns on the asupersync runtime
+/// via the thread-local handle installed by `Runtime::block_on`. Otherwise,
+/// delegates to tokio.
+#[cfg(not(feature = "asupersync-runtime"))]
 pub mod task {
     pub use tokio::task::{JoinError, JoinHandle, JoinSet};
 
@@ -486,6 +513,185 @@ pub mod task {
     /// Yields execution back to the runtime, allowing other tasks to progress.
     pub async fn yield_now() {
         tokio::task::yield_now().await;
+    }
+}
+
+/// Task primitives for the asupersync runtime backend.
+///
+/// Provides API-compatible wrappers around asupersync's spawn/join
+/// infrastructure, using the thread-local `ASUPERSYNC_HANDLE` installed
+/// by `Runtime::block_on` to support ambient spawning.
+#[cfg(feature = "asupersync-runtime")]
+pub mod task {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Error type returned when a spawned task fails.
+    ///
+    /// Wraps asupersync's join error to provide a compatible API surface.
+    #[derive(Debug)]
+    pub struct JoinError {
+        msg: String,
+    }
+
+    impl std::fmt::Display for JoinError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "JoinError: {}", self.msg)
+        }
+    }
+
+    impl std::error::Error for JoinError {}
+
+    /// Handle to a spawned task. Awaiting it yields the task's output
+    /// wrapped in `Result<T, JoinError>` for API compatibility with tokio.
+    ///
+    /// Uses `Pin<Box<_>>` internally to avoid unsafe pin projection while
+    /// maintaining `#![forbid(unsafe_code)]` compliance.
+    pub struct JoinHandle<T> {
+        inner: Pin<Box<asupersync::runtime::JoinHandle<T>>>,
+    }
+
+    impl<T> Future for JoinHandle<T> {
+        type Output = Result<T, JoinError>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            match self.inner.as_mut().poll(cx) {
+                Poll::Ready(value) => Poll::Ready(Ok(value)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl<T> JoinHandle<T> {
+        /// Returns `true` if the task has completed.
+        pub fn is_finished(&self) -> bool {
+            // is_finished is available on the inner JoinHandle via deref
+            // through Pin<Box<_>>
+            self.inner.is_finished()
+        }
+
+        /// Request cancellation of the task.
+        ///
+        /// Note: asupersync uses context-based cancellation; this is a
+        /// best-effort no-op provided for API compatibility with tokio.
+        pub fn abort(&self) {
+            // asupersync JoinHandle does not support abort; cancellation
+            // is driven through Cx. This is a no-op for compatibility.
+        }
+    }
+
+    /// Minimal JoinSet implementation backed by a Vec of JoinHandles.
+    ///
+    /// Provides the subset of tokio::task::JoinSet API used in frankenterm.
+    pub struct JoinSet<T> {
+        handles: Vec<JoinHandle<T>>,
+    }
+
+    impl<T: Send + 'static> JoinSet<T> {
+        pub fn new() -> Self {
+            Self {
+                handles: Vec::new(),
+            }
+        }
+
+        pub fn spawn<F>(&mut self, future: F)
+        where
+            F: Future<Output = T> + Send + 'static,
+        {
+            self.handles.push(super::task::spawn(future));
+        }
+
+        pub fn len(&self) -> usize {
+            self.handles.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.handles.is_empty()
+        }
+
+        /// Await the next completed task. Returns `None` if the set is empty.
+        pub async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
+            if self.handles.is_empty() {
+                return None;
+            }
+            // Simple approach: await the last handle (LIFO)
+            let handle = self.handles.pop().unwrap();
+            Some(handle.await)
+        }
+
+        /// Non-blocking poll for the next completed task.
+        ///
+        /// Checks if any handle is finished and returns its result.
+        /// Returns `None` if the set is empty or no task has completed.
+        pub fn try_join_next(&mut self) -> Option<Result<T, JoinError>> {
+            // Find the first finished handle
+            let pos = self.handles.iter().position(|h| h.is_finished());
+            if let Some(idx) = pos {
+                let handle = self.handles.swap_remove(idx);
+                // Task is finished, so we can poll it synchronously via a noop waker
+                let waker = futures::task::noop_waker();
+                let mut cx = std::task::Context::from_waker(&waker);
+                let mut pinned = std::pin::pin!(handle);
+                match pinned.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(result) => Some(result),
+                    std::task::Poll::Pending => None, // shouldn't happen for finished task
+                }
+            } else {
+                None
+            }
+        }
+
+        /// Cancel all tasks in the set.
+        ///
+        /// Under asupersync, abort is a no-op (context-based cancellation).
+        /// This clears the handle set to release resources.
+        pub fn abort_all(&mut self) {
+            // asupersync doesn't support handle-based abort.
+            // Best effort: drop all handles (tasks continue to completion).
+            self.handles.clear();
+        }
+    }
+
+    /// Spawn a future on the current asupersync runtime.
+    ///
+    /// Uses the thread-local `ASUPERSYNC_HANDLE` installed by
+    /// `Runtime::block_on`. Panics if called outside a runtime context.
+    pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let inner = super::ASUPERSYNC_HANDLE.with(|cell| {
+            let borrow = cell.borrow();
+            let handle = borrow
+                .as_ref()
+                .expect("task::spawn called outside of Runtime::block_on context");
+            handle.spawn(future)
+        });
+        JoinHandle {
+            inner: Box::pin(inner),
+        }
+    }
+
+    /// Spawns blocking work on the runtime's blocking thread pool.
+    ///
+    /// Returns a `JoinHandle` for API compatibility. Under asupersync,
+    /// this delegates to `asupersync::runtime::spawn_blocking`.
+    pub fn spawn_blocking<F, T>(f: F) -> JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        // For spawn_blocking we need to wrap it differently since
+        // asupersync's spawn_blocking is async and returns T directly.
+        // We spawn a task that calls spawn_blocking internally.
+        spawn(async move { asupersync::runtime::spawn_blocking(f).await })
+    }
+
+    /// Yields execution back to the runtime, allowing other tasks to progress.
+    pub async fn yield_now() {
+        asupersync::runtime::yield_now().await;
     }
 }
 
@@ -735,7 +941,14 @@ impl CompatRuntime for Runtime {
     where
         F: Future,
     {
-        self.inner.block_on(future)
+        // Install the RuntimeHandle into thread-local storage so that
+        // task::spawn can find it without requiring callers to pass it
+        // explicitly. This mirrors tokio's ambient runtime context.
+        let handle = self.inner.handle();
+        ASUPERSYNC_HANDLE.with(|cell| cell.replace(Some(handle)));
+        let result = self.inner.block_on(future);
+        ASUPERSYNC_HANDLE.with(|cell| cell.replace(None));
+        result
     }
 
     fn spawn_detached<F>(&self, future: F)
@@ -962,6 +1175,35 @@ pub async fn mpsc_send<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::Se
     #[cfg(not(feature = "asupersync-runtime"))]
     {
         tx.send(value).await
+    }
+}
+
+/// Checks whether a watch receiver has observed a new value.
+///
+/// Returns `false` if the channel has closed.
+pub fn watch_has_changed<T>(rx: &watch::Receiver<T>) -> bool {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        rx.has_changed()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        rx.has_changed().unwrap_or(false)
+    }
+}
+
+/// Borrows the latest watch value and clones it while marking the update as
+/// consumed where required by the active runtime backend.
+pub fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        rx.borrow_and_clone()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        rx.borrow_and_update().clone()
     }
 }
 
@@ -1301,6 +1543,31 @@ mod tests {
         let (tx, rx) = watch::channel(0);
         tx.send(99).expect("send");
         assert_eq!(*rx.borrow(), 99);
+    }
+
+    #[tokio::test]
+    async fn watch_has_changed_detects_new_value() {
+        let (tx, mut rx) = watch::channel(0u32);
+        assert!(!watch_has_changed(&rx));
+        tx.send(5).expect("send");
+        assert!(watch_has_changed(&rx));
+        let latest = watch_borrow_and_update_clone(&mut rx);
+        assert_eq!(latest, 5);
+    }
+
+    #[tokio::test]
+    async fn watch_has_changed_handles_closed_channel() {
+        let (tx, rx) = watch::channel(42u32);
+        drop(tx);
+        assert!(!watch_has_changed(&rx));
+    }
+
+    #[tokio::test]
+    async fn watch_borrow_and_update_clone_returns_latest_value() {
+        let (tx, mut rx) = watch::channel(vec![1u8, 2u8]);
+        tx.send(vec![3u8, 4u8]).expect("send");
+        let latest = watch_borrow_and_update_clone(&mut rx);
+        assert_eq!(latest, vec![3u8, 4u8]);
     }
 
     // ========================================================================

@@ -328,11 +328,17 @@ impl RuntimeFixture {
     }
 
     /// Run an async test within this runtime.
+    ///
+    /// Installs the runtime handle into thread-local storage so that
+    /// `runtime_compat::task::spawn` can find the asupersync runtime.
     pub fn block_on<F, T>(&self, future: F) -> T
     where
         F: std::future::Future<Output = T>,
     {
-        self.runtime.block_on(future)
+        frankenterm_core::runtime_compat::install_runtime_handle(self.runtime.handle());
+        let result = self.runtime.block_on(future);
+        frankenterm_core::runtime_compat::clear_runtime_handle();
+        result
     }
 
     /// Get the runtime handle for spawning tasks.
