@@ -68,7 +68,7 @@ export CARGO_TARGET_DIR
 log_event "preflight" "startup" "cargo_target=$CARGO_TARGET_DIR" "ready"
 
 # ── Test matrix ────────────────────────────────────────────────────────────
-TOTAL_STEPS=7
+TOTAL_STEPS=8
 PASSED=0
 FAILED=0
 
@@ -166,6 +166,20 @@ if $CARGO_CMD test -p frankenterm-core --test proptest_dashboard 2>&1 | tee "$TE
 else
     log_event "proptest" "failure_injection_path" "dashboard_proptests" "fail" "proptest_failure" "TEST-E006"
     echo "  ✗ Property tests FAILED"
+    FAILED=$((FAILED + 1))
+fi
+
+# ── Step 8: dashboard adapter property tests (requires tui/ftui feature) ──
+echo "[8/$TOTAL_STEPS] Running dashboard adapter property tests..."
+TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_adapter_proptest.log"
+if $CARGO_CMD test -p frankenterm-core --test proptest_dashboard_adapter 2>&1 | tee "$TEST_OUTPUT"; then
+    test_count=$(grep "test result:" "$TEST_OUTPUT" | head -1 | grep -o '[0-9]* passed' || echo "? passed")
+    log_event "proptest" "nominal_path" "dashboard_adapter_proptests" "pass" "tests=$test_count"
+    echo "  ✓ Adapter property tests passed"
+    PASSED=$((PASSED + 1))
+else
+    log_event "proptest" "failure_injection_path" "dashboard_adapter_proptests" "fail" "proptest_failure" "TEST-E007"
+    echo "  ✗ Adapter property tests FAILED"
     FAILED=$((FAILED + 1))
 fi
 
