@@ -2,6 +2,7 @@
 //!
 //! Middleware/state extraction from `web.rs` while preserving behavior.
 
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 #[derive(Debug, Clone, Copy)]

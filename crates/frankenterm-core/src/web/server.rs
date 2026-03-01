@@ -2,6 +2,7 @@
 //!
 //! Extracted from `web.rs` as part of Wave 4B migration (ft-1zej2).
 
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 /// Start the web server and return a handle for shutdown.

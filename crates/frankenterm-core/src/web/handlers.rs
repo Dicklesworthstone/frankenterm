@@ -3,6 +3,7 @@
 //! These handlers are extracted from `web.rs` in a strangler-fig migration to
 //! keep behavior stable while reducing monolith size.
 
+#[allow(clippy::wildcard_imports)]
 use super::*;
 use serde::Serialize;
 

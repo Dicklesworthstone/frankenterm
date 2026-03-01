@@ -3,6 +3,7 @@
 //! This is the first strangler-fig extraction from `web.rs`, keeping
 //! behavior identical while moving route wiring into `web/` modules.
 
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 pub(super) fn build_app(storage: Option<StorageHandle>, event_bus: Option<Arc<EventBus>>) -> App {

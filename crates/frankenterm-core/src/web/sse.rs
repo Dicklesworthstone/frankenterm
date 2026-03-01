@@ -1,5 +1,6 @@
 //! Server-Sent Events endpoint surface for Wave 4B migration.
 
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
