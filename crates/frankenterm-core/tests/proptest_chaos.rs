@@ -666,9 +666,15 @@ fn init_global_returns_arc() {
 }
 
 #[test]
-fn global_returns_none_after_reset() {
+fn global_cleared_after_reset() {
     FaultInjector::reset_global();
-    assert!(FaultInjector::global().is_none());
+    // After reset, either the global was never initialized (None)
+    // or it was initialized but all faults have been cleared.
+    // OnceLock doesn't support removal, so reset only clears faults.
+    match FaultInjector::global() {
+        None => {} // never initialized in this test run — fine
+        Some(inj) => assert_eq!(inj.total_fired(), 0, "expected cleared injector after reset"),
+    }
 }
 
 #[test]
