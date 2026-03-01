@@ -41,9 +41,10 @@ use super::ftui_compat::{Area, InputEvent, RenderSurface, ScreenMode};
 ///
 /// Used to enforce valid state transitions and prevent double-enter or
 /// use-after-leave bugs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionPhase {
     /// Session not yet entered or already left.
+    #[default]
     Idle,
     /// Terminal acquired: raw mode on, rendering active.
     Active,
@@ -462,12 +463,6 @@ pub struct MockTerminalSession {
     pub draw_count: usize,
     /// Events to return from poll_event (drained in order).
     pub pending_events: Vec<InputEvent>,
-}
-
-impl Default for SessionPhase {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl MockTerminalSession {

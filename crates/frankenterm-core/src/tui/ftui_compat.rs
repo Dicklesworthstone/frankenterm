@@ -512,12 +512,13 @@ impl<'a> RatatuiSurface<'a> {
 ///
 /// # Deletion criterion
 /// Remove when views use `ftui::ScreenMode` directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScreenMode {
     /// Full-screen alternate screen. Standard TUI mode.
     ///
     /// - Scrollback hidden while active, restored on exit.
     /// - Best for: interactive dashboards, multi-view navigation.
+    #[default]
     AltScreen,
 
     /// Inline mode with fixed UI height.
@@ -539,12 +540,6 @@ pub enum ScreenMode {
         /// Maximum UI height in rows.
         max_height: u16,
     },
-}
-
-impl Default for ScreenMode {
-    fn default() -> Self {
-        Self::AltScreen
-    }
 }
 
 impl ScreenMode {

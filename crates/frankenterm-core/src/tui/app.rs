@@ -1459,7 +1459,7 @@ mod tests {
 
     #[test]
     fn search_saved_shortcuts_cycle_and_queue_actions() {
-        let mut app = App::new(SearchQueryClient, AppConfig::default());
+        let mut app = App::new(TestQueryClient, AppConfig::default());
         app.refresh_data();
         assert_eq!(app.view_state.saved_searches.len(), 3);
         assert_eq!(app.view_state.saved_search_selected_index, 0);
