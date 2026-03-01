@@ -603,20 +603,20 @@ pub fn adapt_dashboard(state: &DashboardState) -> DashboardModel {
         .costs
         .providers
         .iter()
-        .map(|p| {
-            let budget_label = match p.budget_usage_fraction {
+        .map(|(_key, pv)| {
+            let budget_label = match pv.budget_usage_fraction {
                 Some(f) => format!("{:.0}%", f * 100.0),
                 None => "n/a".to_string(),
             };
-            let budget_style = match p.budget_usage_fraction {
+            let budget_style = match pv.budget_usage_fraction {
                 Some(f) if f >= 1.0 => StyleSpec::new().fg(ColorSpec::Red).bold(),
                 Some(f) if f >= 0.8 => StyleSpec::new().fg(ColorSpec::Yellow),
                 _ => StyleSpec::new().fg(ColorSpec::DarkGray),
             };
             DashboardCostRow {
-                agent_type: p.agent_type.clone(),
-                cost_label: format!("${:.2}", p.cost_usd),
-                tokens_label: format_tokens(p.tokens),
+                agent_type: pv.agent_type.clone(),
+                cost_label: format!("${:.2}", pv.cost_usd),
+                tokens_label: format_tokens(pv.tokens),
                 budget_label,
                 budget_style,
             }

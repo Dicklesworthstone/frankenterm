@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "asupersync-runtime")]
+use crate::cx::{self, Cx};
 use crate::runtime_compat::{Mutex, Semaphore, TryAcquireError};
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +127,29 @@ impl<C: Send + 'static> Pool<C> {
     /// available, or `Err` if no slots are free. If `result.conn` is `None`,
     /// the caller should create a new connection.
     pub async fn try_acquire(&self) -> Result<PoolAcquireResult<C>, PoolError> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = cx::for_testing();
+            return self.try_acquire_with_cx(&cx).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            self.try_acquire_inner().await
+        }
+    }
+
+    /// Try to acquire a connection using an explicit capability context.
+    ///
+    /// This is the migration-safe entry point for call paths that already
+    /// thread `Cx` explicitly.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn try_acquire_with_cx(&self, cx: &Cx) -> Result<PoolAcquireResult<C>, PoolError> {
+        cx::with_cx(cx, |_| ());
+        self.try_acquire_inner().await
+    }
+
+    /// Inner implementation shared by both cx and non-cx paths.
+    async fn try_acquire_inner(&self) -> Result<PoolAcquireResult<C>, PoolError> {
         match self.semaphore.clone().try_acquire_owned() {
             Ok(permit) => {
                 let conn = {
@@ -148,12 +173,62 @@ impl<C: Send + 'static> Pool<C> {
     /// Returns an idle connection if available, or `None` as the connection
     /// value if the caller needs to create a fresh one (a permit is still held).
     pub async fn acquire(&self) -> Result<PoolAcquireResult<C>, PoolError> {
-        let permit = match crate::runtime_compat::timeout(
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = cx::for_testing();
+            return self.acquire_with_cx(&cx).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            self.acquire_inner().await
+        }
+    }
+
+    /// Acquire a connection using an explicit capability context.
+    ///
+    /// This preserves existing timeout behavior while allowing upstream
+    /// call graphs to carry `Cx` explicitly.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn acquire_with_cx(&self, cx: &Cx) -> Result<PoolAcquireResult<C>, PoolError> {
+        let acquire_result = cx::with_cx_async(cx, |_| async {
+            crate::runtime_compat::timeout(
+                self.config.acquire_timeout,
+                self.semaphore.clone().acquire_owned(),
+            )
+            .await
+        })
+        .await;
+
+        let permit = match acquire_result {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_closed)) => return Err(PoolError::Closed),
+            Err(_timeout_err) => {
+                self.stats_timeouts.fetch_add(1, Ordering::Relaxed);
+                return Err(PoolError::AcquireTimeout);
+            }
+        };
+
+        let conn = {
+            let mut idle = self.idle.lock().await;
+            self.evict_expired(&mut idle);
+            idle.pop_front().map(|e| e.conn)
+        };
+        self.stats_acquired.fetch_add(1, Ordering::Relaxed);
+        Ok(PoolAcquireResult {
+            conn,
+            permit: Some(permit),
+        })
+    }
+
+    /// Inner implementation for acquire without cx.
+    async fn acquire_inner(&self) -> Result<PoolAcquireResult<C>, PoolError> {
+        let acquire_result = crate::runtime_compat::timeout(
             self.config.acquire_timeout,
             self.semaphore.clone().acquire_owned(),
         )
-        .await
-        {
+        .await;
+
+        let permit = match acquire_result {
             Ok(Ok(permit)) => permit,
             Ok(Err(_closed)) => return Err(PoolError::Closed),
             Err(_timeout_err) => {
@@ -316,6 +391,16 @@ mod tests {
         assert!(!result.has_connection());
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[tokio::test]
+    async fn pool_acquire_with_cx_returns_none_when_empty() {
+        let pool: Pool<String> = Pool::new(test_config(2));
+        let cx = crate::cx::for_testing();
+        let result = pool.acquire_with_cx(&cx).await.expect("should acquire");
+        assert!(result.conn.is_none());
+        assert!(!result.has_connection());
+    }
+
     #[tokio::test]
     async fn pool_put_and_acquire_returns_idle_connection() {
         let pool: Pool<String> = Pool::new(test_config(2));
@@ -434,6 +519,17 @@ mod tests {
         pool.put("idle-conn".to_string()).await;
 
         let result = pool.try_acquire().await.expect("should succeed");
+        assert_eq!(result.conn.as_deref(), Some("idle-conn"));
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[tokio::test]
+    async fn pool_try_acquire_with_cx_returns_idle() {
+        let pool: Pool<String> = Pool::new(test_config(2));
+        pool.put("idle-conn".to_string()).await;
+        let cx = crate::cx::for_testing();
+
+        let result = pool.try_acquire_with_cx(&cx).await.expect("should succeed");
         assert_eq!(result.conn.as_deref(), Some("idle-conn"));
     }
 

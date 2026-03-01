@@ -180,6 +180,11 @@ name = "cache_gc"
 harness = false
 
 [[bench]]
+name = "dashboard_aggregation"
+harness = false
+required-features = ["tui"]
+
+[[bench]]
 name = "tui_rendering"
 harness = false
 required-features = ["ftui"]
