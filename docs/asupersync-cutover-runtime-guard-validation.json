@@ -1,62 +1,11 @@
 {
-  "checked_at": "2026-02-28T07:21:22Z",
-  "checks": [
-    {
-      "name": "contract_identity",
-      "status": "passed"
-    },
-    {
-      "name": "dependency_manifest_allowlist",
-      "observed": {
-        "async-io": [
-          "Cargo.toml",
-          "frankenterm/async_ossl/Cargo.toml",
-          "frankenterm/promise/Cargo.toml",
-          "frankenterm/uds/Cargo.toml"
-        ],
-        "smol": [
-          "Cargo.toml",
-          "frankenterm/codec/Cargo.toml",
-          "frankenterm/config/Cargo.toml",
-          "frankenterm/pty/Cargo.toml",
-          "frankenterm/scripting/Cargo.toml",
-          "frankenterm/ssh/Cargo.toml"
-        ],
-        "tokio": [
-          "Cargo.toml",
-          "crates/frankenterm-core/Cargo.toml",
-          "crates/frankenterm/Cargo.toml"
-        ]
-      },
-      "status": "passed"
-    },
-    {
-      "counts": {
-        "async_io::": 3,
-        "smol::": 83,
-        "tokio::": 1302
-      },
-      "files": {
-        "async_io::": [
-          "frankenterm/async_ossl/src/lib.rs",
-          "frankenterm/promise/src/spawn.rs",
-          "frankenterm/uds/src/lib.rs"
-        ],
-        "smol::": [
-          "crates/frankenterm-core/src/vendored_migration_map.rs",
-          "frankenterm/codec/src/lib.rs",
-          "frankenterm/config/src/config.rs",
-          "frankenterm/config/src/lib.rs",
-          "frankenterm/config/src/lua.rs",
-          "frankenterm/pty/examples/whoami_async.rs",
-          "frankenterm/scripting/src/lua_engine.rs",
-          "frankenterm/ssh/examples/ssh.rs",
-          "frankenterm/ssh/src/lib.rs",
-          "frankenterm/ssh/tests/e2e/agent_forward.rs",
-          "frankenterm/ssh/tests/e2e/sftp.rs",
-          "frankenterm/ssh/tests/e2e/sftp/file.rs"
-        ],
-        "tokio::": [
+  "checked_at": "2026-03-01T02:31:58Z",
+  "detail": {
+    "violations": [
+      {
+        "actual": 1304,
+        "ceiling": 1302,
+        "files": [
           "crates/frankenterm-core/benches/compression_bypass.rs",
           "crates/frankenterm-core/benches/fts_query.rs",
           "crates/frankenterm-core/benches/ipc_throughput.rs",
@@ -114,7 +63,8 @@
           "crates/frankenterm-core/src/web/sse.rs",
           "crates/frankenterm-core/src/webhook.rs",
           "crates/frankenterm-core/src/wezterm.rs",
-          "crates/frankenterm-core/src/workflows.rs",
+          "crates/frankenterm-core/src/workflows/context.rs",
+          "crates/frankenterm-core/src/workflows/mod.rs",
           "crates/frankenterm-core/tests/daemon_integration.rs",
           "crates/frankenterm-core/tests/distributed_security_e2e.rs",
           "crates/frankenterm-core/tests/distributed_streaming_e2e.rs",
@@ -134,47 +84,35 @@
           "crates/frankenterm-core/tests/tantivy_integration_tests.rs",
           "crates/frankenterm-core/tests/tx_correctness_suite.rs",
           "crates/frankenterm-core/tests/web.rs",
-          "crates/frankenterm/src/main.rs"
-        ]
+          "crates/frankenterm/src/main.rs",
+          "frankenterm/ssh/src/lib.rs"
+        ],
+        "token": "tokio::"
       },
-      "name": "forbidden_token_ceiling",
-      "status": "passed"
-    },
-    {
-      "module_count": 3,
-      "name": "strict_zero_modules",
-      "status": "passed"
-    }
-  ],
-  "policy_path": "docs/asupersync-cutover-runtime-guardrails.json",
+      {
+        "actual": 84,
+        "ceiling": 83,
+        "files": [
+          "crates/frankenterm-core/src/vendored_migration_map.rs",
+          "frankenterm/codec/src/lib.rs",
+          "frankenterm/config/src/config.rs",
+          "frankenterm/config/src/lib.rs",
+          "frankenterm/config/src/lua.rs",
+          "frankenterm/pty/examples/whoami_async.rs",
+          "frankenterm/scripting/src/lua_engine.rs",
+          "frankenterm/ssh/examples/ssh.rs",
+          "frankenterm/ssh/src/lib.rs",
+          "frankenterm/ssh/tests/e2e/agent_forward.rs",
+          "frankenterm/ssh/tests/e2e/sftp.rs",
+          "frankenterm/ssh/tests/e2e/sftp/file.rs"
+        ],
+        "token": "smol::"
+      }
+    ]
+  },
+  "error_code": "token_ceiling_exceeded",
+  "error_message": "forbidden runtime token count exceeded configured ceiling",
+  "policy_path": "/Users/jemanuel/projects/frankenterm/docs/asupersync-cutover-runtime-guardrails.json",
   "repo_root": "/Users/jemanuel/projects/frankenterm",
-  "status": "passed",
-  "summary": {
-    "dependency_manifest_hits": {
-      "async-io": [
-        "Cargo.toml",
-        "frankenterm/async_ossl/Cargo.toml",
-        "frankenterm/promise/Cargo.toml",
-        "frankenterm/uds/Cargo.toml"
-      ],
-      "smol": [
-        "Cargo.toml",
-        "frankenterm/codec/Cargo.toml",
-        "frankenterm/config/Cargo.toml",
-        "frankenterm/pty/Cargo.toml",
-        "frankenterm/scripting/Cargo.toml",
-        "frankenterm/ssh/Cargo.toml"
-      ],
-      "tokio": [
-        "Cargo.toml",
-        "crates/frankenterm-core/Cargo.toml",
-        "crates/frankenterm/Cargo.toml"
-      ]
-    },
-    "forbidden_token_counts": {
-      "async_io::": 3,
-      "smol::": 83,
-      "tokio::": 1302
-    }
-  }
+  "status": "failed"
 }

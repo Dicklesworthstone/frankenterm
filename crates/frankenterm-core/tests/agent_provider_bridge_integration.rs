@@ -87,7 +87,7 @@ fn ambiguous_process_resolution_stays_deterministic_across_bridges() {
         CassAgent::from_provider(&provider),
         Some(CassAgent::ClaudeCode)
     );
-    assert_eq!(CautService::from_provider(&provider), None);
+    assert_eq!(CautService::from_provider(&provider), Some(CautService::Anthropic));
 }
 
 #[test]

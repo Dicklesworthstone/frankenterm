@@ -212,7 +212,7 @@ fn mixed_operations() {
     let snap = tracker.telemetry().snapshot();
     assert_eq!(snap.tokens_requested, 3);
     assert_eq!(snap.tokens_created, 3);
-    assert_eq!(snap.advances, 3); // 1 + 1 + 0 from advance, but timeout doesn't go through advance
+    assert_eq!(snap.advances, 2); // 1 + 1 + 0: timeout doesn't go through advance
     assert_eq!(snap.completions, 1);
     assert_eq!(snap.failures, 1);
     assert_eq!(snap.timeouts, 1);

@@ -18,7 +18,7 @@ use frankenterm_core::patterns::{PatternEngine, PatternPack, PatternTelemetrySna
 
 fn minimal_engine() -> PatternEngine {
     let rule = RuleDef {
-        id: "test.telemetry:keyword".to_string(),
+        id: "wezterm.test_telemetry".to_string(),
         agent_type: frankenterm_core::patterns::AgentType::Unknown,
         event_type: "test_event".to_string(),
         severity: frankenterm_core::patterns::Severity::Info,
