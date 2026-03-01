@@ -903,6 +903,10 @@ async fn pane_delta_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) {
     }
 }
 
+fn pane_delta_try_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) -> bool {
+    tx.try_send(delta).is_ok()
+}
+
 fn cancel_requested(cancel_rx: &mut watch::Receiver<bool>) -> bool {
     #[cfg(feature = "asupersync-runtime")]
     {
@@ -937,6 +941,14 @@ impl PaneOutputSubscription {
     /// Cancel the subscription.
     pub fn cancel(&self) {
         let _ = self.cancel.send(true);
+    }
+}
+
+fn subscription_poll_delay(config: &SubscriptionConfig, saw_dirty_output: bool) -> Duration {
+    if saw_dirty_output {
+        config.min_poll_interval.min(config.poll_interval)
+    } else {
+        config.poll_interval
     }
 }
 
@@ -982,7 +994,7 @@ pub fn subscribe_pane_output(
             // Poll for render changes
             let result = client.get_pane_render_changes(pane_id).await;
 
-            match result {
+            let saw_dirty_output = match result {
                 Ok(changes) => {
                     let seqno = changes.seqno as u64;
                     let has_dirty = !changes.dirty_lines.is_empty();
@@ -1021,17 +1033,18 @@ pub fn subscribe_pane_output(
                         };
 
                         // Bounded send — if the channel is full, emit a gap
-                        if tx.try_send(delta).is_err() {
-                            pane_delta_send(
+                        if !pane_delta_try_send(&tx, delta) {
+                            let _ = pane_delta_try_send(
                                 &tx,
                                 PaneDelta::Gap {
                                     pane_id,
                                     reason: "slow consumer: channel full".to_string(),
                                 },
-                            )
-                            .await;
+                            );
                         }
                     }
+
+                    has_dirty
                 }
                 Err(DirectMuxError::Disconnected) => {
                     pane_delta_send(
@@ -1047,6 +1060,7 @@ pub fn subscribe_pane_output(
                 Err(DirectMuxError::ReadTimeout) => {
                     // Transient — continue polling
                     tracing::debug!(pane_id, "subscription poll timeout, retrying");
+                    false
                 }
                 Err(err) => {
                     pane_delta_send(
@@ -1059,11 +1073,12 @@ pub fn subscribe_pane_output(
                     .await;
                     break;
                 }
-            }
+            };
 
             // Wait for either poll interval elapse or cancellation signal.
+            let wait_interval = subscription_poll_delay(&config, saw_dirty_output);
             if let Ok(changed_ok) =
-                timeout(config.poll_interval, wait_for_cancel_change(&mut cancel_rx)).await
+                timeout(wait_interval, wait_for_cancel_change(&mut cancel_rx)).await
             {
                 if !changed_ok || cancel_requested(&mut cancel_rx) {
                     pane_delta_send(
@@ -1111,6 +1126,7 @@ fn bonus_lines_to_text(lines: codec::SerializedLines) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
     use crate::runtime_compat::unix as compat_unix;
@@ -2768,6 +2784,36 @@ mod tests {
     }
 
     #[test]
+    fn subscription_poll_delay_uses_fast_path_when_dirty() {
+        let config = SubscriptionConfig {
+            poll_interval: Duration::from_millis(100),
+            min_poll_interval: Duration::from_millis(20),
+            channel_capacity: 8,
+        };
+        assert_eq!(
+            subscription_poll_delay(&config, true),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            subscription_poll_delay(&config, false),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn subscription_poll_delay_caps_min_interval_to_poll_interval() {
+        let config = SubscriptionConfig {
+            poll_interval: Duration::from_millis(25),
+            min_poll_interval: Duration::from_millis(80),
+            channel_capacity: 8,
+        };
+        assert_eq!(
+            subscription_poll_delay(&config, true),
+            Duration::from_millis(25)
+        );
+    }
+
+    #[test]
     fn total_dirty_rows_sums_range_spans() {
         let ranges: Vec<std::ops::Range<isize>> = vec![-4..-2, 10..13, 20..21];
         assert_eq!(total_dirty_rows(&ranges), 6);
@@ -2941,6 +2987,231 @@ mod tests {
             assert_eq!(dirty_range_count, 2);
             assert_eq!(dirty_row_count, 5);
             sub.cancel();
+        });
+    }
+
+    #[test]
+    fn subscription_emits_gap_when_seqno_jumps() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("seqno-gap.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+
+            task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut render_requests = 0usize;
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(_) => {
+                                render_requests += 1;
+                                #[allow(clippy::single_range_in_vec_init)]
+                                let (seqno, dirty_lines) = match render_requests {
+                                    1 => (1, vec![0isize..1isize]),
+                                    2 => (4, vec![1isize..2isize]),
+                                    _ => (4, Vec::new()),
+                                };
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: 11,
+                                    mouse_grabbed: false,
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    dirty_lines,
+                                    title: "gap-test".to_string(),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno,
+                                })
+                            }
+                            _ => continue,
+                        };
+                        let mut out = Vec::new();
+                        response.encode(&mut out, decoded.serial).expect("encode");
+                        stream.write_all(&out).await.expect("write");
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let client = DirectMuxClient::connect(config).await.expect("connect");
+            let mut sub = subscribe_pane_output(
+                client,
+                11,
+                SubscriptionConfig {
+                    poll_interval: Duration::from_millis(10),
+                    min_poll_interval: Duration::from_millis(5),
+                    channel_capacity: 16,
+                },
+            );
+
+            let mut saw_seq1 = false;
+            let mut saw_gap = false;
+            let mut saw_seq4 = false;
+
+            for _ in 0..30 {
+                match timeout(Duration::from_millis(200), sub.next()).await {
+                    Ok(Some(PaneDelta::Output { seqno: 1, .. })) => saw_seq1 = true,
+                    Ok(Some(PaneDelta::Output { seqno: 4, .. })) => saw_seq4 = true,
+                    Ok(Some(PaneDelta::Gap { reason, .. })) => {
+                        if reason.contains("seqno jump: 1 -> 4") && reason.contains("missed 2") {
+                            saw_gap = true;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+
+                if saw_seq1 && saw_gap && saw_seq4 {
+                    break;
+                }
+            }
+
+            sub.cancel();
+            assert!(saw_seq1, "expected first output event at seqno=1");
+            assert!(saw_gap, "expected gap event for seqno jump 1 -> 4");
+            assert!(saw_seq4, "expected second output event at seqno=4");
+        });
+    }
+
+    #[test]
+    fn subscription_emits_ended_when_mux_disconnects() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("subscription-disconnect.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+
+            task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut render_requests = 0usize;
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let maybe_response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Some(Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                }))
+                            }
+                            Pdu::SetClientId(_) => Some(Pdu::UnitResponse(UnitResponse {})),
+                            Pdu::GetPaneRenderChanges(_) => {
+                                render_requests += 1;
+                                if render_requests == 1 {
+                                    Some(Pdu::GetPaneRenderChangesResponse(
+                                        GetPaneRenderChangesResponse {
+                                            pane_id: 12,
+                                            mouse_grabbed: false,
+                                            cursor_position:
+                                                mux::renderable::StableCursorPosition::default(),
+                                            dimensions: mux::renderable::RenderableDimensions {
+                                                cols: 80,
+                                                viewport_rows: 24,
+                                                scrollback_rows: 0,
+                                                physical_top: 0,
+                                                scrollback_top: 0,
+                                                dpi: 96,
+                                                pixel_width: 0,
+                                                pixel_height: 0,
+                                                reverse_video: false,
+                                            },
+                                            dirty_lines: vec![0isize..1isize],
+                                            title: "disconnect-test".to_string(),
+                                            working_dir: None,
+                                            bonus_lines: Vec::new().into(),
+                                            input_serial: None,
+                                            seqno: 1,
+                                        },
+                                    ))
+                                } else {
+                                    // Simulate abrupt server disconnect after consuming request.
+                                    return;
+                                }
+                            }
+                            _ => None,
+                        };
+
+                        let Some(response) = maybe_response else {
+                            continue;
+                        };
+                        let mut out = Vec::new();
+                        response.encode(&mut out, decoded.serial).expect("encode");
+                        stream.write_all(&out).await.expect("write");
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let client = DirectMuxClient::connect(config).await.expect("connect");
+            let mut sub = subscribe_pane_output(
+                client,
+                12,
+                SubscriptionConfig {
+                    poll_interval: Duration::from_millis(10),
+                    min_poll_interval: Duration::from_millis(5),
+                    channel_capacity: 8,
+                },
+            );
+
+            let mut saw_disconnect_end = false;
+            for _ in 0..30 {
+                match timeout(Duration::from_millis(200), sub.next()).await {
+                    Ok(Some(PaneDelta::Ended { reason, .. })) => {
+                        if reason.contains("mux socket disconnected") {
+                            saw_disconnect_end = true;
+                            break;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+
+            assert!(
+                saw_disconnect_end,
+                "expected Ended event with disconnect reason"
+            );
         });
     }
 

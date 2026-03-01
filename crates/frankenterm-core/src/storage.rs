@@ -21050,7 +21050,7 @@ mod storage_handle_tests {
         // Concurrent reads should work (WAL mode)
         let read1 = handle.get_segments(1, 10);
         let read2 = handle.get_segments(1, 10);
-        let (result1, result2) = crate::runtime_compat::join!(read1, read2);
+        let (result1, result2) = futures::future::join(read1, read2).await;
 
         assert!(result1.is_ok());
         assert!(result2.is_ok());

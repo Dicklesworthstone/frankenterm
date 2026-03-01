@@ -2014,11 +2014,10 @@ impl ObservationRuntime {
                 }
 
                 if !poll_tasks.is_empty() {
-                    match timeout(wait_duration, poll_tasks.join_next()).await {
-                        Ok(Some((pane_id, outcome))) => {
-                            supervisor.handle_poll_result(pane_id, outcome);
-                        }
-                        Ok(None) | Err(_) => {}
+                    if let Ok(Some((pane_id, outcome))) =
+                        timeout(wait_duration, poll_tasks.join_next()).await
+                    {
+                        supervisor.handle_poll_result(pane_id, outcome);
                     }
                 } else {
                     sleep(wait_duration).await;
@@ -2107,7 +2106,7 @@ impl ObservationRuntime {
                 }
 
                 let flush_wait = next_flush.saturating_duration_since(now);
-                match timeout(flush_wait, event_rx.recv()).await {
+                match timeout(flush_wait, mpsc_recv_option(&mut event_rx)).await {
                     Ok(maybe_event) => {
                         let Some(event) = maybe_event else {
                             break;
@@ -2780,6 +2779,7 @@ fn watch_has_changed<T>(rx: &watch::Receiver<T>) -> bool {
     }
 }
 
+#[allow(clippy::needless_pass_by_ref_mut)]
 fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T {
     #[cfg(feature = "asupersync-runtime")]
     {
@@ -3532,6 +3532,69 @@ mod tests {
             snapshot_trigger_from_event(&fail_event),
             Some(crate::snapshot_engine::SnapshotTrigger::HazardThreshold)
         );
+    }
+
+    #[test]
+    fn snapshot_trigger_from_event_maps_pattern_detection() {
+        let event = Event::PatternDetected {
+            pane_id: 7,
+            pane_uuid: Some("pane-uuid-7".to_string()),
+            detection: test_detection("session.start", Severity::Info),
+            event_id: Some(42),
+        };
+
+        assert_eq!(
+            snapshot_trigger_from_event(&event),
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_from_event_maps_pane_lifecycle_events() {
+        let discovered = Event::PaneDiscovered {
+            pane_id: 9,
+            domain: "local".to_string(),
+            title: "codex".to_string(),
+        };
+        let disappeared = Event::PaneDisappeared { pane_id: 9 };
+
+        assert_eq!(
+            snapshot_trigger_from_event(&discovered),
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+        assert_eq!(
+            snapshot_trigger_from_event(&disappeared),
+            Some(crate::snapshot_engine::SnapshotTrigger::StateTransition)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_from_event_ignores_non_trigger_events() {
+        let events = [
+            Event::SegmentCaptured {
+                pane_id: 1,
+                seq: 10,
+                content_len: 25,
+            },
+            Event::GapDetected {
+                pane_id: 1,
+                reason: "overlap_not_found".to_string(),
+            },
+            Event::WorkflowStarted {
+                workflow_id: "wf-3".to_string(),
+                workflow_name: "handle_usage_limits".to_string(),
+                pane_id: 1,
+            },
+            Event::WorkflowStep {
+                workflow_id: "wf-3".to_string(),
+                step_name: "record_and_plan".to_string(),
+                result: "continue".to_string(),
+            },
+        ];
+
+        for event in events {
+            assert_eq!(snapshot_trigger_from_event(&event), None);
+        }
     }
 
     #[test]
