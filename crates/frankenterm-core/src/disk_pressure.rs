@@ -350,7 +350,7 @@ impl PidController {
         let dt_secs = dt_secs.max(f64::EPSILON);
 
         self.integral =
-            (self.integral + error * dt_secs).clamp(self.integral_min, self.integral_max);
+            error.mul_add(dt_secs, self.integral).clamp(self.integral_min, self.integral_max);
 
         self.last_derivative = self
             .previous_error
@@ -626,12 +626,12 @@ fn read_disk_space_df(path: &Path) -> Option<(u64, u64)> {
 }
 
 fn parse_df_output_kib(output: &str) -> Option<(u64, u64)> {
-    let lines: Vec<&str> = output
+    output
         .lines()
         .skip(1)
         .filter(|line| !line.trim().is_empty())
-        .collect();
-    lines.into_iter().rev().find_map(parse_df_data_line)
+        .filter_map(parse_df_data_line)
+        .last()
 }
 
 fn parse_df_data_line(line: &str) -> Option<(u64, u64)> {

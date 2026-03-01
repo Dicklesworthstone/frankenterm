@@ -1,6 +1,7 @@
 //! Criterion benchmarks for `DirectMuxClient` operation latency.
 //!
 //! Bead: ft-p48pw
+#![allow(clippy::large_futures)]
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -604,7 +605,7 @@ fn bench_subscription_setup(c: &mut Criterion) {
                                     break;
                                 }
                             }
-                            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                            () = tokio::time::sleep(Duration::from_millis(10)) => {}
                         }
                     }
                 });

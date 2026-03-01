@@ -71,12 +71,10 @@ proptest! {
     fn tier_ordering_is_total(a in arb_tier(), b in arb_tier()) {
         let a_u8 = a.as_u8();
         let b_u8 = b.as_u8();
-        if a_u8 < b_u8 {
-            prop_assert!(a < b);
-        } else if a_u8 > b_u8 {
-            prop_assert!(a > b);
-        } else {
-            prop_assert_eq!(a, b);
+        match a_u8.cmp(&b_u8) {
+            std::cmp::Ordering::Less => prop_assert!(a < b),
+            std::cmp::Ordering::Greater => prop_assert!(a > b),
+            std::cmp::Ordering::Equal => prop_assert_eq!(a, b),
         }
     }
 
@@ -145,7 +143,7 @@ proptest! {
     // 8. Thresholds Clone produces equal values
     #[test]
     fn thresholds_clone_eq(t in arb_thresholds()) {
-        let cloned = t.clone();
+        let cloned = t;
         prop_assert!((t.yellow - cloned.yellow).abs() < f64::EPSILON);
         prop_assert!((t.red - cloned.red).abs() < f64::EPSILON);
         prop_assert!((t.black - cloned.black).abs() < f64::EPSILON);
@@ -183,7 +181,7 @@ proptest! {
         let mut ewma = EwmaEstimator::new(alpha);
         for s in &samples {
             let v = ewma.update(*s);
-            prop_assert!(v >= 0.0 && v <= 1.0, "EWMA output {} out of bounds", v);
+            prop_assert!((0.0..=1.0).contains(&v), "EWMA output {} out of bounds", v);
         }
     }
 
@@ -273,7 +271,7 @@ proptest! {
     fn pid_proportional_only(kp in 0.0f64..=2.0, error in -1.0f64..=1.0) {
         let mut pid = PidController::new(kp, 0.0, 0.0, -1.0, 1.0);
         let out = pid.update(error, 1.0);
-        prop_assert!((out - kp * error).abs() < 1e-10, "P-only: expected {}, got {}", kp * error, out);
+        prop_assert!(kp.mul_add(-error, out).abs() < 1e-10, "P-only: expected {}, got {}", kp * error, out);
     }
 
     // 19. Swapped integral bounds are corrected

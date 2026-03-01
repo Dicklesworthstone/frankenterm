@@ -15,8 +15,7 @@ use proptest::prelude::*;
 use std::time::Instant;
 
 use frankenterm_core::disk_pressure::{
-    DiskPressureConfig, DiskPressureMonitor, DiskPressureTelemetrySnapshot, DiskPressureTier,
-    DiskSample, PressureThresholds,
+    DiskPressureConfig, DiskPressureMonitor, DiskPressureTelemetrySnapshot, DiskSample,
 };
 
 // =============================================================================
