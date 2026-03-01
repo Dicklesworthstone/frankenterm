@@ -178,9 +178,7 @@ proptest! {
         ops in prop::collection::vec(0u8..3, 1..40),
     ) {
         let mut mon = test_monitor();
-        let mut op_idx = 0u64;
-
-        for op in &ops {
+        for (op_idx, op) in ops.iter().enumerate() {
             match op {
                 0 => {
                     // Stable observations (unlikely to drift)
@@ -196,7 +194,6 @@ proptest! {
                 }
                 _ => unreachable!(),
             }
-            op_idx += 1;
         }
 
         let snap = mon.telemetry().snapshot();

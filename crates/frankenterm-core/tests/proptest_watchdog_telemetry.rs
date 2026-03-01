@@ -88,8 +88,8 @@ fn maintenance_heartbeats_tracked() {
 fn health_checks_tracked() {
     let reg = test_registry();
     let config = test_config();
-    reg.check_health(&config);
-    reg.check_health(&config);
+    let _ = reg.check_health(&config);
+    let _ = reg.check_health(&config);
 
     let snap = reg.telemetry().snapshot();
     assert_eq!(snap.health_checks, 2);
@@ -104,7 +104,7 @@ fn mixed_operations_tracked() {
     reg.record_capture();
     reg.record_persistence();
     reg.record_maintenance();
-    reg.check_health(&config);
+    let _ = reg.check_health(&config);
 
     let snap = reg.telemetry().snapshot();
     assert_eq!(snap.discovery_heartbeats, 1);
@@ -188,7 +188,7 @@ proptest! {
         let reg = test_registry();
         let config = test_config();
         for _ in 0..checks {
-            reg.check_health(&config);
+            let _ = reg.check_health(&config);
         }
 
         let snap = reg.telemetry().snapshot();
@@ -209,7 +209,7 @@ proptest! {
                 1 => reg.record_capture(),
                 2 => reg.record_persistence(),
                 3 => reg.record_maintenance(),
-                4 => { reg.check_health(&config); }
+                4 => { let _ = reg.check_health(&config); }
                 _ => unreachable!(),
             }
 

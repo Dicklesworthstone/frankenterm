@@ -290,7 +290,7 @@ proptest! {
         // shard count. The theoretical bound is 1/N for perfect consistent
         // hashing, but with finite virtual_nodes (as low as 16) the ring
         // distribution is imperfect, so we allow 2x headroom.
-        let max_allowed = 2 * ((pane_ids.len() + base_nodes - 1) / base_nodes);
+        let max_allowed = 2 * pane_ids.len().div_ceil(base_nodes);
         prop_assert!(
             remapped <= max_allowed,
             "remapped {remapped}/{} keys (max allowed {max_allowed}) when expanding {base_nodes} -> {} shards",

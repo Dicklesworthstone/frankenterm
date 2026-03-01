@@ -12,7 +12,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::completion_token::{
-    CompletionBoundary, CompletionState, CompletionTracker, CompletionTrackerConfig,
+    CompletionBoundary, CompletionTracker, CompletionTrackerConfig,
     CompletionTrackerTelemetrySnapshot, StepOutcome,
 };
 
@@ -260,11 +260,10 @@ proptest! {
         ops in prop::collection::vec(0u8..3, 1..20),
     ) {
         let mut tracker = make_tracker();
-        let mut prev = tracker.telemetry().snapshot();
 
         // Pre-create a token for advance operations
         let tid = tracker.begin("op", simple_boundary()).unwrap();
-        prev = tracker.telemetry().snapshot();
+        let mut prev = tracker.telemetry().snapshot();
 
         for op in &ops {
             match op {

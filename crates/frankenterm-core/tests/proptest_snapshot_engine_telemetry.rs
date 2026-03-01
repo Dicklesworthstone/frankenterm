@@ -81,7 +81,7 @@ fn multiple_triggers_accumulate() {
     let engine = test_engine();
 
     for _ in 0..10 {
-        engine.emit_trigger(SnapshotTrigger::Event);
+        let _ = engine.emit_trigger(SnapshotTrigger::Event);
     }
 
     let snap = engine.telemetry().snapshot();
@@ -123,7 +123,7 @@ proptest! {
         let engine = test_engine();
 
         for trigger in &triggers {
-            engine.emit_trigger(*trigger);
+            let _ = engine.emit_trigger(*trigger);
         }
 
         let snap = engine.telemetry().snapshot();
@@ -142,7 +142,7 @@ proptest! {
 
         for count in &counts {
             for _ in 0..*count {
-                engine.emit_trigger(SnapshotTrigger::Event);
+                let _ = engine.emit_trigger(SnapshotTrigger::Event);
             }
 
             let snap = engine.telemetry().snapshot();
@@ -169,7 +169,7 @@ proptest! {
         let engine = test_engine();
 
         for _ in 0..count {
-            engine.emit_trigger(SnapshotTrigger::Manual);
+            let _ = engine.emit_trigger(SnapshotTrigger::Manual);
         }
 
         let snap = engine.telemetry().snapshot();

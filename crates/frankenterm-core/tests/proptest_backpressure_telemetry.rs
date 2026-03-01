@@ -75,9 +75,9 @@ fn telemetry_starts_at_zero() {
 #[test]
 fn evaluations_tracked() {
     let mgr = default_manager();
-    mgr.evaluate(&green_depths());
-    mgr.evaluate(&green_depths());
-    mgr.evaluate(&green_depths());
+    let _ = mgr.evaluate(&green_depths());
+    let _ = mgr.evaluate(&green_depths());
+    let _ = mgr.evaluate(&green_depths());
 
     let snap = mgr.telemetry().snapshot();
     assert_eq!(snap.evaluations, 3);
@@ -86,8 +86,8 @@ fn evaluations_tracked() {
 #[test]
 fn classifications_tracked() {
     let mgr = default_manager();
-    mgr.classify(&green_depths());
-    mgr.classify(&red_depths());
+    let _ = mgr.classify(&green_depths());
+    let _ = mgr.classify(&red_depths());
 
     let snap = mgr.telemetry().snapshot();
     assert_eq!(snap.classifications, 2);
@@ -96,7 +96,7 @@ fn classifications_tracked() {
 #[test]
 fn evaluate_also_counts_classification() {
     let mgr = default_manager();
-    mgr.evaluate(&green_depths());
+    let _ = mgr.evaluate(&green_depths());
 
     let snap = mgr.telemetry().snapshot();
     // evaluate() calls classify() internally
@@ -160,8 +160,8 @@ fn resume_alls_tracked() {
 #[test]
 fn mixed_operations() {
     let mgr = default_manager();
-    mgr.evaluate(&red_depths()); // eval+classify+transition
-    mgr.classify(&green_depths()); // classify only
+    let _ = mgr.evaluate(&red_depths()); // eval+classify+transition
+    let _ = mgr.classify(&green_depths()); // classify only
     mgr.pause_pane(1);
     mgr.resume_pane(1);
     mgr.resume_all_panes();
@@ -203,7 +203,7 @@ proptest! {
     ) {
         let mgr = default_manager();
         for _ in 0..count {
-            mgr.evaluate(&green_depths());
+            let _ = mgr.evaluate(&green_depths());
         }
         let snap = mgr.telemetry().snapshot();
         prop_assert_eq!(snap.evaluations, count as u64);
@@ -216,10 +216,10 @@ proptest! {
     ) {
         let mgr = default_manager();
         for _ in 0..n_eval {
-            mgr.evaluate(&green_depths());
+            let _ = mgr.evaluate(&green_depths());
         }
         for _ in 0..n_classify {
-            mgr.classify(&green_depths());
+            let _ = mgr.classify(&green_depths());
         }
         let snap = mgr.telemetry().snapshot();
         // Each evaluate calls classify internally
@@ -237,7 +237,7 @@ proptest! {
     ) {
         let mgr = default_manager();
         for _ in 0..count {
-            mgr.evaluate(&red_depths());
+            let _ = mgr.evaluate(&red_depths());
         }
         let snap = mgr.telemetry().snapshot();
         prop_assert!(
@@ -258,9 +258,9 @@ proptest! {
 
         for op in &ops {
             match op {
-                0 => { mgr.evaluate(&depths_list[0]); }
-                1 => { mgr.evaluate(&depths_list[1]); }
-                2 => { mgr.classify(&depths_list[2]); }
+                0 => { let _ = mgr.evaluate(&depths_list[0]); }
+                1 => { let _ = mgr.evaluate(&depths_list[1]); }
+                2 => { let _ = mgr.classify(&depths_list[2]); }
                 3 => { mgr.pause_pane(1); }
                 4 => { mgr.resume_pane(1); }
                 5 => { mgr.resume_all_panes(); }

@@ -172,8 +172,8 @@ fn mixed_operations() {
     let mut engine = make_engine();
 
     // Appends
-    let s1 = engine.append("a".to_string(), 1000);
-    let s2 = engine.append("b".to_string(), 2000);
+    let _s1 = engine.append("a".to_string(), 1000);
+    let _s2 = engine.append("b".to_string(), 2000);
     let s3 = engine.append("c".to_string(), 3000);
 
     // Checkpoint

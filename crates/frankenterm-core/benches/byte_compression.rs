@@ -144,7 +144,7 @@ fn bench_compression_payload_sizes(c: &mut Criterion) {
         let compressor = ByteCompressor::new(CompressionLevel::Default);
 
         group.bench_with_input(BenchmarkId::new("compress", label), &payload, |b, data| {
-            b.iter(|| black_box(compressor.compress(black_box(data))))
+            b.iter(|| black_box(compressor.compress(black_box(data))));
         });
 
         let compressed = compressor.compress(&payload);
@@ -174,7 +174,7 @@ fn bench_compression_payload_types(c: &mut Criterion) {
         let compressor = ByteCompressor::new(CompressionLevel::Default);
 
         group.bench_with_input(BenchmarkId::new("compress", label), &payload, |b, data| {
-            b.iter(|| black_box(compressor.compress(black_box(data))))
+            b.iter(|| black_box(compressor.compress(black_box(data))));
         });
 
         let compressed = compressor.compress(&payload);
@@ -223,11 +223,11 @@ fn bench_dictionary_comparison(c: &mut Criterion) {
             ByteCompressor::new(CompressionLevel::Default).with_dictionary(dict.clone());
 
         group.bench_with_input(BenchmarkId::new("no_dict", label), &payload, |b, data| {
-            b.iter(|| black_box(no_dict.compress(black_box(data))))
+            b.iter(|| black_box(no_dict.compress(black_box(data))));
         });
 
         group.bench_with_input(BenchmarkId::new("with_dict", label), &payload, |b, data| {
-            b.iter(|| black_box(with_dict.compress(black_box(data))))
+            b.iter(|| black_box(with_dict.compress(black_box(data))));
         });
     }
 

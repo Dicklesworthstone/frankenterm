@@ -100,8 +100,8 @@ fn parameter_updates_skip_during_warmup() {
 #[test]
 fn reports_tracked() {
     let model = test_model();
-    model.report(1.0, &test_covariates());
-    model.report(2.0, &test_covariates());
+    let _ = model.report(1.0, &test_covariates());
+    let _ = model.report(2.0, &test_covariates());
 
     let snap = model.telemetry().snapshot();
     assert_eq!(snap.reports_generated, 2);
@@ -110,9 +110,9 @@ fn reports_tracked() {
 #[test]
 fn hazard_evaluations_tracked() {
     let model = test_model();
-    model.evaluate_action(1.0, &test_covariates());
-    model.evaluate_action(2.0, &test_covariates());
-    model.evaluate_action(3.0, &test_covariates());
+    let _ = model.evaluate_action(1.0, &test_covariates());
+    let _ = model.evaluate_action(2.0, &test_covariates());
+    let _ = model.evaluate_action(3.0, &test_covariates());
 
     let snap = model.telemetry().snapshot();
     assert_eq!(snap.hazard_evaluations, 3);

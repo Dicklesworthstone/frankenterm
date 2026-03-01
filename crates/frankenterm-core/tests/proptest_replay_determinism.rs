@@ -202,7 +202,7 @@ fn is_empty_text_event(event: &RecorderEvent) -> bool {
 
 #[derive(Debug, Clone)]
 struct DecisionChain {
-    event_ids: Vec<String>,
+    _event_ids: Vec<String>,
     decisions: Vec<DecisionEvent>,
 }
 
@@ -256,7 +256,7 @@ fn arb_decision_chain(max_len: usize) -> impl Strategy<Value = DecisionChain> {
         }
 
         DecisionChain {
-            event_ids,
+            _event_ids: event_ids,
             decisions,
         }
     })

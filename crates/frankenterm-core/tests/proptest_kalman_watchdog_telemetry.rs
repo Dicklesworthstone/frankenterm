@@ -25,7 +25,7 @@ fn make_watchdog() -> AdaptiveWatchdog {
     AdaptiveWatchdog::new(AdaptiveWatchdogConfig::default())
 }
 
-fn make_fast_warmup_watchdog() -> AdaptiveWatchdog {
+fn _make_fast_warmup_watchdog() -> AdaptiveWatchdog {
     AdaptiveWatchdog::new(AdaptiveWatchdogConfig {
         min_observations: 2,
         ..AdaptiveWatchdogConfig::default()
@@ -82,9 +82,9 @@ fn observe_unmatched_component() {
 fn check_health_increments_counter() {
     let mut wd = make_watchdog();
 
-    wd.check_health(1000);
-    wd.check_health(2000);
-    wd.check_health(3000);
+    let _ = wd.check_health(1000);
+    let _ = wd.check_health(2000);
+    let _ = wd.check_health(3000);
 
     let snap = wd.telemetry().snapshot();
     assert_eq!(snap.health_checks, 3);
@@ -95,7 +95,7 @@ fn check_health_counts_statuses() {
     let mut wd = make_watchdog();
 
     // All components are in warmup with no heartbeats → Healthy by default
-    wd.check_health(1000);
+    let _ = wd.check_health(1000);
 
     let snap = wd.telemetry().snapshot();
     // 4 components (Discovery, Capture, Persistence, Maintenance) all Healthy
@@ -108,8 +108,8 @@ fn classify_component_increments() {
     let mut wd = make_watchdog();
     wd.observe(Component::Capture, 1000);
 
-    wd.classify_component(Component::Capture, 2000);
-    wd.classify_component(Component::Capture, 3000);
+    let _ = wd.classify_component(Component::Capture, 2000);
+    let _ = wd.classify_component(Component::Capture, 3000);
 
     let snap = wd.telemetry().snapshot();
     assert_eq!(snap.classifications, 2);
@@ -177,10 +177,10 @@ fn mixed_operations() {
     wd.observe(Component::Discovery, 1500);
 
     // Health check
-    wd.check_health(3000);
+    let _ = wd.check_health(3000);
 
     // Single classification
-    wd.classify_component(Component::Capture, 3500);
+    let _ = wd.classify_component(Component::Capture, 3500);
 
     // Reset
     wd.reset();
@@ -223,7 +223,7 @@ proptest! {
     ) {
         let mut wd = make_watchdog();
         for i in 0..count {
-            wd.check_health(i as u64 * 1000);
+            let _ = wd.check_health(i as u64 * 1000);
         }
         let snap = wd.telemetry().snapshot();
         prop_assert_eq!(snap.health_checks, count as u64);
@@ -235,7 +235,7 @@ proptest! {
     ) {
         let mut wd = make_watchdog();
         for i in 0..health_check_count {
-            wd.check_health(i as u64 * 1000);
+            let _ = wd.check_health(i as u64 * 1000);
         }
         let snap = wd.telemetry().snapshot();
         let total_statuses = snap.status_healthy + snap.status_degraded
@@ -256,8 +256,8 @@ proptest! {
         for (i, op) in ops.iter().enumerate() {
             match op {
                 0 => { wd.observe(Component::Capture, i as u64 * 1000); }
-                1 => { wd.check_health(i as u64 * 1000); }
-                2 => { wd.classify_component(Component::Capture, i as u64 * 1000); }
+                1 => { let _ = wd.check_health(i as u64 * 1000); }
+                2 => { let _ = wd.classify_component(Component::Capture, i as u64 * 1000); }
                 3 => { wd.reset(); }
                 _ => unreachable!(),
             }

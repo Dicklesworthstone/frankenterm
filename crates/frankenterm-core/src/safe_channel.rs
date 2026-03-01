@@ -918,7 +918,6 @@ mod tests {
                     Ok(res) => items.push(res.commit()),
                     Err(SafeChannelError::Empty) => {
                         thread::sleep(Duration::from_millis(1));
-                        continue;
                     }
                     Err(SafeChannelError::Closed) => break,
                     Err(e) => panic!("unexpected: {e}"),
@@ -934,7 +933,6 @@ mod tests {
                     Ok(res) => items.push(res.commit()),
                     Err(SafeChannelError::Empty) => {
                         thread::sleep(Duration::from_millis(1));
-                        continue;
                     }
                     Err(SafeChannelError::Closed) => break,
                     Err(e) => panic!("unexpected: {e}"),
@@ -982,7 +980,7 @@ mod tests {
         loop {
             match rx.try_recv() {
                 Ok(v) => items.push(v),
-                Err(SafeChannelError::Empty) | Err(SafeChannelError::Closed) => break,
+                Err(SafeChannelError::Empty | SafeChannelError::Closed) => break,
                 Err(e) => panic!("unexpected: {e}"),
             }
         }
