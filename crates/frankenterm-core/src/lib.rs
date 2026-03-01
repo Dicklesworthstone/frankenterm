@@ -115,6 +115,7 @@ pub mod content_dedup;
 pub mod context_snapshot;
 pub mod continuous_backpressure;
 pub mod cooldown_tracker;
+pub mod cost_tracker;
 pub mod count_min_sketch;
 pub mod cpu_pressure;
 pub mod crash;
