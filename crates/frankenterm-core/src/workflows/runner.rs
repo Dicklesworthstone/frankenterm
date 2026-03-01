@@ -1993,3 +1993,253 @@ pub struct AbortResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_reason: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // WorkflowStartResult predicates
+    // ========================================================================
+
+    #[test]
+    fn start_result_started_is_started() {
+        let r = WorkflowStartResult::Started {
+            execution_id: "exec-1".to_string(),
+            workflow_name: "wf".to_string(),
+        };
+        assert!(r.is_started());
+        assert!(!r.is_locked());
+        assert_eq!(r.execution_id(), Some("exec-1"));
+    }
+
+    #[test]
+    fn start_result_no_matching_workflow() {
+        let r = WorkflowStartResult::NoMatchingWorkflow {
+            rule_id: "rule-1".to_string(),
+        };
+        assert!(!r.is_started());
+        assert!(!r.is_locked());
+        assert!(r.execution_id().is_none());
+    }
+
+    #[test]
+    fn start_result_pane_locked() {
+        let r = WorkflowStartResult::PaneLocked {
+            pane_id: 42,
+            held_by_workflow: "wf-other".to_string(),
+            held_by_execution: "exec-other".to_string(),
+        };
+        assert!(!r.is_started());
+        assert!(r.is_locked());
+        assert!(r.execution_id().is_none());
+    }
+
+    #[test]
+    fn start_result_error() {
+        let r = WorkflowStartResult::Error {
+            error: "boom".to_string(),
+        };
+        assert!(!r.is_started());
+        assert!(!r.is_locked());
+        assert!(r.execution_id().is_none());
+    }
+
+    // ========================================================================
+    // WorkflowStartResult serde roundtrip
+    // ========================================================================
+
+    #[test]
+    fn start_result_serde_started() {
+        let r = WorkflowStartResult::Started {
+            execution_id: "e1".to_string(),
+            workflow_name: "w1".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowStartResult = serde_json::from_str(&json).unwrap();
+        assert!(back.is_started());
+        assert_eq!(back.execution_id(), Some("e1"));
+    }
+
+    #[test]
+    fn start_result_serde_no_matching() {
+        let r = WorkflowStartResult::NoMatchingWorkflow {
+            rule_id: "r1".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowStartResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.is_started());
+    }
+
+    #[test]
+    fn start_result_serde_pane_locked() {
+        let r = WorkflowStartResult::PaneLocked {
+            pane_id: 10,
+            held_by_workflow: "hw".to_string(),
+            held_by_execution: "he".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowStartResult = serde_json::from_str(&json).unwrap();
+        assert!(back.is_locked());
+    }
+
+    #[test]
+    fn start_result_serde_error() {
+        let r = WorkflowStartResult::Error {
+            error: "err".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowStartResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.is_started());
+    }
+
+    // ========================================================================
+    // WorkflowExecutionResult predicates
+    // ========================================================================
+
+    #[test]
+    fn exec_result_completed() {
+        let r = WorkflowExecutionResult::Completed {
+            execution_id: "e1".to_string(),
+            result: serde_json::json!({"ok": true}),
+            elapsed_ms: 500,
+            steps_executed: 3,
+        };
+        assert!(r.is_completed());
+        assert!(!r.is_aborted());
+        assert_eq!(r.execution_id(), Some("e1"));
+    }
+
+    #[test]
+    fn exec_result_aborted() {
+        let r = WorkflowExecutionResult::Aborted {
+            execution_id: "e2".to_string(),
+            reason: "timeout".to_string(),
+            step_index: 1,
+            elapsed_ms: 30_000,
+        };
+        assert!(!r.is_completed());
+        assert!(r.is_aborted());
+        assert_eq!(r.execution_id(), Some("e2"));
+    }
+
+    #[test]
+    fn exec_result_policy_denied() {
+        let r = WorkflowExecutionResult::PolicyDenied {
+            execution_id: "e3".to_string(),
+            step_index: 0,
+            reason: "alt_screen".to_string(),
+        };
+        assert!(!r.is_completed());
+        assert!(!r.is_aborted());
+        assert_eq!(r.execution_id(), Some("e3"));
+    }
+
+    #[test]
+    fn exec_result_error_with_id() {
+        let r = WorkflowExecutionResult::Error {
+            execution_id: Some("e4".to_string()),
+            error: "oops".to_string(),
+        };
+        assert!(!r.is_completed());
+        assert!(!r.is_aborted());
+        assert_eq!(r.execution_id(), Some("e4"));
+    }
+
+    #[test]
+    fn exec_result_error_without_id() {
+        let r = WorkflowExecutionResult::Error {
+            execution_id: None,
+            error: "oops".to_string(),
+        };
+        assert!(r.execution_id().is_none());
+    }
+
+    // ========================================================================
+    // WorkflowExecutionResult serde roundtrip
+    // ========================================================================
+
+    #[test]
+    fn exec_result_serde_completed() {
+        let r = WorkflowExecutionResult::Completed {
+            execution_id: "e1".to_string(),
+            result: serde_json::json!(42),
+            elapsed_ms: 100,
+            steps_executed: 2,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowExecutionResult = serde_json::from_str(&json).unwrap();
+        assert!(back.is_completed());
+    }
+
+    #[test]
+    fn exec_result_serde_aborted() {
+        let r = WorkflowExecutionResult::Aborted {
+            execution_id: "e2".to_string(),
+            reason: "err".to_string(),
+            step_index: 1,
+            elapsed_ms: 500,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowExecutionResult = serde_json::from_str(&json).unwrap();
+        assert!(back.is_aborted());
+    }
+
+    // ========================================================================
+    // WorkflowRunnerConfig defaults
+    // ========================================================================
+
+    #[test]
+    fn runner_config_defaults() {
+        let config = WorkflowRunnerConfig::default();
+        assert_eq!(config.max_concurrent, 3);
+        assert_eq!(config.step_timeout_ms, 30_000);
+        assert!((config.retry_backoff_multiplier - 2.0).abs() < f64::EPSILON);
+        assert_eq!(config.max_retries_per_step, 3);
+    }
+
+    // ========================================================================
+    // AbortResult serialization
+    // ========================================================================
+
+    #[test]
+    fn abort_result_serializes() {
+        let r = AbortResult {
+            aborted: true,
+            execution_id: "e1".to_string(),
+            workflow_name: "wf1".to_string(),
+            pane_id: 42,
+            previous_status: "running".to_string(),
+            aborted_at_step: 2,
+            reason: Some("user requested".to_string()),
+            aborted_at: Some(1234567890),
+            error_reason: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["aborted"], true);
+        assert_eq!(json["execution_id"], "e1");
+        assert_eq!(json["pane_id"], 42);
+        assert_eq!(json["reason"], "user requested");
+        // error_reason should be skipped (None)
+        assert!(json.get("error_reason").is_none());
+    }
+
+    #[test]
+    fn abort_result_skips_none_fields() {
+        let r = AbortResult {
+            aborted: false,
+            execution_id: "e2".to_string(),
+            workflow_name: "wf2".to_string(),
+            pane_id: 1,
+            previous_status: "waiting".to_string(),
+            aborted_at_step: 0,
+            reason: None,
+            aborted_at: None,
+            error_reason: Some("already_completed".to_string()),
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("reason").is_none());
+        assert!(json.get("aborted_at").is_none());
+        assert_eq!(json["error_reason"], "already_completed");
+    }
+}
