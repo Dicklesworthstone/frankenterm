@@ -349,8 +349,9 @@ impl PidController {
     pub fn update(&mut self, error: f64, dt_secs: f64) -> f64 {
         let dt_secs = dt_secs.max(f64::EPSILON);
 
-        self.integral =
-            error.mul_add(dt_secs, self.integral).clamp(self.integral_min, self.integral_max);
+        self.integral = error
+            .mul_add(dt_secs, self.integral)
+            .clamp(self.integral_min, self.integral_max);
 
         self.last_derivative = self
             .previous_error

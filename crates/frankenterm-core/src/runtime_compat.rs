@@ -932,6 +932,9 @@ where
 /// Returns:
 /// - `Some(value)` when a message was received.
 /// - `None` when the channel is closed.
+///
+/// Transitional helper retained for migration-era tests. New production
+/// call-sites should prefer explicit receive semantics.
 pub async fn mpsc_recv_option<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
     #[cfg(feature = "asupersync-runtime")]
     {
@@ -946,6 +949,9 @@ pub async fn mpsc_recv_option<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
 }
 
 /// Sends one message through an mpsc sender using the active runtime semantics.
+///
+/// Transitional helper retained for migration-era tests. New production
+/// call-sites should prefer explicit send semantics.
 pub async fn mpsc_send<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::SendError<T>> {
     #[cfg(feature = "asupersync-runtime")]
     {

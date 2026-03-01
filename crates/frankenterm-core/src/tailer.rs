@@ -1368,6 +1368,19 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_testing();
+            rx.recv(&cx).await.ok()
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            rx.recv().await
+        }
+    }
+
     fn make_pane(id: u64) -> PaneInfo {
         PaneInfo {
             pane_id: id,
@@ -1994,7 +2007,7 @@ mod tests {
         }
 
         // Verify the gap event was sent
-        let event = crate::runtime_compat::mpsc_recv_option(&mut rx)
+        let event = recv_next(&mut rx)
             .await
             .expect("should have received overflow gap event");
         assert_eq!(event.segment.pane_id, 1);
@@ -2050,7 +2063,7 @@ mod tests {
             supervisor.handle_poll_result(pane_id, outcome);
         }
 
-        let event = crate::runtime_compat::mpsc_recv_option(&mut rx)
+        let event = recv_next(&mut rx)
             .await
             .expect("should have received gap event");
         assert_eq!(event.segment.seq, 5, "gap should use cursor's next_seq");

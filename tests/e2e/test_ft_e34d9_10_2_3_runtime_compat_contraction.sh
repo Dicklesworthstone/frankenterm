@@ -126,6 +126,12 @@ validate_spawn_blocking_allowlist() {
   [[ -s "${output_file}" ]]
 }
 
+validate_mpsc_helper_callsites() {
+  local output_file="$1"
+  rg -n "runtime_compat::mpsc_(recv_option|send)" crates/frankenterm-core/src > "${output_file}" || true
+  [[ ! -s "${output_file}" ]]
+}
+
 cd "${ROOT_DIR}"
 : > "${STDOUT_FILE}"
 
@@ -206,6 +212,15 @@ if validate_spawn_blocking_allowlist "nominal" "${recovery_log}"; then
 else
   emit_log "validation" "compat_surface.allowlist.recovery" "allowed=search_bridge_only" "failed" "recovery_check_failed" "SURFACE-E202" "$(basename "${recovery_log}")"
   cat "${recovery_log}" >&2
+  exit 1
+fi
+
+mpsc_helper_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_mpsc_helpers.log"
+if validate_mpsc_helper_callsites "${mpsc_helper_log}"; then
+  emit_log "validation" "compat_surface.mpsc_helpers.nominal" "expected=zero_runtime_compat_mpsc_helper_callsites" "passed" "mpsc_helper_replacement_enforced" "none" "$(basename "${mpsc_helper_log}")"
+else
+  emit_log "validation" "compat_surface.mpsc_helpers.nominal" "expected=zero_runtime_compat_mpsc_helper_callsites" "failed" "unexpected_runtime_compat_mpsc_helper_callsite" "SURFACE-E203" "$(basename "${mpsc_helper_log}")"
+  cat "${mpsc_helper_log}" >&2
   exit 1
 fi
 

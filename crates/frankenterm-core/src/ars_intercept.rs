@@ -103,7 +103,6 @@ pub struct ContextBounds {
     pub min_pane_rows: u16,
 }
 
-
 /// Current pane context for gate evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneContext {

@@ -714,12 +714,38 @@ mod tests {
         runtime.block_on(future);
     }
 
+    async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_testing();
+            rx.recv(&cx).await.ok()
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            rx.recv().await
+        }
+    }
+
+    async fn send_value<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::SendError<T>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_testing();
+            tx.send(value, &cx).await
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            tx.send(value).await
+        }
+    }
+
     async fn recv_event(
         event_rx: &mut mpsc::Receiver<NativeEvent>,
         timeout: Duration,
         label: &'static str,
     ) -> NativeEvent {
-        crate::runtime_compat::timeout(timeout, crate::runtime_compat::mpsc_recv_option(event_rx))
+        crate::runtime_compat::timeout(timeout, recv_next(event_rx))
             .await
             .expect("timeout")
             .expect(label)
@@ -1109,9 +1135,7 @@ mod tests {
             .await;
 
             assert_eq!(outcome, EventDispatchOutcome::Sent);
-            let event = crate::runtime_compat::mpsc_recv_option(&mut rx)
-                .await
-                .expect("event should be delivered");
+            let event = recv_next(&mut rx).await.expect("event should be delivered");
             assert!(matches!(
                 event,
                 NativeEvent::PaneDestroyed { pane_id: 7, .. }
@@ -1140,7 +1164,7 @@ mod tests {
     fn dispatch_event_reports_backpressure_when_queue_full() {
         run_async_test(async {
             let (tx, _rx) = mpsc::channel(1);
-            crate::runtime_compat::mpsc_send(&tx, pane_destroyed_event(1))
+            send_value(&tx, pane_destroyed_event(1))
                 .await
                 .expect("first send should fit in queue");
 

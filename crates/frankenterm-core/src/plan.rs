@@ -1423,7 +1423,6 @@ pub enum MissionLifecycleState {
     Failed,
 }
 
-
 impl fmt::Display for MissionLifecycleState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2268,9 +2267,7 @@ impl Mission {
             assignment_id: assignment
                 .map(|a| a.assignment_id.0.clone())
                 .unwrap_or_else(|| candidate.candidate_id.0.clone()),
-            target_agent: assignment
-                .map(|a| a.assignee.clone())
-                .unwrap_or_default(),
+            target_agent: assignment.map(|a| a.assignee.clone()).unwrap_or_default(),
         })
     }
 
@@ -5223,8 +5220,7 @@ mod tests {
     #[test]
     fn resolve_dispatch_target_for_known_assignment() {
         let mission = mission_with_dispatch_data();
-        let target = mission
-            .resolve_dispatch_target(&AssignmentId("assignment:alpha".to_string()));
+        let target = mission.resolve_dispatch_target(&AssignmentId("assignment:alpha".to_string()));
         assert!(target.is_ok());
         let target = target.unwrap();
         assert_eq!(target.pane_id, 1);
@@ -5234,8 +5230,8 @@ mod tests {
     #[test]
     fn resolve_dispatch_target_for_unknown_assignment_returns_error() {
         let mission = mission_with_dispatch_data();
-        let result = mission
-            .resolve_dispatch_target(&AssignmentId("assignment:unknown".to_string()));
+        let result =
+            mission.resolve_dispatch_target(&AssignmentId("assignment:unknown".to_string()));
         assert!(result.is_err());
         let is_not_found = matches!(
             result.unwrap_err(),
@@ -5269,8 +5265,10 @@ mod tests {
     #[test]
     fn dispatch_dry_run_unknown_assignment_returns_error() {
         let mission = mission_with_dispatch_data();
-        let result = mission
-            .dispatch_assignment_dry_run(&AssignmentId("assignment:unknown".to_string()), 2_000_000);
+        let result = mission.dispatch_assignment_dry_run(
+            &AssignmentId("assignment:unknown".to_string()),
+            2_000_000,
+        );
         assert!(result.is_err());
     }
 

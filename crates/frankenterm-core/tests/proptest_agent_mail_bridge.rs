@@ -122,15 +122,13 @@ fn agent_registration_strategy() -> impl Strategy<Value = AgentRegistration> {
 }
 
 fn send_response_strategy() -> impl Strategy<Value = SendResponse> {
-    (
-        prop::option::of(message_id_strategy()),
-        prop::bool::ANY,
-    )
-        .prop_map(|(message_id, success)| SendResponse {
+    (prop::option::of(message_id_strategy()), prop::bool::ANY).prop_map(|(message_id, success)| {
+        SendResponse {
             message_id,
             success,
             extra: HashMap::new(),
-        })
+        }
+    })
 }
 
 fn release_response_strategy() -> impl Strategy<Value = ReleaseResponse> {

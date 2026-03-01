@@ -1027,7 +1027,6 @@ pub struct BeadGovernorState {
     pub last_agent_id: Option<String>,
 }
 
-
 /// Actions the governor can impose on a candidate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3580,10 +3579,7 @@ mod tests {
         let expl = &report.explanations[0];
         assert_eq!(expl.outcome, DecisionOutcome::Rejected);
         // Should have rejection factors
-        assert!(expl
-            .factors
-            .iter()
-            .any(|f| f.dimension == "rejection"));
+        assert!(expl.factors.iter().any(|f| f.dimension == "rejection"));
     }
 
     // ── Anti-thrash governor tests (ft-1i2ge.2.7) ───────────────────────────

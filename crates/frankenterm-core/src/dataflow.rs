@@ -1431,7 +1431,10 @@ mod tests {
         let successful_calls_clone = Arc::clone(&successful_calls);
         g.add_sink(mapped, move |_val| {
             let call_index = callback_calls_clone.fetch_add(1, Ordering::SeqCst);
-            assert!(call_index != 0, "intentional sink panic for resilience test");
+            assert!(
+                call_index != 0,
+                "intentional sink panic for resilience test"
+            );
             successful_calls_clone.fetch_add(1, Ordering::SeqCst);
         })
         .unwrap();

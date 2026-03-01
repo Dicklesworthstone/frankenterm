@@ -37,8 +37,8 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use asupersync::lab::explorer::{ExplorerConfig, ScheduleExplorer};
 use asupersync::{Budget, LabRuntime};
@@ -89,8 +89,7 @@ impl SharedWorkloadState {
             self.ops_failed.fetch_add(1, Ordering::SeqCst);
         }
         // Mark task as having completed at least one operation.
-        self.completed_mask
-            .fetch_or(1 << task_id, Ordering::SeqCst);
+        self.completed_mask.fetch_or(1 << task_id, Ordering::SeqCst);
     }
 
     /// Record a cancellation.
@@ -443,10 +442,7 @@ fn cfm_pool_single_fault() {
         20,
         |runtime, state| pool_acquire_release_workload(runtime, state, 4),
     );
-    assert!(
-        result.all_passed,
-        "pool/single_db_write failed: {result:?}"
-    );
+    assert!(result.all_passed, "pool/single_db_write failed: {result:?}");
 }
 
 #[test]
@@ -522,10 +518,7 @@ fn cfm_channel_multi_fault() {
         20,
         |runtime, state| channel_pipeline_workload(runtime, state, 3, 2),
     );
-    assert!(
-        result.all_passed,
-        "channel/multi_fault failed: {result:?}"
-    );
+    assert!(result.all_passed, "channel/multi_fault failed: {result:?}");
 }
 
 #[test]
@@ -626,10 +619,7 @@ fn cfm_dispatch_multi_fault() {
         20,
         |runtime, state| event_dispatch_workload(runtime, state, 5),
     );
-    assert!(
-        result.all_passed,
-        "dispatch/multi_fault failed: {result:?}"
-    );
+    assert!(result.all_passed, "dispatch/multi_fault failed: {result:?}");
 }
 
 #[test]

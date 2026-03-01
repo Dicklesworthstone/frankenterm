@@ -6830,6 +6830,24 @@ fn now_ms_i64() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+fn parse_accounts_caut_service(service: &str) -> Option<frankenterm_core::caut::CautService> {
+    frankenterm_core::caut::CautService::from_cli_input(service)
+}
+
+fn canonical_accounts_service_key(service: &str) -> String {
+    parse_accounts_caut_service(service).map_or_else(
+        || service.trim().to_string(),
+        |parsed| parsed.as_str().to_string(),
+    )
+}
+
+fn supported_accounts_services_hint() -> String {
+    format!(
+        "Supported services: {}",
+        frankenterm_core::caut::CautService::supported_cli_inputs().join(", ")
+    )
+}
+
 /// Parse a human-friendly duration string into milliseconds.
 ///
 /// Supports: "30s", "5m", "1h", "7d", "2w". Returns `None` if the format is invalid.
@@ -16794,6 +16812,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             match command {
                                 RobotAccountsCommands::List { service, pick } => {
+                                    let service_key = canonical_accounts_service_key(&service);
+
                                     // Open storage handle
                                     let db_path = layout.db_path.to_string_lossy();
                                     let storage =
@@ -16821,7 +16841,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     // Fetch accounts
                                     let accounts = match storage
-                                        .get_accounts_by_service(&service)
+                                        .get_accounts_by_service(&service_key)
                                         .await
                                     {
                                         Ok(a) => a,
@@ -16899,7 +16919,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let data = RobotAccountsListData {
                                         accounts: account_infos,
                                         total,
-                                        service,
+                                        service: service_key,
                                         pick_preview,
                                     };
                                     let response = RobotResponse::success(data, elapsed_ms(start));
@@ -16912,22 +16932,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                                 RobotAccountsCommands::Refresh { service } => {
                                     // Parse CautService
-                                    let caut_service = match service.as_str() {
-                                        "openai" => frankenterm_core::caut::CautService::OpenAI,
-                                        other => {
+                                    let caut_service = match parse_accounts_caut_service(&service) {
+                                        Some(parsed) => parsed,
+                                        None => {
                                             let response =
                                                 RobotResponse::<RobotAccountsRefreshData>::error_with_code(
                                                     "robot.invalid_service",
-                                                    format!("Unknown service: {other}"),
-                                                    Some(
-                                                        "Supported services: openai".to_string(),
-                                                    ),
+                                                    format!("Unknown service: {service}"),
+                                                    Some(supported_accounts_services_hint()),
                                                     elapsed_ms(start),
                                                 );
                                             print_robot_response(&response, format, stats)?;
                                             return Ok(());
                                         }
                                     };
+                                    let service_key = caut_service.as_str().to_string();
 
                                     // Rate-limit: check last refresh time in DB
                                     let db_path = layout.db_path.to_string_lossy();
@@ -16937,7 +16956,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 .await
                                         {
                                             if let Ok(accounts) = storage_check
-                                                .get_accounts_by_service(&service)
+                                                .get_accounts_by_service(&service_key)
                                                 .await
                                             {
                                                 let now_check = std::time::SystemTime::now()
@@ -17060,7 +17079,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
 
                                     let data = RobotAccountsRefreshData {
-                                        service,
+                                        service: service_key,
                                         refreshed_count: account_infos.len(),
                                         refreshed_at: refresh_result.refreshed_at,
                                         accounts: account_infos,
@@ -25414,22 +25433,23 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 service: ref_service,
             }) = command
             {
-                let caut_service = match ref_service.as_str() {
-                    "openai" => frankenterm_core::caut::CautService::OpenAI,
-                    other => {
+                let caut_service = match parse_accounts_caut_service(ref_service) {
+                    Some(parsed) => parsed,
+                    None => {
                         die(
-                            &format!("Unknown service: {other}"),
-                            Some("Supported services: openai"),
+                            &format!("Unknown service: {ref_service}"),
+                            Some(&supported_accounts_services_hint()),
                         );
                     }
                 };
+                let service_key = caut_service.as_str().to_string();
 
                 // Open storage for rate-limit check
                 let db_path = layout.db_path.to_string_lossy();
                 if let Ok(storage_check) =
                     frankenterm_core::storage::StorageHandle::new(&db_path).await
                 {
-                    if let Ok(accounts) = storage_check.get_accounts_by_service(&ref_service).await
+                    if let Ok(accounts) = storage_check.get_accounts_by_service(&service_key).await
                     {
                         let now_check = now_ms_i64();
                         let most_recent = accounts
@@ -25496,7 +25516,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 // Now render the refreshed list
                 let accounts = storage
-                    .get_accounts_by_service(&ref_service)
+                    .get_accounts_by_service(&service_key)
                     .await
                     .unwrap_or_default();
 
@@ -25514,12 +25534,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let rendered = AccountListRenderer::render(
                     &accounts,
                     pick_result.as_ref(),
-                    &ref_service,
+                    &service_key,
                     &ctx,
                 );
 
                 if !output_format.is_json() {
-                    eprintln!("Refreshed {count} account(s) for service \"{ref_service}\"");
+                    eprintln!("Refreshed {count} account(s) for service \"{service_key}\"");
                 }
                 print!("{rendered}");
 
@@ -25528,6 +25548,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             } else {
                 // Default: list accounts
+                let service_key = canonical_accounts_service_key(&service);
                 let db_path = layout.db_path.to_string_lossy();
                 let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
                     Ok(s) => s,
@@ -25539,7 +25560,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 };
 
-                let accounts = match storage.get_accounts_by_service(&service).await {
+                let accounts = match storage.get_accounts_by_service(&service_key).await {
                     Ok(a) => a,
                     Err(e) => {
                         die(&format!("Failed to fetch accounts: {e}"), None);
@@ -25557,8 +25578,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 };
 
                 let ctx = RenderContext::new(output_format).verbose(cli.verbose);
-                let rendered =
-                    AccountListRenderer::render(&accounts, pick_result.as_ref(), &service, &ctx);
+                let rendered = AccountListRenderer::render(
+                    &accounts,
+                    pick_result.as_ref(),
+                    &service_key,
+                    &ctx,
+                );
                 print!("{rendered}");
 
                 if let Err(e) = storage.shutdown().await {
@@ -39886,6 +39911,48 @@ log_level = "debug"
     #[test]
     fn refresh_cooldown_constant_is_30_seconds() {
         assert_eq!(ROBOT_REFRESH_COOLDOWN_MS, 30_000);
+    }
+
+    #[test]
+    fn parse_accounts_caut_service_accepts_aliases() {
+        assert_eq!(
+            parse_accounts_caut_service("openai"),
+            Some(frankenterm_core::caut::CautService::OpenAI)
+        );
+        assert_eq!(
+            parse_accounts_caut_service("codex"),
+            Some(frankenterm_core::caut::CautService::OpenAI)
+        );
+        assert_eq!(
+            parse_accounts_caut_service("claude"),
+            Some(frankenterm_core::caut::CautService::Anthropic)
+        );
+        assert_eq!(
+            parse_accounts_caut_service("gemini"),
+            Some(frankenterm_core::caut::CautService::Google)
+        );
+    }
+
+    #[test]
+    fn canonical_accounts_service_key_maps_aliases() {
+        assert_eq!(canonical_accounts_service_key("codex"), "openai");
+        assert_eq!(canonical_accounts_service_key("claude"), "anthropic");
+        assert_eq!(canonical_accounts_service_key("gemini"), "google");
+        assert_eq!(
+            canonical_accounts_service_key("custom-service"),
+            "custom-service"
+        );
+    }
+
+    #[test]
+    fn supported_accounts_services_hint_includes_aliases() {
+        let hint = supported_accounts_services_hint();
+        assert!(hint.contains("openai"));
+        assert!(hint.contains("codex"));
+        assert!(hint.contains("anthropic"));
+        assert!(hint.contains("claude"));
+        assert!(hint.contains("google"));
+        assert!(hint.contains("gemini"));
     }
 
     #[tokio::test]

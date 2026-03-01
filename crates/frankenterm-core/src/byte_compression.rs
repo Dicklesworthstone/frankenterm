@@ -63,7 +63,6 @@ impl CompressionLevel {
     }
 }
 
-
 /// Configuration for the byte compressor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ByteCompressionConfig {

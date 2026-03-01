@@ -2869,7 +2869,10 @@ impl ToolHandler for WaAccountsRefreshTool {
                     McpToolError::new(
                         MCP_ERR_INVALID_ARGS,
                         format!("Unknown service: {service}"),
-                        Some("Supported services: openai".to_string()),
+                        Some(format!(
+                            "Supported services: {}",
+                            crate::caut::CautService::supported_cli_inputs().join(", ")
+                        )),
                     )
                 })?;
 

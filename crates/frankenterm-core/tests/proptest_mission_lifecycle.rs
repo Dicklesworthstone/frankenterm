@@ -19,8 +19,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use proptest::prelude::*;
 
 use frankenterm_core::plan::{
-    Mission, MissionId, MissionLifecycleState,
-    MissionLifecycleTransitionKind, MissionOwnership, mission_lifecycle_transition_table,
+    Mission, MissionId, MissionLifecycleState, MissionLifecycleTransitionKind, MissionOwnership,
+    mission_lifecycle_transition_table,
 };
 
 // =============================================================================
@@ -166,8 +166,7 @@ fn all_non_terminal_states_reachable_from_planning() {
     for state in ALL_STATES {
         if !state.is_terminal() {
             // Non-terminal states should be reachable (Planned is an alias/peer of Planning)
-            let reachable =
-                visited.contains(state) || *state == MissionLifecycleState::Planned;
+            let reachable = visited.contains(state) || *state == MissionLifecycleState::Planned;
             if !reachable {
                 // Planned can be reached from itself (it has outgoing transitions)
                 // but might not be reachable from Planning if there's no Planning -> Planned transition
@@ -230,8 +229,7 @@ fn apply_transition_agrees_with_allowed_transitions() {
 fn state_serde_roundtrip_all_variants() {
     for state in ALL_STATES {
         let json = serde_json::to_string(state).expect("serialize");
-        let back: MissionLifecycleState =
-            serde_json::from_str(&json).expect("deserialize");
+        let back: MissionLifecycleState = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(*state, back, "serde roundtrip failed for {:?}", state);
     }
 }

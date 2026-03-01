@@ -2969,9 +2969,7 @@ mod tests {
 
         for i in 1..=9 {
             engine
-                .handle_event(TutorialEvent::CompleteExercise(
-                    format!("advanced.{i}"),
-                ))
+                .handle_event(TutorialEvent::CompleteExercise(format!("advanced.{i}")))
                 .unwrap();
         }
 
@@ -3044,9 +3042,7 @@ mod tests {
         // Complete only 8 of 9
         for i in 1..=8 {
             engine
-                .handle_event(TutorialEvent::CompleteExercise(
-                    format!("advanced.{i}"),
-                ))
+                .handle_event(TutorialEvent::CompleteExercise(format!("advanced.{i}")))
                 .unwrap();
         }
 
