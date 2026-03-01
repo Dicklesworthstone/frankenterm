@@ -7,7 +7,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 /// Standardized JSON envelope for subprocess bridge outputs.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RobotEnvelope<T> {
     /// ISO-8601 timestamp of when the data was captured.
     pub timestamp: String,

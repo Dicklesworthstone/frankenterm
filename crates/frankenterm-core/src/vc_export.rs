@@ -243,7 +243,7 @@ mod tests {
     fn test_session_telemetry_default_values() {
         let t = SessionTelemetry::default();
         assert!(t.session_id.is_none());
-        assert_eq!(t.duration_secs, 0.0);
+        assert!(t.duration_secs.abs() < f64::EPSILON);
         assert_eq!(t.commands, 0);
         assert_eq!(t.errors, 0);
         assert_eq!(t.agent_interactions, 0);
