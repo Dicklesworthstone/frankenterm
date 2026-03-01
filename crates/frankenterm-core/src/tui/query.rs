@@ -300,6 +300,9 @@ pub struct ProductionQueryClient {
     wezterm: WeztermHandle,
     #[allow(dead_code)]
     storage: Option<StorageHandle>,
+    /// Shared dashboard manager updated by the runtime, read by TUI.
+    dashboard_manager:
+        Option<std::sync::Arc<std::sync::Mutex<crate::dashboard::DashboardManager>>>,
     /// Dedicated runtime for async operations - avoids nested runtime panics
     runtime: crate::runtime_compat::Runtime,
 }
@@ -322,6 +325,7 @@ impl ProductionQueryClient {
             config_path: crate::config::resolve_config_path(None),
             wezterm: default_wezterm_handle(),
             storage: None,
+            dashboard_manager: None,
             runtime,
         }
     }
@@ -343,6 +347,7 @@ impl ProductionQueryClient {
             config_path: crate::config::resolve_config_path(None),
             wezterm: default_wezterm_handle(),
             storage: Some(storage),
+            dashboard_manager: None,
             runtime,
         }
     }
@@ -361,6 +366,7 @@ impl ProductionQueryClient {
             config_path: crate::config::resolve_config_path(None),
             wezterm,
             storage: None,
+            dashboard_manager: None,
             runtime,
         }
     }
@@ -383,8 +389,20 @@ impl ProductionQueryClient {
             config_path: crate::config::resolve_config_path(None),
             wezterm,
             storage: Some(storage),
+            dashboard_manager: None,
             runtime,
         }
+    }
+
+    /// Set the shared dashboard manager for live subsystem data.
+    ///
+    /// The dashboard manager should be updated by the runtime observation loop.
+    /// The TUI queries it on each refresh cycle via `dashboard_state()`.
+    pub fn set_dashboard_manager(
+        &mut self,
+        mgr: std::sync::Arc<std::sync::Mutex<crate::dashboard::DashboardManager>>,
+    ) {
+        self.dashboard_manager = Some(mgr);
     }
 
     /// Get the database path
@@ -908,6 +926,18 @@ impl QueryClient for ProductionQueryClient {
         self.runtime
             .block_on(storage.get_timeline(query))
             .map_err(|e| QueryError::StorageError(e.to_string()))
+    }
+
+    fn dashboard_state(
+        &self,
+    ) -> Result<Option<crate::dashboard::DashboardState>, QueryError> {
+        let Some(mgr) = &self.dashboard_manager else {
+            return Ok(None);
+        };
+        let mut guard = mgr
+            .lock()
+            .map_err(|e| QueryError::QueryFailed(format!("dashboard lock poisoned: {e}")))?;
+        Ok(Some(guard.snapshot()))
     }
 }
 

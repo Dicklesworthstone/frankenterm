@@ -765,6 +765,17 @@ impl<Q: QueryClient> App<Q> {
             }
         }
 
+        // Refresh unified dashboard state (cost, rate limits, backpressure, quota)
+        match self.query_client.dashboard_state() {
+            Ok(state) => {
+                self.view_state.dashboard = state;
+            }
+            Err(e) => {
+                tracing::debug!("Dashboard state unavailable: {e}");
+                // Non-fatal: dashboard is optional; leave previous state or None
+            }
+        }
+
         self.last_refresh = Instant::now();
     }
 
@@ -2373,6 +2384,166 @@ mod tests {
         assert!(
             text.contains("Watcher") || text.contains("watcher") || text.contains("Panes"),
             "Home view should show health/status info"
+        );
+    }
+
+    // ---- Dashboard refresh integration tests ----
+
+    fn make_test_dashboard_state() -> crate::dashboard::DashboardState {
+        use crate::cost_tracker::{
+            AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary,
+            ProviderCostSummary,
+        };
+        use crate::dashboard::DashboardManager;
+
+        let mut mgr = DashboardManager::new();
+        mgr.update_costs(CostDashboardSnapshot {
+            providers: vec![ProviderCostSummary {
+                agent_type: "openai".to_string(),
+                total_tokens: 50_000,
+                total_cost_usd: 2.50,
+                pane_count: 3,
+                record_count: 10,
+            }],
+            panes: vec![PaneCostSummary {
+                pane_id: 1,
+                agent_type: "openai".to_string(),
+                total_tokens: 50_000,
+                total_cost_usd: 2.50,
+                record_count: 10,
+                last_updated_ms: 1000,
+            }],
+            alerts: vec![BudgetAlert {
+                agent_type: "openai".to_string(),
+                current_cost_usd: 2.50,
+                budget_limit_usd: 100.0,
+                usage_fraction: 0.025,
+                severity: AlertSeverity::Warning,
+            }],
+            grand_total_cost_usd: 2.50,
+            grand_total_tokens: 50_000,
+        });
+        mgr.snapshot()
+    }
+
+    /// QueryClient that provides dashboard data.
+    struct DashboardQueryClient;
+
+    impl QueryClient for DashboardQueryClient {
+        fn list_panes(&self) -> Result<Vec<PaneView>, QueryError> {
+            Ok(vec![PaneView {
+                pane_id: 1,
+                title: "agent".to_string(),
+                domain: "local".to_string(),
+                cwd: None,
+                is_excluded: false,
+                agent_type: Some("openai".to_string()),
+                pane_state: "PromptActive".to_string(),
+                last_activity_ts: None,
+                unhandled_event_count: 0,
+            }])
+        }
+
+        fn list_events(&self, _: &EventFilters) -> Result<Vec<EventView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn list_triage_items(
+            &self,
+        ) -> Result<Vec<crate::tui::query::TriageItemView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn search(&self, _: &str, _: usize) -> Result<Vec<SearchResultView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn health(&self) -> Result<HealthStatus, QueryError> {
+            Ok(HealthStatus {
+                watcher_running: true,
+                db_accessible: true,
+                wezterm_accessible: true,
+                wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus::default(),
+                pane_count: 1,
+                event_count: 0,
+                last_capture_ts: None,
+            })
+        }
+
+        fn is_watcher_running(&self) -> bool {
+            true
+        }
+
+        fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
+            Ok(())
+        }
+
+        fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn dashboard_state(
+            &self,
+        ) -> Result<Option<crate::dashboard::DashboardState>, QueryError> {
+            Ok(Some(make_test_dashboard_state()))
+        }
+    }
+
+    #[test]
+    fn refresh_data_populates_dashboard_state() {
+        let mut app = App::new(DashboardQueryClient, AppConfig::default());
+        assert!(app.view_state.dashboard.is_none());
+
+        app.refresh_data();
+
+        let ds = app
+            .view_state
+            .dashboard
+            .as_ref()
+            .expect("dashboard should be Some after refresh");
+        // Warning-level alert (non-blocking) → Yellow overall health
+        assert_eq!(ds.overall_health, crate::dashboard::SystemHealthTier::Yellow);
+        assert!(!ds.costs.providers.is_empty());
+        assert_eq!(ds.costs.total_tokens, 50_000);
+    }
+
+    #[test]
+    fn refresh_data_leaves_dashboard_none_when_not_available() {
+        let mut app = App::new(TestQueryClient, AppConfig::default());
+        app.refresh_data();
+        // TestQueryClient uses default dashboard_state() → Ok(None)
+        assert!(app.view_state.dashboard.is_none());
+    }
+
+    #[test]
+    fn dashboard_panels_render_after_refresh() {
+        let mut app = App::new(DashboardQueryClient, AppConfig::default());
+        app.refresh_data();
+
+        // Render the home view at a size large enough to show dashboard
+        let area = Rect::new(0, 0, 120, 50);
+        let mut buf = Buffer::empty(area);
+        render_home_view(&app.view_state, area, &mut buf);
+
+        // Extract rendered text
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                text.push(
+                    buf.cell((x, y))
+                        .map_or(' ', |c| c.symbol().chars().next().unwrap_or(' ')),
+                );
+            }
+            text.push('\n');
+        }
+
+        // Dashboard should show cost data
+        assert!(
+            text.contains("openai")
+                || text.contains("$2.50")
+                || text.contains("50000")
+                || text.contains("Cost"),
+            "Dashboard panels should render cost data from QueryClient. Got:\n{text}"
         );
     }
 }
