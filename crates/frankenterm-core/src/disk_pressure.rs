@@ -599,6 +599,7 @@ fn classify_tier(usage_fraction: f64, thresholds: PressureThresholds) -> DiskPre
 }
 
 #[cfg(unix)]
+#[allow(clippy::useless_conversion)] // u64::from() is intentional for 32-bit platform compat
 fn read_disk_space_statvfs(path: &Path) -> Option<(u64, u64)> {
     let vfs = statvfs(path).ok()?;
     let block_size = u64::from(vfs.fragment_size().max(1));
