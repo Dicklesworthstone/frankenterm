@@ -87,7 +87,7 @@ impl Default for InterceptConfig {
 // =============================================================================
 
 /// Required context bounds for a reflex to be executable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextBounds {
     /// Required CWD prefix (e.g., `/app/` or `/home/user/project`).
     /// Empty means any CWD is acceptable.
@@ -103,17 +103,6 @@ pub struct ContextBounds {
     pub min_pane_rows: u16,
 }
 
-impl Default for ContextBounds {
-    fn default() -> Self {
-        Self {
-            cwd_prefix: String::new(),
-            required_env: HashMap::new(),
-            required_shell: String::new(),
-            min_pane_cols: 0,
-            min_pane_rows: 0,
-        }
-    }
-}
 
 /// Current pane context for gate evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -431,7 +431,7 @@ pub(super) async fn record_mcp_audit(
 /// Opens a StorageHandle, records the audit, and closes it.
 /// Fire-and-forget: errors are logged, never propagated.
 pub(super) fn record_mcp_audit_sync(
-    db_path: &PathBuf,
+    db_path: &Path,
     tool_name: &str,
     args: &serde_json::Value,
     ok: bool,

@@ -1405,10 +1405,11 @@ impl Outcome {
 }
 
 /// Lifecycle state for mission orchestration from planning to terminal outcomes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MissionLifecycleState {
     Planned,
+    #[default]
     Planning,
     Dispatching,
     AwaitingApproval,
@@ -1422,11 +1423,6 @@ pub enum MissionLifecycleState {
     Failed,
 }
 
-impl Default for MissionLifecycleState {
-    fn default() -> Self {
-        Self::Planning
-    }
-}
 
 impl fmt::Display for MissionLifecycleState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

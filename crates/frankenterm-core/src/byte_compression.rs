@@ -37,11 +37,12 @@ use serde::{Deserialize, Serialize};
 // =============================================================================
 
 /// Compression level preset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionLevel {
     /// Fast compression (zstd level 1). Best throughput, lowest ratio.
     Fast,
     /// Default compression (zstd level 3). Good balance.
+    #[default]
     Default,
     /// High compression (zstd level 9). Better ratio, slower.
     High,
@@ -62,11 +63,6 @@ impl CompressionLevel {
     }
 }
 
-impl Default for CompressionLevel {
-    fn default() -> Self {
-        Self::Default
-    }
-}
 
 /// Configuration for the byte compressor.
 #[derive(Debug, Clone, Serialize, Deserialize)]

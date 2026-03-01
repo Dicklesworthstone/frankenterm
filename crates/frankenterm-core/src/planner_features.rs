@@ -1015,7 +1015,7 @@ impl Default for GovernorConfig {
 }
 
 /// Tracks per-bead state for anti-thrash governance.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BeadGovernorState {
     /// When this bead was last assigned (cycle number).
     pub last_assigned_cycle: Option<u64>,
@@ -1027,16 +1027,6 @@ pub struct BeadGovernorState {
     pub last_agent_id: Option<String>,
 }
 
-impl Default for BeadGovernorState {
-    fn default() -> Self {
-        Self {
-            last_assigned_cycle: None,
-            consecutive_skipped: 0,
-            assignment_history: Vec::new(),
-            last_agent_id: None,
-        }
-    }
-}
 
 /// Actions the governor can impose on a candidate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1235,8 +1225,10 @@ impl ThrashGovernor {
         // Register newly seen beads.
         for bead_id in assigned_bead_ids {
             if !self.bead_states.contains_key(bead_id) {
-                let mut state = BeadGovernorState::default();
-                state.last_assigned_cycle = Some(self.current_cycle);
+                let mut state = BeadGovernorState {
+                    last_assigned_cycle: Some(self.current_cycle),
+                    ..BeadGovernorState::default()
+                };
                 state.assignment_history.push(true);
                 self.bead_states.insert(bead_id.clone(), state);
             }
