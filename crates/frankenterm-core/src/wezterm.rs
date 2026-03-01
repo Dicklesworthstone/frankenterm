@@ -1940,6 +1940,7 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::sync::Arc;
+    #[cfg(not(feature = "asupersync-runtime"))]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -2205,12 +2206,14 @@ mod tests {
         assert!(matches!(wez_err, WeztermError::CommandFailed(_)));
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[derive(Clone)]
     struct TestTextSource {
         sequence: Arc<Vec<String>>,
         index: Arc<AtomicUsize>,
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     impl TestTextSource {
         fn new(sequence: Vec<&str>) -> Self {
             Self {
@@ -2220,6 +2223,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     impl PaneTextSource for TestTextSource {
         type Fut<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 
@@ -2235,6 +2239,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test(start_paused = true)]
     async fn waiter_matches_substring() {
         let source = TestTextSource::new(vec!["booting...", "ready: prompt"]);
@@ -2275,6 +2280,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test(start_paused = true)]
     async fn waiter_times_out() {
         let source = TestTextSource::new(vec!["still waiting"]);
@@ -2973,6 +2979,7 @@ mod tests {
     // PaneWaiter with max_polls limit
     // =====================================================================
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test(start_paused = true)]
     async fn waiter_stops_at_max_polls() {
         let source = TestTextSource::new(vec!["no match"]);

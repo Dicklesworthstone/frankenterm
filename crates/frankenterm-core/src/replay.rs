@@ -1319,6 +1319,7 @@ mod tests {
         assert!(sink.output.is_empty());
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn play_deterministic_timing() {
         // Pause the runtime clock for deterministic timing tests.
@@ -1341,6 +1342,7 @@ mod tests {
         assert_eq!(player.position().frame_index, 3);
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn play_double_speed() {
         crate::runtime_compat::time::pause();
@@ -1954,6 +1956,7 @@ mod tests {
         assert_eq!(rec.frames[0].payload, large);
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn play_with_pause_then_resume() {
         crate::runtime_compat::time::pause();

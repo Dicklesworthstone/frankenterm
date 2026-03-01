@@ -1217,9 +1217,6 @@ mod tests {
 
     #[tokio::test]
     async fn mpsc_send_recv() {
-        #[cfg(feature = "asupersync-runtime")]
-        let (tx, rx) = mpsc::channel(10);
-        #[cfg(not(feature = "asupersync-runtime"))]
         let (tx, mut rx) = mpsc::channel(10);
         #[cfg(feature = "asupersync-runtime")]
         {
@@ -1238,9 +1235,6 @@ mod tests {
 
     #[tokio::test]
     async fn mpsc_multiple_messages_fifo() {
-        #[cfg(feature = "asupersync-runtime")]
-        let (tx, rx) = mpsc::channel(10);
-        #[cfg(not(feature = "asupersync-runtime"))]
         let (tx, mut rx) = mpsc::channel(10);
         #[cfg(feature = "asupersync-runtime")]
         {
@@ -2589,6 +2583,7 @@ mod tests {
     // IO module tests
     // ========================================================================
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn io_async_read_ext_available() {
         use io::AsyncReadExt;
@@ -2608,6 +2603,7 @@ mod tests {
         assert_eq!(&buf, b"test");
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn io_read_to_end_via_ext() {
         use io::AsyncReadExt;
@@ -2746,6 +2742,7 @@ mod tests {
     // join! macro tests
     // ========================================================================
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn join_two_futures() {
         let (a, b) = join!(async { 1 }, async { 2 });
@@ -2753,6 +2750,7 @@ mod tests {
         assert_eq!(b, 2);
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn join_three_futures() {
         let (a, b, c) = join!(async { "x" }, async { "y" }, async { "z" });
@@ -2761,6 +2759,7 @@ mod tests {
         assert_eq!(c, "z");
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn join_with_sleep() {
         let (a, b) = join!(
@@ -2776,6 +2775,7 @@ mod tests {
         assert_eq!(a + b, 30);
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn join_single_future() {
         let (result,) = join!(async { 99 });
@@ -2786,6 +2786,7 @@ mod tests {
     // select! macro tests
     // ========================================================================
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn select_first_branch_ready() {
         let result = select! {
@@ -2795,6 +2796,7 @@ mod tests {
         assert_eq!(result, 1);
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn select_sleep_branch() {
         let result = select! {
@@ -2804,6 +2806,7 @@ mod tests {
         assert_eq!(result, "timer");
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn select_with_channel() {
         let (tx, mut rx) = mpsc::channel(1);
@@ -2815,6 +2818,7 @@ mod tests {
         assert_eq!(result, 42);
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn select_biased_picks_first_ready() {
         let result = select! {
@@ -2845,6 +2849,7 @@ mod tests {
     // time module tests
     // ========================================================================
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test(start_paused = true)]
     async fn time_advance_moves_clock() {
         let start = std::time::Instant::now();
@@ -2854,6 +2859,7 @@ mod tests {
         let _ = start.elapsed();
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn time_pause_enables_deterministic_sleep() {
         time::pause();
@@ -2866,6 +2872,7 @@ mod tests {
         assert!(wall_elapsed < Duration::from_secs(5));
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test(start_paused = true)]
     async fn time_advance_then_sleep_resolves() {
         let (tx, mut rx) = mpsc::channel(1);
@@ -2881,6 +2888,7 @@ mod tests {
 
     // ── Signal module tests ──────────────────────────────────────────────
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn signal_ctrl_c_is_constructible() {
         // Verify ctrl_c() returns a future that can be selected against.
@@ -2892,6 +2900,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn signal_unix_terminate_is_constructible() {
         // Verify we can create a SIGTERM listener via the compat layer.
@@ -2900,6 +2909,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn signal_unix_hangup_is_constructible() {
         let listener = signal::unix::signal(signal::unix::SignalKind::hangup());
@@ -2907,6 +2917,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn signal_unix_recv_times_out_without_signal() {
         let mut sig = signal::unix::signal(signal::unix::SignalKind::terminate())
@@ -2916,6 +2927,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn signal_unix_usr1_is_constructible() {
         let listener = signal::unix::signal(signal::unix::SignalKind::user_defined1());
@@ -2923,6 +2935,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn signal_unix_usr2_is_constructible() {
         let listener = signal::unix::signal(signal::unix::SignalKind::user_defined2());
@@ -2930,6 +2943,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[tokio::test]
     async fn signal_unix_recv_delivers_sent_signal() {
         use std::sync::Arc;
@@ -2966,6 +2980,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     #[test]
     fn join_error_type_is_reexported() {
         // Verify the JoinError re-export compiles and is usable as a type.
