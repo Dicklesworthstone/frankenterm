@@ -18,7 +18,7 @@ use common::fixtures::RuntimeFixture;
 use frankenterm_core::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use frankenterm_core::error::Error;
 use frankenterm_core::retry::{
-    RetryPolicy, RetryOutcome, with_retry, with_retry_and_circuit, with_retry_outcome,
+    RetryOutcome, RetryPolicy, with_retry, with_retry_and_circuit, with_retry_outcome,
     with_smart_retry,
 };
 use std::sync::Arc;

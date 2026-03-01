@@ -13,12 +13,10 @@
 mod common;
 
 use asupersync::Budget;
-use common::fixtures::{
-    MockPool, RuntimeFixture, healthy_cx, timeout_cx,
-};
+use common::fixtures::{MockPool, RuntimeFixture, healthy_cx, timeout_cx};
 use common::lab::{
-    ChaosTestConfig, ExplorationTestConfig, LabTestConfig,
-    run_chaos_test, run_exploration_test, run_lab_test, run_lab_test_simple,
+    ChaosTestConfig, ExplorationTestConfig, LabTestConfig, run_chaos_test, run_exploration_test,
+    run_lab_test, run_lab_test_simple,
 };
 use frankenterm_core::pool::{Pool, PoolConfig, PoolError};
 use std::sync::Arc;
@@ -358,10 +356,7 @@ fn lab_mock_pool_basic_lifecycle() {
                 pool_c.release(&cx, conn).await.expect("release");
             })
             .expect("create task");
-        runtime
-            .scheduler
-            .lock()
-            .schedule(task_id, 0);
+        runtime.scheduler.lock().schedule(task_id, 0);
         runtime.run_until_quiescent();
 
         assert_eq!(pool.total_acquired(), 1);
@@ -394,10 +389,7 @@ fn lab_mock_pool_concurrent_acquire_release() {
                         pool_c.release(&cx, conn).await.expect("release");
                     })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             runtime.run_until_quiescent();
@@ -440,10 +432,7 @@ fn lab_mock_pool_cancelled_acquire() {
                 pool_c.release(&cx, conn).await.expect("release");
             })
             .expect("create task");
-        runtime
-            .scheduler
-            .lock()
-            .schedule(task_id, 0);
+        runtime.scheduler.lock().schedule(task_id, 0);
         runtime.run_until_quiescent();
     });
     assert!(report.passed());
@@ -479,10 +468,7 @@ fn exploration_mock_pool_acquire_release_ordering() {
                     pool_c.release(&cx, conn).await.expect("release");
                 })
                 .expect("create task");
-            runtime
-                .scheduler
-                .lock()
-                .schedule(task_id, 0);
+            runtime.scheduler.lock().schedule(task_id, 0);
         }
 
         runtime.run_until_quiescent();
@@ -494,17 +480,10 @@ fn exploration_mock_pool_acquire_release_ordering() {
             "all tasks must complete under any schedule"
         );
         // Invariant: all permits returned
-        assert_eq!(
-            pool.available_permits(),
-            2,
-            "all permits must be returned"
-        );
+        assert_eq!(pool.available_permits(), 2, "all permits must be returned");
     });
     assert!(report.passed());
-    assert!(
-        report.total_runs >= 5,
-        "should explore multiple schedules"
-    );
+    assert!(report.total_runs >= 5, "should explore multiple schedules");
 }
 
 // ===========================================================================
@@ -532,10 +511,7 @@ fn chaos_mock_pool_survives_faults() {
                     }
                 })
                 .expect("create task");
-            runtime
-                .scheduler
-                .lock()
-                .schedule(task_id, 0);
+            runtime.scheduler.lock().schedule(task_id, 0);
         }
 
         runtime.run_until_quiescent();
@@ -566,10 +542,7 @@ fn chaos_mock_pool_heavy_fault_injection() {
                     }
                 })
                 .expect("create task");
-            runtime
-                .scheduler
-                .lock()
-                .schedule(task_id, 0);
+            runtime.scheduler.lock().schedule(task_id, 0);
         }
 
         runtime.run_until_quiescent();
@@ -584,10 +557,8 @@ fn chaos_mock_pool_heavy_fault_injection() {
 #[test]
 fn multi_seed_mock_pool_invariants() {
     let seeds = [1, 42, 99, 256, 1000, 9999];
-    let reports = common::lab::run_multi_seed_test(
-        "pool_multi_seed_invariants",
-        &seeds,
-        |runtime| {
+    let reports =
+        common::lab::run_multi_seed_test("pool_multi_seed_invariants", &seeds, |runtime| {
             let region = runtime.state.create_root_region(Budget::INFINITE);
             let pool = Arc::new(MockPool::new(2));
             let acquired_count = Arc::new(AtomicU64::new(0));
@@ -605,10 +576,7 @@ fn multi_seed_mock_pool_invariants() {
                         pool_c.release(&cx, conn).await.expect("release");
                     })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
 
             runtime.run_until_quiescent();
@@ -616,8 +584,7 @@ fn multi_seed_mock_pool_invariants() {
             // Invariants hold across all seeds
             assert_eq!(acquired_count.load(Ordering::SeqCst), 4);
             assert_eq!(pool.available_permits(), 2);
-        },
-    );
+        });
     assert_eq!(reports.len(), seeds.len());
     for report in &reports {
         assert!(report.passed());

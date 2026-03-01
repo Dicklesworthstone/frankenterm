@@ -1,3 +1,4 @@
+#![cfg(feature = "disk-pressure")]
 //! Property-based tests for the disk_pressure module
 //!
 //! Tests: DiskPressureTier ordering, PressureThresholds normalization,
