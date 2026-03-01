@@ -2557,3 +2557,638 @@ pub fn is_fallback_result(result: &StepResult) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // HandleSessionEnd::record_from_detection
+    // ========================================================================
+
+    #[test]
+    fn record_from_detection_extracts_all_fields() {
+        let detection = serde_json::json!({
+            "agent_type": "codex",
+            "event_type": "session.summary",
+            "extracted": {
+                "session_id": "abc-123",
+                "total": "10,000",
+                "input": "5,000",
+                "output": "3,000",
+                "cached": "1,500",
+                "reasoning": "500",
+                "cost": "0.42",
+                "model": "o3-pro"
+            }
+        });
+
+        let record = HandleSessionEnd::record_from_detection(42, &detection);
+        assert_eq!(record.pane_id, 42);
+        assert_eq!(record.agent_type, "codex");
+        assert_eq!(record.session_id.as_deref(), Some("abc-123"));
+        assert_eq!(record.total_tokens, Some(10_000));
+        assert_eq!(record.input_tokens, Some(5_000));
+        assert_eq!(record.output_tokens, Some(3_000));
+        assert_eq!(record.cached_tokens, Some(1_500));
+        assert_eq!(record.reasoning_tokens, Some(500));
+        assert!((record.estimated_cost_usd.unwrap() - 0.42).abs() < f64::EPSILON);
+        assert_eq!(record.model_name.as_deref(), Some("o3-pro"));
+        assert_eq!(record.end_reason.as_deref(), Some("completed"));
+        assert!(record.ended_at.is_some());
+    }
+
+    #[test]
+    fn record_from_detection_handles_missing_extracted() {
+        let detection = serde_json::json!({
+            "agent_type": "gemini",
+            "event_type": "session.end"
+        });
+
+        let record = HandleSessionEnd::record_from_detection(10, &detection);
+        assert_eq!(record.pane_id, 10);
+        assert_eq!(record.agent_type, "gemini");
+        assert_eq!(record.end_reason.as_deref(), Some("completed"));
+        assert!(record.session_id.is_none());
+        assert!(record.total_tokens.is_none());
+        assert!(record.model_name.is_none());
+    }
+
+    #[test]
+    fn record_from_detection_unknown_event_type() {
+        let detection = serde_json::json!({
+            "event_type": "session.crash"
+        });
+
+        let record = HandleSessionEnd::record_from_detection(1, &detection);
+        assert_eq!(record.agent_type, "unknown");
+        assert_eq!(record.end_reason.as_deref(), Some("session.crash"));
+    }
+
+    #[test]
+    fn record_from_detection_partial_token_fields() {
+        let detection = serde_json::json!({
+            "agent_type": "claude_code",
+            "event_type": "session.summary",
+            "extracted": {
+                "total": "1000",
+                "cost": "not_a_number"
+            }
+        });
+
+        let record = HandleSessionEnd::record_from_detection(5, &detection);
+        assert_eq!(record.total_tokens, Some(1000));
+        assert!(record.input_tokens.is_none());
+        assert!(record.estimated_cost_usd.is_none()); // "not_a_number" fails parse
+    }
+
+    // ========================================================================
+    // HandleSessionEnd trait methods
+    // ========================================================================
+
+    #[test]
+    fn handle_session_end_name_and_description() {
+        let h = HandleSessionEnd::new();
+        assert_eq!(h.name(), "handle_session_end");
+        assert!(!h.description().is_empty());
+    }
+
+    #[test]
+    fn handle_session_end_trigger_event_types() {
+        let h = HandleSessionEnd::new();
+        let types = h.trigger_event_types();
+        assert!(types.contains(&"session.summary"));
+        assert!(types.contains(&"session.end"));
+    }
+
+    #[test]
+    fn handle_session_end_supported_agent_types() {
+        let h = HandleSessionEnd::new();
+        let agents = h.supported_agent_types();
+        assert!(agents.contains(&"codex"));
+        assert!(agents.contains(&"claude_code"));
+        assert!(agents.contains(&"gemini"));
+    }
+
+    #[test]
+    fn handle_session_end_is_not_destructive() {
+        let h = HandleSessionEnd::new();
+        assert!(!h.is_destructive());
+        assert!(!h.requires_approval());
+        assert!(h.requires_pane());
+    }
+
+    #[test]
+    fn handle_session_end_has_two_steps() {
+        let h = HandleSessionEnd::new();
+        let steps = h.steps();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].name, "extract_summary");
+        assert_eq!(steps[1].name, "persist_record");
+    }
+
+    // ========================================================================
+    // ResumeSessionConfig defaults
+    // ========================================================================
+
+    #[test]
+    fn resume_session_config_default() {
+        let config = ResumeSessionConfig::default();
+        assert!(config.resume_command_template.contains("{session_id}"));
+        assert_eq!(config.proceed_text, "proceed.\n");
+        assert_eq!(config.post_resume_stable_ms, 3_000);
+        assert_eq!(config.post_proceed_stable_ms, 5_000);
+        assert_eq!(config.resume_timeout_ms, 30_000);
+        assert_eq!(config.proceed_timeout_ms, 30_000);
+    }
+
+    // ========================================================================
+    // format_resume_command
+    // ========================================================================
+
+    #[test]
+    fn format_resume_command_substitutes_session_id() {
+        let config = ResumeSessionConfig::default();
+        let cmd = format_resume_command("abc-def-123", &config);
+        assert!(cmd.contains("abc-def-123"));
+        assert!(!cmd.contains("{session_id}"));
+    }
+
+    #[test]
+    fn format_resume_command_custom_template() {
+        let config = ResumeSessionConfig {
+            resume_command_template: "resume --session={session_id} --force\n".to_string(),
+            ..Default::default()
+        };
+        let cmd = format_resume_command("sess-42", &config);
+        assert_eq!(cmd, "resume --session=sess-42 --force\n");
+    }
+
+    #[test]
+    fn format_resume_command_no_placeholder() {
+        let config = ResumeSessionConfig {
+            resume_command_template: "static_command\n".to_string(),
+            ..Default::default()
+        };
+        let cmd = format_resume_command("ignored", &config);
+        assert_eq!(cmd, "static_command\n");
+    }
+
+    // ========================================================================
+    // validate_session_id
+    // ========================================================================
+
+    #[test]
+    fn validate_session_id_valid_uuid() {
+        assert!(validate_session_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890"));
+    }
+
+    #[test]
+    fn validate_session_id_short_hex() {
+        assert!(validate_session_id("abcdef12"));
+    }
+
+    #[test]
+    fn validate_session_id_too_short() {
+        assert!(!validate_session_id("abc"));
+        assert!(!validate_session_id("1234567")); // 7 chars
+    }
+
+    #[test]
+    fn validate_session_id_exactly_eight() {
+        assert!(validate_session_id("12345678"));
+    }
+
+    #[test]
+    fn validate_session_id_non_hex_chars() {
+        assert!(!validate_session_id("abcdefg1-2345-6789")); // 'g' is not hex
+    }
+
+    #[test]
+    fn validate_session_id_empty() {
+        assert!(!validate_session_id(""));
+    }
+
+    #[test]
+    fn validate_session_id_whitespace_trimmed() {
+        assert!(validate_session_id("  abcdef12  "));
+    }
+
+    #[test]
+    fn validate_session_id_special_chars() {
+        assert!(!validate_session_id("abc!def@12345678"));
+    }
+
+    // ========================================================================
+    // build_resume_step_result
+    // ========================================================================
+
+    #[test]
+    fn build_resume_step_result_is_send_text() {
+        let config = ResumeSessionConfig::default();
+        let result = build_resume_step_result("sess-123", &config);
+        match &result {
+            StepResult::SendText { text, wait_for, wait_timeout_ms } => {
+                assert!(text.contains("sess-123"));
+                assert!(wait_for.is_some());
+                assert_eq!(*wait_timeout_ms, Some(config.resume_timeout_ms));
+            }
+            other => panic!("Expected SendText, got {other:?}"),
+        }
+    }
+
+    // ========================================================================
+    // build_proceed_step_result
+    // ========================================================================
+
+    #[test]
+    fn build_proceed_step_result_sends_proceed_text() {
+        let config = ResumeSessionConfig::default();
+        let result = build_proceed_step_result(&config);
+        match &result {
+            StepResult::SendText { text, wait_for, wait_timeout_ms } => {
+                assert_eq!(text, "proceed.\n");
+                assert!(wait_for.is_some());
+                assert_eq!(*wait_timeout_ms, Some(config.proceed_timeout_ms));
+            }
+            other => panic!("Expected SendText, got {other:?}"),
+        }
+    }
+
+    // ========================================================================
+    // resume_outcome_to_step_result
+    // ========================================================================
+
+    #[test]
+    fn resume_outcome_ready_returns_done() {
+        let outcome = ResumeSessionOutcome::Ready {
+            session_id: "sess-1".to_string(),
+        };
+        let result = resume_outcome_to_step_result(&outcome);
+        match &result {
+            StepResult::Done { result } => {
+                assert_eq!(result["status"], "ready");
+                assert_eq!(result["session_id"], "sess-1");
+            }
+            other => panic!("Expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_outcome_timeout_returns_done() {
+        let outcome = ResumeSessionOutcome::VerifyTimeout {
+            session_id: "sess-2".to_string(),
+            phase: "resume".to_string(),
+            waited_ms: 30_000,
+        };
+        let result = resume_outcome_to_step_result(&outcome);
+        match &result {
+            StepResult::Done { result } => {
+                assert_eq!(result["status"], "timeout");
+                assert_eq!(result["phase"], "resume");
+            }
+            other => panic!("Expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_outcome_failed_returns_abort() {
+        let outcome = ResumeSessionOutcome::Failed {
+            error: "connection lost".to_string(),
+        };
+        let result = resume_outcome_to_step_result(&outcome);
+        match &result {
+            StepResult::Abort { reason } => {
+                assert!(reason.contains("connection lost"));
+            }
+            other => panic!("Expected Abort, got {other:?}"),
+        }
+    }
+
+    // ========================================================================
+    // FallbackReason Display
+    // ========================================================================
+
+    #[test]
+    fn fallback_reason_needs_human_auth_display() {
+        let reason = FallbackReason::NeedsHumanAuth {
+            account: "openai-team".to_string(),
+            detail: "MFA required".to_string(),
+        };
+        let s = reason.to_string();
+        assert!(s.contains("openai-team"));
+        assert!(s.contains("MFA required"));
+    }
+
+    #[test]
+    fn fallback_reason_failover_disabled_display() {
+        let reason = FallbackReason::FailoverDisabled;
+        assert!(reason.to_string().contains("disabled"));
+    }
+
+    #[test]
+    fn fallback_reason_tool_missing_display() {
+        let reason = FallbackReason::ToolMissing {
+            tool: "playwright".to_string(),
+        };
+        assert!(reason.to_string().contains("playwright"));
+    }
+
+    #[test]
+    fn fallback_reason_policy_denied_display() {
+        let reason = FallbackReason::PolicyDenied {
+            rule: "alt_screen_active".to_string(),
+        };
+        assert!(reason.to_string().contains("alt_screen_active"));
+    }
+
+    #[test]
+    fn fallback_reason_all_accounts_exhausted_display() {
+        let reason = FallbackReason::AllAccountsExhausted {
+            accounts_checked: 3,
+        };
+        let s = reason.to_string();
+        assert!(s.contains("3"));
+        assert!(s.contains("limit"));
+    }
+
+    #[test]
+    fn fallback_reason_other_display() {
+        let reason = FallbackReason::Other {
+            detail: "unexpected condition".to_string(),
+        };
+        assert_eq!(reason.to_string(), "unexpected condition");
+    }
+
+    // ========================================================================
+    // FallbackReason serde roundtrip
+    // ========================================================================
+
+    #[test]
+    fn fallback_reason_serde_roundtrip() {
+        let variants = vec![
+            FallbackReason::NeedsHumanAuth {
+                account: "acct".to_string(),
+                detail: "mfa".to_string(),
+            },
+            FallbackReason::FailoverDisabled,
+            FallbackReason::ToolMissing {
+                tool: "caut".to_string(),
+            },
+            FallbackReason::PolicyDenied {
+                rule: "rule1".to_string(),
+            },
+            FallbackReason::AllAccountsExhausted {
+                accounts_checked: 5,
+            },
+            FallbackReason::Other {
+                detail: "misc".to_string(),
+            },
+        ];
+
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: FallbackReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant.to_string(), back.to_string());
+        }
+    }
+
+    // ========================================================================
+    // build_needs_human_auth_plan
+    // ========================================================================
+
+    #[test]
+    fn build_needs_human_auth_plan_basic() {
+        let plan = build_needs_human_auth_plan(42, "openai-team", "MFA needed", None, None, 1000);
+        assert_eq!(plan.version, FallbackNextStepPlan::CURRENT_VERSION);
+        assert_eq!(plan.pane_id, 42);
+        assert_eq!(plan.created_at_ms, 1000);
+        assert!(plan.resume_session_id.is_none());
+        assert!(plan.retry_after_ms.is_none());
+        assert_eq!(plan.account_id.as_deref(), Some("openai-team"));
+        assert!(!plan.operator_steps.is_empty());
+        assert!(plan.operator_steps[0].contains("bootstrap"));
+    }
+
+    #[test]
+    fn build_needs_human_auth_plan_with_session_and_retry() {
+        let plan = build_needs_human_auth_plan(
+            42,
+            "openai-team",
+            "MFA needed",
+            Some("sess-abc"),
+            Some(999_999),
+            2000,
+        );
+        assert_eq!(plan.resume_session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(plan.retry_after_ms, Some(999_999));
+        // Should have extra operator steps for resume and retry
+        assert!(plan.operator_steps.len() >= 3);
+        assert!(plan.operator_steps.iter().any(|s| s.contains("resume")));
+    }
+
+    // ========================================================================
+    // build_failover_disabled_plan
+    // ========================================================================
+
+    #[test]
+    fn build_failover_disabled_plan_basic() {
+        let plan = build_failover_disabled_plan(10, None, None, 3000);
+        assert_eq!(plan.pane_id, 10);
+        assert!(plan.account_id.is_none());
+        match &plan.reason {
+            FallbackReason::FailoverDisabled => {}
+            other => panic!("Expected FailoverDisabled, got {other:?}"),
+        }
+        assert!(plan.suggested_commands.iter().any(|s| s.contains("config")));
+    }
+
+    #[test]
+    fn build_failover_disabled_plan_with_resume() {
+        let plan = build_failover_disabled_plan(10, Some("sess-xyz"), None, 3000);
+        assert_eq!(plan.resume_session_id.as_deref(), Some("sess-xyz"));
+        assert!(plan.operator_steps.iter().any(|s| s.contains("resume")));
+    }
+
+    // ========================================================================
+    // build_tool_missing_plan
+    // ========================================================================
+
+    #[test]
+    fn build_tool_missing_plan_basic() {
+        let plan = build_tool_missing_plan(99, "playwright", 5000);
+        assert_eq!(plan.pane_id, 99);
+        assert_eq!(plan.created_at_ms, 5000);
+        match &plan.reason {
+            FallbackReason::ToolMissing { tool } => assert_eq!(tool, "playwright"),
+            other => panic!("Expected ToolMissing, got {other:?}"),
+        }
+        assert!(plan.operator_steps[0].contains("playwright"));
+        assert!(plan.resume_session_id.is_none());
+        assert!(plan.retry_after_ms.is_none());
+    }
+
+    // ========================================================================
+    // build_all_accounts_exhausted_plan
+    // ========================================================================
+
+    #[test]
+    fn build_all_accounts_exhausted_plan_no_retry() {
+        let plan = build_all_accounts_exhausted_plan(7, 3, None, None, 6000);
+        assert_eq!(plan.pane_id, 7);
+        match &plan.reason {
+            FallbackReason::AllAccountsExhausted { accounts_checked } => {
+                assert_eq!(*accounts_checked, 3);
+            }
+            other => panic!("Expected AllAccountsExhausted, got {other:?}"),
+        }
+        assert!(plan.operator_steps.iter().any(|s| s.contains("accounts")));
+    }
+
+    #[test]
+    fn build_all_accounts_exhausted_plan_with_retry_and_session() {
+        let plan = build_all_accounts_exhausted_plan(7, 2, Some("sess-z"), Some(100_000), 6000);
+        assert_eq!(plan.retry_after_ms, Some(100_000));
+        assert_eq!(plan.resume_session_id.as_deref(), Some("sess-z"));
+        assert!(plan.suggested_commands.iter().any(|s| s.contains("resume")));
+    }
+
+    // ========================================================================
+    // fallback_plan_to_step_result
+    // ========================================================================
+
+    #[test]
+    fn fallback_plan_to_step_result_is_done_with_fallback_tag() {
+        let plan = build_tool_missing_plan(1, "caut", 1000);
+        let result = fallback_plan_to_step_result(&plan);
+        match &result {
+            StepResult::Done { result } => {
+                assert_eq!(result["fallback"], true);
+                assert_eq!(result["version"], 1);
+                assert_eq!(result["pane_id"], 1);
+            }
+            other => panic!("Expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_plan_preserves_reason_in_json() {
+        let plan = build_needs_human_auth_plan(5, "acct", "pw", None, None, 100);
+        let result = fallback_plan_to_step_result(&plan);
+        if let StepResult::Done { result } = &result {
+            assert_eq!(result["reason"]["kind"], "needs_human_auth");
+            assert_eq!(result["reason"]["account"], "acct");
+        }
+    }
+
+    // ========================================================================
+    // is_fallback_result
+    // ========================================================================
+
+    #[test]
+    fn is_fallback_result_true_for_fallback_plan() {
+        let plan = build_tool_missing_plan(1, "caut", 1000);
+        let result = fallback_plan_to_step_result(&plan);
+        assert!(is_fallback_result(&result));
+    }
+
+    #[test]
+    fn is_fallback_result_false_for_normal_done() {
+        let result = StepResult::Done {
+            result: serde_json::json!({"status": "ok"}),
+        };
+        assert!(!is_fallback_result(&result));
+    }
+
+    #[test]
+    fn is_fallback_result_false_for_abort() {
+        let result = StepResult::Abort {
+            reason: "error".to_string(),
+        };
+        assert!(!is_fallback_result(&result));
+    }
+
+    #[test]
+    fn is_fallback_result_false_for_continue() {
+        assert!(!is_fallback_result(&StepResult::Continue));
+    }
+
+    #[test]
+    fn is_fallback_result_false_for_done_without_fallback_key() {
+        let result = StepResult::Done {
+            result: serde_json::json!({}),
+        };
+        assert!(!is_fallback_result(&result));
+    }
+
+    #[test]
+    fn is_fallback_result_false_for_done_with_false_fallback() {
+        let result = StepResult::Done {
+            result: serde_json::json!({"fallback": false}),
+        };
+        assert!(!is_fallback_result(&result));
+    }
+
+    // ========================================================================
+    // FallbackNextStepPlan serde roundtrip
+    // ========================================================================
+
+    #[test]
+    fn fallback_plan_serde_roundtrip() {
+        let plan = build_needs_human_auth_plan(
+            42,
+            "acct-1",
+            "MFA needed",
+            Some("sess-42"),
+            Some(999_999),
+            12345,
+        );
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: FallbackNextStepPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.version, plan.version);
+        assert_eq!(back.pane_id, plan.pane_id);
+        assert_eq!(back.created_at_ms, plan.created_at_ms);
+        assert_eq!(back.resume_session_id, plan.resume_session_id);
+        assert_eq!(back.retry_after_ms, plan.retry_after_ms);
+        assert_eq!(back.operator_steps.len(), plan.operator_steps.len());
+    }
+
+    // ========================================================================
+    // ResumeSessionOutcome serde roundtrip
+    // ========================================================================
+
+    #[test]
+    fn resume_session_outcome_serde_roundtrip() {
+        let variants: Vec<ResumeSessionOutcome> = vec![
+            ResumeSessionOutcome::Ready {
+                session_id: "s1".to_string(),
+            },
+            ResumeSessionOutcome::VerifyTimeout {
+                session_id: "s2".to_string(),
+                phase: "proceed".to_string(),
+                waited_ms: 30_000,
+            },
+            ResumeSessionOutcome::Failed {
+                error: "conn err".to_string(),
+            },
+        ];
+
+        for variant in variants {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: ResumeSessionOutcome = serde_json::from_str(&json).unwrap();
+            // Verify the status tag survives roundtrip
+            let original_json: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let back_json = serde_json::to_value(&back).unwrap();
+            assert_eq!(original_json["status"], back_json["status"]);
+        }
+    }
+
+    // ========================================================================
+    // FALLBACK_HANDLED_STATUS constant
+    // ========================================================================
+
+    #[test]
+    fn fallback_handled_status_is_paused() {
+        assert_eq!(FALLBACK_HANDLED_STATUS, "paused");
+    }
+}
