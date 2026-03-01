@@ -568,6 +568,38 @@ impl DashboardState {
     pub fn paused_pane_count(&self) -> usize {
         self.backpressure.paused_pane_count
     }
+
+    /// Produce a compact summary suitable for status bars and one-line displays.
+    pub fn summary_line(&self) -> String {
+        let health = &self.overall_health;
+        let providers = self.costs.providers.len();
+        let limited = self.rate_limits.limited_provider_count;
+        let paused = self.backpressure.paused_pane_count;
+        let blocked = self.quota.blocked;
+
+        let mut parts = vec![format!("health={health}")];
+
+        if providers > 0 {
+            parts.push(format!(
+                "cost=${:.2}/{}tok",
+                self.costs.total_cost_usd, self.costs.total_tokens
+            ));
+        }
+
+        if limited > 0 {
+            parts.push(format!("rate_limited={limited}"));
+        }
+
+        if paused > 0 {
+            parts.push(format!("paused={paused}"));
+        }
+
+        if blocked > 0 {
+            parts.push(format!("blocked={blocked}"));
+        }
+
+        parts.join(" ")
+    }
 }
 
 // =============================================================================
@@ -975,5 +1007,54 @@ mod tests {
         assert_eq!(SystemHealthTier::Yellow.to_string(), "yellow");
         assert_eq!(SystemHealthTier::Red.to_string(), "red");
         assert_eq!(SystemHealthTier::Black.to_string(), "black");
+    }
+
+    // ── Summary line ────────────────────────────────────────────────
+
+    #[test]
+    fn summary_line_empty_manager() {
+        let mut mgr = DashboardManager::new();
+        let state = mgr.snapshot();
+        assert_eq!(state.summary_line(), "health=green");
+    }
+
+    #[test]
+    fn summary_line_with_all_data() {
+        let mut mgr = DashboardManager::new();
+        mgr.update_costs(sample_cost_snapshot());
+        mgr.update_rate_limits(vec![ProviderRateLimitSummary {
+            agent_type: "codex".to_string(),
+            status: ProviderRateLimitStatus::PartiallyLimited,
+            limited_pane_count: 2,
+            total_pane_count: 5,
+            earliest_clear_secs: 30,
+            total_events: 3,
+        }]);
+        mgr.update_backpressure(BackpressureSnapshot {
+            tier: BackpressureTier::Yellow,
+            timestamp_epoch_ms: 0,
+            capture_depth: 500,
+            capture_capacity: 1000,
+            write_depth: 0,
+            write_capacity: 1000,
+            duration_in_tier_ms: 0,
+            transitions: 0,
+            paused_panes: vec![1, 2],
+        });
+        mgr.update_quota(QuotaGateSnapshot {
+            telemetry: QuotaGateTelemetrySnapshot {
+                evaluations: 10,
+                allowed: 7,
+                warned: 1,
+                blocked: 2,
+            },
+        });
+        let state = mgr.snapshot();
+        let line = state.summary_line();
+        assert!(line.contains("health=yellow"), "got: {line}");
+        assert!(line.contains("cost=$60.00/70000tok"), "got: {line}");
+        assert!(line.contains("rate_limited=1"), "got: {line}");
+        assert!(line.contains("paused=2"), "got: {line}");
+        assert!(line.contains("blocked=2"), "got: {line}");
     }
 }
