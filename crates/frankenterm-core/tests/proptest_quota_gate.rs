@@ -157,10 +157,9 @@ proptest! {
 
         let decision = gate.evaluate(AgentType::Codex, &signals);
         // No budget warnings should appear for Codex
-        let budget_warnings: Vec<_> = decision.warnings.iter()
-            .filter(|w| matches!(w.source, WarningSource::Budget))
-            .collect();
-        prop_assert!(budget_warnings.is_empty(),
+        let has_budget_warning = decision.warnings.iter()
+            .any(|w| matches!(w.source, WarningSource::Budget));
+        prop_assert!(!has_budget_warning,
             "Budget alert for gemini should not affect codex evaluation");
     }
 
