@@ -35,7 +35,7 @@ const REQUIRED_COVERAGE_PATHS: &[&str] = &[
     "crates/frankenterm-core/tests/simulation_resize_suite.rs",
     "crates/frankenterm-core/src/screen_state.rs",
     "crates/frankenterm-core/src/ingest.rs",
-    "crates/frankenterm-core/src/workflows.rs",
+    "crates/frankenterm-core/src/workflows/mod.rs",
 ];
 
 fn workspace_root() -> PathBuf {
