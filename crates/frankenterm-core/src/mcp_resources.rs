@@ -582,3 +582,231 @@ impl ResourceHandler for WaReservationsByPaneTemplateResource {
         read_reservations_resource(ctx, &self.db_path, uri, Some(pane_id))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db_path() -> Arc<PathBuf> {
+        Arc::new(PathBuf::from("/tmp/test-mcp.db"))
+    }
+
+    // ========================================================================
+    // tool_output_as_resource Tests
+    // ========================================================================
+
+    #[test]
+    fn tool_output_as_resource_extracts_text() {
+        let contents = vec![Content::Text {
+            text: r#"{"ok":true}"#.to_string(),
+        }];
+        let result = tool_output_as_resource("wa://test", contents).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].uri, "wa://test");
+        assert_eq!(result[0].mime_type.as_deref(), Some("application/json"));
+        assert_eq!(result[0].text.as_deref(), Some(r#"{"ok":true}"#));
+        assert!(result[0].blob.is_none());
+    }
+
+    #[test]
+    fn tool_output_as_resource_empty_returns_error() {
+        let result = tool_output_as_resource("wa://test", vec![]);
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // envelope_as_resource Tests
+    // ========================================================================
+
+    #[test]
+    fn envelope_as_resource_serializes_to_json() {
+        let envelope = McpEnvelope::success("hello", 42);
+        let result = envelope_as_resource("wa://test", envelope).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].uri, "wa://test");
+        let parsed: serde_json::Value =
+            serde_json::from_str(result[0].text.as_ref().unwrap()).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["data"], "hello");
+    }
+
+    // ========================================================================
+    // Resource Definition Stability Tests
+    // ========================================================================
+
+    #[test]
+    fn panes_resource_definition_uri() {
+        let resource = WaPanesResource::new(PaneFilterConfig::default());
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://panes");
+        assert_eq!(def.mime_type.as_deref(), Some("application/json"));
+        assert!(def.tags.contains(&"wa".to_string()));
+        assert!(def.tags.contains(&"panes".to_string()));
+    }
+
+    #[test]
+    fn events_resource_definition_uri() {
+        let resource = WaEventsResource::new(db_path());
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://events");
+        assert!(def.tags.contains(&"events".to_string()));
+    }
+
+    #[test]
+    fn events_template_resource_has_template() {
+        let resource = WaEventsTemplateResource::new(db_path());
+        let template = resource.template().expect("should have template");
+        assert_eq!(template.uri_template, "wa://events/{limit}");
+    }
+
+    #[test]
+    fn events_unhandled_template_resource_has_template() {
+        let resource = WaEventsUnhandledTemplateResource::new(db_path());
+        let template = resource.template().expect("should have template");
+        assert_eq!(template.uri_template, "wa://events/unhandled/{limit}");
+        assert!(template.tags.contains(&"unhandled".to_string()));
+    }
+
+    #[test]
+    fn accounts_resource_definition_uri() {
+        let resource = WaAccountsResource::new(db_path());
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://accounts");
+        assert!(def.tags.contains(&"accounts".to_string()));
+    }
+
+    #[test]
+    fn accounts_by_service_template_has_template() {
+        let resource = WaAccountsByServiceTemplateResource::new(db_path());
+        let template = resource.template().expect("should have template");
+        assert_eq!(template.uri_template, "wa://accounts/{service}");
+    }
+
+    #[test]
+    fn rules_resource_definition_uri() {
+        let def = WaRulesResource.definition();
+        assert_eq!(def.uri, "wa://rules");
+        assert!(def.tags.contains(&"rules".to_string()));
+    }
+
+    #[test]
+    fn rules_by_agent_template_has_template() {
+        let template = WaRulesByAgentTemplateResource.template().expect("should have template");
+        assert_eq!(template.uri_template, "wa://rules/{agent_type}");
+    }
+
+    #[test]
+    fn workflows_resource_definition_uri() {
+        let resource = WaWorkflowsResource::new(Arc::new(Config::default()));
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://workflows");
+        assert!(def.tags.contains(&"workflows".to_string()));
+    }
+
+    #[test]
+    fn reservations_resource_definition_uri() {
+        let resource = WaReservationsResource::new(db_path());
+        let def = resource.definition();
+        assert_eq!(def.uri, "wa://reservations");
+        assert!(def.tags.contains(&"reservations".to_string()));
+    }
+
+    #[test]
+    fn reservations_by_pane_template_has_template() {
+        let resource = WaReservationsByPaneTemplateResource::new(db_path());
+        let template = resource.template().expect("should have template");
+        assert_eq!(template.uri_template, "wa://reservations/{pane_id}");
+    }
+
+    // ========================================================================
+    // All resource URIs are unique
+    // ========================================================================
+
+    #[test]
+    fn all_resource_uris_are_unique() {
+        let db = db_path();
+        let uris = [
+            WaPanesResource::new(PaneFilterConfig::default()).definition().uri,
+            WaEventsResource::new(Arc::clone(&db)).definition().uri,
+            WaEventsTemplateResource::new(Arc::clone(&db)).definition().uri,
+            WaEventsUnhandledTemplateResource::new(Arc::clone(&db)).definition().uri,
+            WaAccountsResource::new(Arc::clone(&db)).definition().uri,
+            WaAccountsByServiceTemplateResource::new(Arc::clone(&db)).definition().uri,
+            WaRulesResource.definition().uri,
+            WaRulesByAgentTemplateResource.definition().uri,
+            WaWorkflowsResource::new(Arc::new(Config::default())).definition().uri,
+            WaReservationsResource::new(Arc::clone(&db)).definition().uri,
+            WaReservationsByPaneTemplateResource::new(Arc::clone(&db)).definition().uri,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for uri in &uris {
+            assert!(seen.insert(uri.as_str()), "Duplicate URI: {uri}");
+        }
+    }
+
+    // ========================================================================
+    // All resource URIs use wa:// scheme
+    // ========================================================================
+
+    #[test]
+    fn all_resource_uris_use_wa_scheme() {
+        let db = db_path();
+        let uris = [
+            WaPanesResource::new(PaneFilterConfig::default()).definition().uri,
+            WaEventsResource::new(Arc::clone(&db)).definition().uri,
+            WaRulesResource.definition().uri,
+            WaWorkflowsResource::new(Arc::new(Config::default())).definition().uri,
+            WaReservationsResource::new(Arc::clone(&db)).definition().uri,
+        ];
+        for uri in &uris {
+            assert!(uri.starts_with("wa://"), "URI {uri} missing wa:// scheme");
+        }
+    }
+
+    // ========================================================================
+    // All definitions have JSON mime type
+    // ========================================================================
+
+    #[test]
+    fn all_definitions_have_json_mime_type() {
+        let db = db_path();
+        let defs = [
+            WaPanesResource::new(PaneFilterConfig::default()).definition(),
+            WaEventsResource::new(Arc::clone(&db)).definition(),
+            WaRulesResource.definition(),
+            WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaReservationsResource::new(Arc::clone(&db)).definition(),
+        ];
+        for def in &defs {
+            assert_eq!(
+                def.mime_type.as_deref(),
+                Some("application/json"),
+                "Resource {} missing JSON mime type",
+                def.uri
+            );
+        }
+    }
+
+    // ========================================================================
+    // All definitions have version
+    // ========================================================================
+
+    #[test]
+    fn all_definitions_have_version() {
+        let db = db_path();
+        let defs = [
+            WaPanesResource::new(PaneFilterConfig::default()).definition(),
+            WaEventsResource::new(Arc::clone(&db)).definition(),
+            WaRulesResource.definition(),
+            WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaReservationsResource::new(Arc::clone(&db)).definition(),
+        ];
+        for def in &defs {
+            assert!(
+                def.version.is_some(),
+                "Resource {} missing version",
+                def.uri
+            );
+        }
+    }
+}
