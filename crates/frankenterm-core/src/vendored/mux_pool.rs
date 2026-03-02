@@ -1634,9 +1634,35 @@ mod tests {
         });
     }
 
-    // NOTE: pool_batch_render_multiple_panes removed — triggers pre-existing
-    // UB in vendored codec (ptr::copy_nonoverlapping) when deserializing
-    // multiple concurrent render responses. Tracked as known issue.
+    // NOTE: pool_batch_render_multiple_panes was previously removed due to
+    // pre-existing UB in vendored codec (ptr::copy_nonoverlapping on
+    // overlapping buffer regions). Fixed by a7b05007 which replaced
+    // copy_nonoverlapping with copy (memmove) in codec stream_decode.
+    #[test]
+    fn pool_batch_render_multiple_panes() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+
+            let result = pool
+                .get_pane_render_changes_batch(vec![10, 20, 30])
+                .await
+                .expect("multi-pane batch should succeed");
+
+            assert_eq!(result.len(), 3, "should get 3 responses");
+            assert_eq!(result[0].pane_id, 10);
+            assert_eq!(result[1].pane_id, 20);
+            assert_eq!(result[2].pane_id, 30);
+
+            let stats = pool.stats().await;
+            assert!(
+                stats.connections_created >= 1,
+                "should create at least one connection"
+            );
+        });
+    }
 
     #[test]
     fn pool_recovery_disabled_does_not_retry() {
