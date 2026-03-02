@@ -84,7 +84,8 @@ fn run() -> anyhow::Result<()> {
 
     config.update_ulimit()?;
     if let Some(value) = &config.default_ssh_auth_sock {
-        std::env::set_var("SSH_AUTH_SOCK", value);
+        // SAFETY: called during single-threaded startup before worker threads spawn.
+        unsafe { std::env::set_var("SSH_AUTH_SOCK", value) };
     }
 
     if opts.daemonize {
@@ -97,19 +98,22 @@ fn run() -> anyhow::Result<()> {
     // server.
     // We may potentially want to look into starting/registering
     // a session of some kind here as well in the future.
-    for name in &[
-        "OLDPWD",
-        "PWD",
-        "SHLVL",
-        "WEZTERM_PANE",
-        "WEZTERM_UNIX_SOCKET",
-        "FRANKENTERM_UNIX_SOCKET",
-        "_",
-    ] {
-        std::env::remove_var(name);
-    }
-    for name in &config::configuration().mux_env_remove {
-        std::env::remove_var(name);
+    // SAFETY: called during single-threaded startup before worker threads spawn.
+    unsafe {
+        for name in &[
+            "OLDPWD",
+            "PWD",
+            "SHLVL",
+            "WEZTERM_PANE",
+            "WEZTERM_UNIX_SOCKET",
+            "FRANKENTERM_UNIX_SOCKET",
+            "_",
+        ] {
+            std::env::remove_var(name);
+        }
+        for name in &config::configuration().mux_env_remove {
+            std::env::remove_var(name);
+        }
     }
 
     wezterm_blob_leases::register_storage(Arc::new(
@@ -218,7 +222,8 @@ mod ossl;
 pub fn spawn_listener() -> anyhow::Result<()> {
     let config = configuration();
     for unix_dom in &config.unix_domains {
-        std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
+        // SAFETY: called during single-threaded startup of the listener.
+        unsafe { std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path()) };
         let mut listener =
             frankenterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)?;
         thread::spawn(move || {
