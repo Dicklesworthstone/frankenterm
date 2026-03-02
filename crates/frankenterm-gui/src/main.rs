@@ -1,6 +1,10 @@
 // Don't create a new standard console window when launched from the windows GUI.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+// Make `wezterm_dynamic` available as an alias for `frankenterm_dynamic`.
+// Many vendored modules still use the old `wezterm_dynamic::` import paths.
+extern crate frankenterm_dynamic as wezterm_dynamic;
+
 use crate::customglyph::BlockKey;
 use crate::glyphcache::GlyphCache;
 use crate::utilsprites::RenderMetrics;
@@ -58,6 +62,17 @@ mod unicode_names;
 mod uniforms;
 mod update;
 mod utilsprites;
+
+/// Re-export lua_stubs as `mux_lua` so that existing `use mux_lua::*`
+/// imports throughout vendored GUI code resolve to our stubs.
+mod mux_lua {
+    pub use crate::lua_stubs::*;
+}
+
+/// Re-export Url stub as `url_funcs` for vendored code compatibility.
+mod url_funcs {
+    pub use crate::lua_stubs::Url;
+}
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -1267,7 +1282,10 @@ fn run() -> anyhow::Result<()> {
     )?;
     let config = config::configuration();
     if let Some(value) = &config.default_ssh_auth_sock {
-        std::env::set_var("SSH_AUTH_SOCK", value);
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("SSH_AUTH_SOCK", value);
+        }
     }
 
     let sub = match opts.cmd.as_ref().cloned() {
