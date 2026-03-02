@@ -608,3 +608,951 @@ pub(super) fn truncate_for_log(s: &str, max_len: usize) -> String {
         format!("{}...", &s[..max_len.saturating_sub(3)])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingest::{Osc133State, ShellState};
+    use crate::patterns::{AgentType, PatternEngine, PatternPack, RuleDef, Severity};
+    use crate::runtime_compat::CompatRuntime;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    // ========================================================================
+    // MockPaneSource (local copy for wait_execution tests)
+    // ========================================================================
+
+    struct MockPaneSource {
+        texts: StdMutex<Vec<String>>,
+        call_count: AtomicUsize,
+    }
+
+    impl MockPaneSource {
+        fn new(texts: Vec<String>) -> Self {
+            Self {
+                texts: StdMutex::new(texts),
+                call_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.call_count.load(Ordering::Relaxed)
+        }
+    }
+
+    impl crate::wezterm::PaneTextSource for MockPaneSource {
+        type Fut<'a> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            let count = self.call_count.fetch_add(1, Ordering::Relaxed);
+            let texts = self.texts.lock().unwrap();
+            let text = if count < texts.len() {
+                texts[count].clone()
+            } else {
+                texts.last().cloned().unwrap_or_default()
+            };
+            Box::pin(async move { Ok(text) })
+        }
+    }
+
+    fn test_runtime() -> crate::runtime_compat::Runtime {
+        crate::runtime_compat::RuntimeBuilder::multi_thread()
+            .build()
+            .unwrap()
+    }
+
+    // ========================================================================
+    // WaitConditionResult Tests
+    // ========================================================================
+
+    #[test]
+    fn wait_condition_result_satisfied_is_satisfied() {
+        let result = WaitConditionResult::Satisfied {
+            elapsed_ms: 100,
+            polls: 5,
+            context: Some("matched".to_string()),
+        };
+        assert!(result.is_satisfied());
+        assert!(!result.is_timed_out());
+        assert_eq!(result.elapsed_ms(), Some(100));
+    }
+
+    #[test]
+    fn wait_condition_result_timed_out_is_timed_out() {
+        let result = WaitConditionResult::TimedOut {
+            elapsed_ms: 5000,
+            polls: 100,
+            last_observed: Some("some state".to_string()),
+        };
+        assert!(!result.is_satisfied());
+        assert!(result.is_timed_out());
+        assert_eq!(result.elapsed_ms(), Some(5000));
+    }
+
+    #[test]
+    fn wait_condition_result_unsupported_has_no_elapsed() {
+        let result = WaitConditionResult::Unsupported {
+            reason: "not implemented".to_string(),
+        };
+        assert!(!result.is_satisfied());
+        assert!(!result.is_timed_out());
+        assert_eq!(result.elapsed_ms(), None);
+    }
+
+    #[test]
+    fn wait_condition_result_satisfied_with_no_context() {
+        let result = WaitConditionResult::Satisfied {
+            elapsed_ms: 0,
+            polls: 1,
+            context: None,
+        };
+        assert!(result.is_satisfied());
+        assert_eq!(result.elapsed_ms(), Some(0));
+    }
+
+    #[test]
+    fn wait_condition_result_timed_out_with_no_observed() {
+        let result = WaitConditionResult::TimedOut {
+            elapsed_ms: 10000,
+            polls: 50,
+            last_observed: None,
+        };
+        assert!(result.is_timed_out());
+        assert_eq!(result.elapsed_ms(), Some(10000));
+    }
+
+    // ========================================================================
+    // WaitConditionOptions Tests
+    // ========================================================================
+
+    #[test]
+    fn wait_condition_options_defaults() {
+        let opts = WaitConditionOptions::default();
+        assert_eq!(opts.tail_lines, 200);
+        assert_eq!(opts.poll_initial, Duration::from_millis(50));
+        assert_eq!(opts.poll_max, Duration::from_secs(1));
+        assert_eq!(opts.max_polls, 10_000);
+        assert!(opts.allow_idle_heuristics);
+    }
+
+    #[test]
+    fn wait_condition_options_custom() {
+        let opts = WaitConditionOptions {
+            tail_lines: 50,
+            poll_initial: Duration::from_millis(10),
+            poll_max: Duration::from_millis(500),
+            max_polls: 100,
+            allow_idle_heuristics: false,
+        };
+        assert_eq!(opts.tail_lines, 50);
+        assert_eq!(opts.poll_initial, Duration::from_millis(10));
+        assert!(!opts.allow_idle_heuristics);
+    }
+
+    // ========================================================================
+    // truncate_for_log Tests
+    // ========================================================================
+
+    #[test]
+    fn truncate_for_log_short_string() {
+        assert_eq!(truncate_for_log("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_for_log_exact_length() {
+        assert_eq!(truncate_for_log("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_for_log_truncates_long_string() {
+        let result = truncate_for_log("hello world this is a long string", 10);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 10);
+    }
+
+    #[test]
+    fn truncate_for_log_empty_string() {
+        assert_eq!(truncate_for_log("", 10), "");
+    }
+
+    #[test]
+    fn truncate_for_log_zero_max() {
+        let result = truncate_for_log("hello", 0);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_for_log_max_three() {
+        // max_len=3 means saturating_sub(3)=0, so we get "..."
+        let result = truncate_for_log("hello", 3);
+        assert_eq!(result, "...");
+    }
+
+    // ========================================================================
+    // heuristic_idle_check Tests
+    // ========================================================================
+
+    #[test]
+    fn heuristic_idle_detects_bash_prompt() {
+        let text = "some output\nuser@host:~/dir$ ";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle, "should detect bash prompt: {desc}");
+        assert!(desc.contains("prompt"), "desc: {desc}");
+    }
+
+    #[test]
+    fn heuristic_idle_detects_root_prompt() {
+        let text = "output\nroot@server:/# ";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle, "should detect root prompt: {desc}");
+    }
+
+    #[test]
+    fn heuristic_idle_detects_zsh_prompt() {
+        let text = "output\nuser@host:~/dir% ";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle, "should detect zsh prompt: {desc}");
+    }
+
+    #[test]
+    fn heuristic_idle_detects_fish_prompt() {
+        let text = "output\nuser@host ~/dir> ";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle, "should detect fish prompt: {desc}");
+    }
+
+    #[test]
+    fn heuristic_idle_detects_python_repl() {
+        let text = "Python 3.11.0\n>>> ";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle, "should detect python prompt: {desc}");
+    }
+
+    #[test]
+    fn heuristic_idle_detects_python_continuation() {
+        let text = ">>> def foo():\n... ";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle, "should detect python continuation: {desc}");
+    }
+
+    #[test]
+    fn heuristic_idle_detects_starship_prompt() {
+        let text = "some output\n❯ ";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle, "should detect starship prompt: {desc}");
+    }
+
+    #[test]
+    fn heuristic_idle_rejects_running_command() {
+        let text = "Compiling frankenterm v0.1.0\nBuilding [=====>] 50/100";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(!is_idle, "should not detect prompt in build output: {desc}");
+    }
+
+    #[test]
+    fn heuristic_idle_rejects_progress_percent() {
+        // "%" should NOT match as a prompt when in context like "50%"
+        let text = "Downloading: 50%";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(
+            !is_idle,
+            "should not false-positive on percentage: {desc}"
+        );
+    }
+
+    #[test]
+    fn heuristic_idle_empty_text() {
+        let (is_idle, desc) = heuristic_idle_check("", 10);
+        assert!(!is_idle, "empty text is not idle: {desc}");
+    }
+
+    #[test]
+    fn heuristic_idle_empty_last_line_with_prompt_on_prev() {
+        // When last line is empty, checks previous line for prompt
+        let text = "user@host:~/dir$ \n";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle, "should detect prompt on previous line: {desc}");
+    }
+
+    #[test]
+    fn heuristic_idle_short_prompt_char() {
+        // Very short prompt (just "$") should be detected
+        let text = "output\n$";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle, "should detect short $ prompt: {desc}");
+    }
+
+    #[test]
+    fn heuristic_idle_user_host_pattern_with_dollar() {
+        // user@host:path$ (trimmed, no trailing space)
+        let text = "output\nuser@host:~/projects$";
+        let (is_idle, desc) = heuristic_idle_check(text, 10);
+        assert!(is_idle, "should detect user@host prompt: {desc}");
+    }
+
+    #[test]
+    fn heuristic_idle_limits_to_10_lines() {
+        // Even with tail_lines=200, heuristic only checks last 10
+        let mut text = String::new();
+        for i in 0..20 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        text.push_str("user@host:~/dir$ ");
+        let (is_idle, _) = heuristic_idle_check(&text, 200);
+        assert!(is_idle, "should still detect prompt in last 10 lines");
+    }
+
+    // ========================================================================
+    // WaitConditionExecutor Construction Tests
+    // ========================================================================
+
+    #[test]
+    fn executor_new_has_default_options() {
+        let source = MockPaneSource::new(vec!["text".into()]);
+        let engine = PatternEngine::new();
+        let executor = WaitConditionExecutor::new(&source, &engine);
+        assert!(executor.osc_state.is_none());
+        assert_eq!(executor.options.tail_lines, 200);
+        assert!(executor.options.allow_idle_heuristics);
+    }
+
+    #[test]
+    fn executor_with_osc_state() {
+        let source = MockPaneSource::new(vec!["text".into()]);
+        let engine = PatternEngine::new();
+        let osc = Osc133State::new();
+        let executor = WaitConditionExecutor::new(&source, &engine).with_osc_state(&osc);
+        assert!(executor.osc_state.is_some());
+    }
+
+    #[test]
+    fn executor_with_custom_options() {
+        let source = MockPaneSource::new(vec!["text".into()]);
+        let engine = PatternEngine::new();
+        let opts = WaitConditionOptions {
+            tail_lines: 50,
+            poll_initial: Duration::from_millis(10),
+            poll_max: Duration::from_millis(100),
+            max_polls: 5,
+            allow_idle_heuristics: false,
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(opts);
+        assert_eq!(executor.options.tail_lines, 50);
+        assert_eq!(executor.options.max_polls, 5);
+        assert!(!executor.options.allow_idle_heuristics);
+    }
+
+    // ========================================================================
+    // execute() dispatch: Sleep
+    // ========================================================================
+
+    #[test]
+    fn execute_sleep_condition() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec![]);
+        let engine = PatternEngine::new();
+        let executor = WaitConditionExecutor::new(&source, &engine);
+
+        let condition = WaitCondition::Sleep { duration_ms: 10 };
+        let result = rt.block_on(executor.execute(&condition, 1, Duration::from_secs(5)));
+        let result = result.unwrap();
+
+        assert!(result.is_satisfied());
+        if let WaitConditionResult::Satisfied {
+            polls, context, ..
+        } = result
+        {
+            assert_eq!(polls, 0);
+            assert_eq!(context.as_deref(), Some("sleep completed"));
+        }
+        // MockPaneSource should not have been called for Sleep
+        assert_eq!(source.calls(), 0);
+    }
+
+    #[test]
+    fn execute_sleep_capped_by_timeout() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec![]);
+        let engine = PatternEngine::new();
+        let executor = WaitConditionExecutor::new(&source, &engine);
+
+        // Sleep 10 seconds but timeout is 50ms — should cap to 50ms
+        let condition = WaitCondition::Sleep { duration_ms: 10000 };
+        let start = Instant::now();
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_millis(50)))
+            .unwrap();
+
+        assert!(result.is_satisfied());
+        // Should complete near 50ms, not 10 seconds
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    // ========================================================================
+    // execute() dispatch: External (Unsupported)
+    // ========================================================================
+
+    #[test]
+    fn execute_external_returns_unsupported() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec![]);
+        let engine = PatternEngine::new();
+        let executor = WaitConditionExecutor::new(&source, &engine);
+
+        let condition = WaitCondition::External {
+            key: "test_signal".to_string(),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(1)))
+            .unwrap();
+
+        if let WaitConditionResult::Unsupported { reason } = &result {
+            assert!(
+                reason.contains("test_signal"),
+                "reason should mention key: {reason}"
+            );
+            assert!(reason.contains("external signal registry"));
+        } else {
+            panic!("Expected Unsupported, got {result:?}");
+        }
+    }
+
+    // ========================================================================
+    // execute() dispatch: TextMatch
+    // ========================================================================
+
+    #[test]
+    fn execute_text_match_substring_immediate() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["hello world\n$ ".to_string()]);
+        let engine = PatternEngine::new();
+        let executor = WaitConditionExecutor::new(&source, &engine);
+
+        let condition = WaitCondition::TextMatch {
+            pane_id: None,
+            matcher: TextMatch::substring("hello"),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 42, Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(result.is_satisfied());
+        if let WaitConditionResult::Satisfied { polls, .. } = result {
+            assert_eq!(polls, 1, "should match on first poll");
+        }
+    }
+
+    #[test]
+    fn execute_text_match_substring_after_delay() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec![
+            "compiling...".to_string(),
+            "compiling...".to_string(),
+            "done\n$ ".to_string(),
+        ]);
+        let engine = PatternEngine::new();
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(10),
+            max_polls: 100,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(opts);
+
+        let condition = WaitCondition::TextMatch {
+            pane_id: None,
+            matcher: TextMatch::substring("done"),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(5)))
+            .unwrap();
+
+        assert!(result.is_satisfied());
+        assert!(source.calls() >= 3, "should have polled at least 3 times");
+    }
+
+    #[test]
+    fn execute_text_match_regex() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["error code: 42\n$ ".to_string()]);
+        let engine = PatternEngine::new();
+        let executor = WaitConditionExecutor::new(&source, &engine);
+
+        let condition = WaitCondition::TextMatch {
+            pane_id: None,
+            matcher: TextMatch::regex(r"error code: \d+"),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(result.is_satisfied());
+    }
+
+    #[test]
+    fn execute_text_match_timeout() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["nothing relevant".to_string()]);
+        let engine = PatternEngine::new();
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(5),
+            max_polls: 10,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(opts);
+
+        let condition = WaitCondition::TextMatch {
+            pane_id: None,
+            matcher: TextMatch::substring("never_found"),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_millis(50)))
+            .unwrap();
+
+        assert!(result.is_timed_out());
+    }
+
+    #[test]
+    fn execute_text_match_uses_explicit_pane_id() {
+        // When pane_id is Some, it should override context_pane_id
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["target text".to_string()]);
+        let engine = PatternEngine::new();
+        let executor = WaitConditionExecutor::new(&source, &engine);
+
+        let condition = WaitCondition::TextMatch {
+            pane_id: Some(99),
+            matcher: TextMatch::substring("target"),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(result.is_satisfied());
+    }
+
+    // ========================================================================
+    // execute() dispatch: StableTail
+    // ========================================================================
+
+    #[test]
+    fn execute_stable_tail_immediate_stability() {
+        let rt = test_runtime();
+        // All polls return the same text — should stabilize quickly
+        let source = MockPaneSource::new(vec!["stable output\n$ ".to_string()]);
+        let engine = PatternEngine::new();
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(5),
+            max_polls: 100,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(opts);
+
+        let condition = WaitCondition::StableTail {
+            pane_id: None,
+            stable_for_ms: 5, // Very short stability requirement
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(5)))
+            .unwrap();
+
+        assert!(
+            result.is_satisfied(),
+            "stable text should satisfy: {result:?}"
+        );
+        if let WaitConditionResult::Satisfied { context, .. } = &result {
+            let ctx = context.as_deref().unwrap_or("");
+            assert!(ctx.contains("stable for"), "context: {ctx}");
+        }
+    }
+
+    #[test]
+    fn execute_stable_tail_changing_text_times_out() {
+        let rt = test_runtime();
+        // Each poll returns different text — never stabilizes
+        let texts: Vec<String> = (0..50).map(|i| format!("changing output {i}")).collect();
+        let source = MockPaneSource::new(texts);
+        let engine = PatternEngine::new();
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(2),
+            max_polls: 20,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(opts);
+
+        let condition = WaitCondition::StableTail {
+            pane_id: None,
+            stable_for_ms: 1000, // Long stability requirement
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_millis(50)))
+            .unwrap();
+
+        assert!(result.is_timed_out());
+    }
+
+    // ========================================================================
+    // execute() dispatch: PaneIdle with OSC 133
+    // ========================================================================
+
+    #[test]
+    fn execute_pane_idle_with_osc133_prompt_active() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["$ ".to_string()]);
+        let engine = PatternEngine::new();
+        let mut osc = Osc133State::new();
+        osc.state = ShellState::PromptActive;
+
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(5),
+            max_polls: 100,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine)
+            .with_osc_state(&osc)
+            .with_options(opts);
+
+        let condition = WaitCondition::PaneIdle {
+            pane_id: None,
+            idle_threshold_ms: 0, // Zero threshold — immediate satisfaction
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(
+            result.is_satisfied(),
+            "PromptActive with 0 threshold should satisfy: {result:?}"
+        );
+    }
+
+    #[test]
+    fn execute_pane_idle_with_osc133_command_running() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["running...".to_string()]);
+        let engine = PatternEngine::new();
+        let mut osc = Osc133State::new();
+        osc.state = ShellState::CommandRunning;
+
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(2),
+            max_polls: 5,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine)
+            .with_osc_state(&osc)
+            .with_options(opts);
+
+        let condition = WaitCondition::PaneIdle {
+            pane_id: None,
+            idle_threshold_ms: 0,
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_millis(50)))
+            .unwrap();
+
+        assert!(
+            result.is_timed_out(),
+            "CommandRunning should not be idle: {result:?}"
+        );
+    }
+
+    #[test]
+    fn execute_pane_idle_with_osc133_command_finished() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["done\n$ ".to_string()]);
+        let engine = PatternEngine::new();
+        let mut osc = Osc133State::new();
+        osc.state = ShellState::CommandFinished { exit_code: Some(0) };
+
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(5),
+            max_polls: 100,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine)
+            .with_osc_state(&osc)
+            .with_options(opts);
+
+        let condition = WaitCondition::PaneIdle {
+            pane_id: None,
+            idle_threshold_ms: 0,
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(result.is_satisfied());
+    }
+
+    // ========================================================================
+    // execute() dispatch: PaneIdle with heuristics
+    // ========================================================================
+
+    #[test]
+    fn execute_pane_idle_heuristic_bash_prompt() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["user@host:~/dir$ ".to_string()]);
+        let engine = PatternEngine::new();
+
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(5),
+            max_polls: 100,
+            allow_idle_heuristics: true,
+            ..WaitConditionOptions::default()
+        };
+        // No OSC state — forces heuristic fallback
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(opts);
+
+        let condition = WaitCondition::PaneIdle {
+            pane_id: None,
+            idle_threshold_ms: 0,
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(
+            result.is_satisfied(),
+            "heuristic should detect bash prompt: {result:?}"
+        );
+    }
+
+    #[test]
+    fn execute_pane_idle_no_osc_no_heuristics() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["user@host:~/dir$ ".to_string()]);
+        let engine = PatternEngine::new();
+
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(2),
+            max_polls: 5,
+            allow_idle_heuristics: false,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(opts);
+
+        let condition = WaitCondition::PaneIdle {
+            pane_id: None,
+            idle_threshold_ms: 0,
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_millis(50)))
+            .unwrap();
+
+        // With no OSC state and heuristics disabled, should always return not-idle → timeout
+        assert!(
+            result.is_timed_out(),
+            "no osc + no heuristics → never idle: {result:?}"
+        );
+    }
+
+    // ========================================================================
+    // execute() dispatch: Pattern
+    // ========================================================================
+
+    #[test]
+    fn execute_pattern_wait_matches_rule() {
+        let rt = test_runtime();
+        // Create a pattern engine with a test rule that matches "ERROR"
+        let rule = RuleDef {
+            id: "wezterm.error_detect".to_string(),
+            agent_type: AgentType::Unknown,
+            event_type: "error".to_string(),
+            severity: Severity::Warning,
+            anchors: vec!["ERROR".to_string()],
+            regex: None,
+            description: "Test error detection".to_string(),
+            remediation: None,
+            workflow: None,
+            manual_fix: None,
+            preview_command: None,
+            learn_more_url: None,
+        };
+        let pack = PatternPack::new("test:pack", "1.0.0", vec![rule]);
+        let engine = PatternEngine::with_packs(vec![pack]).unwrap();
+
+        let source = MockPaneSource::new(vec!["ERROR: something went wrong".to_string()]);
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(10),
+            max_polls: 100,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(opts);
+
+        let condition = WaitCondition::Pattern {
+            pane_id: None,
+            rule_id: "wezterm.error_detect".to_string(),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(5)))
+            .unwrap();
+
+        assert!(
+            result.is_satisfied(),
+            "should detect ERROR pattern: {result:?}"
+        );
+        if let WaitConditionResult::Satisfied { context, .. } = &result {
+            let ctx = context.as_deref().unwrap_or("");
+            assert!(ctx.contains("matched"), "context: {ctx}");
+        }
+    }
+
+    #[test]
+    fn execute_pattern_wait_timeout_no_match() {
+        let rt = test_runtime();
+        let engine = PatternEngine::new(); // Default engine won't match our text
+
+        let source = MockPaneSource::new(vec!["normal output".to_string()]);
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(2),
+            max_polls: 5,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(opts);
+
+        let condition = WaitCondition::Pattern {
+            pane_id: None,
+            rule_id: "nonexistent.rule".to_string(),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_millis(50)))
+            .unwrap();
+
+        assert!(result.is_timed_out());
+    }
+
+    #[test]
+    fn execute_pattern_wait_uses_explicit_pane_id() {
+        let rt = test_runtime();
+        let engine = PatternEngine::new();
+        let source = MockPaneSource::new(vec!["text".to_string()]);
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(2),
+            max_polls: 3,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(opts);
+
+        // Even with pane_id=Some(99), the MockPaneSource ignores pane_id
+        // This test verifies the dispatch doesn't panic
+        let condition = WaitCondition::Pattern {
+            pane_id: Some(99),
+            rule_id: "any.rule".to_string(),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_millis(20)))
+            .unwrap();
+
+        // Will timeout since no matching rule, but shouldn't panic
+        assert!(result.is_timed_out());
+    }
+
+    // ========================================================================
+    // check_idle_state Tests (via execute_pane_idle_wait)
+    // ========================================================================
+
+    #[test]
+    fn check_idle_osc133_input_active_is_idle() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["$ ".to_string()]);
+        let engine = PatternEngine::new();
+        let mut osc = Osc133State::new();
+        osc.state = ShellState::InputActive;
+
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(5),
+            max_polls: 100,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine)
+            .with_osc_state(&osc)
+            .with_options(opts);
+
+        let condition = WaitCondition::PaneIdle {
+            pane_id: None,
+            idle_threshold_ms: 0,
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(result.is_satisfied(), "InputActive is at_prompt: {result:?}");
+    }
+
+    #[test]
+    fn check_idle_osc133_unknown_is_not_idle() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["...".to_string()]);
+        let engine = PatternEngine::new();
+        let osc = Osc133State::new(); // Default = ShellState::Unknown
+
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(2),
+            max_polls: 5,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine)
+            .with_osc_state(&osc)
+            .with_options(opts);
+
+        let condition = WaitCondition::PaneIdle {
+            pane_id: None,
+            idle_threshold_ms: 0,
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_millis(20)))
+            .unwrap();
+
+        assert!(
+            result.is_timed_out(),
+            "Unknown shell state is not idle: {result:?}"
+        );
+    }
+
+    // ========================================================================
+    // Max polls enforcement
+    // ========================================================================
+
+    #[test]
+    fn execute_respects_max_polls_limit() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec!["no match".to_string()]);
+        let engine = PatternEngine::new();
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(1),
+            max_polls: 3, // Very low limit
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine).with_options(opts);
+
+        let condition = WaitCondition::TextMatch {
+            pane_id: None,
+            matcher: TextMatch::substring("never_found"),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(60)))
+            .unwrap();
+
+        assert!(result.is_timed_out());
+        if let WaitConditionResult::TimedOut { polls, .. } = result {
+            // PaneWaiter enforces max_polls, so total polls should be small
+            assert!(polls <= 5, "should respect max_polls, got {polls}");
+        }
+    }
+}
