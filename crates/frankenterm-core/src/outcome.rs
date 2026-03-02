@@ -710,7 +710,7 @@ mod proptests {
     fn arb_outcome() -> impl Strategy<Value = Outcome<i32, String>> {
         prop_oneof![
             any::<i32>().prop_map(Outcome::ok),
-            "[a-z]{1,10}".prop_map(|s| Outcome::err(s)),
+            "[a-z]{1,10}".prop_map(Outcome::err),
             arb_cancel_reason().prop_map(Outcome::cancelled),
             "[a-z]{1,10}".prop_map(|s| Outcome::panicked(PanicPayload::new(s))),
         ]

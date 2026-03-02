@@ -907,6 +907,7 @@ fn pane_delta_try_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) -> bool {
     tx.try_send(delta).is_ok()
 }
 
+#[allow(clippy::needless_pass_by_ref_mut)] // mut needed for tokio borrow_and_update path
 fn cancel_requested(cancel_rx: &mut watch::Receiver<bool>) -> bool {
     #[cfg(feature = "asupersync-runtime")]
     {

@@ -611,11 +611,17 @@ pub mod task {
         handles: Vec<JoinHandle<T>>,
     }
 
-    impl<T: Send + 'static> JoinSet<T> {
-        pub fn new() -> Self {
+    impl<T: Send + 'static> Default for JoinSet<T> {
+        fn default() -> Self {
             Self {
                 handles: Vec::new(),
             }
+        }
+    }
+
+    impl<T: Send + 'static> JoinSet<T> {
+        pub fn new() -> Self {
+            Self::default()
         }
 
         pub fn spawn<F>(&mut self, future: F)

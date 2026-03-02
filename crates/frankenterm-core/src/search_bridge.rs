@@ -631,6 +631,7 @@ mod tests {
         (SearchBridge::new(searcher), text_provider)
     }
 
+    #[allow(clippy::needless_return)] // return required by cfg-gated dual-runtime pattern
     async fn raw_search_baseline(
         searcher: Arc<TwoTierSearcher>,
         query: String,

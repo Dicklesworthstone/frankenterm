@@ -247,6 +247,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn runtime_preset_clone_copy() {
         let preset = RuntimePreset::CurrentThread;
         let cloned = preset.clone();
@@ -278,6 +279,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn runtime_tuning_clone_eq() {
         let t1 = RuntimeTuning {
             worker_threads: 4,
@@ -513,6 +515,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn spawn_bounded_empty_tasks() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
@@ -527,6 +530,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn spawn_bounded_preserves_order() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
@@ -549,6 +553,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn spawn_bounded_concurrency_limit_1() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};

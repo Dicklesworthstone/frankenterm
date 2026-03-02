@@ -1665,7 +1665,7 @@ mod tests {
 
         // First scan — past grace period
         let alerts1 = wd.scan(&tree, 25_000);
-        assert!(alerts1.len() > 0);
+        assert!(!alerts1.is_empty());
         let count1 = wd.total_alerts();
         assert_eq!(count1, alerts1.len() as u64);
 
@@ -2015,7 +2015,7 @@ mod tests {
 
     #[test]
     fn stuck_cancellation_ignores_running_scopes() {
-        let mut tree = setup_tree();
+        let tree = setup_tree();
         // All scopes are Running (started in setup_tree)
         let mut wd = ScopeWatchdog::new();
         // Even at very late time, Running scopes shouldn't trigger stuck cancellation

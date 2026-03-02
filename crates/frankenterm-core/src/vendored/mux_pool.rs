@@ -1665,6 +1665,86 @@ mod tests {
     }
 
     #[test]
+    fn pool_batch_render_large_batch_preserves_order() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+
+            // Request 50 panes — exercises pipelining and verifies ordering
+            // at a scale beyond the trivial 3-pane test.
+            let pane_ids: Vec<u64> = (100..150).collect();
+            let result = pool
+                .get_pane_render_changes_batch(pane_ids.clone())
+                .await
+                .expect("large batch should succeed");
+
+            assert_eq!(result.len(), 50, "should get 50 responses");
+            for (i, resp) in result.iter().enumerate() {
+                assert_eq!(
+                    resp.pane_id as u64, pane_ids[i],
+                    "response {i} pane_id mismatch: expected {} got {}",
+                    pane_ids[i], resp.pane_id
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn pool_batch_render_duplicate_pane_ids() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+
+            // Requesting the same pane_id twice should return two responses.
+            let result = pool
+                .get_pane_render_changes_batch(vec![42, 42, 42])
+                .await
+                .expect("duplicate pane ids should succeed");
+
+            assert_eq!(result.len(), 3, "should get 3 responses for 3 requests");
+            for resp in &result {
+                assert_eq!(resp.pane_id, 42, "all responses should be for pane 42");
+            }
+        });
+    }
+
+    #[test]
+    fn pool_batch_render_pipeline_depth_one() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+
+            // depth=1 skips pipelining and uses sequential mode directly.
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 4,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig::default(),
+                pipeline_depth: 1,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let result = pool
+                .get_pane_render_changes_batch(vec![10, 20, 30])
+                .await
+                .expect("depth=1 batch should succeed");
+
+            assert_eq!(result.len(), 3);
+            assert_eq!(result[0].pane_id, 10);
+            assert_eq!(result[1].pane_id, 20);
+            assert_eq!(result[2].pane_id, 30);
+        });
+    }
+
+    #[test]
     fn pool_recovery_disabled_does_not_retry() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
