@@ -10522,12 +10522,13 @@ async fn run_distributed_agent(
     let event_bus = Arc::new(EventBus::new(1000));
     let wezterm_handle = frankenterm_core::wezterm::wezterm_handle_from_config(config);
 
-    let native_event_socket = if config.native.enabled {
+    // Auto-detect native event socket: always provide the socket path so the
+    // runtime can bind and listen for push events from frankenterm-gui.
+    // Priority: WEZTERM_FT_SOCKET env var > config socket_path > default.
+    let native_event_socket = {
         let env_socket = std::env::var("WEZTERM_FT_SOCKET").ok();
         let socket = env_socket.unwrap_or_else(|| config.native.socket_path.clone());
         Some(PathBuf::from(socket))
-    } else {
-        None
     };
 
     let runtime_config = RuntimeConfig {
@@ -11131,13 +11132,11 @@ async fn run_watcher(
         None
     };
 
-    // Configure the runtime
-    let native_event_socket = if config.native.enabled {
+    // Configure the runtime — always provide native event socket for auto-detection.
+    let native_event_socket = {
         let env_socket = std::env::var("WEZTERM_FT_SOCKET").ok();
         let socket = env_socket.unwrap_or_else(|| config.native.socket_path.clone());
         Some(PathBuf::from(socket))
-    } else {
-        None
     };
 
     let runtime_config = RuntimeConfig {

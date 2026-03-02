@@ -1014,22 +1014,23 @@ impl ObservationRuntime {
 
         let native_socket = self.config.native_event_socket.clone();
 
-        #[cfg(feature = "native-wezterm")]
-        let native_enabled = native_socket.is_some();
-        #[cfg(not(feature = "native-wezterm"))]
-        let native_enabled = false;
+        // Always spawn the polling capture task. When native push events are
+        // also active, both sources feed the same ingress channel — the cursor
+        // deduplication layer handles overlap. This means polling provides a
+        // safety net even when the native bridge is connected.
+        let capture_handle = self.spawn_capture_task(capture_ingress_tx.clone());
 
-        // Spawn capture tasks (polling) unless native events are enabled.
-        let capture_handle = if native_enabled {
-            self.spawn_idle_capture_task()
-        } else {
-            self.spawn_capture_task(capture_ingress_tx.clone())
-        };
-
-        // Spawn native event listener if configured and supported.
+        // Spawn native event listener if socket path is configured and the
+        // native-wezterm feature is compiled in. Auto-detection: always try
+        // to bind the socket regardless of config.native.enabled.
         #[cfg(feature = "native-wezterm")]
-        let native_handle = native_socket
-            .map(|socket| self.spawn_native_event_task(socket, capture_ingress_tx.clone()));
+        let native_handle = native_socket.map(|socket| {
+            info!(
+                path = %socket.display(),
+                "Switching to native push events (auto-detected socket path)"
+            );
+            self.spawn_native_event_task(socket, capture_ingress_tx.clone())
+        });
         #[cfg(not(feature = "native-wezterm"))]
         let native_handle = {
             if native_socket.is_some() {
@@ -2029,20 +2030,6 @@ impl ObservationRuntime {
         })
     }
 
-    /// Spawn a no-op capture task when native events are used for output capture.
-    fn spawn_idle_capture_task(&self) -> JoinHandle<()> {
-        let shutdown_flag = Arc::clone(&self.shutdown_flag);
-
-        task::spawn(async move {
-            let idle_capture_interval = Duration::from_millis(500);
-            loop {
-                if shutdown_flag.load(Ordering::SeqCst) {
-                    break;
-                }
-                sleep(idle_capture_interval).await;
-            }
-        })
-    }
 
     /// Spawn the native event listener task (vendored WezTerm integration).
     #[cfg(feature = "native-wezterm")]
@@ -2061,9 +2048,19 @@ impl ObservationRuntime {
 
         task::spawn(async move {
             let listener = match NativeEventListener::bind(socket_path.clone()).await {
-                Ok(listener) => listener,
+                Ok(listener) => {
+                    info!(
+                        path = %socket_path.display(),
+                        "Native event listener bound — waiting for GUI connections"
+                    );
+                    listener
+                }
                 Err(err) => {
-                    warn!(error = %err, path = %socket_path.display(), "Failed to bind native event socket");
+                    warn!(
+                        error = %err,
+                        path = %socket_path.display(),
+                        "Failed to bind native event socket, falling back to polling only"
+                    );
                     return;
                 }
             };
