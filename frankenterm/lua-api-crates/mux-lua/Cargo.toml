@@ -20,7 +20,4 @@ termwiz-funcs.workspace = true
 termwiz.workspace = true
 url-funcs.workspace = true
 wezterm-dynamic.workspace = true
-# Proc macros from frankenterm-dynamic-derive expand to `frankenterm_dynamic::`,
-# so we need the actual package name available too.
-frankenterm-dynamic.workspace = true
 wezterm-term.workspace = true

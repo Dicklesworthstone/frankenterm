@@ -1,3 +1,7 @@
+// The proc macros from frankenterm-dynamic-derive expand to `frankenterm_dynamic::` paths,
+// but we import the crate as `wezterm_dynamic`. This alias makes both names resolve.
+extern crate wezterm_dynamic as frankenterm_dynamic;
+
 use config::lua::get_or_create_sub_module;
 use config::lua::mlua::{self, Lua};
 use luahelper::impl_lua_conversion_dynamic;

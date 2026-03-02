@@ -11,5 +11,4 @@ anyhow.workspace = true
 config.workspace = true
 luahelper.workspace = true
 wezterm-dynamic.workspace = true
-frankenterm-dynamic.workspace = true
 window.workspace = true
