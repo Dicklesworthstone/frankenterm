@@ -987,6 +987,108 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::SwapToLayout(SwapToLayout {
+                tab_id,
+                layout_index,
+            }) => {
+                spawn_into_main_thread({
+                    let send_response = send_response.clone();
+                    async move {
+                        catch(
+                            move || {
+                                let mux = Mux::get();
+                                let tab = mux
+                                    .get_tab(tab_id)
+                                    .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
+                                tab.swap_to_layout_index(layout_index);
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        )
+                    }
+                })
+                .detach();
+            }
+            Pdu::SetLayoutCycle(SetLayoutCycle {
+                tab_id,
+                layout_names,
+            }) => {
+                spawn_into_main_thread({
+                    let send_response = send_response.clone();
+                    async move {
+                        catch(
+                            move || {
+                                let mux = Mux::get();
+                                let tab = mux
+                                    .get_tab(tab_id)
+                                    .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
+                                // Build layout cycle from named presets
+                                let mut layouts = Vec::new();
+                                for name in &layout_names {
+                                    let layout = match name.as_str() {
+                                        "grid-4" => mux::layout::grid_4(),
+                                        "main-side" => mux::layout::main_side(),
+                                        "stacked" => mux::layout::stacked(),
+                                        "main-bottom" => mux::layout::main_bottom(),
+                                        other => {
+                                            return Err(anyhow!("unknown layout preset: {other}"));
+                                        }
+                                    };
+                                    layouts.push(layout);
+                                }
+                                if layouts.is_empty() {
+                                    return Err(anyhow!("layout cycle must have at least one layout"));
+                                }
+                                tab.set_layout_cycle(mux::layout::LayoutCycle::new(layouts));
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        )
+                    }
+                })
+                .detach();
+            }
+            Pdu::CycleStack(CycleStack {
+                tab_id,
+                slot_index,
+                forward: _,
+            }) => {
+                spawn_into_main_thread({
+                    let send_response = send_response.clone();
+                    async move {
+                        catch(
+                            move || {
+                                let mux = Mux::get();
+                                let tab = mux
+                                    .get_tab(tab_id)
+                                    .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
+                                tab.cycle_stack(slot_index);
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        )
+                    }
+                })
+                .detach();
+            }
+            Pdu::SelectStackPane(SelectStackPane {
+                tab_id: _,
+                slot_index: _,
+                pane_index: _,
+            }) => {
+                // Select a specific pane within a stack — not yet wired to Tab API.
+                send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
+            }
+            Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+                pane_id: _,
+                min_width: _,
+                max_width: _,
+                min_height: _,
+                max_height: _,
+            }) => {
+                // Constraint updates are local-only for now; acknowledge receipt.
+                send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
+            }
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
