@@ -1,7 +1,7 @@
 use crate::scripting::guiwin::GuiWin;
 use config::keyassignment::{Confirmation, KeyAssignment};
 use mux::termwiztermtab::TermWizTerminal;
-use mux_lua::MuxPane;
+use crate::lua_stubs::MuxPane;
 use std::rc::Rc;
 use termwiz::cell::AttributeChange;
 use termwiz::color::ColorAttribute;

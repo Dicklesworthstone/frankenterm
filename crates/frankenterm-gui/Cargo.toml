@@ -22,19 +22,17 @@ wayland = ["window/wayland"]
 anyhow.workspace = true
 
 [dependencies]
-# Core library — shared types, config, storage, patterns, policy engine
+# Core library
 frankenterm-core.workspace = true
 
 # Vendored FrankenTerm crates (ex-WezTerm)
 codec.workspace = true
 config.workspace = true
-env-bootstrap.workspace = true
 filedescriptor.workspace = true
 frecency.workspace = true
 lfucache.workspace = true
 luahelper.workspace = true
 mux.workspace = true
-mux-lua.workspace = true
 portable-pty = { workspace = true, features = ["serde_support"] }
 promise.workspace = true
 rangeset.workspace = true
@@ -43,20 +41,20 @@ tabout.workspace = true
 termwiz-funcs.workspace = true
 termwiz.workspace = true
 umask.workspace = true
-url-funcs.workspace = true
+# Workspace aliases (wezterm-* → frankenterm-* packages)
 wezterm-bidi.workspace = true
 wezterm-blob-leases = { workspace = true, features = ["simple_tempdir"] }
 wezterm-client.workspace = true
 wezterm-dynamic.workspace = true
 wezterm-font.workspace = true
-wezterm-mux-server-impl.workspace = true
+wezterm-gui-subcommands.workspace = true
 wezterm-open-url.workspace = true
 wezterm-ssh.workspace = true
-wezterm-term = { workspace = true, features = ["use_serde"] }
+wezterm-term.workspace = true
 wezterm-toast-notification.workspace = true
-window-funcs.workspace = true
 window.workspace = true
-wezterm-gui-subcommands.workspace = true
+# FrankenTerm mux server (not aliased — uses frankenterm_mux_server_impl in code)
+frankenterm-mux-server-impl.workspace = true
 
 # Standard dependencies
 anyhow.workspace = true
@@ -94,8 +92,6 @@ terminfo.workspace = true
 textwrap.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 unicode-normalization.workspace = true
 unicode-segmentation.workspace = true
 url.workspace = true

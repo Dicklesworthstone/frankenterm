@@ -3,7 +3,7 @@ use crate::scripting::guiwin::GuiWin;
 use config::configuration;
 use config::keyassignment::{InputSelector, InputSelectorEntry, KeyAssignment};
 use mux::termwiztermtab::TermWizTerminal;
-use mux_lua::MuxPane;
+use crate::lua_stubs::MuxPane;
 use nucleo_matcher::pattern::Pattern;
 use nucleo_matcher::{Matcher, Utf32Str};
 use rayon::prelude::*;

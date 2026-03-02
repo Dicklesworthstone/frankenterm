@@ -8,7 +8,7 @@ use mlua::{UserData, UserDataMethods, UserDataRef};
 use mux::pane::PaneId;
 use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
-use mux_lua::MuxPane;
+use crate::lua_stubs::MuxPane;
 use termwiz_funcs::lines_to_escapes;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_toast_notification::ToastNotification;

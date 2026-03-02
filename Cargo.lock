@@ -2276,14 +2276,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "env-bootstrap"
-version = "0.1.0"
-dependencies = [
- "config",
- "log",
-]
-
-[[package]]
 name = "env_filter"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3347,7 +3339,6 @@ dependencies = [
  "dirs-next",
  "downcast-rs 1.2.1",
  "emojis",
- "env-bootstrap",
  "euclid",
  "fastrand",
  "filedescriptor 0.8.3",
@@ -3373,7 +3364,6 @@ dependencies = [
  "metrics",
  "mlua",
  "mux",
- "mux-lua",
  "nucleo-matcher",
  "ordered-float 4.6.0",
  "parking_lot",
@@ -3396,13 +3386,10 @@ dependencies = [
  "textwrap",
  "thiserror 2.0.18",
  "tiny-skia",
- "tracing",
- "tracing-subscriber",
  "umask",
  "unicode-normalization",
  "unicode-segmentation",
  "url",
- "url-funcs",
  "walkdir",
  "wezterm-client",
  "wezterm-font",
@@ -3411,7 +3398,6 @@ dependencies = [
  "wgpu",
  "winapi",
  "window",
- "window-funcs",
  "windows 0.33.0",
 ]
 
@@ -6590,26 +6576,6 @@ dependencies = [
  "thiserror 2.0.18",
  "url",
  "winapi",
-]
-
-[[package]]
-name = "mux-lua"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "config",
- "frankenterm-dynamic",
- "frankenterm-term",
- "libc",
- "log",
- "luahelper",
- "mux",
- "parking_lot",
- "portable-pty",
- "smol",
- "termwiz 0.24.0",
- "termwiz-funcs",
- "url-funcs",
 ]
 
 [[package]]
@@ -10589,18 +10555,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "url-funcs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "config",
- "frankenterm-dynamic",
- "luahelper",
- "percent-encoding",
- "url",
-]
-
-[[package]]
 name = "utf-8"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11930,17 +11884,6 @@ dependencies = [
  "xkbcommon",
  "zbus",
  "zvariant",
-]
-
-[[package]]
-name = "window-funcs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "config",
- "frankenterm-dynamic",
- "luahelper",
- "window",
 ]
 
 [[package]]

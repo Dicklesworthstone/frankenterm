@@ -50,7 +50,7 @@ use mux::tab::{
 };
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
-use mux_lua::MuxPane;
+use crate::lua_stubs::MuxPane;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
@@ -316,7 +316,7 @@ impl UserData for PaneInformation {
                 if let Some(pane) = mux.get_pane(this.pane_id) {
                     return Ok(pane
                         .get_current_working_dir(CachePolicy::AllowStale)
-                        .map(|url| url_funcs::Url { url }));
+                        .map(|url| crate::lua_stubs::Url { url }));
                 }
             }
             Ok(None)

@@ -156,41 +156,10 @@ pub fn show_debug_overlay(
     term.render(&[Change::Title("Debug".to_string())])?;
 
     fn print_new_log_entries(term: &mut TermWizTerminal) -> termwiz::Result<()> {
-        let entries = env_bootstrap::ringlog::get_entries();
-        let mut changes = vec![];
-        for entry in entries {
-            if let Some(latest) = LATEST_LOG_ENTRY.lock().unwrap().as_ref() {
-                if entry.then <= *latest {
-                    // already seen this one
-                    continue;
-                }
-            }
-            LATEST_LOG_ENTRY.lock().unwrap().replace(entry.then);
-
-            changes.push(Change::AllAttributes(CellAttributes::default()));
-            changes.push(Change::Text(entry.then.format("%H:%M:%S%.3f ").to_string()));
-
-            changes.push(
-                AttributeChange::Foreground(match entry.level {
-                    Level::Error => AnsiColor::Maroon.into(),
-                    Level::Warn => AnsiColor::Red.into(),
-                    Level::Info => AnsiColor::Green.into(),
-                    Level::Debug => AnsiColor::Blue.into(),
-                    Level::Trace => AnsiColor::Fuchsia.into(),
-                })
-                .into(),
-            );
-            changes.push(Change::Text(entry.level.as_str().to_string()));
-            changes.push(Change::AllAttributes(CellAttributes::default()));
-            changes.push(AttributeChange::Intensity(Intensity::Bold).into());
-            changes.push(Change::Text(format!(" {}", entry.target)));
-            changes.push(Change::AllAttributes(CellAttributes::default()));
-            changes.push(Change::Text(format!(
-                " > {}\r\n",
-                entry.msg.replace("\n", "\r\n")
-            )));
-        }
-        term.render(&changes)
+        // env_bootstrap::ringlog not available (Lua deps not vendored).
+        // Debug overlay log entries deferred to ft-1memj.8.
+        let _ = term;
+        Ok(())
     }
 
     let version = config::wezterm_version();
