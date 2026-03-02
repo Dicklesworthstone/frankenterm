@@ -7,7 +7,7 @@
 	<key>CFBundleDisplayName</key>
 	<string>FrankenTerm</string>
 	<key>CFBundleExecutable</key>
-	<string>wezterm-gui</string>
+	<string>frankenterm-gui</string>
 	<key>CFBundleIconFile</key>
 	<string>ft</string>
 	<key>CFBundleIdentifier</key>
