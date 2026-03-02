@@ -103,6 +103,24 @@ It is the canonical source for:
 - heavy-compute execution policy (`docs/asupersync-rch-execution-policy.md`)
 - risk ledger and sequencing scorecard used by downstream `ft-e34d9.*` beads
 
+## FrankenTerm Convergence Architecture (ft-3681t.1.3)
+
+The program-level convergence architecture contract for native mux + swarm
+orchestration + connector fabric integration is defined in:
+
+`docs/ft-3681t-convergence-architecture.md`
+
+This document is the north-star interface and boundary spec for
+`ft-3681t.2.*` through `ft-3681t.9.*` implementation beads, including failure,
+degradation, rollback, and validation/evidence requirements.
+
+## FrankenTerm Convergence Execution Plan (ft-3681t.1.4)
+
+The execution plan with critical path, delivery tracks, parallelism map,
+measurable success gates, and anti-goals is defined in:
+
+`docs/ft-3681t-execution-plan.md`
+
 ## Library integration map (Appendix F)
 
 | Library | Role in ft | Status |
