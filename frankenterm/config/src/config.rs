@@ -1075,6 +1075,25 @@ impl Config {
             return loaded;
         }
 
+        // Skip Lua config unless explicitly enabled. TOML is the default
+        // configuration format for FrankenTerm. Set FRANKENTERM_LUA_CONFIG=1
+        // to enable Lua config fallback.
+        let lua_enabled = std::env::var("FRANKENTERM_LUA_CONFIG")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !lua_enabled {
+            log::info!(
+                "No frankenterm.toml found; Lua config disabled (set FRANKENTERM_LUA_CONFIG=1 to enable)"
+            );
+            return LoadedConfig {
+                config: Ok(Self::default().compute_extra_defaults(None)),
+                file_name: None,
+                lua: None,
+                warnings: vec![],
+            };
+        }
+
         // Note that the directories crate has methods for locating project
         // specific config directories, but only returns one of them, not
         // multiple.  In addition, it spawns a lot of subprocesses,
@@ -1887,10 +1906,10 @@ pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
 
 pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::runtime_dir() {
-        return Ok(runtime.join("wezterm"));
+        return Ok(runtime.join("frankenterm"));
     }
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(crate::HOME_DIR.join(".local/share/frankenterm"))
 }
 
 pub fn pki_dir() -> anyhow::Result<PathBuf> {

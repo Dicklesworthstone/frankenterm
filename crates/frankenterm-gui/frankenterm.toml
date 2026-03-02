@@ -1,0 +1,77 @@
+# FrankenTerm Default Configuration
+# Copy to ~/.config/frankenterm/frankenterm.toml to customize.
+#
+# Docs: all keys map to WezTerm config, with TOML syntax.
+# Migration: frankenterm setup migrate-config (converts wezterm.lua)
+
+# --- Appearance ---
+
+color_scheme = "Builtin Dark"
+
+font_size = 14.0
+
+# Bundled fonts: JetBrains Mono, Roboto, Fira Code, Noto Color Emoji
+[[font.font]]
+family = "JetBrains Mono"
+
+# Disable ligatures for agent-friendly code display
+harfbuzz_features = ["calt=0", "clig=0", "liga=0"]
+
+window_background_opacity = 1.0
+text_background_opacity = 1.0
+
+# --- Terminal ---
+
+scrollback_lines = 100000
+enable_scroll_bar = true
+
+# --- Window ---
+
+initial_rows = 40
+initial_cols = 120
+
+window_decorations = "TITLE | RESIZE"
+window_close_confirmation = "NeverPrompt"
+
+# Padding inside the terminal area (pixels)
+[window_padding]
+left = 4
+right = 4
+top = 4
+bottom = 4
+
+# --- Tab Bar ---
+
+enable_tab_bar = true
+hide_tab_bar_if_only_one_tab = true
+tab_bar_at_bottom = false
+
+# --- Keys ---
+
+# Leader key for chord sequences (like tmux prefix)
+# [leader]
+# key = "a"
+# mods = "CTRL"
+# timeout_milliseconds = 1000
+
+# --- Multiplexer ---
+
+# FrankenTerm uses its own mux socket (not WezTerm's).
+# Override: FRANKENTERM_UNIX_SOCKET env var
+
+[[unix_domains]]
+name = "local"
+connect_automatically = false
+
+# --- Performance ---
+
+# Frame rate cap
+max_fps = 60
+
+# Front-end renderer
+front_end = "WebGpu"
+
+# --- Misc ---
+
+check_for_updates = false
+automatically_reload_config = true
