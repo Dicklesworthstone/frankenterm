@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(feature = "asupersync-runtime")]
+use crate::cx::{self, Cx};
 use crate::config as wa_config;
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
 use crate::runtime_compat::{mpsc, task, timeout, watch};
@@ -200,6 +202,15 @@ impl DirectMuxClient {
         }
     }
 
+    /// Connect using an explicit capability context.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn connect_with_cx(
+        cx: &Cx,
+        config: DirectMuxClientConfig,
+    ) -> Result<Self, DirectMuxError> {
+        cx::with_cx_async(cx, |_| Self::connect(config)).await
+    }
+
     async fn connect_with_mode(
         socket_path: PathBuf,
         config: DirectMuxClientConfig,
@@ -271,6 +282,15 @@ impl DirectMuxClient {
         }
     }
 
+    /// List panes using an explicit capability context.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn list_panes_with_cx(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<ListPanesResponse, DirectMuxError> {
+        cx::with_cx_async(cx, |_| self.list_panes()).await
+    }
+
     /// Poll the mux server for render changes since the last check for a pane.
     pub async fn get_pane_render_changes(
         &mut self,
@@ -288,6 +308,16 @@ impl DirectMuxClient {
                 got: other.pdu_name().to_string(),
             }),
         }
+    }
+
+    /// Poll render changes using an explicit capability context.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_pane_render_changes_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+    ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
+        cx::with_cx_async(cx, |_| self.get_pane_render_changes(pane_id)).await
     }
 
     /// Fetch specific lines from a pane's scrollback.
@@ -311,6 +341,17 @@ impl DirectMuxClient {
         }
     }
 
+    /// Fetch pane lines using an explicit capability context.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_lines_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        lines: Vec<std::ops::Range<isize>>,
+    ) -> Result<GetLinesResponse, DirectMuxError> {
+        cx::with_cx_async(cx, |_| self.get_lines(pane_id, lines)).await
+    }
+
     /// Write raw bytes to a pane (no-paste mode, character-by-character).
     pub async fn write_to_pane(
         &mut self,
@@ -332,6 +373,17 @@ impl DirectMuxClient {
         }
     }
 
+    /// Write raw bytes to a pane using an explicit capability context.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn write_to_pane_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        data: Vec<u8>,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        cx::with_cx_async(cx, |_| self.write_to_pane(pane_id, data)).await
+    }
+
     /// Send text via paste mode (efficient for multi-character input).
     pub async fn send_paste(
         &mut self,
@@ -351,6 +403,17 @@ impl DirectMuxClient {
                 got: other.pdu_name().to_string(),
             }),
         }
+    }
+
+    /// Send paste text using an explicit capability context.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_paste_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        data: String,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        cx::with_cx_async(cx, |_| self.send_paste(pane_id, data)).await
     }
 
     async fn verify_codec_version(&mut self) -> Result<GetCodecVersionResponse, DirectMuxError> {
@@ -430,6 +493,21 @@ impl DirectMuxClient {
             }
         }
         Ok(out)
+    }
+
+    /// Batch render-change requests using an explicit capability context.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_pane_render_changes_batch_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_ids: &[u64],
+        max_pipeline_depth: usize,
+        pipeline_timeout: Duration,
+    ) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
+        cx::with_cx_async(cx, |_| {
+            self.get_pane_render_changes_batch(pane_ids, max_pipeline_depth, pipeline_timeout)
+        })
+        .await
     }
 
     /// Send a batch of requests using depth-limited pipelining.
