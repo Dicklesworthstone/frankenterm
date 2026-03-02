@@ -11470,7 +11470,7 @@ async fn run_watcher(
 
     // Graceful shutdown
     if let Some((shutdown_tx, ipc_task)) = ipc_handle {
-        let _ = shutdown_tx.send(()).await;
+        let _ = shutdown_tx.try_send(());
         let _ = ipc_task.await;
     }
 
@@ -12533,7 +12533,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 };
 
                                 let segments = storage_handle
-                                    .get_recent_segments(pane_id, limit, false)
+                                    .get_segments(pane_id, limit)
                                     .await?;
                                 let embedder = frankenterm_core::search::HashEmbedder::default();
                                 let mut detector =
@@ -12549,7 +12549,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
 
                                 if let Some(shock) = last_shock {
-                                    let response = RobotResponse::<serde_json::Value>::ok(
+                                    let response = RobotResponse::<serde_json::Value>::success(
                                         serde_json::json!({
                                             "anomalous": true,
                                             "z_score": shock.z_score,
@@ -12560,7 +12560,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     );
                                     print_robot_response(&response, format, stats)?;
                                 } else {
-                                    let response = RobotResponse::<serde_json::Value>::ok(
+                                    let response = RobotResponse::<serde_json::Value>::success(
                                         serde_json::json!({
                                             "anomalous": false,
                                             "z_score": 0.0,

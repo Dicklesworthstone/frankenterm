@@ -949,9 +949,19 @@ pub mod signal {
         pub struct SignalKind(asupersync::signal::SignalKind);
 
         impl SignalKind {
+            /// Returns the `SIGINT` signal kind.
+            pub fn interrupt() -> Self {
+                Self(asupersync::signal::SignalKind::interrupt())
+            }
+
             /// Returns the `SIGTERM` signal kind.
             pub fn terminate() -> Self {
                 Self(asupersync::signal::SignalKind::terminate())
+            }
+
+            /// Returns the `SIGHUP` signal kind.
+            pub fn hangup() -> Self {
+                Self(asupersync::signal::SignalKind::hangup())
             }
         }
 
