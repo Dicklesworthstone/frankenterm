@@ -470,3 +470,335 @@ pub(super) fn record_mcp_audit_sync(
         });
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // check_refresh_cooldown Tests
+    // ========================================================================
+
+    #[test]
+    fn cooldown_not_triggered_when_no_prior_refresh() {
+        // most_recent_refresh_ms <= 0 means no prior refresh
+        assert_eq!(check_refresh_cooldown(0, 100_000, 30_000), None);
+        assert_eq!(check_refresh_cooldown(-1, 100_000, 30_000), None);
+    }
+
+    #[test]
+    fn cooldown_triggered_within_period() {
+        // Refreshed 10 seconds ago, cooldown is 30 seconds
+        let result = check_refresh_cooldown(90_000, 100_000, 30_000);
+        assert!(result.is_some());
+        let (elapsed_s, remaining_s) = result.unwrap();
+        assert_eq!(elapsed_s, 10); // 10_000ms / 1000
+        assert_eq!(remaining_s, 20); // (30_000 - 10_000) / 1000
+    }
+
+    #[test]
+    fn cooldown_not_triggered_after_period() {
+        // Refreshed 60 seconds ago, cooldown is 30 seconds
+        assert_eq!(check_refresh_cooldown(40_000, 100_000, 30_000), None);
+    }
+
+    #[test]
+    fn cooldown_boundary_exact_expiry() {
+        // Refreshed exactly cooldown_ms ago — should not trigger
+        assert_eq!(check_refresh_cooldown(70_000, 100_000, 30_000), None);
+    }
+
+    #[test]
+    fn cooldown_just_before_expiry() {
+        // Refreshed 29_999ms ago, cooldown is 30_000ms — still in cooldown
+        let result = check_refresh_cooldown(70_001, 100_000, 30_000);
+        assert!(result.is_some());
+    }
+
+    // ========================================================================
+    // redact_mcp_args Tests
+    // ========================================================================
+
+    #[test]
+    fn redact_args_empty_object() {
+        let args = serde_json::json!({});
+        assert_eq!(redact_mcp_args("wa.pane.list", &args), "mcp:wa.pane.list");
+    }
+
+    #[test]
+    fn redact_args_with_keys() {
+        let args = serde_json::json!({"pane_id": 42, "text": "secret"});
+        let result = redact_mcp_args("wa.pane.send_text", &args);
+        assert!(result.starts_with("mcp:wa.pane.send_text keys=["));
+        assert!(result.contains("pane_id"));
+        assert!(result.contains("text"));
+        // Values should NOT appear
+        assert!(!result.contains("42"));
+        assert!(!result.contains("secret"));
+    }
+
+    #[test]
+    fn redact_args_non_object() {
+        // Arrays and scalars have no keys
+        let args = serde_json::json!([1, 2, 3]);
+        assert_eq!(redact_mcp_args("wa.test", &args), "mcp:wa.test");
+
+        let args = serde_json::json!("string");
+        assert_eq!(redact_mcp_args("wa.test", &args), "mcp:wa.test");
+
+        let args = serde_json::json!(null);
+        assert_eq!(redact_mcp_args("wa.test", &args), "mcp:wa.test");
+    }
+
+    #[test]
+    fn redact_args_single_key() {
+        let args = serde_json::json!({"pane_id": 1});
+        let result = redact_mcp_args("wa.pane.get", &args);
+        assert_eq!(result, "mcp:wa.pane.get keys=[pane_id]");
+    }
+
+    // ========================================================================
+    // resolve_alt_screen_state Tests
+    // ========================================================================
+
+    fn make_ipc_state(pane_id: u64, known: bool) -> IpcPaneState {
+        IpcPaneState {
+            pane_id,
+            known,
+            observed: None,
+            alt_screen: None,
+            last_status_at: None,
+            in_gap: None,
+            cursor_alt_screen: None,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn alt_screen_unknown_state_returns_none() {
+        let state = make_ipc_state(1, false);
+        assert_eq!(resolve_alt_screen_state(&state), None);
+    }
+
+    #[test]
+    fn alt_screen_cursor_alt_screen_preferred() {
+        let mut state = make_ipc_state(1, true);
+        state.cursor_alt_screen = Some(true);
+        state.alt_screen = Some(false); // cursor_alt_screen should take precedence
+        state.last_status_at = Some(100);
+        assert_eq!(resolve_alt_screen_state(&state), Some(true));
+    }
+
+    #[test]
+    fn alt_screen_fallback_to_alt_screen_field() {
+        let mut state = make_ipc_state(1, true);
+        state.alt_screen = Some(true);
+        state.last_status_at = Some(100);
+        assert_eq!(resolve_alt_screen_state(&state), Some(true));
+    }
+
+    #[test]
+    fn alt_screen_no_status_at_returns_none() {
+        let mut state = make_ipc_state(1, true);
+        state.alt_screen = Some(true);
+        // No last_status_at → should return None
+        assert_eq!(resolve_alt_screen_state(&state), None);
+    }
+
+    // ========================================================================
+    // effective_search_fusion_weights Tests
+    // ========================================================================
+
+    #[test]
+    fn fusion_weights_fast_only() {
+        let mut config = Config::default();
+        config.search.fast_only = true;
+        let (lexical, semantic) = effective_search_fusion_weights(&config);
+        assert!((lexical - 1.0).abs() < f32::EPSILON);
+        assert!((semantic - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn fusion_weights_default() {
+        let config = Config::default();
+        let (lexical, semantic) = effective_search_fusion_weights(&config);
+        // Default quality_weight should be between 0 and 1
+        assert!(lexical >= 0.0 && lexical <= 1.0);
+        assert!(semantic >= 0.0 && semantic <= 1.0);
+        assert!((lexical + semantic - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fusion_weights_nan_fallback() {
+        let mut config = Config::default();
+        config.search.quality_weight = f64::NAN;
+        let (lexical, semantic) = effective_search_fusion_weights(&config);
+        // NaN should fall back to 0.7 quality_weight
+        assert!((semantic - 0.7).abs() < 0.01);
+        assert!((lexical - 0.3).abs() < 0.01);
+    }
+
+    #[test]
+    fn fusion_weights_clamped_high() {
+        let mut config = Config::default();
+        config.search.quality_weight = 5.0; // Above 1.0
+        let (lexical, semantic) = effective_search_fusion_weights(&config);
+        assert!((semantic - 1.0).abs() < f32::EPSILON);
+        assert!((lexical - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn fusion_weights_clamped_low() {
+        let mut config = Config::default();
+        config.search.quality_weight = -1.0; // Below 0.0
+        let (lexical, semantic) = effective_search_fusion_weights(&config);
+        assert!((semantic - 0.0).abs() < f32::EPSILON);
+        assert!((lexical - 1.0).abs() < f32::EPSILON);
+    }
+
+    // ========================================================================
+    // effective_search_rrf_k Tests
+    // ========================================================================
+
+    #[test]
+    fn rrf_k_minimum_is_one() {
+        let mut config = Config::default();
+        config.search.rrf_k = 0;
+        assert_eq!(effective_search_rrf_k(&config), 1);
+    }
+
+    #[test]
+    fn rrf_k_preserves_valid_value() {
+        let mut config = Config::default();
+        config.search.rrf_k = 60;
+        assert_eq!(effective_search_rrf_k(&config), 60);
+    }
+
+    // ========================================================================
+    // effective_search_quality_timeout_ms Tests
+    // ========================================================================
+
+    #[test]
+    fn quality_timeout_minimum_is_one() {
+        let mut config = Config::default();
+        config.search.quality_timeout_ms = 0;
+        assert_eq!(effective_search_quality_timeout_ms(&config), 1);
+    }
+
+    #[test]
+    fn quality_timeout_preserves_valid_value() {
+        let mut config = Config::default();
+        config.search.quality_timeout_ms = 5000;
+        assert_eq!(effective_search_quality_timeout_ms(&config), 5000);
+    }
+
+    // ========================================================================
+    // policy_reason Tests
+    // ========================================================================
+
+    #[test]
+    fn policy_reason_allow_returns_none() {
+        let decision = PolicyDecision::Allow {
+            rule_id: None,
+            context: None,
+        };
+        assert_eq!(policy_reason(&decision), None);
+    }
+
+    #[test]
+    fn policy_reason_deny_returns_reason() {
+        let decision = PolicyDecision::Deny {
+            reason: "rate limited".to_string(),
+            rule_id: None,
+            context: None,
+        };
+        assert_eq!(policy_reason(&decision), Some("rate limited"));
+    }
+
+    #[test]
+    fn policy_reason_require_approval_returns_reason() {
+        let decision = PolicyDecision::RequireApproval {
+            reason: "dangerous command".to_string(),
+            rule_id: None,
+            approval: None,
+            context: None,
+        };
+        assert_eq!(policy_reason(&decision), Some("dangerous command"));
+    }
+
+    // ========================================================================
+    // approval_command Tests
+    // ========================================================================
+
+    #[test]
+    fn approval_command_no_approval() {
+        let decision = PolicyDecision::RequireApproval {
+            reason: "test".to_string(),
+            rule_id: None,
+            approval: None,
+            context: None,
+        };
+        assert_eq!(approval_command(&decision), None);
+    }
+
+    #[test]
+    fn approval_command_with_approval() {
+        let decision = PolicyDecision::RequireApproval {
+            reason: "test".to_string(),
+            rule_id: None,
+            approval: Some(crate::policy::ApprovalRequest {
+                allow_once_code: "ABC123".to_string(),
+                allow_once_full_hash: "deadbeef".to_string(),
+                expires_at: 9999999999,
+                summary: "test approval".to_string(),
+                command: "ft approve --pane 1".to_string(),
+            }),
+            context: None,
+        };
+        assert_eq!(
+            approval_command(&decision),
+            Some("ft approve --pane 1".to_string())
+        );
+    }
+
+    #[test]
+    fn approval_command_allow_returns_none() {
+        let decision = PolicyDecision::Allow {
+            rule_id: None,
+            context: None,
+        };
+        assert_eq!(approval_command(&decision), None);
+    }
+
+    #[test]
+    fn approval_command_deny_returns_none() {
+        let decision = PolicyDecision::Deny {
+            reason: "nope".to_string(),
+            rule_id: None,
+            context: None,
+        };
+        assert_eq!(approval_command(&decision), None);
+    }
+
+    // ========================================================================
+    // elapsed_ms Tests
+    // ========================================================================
+
+    #[test]
+    fn elapsed_ms_returns_positive() {
+        let start = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let ms = elapsed_ms(start);
+        assert!(ms >= 4, "should be at least ~5ms, got {ms}");
+    }
+
+    // ========================================================================
+    // SEND_OSC_SEGMENT_LIMIT and MCP_REFRESH_COOLDOWN_MS
+    // ========================================================================
+
+    #[test]
+    fn constants_have_expected_values() {
+        assert_eq!(SEND_OSC_SEGMENT_LIMIT, 200);
+        assert_eq!(MCP_REFRESH_COOLDOWN_MS, 30_000);
+    }
+}
