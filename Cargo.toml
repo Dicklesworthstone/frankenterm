@@ -54,6 +54,8 @@ members = [
     "frankenterm/deps-freetype",
     "frankenterm/deps-harfbuzz",
     "frankenterm/deps-fontconfig",
+    # GUI bootstrap crate (ft-1memj.3)
+    "frankenterm/tabout",
 ]
 exclude = [
     "frankenterm/char-props/codegen",
@@ -468,10 +470,26 @@ dwrote = "0.11"
 xml-rs = "0.8"
 dns-lookup = "2.0"
 rcgen = "0.12"
+# GUI binary deps (wezterm-gui, ft-1memj.3)
+emojis = "0.6"
+fastrand = "2.0"
+hdrhistogram = "7.1"
+http_req = "0.11"
+nucleo-matcher = "0.3"
+rayon = "1.10"
+wgpu = "25.0.2"
 # Additional GUI-layer workspace aliases
 wezterm-gui-subcommands = { path = "frankenterm/gui-subcommands", package = "frankenterm-gui-subcommands" }
 wezterm-escape-parser = { path = "frankenterm/escape-parser", package = "frankenterm-escape-parser" }
 wezterm-surface = { path = "frankenterm/surface", package = "frankenterm-surface" }
+# GUI bootstrap crate aliases (ft-1memj.3)
+env-bootstrap = { path = "frankenterm/env-bootstrap" }
+tabout = { path = "frankenterm/tabout" }
+mux-lua = { path = "frankenterm/lua-api-crates/mux-lua" }
+url-funcs = { path = "frankenterm/lua-api-crates/url-funcs" }
+window-funcs = { path = "frankenterm/lua-api-crates/window-funcs" }
+frankenterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl" }
+wezterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl", package = "frankenterm-mux-server-impl" }
 
 # Notify: upstream uses 5.0, we use 8.x for frankenterm crates.
 # FrankenTerm config crate pins to 5.0 until migrated.
@@ -522,7 +540,6 @@ franken-agent-detection = "0.1.0"
 
 # Internal crates
 frankenterm-core = { path = "crates/frankenterm-core" }
-frankenterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl" }
 frankenterm-alloc = { path = "crates/frankenterm-alloc" }
 
 [profile.release]

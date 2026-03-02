@@ -13,7 +13,7 @@ use config::{ConfigHandle, SerialDomain, SshDomain, SshMultiplexing};
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
 use mux::Mux;
-use crate::lua_stubs::MuxDomain;
+use mux_lua::MuxDomain;
 use portable_pty::cmdbuilder::CommandBuilder;
 use promise::spawn::block_on;
 use std::borrow::Cow;
@@ -31,7 +31,7 @@ use wezterm_client::domain::ClientDomain;
 use wezterm_font::shaper::PresentationWidth;
 use wezterm_font::FontConfiguration;
 use wezterm_gui_subcommands::*;
-use frankenterm_mux_server_impl::update_mux_domains;
+use wezterm_mux_server_impl::update_mux_domains;
 use wezterm_toast_notification::*;
 
 mod colorease;
@@ -41,7 +41,6 @@ mod download;
 mod frontend;
 mod glyphcache;
 mod inputmap;
-mod lua_stubs;
 mod overlay;
 mod quad;
 mod renderstate;
@@ -66,55 +65,9 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 pub use selection::SelectionMode;
 pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DATA};
 
-// ---------------------------------------------------------------------------
-// Bootstrap (inlined from env-bootstrap, minus Lua registration)
-// ---------------------------------------------------------------------------
-
-fn frankenterm_bootstrap() {
-    config::assign_version_info(
-        config::wezterm_version(),
-        config::wezterm_target_triple(),
-    );
-
-    // Set executable location env vars
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            #[allow(unused_unsafe)]
-            unsafe {
-                std::env::set_var("FRANKENTERM_EXECUTABLE_DIR", dir);
-                std::env::set_var("FRANKENTERM_EXECUTABLE", &exe);
-                // WezTerm compat for vendored config crate
-                std::env::set_var("WEZTERM_EXECUTABLE_DIR", dir);
-                std::env::set_var("WEZTERM_EXECUTABLE", &exe);
-            }
-        }
-    }
-
-    // macOS: set LANG from locale if not already set
-    #[cfg(target_os = "macos")]
-    if std::env::var_os("LANG").map_or(true, |v| v.is_empty()) {
-        #[allow(unused_unsafe)]
-        unsafe {
-            std::env::set_var("LANG", "en_US.UTF-8");
-        }
-    }
-
-    // Clean up env vars that interfere with terminal operation
-    #[allow(unused_unsafe)]
-    unsafe {
-        std::env::remove_var("WINDOWID");
-        std::env::remove_var("VTE_VERSION");
-        std::env::remove_var("SHELL");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CLI argument parsing
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Parser)]
 #[command(
-    about = "FrankenTerm — Swarm-Native Terminal Emulator\nhttps://github.com/Dicklesworthstone/frankenterm",
+    about = "Wez's Terminal Emulator\nhttp://github.com/wezterm/wezterm",
     version = config::wezterm_version()
 )]
 struct Opt {
@@ -457,14 +410,9 @@ async fn async_run_terminal_gui(
     opts: StartCommand,
     should_publish: bool,
 ) -> anyhow::Result<()> {
-    let pid = std::process::id();
     let unix_socket_path =
-        config::RUNTIME_DIR.join(format!("frankenterm-gui-sock-{}", pid));
-    #[allow(unused_unsafe)]
-    unsafe {
-        std::env::set_var("FRANKENTERM_UNIX_SOCKET", unix_socket_path.clone());
-        std::env::set_var("WEZTERM_UNIX_SOCKET", unix_socket_path.clone());
-    }
+        config::RUNTIME_DIR.join(format!("gui-sock-{}", unsafe { libc::getpid() }));
+    std::env::set_var("WEZTERM_UNIX_SOCKET", unix_socket_path.clone());
     wezterm_blob_leases::register_storage(Arc::new(
         wezterm_blob_leases::simple_tempdir::SimpleTempDir::new_in(&*config::CACHE_DIR)?,
     ))?;
@@ -702,7 +650,7 @@ impl Publish {
 
 fn spawn_mux_server(unix_socket_path: PathBuf, should_publish: bool) -> anyhow::Result<()> {
     let mut listener =
-        frankenterm_mux_server_impl::local::LocalListener::with_domain(&config::UnixDomain {
+        wezterm_mux_server_impl::local::LocalListener::with_domain(&config::UnixDomain {
             socket_path: Some(unix_socket_path.clone()),
             ..Default::default()
         })?;
@@ -854,7 +802,7 @@ fn notify_on_panic() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if let Some(s) = info.payload().downcast_ref::<&str>() {
-            fatal_toast_notification("FrankenTerm panic", s);
+            fatal_toast_notification("Wezterm panic", s);
         }
         default_hook(info);
     }));
@@ -862,7 +810,7 @@ fn notify_on_panic() {
 
 fn terminate_with_error_message(err: &str) -> ! {
     log::error!("{}; terminating", err);
-    fatal_toast_notification("FrankenTerm Error", &err);
+    fatal_toast_notification("Wezterm Error", &err);
     std::process::exit(1);
 }
 
@@ -1250,12 +1198,13 @@ fn run() -> anyhow::Result<()> {
         }
     };
 
-    // Inline bootstrap (env_bootstrap has too many Lua deps).
-    // Sets version info, executable env vars, locale, cleans env.
-    frankenterm_bootstrap();
-    // Lua function registration deferred to ft-1memj.8.
-    // Legacy: env_bootstrap registered all Lua modules here,
-    // plus window_funcs, scripting, and stats.
+    env_bootstrap::bootstrap();
+    // window_funcs is not set up by env_bootstrap as window_funcs is
+    // GUI environment specific and env_bootstrap is used to setup the
+    // headless mux server.
+    config::lua::add_context_setup_func(window_funcs::register);
+    config::lua::add_context_setup_func(crate::scripting::register);
+    config::lua::add_context_setup_func(crate::stats::register);
 
     stats::Stats::init()?;
     let _saver = umask::UmaskSaver::new();
@@ -1284,7 +1233,7 @@ fn run() -> anyhow::Result<()> {
         Some(sub) => sub,
         None => {
             // Need to fake an argv0
-            let mut argv = vec!["frankenterm-gui".to_string()];
+            let mut argv = vec!["wezterm-gui".to_string()];
             for a in &config.default_gui_startup_args {
                 argv.push(a.clone());
             }

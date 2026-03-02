@@ -16,8 +16,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Full GUI features — enabled once window/font crates are vendored (ft-1memj.2)
-# gui = ["dep:window", "dep:wezterm-font"]
+wayland = ["window/wayland"]
 
 [build-dependencies]
 anyhow.workspace = true
@@ -26,41 +25,98 @@ anyhow.workspace = true
 # Core library — shared types, config, storage, patterns, policy engine
 frankenterm-core.workspace = true
 
-# Vendored FrankenTerm crates (ex-WezTerm, already in workspace)
-config.workspace = true
+# Vendored FrankenTerm crates (ex-WezTerm)
 codec.workspace = true
+config.workspace = true
+env-bootstrap.workspace = true
+filedescriptor.workspace = true
+frecency.workspace = true
+lfucache.workspace = true
+luahelper.workspace = true
 mux.workspace = true
+mux-lua.workspace = true
 portable-pty = { workspace = true, features = ["serde_support"] }
 promise.workspace = true
 rangeset.workspace = true
+ratelim.workspace = true
+tabout.workspace = true
+termwiz-funcs.workspace = true
 termwiz.workspace = true
 umask.workspace = true
-frankenterm-bidi = { workspace = true }
-frankenterm-blob-leases = { workspace = true, features = ["simple_tempdir"] }
-frankenterm-cell.workspace = true
-frankenterm-color-types.workspace = true
-frankenterm-dynamic.workspace = true
-frankenterm-escape-parser.workspace = true
-frankenterm-input-types.workspace = true
-frankenterm-ssh.workspace = true
-frankenterm-scripting.workspace = true
-frankenterm-surface.workspace = true
-frankenterm-term.workspace = true
-frankenterm-uds.workspace = true
+url-funcs.workspace = true
+wezterm-bidi.workspace = true
+wezterm-blob-leases = { workspace = true, features = ["simple_tempdir"] }
+wezterm-client.workspace = true
+wezterm-dynamic.workspace = true
+wezterm-font.workspace = true
+wezterm-mux-server-impl.workspace = true
+wezterm-open-url.workspace = true
+wezterm-ssh.workspace = true
+wezterm-term = { workspace = true, features = ["use_serde"] }
+wezterm-toast-notification.workspace = true
+window-funcs.workspace = true
+window.workspace = true
+wezterm-gui-subcommands.workspace = true
 
 # Standard dependencies
 anyhow.workspace = true
+bitflags.workspace = true
+bytemuck.workspace = true
+chrono.workspace = true
 clap.workspace = true
+colorgrad.workspace = true
+dirs-next.workspace = true
+downcast-rs.workspace = true
+emojis.workspace = true
+euclid.workspace = true
+fastrand.workspace = true
+finl_unicode.workspace = true
+futures.workspace = true
+hdrhistogram.workspace = true
+http_req.workspace = true
+image.workspace = true
+lazy_static.workspace = true
+libc.workspace = true
 log.workspace = true
+metrics.workspace = true
+mlua = { workspace = true, features = ["send", "serialize"] }
+nucleo-matcher.workspace = true
+ordered-float.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+regex.workspace = true
 serde = { workspace = true, features = ["rc", "derive"] }
 serde_json.workspace = true
+shlex.workspace = true
+smol.workspace = true
+tempfile.workspace = true
+terminfo.workspace = true
+textwrap.workspace = true
 thiserror.workspace = true
+tiny-skia.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tokio = { workspace = true }
+unicode-normalization.workspace = true
+unicode-segmentation.workspace = true
+url.workspace = true
+walkdir.workspace = true
+wgpu.workspace = true
 
-# macOS-specific (for future GUI integration)
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(windows)'.dependencies]
+shared_library.workspace = true
+winapi = { workspace = true, features = [
+    "winuser",
+    "consoleapi",
+    "handleapi",
+    "fileapi",
+    "namedpipeapi",
+    "synchapi",
+    "winsock2",
+]}
+windows = { workspace = true, features = [
+    "Win32_UI_Shell",
+]}
 
-[lints]
-workspace = true
+# NOTE: Workspace lints intentionally omitted — vendored GUI code carries
+# upstream style that doesn't conform to our pedantic clippy profile.
+# Linting will be incrementally enabled as the code is FrankenTerm-ified.
