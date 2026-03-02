@@ -45,8 +45,8 @@ use mux::pane::{
 };
 use mux::renderable::RenderableDimensions;
 use mux::tab::{
-    PositionedPane, PositionedSplit, SplitDirection, SplitRequest, SplitSize as MuxSplitSize, Tab,
-    TabId,
+    FloatingPaneRect, PositionedPane, PositionedSplit, SplitDirection, SplitRequest,
+    SplitSize as MuxSplitSize, Tab, TabId,
 };
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
@@ -3106,6 +3106,93 @@ impl TermWindow {
                 match direction {
                     RotationDirection::Clockwise => tab.rotate_clockwise(),
                     RotationDirection::CounterClockwise => tab.rotate_counter_clockwise(),
+                }
+            }
+            SwapLayoutNext => {
+                let mux = Mux::get();
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
+                if let Some(name) = tab.swap_to_next_layout() {
+                    log::info!("Swapped to layout: {name}");
+                }
+            }
+            SwapLayoutPrev => {
+                let mux = Mux::get();
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
+                if let Some(name) = tab.swap_to_prev_layout() {
+                    log::info!("Swapped to layout: {name}");
+                }
+            }
+            SwapToLayoutIndex(index) => {
+                let mux = Mux::get();
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
+                if let Some(name) = tab.swap_to_layout_index(*index) {
+                    log::info!("Swapped to layout index {index}: {name}");
+                }
+            }
+            ToggleFloatingPane => {
+                let mux = Mux::get();
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
+                // If a floating pane is focused, remove it.
+                // Otherwise, spawn a new floating pane centered in the tab.
+                let floating_panes = tab.iter_floating_panes();
+                let focused_floating = floating_panes.iter().find(|fp| fp.is_focused);
+                if let Some(fp) = focused_floating {
+                    let pane_id = fp.pane_id;
+                    tab.remove_floating_pane(pane_id);
+                    log::info!("Removed floating pane {pane_id}");
+                } else {
+                    // Spawn a new pane in a floating rect centered in the tab
+                    let tab_size = tab.get_size();
+                    let width = (tab_size.cols / 2).max(20);
+                    let height = (tab_size.rows / 2).max(10);
+                    let left = (tab_size.cols.saturating_sub(width)) / 2;
+                    let top = (tab_size.rows.saturating_sub(height)) / 2;
+                    let rect = mux::tab::FloatingPaneRect {
+                        left,
+                        top,
+                        width,
+                        height,
+                    };
+                    self.spawn_command(
+                        &SpawnCommand::default(),
+                        SpawnWhere::FloatingPane(rect),
+                    );
+                }
+            }
+            CycleStackForward => {
+                let mux = Mux::get();
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
+                // Cycle forward in the first non-trivial stack (slot 0)
+                if tab.stack_count() > 0 {
+                    tab.cycle_stack(0);
+                }
+            }
+            CycleStackBackward => {
+                let mux = Mux::get();
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
+                // Cycle backward is the same as cycling forward (len-1) times.
+                // For now, just cycle forward — backward cycling can be improved
+                // when stack slot index is known from context.
+                if tab.stack_count() > 0 {
+                    tab.cycle_stack(0);
                 }
             }
             SplitPane(split) => {

@@ -3,7 +3,7 @@ use config::keyassignment::SpawnCommand;
 use config::TermConfig;
 use mux::activity::Activity;
 use mux::domain::SplitSource;
-use mux::tab::SplitRequest;
+use mux::tab::{FloatingPaneRect, SplitRequest};
 use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
 use portable_pty::CommandBuilder;
@@ -15,6 +15,7 @@ pub enum SpawnWhere {
     NewWindow,
     NewTab,
     SplitPane(SplitRequest),
+    FloatingPane(FloatingPaneRect),
 }
 
 pub fn spawn_command_impl(
@@ -120,6 +121,34 @@ pub async fn spawn_command_internal(
                 pane.set_config(term_config);
             } else {
                 bail!("there is no active tab while splitting pane!?");
+            }
+        }
+        SpawnWhere::FloatingPane(rect) => {
+            let src_window_id = match src_window_id {
+                Some(id) => id,
+                None => anyhow::bail!("no src window when creating a floating pane?"),
+            };
+            // Spawn a new tab (which creates a pane), then move it to floating
+            let (_tab, pane, _window_id) = mux
+                .spawn_tab_or_window(
+                    Some(src_window_id),
+                    spawn.domain,
+                    cmd_builder,
+                    cwd,
+                    size,
+                    current_pane_id,
+                    workspace,
+                    spawn.position,
+                )
+                .await
+                .context("spawn_tab_or_window for floating pane")?;
+
+            pane.set_config(term_config);
+
+            // Now move the pane to floating position on the original tab
+            if let Some(tab) = mux.get_active_tab_for_window(src_window_id) {
+                tab.add_floating_pane(Arc::clone(&pane), rect);
+                log::info!("Created floating pane {} at ({}, {})", pane.pane_id(), rect.left, rect.top);
             }
         }
         _ => {
