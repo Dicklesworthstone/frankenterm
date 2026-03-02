@@ -211,3 +211,247 @@ impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // McpOutputFormat Tests
+    // ========================================================================
+
+    #[test]
+    fn output_format_default_is_json() {
+        assert_eq!(McpOutputFormat::default(), McpOutputFormat::Json);
+    }
+
+    // ========================================================================
+    // parse_mcp_output_format Tests
+    // ========================================================================
+
+    #[test]
+    fn parse_format_json() {
+        assert_eq!(
+            parse_mcp_output_format("json"),
+            Some(McpOutputFormat::Json)
+        );
+    }
+
+    #[test]
+    fn parse_format_toon() {
+        assert_eq!(
+            parse_mcp_output_format("toon"),
+            Some(McpOutputFormat::Toon)
+        );
+    }
+
+    #[test]
+    fn parse_format_case_insensitive() {
+        assert_eq!(
+            parse_mcp_output_format("JSON"),
+            Some(McpOutputFormat::Json)
+        );
+        assert_eq!(
+            parse_mcp_output_format("Toon"),
+            Some(McpOutputFormat::Toon)
+        );
+        assert_eq!(
+            parse_mcp_output_format("TOON"),
+            Some(McpOutputFormat::Toon)
+        );
+    }
+
+    #[test]
+    fn parse_format_with_whitespace() {
+        assert_eq!(
+            parse_mcp_output_format("  json  "),
+            Some(McpOutputFormat::Json)
+        );
+        assert_eq!(
+            parse_mcp_output_format("\ttoon\n"),
+            Some(McpOutputFormat::Toon)
+        );
+    }
+
+    #[test]
+    fn parse_format_invalid() {
+        assert_eq!(parse_mcp_output_format("xml"), None);
+        assert_eq!(parse_mcp_output_format(""), None);
+        assert_eq!(parse_mcp_output_format("yaml"), None);
+    }
+
+    // ========================================================================
+    // extract_mcp_output_format Tests
+    // ========================================================================
+
+    #[test]
+    fn extract_format_missing_defaults_to_json() {
+        let mut args = serde_json::json!({"pane_id": 1});
+        let result = extract_mcp_output_format(&mut args);
+        assert_eq!(result.unwrap(), McpOutputFormat::Json);
+        // format key should not have been inserted
+        assert!(args.get("format").is_none());
+    }
+
+    #[test]
+    fn extract_format_json_removes_key() {
+        let mut args = serde_json::json!({"pane_id": 1, "format": "json"});
+        let result = extract_mcp_output_format(&mut args);
+        assert_eq!(result.unwrap(), McpOutputFormat::Json);
+        // format key should be removed after extraction
+        assert!(args.get("format").is_none());
+        // Other keys should remain
+        assert_eq!(args.get("pane_id").unwrap().as_u64(), Some(1));
+    }
+
+    #[test]
+    fn extract_format_toon_removes_key() {
+        let mut args = serde_json::json!({"format": "toon"});
+        let result = extract_mcp_output_format(&mut args);
+        assert_eq!(result.unwrap(), McpOutputFormat::Toon);
+        assert!(args.get("format").is_none());
+    }
+
+    #[test]
+    fn extract_format_invalid_string_returns_error() {
+        let mut args = serde_json::json!({"format": "xml"});
+        let result = extract_mcp_output_format(&mut args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("xml"));
+    }
+
+    #[test]
+    fn extract_format_non_string_returns_error() {
+        let mut args = serde_json::json!({"format": 42});
+        let result = extract_mcp_output_format(&mut args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expected string"));
+    }
+
+    #[test]
+    fn extract_format_non_object_defaults_to_json() {
+        let mut args = serde_json::json!("string_value");
+        let result = extract_mcp_output_format(&mut args);
+        assert_eq!(result.unwrap(), McpOutputFormat::Json);
+    }
+
+    #[test]
+    fn extract_format_null_defaults_to_json() {
+        let mut args = serde_json::json!(null);
+        let result = extract_mcp_output_format(&mut args);
+        assert_eq!(result.unwrap(), McpOutputFormat::Json);
+    }
+
+    // ========================================================================
+    // augment_tool_schema_with_format Tests
+    // ========================================================================
+
+    #[test]
+    fn augment_schema_adds_format_property() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pane_id": {"type": "integer"}
+            }
+        });
+        augment_tool_schema_with_format(&mut schema);
+
+        let format_prop = schema
+            .get("properties")
+            .unwrap()
+            .get("format")
+            .expect("format property should exist");
+        assert_eq!(format_prop.get("type").unwrap().as_str(), Some("string"));
+        let enum_values = format_prop.get("enum").unwrap().as_array().unwrap();
+        assert!(enum_values.contains(&serde_json::json!("json")));
+        assert!(enum_values.contains(&serde_json::json!("toon")));
+    }
+
+    #[test]
+    fn augment_schema_preserves_existing_format() {
+        let custom_format = serde_json::json!({"type": "string", "enum": ["custom"]});
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "format": custom_format.clone()
+            }
+        });
+        augment_tool_schema_with_format(&mut schema);
+
+        // Should not overwrite existing "format" property
+        let format_prop = schema.get("properties").unwrap().get("format").unwrap();
+        assert_eq!(format_prop, &custom_format);
+    }
+
+    #[test]
+    fn augment_schema_creates_properties_if_missing() {
+        let mut schema = serde_json::json!({"type": "object"});
+        augment_tool_schema_with_format(&mut schema);
+
+        assert!(schema.get("properties").is_some());
+        assert!(schema.get("properties").unwrap().get("format").is_some());
+    }
+
+    #[test]
+    fn augment_schema_non_object_type_is_noop() {
+        let mut schema = serde_json::json!({"type": "array"});
+        let before = schema.clone();
+        augment_tool_schema_with_format(&mut schema);
+        assert_eq!(schema, before);
+    }
+
+    #[test]
+    fn augment_schema_non_object_value_is_noop() {
+        let mut schema = serde_json::json!("not an object");
+        let before = schema.clone();
+        augment_tool_schema_with_format(&mut schema);
+        assert_eq!(schema, before);
+    }
+
+    // ========================================================================
+    // encode_mcp_contents Tests
+    // ========================================================================
+
+    #[test]
+    fn encode_json_passthrough() {
+        let contents = vec![Content::Text {
+            text: r#"{"ok":true}"#.to_string(),
+        }];
+        let result = encode_mcp_contents(contents.clone(), McpOutputFormat::Json).unwrap();
+        assert_eq!(result.len(), 1);
+        if let Content::Text { text } = &result[0] {
+            assert_eq!(text, r#"{"ok":true}"#);
+        }
+    }
+
+    #[test]
+    fn encode_toon_converts_json() {
+        let contents = vec![Content::Text {
+            text: r#"{"ok":true,"data":"hello"}"#.to_string(),
+        }];
+        let result = encode_mcp_contents(contents, McpOutputFormat::Toon).unwrap();
+        assert_eq!(result.len(), 1);
+        if let Content::Text { text } = &result[0] {
+            // TOON output should be different from raw JSON
+            assert!(!text.is_empty());
+        }
+    }
+
+    #[test]
+    fn encode_toon_invalid_json_returns_error() {
+        let contents = vec![Content::Text {
+            text: "not valid json".to_string(),
+        }];
+        let result = encode_mcp_contents(contents, McpOutputFormat::Toon);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn encode_empty_contents() {
+        let result = encode_mcp_contents(vec![], McpOutputFormat::Json).unwrap();
+        assert!(result.is_empty());
+
+        let result = encode_mcp_contents(vec![], McpOutputFormat::Toon).unwrap();
+        assert!(result.is_empty());
+    }
+}
