@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "asupersync-runtime")]
 use crate::cx::{self, Cx};
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
 use crate::retry::RetryPolicy;
@@ -186,12 +187,22 @@ impl MuxPool {
     ///
     /// Returns the client and a guard that holds the concurrency slot.
     /// The guard must be dropped after the client is returned (or discarded).
+    /// Used directly by tests and by `execute_with_recovery_inner`.
+    #[cfg_attr(feature = "asupersync-runtime", allow(dead_code))]
     async fn acquire_client(&self) -> Result<(DirectMuxClient, PoolAcquireGuard), MuxPoolError> {
-        let cx = cx::for_testing();
-        self.acquire_client_with_cx(&cx).await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = cx::for_testing();
+            return self.acquire_client_with_cx(&cx).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            self.acquire_client_inner().await
+        }
     }
 
     /// Acquire a client using an explicit capability context.
+    #[cfg(feature = "asupersync-runtime")]
     async fn acquire_client_with_cx(
         &self,
         cx: &Cx,
@@ -218,6 +229,29 @@ impl MuxPool {
         Ok((client, guard))
     }
 
+    /// Acquire a client without an explicit capability context.
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn acquire_client_inner(
+        &self,
+    ) -> Result<(DirectMuxClient, PoolAcquireGuard), MuxPoolError> {
+        let result = self.pool.acquire().await?;
+        let (conn, guard) = result.into_parts();
+        let client = match conn {
+            Some(c) => c,
+            None => match DirectMuxClient::connect(self.mux_config.clone()).await {
+                Ok(client) => {
+                    self.connections_created.fetch_add(1, Ordering::Relaxed);
+                    client
+                }
+                Err(e) => {
+                    self.connections_failed.fetch_add(1, Ordering::Relaxed);
+                    return Err(MuxPoolError::Mux(e));
+                }
+            },
+        };
+        Ok((client, guard))
+    }
+
     /// Return a healthy client to the pool for reuse.
     async fn return_client(&self, client: DirectMuxClient) {
         self.pool.put(client).await;
@@ -226,15 +260,23 @@ impl MuxPool {
     async fn execute_with_recovery<T, Op>(
         &self,
         op_name: &'static str,
-        mut op: Op,
+        op: Op,
     ) -> Result<T, MuxPoolError>
     where
         Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
     {
-        let cx = cx::for_testing();
-        self.execute_with_recovery_with_cx(&cx, op_name, op).await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = cx::for_testing();
+            return self.execute_with_recovery_with_cx(&cx, op_name, op).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            self.execute_with_recovery_inner(op_name, op).await
+        }
     }
 
+    #[cfg(feature = "asupersync-runtime")]
     async fn execute_with_recovery_with_cx<T, Op>(
         &self,
         cx: &Cx,
@@ -311,13 +353,91 @@ impl MuxPool {
         }
     }
 
+    /// Non-cx recovery loop for when asupersync-runtime is not enabled.
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn execute_with_recovery_inner<T, Op>(
+        &self,
+        op_name: &'static str,
+        mut op: Op,
+    ) -> Result<T, MuxPoolError>
+    where
+        Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
+    {
+        let max_attempts = if self.recovery.enabled {
+            self.recovery.retry_policy.max_attempts.unwrap_or(1).max(1)
+        } else {
+            1
+        };
+
+        let mut attempt: u32 = 0;
+        loop {
+            attempt = attempt.saturating_add(1);
+
+            let (mut client, _guard) = self.acquire_client().await?;
+            let result = op(&mut client).await;
+            match result {
+                Ok(value) => {
+                    self.return_client(client).await;
+                    if attempt > 1 {
+                        self.recovery_successes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(value);
+                }
+                Err(err) => {
+                    let kind = err.protocol_error_kind();
+                    let can_retry = self.recovery.enabled
+                        && attempt < max_attempts
+                        && matches!(
+                            kind,
+                            ProtocolErrorKind::Recoverable | ProtocolErrorKind::Transient
+                        );
+                    if can_retry {
+                        self.recovery_attempts.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            op = op_name,
+                            attempt,
+                            max_attempts,
+                            kind = ?kind,
+                            error = %err,
+                            "mux pool op failed; reconnecting and retrying"
+                        );
+
+                        let delay = self
+                            .recovery
+                            .retry_policy
+                            .delay_for_attempt(attempt.saturating_sub(1));
+                        if !delay.is_zero() {
+                            sleep(delay).await;
+                        }
+                        continue;
+                    }
+
+                    if kind == ProtocolErrorKind::Permanent {
+                        self.permanent_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    tracing::debug!(
+                        op = op_name,
+                        attempt,
+                        max_attempts,
+                        kind = ?kind,
+                        error = %err,
+                        "mux pool op failed; dropping client"
+                    );
+                    return Err(MuxPoolError::Mux(err));
+                }
+            }
+        }
+    }
+
     /// List all panes via a pooled connection.
     pub async fn list_panes(&self) -> Result<ListPanesResponse, MuxPoolError> {
-        let cx = cx::for_testing();
-        self.list_panes_with_cx(&cx).await
+        self.execute_with_recovery("list_panes", |client| Box::pin(client.list_panes()))
+            .await
     }
 
     /// List all panes via a pooled connection using explicit `Cx`.
+    #[cfg(feature = "asupersync-runtime")]
     pub async fn list_panes_with_cx(&self, cx: &Cx) -> Result<ListPanesResponse, MuxPoolError> {
         self.execute_with_recovery_with_cx(cx, "list_panes", |client| Box::pin(client.list_panes()))
             .await
@@ -329,11 +449,15 @@ impl MuxPool {
         pane_id: u64,
         lines: Vec<std::ops::Range<isize>>,
     ) -> Result<GetLinesResponse, MuxPoolError> {
-        let cx = cx::for_testing();
-        self.get_lines_with_cx(&cx, pane_id, lines).await
+        self.execute_with_recovery("get_lines", move |client| {
+            let lines = lines.clone();
+            Box::pin(client.get_lines(pane_id, lines))
+        })
+        .await
     }
 
     /// Get lines from a pane via a pooled connection using explicit `Cx`.
+    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_lines_with_cx(
         &self,
         cx: &Cx,
@@ -352,11 +476,14 @@ impl MuxPool {
         &self,
         pane_id: u64,
     ) -> Result<GetPaneRenderChangesResponse, MuxPoolError> {
-        let cx = cx::for_testing();
-        self.get_pane_render_changes_with_cx(&cx, pane_id).await
+        self.execute_with_recovery("get_pane_render_changes", |client| {
+            Box::pin(client.get_pane_render_changes(pane_id))
+        })
+        .await
     }
 
     /// Poll for pane render changes using explicit `Cx`.
+    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_pane_render_changes_with_cx(
         &self,
         cx: &Cx,
@@ -376,12 +503,51 @@ impl MuxPool {
         &self,
         pane_ids: Vec<u64>,
     ) -> Result<Vec<GetPaneRenderChangesResponse>, MuxPoolError> {
-        let cx = cx::for_testing();
-        self.get_pane_render_changes_batch_with_cx(&cx, pane_ids)
-            .await
+        if pane_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let depth = self.pipeline_depth;
+        let timeout = self.pipeline_timeout;
+        let pane_ids_for_pipeline = pane_ids.clone();
+        let pipeline_result = self
+            .execute_with_recovery("get_pane_render_changes_batch", move |client| {
+                let pane_ids = pane_ids_for_pipeline.clone();
+                Box::pin(async move {
+                    Box::pin(client.get_pane_render_changes_batch(&pane_ids, depth, timeout)).await
+                })
+            })
+            .await;
+
+        if depth <= 1 {
+            return pipeline_result;
+        }
+
+        match pipeline_result {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    depth,
+                    "pipelined render batch failed; falling back to sequential"
+                );
+                self.execute_with_recovery(
+                    "get_pane_render_changes_batch_fallback",
+                    move |client| {
+                        let pane_ids = pane_ids.clone();
+                        Box::pin(async move {
+                            Box::pin(client.get_pane_render_changes_batch(&pane_ids, 1, timeout))
+                                .await
+                        })
+                    },
+                )
+                .await
+            }
+        }
     }
 
     /// Poll render changes for many panes using depth-limited pipelining and explicit `Cx`.
+    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_pane_render_changes_batch_with_cx(
         &self,
         cx: &Cx,
@@ -437,11 +603,15 @@ impl MuxPool {
         pane_id: u64,
         data: Vec<u8>,
     ) -> Result<UnitResponse, MuxPoolError> {
-        let cx = cx::for_testing();
-        self.write_to_pane_with_cx(&cx, pane_id, data).await
+        self.execute_with_recovery("write_to_pane", move |client| {
+            let data = data.clone();
+            Box::pin(client.write_to_pane(pane_id, data))
+        })
+        .await
     }
 
     /// Write raw bytes to a pane via a pooled connection using explicit `Cx`.
+    #[cfg(feature = "asupersync-runtime")]
     pub async fn write_to_pane_with_cx(
         &self,
         cx: &Cx,
@@ -461,11 +631,15 @@ impl MuxPool {
         pane_id: u64,
         data: String,
     ) -> Result<UnitResponse, MuxPoolError> {
-        let cx = cx::for_testing();
-        self.send_paste_with_cx(&cx, pane_id, data).await
+        self.execute_with_recovery("send_paste", move |client| {
+            let data = data.clone();
+            Box::pin(client.send_paste(pane_id, data))
+        })
+        .await
     }
 
     /// Send text via paste mode through a pooled connection using explicit `Cx`.
+    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_paste_with_cx(
         &self,
         cx: &Cx,
@@ -481,11 +655,18 @@ impl MuxPool {
 
     /// Run a health check by listing panes on a pooled connection.
     pub async fn health_check(&self) -> Result<(), MuxPoolError> {
-        let cx = cx::for_testing();
-        self.health_check_with_cx(&cx).await
+        self.health_checks.fetch_add(1, Ordering::Relaxed);
+        match self.list_panes().await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.health_check_failures.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
     }
 
     /// Run a health check by listing panes using explicit `Cx`.
+    #[cfg(feature = "asupersync-runtime")]
     pub async fn health_check_with_cx(&self, cx: &Cx) -> Result<(), MuxPoolError> {
         self.health_checks.fetch_add(1, Ordering::Relaxed);
         match self.list_panes_with_cx(cx).await {
@@ -765,6 +946,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_list_panes_with_cx_succeeds() {
         run_async_test(async {
@@ -917,6 +1099,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_health_check_with_cx_success() {
         run_async_test(async {
