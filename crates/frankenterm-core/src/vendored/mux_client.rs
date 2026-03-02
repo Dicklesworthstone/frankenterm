@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::config as wa_config;
 #[cfg(feature = "asupersync-runtime")]
 use crate::cx::{self, Cx};
-use crate::config as wa_config;
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
 use crate::runtime_compat::{mpsc, task, timeout, watch};
 use codec::{
