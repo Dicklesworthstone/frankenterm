@@ -990,10 +990,10 @@ proptest! {
             let (tx, mut rx) = mpsc::channel(1);
             let ((), recv_result) = runtime_compat::join!(
                 async {
-                    tx.send(val).await.expect("send");
+                    runtime_compat::mpsc_send(&tx, val).await.expect("send");
                 },
                 async {
-                    rx.recv().await.expect("recv")
+                    runtime_compat::mpsc_recv_option(&mut rx).await.expect("recv")
                 }
             );
             assert_eq!(recv_result, val, "channel+join must preserve value");
@@ -1025,9 +1025,9 @@ proptest! {
     fn select_channel_wins_over_sleep(val in any::<u32>()) {
         with_tokio(move || async move {
             let (tx, mut rx) = mpsc::channel(1);
-            tx.send(val).await.expect("send");
+            runtime_compat::mpsc_send(&tx, val).await.expect("send");
             let result = runtime_compat::select! {
-                maybe = rx.recv() => maybe.unwrap_or(0),
+                maybe = runtime_compat::mpsc_recv_option(&mut rx) => maybe.unwrap_or(0),
                 () = runtime_compat::sleep(Duration::from_secs(60)) => 0,
             };
             assert_eq!(result, val, "channel should win over long sleep");
@@ -1131,9 +1131,9 @@ proptest! {
         with_tokio(move || async move {
             let (tx, mut rx) = mpsc::channel(1);
             // Send immediately so channel is ready before timeout.
-            tx.send(val).await.expect("send");
+            runtime_compat::mpsc_send(&tx, val).await.expect("send");
             let result = runtime_compat::select! {
-                v = rx.recv() => v.unwrap_or(0),
+                v = runtime_compat::mpsc_recv_option(&mut rx) => v.unwrap_or(0),
                 () = runtime_compat::sleep(Duration::from_secs(60)) => u64::MAX,
             };
             assert_eq!(result, val, "channel should resolve before timeout");
@@ -1170,7 +1170,7 @@ proptest! {
                 let tx_clone = tx.clone();
                 let v = *v;
                 runtime_compat::task::spawn(async move {
-                    tx_clone.send(v).await.expect("send");
+                    runtime_compat::mpsc_send(&tx_clone, v).await.expect("send");
                 });
             }
             drop(tx); // Drop original sender so rx completes.
@@ -1219,7 +1219,7 @@ proptest! {
             }
             // select! should immediately see the latest value.
             let result = runtime_compat::select! {
-                _ = rx.changed() => *rx.borrow(),
+                _ = runtime_compat::watch_changed(&mut rx) => *rx.borrow(),
                 () = runtime_compat::sleep(Duration::from_secs(60)) => -1,
             };
             let last = *vals.last().unwrap();

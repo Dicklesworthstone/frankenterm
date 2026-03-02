@@ -158,7 +158,7 @@ fn bench_two_phase_send(c: &mut Criterion) {
         b.iter(|| {
             asup_rt.block_on(async {
                 let cx = Cx::for_testing();
-                let (tx, rx) = asup_mpsc::channel(1);
+                let (tx, mut rx) = asup_mpsc::channel(1);
                 let permit = tx.reserve(&cx).await.expect("reserve");
                 permit.send(7_u32);
                 let got = rx.recv(&cx).await.expect("recv");

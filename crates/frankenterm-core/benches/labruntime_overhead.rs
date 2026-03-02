@@ -140,7 +140,6 @@ fn bench_oracle_check(c: &mut Criterion) {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
@@ -208,7 +207,6 @@ fn bench_task_spawn(c: &mut Criterion) {
             runtime
                 .scheduler
                 .lock()
-                .expect("lock scheduler")
                 .schedule(task_id, 0);
             black_box(runtime.run_until_quiescent());
         });
@@ -230,7 +228,6 @@ fn bench_task_spawn(c: &mut Criterion) {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
                     .schedule(task_id, 0);
             }
             black_box(runtime.run_until_quiescent());
@@ -319,7 +316,6 @@ fn bench_comparison(c: &mut Criterion) {
             runtime
                 .scheduler
                 .lock()
-                .expect("lock scheduler")
                 .schedule(task_id, 0);
             runtime.run_until_quiescent();
         });

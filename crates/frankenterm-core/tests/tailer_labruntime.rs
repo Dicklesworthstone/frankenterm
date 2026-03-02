@@ -99,7 +99,6 @@ fn schedule_task(runtime: &mut LabRuntime, task_id: TaskId) {
     runtime
         .scheduler
         .lock()
-        .expect("lock scheduler")
         .schedule(task_id, 0);
 }
 

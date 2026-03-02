@@ -424,6 +424,29 @@ pub mod mpsc {
     pub use asupersync::channel::mpsc::{
         Receiver, RecvError, SendError, SendPermit, Sender, channel,
     };
+
+    /// Compatibility alias for `try_send` errors, matching the tokio
+    /// `TrySendError` API surface (`Full` / `Closed`).
+    ///
+    /// In asupersync the `try_send` method returns `SendError` which uses
+    /// `Disconnected` instead of `Closed`. This wrapper bridges the naming
+    /// gap so that call-sites can use `TrySendError::Full` / `Closed` uniformly.
+    #[derive(Debug)]
+    pub enum TrySendError<T> {
+        /// The channel is full.
+        Full(T),
+        /// The receiver has been dropped.
+        Closed(T),
+    }
+
+    impl<T> From<SendError<T>> for TrySendError<T> {
+        fn from(err: SendError<T>) -> Self {
+            match err {
+                SendError::Full(v) => Self::Full(v),
+                SendError::Disconnected(v) | SendError::Cancelled(v) => Self::Closed(v),
+            }
+        }
+    }
 }
 
 /// MPSC channel aliases for the active runtime.
@@ -697,13 +720,21 @@ pub mod task {
 
 /// Re-export `join!` macro for concurrent future evaluation.
 ///
-/// Wraps `tokio::join!` in the default (non-asupersync) build.
+/// Uses `futures::join!` under asupersync-runtime (runtime-agnostic),
+/// and `tokio::join!` otherwise.
+#[cfg(feature = "asupersync-runtime")]
+pub use futures::join;
 #[cfg(not(feature = "asupersync-runtime"))]
 pub use tokio::join;
 
 /// Re-export `select!` macro for multiplexing futures.
 ///
-/// Wraps `tokio::select!` in the default (non-asupersync) build.
+/// Uses `tokio::select!` in both paths during migration. The asupersync
+/// path will be replaced with a runtime-agnostic implementation once all
+/// select call-sites are audited.
+// TODO(asupersync): replace with asupersync-native select when available
+#[cfg(feature = "asupersync-runtime")]
+pub use tokio::select;
 #[cfg(not(feature = "asupersync-runtime"))]
 pub use tokio::select;
 
@@ -889,6 +920,58 @@ pub mod net {
 #[cfg(not(feature = "asupersync-runtime"))]
 pub mod net {
     pub use tokio::net::{TcpListener, TcpStream};
+}
+
+/// Signal handling primitives for graceful shutdown.
+///
+/// Wraps `asupersync::signal` for the asupersync runtime.
+#[cfg(feature = "asupersync-runtime")]
+pub mod signal {
+    /// Completes when a Ctrl+C (SIGINT) signal is received.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signal handler could not be registered.
+    pub async fn ctrl_c() -> std::io::Result<()> {
+        asupersync::signal::ctrl_c().await
+    }
+
+    /// Unix-specific signal handling.
+    #[cfg(unix)]
+    pub mod unix {
+        /// Signal kinds for Unix signal handling.
+        pub struct SignalKind(asupersync::signal::SignalKind);
+
+        impl SignalKind {
+            /// Returns the `SIGTERM` signal kind.
+            pub fn terminate() -> Self {
+                Self(asupersync::signal::SignalKind::terminate())
+            }
+        }
+
+        /// A stream of signals of a specific kind.
+        pub struct Signal {
+            inner: asupersync::signal::Signal,
+        }
+
+        impl Signal {
+            /// Receives the next signal notification.
+            ///
+            /// Returns `None` if the signal stream is terminated.
+            pub async fn recv(&mut self) -> Option<()> {
+                self.inner.recv().await
+            }
+        }
+
+        /// Creates a new listener for the given signal kind.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the signal handler could not be registered.
+        pub fn signal(kind: SignalKind) -> std::io::Result<Signal> {
+            asupersync::signal::signal(kind.0).map(|inner| Signal { inner })
+        }
+    }
 }
 
 /// Signal handling primitives for graceful shutdown.
@@ -1233,6 +1316,25 @@ pub fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T
     #[cfg(not(feature = "asupersync-runtime"))]
     {
         rx.borrow_and_update().clone()
+    }
+}
+
+/// Waits until the watch receiver observes a change, abstracting the
+/// `&Cx` parameter required by asupersync.
+///
+/// Returns `Ok(())` on change, `Err(RecvError)` if the sender was dropped.
+pub async fn watch_changed<T: Send + Sync>(
+    rx: &mut watch::Receiver<T>,
+) -> Result<(), watch::RecvError> {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_testing();
+        rx.changed(&cx).await
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        rx.changed().await
     }
 }
 

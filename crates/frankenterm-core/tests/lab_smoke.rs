@@ -53,7 +53,6 @@ fn smoke_run_lab_test_with_tasks() {
         runtime
             .scheduler
             .lock()
-            .expect("lock scheduler")
             .schedule(task_id, 0);
         runtime.run_until_quiescent();
     });
@@ -75,8 +74,7 @@ fn smoke_run_lab_test_concurrent_tasks() {
                 runtime
                     .scheduler
                     .lock()
-                    .expect("lock scheduler")
-                    .schedule(task_id, 0);
+                            .schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
         },
@@ -120,7 +118,6 @@ fn smoke_chaos_test_with_tasks() {
         runtime
             .scheduler
             .lock()
-            .expect("lock scheduler")
             .schedule(task_id, 0);
         runtime.run_until_quiescent();
     });
@@ -159,8 +156,7 @@ fn smoke_exploration_test_with_tasks() {
             runtime
                 .scheduler
                 .lock()
-                .expect("lock scheduler")
-                .schedule(task_id, 0);
+                    .schedule(task_id, 0);
         }
         runtime.run_until_quiescent();
     });
