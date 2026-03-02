@@ -772,7 +772,7 @@ impl super::TermWindow {
             }
 
             WK::Char(c) => KC::Char(*c),
-            WK::Composed(ref s) => {
+            WK::Composed(s) => {
                 let mut chars = s.chars();
                 if let Some(first_char) = chars.next() {
                     if chars.next().is_none() {

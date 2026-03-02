@@ -17,7 +17,7 @@ use config::{ConfigHandle, SerialDomain, SshDomain, SshMultiplexing};
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
 use mux::Mux;
-use crate::lua_stubs::MuxDomain;
+use mux_lua::MuxDomain;
 use portable_pty::cmdbuilder::CommandBuilder;
 use promise::spawn::block_on;
 use std::borrow::Cow;
@@ -45,7 +45,6 @@ mod download;
 mod frontend;
 mod glyphcache;
 mod inputmap;
-mod lua_stubs;
 mod overlay;
 mod quad;
 mod renderstate;
@@ -62,17 +61,6 @@ mod unicode_names;
 mod uniforms;
 mod update;
 mod utilsprites;
-
-/// Re-export lua_stubs as `mux_lua` so that existing `use mux_lua::*`
-/// imports throughout vendored GUI code resolve to our stubs.
-mod mux_lua {
-    pub use crate::lua_stubs::*;
-}
-
-/// Re-export Url stub as `url_funcs` for vendored code compatibility.
-mod url_funcs {
-    pub use crate::lua_stubs::Url;
-}
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]

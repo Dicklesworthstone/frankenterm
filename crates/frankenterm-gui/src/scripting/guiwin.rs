@@ -8,7 +8,7 @@ use mlua::{UserData, UserDataMethods, UserDataRef};
 use mux::pane::PaneId;
 use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
-use crate::lua_stubs::MuxPane;
+use mux_lua::MuxPane;
 use termwiz_funcs::lines_to_escapes;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_toast_notification::ToastNotification;
@@ -136,7 +136,7 @@ impl UserData for GuiWin {
             |_, this, pane: UserDataRef<MuxPane>| async move {
                 let (tx, rx) = smol::channel::bounded(1);
                 this.window.notify(TermWindowNotif::GetSelectionForPane {
-                    pane_id: pane.0,
+                    pane_id: (*pane).0,
                     tx,
                 });
                 let text = rx
@@ -162,7 +162,7 @@ impl UserData for GuiWin {
             |_, this, (assignment, pane): (KeyAssignment, UserDataRef<MuxPane>)| async move {
                 let (tx, rx) = smol::channel::bounded(1);
                 this.window.notify(TermWindowNotif::PerformAssignment {
-                    pane_id: pane.0,
+                    pane_id: (*pane).0,
                     assignment,
                     tx: Some(tx),
                 });
@@ -274,7 +274,7 @@ impl UserData for GuiWin {
             Ok((mods.to_string(), leds.to_string()))
         });
         methods.add_async_method("active_pane", |_, this, _: ()| async move {
-            let (tx, rx) = smol::channel::bounded(1);
+            let (tx, rx) = smol::channel::bounded::<Option<MuxPane>>(1);
             this.window
                 .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                     tx.try_send(
@@ -313,7 +313,7 @@ impl UserData for GuiWin {
             "get_selection_escapes_for_pane",
             |_, this, pane: UserDataRef<MuxPane>| async move {
                 let (tx, rx) = smol::channel::bounded(1);
-                let pane_id = pane.0;
+                let pane_id = (*pane).0;
                 this.window
                     .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                         fn do_it(

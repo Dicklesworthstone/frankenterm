@@ -1013,6 +1013,11 @@ impl SessionHandler {
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)))
             }
+            // Catch-all for newly added PDU variants (floating panes, etc.)
+            // that this server implementation doesn't handle yet.
+            _ => {
+                send_response(Err(anyhow!("unhandled PDU: {:?}", decoded.pdu)))
+            }
         }
     }
 }

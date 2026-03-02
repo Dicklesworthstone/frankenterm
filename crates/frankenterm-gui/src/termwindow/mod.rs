@@ -50,7 +50,7 @@ use mux::tab::{
 };
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
-use crate::lua_stubs::MuxPane;
+use mux_lua::MuxPane;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
@@ -93,7 +93,7 @@ lazy_static::lazy_static! {
     static ref POSITION: Mutex<Option<GuiPosition>> = Mutex::new(None);
 }
 
-pub const ICON_DATA: &'static [u8] = include_bytes!("../../../assets/icon/terminal.png");
+pub const ICON_DATA: &'static [u8] = include_bytes!("../../../../assets/icon/terminal.png");
 
 pub fn set_window_position(pos: GuiPosition) {
     POSITION.lock().unwrap().replace(pos);
@@ -316,7 +316,7 @@ impl UserData for PaneInformation {
                 if let Some(pane) = mux.get_pane(this.pane_id) {
                     return Ok(pane
                         .get_current_working_dir(CachePolicy::AllowStale)
-                        .map(|url| crate::lua_stubs::Url { url }));
+                        .map(|url| url_funcs::Url { url }));
                 }
             }
             Ok(None)

@@ -3364,6 +3364,7 @@ dependencies = [
  "metrics",
  "mlua",
  "mux",
+ "mux-lua",
  "nucleo-matcher",
  "ordered-float 4.6.0",
  "parking_lot",
@@ -3390,6 +3391,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "url",
+ "url-funcs",
  "walkdir",
  "wezterm-client",
  "wezterm-font",
@@ -6576,6 +6578,28 @@ dependencies = [
  "thiserror 2.0.18",
  "url",
  "winapi",
+]
+
+[[package]]
+name = "mux-lua"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "config",
+ "frankenterm-dynamic",
+ "frankenterm-term",
+ "libc",
+ "log",
+ "luahelper",
+ "mlua",
+ "mux",
+ "parking_lot",
+ "portable-pty",
+ "smol",
+ "termwiz 0.24.0",
+ "termwiz-funcs",
+ "url",
+ "url-funcs",
 ]
 
 [[package]]
@@ -10552,6 +10576,18 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "url-funcs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "config",
+ "frankenterm-dynamic",
+ "luahelper",
+ "percent-encoding",
+ "url",
 ]
 
 [[package]]

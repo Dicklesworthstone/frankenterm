@@ -26,9 +26,6 @@ anyhow.workspace = true
 frankenterm-core.workspace = true
 
 # Vendored FrankenTerm crates (ex-WezTerm)
-# NOTE: env-bootstrap and mux-lua are NOT included — they depend on the
-# full Lua API crate tree which is not vendored yet. Stubs are provided
-# in src/lua_stubs.rs and src/main.rs::frankenterm_bootstrap().
 codec.workspace = true
 config.workspace = true
 filedescriptor.workspace = true
@@ -44,12 +41,15 @@ tabout.workspace = true
 termwiz-funcs.workspace = true
 termwiz.workspace = true
 umask.workspace = true
+mux-lua.workspace = true
+url-funcs.workspace = true
 # Workspace aliases (wezterm-* -> frankenterm-* packages)
+# NOTE: frankenterm-dynamic is the canonical dep name. The extern crate alias
+# in main.rs provides `wezterm_dynamic` for vendored code that uses the old name.
+# Do NOT add wezterm-dynamic here — it would create a duplicate dep error.
 wezterm-bidi.workspace = true
 wezterm-blob-leases = { workspace = true, features = ["simple_tempdir"] }
 wezterm-client.workspace = true
-wezterm-dynamic.workspace = true
-# Also needed as frankenterm-dynamic for derive macro generated code
 frankenterm-dynamic.workspace = true
 wezterm-font.workspace = true
 wezterm-gui-subcommands.workspace = true

@@ -12,7 +12,7 @@ use config::keyassignment::KeyAssignment;
 use config::Dimension;
 use frecency::Frecency;
 use luahelper::{from_lua_value_dynamic, impl_lua_conversion_dynamic};
-use crate::lua_stubs::MuxPane;
+use mux_lua::MuxPane;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
