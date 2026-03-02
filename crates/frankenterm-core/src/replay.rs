@@ -1050,6 +1050,7 @@ mod tests {
     use super::*;
     use crate::recording::{FrameHeader, FrameType, RecordingFrame};
     use serde_json::json;
+    use std::future::Future;
 
     /// Build a test recording from frame specs: (timestamp_ms, frame_type, payload).
     fn build_recording(specs: &[(u64, FrameType, Vec<u8>)]) -> Vec<u8> {
@@ -1067,6 +1068,18 @@ mod tests {
             data.extend(frame.encode());
         }
         data
+    }
+
+    fn run_async_test<F>(future: F)
+    where
+        F: Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build replay test runtime");
+        runtime.block_on(future);
     }
 
     #[test]
@@ -1275,113 +1288,123 @@ mod tests {
         assert!(PlaybackSpeed::new(0.1).is_ok());
     }
 
-    #[tokio::test]
-    async fn play_simple_all_frames() {
-        let data = build_recording(&[
-            (0, FrameType::Output, b"A".to_vec()),
-            (10, FrameType::Output, b"B".to_vec()),
-            (20, FrameType::Marker, b"done".to_vec()),
-        ]);
-        let recording = Recording::from_bytes(&data).unwrap();
-        let mut player = Player::new(recording);
-        player.set_speed(PlaybackSpeed::QUAD); // fast
-        let mut sink = CollectorSink::new();
+    #[test]
+    fn play_simple_all_frames() {
+        run_async_test(async {
+            let data = build_recording(&[
+                (0, FrameType::Output, b"A".to_vec()),
+                (10, FrameType::Output, b"B".to_vec()),
+                (20, FrameType::Marker, b"done".to_vec()),
+            ]);
+            let recording = Recording::from_bytes(&data).unwrap();
+            let mut player = Player::new(recording);
+            player.set_speed(PlaybackSpeed::QUAD); // fast
+            let mut sink = CollectorSink::new();
 
-        player.play_simple(&mut sink).await.unwrap();
+            player.play_simple(&mut sink).await.unwrap();
 
-        assert_eq!(player.state(), PlayerState::Finished);
-        assert_eq!(sink.output, b"AB");
-        assert_eq!(sink.markers, vec!["done"]);
+            assert_eq!(player.state(), PlayerState::Finished);
+            assert_eq!(sink.output, b"AB");
+            assert_eq!(sink.markers, vec!["done"]);
+        });
     }
 
-    #[tokio::test]
-    async fn play_with_stop_control() {
-        // Send stop before play starts to deterministically test the pre-loop
-        // control-check path. (Spawned-task timing is unreliable with
-        // crate::runtime_compat::time::pause() on a single-threaded runtime.)
-        let data = build_recording(&[
-            (0, FrameType::Output, b"A".to_vec()),
-            (5000, FrameType::Output, b"B".to_vec()),
-            (10000, FrameType::Output, b"C".to_vec()),
-        ]);
-        let recording = Recording::from_bytes(&data).unwrap();
-        let mut player = Player::new(recording);
+    #[test]
+    fn play_with_stop_control() {
+        run_async_test(async {
+            // Send stop before play starts to deterministically test the pre-loop
+            // control-check path. (Spawned-task timing is unreliable with
+            // crate::runtime_compat::time::pause() on a single-threaded runtime.)
+            let data = build_recording(&[
+                (0, FrameType::Output, b"A".to_vec()),
+                (5000, FrameType::Output, b"B".to_vec()),
+                (10000, FrameType::Output, b"C".to_vec()),
+            ]);
+            let recording = Recording::from_bytes(&data).unwrap();
+            let mut player = Player::new(recording);
 
-        let (tx, rx) = watch::channel(PlayerControl::Play);
-        let mut sink = CollectorSink::new();
+            let (tx, rx) = watch::channel(PlayerControl::Play);
+            let mut sink = CollectorSink::new();
 
-        // Send stop before play — the very first check_control sees it.
-        let _ = tx.send(PlayerControl::Stop);
+            // Send stop before play — the very first check_control sees it.
+            let _ = tx.send(PlayerControl::Stop);
 
-        player.play(&mut sink, rx).await.unwrap();
-        assert_eq!(player.state(), PlayerState::Stopped);
-        // Stop arrived before any frames were output.
-        assert!(sink.output.is_empty());
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[tokio::test]
-    async fn play_deterministic_timing() {
-        // Pause the runtime clock for deterministic timing tests.
-        crate::runtime_compat::time::pause();
-
-        let data = build_recording(&[
-            (0, FrameType::Output, b"A".to_vec()),
-            (100, FrameType::Output, b"B".to_vec()),
-            (200, FrameType::Output, b"C".to_vec()),
-        ]);
-        let recording = Recording::from_bytes(&data).unwrap();
-        let mut player = Player::new(recording);
-        // Normal speed (1x).
-        let mut sink = CollectorSink::new();
-
-        player.play_simple(&mut sink).await.unwrap();
-
-        assert_eq!(player.state(), PlayerState::Finished);
-        assert_eq!(sink.output, b"ABC");
-        assert_eq!(player.position().frame_index, 3);
+            player.play(&mut sink, rx).await.unwrap();
+            assert_eq!(player.state(), PlayerState::Stopped);
+            // Stop arrived before any frames were output.
+            assert!(sink.output.is_empty());
+        });
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]
-    #[tokio::test]
-    async fn play_double_speed() {
-        crate::runtime_compat::time::pause();
+    #[test]
+    fn play_deterministic_timing() {
+        run_async_test(async {
+            // Pause the runtime clock for deterministic timing tests.
+            crate::runtime_compat::time::pause();
 
-        let data = build_recording(&[
-            (0, FrameType::Output, b"A".to_vec()),
-            (1000, FrameType::Output, b"B".to_vec()),
-        ]);
-        let recording = Recording::from_bytes(&data).unwrap();
-        let mut player = Player::new(recording);
-        player.set_speed(PlaybackSpeed::DOUBLE);
-        let mut sink = CollectorSink::new();
+            let data = build_recording(&[
+                (0, FrameType::Output, b"A".to_vec()),
+                (100, FrameType::Output, b"B".to_vec()),
+                (200, FrameType::Output, b"C".to_vec()),
+            ]);
+            let recording = Recording::from_bytes(&data).unwrap();
+            let mut player = Player::new(recording);
+            // Normal speed (1x).
+            let mut sink = CollectorSink::new();
 
-        player.play_simple(&mut sink).await.unwrap();
+            player.play_simple(&mut sink).await.unwrap();
 
-        assert_eq!(sink.output, b"AB");
-        assert_eq!(player.state(), PlayerState::Finished);
+            assert_eq!(player.state(), PlayerState::Finished);
+            assert_eq!(sink.output, b"ABC");
+            assert_eq!(player.position().frame_index, 3);
+        });
     }
 
-    #[tokio::test]
-    async fn play_with_events_and_markers() {
-        let event_payload = serde_json::to_vec(&json!({"rule": "test"})).unwrap();
-        let data = build_recording(&[
-            (0, FrameType::Output, b"text".to_vec()),
-            (50, FrameType::Event, event_payload),
-            (100, FrameType::Marker, b"annotation".to_vec()),
-            (150, FrameType::Output, b"more".to_vec()),
-        ]);
-        let recording = Recording::from_bytes(&data).unwrap();
-        let mut player = Player::new(recording);
-        player.set_speed(PlaybackSpeed::QUAD);
-        let mut sink = CollectorSink::new();
+    #[cfg(not(feature = "asupersync-runtime"))]
+    #[test]
+    fn play_double_speed() {
+        run_async_test(async {
+            crate::runtime_compat::time::pause();
 
-        player.play_simple(&mut sink).await.unwrap();
+            let data = build_recording(&[
+                (0, FrameType::Output, b"A".to_vec()),
+                (1000, FrameType::Output, b"B".to_vec()),
+            ]);
+            let recording = Recording::from_bytes(&data).unwrap();
+            let mut player = Player::new(recording);
+            player.set_speed(PlaybackSpeed::DOUBLE);
+            let mut sink = CollectorSink::new();
 
-        assert_eq!(sink.output, b"textmore");
-        assert_eq!(sink.events.len(), 1);
-        assert_eq!(sink.events[0]["rule"], "test");
-        assert_eq!(sink.markers, vec!["annotation"]);
+            player.play_simple(&mut sink).await.unwrap();
+
+            assert_eq!(sink.output, b"AB");
+            assert_eq!(player.state(), PlayerState::Finished);
+        });
+    }
+
+    #[test]
+    fn play_with_events_and_markers() {
+        run_async_test(async {
+            let event_payload = serde_json::to_vec(&json!({"rule": "test"})).unwrap();
+            let data = build_recording(&[
+                (0, FrameType::Output, b"text".to_vec()),
+                (50, FrameType::Event, event_payload),
+                (100, FrameType::Marker, b"annotation".to_vec()),
+                (150, FrameType::Output, b"more".to_vec()),
+            ]);
+            let recording = Recording::from_bytes(&data).unwrap();
+            let mut player = Player::new(recording);
+            player.set_speed(PlaybackSpeed::QUAD);
+            let mut sink = CollectorSink::new();
+
+            player.play_simple(&mut sink).await.unwrap();
+
+            assert_eq!(sink.output, b"textmore");
+            assert_eq!(sink.events.len(), 1);
+            assert_eq!(sink.events[0]["rule"], "test");
+            assert_eq!(sink.markers, vec!["annotation"]);
+        });
     }
 
     #[test]
@@ -1937,14 +1960,16 @@ mod tests {
         assert_eq!(player.duration_ms(), 0);
     }
 
-    #[tokio::test]
-    async fn play_empty_recording_finishes_immediately() {
-        let recording = Recording::from_bytes(&[]).unwrap();
-        let mut player = Player::new(recording);
-        let mut sink = HeadlessSink;
+    #[test]
+    fn play_empty_recording_finishes_immediately() {
+        run_async_test(async {
+            let recording = Recording::from_bytes(&[]).unwrap();
+            let mut player = Player::new(recording);
+            let mut sink = HeadlessSink;
 
-        player.play_simple(&mut sink).await.unwrap();
-        assert_eq!(player.state(), PlayerState::Finished);
+            player.play_simple(&mut sink).await.unwrap();
+            assert_eq!(player.state(), PlayerState::Finished);
+        });
     }
 
     #[test]
@@ -1957,32 +1982,34 @@ mod tests {
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]
-    #[tokio::test]
-    async fn play_with_pause_then_resume() {
-        crate::runtime_compat::time::pause();
+    #[test]
+    fn play_with_pause_then_resume() {
+        run_async_test(async {
+            crate::runtime_compat::time::pause();
 
-        let data = build_recording(&[
-            (0, FrameType::Output, b"A".to_vec()),
-            (5000, FrameType::Output, b"B".to_vec()),
-            (10000, FrameType::Output, b"C".to_vec()),
-        ]);
-        let recording = Recording::from_bytes(&data).unwrap();
-        let mut player = Player::new(recording);
+            let data = build_recording(&[
+                (0, FrameType::Output, b"A".to_vec()),
+                (5000, FrameType::Output, b"B".to_vec()),
+                (10000, FrameType::Output, b"C".to_vec()),
+            ]);
+            let recording = Recording::from_bytes(&data).unwrap();
+            let mut player = Player::new(recording);
 
-        let (tx, rx) = watch::channel(PlayerControl::Play);
-        let mut sink = CollectorSink::new();
+            let (tx, rx) = watch::channel(PlayerControl::Play);
+            let mut sink = CollectorSink::new();
 
-        crate::runtime_compat::task::spawn(async move {
-            // Pause at 1s, resume at 2s
-            sleep(Duration::from_secs(1)).await;
-            let _ = tx.send(PlayerControl::Pause);
-            sleep(Duration::from_secs(1)).await;
-            let _ = tx.send(PlayerControl::Play);
+            crate::runtime_compat::task::spawn(async move {
+                // Pause at 1s, resume at 2s
+                sleep(Duration::from_secs(1)).await;
+                let _ = tx.send(PlayerControl::Pause);
+                sleep(Duration::from_secs(1)).await;
+                let _ = tx.send(PlayerControl::Play);
+            });
+
+            player.play(&mut sink, rx).await.unwrap();
+            assert_eq!(player.state(), PlayerState::Finished);
+            assert_eq!(sink.output, b"ABC");
         });
-
-        player.play(&mut sink, rx).await.unwrap();
-        assert_eq!(player.state(), PlayerState::Finished);
-        assert_eq!(sink.output, b"ABC");
     }
 
     #[test]
@@ -2036,22 +2063,24 @@ mod tests {
         assert_eq!(output.lines().count(), 2); // header + 1 output event
     }
 
-    #[tokio::test]
-    async fn play_simple_records_correct_final_position() {
-        let data = build_recording(&[
-            (0, FrameType::Output, b"a".to_vec()),
-            (100, FrameType::Output, b"b".to_vec()),
-            (500, FrameType::Output, b"c".to_vec()),
-        ]);
-        let recording = Recording::from_bytes(&data).unwrap();
-        let mut player = Player::new(recording);
-        player.set_speed(PlaybackSpeed::QUAD);
-        let mut sink = CollectorSink::new();
+    #[test]
+    fn play_simple_records_correct_final_position() {
+        run_async_test(async {
+            let data = build_recording(&[
+                (0, FrameType::Output, b"a".to_vec()),
+                (100, FrameType::Output, b"b".to_vec()),
+                (500, FrameType::Output, b"c".to_vec()),
+            ]);
+            let recording = Recording::from_bytes(&data).unwrap();
+            let mut player = Player::new(recording);
+            player.set_speed(PlaybackSpeed::QUAD);
+            let mut sink = CollectorSink::new();
 
-        player.play_simple(&mut sink).await.unwrap();
+            player.play_simple(&mut sink).await.unwrap();
 
-        assert_eq!(player.position().frame_index, 3);
-        assert_eq!(sink.output, b"abc");
+            assert_eq!(player.position().frame_index, 3);
+            assert_eq!(sink.output, b"abc");
+        });
     }
 
     // =========================================================================
