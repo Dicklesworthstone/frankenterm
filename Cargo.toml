@@ -54,8 +54,12 @@ members = [
     "frankenterm/deps-freetype",
     "frankenterm/deps-harfbuzz",
     "frankenterm/deps-fontconfig",
-    # GUI bootstrap crate (ft-1memj.3)
+    # GUI bootstrap crates (ft-1memj.3)
     "frankenterm/tabout",
+    "frankenterm/env-bootstrap",
+    "frankenterm/lua-api-crates/mux-lua",
+    "frankenterm/lua-api-crates/url-funcs",
+    "frankenterm/lua-api-crates/window-funcs",
 ]
 exclude = [
     "frankenterm/char-props/codegen",
@@ -482,8 +486,12 @@ wgpu = "25.0.2"
 wezterm-gui-subcommands = { path = "frankenterm/gui-subcommands", package = "frankenterm-gui-subcommands" }
 wezterm-escape-parser = { path = "frankenterm/escape-parser", package = "frankenterm-escape-parser" }
 wezterm-surface = { path = "frankenterm/surface", package = "frankenterm-surface" }
-# GUI bootstrap crate (ft-1memj.3)
+# GUI bootstrap crates (ft-1memj.3)
 tabout = { path = "frankenterm/tabout" }
+env-bootstrap = { path = "frankenterm/env-bootstrap" }
+mux-lua = { path = "frankenterm/lua-api-crates/mux-lua" }
+url-funcs = { path = "frankenterm/lua-api-crates/url-funcs" }
+window-funcs = { path = "frankenterm/lua-api-crates/window-funcs" }
 frankenterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl" }
 
 # Notify: upstream uses 5.0, we use 8.x for frankenterm crates.

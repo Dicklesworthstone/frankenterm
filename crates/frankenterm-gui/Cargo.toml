@@ -26,6 +26,9 @@ anyhow.workspace = true
 frankenterm-core.workspace = true
 
 # Vendored FrankenTerm crates (ex-WezTerm)
+# NOTE: env-bootstrap and mux-lua are NOT included — they depend on the
+# full Lua API crate tree which is not vendored yet. Stubs are provided
+# in src/lua_stubs.rs and src/main.rs::frankenterm_bootstrap().
 codec.workspace = true
 config.workspace = true
 filedescriptor.workspace = true
@@ -41,11 +44,13 @@ tabout.workspace = true
 termwiz-funcs.workspace = true
 termwiz.workspace = true
 umask.workspace = true
-# Workspace aliases (wezterm-* → frankenterm-* packages)
+# Workspace aliases (wezterm-* -> frankenterm-* packages)
 wezterm-bidi.workspace = true
 wezterm-blob-leases = { workspace = true, features = ["simple_tempdir"] }
 wezterm-client.workspace = true
 wezterm-dynamic.workspace = true
+# Also needed as frankenterm-dynamic for derive macro generated code
+frankenterm-dynamic.workspace = true
 wezterm-font.workspace = true
 wezterm-gui-subcommands.workspace = true
 wezterm-open-url.workspace = true
@@ -53,7 +58,7 @@ wezterm-ssh.workspace = true
 wezterm-term.workspace = true
 wezterm-toast-notification.workspace = true
 window.workspace = true
-# FrankenTerm mux server (not aliased — uses frankenterm_mux_server_impl in code)
+# FrankenTerm mux server (uses frankenterm_mux_server_impl in code)
 frankenterm-mux-server-impl.workspace = true
 
 # Standard dependencies
@@ -113,6 +118,6 @@ windows = { workspace = true, features = [
     "Win32_UI_Shell",
 ]}
 
-# NOTE: Workspace lints intentionally omitted — vendored GUI code carries
-# upstream style that doesn't conform to our pedantic clippy profile.
+# NOTE: Workspace lints intentionally omitted - vendored GUI code carries
+# upstream style that does not conform to our pedantic clippy profile.
 # Linting will be incrementally enabled as the code is FrankenTerm-ified.
