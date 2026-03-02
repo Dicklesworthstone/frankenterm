@@ -1,0 +1,38 @@
+[package]
+name = "frankenterm-mux-server"
+description = "FrankenTerm headless mux server binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "frankenterm-mux-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async_ossl.workspace = true
+clap.workspace = true
+config.workspace = true
+libc.workspace = true
+log.workspace = true
+mux.workspace = true
+mlua.workspace = true
+openssl.workspace = true
+portable-pty = { workspace=true, features = ["serde_support"]}
+promise.workspace = true
+umask.workspace = true
+wezterm-blob-leases = {workspace=true, features=["simple_tempdir"]}
+frankenterm-mux-server-impl.workspace = true
+wezterm-gui-subcommands.workspace = true
+wezterm-term.workspace = true
+
+[target."cfg(windows)".dependencies]
+winapi = { workspace=true, features = [ "winuser" ]}
+
+[lints]
+workspace = true
