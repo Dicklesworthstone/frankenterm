@@ -731,7 +731,7 @@ mod tests {
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::for_testing();
-            tx.send(value, &cx).await
+            tx.send(&cx, value).await
         }
 
         #[cfg(not(feature = "asupersync-runtime"))]

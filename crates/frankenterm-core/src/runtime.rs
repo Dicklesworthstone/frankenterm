@@ -44,9 +44,9 @@ use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 use crate::runtime_compat::{
-    Mutex, MutexGuard, RwLock, mpsc, sleep,
+    Mutex, MutexGuard, RwLock, mpsc, mpsc_recv_option, sleep,
     task::{self, JoinHandle},
-    timeout, watch,
+    timeout, watch, watch_borrow_and_update_clone, watch_has_changed,
 };
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
@@ -2767,31 +2767,6 @@ fn classify_backpressure_tier(
     Some(tier.to_string())
 }
 
-fn watch_has_changed<T>(rx: &watch::Receiver<T>) -> bool {
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        rx.has_changed()
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        rx.has_changed().unwrap_or(false)
-    }
-}
-
-#[allow(clippy::needless_pass_by_ref_mut)]
-fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T {
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        rx.borrow_and_clone()
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        rx.borrow_and_update().clone()
-    }
-}
-
 fn mpsc_max_capacity<T>(tx: &mpsc::Sender<T>) -> usize {
     #[cfg(feature = "asupersync-runtime")]
     {
@@ -2801,19 +2776,6 @@ fn mpsc_max_capacity<T>(tx: &mpsc::Sender<T>) -> usize {
     #[cfg(not(feature = "asupersync-runtime"))]
     {
         tx.max_capacity()
-    }
-}
-
-async fn mpsc_recv_option<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        let cx = crate::cx::for_testing();
-        rx.recv(&cx).await.ok()
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        rx.recv().await
     }
 }
 

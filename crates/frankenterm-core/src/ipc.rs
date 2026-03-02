@@ -70,7 +70,7 @@ async fn mpsc_send_value<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::
     #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::for_testing();
-        tx.send(value, &cx).await
+        tx.send(&cx, value).await
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]

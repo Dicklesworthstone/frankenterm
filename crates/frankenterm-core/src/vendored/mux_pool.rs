@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cx::{self, Cx};
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
 use crate::retry::RetryPolicy;
 use crate::runtime_compat::sleep;
@@ -186,11 +187,24 @@ impl MuxPool {
     /// Returns the client and a guard that holds the concurrency slot.
     /// The guard must be dropped after the client is returned (or discarded).
     async fn acquire_client(&self) -> Result<(DirectMuxClient, PoolAcquireGuard), MuxPoolError> {
-        let result = self.pool.acquire().await?;
+        let cx = cx::for_testing();
+        self.acquire_client_with_cx(&cx).await
+    }
+
+    /// Acquire a client using an explicit capability context.
+    async fn acquire_client_with_cx(
+        &self,
+        cx: &Cx,
+    ) -> Result<(DirectMuxClient, PoolAcquireGuard), MuxPoolError> {
+        let result = self.pool.acquire_with_cx(cx).await?;
         let (conn, guard) = result.into_parts();
         let client = match conn {
             Some(c) => c,
-            None => match DirectMuxClient::connect(self.mux_config.clone()).await {
+            None => match cx::with_cx_async(cx, |_| async {
+                DirectMuxClient::connect(self.mux_config.clone()).await
+            })
+            .await
+            {
                 Ok(client) => {
                     self.connections_created.fetch_add(1, Ordering::Relaxed);
                     client
@@ -217,6 +231,19 @@ impl MuxPool {
     where
         Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
     {
+        let cx = cx::for_testing();
+        self.execute_with_recovery_with_cx(&cx, op_name, op).await
+    }
+
+    async fn execute_with_recovery_with_cx<T, Op>(
+        &self,
+        cx: &Cx,
+        op_name: &'static str,
+        mut op: Op,
+    ) -> Result<T, MuxPoolError>
+    where
+        Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
+    {
         let max_attempts = if self.recovery.enabled {
             self.recovery.retry_policy.max_attempts.unwrap_or(1).max(1)
         } else {
@@ -227,7 +254,7 @@ impl MuxPool {
         loop {
             attempt = attempt.saturating_add(1);
 
-            let (mut client, _guard) = self.acquire_client().await?;
+            let (mut client, _guard) = self.acquire_client_with_cx(cx).await?;
             let result = op(&mut client).await;
             match result {
                 Ok(value) => {
@@ -261,7 +288,7 @@ impl MuxPool {
                             .retry_policy
                             .delay_for_attempt(attempt.saturating_sub(1));
                         if !delay.is_zero() {
-                            sleep(delay).await;
+                            cx::with_cx_async(cx, |_| sleep(delay)).await;
                         }
                         continue;
                     }
@@ -286,7 +313,13 @@ impl MuxPool {
 
     /// List all panes via a pooled connection.
     pub async fn list_panes(&self) -> Result<ListPanesResponse, MuxPoolError> {
-        self.execute_with_recovery("list_panes", |client| Box::pin(client.list_panes()))
+        let cx = cx::for_testing();
+        self.list_panes_with_cx(&cx).await
+    }
+
+    /// List all panes via a pooled connection using explicit `Cx`.
+    pub async fn list_panes_with_cx(&self, cx: &Cx) -> Result<ListPanesResponse, MuxPoolError> {
+        self.execute_with_recovery_with_cx(cx, "list_panes", |client| Box::pin(client.list_panes()))
             .await
     }
 
@@ -296,7 +329,18 @@ impl MuxPool {
         pane_id: u64,
         lines: Vec<std::ops::Range<isize>>,
     ) -> Result<GetLinesResponse, MuxPoolError> {
-        self.execute_with_recovery("get_lines", move |client| {
+        let cx = cx::for_testing();
+        self.get_lines_with_cx(&cx, pane_id, lines).await
+    }
+
+    /// Get lines from a pane via a pooled connection using explicit `Cx`.
+    pub async fn get_lines_with_cx(
+        &self,
+        cx: &Cx,
+        pane_id: u64,
+        lines: Vec<std::ops::Range<isize>>,
+    ) -> Result<GetLinesResponse, MuxPoolError> {
+        self.execute_with_recovery_with_cx(cx, "get_lines", move |client| {
             let lines = lines.clone();
             Box::pin(client.get_lines(pane_id, lines))
         })
@@ -308,7 +352,17 @@ impl MuxPool {
         &self,
         pane_id: u64,
     ) -> Result<GetPaneRenderChangesResponse, MuxPoolError> {
-        self.execute_with_recovery("get_pane_render_changes", |client| {
+        let cx = cx::for_testing();
+        self.get_pane_render_changes_with_cx(&cx, pane_id).await
+    }
+
+    /// Poll for pane render changes using explicit `Cx`.
+    pub async fn get_pane_render_changes_with_cx(
+        &self,
+        cx: &Cx,
+        pane_id: u64,
+    ) -> Result<GetPaneRenderChangesResponse, MuxPoolError> {
+        self.execute_with_recovery_with_cx(cx, "get_pane_render_changes", |client| {
             Box::pin(client.get_pane_render_changes(pane_id))
         })
         .await
@@ -322,6 +376,17 @@ impl MuxPool {
         &self,
         pane_ids: Vec<u64>,
     ) -> Result<Vec<GetPaneRenderChangesResponse>, MuxPoolError> {
+        let cx = cx::for_testing();
+        self.get_pane_render_changes_batch_with_cx(&cx, pane_ids)
+            .await
+    }
+
+    /// Poll render changes for many panes using depth-limited pipelining and explicit `Cx`.
+    pub async fn get_pane_render_changes_batch_with_cx(
+        &self,
+        cx: &Cx,
+        pane_ids: Vec<u64>,
+    ) -> Result<Vec<GetPaneRenderChangesResponse>, MuxPoolError> {
         if pane_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -330,7 +395,7 @@ impl MuxPool {
         let timeout = self.pipeline_timeout;
         let pane_ids_for_pipeline = pane_ids.clone();
         let pipeline_result = self
-            .execute_with_recovery("get_pane_render_changes_batch", move |client| {
+            .execute_with_recovery_with_cx(cx, "get_pane_render_changes_batch", move |client| {
                 let pane_ids = pane_ids_for_pipeline.clone();
                 Box::pin(async move {
                     Box::pin(client.get_pane_render_changes_batch(&pane_ids, depth, timeout)).await
@@ -350,7 +415,8 @@ impl MuxPool {
                     depth,
                     "pipelined render batch failed; falling back to sequential"
                 );
-                self.execute_with_recovery(
+                self.execute_with_recovery_with_cx(
+                    cx,
                     "get_pane_render_changes_batch_fallback",
                     move |client| {
                         let pane_ids = pane_ids.clone();
@@ -371,7 +437,18 @@ impl MuxPool {
         pane_id: u64,
         data: Vec<u8>,
     ) -> Result<UnitResponse, MuxPoolError> {
-        self.execute_with_recovery("write_to_pane", move |client| {
+        let cx = cx::for_testing();
+        self.write_to_pane_with_cx(&cx, pane_id, data).await
+    }
+
+    /// Write raw bytes to a pane via a pooled connection using explicit `Cx`.
+    pub async fn write_to_pane_with_cx(
+        &self,
+        cx: &Cx,
+        pane_id: u64,
+        data: Vec<u8>,
+    ) -> Result<UnitResponse, MuxPoolError> {
+        self.execute_with_recovery_with_cx(cx, "write_to_pane", move |client| {
             let data = data.clone();
             Box::pin(client.write_to_pane(pane_id, data))
         })
@@ -384,7 +461,18 @@ impl MuxPool {
         pane_id: u64,
         data: String,
     ) -> Result<UnitResponse, MuxPoolError> {
-        self.execute_with_recovery("send_paste", move |client| {
+        let cx = cx::for_testing();
+        self.send_paste_with_cx(&cx, pane_id, data).await
+    }
+
+    /// Send text via paste mode through a pooled connection using explicit `Cx`.
+    pub async fn send_paste_with_cx(
+        &self,
+        cx: &Cx,
+        pane_id: u64,
+        data: String,
+    ) -> Result<UnitResponse, MuxPoolError> {
+        self.execute_with_recovery_with_cx(cx, "send_paste", move |client| {
             let data = data.clone();
             Box::pin(client.send_paste(pane_id, data))
         })
@@ -393,8 +481,14 @@ impl MuxPool {
 
     /// Run a health check by listing panes on a pooled connection.
     pub async fn health_check(&self) -> Result<(), MuxPoolError> {
+        let cx = cx::for_testing();
+        self.health_check_with_cx(&cx).await
+    }
+
+    /// Run a health check by listing panes using explicit `Cx`.
+    pub async fn health_check_with_cx(&self, cx: &Cx) -> Result<(), MuxPoolError> {
         self.health_checks.fetch_add(1, Ordering::Relaxed);
-        match self.list_panes().await {
+        match self.list_panes_with_cx(cx).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 self.health_check_failures.fetch_add(1, Ordering::Relaxed);
@@ -672,6 +766,25 @@ mod tests {
     }
 
     #[test]
+    fn pool_list_panes_with_cx_succeeds() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let cx = crate::cx::for_testing();
+
+            let result = pool
+                .list_panes_with_cx(&cx)
+                .await
+                .expect("list_panes_with_cx should succeed");
+            assert!(result.tabs.is_empty());
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.connections_created, 1);
+        });
+    }
+
+    #[test]
     fn pool_reuses_idle_connection() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -797,6 +910,24 @@ mod tests {
 
             let pool = MuxPool::new(pool_config(socket_path, 2));
             pool.health_check().await.expect("health check should pass");
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.health_checks, 1);
+            assert_eq!(stats.health_check_failures, 0);
+        });
+    }
+
+    #[test]
+    fn pool_health_check_with_cx_success() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 2));
+            let cx = crate::cx::for_testing();
+
+            pool.health_check_with_cx(&cx)
+                .await
+                .expect("health_check_with_cx should pass");
 
             let stats = pool.stats().await;
             assert_eq!(stats.health_checks, 1);
