@@ -1527,4 +1527,345 @@ mod tests {
             "MAX_OUTPUT_BYTES should be less than MAX_EVENT_LINE_BYTES"
         );
     }
+
+    // --- WireEvent serialize → deserialize roundtrip tests ---
+
+    #[test]
+    fn wire_event_hello_roundtrip() {
+        let event = WireEvent::Hello {
+            proto: Some(1),
+            wezterm_version: Some("FrankenTerm 0.1.0".into()),
+            ts: Some(1234567890),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: WireEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            WireEvent::Hello {
+                proto,
+                wezterm_version,
+                ts,
+            } => {
+                assert_eq!(proto, Some(1));
+                assert_eq!(wezterm_version.as_deref(), Some("FrankenTerm 0.1.0"));
+                assert_eq!(ts, Some(1234567890));
+            }
+            _ => panic!("wrong variant after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn wire_event_hello_minimal_roundtrip() {
+        let event = WireEvent::Hello {
+            proto: None,
+            wezterm_version: None,
+            ts: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: WireEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            WireEvent::Hello {
+                proto: None,
+                wezterm_version: None,
+                ts: None
+            }
+        ));
+    }
+
+    #[test]
+    fn wire_event_pane_output_roundtrip() {
+        let event = WireEvent::PaneOutput {
+            pane_id: 42,
+            data_b64: base64::engine::general_purpose::STANDARD.encode(b"hello world"),
+            ts: 9999,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: WireEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            WireEvent::PaneOutput {
+                pane_id,
+                data_b64,
+                ts,
+            } => {
+                assert_eq!(pane_id, 42);
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&data_b64)
+                    .unwrap();
+                assert_eq!(decoded, b"hello world");
+                assert_eq!(ts, 9999);
+            }
+            _ => panic!("wrong variant after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn wire_event_state_change_roundtrip() {
+        let event = WireEvent::StateChange {
+            pane_id: 7,
+            state: WirePaneState {
+                title: "vim".into(),
+                rows: 40,
+                cols: 120,
+                is_alt_screen: true,
+                cursor_row: 10,
+                cursor_col: 5,
+            },
+            ts: 555,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: WireEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            WireEvent::StateChange { pane_id, state, ts } => {
+                assert_eq!(pane_id, 7);
+                assert_eq!(state.title, "vim");
+                assert_eq!(state.rows, 40);
+                assert_eq!(state.cols, 120);
+                assert!(state.is_alt_screen);
+                assert_eq!(state.cursor_row, 10);
+                assert_eq!(state.cursor_col, 5);
+                assert_eq!(ts, 555);
+            }
+            _ => panic!("wrong variant after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn wire_event_user_var_roundtrip() {
+        let event = WireEvent::UserVar {
+            pane_id: 3,
+            name: "FT_STATUS".into(),
+            value: "active".into(),
+            ts: 888,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: WireEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            WireEvent::UserVar {
+                pane_id,
+                name,
+                value,
+                ts,
+            } => {
+                assert_eq!(pane_id, 3);
+                assert_eq!(name, "FT_STATUS");
+                assert_eq!(value, "active");
+                assert_eq!(ts, 888);
+            }
+            _ => panic!("wrong variant after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn wire_event_pane_created_roundtrip() {
+        let event = WireEvent::PaneCreated {
+            pane_id: 10,
+            domain: "local".into(),
+            cwd: Some("/home/user".into()),
+            ts: 1000,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: WireEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            WireEvent::PaneCreated {
+                pane_id,
+                domain,
+                cwd,
+                ts,
+            } => {
+                assert_eq!(pane_id, 10);
+                assert_eq!(domain, "local");
+                assert_eq!(cwd, Some("/home/user".into()));
+                assert_eq!(ts, 1000);
+            }
+            _ => panic!("wrong variant after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn wire_event_pane_created_no_cwd_roundtrip() {
+        let event = WireEvent::PaneCreated {
+            pane_id: 11,
+            domain: "remote".into(),
+            cwd: None,
+            ts: 2000,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: WireEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            WireEvent::PaneCreated { cwd, .. } => {
+                assert!(cwd.is_none());
+            }
+            _ => panic!("wrong variant after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn wire_event_pane_destroyed_roundtrip() {
+        let event = WireEvent::PaneDestroyed {
+            pane_id: 99,
+            ts: 3000,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: WireEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            WireEvent::PaneDestroyed { pane_id, ts } => {
+                assert_eq!(pane_id, 99);
+                assert_eq!(ts, 3000);
+            }
+            _ => panic!("wrong variant after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn wire_event_all_variants_roundtrip() {
+        let events = vec![
+            WireEvent::Hello {
+                proto: Some(1),
+                wezterm_version: Some("v1".into()),
+                ts: Some(100),
+            },
+            WireEvent::PaneOutput {
+                pane_id: 1,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(b"test"),
+                ts: 200,
+            },
+            WireEvent::StateChange {
+                pane_id: 2,
+                state: WirePaneState {
+                    title: "zsh".into(),
+                    rows: 24,
+                    cols: 80,
+                    is_alt_screen: false,
+                    cursor_row: 0,
+                    cursor_col: 0,
+                },
+                ts: 300,
+            },
+            WireEvent::UserVar {
+                pane_id: 3,
+                name: "k".into(),
+                value: "v".into(),
+                ts: 400,
+            },
+            WireEvent::PaneCreated {
+                pane_id: 4,
+                domain: "local".into(),
+                cwd: Some("/tmp".into()),
+                ts: 500,
+            },
+            WireEvent::PaneDestroyed {
+                pane_id: 5,
+                ts: 600,
+            },
+        ];
+
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            let parsed: WireEvent = serde_json::from_str(&json).unwrap();
+            // Verify the JSON roundtrip produces valid output
+            let json2 = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(json, json2, "double roundtrip should be stable");
+        }
+    }
+
+    #[test]
+    fn wire_event_malformed_json_no_panic() {
+        let garbage_inputs = [
+            "",
+            "not json",
+            "{",
+            "{}",
+            r#"{"type":"hello""#,
+            "null",
+            "42",
+            "[1,2,3]",
+            r#"{"type":null}"#,
+        ];
+        for input in &garbage_inputs {
+            let result = serde_json::from_str::<WireEvent>(input);
+            assert!(
+                result.is_err(),
+                "expected error for input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_pane_state_roundtrip() {
+        let state = WirePaneState {
+            title: "nvim main.rs".into(),
+            rows: 50,
+            cols: 200,
+            is_alt_screen: true,
+            cursor_row: 25,
+            cursor_col: 42,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: WirePaneState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.title, "nvim main.rs");
+        assert_eq!(parsed.rows, 50);
+        assert_eq!(parsed.cols, 200);
+        assert!(parsed.is_alt_screen);
+        assert_eq!(parsed.cursor_row, 25);
+        assert_eq!(parsed.cursor_col, 42);
+    }
+
+    // --- Throughput / rapid events test ---
+
+    #[test]
+    fn listener_handles_rapid_events() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("rapid.sock");
+            let listener = NativeEventListener::bind(socket_path.clone())
+                .await
+                .expect("bind listener");
+            let (event_tx, mut event_rx) = mpsc::channel(4096);
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            let handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown)));
+
+            let mut stream = compat_unix::connect(socket_path).await.expect("connect");
+
+            // Send 1000 events rapidly (enough to test throughput without being
+            // too slow for CI)
+            let event_count = 1000u64;
+            for i in 0..event_count {
+                let line = format!(
+                    r#"{{"type":"pane_destroyed","pane_id":{},"ts":{}}}"#,
+                    i,
+                    i * 10
+                );
+                stream
+                    .write_all(line.as_bytes())
+                    .await
+                    .expect("write event");
+                stream.write_all(b"\n").await.expect("write newline");
+            }
+
+            // Receive all events
+            let mut received = 0u64;
+            let deadline = Duration::from_secs(10);
+            while received < event_count {
+                match crate::runtime_compat::timeout(deadline, recv_next(&mut event_rx)).await {
+                    Ok(Some(_)) => received += 1,
+                    Ok(None) => break,
+                    Err(_) => {
+                        panic!(
+                            "timeout: received {received}/{event_count} events"
+                        );
+                    }
+                }
+            }
+
+            assert_eq!(
+                received, event_count,
+                "all events should be delivered without loss"
+            );
+
+            drop(stream);
+            shutdown.store(true, Ordering::SeqCst);
+            let _ = handle.await;
+        });
+    }
 }
