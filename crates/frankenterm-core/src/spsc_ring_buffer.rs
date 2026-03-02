@@ -410,38 +410,55 @@ mod tests {
 
     use super::{channel, spmc_channel};
 
-    #[tokio::test]
-    async fn preserves_fifo_order() {
-        let (tx, rx) = channel(8);
-        tx.send(1).await.unwrap();
-        tx.send(2).await.unwrap();
-        tx.send(3).await.unwrap();
-
-        assert_eq!(rx.recv().await, Some(1));
-        assert_eq!(rx.recv().await, Some(2));
-        assert_eq!(rx.recv().await, Some(3));
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = crate::runtime_compat::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build compat runtime for test");
+        runtime.block_on(future);
     }
 
-    #[tokio::test]
-    async fn try_send_respects_capacity() {
-        let (tx, rx) = channel(1);
-        assert!(tx.try_send(11).is_ok());
-        assert!(tx.try_send(12).is_err());
-        assert_eq!(rx.recv().await, Some(11));
-        assert!(tx.try_send(13).is_ok());
-        assert_eq!(rx.recv().await, Some(13));
+    #[test]
+    fn preserves_fifo_order() {
+        run_async_test(async {
+            let (tx, rx) = channel(8);
+            tx.send(1).await.unwrap();
+            tx.send(2).await.unwrap();
+            tx.send(3).await.unwrap();
+
+            assert_eq!(rx.recv().await, Some(1));
+            assert_eq!(rx.recv().await, Some(2));
+            assert_eq!(rx.recv().await, Some(3));
+        });
     }
 
-    #[tokio::test]
-    async fn recv_returns_none_after_close_and_drain() {
-        let (tx, rx) = channel(2);
-        tx.send(1).await.unwrap();
-        tx.send(2).await.unwrap();
-        drop(tx);
+    #[test]
+    fn try_send_respects_capacity() {
+        run_async_test(async {
+            let (tx, rx) = channel(1);
+            assert!(tx.try_send(11).is_ok());
+            assert!(tx.try_send(12).is_err());
+            assert_eq!(rx.recv().await, Some(11));
+            assert!(tx.try_send(13).is_ok());
+            assert_eq!(rx.recv().await, Some(13));
+        });
+    }
 
-        assert_eq!(rx.recv().await, Some(1));
-        assert_eq!(rx.recv().await, Some(2));
-        assert_eq!(rx.recv().await, None);
+    #[test]
+    fn recv_returns_none_after_close_and_drain() {
+        run_async_test(async {
+            let (tx, rx) = channel(2);
+            tx.send(1).await.unwrap();
+            tx.send(2).await.unwrap();
+            drop(tx);
+
+            assert_eq!(rx.recv().await, Some(1));
+            assert_eq!(rx.recv().await, Some(2));
+            assert_eq!(rx.recv().await, None);
+        });
     }
 
     #[test]
@@ -506,47 +523,55 @@ mod tests {
         assert_eq!(rx.try_recv(), None);
     }
 
-    #[tokio::test]
-    async fn recv_on_closed_empty_returns_none() {
-        let (tx, rx) = channel::<u32>(4);
-        drop(tx);
-        assert_eq!(rx.recv().await, None);
+    #[test]
+    fn recv_on_closed_empty_returns_none() {
+        run_async_test(async {
+            let (tx, rx) = channel::<u32>(4);
+            drop(tx);
+            assert_eq!(rx.recv().await, None);
+        });
     }
 
-    #[tokio::test]
-    async fn send_on_closed_returns_err() {
-        let (tx, rx) = channel::<u32>(4);
-        drop(rx);
-        tx.close(); // Consumer drop doesn't auto-close.
-        let result = tx.send(1).await;
-        assert!(result.is_err());
+    #[test]
+    fn send_on_closed_returns_err() {
+        run_async_test(async {
+            let (tx, rx) = channel::<u32>(4);
+            drop(rx);
+            tx.close(); // Consumer drop doesn't auto-close.
+            let result = tx.send(1).await;
+            assert!(result.is_err());
+        });
     }
 
-    #[tokio::test]
-    async fn fill_and_drain_multiple_cycles() {
-        let (tx, rx) = channel::<u32>(2);
-        for cycle in 0..5u32 {
-            let base = cycle * 2;
-            tx.send(base).await.unwrap();
-            tx.send(base + 1).await.unwrap();
-            assert_eq!(rx.recv().await, Some(base));
-            assert_eq!(rx.recv().await, Some(base + 1));
-        }
+    #[test]
+    fn fill_and_drain_multiple_cycles() {
+        run_async_test(async {
+            let (tx, rx) = channel::<u32>(2);
+            for cycle in 0..5u32 {
+                let base = cycle * 2;
+                tx.send(base).await.unwrap();
+                tx.send(base + 1).await.unwrap();
+                assert_eq!(rx.recv().await, Some(base));
+                assert_eq!(rx.recv().await, Some(base + 1));
+            }
+        });
     }
 
-    #[tokio::test]
-    async fn send_waits_until_consumer_frees_capacity() {
-        let (tx, rx) = channel(1);
-        tx.send(1).await.unwrap();
+    #[test]
+    fn send_waits_until_consumer_frees_capacity() {
+        run_async_test(async {
+            let (tx, rx) = channel(1);
+            tx.send(1).await.unwrap();
 
-        let sender = crate::runtime_compat::task::spawn(async move { tx.send(2).await });
+            let sender = crate::runtime_compat::task::spawn(async move { tx.send(2).await });
 
-        crate::runtime_compat::sleep(Duration::from_millis(20)).await;
-        assert!(!sender.is_finished());
+            crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+            assert!(!sender.is_finished());
 
-        assert_eq!(rx.recv().await, Some(1));
-        assert!(sender.await.unwrap().is_ok());
-        assert_eq!(rx.recv().await, Some(2));
+            assert_eq!(rx.recv().await, Some(1));
+            assert!(sender.await.unwrap().is_ok());
+            assert_eq!(rx.recv().await, Some(2));
+        });
     }
 
     // ----------------------------------------------------------------
@@ -581,53 +606,61 @@ mod tests {
         assert!(rx.is_closed());
     }
 
-    #[tokio::test]
-    async fn try_recv_drains_after_producer_drop() {
-        let (tx, rx) = channel::<u32>(4);
-        tx.try_send(1).unwrap();
-        tx.try_send(2).unwrap();
-        tx.try_send(3).unwrap();
-        drop(tx);
+    #[test]
+    fn try_recv_drains_after_producer_drop() {
+        run_async_test(async {
+            let (tx, rx) = channel::<u32>(4);
+            tx.try_send(1).unwrap();
+            tx.try_send(2).unwrap();
+            tx.try_send(3).unwrap();
+            drop(tx);
 
-        assert!(rx.is_closed());
-        assert_eq!(rx.try_recv(), Some(1));
-        assert_eq!(rx.try_recv(), Some(2));
-        assert_eq!(rx.try_recv(), Some(3));
-        assert_eq!(rx.try_recv(), None);
-    }
-
-    #[tokio::test]
-    async fn large_batch_1000_items() {
-        let (tx, rx) = channel(64);
-        let sender = crate::runtime_compat::task::spawn(async move {
-            for i in 0..1000u32 {
-                tx.send(i).await.unwrap();
-            }
+            assert!(rx.is_closed());
+            assert_eq!(rx.try_recv(), Some(1));
+            assert_eq!(rx.try_recv(), Some(2));
+            assert_eq!(rx.try_recv(), Some(3));
+            assert_eq!(rx.try_recv(), None);
         });
-
-        for i in 0..1000u32 {
-            let val = rx.recv().await.unwrap();
-            assert_eq!(val, i);
-        }
-        sender.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn string_payload() {
-        let (tx, rx) = channel(4);
-        tx.send("hello".to_string()).await.unwrap();
-        tx.send("world".to_string()).await.unwrap();
-        assert_eq!(rx.recv().await, Some("hello".to_string()));
-        assert_eq!(rx.recv().await, Some("world".to_string()));
+    #[test]
+    fn large_batch_1000_items() {
+        run_async_test(async {
+            let (tx, rx) = channel(64);
+            let sender = crate::runtime_compat::task::spawn(async move {
+                for i in 0..1000u32 {
+                    tx.send(i).await.unwrap();
+                }
+            });
+
+            for i in 0..1000u32 {
+                let val = rx.recv().await.unwrap();
+                assert_eq!(val, i);
+            }
+            sender.await.unwrap();
+        });
     }
 
-    #[tokio::test]
-    async fn vec_payload() {
-        let (tx, rx) = channel(2);
-        tx.send(vec![1, 2, 3]).await.unwrap();
-        tx.send(vec![4, 5]).await.unwrap();
-        assert_eq!(rx.recv().await, Some(vec![1, 2, 3]));
-        assert_eq!(rx.recv().await, Some(vec![4, 5]));
+    #[test]
+    fn string_payload() {
+        run_async_test(async {
+            let (tx, rx) = channel(4);
+            tx.send("hello".to_string()).await.unwrap();
+            tx.send("world".to_string()).await.unwrap();
+            assert_eq!(rx.recv().await, Some("hello".to_string()));
+            assert_eq!(rx.recv().await, Some("world".to_string()));
+        });
+    }
+
+    #[test]
+    fn vec_payload() {
+        run_async_test(async {
+            let (tx, rx) = channel(2);
+            tx.send(vec![1, 2, 3]).await.unwrap();
+            tx.send(vec![4, 5]).await.unwrap();
+            assert_eq!(rx.recv().await, Some(vec![1, 2, 3]));
+            assert_eq!(rx.recv().await, Some(vec![4, 5]));
+        });
     }
 
     #[test]
@@ -649,20 +682,22 @@ mod tests {
         assert_eq!(rx.depth(), 0);
     }
 
-    #[tokio::test]
-    async fn capacity_1_stress() {
-        let (tx, rx) = channel(1);
-        let sender = crate::runtime_compat::task::spawn(async move {
-            for i in 0..100u32 {
-                tx.send(i).await.unwrap();
-            }
-        });
+    #[test]
+    fn capacity_1_stress() {
+        run_async_test(async {
+            let (tx, rx) = channel(1);
+            let sender = crate::runtime_compat::task::spawn(async move {
+                for i in 0..100u32 {
+                    tx.send(i).await.unwrap();
+                }
+            });
 
-        for i in 0..100u32 {
-            let val = rx.recv().await.unwrap();
-            assert_eq!(val, i);
-        }
-        sender.await.unwrap();
+            for i in 0..100u32 {
+                let val = rx.recv().await.unwrap();
+                assert_eq!(val, i);
+            }
+            sender.await.unwrap();
+        });
     }
 
     #[test]
@@ -676,33 +711,39 @@ mod tests {
         assert_eq!(rx.depth(), 3);
     }
 
-    #[tokio::test]
-    async fn alternating_send_recv() {
-        let (tx, rx) = channel(2);
-        for i in 0..50u32 {
-            tx.send(i).await.unwrap();
-            assert_eq!(rx.recv().await, Some(i));
-        }
-        assert_eq!(tx.depth(), 0);
+    #[test]
+    fn alternating_send_recv() {
+        run_async_test(async {
+            let (tx, rx) = channel(2);
+            for i in 0..50u32 {
+                tx.send(i).await.unwrap();
+                assert_eq!(rx.recv().await, Some(i));
+            }
+            assert_eq!(tx.depth(), 0);
+        });
     }
 
-    #[tokio::test]
-    async fn send_on_closed_returns_original_value() {
-        let (tx, _rx) = channel::<u32>(4);
-        tx.close();
-        let result = tx.send(42).await;
-        assert_eq!(result.unwrap_err(), 42);
+    #[test]
+    fn send_on_closed_returns_original_value() {
+        run_async_test(async {
+            let (tx, _rx) = channel::<u32>(4);
+            tx.close();
+            let result = tx.send(42).await;
+            assert_eq!(result.unwrap_err(), 42);
+        });
     }
 
-    #[tokio::test]
-    async fn recv_returns_none_immediately_on_empty_closed() {
-        let (tx, rx) = channel::<u32>(4);
-        tx.close();
-        let start = std::time::Instant::now();
-        let result = rx.recv().await;
-        assert!(result.is_none());
-        // Should return almost immediately, not block
-        assert!(start.elapsed() < Duration::from_millis(100));
+    #[test]
+    fn recv_returns_none_immediately_on_empty_closed() {
+        run_async_test(async {
+            let (tx, rx) = channel::<u32>(4);
+            tx.close();
+            let start = std::time::Instant::now();
+            let result = rx.recv().await;
+            assert!(result.is_none());
+            // Should return almost immediately, not block
+            assert!(start.elapsed() < Duration::from_millis(100));
+        });
     }
 
     #[test]
@@ -725,47 +766,51 @@ mod tests {
         assert_eq!(rx.try_recv(), None);
     }
 
-    #[tokio::test]
-    async fn concurrent_producer_consumer_stress() {
-        let (tx, rx) = channel(16);
-        let n = 5000u32;
+    #[test]
+    fn concurrent_producer_consumer_stress() {
+        run_async_test(async {
+            let (tx, rx) = channel(16);
+            let n = 5000u32;
 
-        let producer = crate::runtime_compat::task::spawn(async move {
-            for i in 0..n {
-                tx.send(i).await.unwrap();
+            let producer = crate::runtime_compat::task::spawn(async move {
+                for i in 0..n {
+                    tx.send(i).await.unwrap();
+                }
+            });
+
+            let consumer = crate::runtime_compat::task::spawn(async move {
+                let mut received = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    received.push(rx.recv().await.unwrap());
+                }
+                received
+            });
+
+            producer.await.unwrap();
+            let received = consumer.await.unwrap();
+            assert_eq!(received.len(), n as usize);
+            // FIFO order preserved
+            for (i, &v) in received.iter().enumerate() {
+                assert_eq!(v, i as u32);
             }
         });
-
-        let consumer = crate::runtime_compat::task::spawn(async move {
-            let mut received = Vec::with_capacity(n as usize);
-            for _ in 0..n {
-                received.push(rx.recv().await.unwrap());
-            }
-            received
-        });
-
-        producer.await.unwrap();
-        let received = consumer.await.unwrap();
-        assert_eq!(received.len(), n as usize);
-        // FIFO order preserved
-        for (i, &v) in received.iter().enumerate() {
-            assert_eq!(v, i as u32);
-        }
     }
 
-    #[tokio::test]
-    async fn recv_wakes_on_close() {
-        let (tx, rx) = channel::<u32>(4);
+    #[test]
+    fn recv_wakes_on_close() {
+        run_async_test(async {
+            let (tx, rx) = channel::<u32>(4);
 
-        let consumer = crate::runtime_compat::task::spawn(async move { rx.recv().await });
+            let consumer = crate::runtime_compat::task::spawn(async move { rx.recv().await });
 
-        // Give consumer time to block on empty queue
-        crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+            // Give consumer time to block on empty queue
+            crate::runtime_compat::sleep(Duration::from_millis(20)).await;
 
-        // Close should wake the consumer
-        tx.close();
-        let result = consumer.await.unwrap();
-        assert_eq!(result, None);
+            // Close should wake the consumer
+            tx.close();
+            let result = consumer.await.unwrap();
+            assert_eq!(result, None);
+        });
     }
 
     #[test]
@@ -787,44 +832,48 @@ mod tests {
         assert_eq!(tx.depth(), rx.depth());
     }
 
-    #[tokio::test]
-    async fn spmc_broadcasts_to_all_consumers_in_order() {
-        // Keep enough headroom so this test validates ordering, not backpressure.
-        let (tx, mut consumers) = spmc_channel(16, 2);
-        let rx0 = consumers.remove(0);
-        let rx1 = consumers.remove(0);
+    #[test]
+    fn spmc_broadcasts_to_all_consumers_in_order() {
+        run_async_test(async {
+            // Keep enough headroom so this test validates ordering, not backpressure.
+            let (tx, mut consumers) = spmc_channel(16, 2);
+            let rx0 = consumers.remove(0);
+            let rx1 = consumers.remove(0);
 
-        for i in 0..10u32 {
-            tx.send(i).await.unwrap();
-        }
+            for i in 0..10u32 {
+                tx.send(i).await.unwrap();
+            }
 
-        for i in 0..10u32 {
-            assert_eq!(rx0.recv().await, Some(i));
-            assert_eq!(rx1.recv().await, Some(i));
-        }
+            for i in 0..10u32 {
+                assert_eq!(rx0.recv().await, Some(i));
+                assert_eq!(rx1.recv().await, Some(i));
+            }
+        });
     }
 
-    #[tokio::test]
-    async fn spmc_send_waits_for_slowest_consumer() {
-        let (tx, mut consumers) = spmc_channel(1, 2);
-        let rx0 = consumers.remove(0);
-        let rx1 = consumers.remove(0);
+    #[test]
+    fn spmc_send_waits_for_slowest_consumer() {
+        run_async_test(async {
+            let (tx, mut consumers) = spmc_channel(1, 2);
+            let rx0 = consumers.remove(0);
+            let rx1 = consumers.remove(0);
 
-        tx.send(1u32).await.unwrap();
-        let sender = crate::runtime_compat::task::spawn(async move { tx.send(2u32).await });
+            tx.send(1u32).await.unwrap();
+            let sender = crate::runtime_compat::task::spawn(async move { tx.send(2u32).await });
 
-        crate::runtime_compat::sleep(Duration::from_millis(20)).await;
-        assert!(!sender.is_finished());
+            crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+            assert!(!sender.is_finished());
 
-        assert_eq!(rx0.recv().await, Some(1));
-        crate::runtime_compat::sleep(Duration::from_millis(20)).await;
-        assert!(!sender.is_finished());
+            assert_eq!(rx0.recv().await, Some(1));
+            crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+            assert!(!sender.is_finished());
 
-        assert_eq!(rx1.recv().await, Some(1));
-        assert!(sender.await.unwrap().is_ok());
+            assert_eq!(rx1.recv().await, Some(1));
+            assert!(sender.await.unwrap().is_ok());
 
-        assert_eq!(rx0.recv().await, Some(2));
-        assert_eq!(rx1.recv().await, Some(2));
+            assert_eq!(rx0.recv().await, Some(2));
+            assert_eq!(rx1.recv().await, Some(2));
+        });
     }
 
     #[test]
@@ -845,16 +894,18 @@ mod tests {
         assert_eq!(rx1.try_recv(), Some(2));
     }
 
-    #[tokio::test]
-    async fn spmc_close_allows_drain_then_none() {
-        let (tx, consumers) = spmc_channel(2, 2);
-        tx.send(7u32).await.unwrap();
-        drop(tx);
+    #[test]
+    fn spmc_close_allows_drain_then_none() {
+        run_async_test(async {
+            let (tx, consumers) = spmc_channel(2, 2);
+            tx.send(7u32).await.unwrap();
+            drop(tx);
 
-        for rx in consumers {
-            assert_eq!(rx.recv().await, Some(7));
-            assert_eq!(rx.recv().await, None);
-        }
+            for rx in consumers {
+                assert_eq!(rx.recv().await, Some(7));
+                assert_eq!(rx.recv().await, None);
+            }
+        });
     }
 
     #[test]

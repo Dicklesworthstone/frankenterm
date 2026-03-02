@@ -1179,347 +1179,371 @@ mod tests {
     }
 
     #[cfg(feature = "distributed")]
-    #[tokio::test]
-    async fn tls_handshake_succeeds() {
-        let ca_cert = temp_pem(CA_CERT);
-        let server_cert = temp_pem(SERVER_CERT);
-        let server_key = temp_pem(SERVER_KEY);
-
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.tls.enabled = true;
-        config.tls.cert_path = Some(server_cert.path().display().to_string());
-        config.tls.key_path = Some(server_key.path().display().to_string());
-
-        let server_config = build_server_config(
-            &config.tls,
-            DistributedAuthMode::Token,
-            &config.allow_agent_ids,
-        )
-        .expect("server config");
-        let client_config = build_client_config(
-            &config.tls,
-            DistributedAuthMode::Token,
-            Some(ca_cert.path()),
-        )
-        .expect("client config");
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-
-        let acceptor = TlsAcceptor::new((*server_config).clone());
-        let server_task = crate::runtime_compat::task::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let mut tls_stream = acceptor.accept(stream).await.expect("accept tls");
-            let mut buf = [0u8; 4];
-            tls_stream.read_exact(&mut buf).await.expect("read");
-            buf
-        });
-
-        let connector = TlsConnector::new((*client_config).clone());
-        let mut stream = connector
-            .connect(
-                "localhost",
-                TcpStream::connect(addr).await.expect("connect"),
-            )
-            .await
-            .expect("tls connect");
-        stream.write_all(b"ping").await.expect("write");
-
-        let received = server_task.await.expect("join");
-        assert_eq!(&received, b"ping");
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = crate::runtime_compat::RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create runtime");
+        runtime.block_on(future);
     }
 
     #[cfg(feature = "distributed")]
-    #[tokio::test]
-    async fn mtls_handshake_succeeds() {
-        let ca_cert = temp_pem(CA_CERT);
-        let server_cert = temp_pem(SERVER_CERT);
-        let server_key = temp_pem(SERVER_KEY);
-        let client_cert = temp_pem(CLIENT_CERT);
-        let client_key = temp_pem(CLIENT_KEY);
+    #[test]
+    fn tls_handshake_succeeds() {
+        run_async_test(async {
+            let ca_cert = temp_pem(CA_CERT);
+            let server_cert = temp_pem(SERVER_CERT);
+            let server_key = temp_pem(SERVER_KEY);
 
-        let mut server_config = DistributedConfig::default();
-        server_config.enabled = true;
-        server_config.auth_mode = DistributedAuthMode::Mtls;
-        server_config.tls.enabled = true;
-        server_config.tls.cert_path = Some(server_cert.path().display().to_string());
-        server_config.tls.key_path = Some(server_key.path().display().to_string());
-        server_config.tls.client_ca_path = Some(ca_cert.path().display().to_string());
-        server_config.allow_agent_ids = vec!["wa-client".to_string()];
+            let mut config = DistributedConfig::default();
+            config.enabled = true;
+            config.tls.enabled = true;
+            config.tls.cert_path = Some(server_cert.path().display().to_string());
+            config.tls.key_path = Some(server_key.path().display().to_string());
 
-        let mut client_config = DistributedConfig::default();
-        client_config.enabled = true;
-        client_config.auth_mode = DistributedAuthMode::Mtls;
-        client_config.tls.enabled = true;
-        client_config.tls.cert_path = Some(client_cert.path().display().to_string());
-        client_config.tls.key_path = Some(client_key.path().display().to_string());
-
-        let server_tls = build_server_config(
-            &server_config.tls,
-            server_config.auth_mode,
-            &server_config.allow_agent_ids,
-        )
-        .expect("server config");
-        let client_tls = build_client_config(
-            &client_config.tls,
-            client_config.auth_mode,
-            Some(ca_cert.path()),
-        )
-        .expect("client config");
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-
-        let acceptor = TlsAcceptor::new((*server_tls).clone());
-        let server_task = crate::runtime_compat::task::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let mut tls_stream = acceptor.accept(stream).await.expect("accept tls");
-            let mut buf = [0u8; 2];
-            tls_stream.read_exact(&mut buf).await.expect("read");
-            buf
-        });
-
-        let connector = TlsConnector::new((*client_tls).clone());
-        let mut stream = connector
-            .connect(
-                "localhost",
-                TcpStream::connect(addr).await.expect("connect"),
+            let server_config = build_server_config(
+                &config.tls,
+                DistributedAuthMode::Token,
+                &config.allow_agent_ids,
             )
-            .await
-            .expect("tls connect");
-        stream.write_all(b"ok").await.expect("write");
+            .expect("server config");
+            let client_config = build_client_config(
+                &config.tls,
+                DistributedAuthMode::Token,
+                Some(ca_cert.path()),
+            )
+            .expect("client config");
 
-        let received = server_task.await.expect("join");
-        assert_eq!(&received, b"ok");
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let acceptor = TlsAcceptor::new((*server_config).clone());
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut tls_stream = acceptor.accept(stream).await.expect("accept tls");
+                let mut buf = [0u8; 4];
+                tls_stream.read_exact(&mut buf).await.expect("read");
+                buf
+            });
+
+            let connector = TlsConnector::new((*client_config).clone());
+            let mut stream = connector
+                .connect(
+                    "localhost",
+                    TcpStream::connect(addr).await.expect("connect"),
+                )
+                .await
+                .expect("tls connect");
+            stream.write_all(b"ping").await.expect("write");
+
+            let received = server_task.await.expect("join");
+            assert_eq!(&received, b"ping");
+        });
     }
 
     #[cfg(feature = "distributed")]
-    #[tokio::test]
-    async fn tls_handshake_rejects_untrusted_server() {
-        let ca_cert_alt = temp_pem(CA_CERT_ALT);
-        let server_cert = temp_pem(SERVER_CERT);
-        let server_key = temp_pem(SERVER_KEY);
+    #[test]
+    fn mtls_handshake_succeeds() {
+        run_async_test(async {
+            let ca_cert = temp_pem(CA_CERT);
+            let server_cert = temp_pem(SERVER_CERT);
+            let server_key = temp_pem(SERVER_KEY);
+            let client_cert = temp_pem(CLIENT_CERT);
+            let client_key = temp_pem(CLIENT_KEY);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.tls.enabled = true;
-        config.tls.cert_path = Some(server_cert.path().display().to_string());
-        config.tls.key_path = Some(server_key.path().display().to_string());
+            let mut server_config = DistributedConfig::default();
+            server_config.enabled = true;
+            server_config.auth_mode = DistributedAuthMode::Mtls;
+            server_config.tls.enabled = true;
+            server_config.tls.cert_path = Some(server_cert.path().display().to_string());
+            server_config.tls.key_path = Some(server_key.path().display().to_string());
+            server_config.tls.client_ca_path = Some(ca_cert.path().display().to_string());
+            server_config.allow_agent_ids = vec!["wa-client".to_string()];
 
-        let server_config = build_server_config(
-            &config.tls,
-            DistributedAuthMode::Token,
-            &config.allow_agent_ids,
-        )
-        .expect("server config");
-        let client_config = build_client_config(
-            &config.tls,
-            DistributedAuthMode::Token,
-            Some(ca_cert_alt.path()),
-        )
-        .expect("client config");
+            let mut client_config = DistributedConfig::default();
+            client_config.enabled = true;
+            client_config.auth_mode = DistributedAuthMode::Mtls;
+            client_config.tls.enabled = true;
+            client_config.tls.cert_path = Some(client_cert.path().display().to_string());
+            client_config.tls.key_path = Some(client_key.path().display().to_string());
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-
-        let acceptor = TlsAcceptor::new((*server_config).clone());
-        let server_task = crate::runtime_compat::task::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            acceptor.accept(stream).await
-        });
-
-        let connector = TlsConnector::new((*client_config).clone());
-        let client_result = connector
-            .connect(
-                "localhost",
-                TcpStream::connect(addr).await.expect("connect"),
+            let server_tls = build_server_config(
+                &server_config.tls,
+                server_config.auth_mode,
+                &server_config.allow_agent_ids,
             )
-            .await;
+            .expect("server config");
+            let client_tls = build_client_config(
+                &client_config.tls,
+                client_config.auth_mode,
+                Some(ca_cert.path()),
+            )
+            .expect("client config");
 
-        let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
-            .await
-            .expect("server timeout")
-            .expect("join");
-        assert!(server_result.is_err());
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
 
-        if let Ok(mut stream) = client_result {
-            let write_result = stream.write_all(b"no cert").await;
-            let mut buf = [0u8; 1];
-            let read_result = stream.read_exact(&mut buf).await;
-            assert!(write_result.is_err() || read_result.is_err());
-        }
+            let acceptor = TlsAcceptor::new((*server_tls).clone());
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut tls_stream = acceptor.accept(stream).await.expect("accept tls");
+                let mut buf = [0u8; 2];
+                tls_stream.read_exact(&mut buf).await.expect("read");
+                buf
+            });
+
+            let connector = TlsConnector::new((*client_tls).clone());
+            let mut stream = connector
+                .connect(
+                    "localhost",
+                    TcpStream::connect(addr).await.expect("connect"),
+                )
+                .await
+                .expect("tls connect");
+            stream.write_all(b"ok").await.expect("write");
+
+            let received = server_task.await.expect("join");
+            assert_eq!(&received, b"ok");
+        });
     }
 
     #[cfg(feature = "distributed")]
-    #[tokio::test]
-    async fn mtls_handshake_rejects_missing_client_cert() {
-        let ca_cert = temp_pem(CA_CERT);
-        let server_cert = temp_pem(SERVER_CERT);
-        let server_key = temp_pem(SERVER_KEY);
+    #[test]
+    fn tls_handshake_rejects_untrusted_server() {
+        run_async_test(async {
+            let ca_cert_alt = temp_pem(CA_CERT_ALT);
+            let server_cert = temp_pem(SERVER_CERT);
+            let server_key = temp_pem(SERVER_KEY);
 
-        let mut server_config = DistributedConfig::default();
-        server_config.enabled = true;
-        server_config.auth_mode = DistributedAuthMode::Mtls;
-        server_config.tls.enabled = true;
-        server_config.tls.cert_path = Some(server_cert.path().display().to_string());
-        server_config.tls.key_path = Some(server_key.path().display().to_string());
-        server_config.tls.client_ca_path = Some(ca_cert.path().display().to_string());
+            let mut config = DistributedConfig::default();
+            config.enabled = true;
+            config.tls.enabled = true;
+            config.tls.cert_path = Some(server_cert.path().display().to_string());
+            config.tls.key_path = Some(server_key.path().display().to_string());
 
-        let mut client_config = DistributedConfig::default();
-        client_config.enabled = true;
-        client_config.auth_mode = DistributedAuthMode::Token;
-        client_config.tls.enabled = true;
-
-        let server_tls = build_server_config(
-            &server_config.tls,
-            server_config.auth_mode,
-            &server_config.allow_agent_ids,
-        )
-        .expect("server");
-        let client_tls = build_client_config(
-            &client_config.tls,
-            client_config.auth_mode,
-            Some(ca_cert.path()),
-        )
-        .expect("client");
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-
-        let acceptor = TlsAcceptor::new((*server_tls).clone());
-        let server_task = crate::runtime_compat::task::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            acceptor.accept(stream).await
-        });
-
-        let connector = TlsConnector::new((*client_tls).clone());
-        let client_result = connector
-            .connect(
-                "localhost",
-                TcpStream::connect(addr).await.expect("connect"),
+            let server_config = build_server_config(
+                &config.tls,
+                DistributedAuthMode::Token,
+                &config.allow_agent_ids,
             )
-            .await;
+            .expect("server config");
+            let client_config = build_client_config(
+                &config.tls,
+                DistributedAuthMode::Token,
+                Some(ca_cert_alt.path()),
+            )
+            .expect("client config");
 
-        let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
-            .await
-            .expect("server timeout")
-            .expect("join");
-        assert!(server_result.is_err());
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
 
-        if let Ok(mut stream) = client_result {
-            let write_result = stream.write_all(b"no cert").await;
-            let mut buf = [0u8; 1];
-            let read_result = stream.read_exact(&mut buf).await;
-            assert!(write_result.is_err() || read_result.is_err());
-        }
+            let acceptor = TlsAcceptor::new((*server_config).clone());
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                acceptor.accept(stream).await
+            });
+
+            let connector = TlsConnector::new((*client_config).clone());
+            let client_result = connector
+                .connect(
+                    "localhost",
+                    TcpStream::connect(addr).await.expect("connect"),
+                )
+                .await;
+
+            let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
+                .await
+                .expect("server timeout")
+                .expect("join");
+            assert!(server_result.is_err());
+
+            if let Ok(mut stream) = client_result {
+                let write_result = stream.write_all(b"no cert").await;
+                let mut buf = [0u8; 1];
+                let read_result = stream.read_exact(&mut buf).await;
+                assert!(write_result.is_err() || read_result.is_err());
+            }
+        });
     }
 
     #[cfg(feature = "distributed")]
-    #[tokio::test]
-    async fn mtls_handshake_rejects_disallowed_client() {
-        let ca_cert = temp_pem(CA_CERT);
-        let server_cert = temp_pem(SERVER_CERT);
-        let server_key = temp_pem(SERVER_KEY);
-        let client_cert = temp_pem(CLIENT_CERT);
-        let client_key = temp_pem(CLIENT_KEY);
+    #[test]
+    fn mtls_handshake_rejects_missing_client_cert() {
+        run_async_test(async {
+            let ca_cert = temp_pem(CA_CERT);
+            let server_cert = temp_pem(SERVER_CERT);
+            let server_key = temp_pem(SERVER_KEY);
 
-        let mut server_config = DistributedConfig::default();
-        server_config.enabled = true;
-        server_config.auth_mode = DistributedAuthMode::Mtls;
-        server_config.tls.enabled = true;
-        server_config.tls.cert_path = Some(server_cert.path().display().to_string());
-        server_config.tls.key_path = Some(server_key.path().display().to_string());
-        server_config.tls.client_ca_path = Some(ca_cert.path().display().to_string());
-        server_config.allow_agent_ids = vec!["not-allowed".to_string()];
+            let mut server_config = DistributedConfig::default();
+            server_config.enabled = true;
+            server_config.auth_mode = DistributedAuthMode::Mtls;
+            server_config.tls.enabled = true;
+            server_config.tls.cert_path = Some(server_cert.path().display().to_string());
+            server_config.tls.key_path = Some(server_key.path().display().to_string());
+            server_config.tls.client_ca_path = Some(ca_cert.path().display().to_string());
 
-        let mut client_config = DistributedConfig::default();
-        client_config.enabled = true;
-        client_config.auth_mode = DistributedAuthMode::Mtls;
-        client_config.tls.enabled = true;
-        client_config.tls.cert_path = Some(client_cert.path().display().to_string());
-        client_config.tls.key_path = Some(client_key.path().display().to_string());
+            let mut client_config = DistributedConfig::default();
+            client_config.enabled = true;
+            client_config.auth_mode = DistributedAuthMode::Token;
+            client_config.tls.enabled = true;
 
-        let server_tls = build_server_config(
-            &server_config.tls,
-            server_config.auth_mode,
-            &server_config.allow_agent_ids,
-        )
-        .expect("server config");
-        let client_tls = build_client_config(
-            &client_config.tls,
-            client_config.auth_mode,
-            Some(ca_cert.path()),
-        )
-        .expect("client config");
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-
-        let acceptor = TlsAcceptor::new((*server_tls).clone());
-        let server_task = crate::runtime_compat::task::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            acceptor.accept(stream).await
-        });
-
-        let connector = TlsConnector::new((*client_tls).clone());
-        let client_result = connector
-            .connect(
-                "localhost",
-                TcpStream::connect(addr).await.expect("connect"),
+            let server_tls = build_server_config(
+                &server_config.tls,
+                server_config.auth_mode,
+                &server_config.allow_agent_ids,
             )
-            .await;
+            .expect("server");
+            let client_tls = build_client_config(
+                &client_config.tls,
+                client_config.auth_mode,
+                Some(ca_cert.path()),
+            )
+            .expect("client");
 
-        let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
-            .await
-            .expect("server timeout")
-            .expect("join");
-        assert!(server_result.is_err());
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
 
-        if let Ok(mut stream) = client_result {
-            let write_result = stream.write_all(b"nope").await;
-            let mut buf = [0u8; 1];
-            let read_result = stream.read_exact(&mut buf).await;
-            assert!(write_result.is_err() || read_result.is_err());
-        }
+            let acceptor = TlsAcceptor::new((*server_tls).clone());
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                acceptor.accept(stream).await
+            });
+
+            let connector = TlsConnector::new((*client_tls).clone());
+            let client_result = connector
+                .connect(
+                    "localhost",
+                    TcpStream::connect(addr).await.expect("connect"),
+                )
+                .await;
+
+            let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
+                .await
+                .expect("server timeout")
+                .expect("join");
+            assert!(server_result.is_err());
+
+            if let Ok(mut stream) = client_result {
+                let write_result = stream.write_all(b"no cert").await;
+                let mut buf = [0u8; 1];
+                let read_result = stream.read_exact(&mut buf).await;
+                assert!(write_result.is_err() || read_result.is_err());
+            }
+        });
     }
 
     #[cfg(feature = "distributed")]
-    #[tokio::test]
-    async fn tls_rejects_plaintext_client() {
-        let server_cert = temp_pem(SERVER_CERT);
-        let server_key = temp_pem(SERVER_KEY);
+    #[test]
+    fn mtls_handshake_rejects_disallowed_client() {
+        run_async_test(async {
+            let ca_cert = temp_pem(CA_CERT);
+            let server_cert = temp_pem(SERVER_CERT);
+            let server_key = temp_pem(SERVER_KEY);
+            let client_cert = temp_pem(CLIENT_CERT);
+            let client_key = temp_pem(CLIENT_KEY);
 
-        let mut config = DistributedConfig::default();
-        config.enabled = true;
-        config.tls.enabled = true;
-        config.tls.cert_path = Some(server_cert.path().display().to_string());
-        config.tls.key_path = Some(server_key.path().display().to_string());
+            let mut server_config = DistributedConfig::default();
+            server_config.enabled = true;
+            server_config.auth_mode = DistributedAuthMode::Mtls;
+            server_config.tls.enabled = true;
+            server_config.tls.cert_path = Some(server_cert.path().display().to_string());
+            server_config.tls.key_path = Some(server_key.path().display().to_string());
+            server_config.tls.client_ca_path = Some(ca_cert.path().display().to_string());
+            server_config.allow_agent_ids = vec!["not-allowed".to_string()];
 
-        let server_config = build_server_config(
-            &config.tls,
-            DistributedAuthMode::Token,
-            &config.allow_agent_ids,
-        )
-        .expect("server config");
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
+            let mut client_config = DistributedConfig::default();
+            client_config.enabled = true;
+            client_config.auth_mode = DistributedAuthMode::Mtls;
+            client_config.tls.enabled = true;
+            client_config.tls.cert_path = Some(client_cert.path().display().to_string());
+            client_config.tls.key_path = Some(client_key.path().display().to_string());
 
-        let acceptor = TlsAcceptor::new((*server_config).clone());
-        let server_task = crate::runtime_compat::task::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            acceptor.accept(stream).await
+            let server_tls = build_server_config(
+                &server_config.tls,
+                server_config.auth_mode,
+                &server_config.allow_agent_ids,
+            )
+            .expect("server config");
+            let client_tls = build_client_config(
+                &client_config.tls,
+                client_config.auth_mode,
+                Some(ca_cert.path()),
+            )
+            .expect("client config");
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let acceptor = TlsAcceptor::new((*server_tls).clone());
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                acceptor.accept(stream).await
+            });
+
+            let connector = TlsConnector::new((*client_tls).clone());
+            let client_result = connector
+                .connect(
+                    "localhost",
+                    TcpStream::connect(addr).await.expect("connect"),
+                )
+                .await;
+
+            let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
+                .await
+                .expect("server timeout")
+                .expect("join");
+            assert!(server_result.is_err());
+
+            if let Ok(mut stream) = client_result {
+                let write_result = stream.write_all(b"nope").await;
+                let mut buf = [0u8; 1];
+                let read_result = stream.read_exact(&mut buf).await;
+                assert!(write_result.is_err() || read_result.is_err());
+            }
         });
+    }
 
-        let mut client = TcpStream::connect(addr).await.expect("connect");
-        client.write_all(b"not tls").await.expect("write");
-        let _ = client.shutdown(std::net::Shutdown::Both);
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn tls_rejects_plaintext_client() {
+        run_async_test(async {
+            let server_cert = temp_pem(SERVER_CERT);
+            let server_key = temp_pem(SERVER_KEY);
 
-        let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
-            .await
-            .expect("server timeout")
-            .expect("join");
-        assert!(server_result.is_err());
+            let mut config = DistributedConfig::default();
+            config.enabled = true;
+            config.tls.enabled = true;
+            config.tls.cert_path = Some(server_cert.path().display().to_string());
+            config.tls.key_path = Some(server_key.path().display().to_string());
+
+            let server_config = build_server_config(
+                &config.tls,
+                DistributedAuthMode::Token,
+                &config.allow_agent_ids,
+            )
+            .expect("server config");
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let acceptor = TlsAcceptor::new((*server_config).clone());
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                acceptor.accept(stream).await
+            });
+
+            let mut client = TcpStream::connect(addr).await.expect("connect");
+            client.write_all(b"not tls").await.expect("write");
+            let _ = client.shutdown(std::net::Shutdown::Both);
+
+            let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
+                .await
+                .expect("server timeout")
+                .expect("join");
+            assert!(server_result.is_err());
+        });
     }
 
     #[cfg(feature = "distributed")]

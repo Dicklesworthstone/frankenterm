@@ -42,7 +42,25 @@ zstd.workspace = true
 asupersync = { workspace = true, features = ["tls"] }
 
 [features]
-default = []
+# Everything is on by default — ft is a standalone terminal platform with no feature gates.
+default = [
+    "browser",
+    "distributed",
+    "vendored",
+    "jemalloc",
+    "mcp",
+    "metrics",
+    "native-wezterm",
+    "rollout",
+    "semantic-search",
+    "sync",
+    "tui",
+    "tui-dashboard",
+    "tui-widgets",
+    "web",
+    "redis-session",
+    "asupersync-runtime",
+]
 frankenterm = ["frankenterm-core/frankenterm"]
 vendored = ["frankenterm"]  # backward compat alias
 browser = ["frankenterm-core/browser"]

@@ -442,9 +442,35 @@ path = "tests/tantivy_search_integration.rs"
 required-features = ["recorder-lexical"]
 
 [features]
-# Default-on so workspace builds include FrankenSearch + agent-detection integration.
-# Use `--no-default-features` to compile without these dependencies.
-default = ["agent-detection", "frankensearch"]
+# Everything is on by default — ft is a standalone terminal platform with no feature gates.
+# Use `--no-default-features` to compile a minimal build.
+default = [
+    "agent-detection",
+    "agent-mail",
+    "asupersync-runtime",
+    "browser",
+    "disk-pressure",
+    "distributed",
+    "frankensearch",
+    "vendored",
+    "mcp",
+    "mcp-client",
+    "metrics",
+    "native-wezterm",
+    "recorder-lexical",
+    "redis-session",
+    "rollout",
+    "semantic-search",
+    "session-resume",
+    "streaming",
+    "subprocess-bridge",
+    "sync",
+    "tui",
+    "tui-dashboard",
+    "tui-widgets",
+    "vc-export",
+    "web",
+]
 # Public feature flags (stable surface)
 frankenterm = ["frankenterm-deps"]
 vendored = ["frankenterm"]  # backward compat alias

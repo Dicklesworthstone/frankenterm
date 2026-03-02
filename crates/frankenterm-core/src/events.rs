@@ -14,22 +14,27 @@
 //! ```no_run
 //! use frankenterm_core::events::{EventBus, Event};
 //!
-//! #[tokio::main]
-//! async fn main() {
-//!     let bus = EventBus::new(1000);
-//!     let mut subscriber = bus.subscribe();
+//! fn main() {
+//!     let runtime = frankenterm_core::runtime_compat::Builder::new_current_thread()
+//!         .enable_all()
+//!         .build()
+//!         .expect("build runtime");
+//!     runtime.block_on(async {
+//!         let bus = EventBus::new(1000);
+//!         let mut subscriber = bus.subscribe();
 //!
-//!     // Publish events
-//!     bus.publish(Event::PaneDiscovered {
-//!         pane_id: 1,
-//!         domain: "local".to_string(),
-//!         title: "shell".to_string(),
+//!         // Publish events
+//!         bus.publish(Event::PaneDiscovered {
+//!             pane_id: 1,
+//!             domain: "local".to_string(),
+//!             title: "shell".to_string(),
+//!         });
+//!
+//!         // Receive events
+//!         while let Ok(event) = subscriber.recv().await {
+//!             println!("Got event: {:?}", event);
+//!         }
 //!     });
-//!
-//!     // Receive events
-//!     while let Ok(event) = subscriber.recv().await {
-//!         println!("Got event: {:?}", event);
-//!     }
 //! }
 //! ```
 
@@ -2768,211 +2773,218 @@ mod tests {
     }
 
     /// E2E: mute lifecycle with storage (add, check, list, remove).
-    #[tokio::test]
-    async fn e2e_mute_lifecycle_with_storage() {
-        use crate::storage::{EventMuteRecord, StorageHandle};
+    #[test]
+    fn e2e_mute_lifecycle_with_storage() {
+        run_async_test(async {
+            use crate::storage::{EventMuteRecord, StorageHandle};
 
-        let db_path = std::env::temp_dir().join(format!("wa_e2e_mute_{}.db", std::process::id()));
-        let db_str = db_path.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{db_str}-wal"));
-        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+            let db_path =
+                std::env::temp_dir().join(format!("wa_e2e_mute_{}.db", std::process::id()));
+            let db_str = db_path.to_string_lossy().to_string();
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_str}-shm"));
 
-        let storage = StorageHandle::new(&db_str).await.expect("open test db");
-        let now = crate::storage::now_ms();
+            let storage = StorageHandle::new(&db_str).await.expect("open test db");
+            let now = crate::storage::now_ms();
 
-        // Generate an identity key for our test event
-        let d = make_detection(
-            "codex.usage_reached",
-            crate::patterns::Severity::Warning,
-            crate::patterns::AgentType::Codex,
-        );
-        let identity_key = event_identity_key(&d, 1, None);
+            // Generate an identity key for our test event
+            let d = make_detection(
+                "codex.usage_reached",
+                crate::patterns::Severity::Warning,
+                crate::patterns::AgentType::Codex,
+            );
+            let identity_key = event_identity_key(&d, 1, None);
 
-        // Initially not muted
-        assert!(
-            !storage.is_event_muted(&identity_key, now).await.unwrap(),
-            "should not be muted initially"
-        );
+            // Initially not muted
+            assert!(
+                !storage.is_event_muted(&identity_key, now).await.unwrap(),
+                "should not be muted initially"
+            );
 
-        // Add mute with no expiry (permanent)
-        storage
-            .add_event_mute(EventMuteRecord {
-                identity_key: identity_key.clone(),
-                scope: "workspace".to_string(),
-                created_at: now,
-                expires_at: None,
-                created_by: Some("test".to_string()),
-                reason: Some("noisy test event".to_string()),
-            })
-            .await
-            .unwrap();
+            // Add mute with no expiry (permanent)
+            storage
+                .add_event_mute(EventMuteRecord {
+                    identity_key: identity_key.clone(),
+                    scope: "workspace".to_string(),
+                    created_at: now,
+                    expires_at: None,
+                    created_by: Some("test".to_string()),
+                    reason: Some("noisy test event".to_string()),
+                })
+                .await
+                .unwrap();
 
-        // Now muted
-        assert!(
-            storage.is_event_muted(&identity_key, now).await.unwrap(),
-            "should be muted after add"
-        );
+            // Now muted
+            assert!(
+                storage.is_event_muted(&identity_key, now).await.unwrap(),
+                "should be muted after add"
+            );
 
-        // Appears in active mutes list
-        let mutes = storage.list_active_mutes(now).await.unwrap();
-        assert!(
-            mutes.iter().any(|m| m.identity_key == identity_key),
-            "mute should appear in active list"
-        );
+            // Appears in active mutes list
+            let mutes = storage.list_active_mutes(now).await.unwrap();
+            assert!(
+                mutes.iter().any(|m| m.identity_key == identity_key),
+                "mute should appear in active list"
+            );
 
-        // Remove mute
-        storage.remove_event_mute(&identity_key).await.unwrap();
+            // Remove mute
+            storage.remove_event_mute(&identity_key).await.unwrap();
 
-        // No longer muted
-        assert!(
-            !storage.is_event_muted(&identity_key, now).await.unwrap(),
-            "should not be muted after remove"
-        );
+            // No longer muted
+            assert!(
+                !storage.is_event_muted(&identity_key, now).await.unwrap(),
+                "should not be muted after remove"
+            );
 
-        // Clean up
-        storage.shutdown().await.expect("shutdown");
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{db_str}-wal"));
-        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+            // Clean up
+            storage.shutdown().await.expect("shutdown");
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_str}-shm"));
+        });
     }
 
     /// E2E: mute with expiry automatically expires.
-    #[tokio::test]
-    async fn e2e_mute_expiry() {
-        use crate::storage::{EventMuteRecord, StorageHandle};
+    #[test]
+    fn e2e_mute_expiry() {
+        run_async_test(async {
+            use crate::storage::{EventMuteRecord, StorageHandle};
 
-        let db_path =
-            std::env::temp_dir().join(format!("wa_e2e_mute_expiry_{}.db", std::process::id()));
-        let db_str = db_path.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{db_str}-wal"));
-        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+            let db_path = std::env::temp_dir()
+                .join(format!("wa_e2e_mute_expiry_{}.db", std::process::id()));
+            let db_str = db_path.to_string_lossy().to_string();
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_str}-shm"));
 
-        let storage = StorageHandle::new(&db_str).await.expect("open test db");
-        let now = crate::storage::now_ms();
+            let storage = StorageHandle::new(&db_str).await.expect("open test db");
+            let now = crate::storage::now_ms();
 
-        let identity_key = "evt:test_expiry_key".to_string();
+            let identity_key = "evt:test_expiry_key".to_string();
 
-        // Add mute that already expired (expires_at in the past)
-        storage
-            .add_event_mute(EventMuteRecord {
-                identity_key: identity_key.clone(),
-                scope: "workspace".to_string(),
-                created_at: now - 60_000,
-                expires_at: Some(now - 1000), // expired 1 second ago
-                created_by: None,
-                reason: None,
-            })
-            .await
-            .unwrap();
+            // Add mute that already expired (expires_at in the past)
+            storage
+                .add_event_mute(EventMuteRecord {
+                    identity_key: identity_key.clone(),
+                    scope: "workspace".to_string(),
+                    created_at: now - 60_000,
+                    expires_at: Some(now - 1000), // expired 1 second ago
+                    created_by: None,
+                    reason: None,
+                })
+                .await
+                .unwrap();
 
-        // Should not be active since it's expired
-        assert!(
-            !storage.is_event_muted(&identity_key, now).await.unwrap(),
-            "expired mute should not be active"
-        );
+            // Should not be active since it's expired
+            assert!(
+                !storage.is_event_muted(&identity_key, now).await.unwrap(),
+                "expired mute should not be active"
+            );
 
-        // Should not appear in active mutes list
-        let mutes = storage.list_active_mutes(now).await.unwrap();
-        assert!(
-            !mutes.iter().any(|m| m.identity_key == identity_key),
-            "expired mute should not appear in active list"
-        );
+            // Should not appear in active mutes list
+            let mutes = storage.list_active_mutes(now).await.unwrap();
+            assert!(
+                !mutes.iter().any(|m| m.identity_key == identity_key),
+                "expired mute should not appear in active list"
+            );
 
-        // Add a mute that expires in the future
-        let future_key = "evt:test_future_key".to_string();
-        storage
-            .add_event_mute(EventMuteRecord {
-                identity_key: future_key.clone(),
-                scope: "workspace".to_string(),
-                created_at: now,
-                expires_at: Some(now + 3_600_000), // 1 hour from now
-                created_by: None,
-                reason: Some("temporary mute".to_string()),
-            })
-            .await
-            .unwrap();
+            // Add a mute that expires in the future
+            let future_key = "evt:test_future_key".to_string();
+            storage
+                .add_event_mute(EventMuteRecord {
+                    identity_key: future_key.clone(),
+                    scope: "workspace".to_string(),
+                    created_at: now,
+                    expires_at: Some(now + 3_600_000), // 1 hour from now
+                    created_by: None,
+                    reason: Some("temporary mute".to_string()),
+                })
+                .await
+                .unwrap();
 
-        // Should be active
-        assert!(
-            storage.is_event_muted(&future_key, now).await.unwrap(),
-            "future mute should be active"
-        );
+            // Should be active
+            assert!(
+                storage.is_event_muted(&future_key, now).await.unwrap(),
+                "future mute should be active"
+            );
 
-        // Clean up
-        storage.shutdown().await.expect("shutdown");
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{db_str}-wal"));
-        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+            // Clean up
+            storage.shutdown().await.expect("shutdown");
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_str}-shm"));
+        });
     }
 
     /// E2E: full noise control pipeline - dedup → cooldown → mute check.
-    #[tokio::test]
-    async fn e2e_full_pipeline_dedup_cooldown_mute() {
-        use crate::storage::{EventMuteRecord, StorageHandle};
+    #[test]
+    fn e2e_full_pipeline_dedup_cooldown_mute() {
+        run_async_test(async {
+            use crate::storage::{EventMuteRecord, StorageHandle};
 
-        let db_path =
-            std::env::temp_dir().join(format!("wa_e2e_full_pipeline_{}.db", std::process::id()));
-        let db_str = db_path.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{db_str}-wal"));
-        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+            let db_path = std::env::temp_dir()
+                .join(format!("wa_e2e_full_pipeline_{}.db", std::process::id()));
+            let db_str = db_path.to_string_lossy().to_string();
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_str}-shm"));
 
-        let storage = StorageHandle::new(&db_str).await.expect("open test db");
-        let now = crate::storage::now_ms();
+            let storage = StorageHandle::new(&db_str).await.expect("open test db");
+            let now = crate::storage::now_ms();
 
-        let d = make_detection(
-            "codex.compaction",
-            crate::patterns::Severity::Warning,
-            crate::patterns::AgentType::Codex,
-        );
-        let identity_key = event_identity_key(&d, 1, None);
+            let d = make_detection(
+                "codex.compaction",
+                crate::patterns::Severity::Warning,
+                crate::patterns::AgentType::Codex,
+            );
+            let identity_key = event_identity_key(&d, 1, None);
 
-        // Step 1: gate allows first event
-        let mut gate = NotificationGate::from_config(
-            EventFilter::allow_all(),
-            Duration::from_secs(300),
-            Duration::from_secs(300),
-        );
-        let r1 = gate.should_notify(&d, 1, None);
-        assert!(matches!(r1, NotifyDecision::Send { .. }));
+            // Step 1: gate allows first event
+            let mut gate = NotificationGate::from_config(
+                EventFilter::allow_all(),
+                Duration::from_secs(300),
+                Duration::from_secs(300),
+            );
+            let r1 = gate.should_notify(&d, 1, None);
+            assert!(matches!(r1, NotifyDecision::Send { .. }));
 
-        // Step 2: gate deduplicates second event
-        let r2 = gate.should_notify(&d, 1, None);
-        assert!(matches!(r2, NotifyDecision::Deduplicated { .. }));
+            // Step 2: gate deduplicates second event
+            let r2 = gate.should_notify(&d, 1, None);
+            assert!(matches!(r2, NotifyDecision::Deduplicated { .. }));
 
-        // Step 3: mute the event via storage
-        storage
-            .add_event_mute(EventMuteRecord {
-                identity_key: identity_key.clone(),
-                scope: "workspace".to_string(),
-                created_at: now,
-                expires_at: None,
-                created_by: Some("operator".to_string()),
-                reason: Some("too noisy".to_string()),
-            })
-            .await
-            .unwrap();
+            // Step 3: mute the event via storage
+            storage
+                .add_event_mute(EventMuteRecord {
+                    identity_key: identity_key.clone(),
+                    scope: "workspace".to_string(),
+                    created_at: now,
+                    expires_at: None,
+                    created_by: Some("operator".to_string()),
+                    reason: Some("too noisy".to_string()),
+                })
+                .await
+                .unwrap();
 
-        // Step 4: verify mute is active
-        assert!(storage.is_event_muted(&identity_key, now).await.unwrap());
+            // Step 4: verify mute is active
+            assert!(storage.is_event_muted(&identity_key, now).await.unwrap());
 
-        // Step 5: muted event is visible in muted list
-        let mutes = storage.list_active_mutes(now).await.unwrap();
-        let our_mute = mutes.iter().find(|m| m.identity_key == identity_key);
-        assert!(our_mute.is_some(), "muted event should be in list");
-        assert_eq!(our_mute.unwrap().reason.as_deref(), Some("too noisy"));
+            // Step 5: muted event is visible in muted list
+            let mutes = storage.list_active_mutes(now).await.unwrap();
+            let our_mute = mutes.iter().find(|m| m.identity_key == identity_key);
+            assert!(our_mute.is_some(), "muted event should be in list");
+            assert_eq!(our_mute.unwrap().reason.as_deref(), Some("too noisy"));
 
-        // Step 6: after unmuting, is_event_muted returns false
-        storage.remove_event_mute(&identity_key).await.unwrap();
-        assert!(!storage.is_event_muted(&identity_key, now).await.unwrap());
+            // Step 6: after unmuting, is_event_muted returns false
+            storage.remove_event_mute(&identity_key).await.unwrap();
+            assert!(!storage.is_event_muted(&identity_key, now).await.unwrap());
 
-        // Clean up
-        storage.shutdown().await.expect("shutdown");
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{db_str}-wal"));
-        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+            // Clean up
+            storage.shutdown().await.expect("shutdown");
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_str}-shm"));
+        });
     }
 
     /// E2E: dedup and cooldown JSON artifacts are deterministic.
