@@ -414,6 +414,7 @@ NOTES:
     ft status --pane-id 3             Status for specific pane
     ft status --bookmark build        Status for pane aliased as "build"
     ft status --health                Health check only
+    ft status --resize                Resize quality dashboard only
 
 SEE ALSO:
     ft list       Detailed pane listing
@@ -422,6 +423,10 @@ SEE ALSO:
         /// Output health check only (JSON)
         #[arg(long)]
         health: bool,
+
+        /// Show resize quality dashboard only (scorecard, gate, watchdog)
+        #[arg(long)]
+        resize: bool,
 
         /// Output format: auto, plain, or json
         #[arg(long, short = 'f', default_value = "auto")]
@@ -19850,6 +19855,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Status {
             health,
+            resize,
             format,
             domain,
             agent,
@@ -19998,6 +20004,93 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     "{}",
                     serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
                 );
+            } else if resize {
+                // Resize dashboard mode: show only resize quality telemetry
+                use frankenterm_core::output::{
+                    HealthSnapshotRenderer, OutputFormat, RenderContext, detect_format,
+                };
+
+                let output_format = match format.to_lowercase().as_str() {
+                    "json" => OutputFormat::Json,
+                    "plain" => OutputFormat::Plain,
+                    _ => detect_format(),
+                };
+
+                let watcher_status_payload = watcher_status.ok().and_then(|s| s);
+                let dashboard = watcher_status_payload
+                    .as_ref()
+                    .and_then(HealthSnapshotRenderer::resize_dashboard_from_status_payload);
+
+                if output_format.is_json() {
+                    let mut payload = serde_json::json!({
+                        "version": frankenterm_core::VERSION,
+                    });
+
+                    // Copy resize keys from watcher status
+                    if let Some(ref status) = watcher_status_payload {
+                        for key in [
+                            "resize_control_plane",
+                            "resize_control_plane_stalled",
+                            "resize_control_plane_watchdog",
+                            "resize_degradation_ladder",
+                        ] {
+                            if let Some(value) = status.get(key) {
+                                payload[key] = value.clone();
+                            }
+                        }
+                        attach_resize_dashboard_from_status_payload(&mut payload, status);
+                    }
+
+                    // Fallback to process-global snapshots
+                    if payload.get("resize_control_plane").is_none() {
+                        if let Some(snapshot) =
+                            frankenterm_core::resize_scheduler::ResizeSchedulerDebugSnapshot::get_global()
+                        {
+                            let now_ms = u64::try_from(now_epoch_ms()).unwrap_or(0);
+                            let stalled = snapshot.stalled_transactions(now_ms, 2_000);
+                            payload["resize_control_plane"] =
+                                serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+                            payload["resize_control_plane_stalled"] =
+                                serde_json::to_value(stalled).unwrap_or(serde_json::Value::Null);
+                        }
+                    }
+                    if payload.get("resize_control_plane_watchdog").is_none() {
+                        if let Some(watchdog) = frankenterm_core::runtime::evaluate_resize_watchdog(
+                            u64::try_from(now_epoch_ms()).unwrap_or(0),
+                        ) {
+                            payload["resize_control_plane_watchdog"] =
+                                serde_json::to_value(&watchdog).unwrap_or(serde_json::Value::Null);
+                            let ladder =
+                                frankenterm_core::runtime::derive_resize_degradation_ladder(&watchdog);
+                            payload["resize_degradation_ladder"] =
+                                serde_json::to_value(ladder).unwrap_or(serde_json::Value::Null);
+                        }
+                    }
+                    if payload.get("resize_dashboard").is_none() {
+                        let snapshot = payload.clone();
+                        attach_resize_dashboard_from_status_payload(&mut payload, &snapshot);
+                    }
+
+                    println!(
+                        "{}",
+                        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    // Plain text resize dashboard
+                    let ctx = RenderContext::new(output_format).verbose(cli.verbose);
+                    if let Some(ref dash) = dashboard {
+                        let resize_output =
+                            HealthSnapshotRenderer::render_resize_dashboard_compact(dash, &ctx);
+                        print!("{resize_output}");
+                        let checks =
+                            HealthSnapshotRenderer::resize_dashboard_diagnostic_checks(dash);
+                        if checks.iter().all(|c| c.status == frankenterm_core::output::HealthDiagnosticStatus::Ok) {
+                            println!("  All resize quality checks: OK");
+                        }
+                    } else {
+                        println!("  Resize dashboard: no data (watcher not running or no resize events yet)");
+                    }
+                }
             } else {
                 // Rich status mode: pane table + health summary
                 use frankenterm_core::output::{

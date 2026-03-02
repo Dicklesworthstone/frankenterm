@@ -133,8 +133,8 @@ require_rch() {
 
 build_gui() {
   if [[ "$SKIP_BUILD" -eq 1 ]]; then
-    log "build skipped by --skip-build"
-    return 0
+    mark_skip "--skip-build set"
+    return 125
   fi
   if ! require_rch; then
     log "rch not found at '$RCH_BIN'"

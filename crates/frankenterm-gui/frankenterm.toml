@@ -63,6 +63,33 @@ tab_bar_at_bottom = false
 name = "local"
 connect_automatically = false
 
+# --- Resize Reflow Quality ---
+
+# Enable wrap-quality scorecard telemetry during terminal resize.
+# Tracks per-line wrap quality to detect bad reflows.
+resize_wrap_scorecard_enabled = true
+
+# Enable readability gate: reject reflows that produce unreadable output.
+# When gate triggers, falls back to simpler (greedy) wrapping strategy.
+resize_wrap_readability_gate_enabled = true
+
+# Max per-line badness delta vs greedy baseline before gate triggers.
+# Lower = stricter. 0 = disabled (any badness triggers fallback).
+resize_wrap_readability_max_line_badness_delta = 500
+
+# Max aggregate badness delta across all lines before gate triggers.
+resize_wrap_readability_max_total_badness_delta = 2000
+
+# Max percent of lines allowed to use fallback wrapping (0-100).
+# 20 = at most 20% of lines can fall back before gate rejects the reflow.
+resize_wrap_readability_max_fallback_ratio_percent = 20
+
+# KP cost model tuning (advanced — defaults are good for most use cases)
+# resize_wrap_kp_badness_scale = 10000
+# resize_wrap_kp_forced_break_penalty = 5000
+# resize_wrap_kp_lookahead_limit = 64
+# resize_wrap_kp_max_dp_states = 8192
+
 # --- Performance ---
 
 # Frame rate cap

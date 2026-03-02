@@ -286,6 +286,7 @@ impl Drop for ScopedExecutor {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+    use std::time::{Duration, Instant};
 
     // Serialize spawn tests that touch global scheduler state
     static TEST_LOCK: StdMutex<()> = StdMutex::new(());
@@ -316,6 +317,18 @@ mod tests {
     fn block_on_with_string() {
         let result = block_on(async { String::from("hello async") });
         assert_eq!(result, "hello async");
+    }
+
+    #[test]
+    fn sleep_waits_at_least_requested_duration() {
+        let start = Instant::now();
+        block_on(sleep(Duration::from_millis(5)));
+        assert!(start.elapsed() >= Duration::from_millis(5));
+    }
+
+    #[test]
+    fn sleep_zero_duration_completes() {
+        block_on(sleep(Duration::ZERO));
     }
 
     #[test]

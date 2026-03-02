@@ -490,4 +490,122 @@ scrollback_lines = 5000
         .unwrap();
         assert_eq!(cfg.scrollback_lines, 9999);
     }
+
+    #[test]
+    fn resize_wrap_scorecard_config_loads() {
+        let toml_str = r#"
+resize_wrap_scorecard_enabled = true
+resize_wrap_readability_gate_enabled = true
+resize_wrap_readability_max_line_badness_delta = 500
+resize_wrap_readability_max_total_badness_delta = 2000
+resize_wrap_readability_max_fallback_ratio_percent = 20
+"#;
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        )
+        .unwrap();
+        assert!(cfg.resize_wrap_scorecard_enabled);
+        assert!(cfg.resize_wrap_readability_gate_enabled);
+        assert_eq!(cfg.resize_wrap_readability_max_line_badness_delta, 500);
+        assert_eq!(cfg.resize_wrap_readability_max_total_badness_delta, 2000);
+        assert_eq!(cfg.resize_wrap_readability_max_fallback_ratio_percent, 20);
+    }
+
+    #[test]
+    fn resize_wrap_kp_cost_model_config_loads() {
+        let toml_str = r#"
+resize_wrap_kp_badness_scale = 20000
+resize_wrap_kp_forced_break_penalty = 10000
+resize_wrap_kp_lookahead_limit = 128
+resize_wrap_kp_max_dp_states = 16384
+"#;
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.resize_wrap_kp_badness_scale, 20000);
+        assert_eq!(cfg.resize_wrap_kp_forced_break_penalty, 10000);
+        assert_eq!(cfg.resize_wrap_kp_lookahead_limit, 128);
+        assert_eq!(cfg.resize_wrap_kp_max_dp_states, 16384);
+    }
+
+    #[test]
+    fn resize_wrap_defaults_when_not_specified() {
+        let toml_str = r#"
+scrollback_lines = 5000
+"#;
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        )
+        .unwrap();
+        // Defaults: scorecard and gate are enabled for resize quality telemetry
+        assert!(cfg.resize_wrap_scorecard_enabled);
+        assert!(cfg.resize_wrap_readability_gate_enabled);
+        // Default KP cost model values
+        assert_eq!(cfg.resize_wrap_kp_badness_scale, 10_000);
+        assert_eq!(cfg.resize_wrap_kp_forced_break_penalty, 5_000);
+        assert_eq!(cfg.resize_wrap_kp_lookahead_limit, 64);
+        assert_eq!(cfg.resize_wrap_kp_max_dp_states, 8_192);
+        // Default gate thresholds (sensible production values)
+        assert_eq!(cfg.resize_wrap_readability_max_line_badness_delta, 500);
+        assert_eq!(cfg.resize_wrap_readability_max_total_badness_delta, 2000);
+        assert_eq!(cfg.resize_wrap_readability_max_fallback_ratio_percent, 20);
+    }
+
+    #[test]
+    fn resize_wrap_fallback_ratio_percent_clamped() {
+        // Values above 100 should still parse (validation happens separately)
+        let toml_str = r#"
+resize_wrap_readability_max_fallback_ratio_percent = 50
+"#;
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.resize_wrap_readability_max_fallback_ratio_percent, 50);
+    }
+
+    #[test]
+    fn resize_wrap_scorecard_can_be_explicitly_disabled() {
+        let toml_str = r#"
+resize_wrap_scorecard_enabled = false
+resize_wrap_readability_gate_enabled = false
+"#;
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        )
+        .unwrap();
+        assert!(!cfg.resize_wrap_scorecard_enabled);
+        assert!(!cfg.resize_wrap_readability_gate_enabled);
+    }
 }
