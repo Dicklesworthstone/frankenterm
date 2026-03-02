@@ -1411,7 +1411,7 @@ steps:
 
     #[test]
     fn step_id_returns_correct_id_for_each_variant() {
-        let steps = vec![
+        let steps = [
             DescriptorStep::WaitFor {
                 id: "w1".into(),
                 description: None,
@@ -1987,7 +1987,7 @@ steps:
 
     #[test]
     fn trigger_defaults_empty_fields() {
-        let json = r#"{}"#;
+        let json = r"{}";
         let trigger: DescriptorTrigger = serde_json::from_str(json).unwrap();
         assert!(trigger.event_types.is_empty());
         assert!(trigger.agent_types.is_empty());

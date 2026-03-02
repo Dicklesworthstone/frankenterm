@@ -973,7 +973,7 @@ mod tests {
     fn envelope_success_fields() {
         let envelope = McpEnvelope::success("hello", 42);
         assert!(envelope.ok);
-        assert_eq!(envelope.data.as_deref(), Some("hello"));
+        assert_eq!(envelope.data, Some("hello"));
         assert!(envelope.error.is_none());
         assert!(envelope.error_code.is_none());
         assert!(envelope.hint.is_none());
