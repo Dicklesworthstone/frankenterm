@@ -3339,6 +3339,7 @@ dependencies = [
  "dirs-next",
  "downcast-rs 1.2.1",
  "emojis",
+ "env_logger",
  "euclid",
  "fastrand",
  "filedescriptor 0.8.3",

@@ -74,6 +74,9 @@ pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DAT
 // ---------------------------------------------------------------------------
 
 fn frankenterm_bootstrap() {
+    // Initialize logging from RUST_LOG env var
+    env_logger::init();
+
     config::assign_version_info(
         config::wezterm_version(),
         config::wezterm_target_triple(),

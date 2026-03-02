@@ -71,6 +71,7 @@ colorgrad.workspace = true
 dirs-next.workspace = true
 downcast-rs.workspace = true
 emojis.workspace = true
+env_logger.workspace = true
 euclid.workspace = true
 fastrand.workspace = true
 finl_unicode.workspace = true

@@ -93,13 +93,38 @@ impl Drop for NotifDelegate {
     }
 }
 
+/// Returns true if the process is running inside a valid macOS app bundle.
+/// UNUserNotificationCenter crashes with NSInternalInconsistencyException
+/// when invoked outside a bundle (e.g. `cargo run` from a build directory).
+fn has_valid_bundle() -> bool {
+    use objc2_foundation::NSBundle;
+    let bundle = NSBundle::mainBundle();
+    bundle.bundleIdentifier().is_some()
+}
+
+/// Once-checked flag: have we already determined bundle validity?
+static BUNDLE_CHECK: LazyLock<bool> = LazyLock::new(|| {
+    let valid = has_valid_bundle();
+    if !valid {
+        log::warn!(
+            "Not running inside an app bundle; toast notifications disabled. \
+             Launch from FrankenTerm.app for full notification support."
+        );
+    }
+    valid
+});
+
 const CENTER: LazyLock<Retained<UNUserNotificationCenter>> =
-    LazyLock::new(|| unsafe { UNUserNotificationCenter::currentNotificationCenter() });
+    LazyLock::new(|| UNUserNotificationCenter::currentNotificationCenter());
 
 pub fn initialize() {
+    if !*BUNDLE_CHECK {
+        return;
+    }
     static INIT: Once = Once::new();
-    INIT.call_once(|| unsafe {
-        CENTER.requestAuthorizationWithOptions_completionHandler(
+    INIT.call_once(|| {
+        let center = CENTER;
+        center.requestAuthorizationWithOptions_completionHandler(
             UNAuthorizationOptions::Alert
                 | UNAuthorizationOptions::Provisional
                 | UNAuthorizationOptions::Sound,
@@ -125,15 +150,15 @@ pub fn initialize() {
                 &NSArray::from_slice(&[]),
                 UNNotificationCategoryOptions::CustomDismissAction,
             );
-        CENTER.setNotificationCategories(&NSSet::from_retained_slice(&[show_url_cat]));
+        center.setNotificationCategories(&NSSet::from_retained_slice(&[show_url_cat]));
 
         let delegate = NotifDelegate::new();
         let delegate_proto = ProtocolObject::from_retained(delegate.clone());
-        CENTER.setDelegate(Some(&delegate_proto));
+        center.setDelegate(Some(&delegate_proto));
         log::debug!(
             "after setDelegate {:?}, center.delegate={:?}",
             delegate,
-            CENTER.delegate()
+            center.delegate()
         );
 
         // Intentionally "leak" the delegate.
@@ -148,9 +173,14 @@ pub fn initialize() {
 }
 
 pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Error>> {
+    if !*BUNDLE_CHECK {
+        log::debug!("Skipping notification (no bundle): {}", toast.title);
+        return Ok(());
+    }
     initialize();
+    let center = CENTER;
     unsafe {
-        log::debug!("show_notif center.delegate is {:?}", CENTER.delegate());
+        log::debug!("show_notif center.delegate is {:?}", center.delegate());
 
         let notif = UNMutableNotificationContent::new();
         notif.setTitle(&NSString::from_str(&toast.title));
@@ -173,23 +203,19 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
             None,
         );
 
-        CENTER.addNotificationRequest_withCompletionHandler(
+        center.addNotificationRequest_withCompletionHandler(
             &*request,
             Some(&RcBlock::new(move |err: *mut NSError| {
                 if err.is_null() {
                     if let Some(timeout) = toast.timeout {
-                        // Spawn a thread to wait. This could be more efficient.
-                        // We cannot simply use performSelector:withObject:afterDelay:
-                        // because we're not guaranteed to be called from the main
-                        // thread.  We also don't have access to the executor machinery
-                        // from the window crate here, so we just do this basic take.
                         let identifier = identifier.clone();
                         std::thread::spawn(move || {
                             std::thread::sleep(timeout);
                             // Remove this notification
                             let ident_array =
                                 NSArray::from_retained_slice(&[NSString::from_str(&identifier)]);
-                            CENTER.removeDeliveredNotificationsWithIdentifiers(&ident_array);
+                            let c = CENTER;
+                            c.removeDeliveredNotificationsWithIdentifiers(&ident_array);
                         });
                     }
                 } else {
