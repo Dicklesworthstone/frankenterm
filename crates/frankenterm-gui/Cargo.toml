@@ -1,0 +1,66 @@
+[package]
+name = "frankenterm-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "FrankenTerm GUI — custom terminal emulator binary"
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "frankenterm-gui"
+path = "src/main.rs"
+
+[features]
+default = []
+# Full GUI features — enabled once window/font crates are vendored (ft-1memj.2)
+# gui = ["dep:window", "dep:wezterm-font"]
+
+[build-dependencies]
+anyhow.workspace = true
+
+[dependencies]
+# Core library — shared types, config, storage, patterns, policy engine
+frankenterm-core.workspace = true
+
+# Vendored FrankenTerm crates (ex-WezTerm, already in workspace)
+config.workspace = true
+codec.workspace = true
+mux.workspace = true
+portable-pty = { workspace = true, features = ["serde_support"] }
+promise.workspace = true
+rangeset.workspace = true
+termwiz.workspace = true
+umask.workspace = true
+frankenterm-bidi = { workspace = true }
+frankenterm-blob-leases = { workspace = true, features = ["simple_tempdir"] }
+frankenterm-cell.workspace = true
+frankenterm-color-types.workspace = true
+frankenterm-dynamic.workspace = true
+frankenterm-escape-parser.workspace = true
+frankenterm-input-types.workspace = true
+frankenterm-ssh.workspace = true
+frankenterm-scripting.workspace = true
+frankenterm-surface.workspace = true
+frankenterm-term.workspace = true
+frankenterm-uds.workspace = true
+
+# Standard dependencies
+anyhow.workspace = true
+clap.workspace = true
+log.workspace = true
+serde = { workspace = true, features = ["rc", "derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true }
+
+# macOS-specific (for future GUI integration)
+[target.'cfg(target_os = "macos")'.dependencies]
+
+[lints]
+workspace = true

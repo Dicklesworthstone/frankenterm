@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/frankenterm",
     "crates/frankenterm-core",
+    "crates/frankenterm-gui",
     "crates/frankenterm-alloc",
     "fuzz",
     # FrankenTerm crates (ex-WezTerm, owned in-tree)
@@ -49,6 +50,7 @@ exclude = [
 default-members = [
     "crates/frankenterm",
     "crates/frankenterm-core",
+    "crates/frankenterm-gui",
     "crates/frankenterm-alloc",
     "fuzz",
 ]
