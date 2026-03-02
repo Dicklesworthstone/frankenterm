@@ -358,6 +358,109 @@ color_scheme = "Catppuccin Mocha"
     }
 
     #[test]
+    fn full_config_loads_all_fields() {
+        let toml_str = r#"
+scrollback_lines = 50000
+font_size = 16.0
+color_scheme = "Builtin Dark"
+enable_scroll_bar = true
+enable_tab_bar = true
+hide_tab_bar_if_only_one_tab = true
+tab_bar_at_bottom = false
+initial_rows = 40
+initial_cols = 120
+window_close_confirmation = "NeverPrompt"
+check_for_updates = false
+automatically_reload_config = true
+max_fps = 60
+
+[window_padding]
+left = 4
+right = 4
+top = 4
+bottom = 4
+
+[[font.font]]
+family = "JetBrains Mono"
+"#;
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.scrollback_lines, 50000);
+        assert!((cfg.font_size - 16.0).abs() < 0.01);
+        assert_eq!(cfg.color_scheme.as_deref(), Some("Builtin Dark"));
+        assert_eq!(cfg.enable_scroll_bar, true);
+        assert_eq!(cfg.initial_rows, 40);
+        assert_eq!(cfg.initial_cols, 120);
+    }
+
+    #[test]
+    fn type_mismatch_produces_error() {
+        // scrollback_lines should be integer, not string
+        let toml_str = r#"scrollback_lines = "not a number""#;
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let result = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn default_values_for_unpopulated_keys() {
+        let toml_str = "color_scheme = \"Test\"\n";
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        )
+        .unwrap();
+        // scrollback_lines should have a default > 0
+        assert!(cfg.scrollback_lines > 0);
+        // font_size should have a reasonable default
+        assert!(cfg.font_size > 0.0);
+        // initial_rows/cols should have defaults
+        assert!(cfg.initial_rows > 0);
+        assert!(cfg.initial_cols > 0);
+    }
+
+    #[test]
+    fn window_padding_config_loads() {
+        let toml_str = r#"
+[window_padding]
+left = 8
+right = 8
+top = 12
+bottom = 12
+"#;
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        );
+        assert!(cfg.is_ok(), "window_padding config should parse without error");
+    }
+
+    #[test]
     fn overrides_take_precedence() {
         let toml_str = r#"
 scrollback_lines = 5000
