@@ -860,6 +860,7 @@ pub fn default_workflow_dir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patterns::{AgentType, Detection, Severity};
 
     fn minimal_yaml() -> &'static str {
         r#"
@@ -1402,5 +1403,769 @@ steps:
         let parsed: WorkflowDescriptor = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "test_workflow");
         assert_eq!(parsed.steps.len(), 1);
+    }
+
+    // ========================================================================
+    // DescriptorStep::id() and description()
+    // ========================================================================
+
+    #[test]
+    fn step_id_returns_correct_id_for_each_variant() {
+        let steps = vec![
+            DescriptorStep::WaitFor {
+                id: "w1".into(),
+                description: None,
+                matcher: DescriptorMatcher::Substring {
+                    value: "x".into(),
+                },
+                timeout_ms: None,
+            },
+            DescriptorStep::Sleep {
+                id: "s1".into(),
+                description: None,
+                duration_ms: 100,
+            },
+            DescriptorStep::SendText {
+                id: "t1".into(),
+                description: None,
+                text: "hello".into(),
+                wait_for: None,
+                wait_timeout_ms: None,
+            },
+            DescriptorStep::SendCtrl {
+                id: "c1".into(),
+                description: None,
+                key: DescriptorControlKey::CtrlC,
+            },
+            DescriptorStep::Notify {
+                id: "n1".into(),
+                description: None,
+                message: "note".into(),
+            },
+            DescriptorStep::Log {
+                id: "l1".into(),
+                description: None,
+                message: "log".into(),
+            },
+            DescriptorStep::Abort {
+                id: "a1".into(),
+                description: None,
+                reason: "bail".into(),
+            },
+        ];
+        let expected_ids = ["w1", "s1", "t1", "c1", "n1", "l1", "a1"];
+        for (step, expected) in steps.iter().zip(expected_ids.iter()) {
+            assert_eq!(step.id(), *expected);
+        }
+    }
+
+    #[test]
+    fn step_description_defaults_when_none() {
+        let step = DescriptorStep::WaitFor {
+            id: "w1".into(),
+            description: None,
+            matcher: DescriptorMatcher::Substring {
+                value: "x".into(),
+            },
+            timeout_ms: None,
+        };
+        assert_eq!(step.description(), "Wait for substring/regex match");
+
+        let step = DescriptorStep::Sleep {
+            id: "s1".into(),
+            description: None,
+            duration_ms: 100,
+        };
+        assert_eq!(step.description(), "Sleep");
+
+        let step = DescriptorStep::Abort {
+            id: "a1".into(),
+            description: None,
+            reason: "bye".into(),
+        };
+        assert_eq!(step.description(), "Abort workflow");
+    }
+
+    #[test]
+    fn step_description_uses_custom_when_provided() {
+        let step = DescriptorStep::SendText {
+            id: "t1".into(),
+            description: Some("Run ls command".into()),
+            text: "ls\n".into(),
+            wait_for: None,
+            wait_timeout_ms: None,
+        };
+        assert_eq!(step.description(), "Run ls command");
+    }
+
+    #[test]
+    fn step_description_all_variants_with_custom() {
+        let variants: Vec<(DescriptorStep, &str)> = vec![
+            (
+                DescriptorStep::WaitFor {
+                    id: "a".into(),
+                    description: Some("custom wait".into()),
+                    matcher: DescriptorMatcher::Substring {
+                        value: "x".into(),
+                    },
+                    timeout_ms: None,
+                },
+                "custom wait",
+            ),
+            (
+                DescriptorStep::Sleep {
+                    id: "b".into(),
+                    description: Some("custom sleep".into()),
+                    duration_ms: 1,
+                },
+                "custom sleep",
+            ),
+            (
+                DescriptorStep::SendCtrl {
+                    id: "c".into(),
+                    description: Some("custom ctrl".into()),
+                    key: DescriptorControlKey::CtrlD,
+                },
+                "custom ctrl",
+            ),
+            (
+                DescriptorStep::Notify {
+                    id: "d".into(),
+                    description: Some("custom notify".into()),
+                    message: "m".into(),
+                },
+                "custom notify",
+            ),
+            (
+                DescriptorStep::Log {
+                    id: "e".into(),
+                    description: Some("custom log".into()),
+                    message: "m".into(),
+                },
+                "custom log",
+            ),
+            (
+                DescriptorStep::Conditional {
+                    id: "f".into(),
+                    description: Some("custom cond".into()),
+                    test_text: "x".into(),
+                    matcher: DescriptorMatcher::Substring {
+                        value: "x".into(),
+                    },
+                    then_steps: vec![],
+                    else_steps: vec![],
+                },
+                "custom cond",
+            ),
+            (
+                DescriptorStep::Loop {
+                    id: "g".into(),
+                    description: Some("custom loop".into()),
+                    count: 1,
+                    body: vec![],
+                },
+                "custom loop",
+            ),
+        ];
+        for (step, expected) in &variants {
+            assert_eq!(step.description(), *expected);
+        }
+    }
+
+    // ========================================================================
+    // DescriptorWorkflow compilation (compile / compile_recursive)
+    // ========================================================================
+
+    #[test]
+    fn compile_simple_steps_produces_action_and_metadata() {
+        let wf = DescriptorWorkflow::from_yaml_str(minimal_yaml()).unwrap();
+        let steps = wf.steps();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].name, "step1");
+        assert_eq!(steps[0].description, "Send text");
+    }
+
+    #[test]
+    fn compile_loop_unrolls_body() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: loop_test
+steps:
+  - type: loop
+    id: loop1
+    count: 3
+    body:
+      - type: send_text
+        id: inner
+        text: "x"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let steps = wf.steps();
+        // Loop with count=3 and 1 inner step should produce 3 steps
+        assert_eq!(steps.len(), 3);
+        for step in &steps {
+            assert_eq!(step.name, "inner");
+            assert_eq!(step.description, "Send text");
+        }
+    }
+
+    #[test]
+    fn compile_loop_zero_count_produces_no_steps() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: loop_zero
+steps:
+  - type: loop
+    id: loop1
+    count: 0
+    body:
+      - type: send_text
+        id: inner
+        text: "x"
+  - type: send_text
+    id: after
+    text: "done"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let steps = wf.steps();
+        // Loop 0 = no unrolled steps, plus 1 trailing step
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].name, "after");
+    }
+
+    #[test]
+    fn compile_nested_loops_unroll_multiplicatively() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: nested_loop
+steps:
+  - type: loop
+    id: outer
+    count: 2
+    body:
+      - type: loop
+        id: inner
+        count: 3
+        body:
+          - type: notify
+            id: ping
+            message: "ping"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let steps = wf.steps();
+        // 2 * 3 = 6 unrolled steps
+        assert_eq!(steps.len(), 6);
+        for step in &steps {
+            assert_eq!(step.name, "ping");
+        }
+    }
+
+    #[test]
+    fn compile_conditional_produces_jump_and_branch_metadata() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: cond_test
+steps:
+  - type: conditional
+    id: check1
+    test_text: "hello"
+    matcher:
+      kind: substring
+      value: "hello"
+    then_steps:
+      - type: notify
+        id: then_step
+        message: "matched"
+    else_steps:
+      - type: notify
+        id: else_step
+        message: "no match"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let steps = wf.steps();
+        // Conditional produces: JumpIfFalse meta + then_step + Jump meta + else_step = 4
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[0].name, "check1");
+        assert!(steps[0].description.contains("Check:"));
+        assert_eq!(steps[1].name, "then_step");
+        assert_eq!(steps[2].name, "check1_jump");
+        assert_eq!(steps[3].name, "else_step");
+    }
+
+    #[test]
+    fn compile_conditional_empty_else_branch() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: cond_no_else
+steps:
+  - type: conditional
+    id: check
+    test_text: "x"
+    matcher:
+      kind: substring
+      value: "x"
+    then_steps:
+      - type: notify
+        id: yes
+        message: "yes"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let steps = wf.steps();
+        // JumpIfFalse meta + then_step + Jump meta = 3 (no else steps)
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].name, "check");
+        assert_eq!(steps[1].name, "yes");
+        assert_eq!(steps[2].name, "check_jump");
+    }
+
+    #[test]
+    fn compile_mixed_steps_preserves_order() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: mixed
+steps:
+  - type: send_text
+    id: first
+    text: "a"
+  - type: sleep
+    id: second
+    duration_ms: 100
+  - type: loop
+    id: loop1
+    count: 2
+    body:
+      - type: notify
+        id: looped
+        message: "ping"
+  - type: send_text
+    id: last
+    text: "z"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let steps = wf.steps();
+        // first + second + 2*looped + last = 5
+        assert_eq!(steps.len(), 5);
+        assert_eq!(steps[0].name, "first");
+        assert_eq!(steps[1].name, "second");
+        assert_eq!(steps[2].name, "looped");
+        assert_eq!(steps[3].name, "looped");
+        assert_eq!(steps[4].name, "last");
+    }
+
+    // ========================================================================
+    // DescriptorWorkflow::handles() — trigger matching
+    // ========================================================================
+
+    fn make_detection(rule_id: &str, agent_type: AgentType, event_type: &str) -> Detection {
+        Detection {
+            rule_id: rule_id.to_string(),
+            agent_type,
+            event_type: event_type.to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: String::new(),
+            span: (0, 0),
+        }
+    }
+
+    #[test]
+    fn handles_returns_false_when_no_triggers() {
+        let wf = DescriptorWorkflow::from_yaml_str(minimal_yaml()).unwrap();
+        let det = make_detection("wezterm.test", AgentType::Unknown, "test");
+        assert!(!wf.handles(&det));
+    }
+
+    #[test]
+    fn handles_matches_event_type_trigger() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: triggered
+triggers:
+  - event_types: ["session.compaction"]
+steps:
+  - type: send_text
+    id: s1
+    text: "x"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+
+        let det = make_detection("wezterm.test", AgentType::Unknown, "session.compaction");
+        assert!(wf.handles(&det));
+
+        let det2 = make_detection("wezterm.test", AgentType::Unknown, "other.event");
+        assert!(!wf.handles(&det2));
+    }
+
+    #[test]
+    fn handles_matches_rule_id_trigger() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: rule_triggered
+triggers:
+  - rule_ids: ["wezterm.stuck_detection"]
+steps:
+  - type: send_text
+    id: s1
+    text: "x"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+
+        let det = make_detection("wezterm.stuck_detection", AgentType::Unknown, "any");
+        assert!(wf.handles(&det));
+
+        let det2 = make_detection("wezterm.other_rule", AgentType::Unknown, "any");
+        assert!(!wf.handles(&det2));
+    }
+
+    #[test]
+    fn handles_matches_agent_type_trigger() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: agent_triggered
+triggers:
+  - agent_types: ["codex"]
+steps:
+  - type: send_text
+    id: s1
+    text: "x"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+
+        let det = make_detection("wezterm.test", AgentType::Codex, "any");
+        assert!(wf.handles(&det));
+
+        let det2 = make_detection("wezterm.test", AgentType::ClaudeCode, "any");
+        assert!(!wf.handles(&det2));
+    }
+
+    #[test]
+    fn handles_requires_all_trigger_conditions_to_match() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: combined
+triggers:
+  - event_types: ["stuck"]
+    agent_types: ["codex"]
+    rule_ids: ["wezterm.stuck"]
+steps:
+  - type: send_text
+    id: s1
+    text: "x"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+
+        // All three match
+        let det = make_detection("wezterm.stuck", AgentType::Codex, "stuck");
+        assert!(wf.handles(&det));
+
+        // Event matches but agent doesn't
+        let det2 = make_detection("wezterm.stuck", AgentType::ClaudeCode, "stuck");
+        assert!(!wf.handles(&det2));
+
+        // Agent matches but rule doesn't
+        let det3 = make_detection("wezterm.other", AgentType::Codex, "stuck");
+        assert!(!wf.handles(&det3));
+    }
+
+    #[test]
+    fn handles_empty_trigger_fields_match_anything() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: open_trigger
+triggers:
+  - event_types: ["stuck"]
+steps:
+  - type: send_text
+    id: s1
+    text: "x"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+
+        // Empty agent_types and rule_ids means any agent/rule matches
+        let det = make_detection("wezterm.anything", AgentType::Gemini, "stuck");
+        assert!(wf.handles(&det));
+    }
+
+    #[test]
+    fn handles_any_of_multiple_triggers() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: multi_trigger
+triggers:
+  - event_types: ["error"]
+  - event_types: ["timeout"]
+steps:
+  - type: send_text
+    id: s1
+    text: "x"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+
+        let det1 = make_detection("wezterm.test", AgentType::Unknown, "error");
+        assert!(wf.handles(&det1));
+
+        let det2 = make_detection("wezterm.test", AgentType::Unknown, "timeout");
+        assert!(wf.handles(&det2));
+
+        let det3 = make_detection("wezterm.test", AgentType::Unknown, "success");
+        assert!(!wf.handles(&det3));
+    }
+
+    // ========================================================================
+    // DescriptorMatcher validation edge cases
+    // ========================================================================
+
+    #[test]
+    fn matcher_validate_valid_substring() {
+        let matcher = DescriptorMatcher::Substring {
+            value: "hello".into(),
+        };
+        assert!(matcher.validate(&DescriptorLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn matcher_validate_valid_regex() {
+        let matcher = DescriptorMatcher::Regex {
+            pattern: r"\d+".into(),
+        };
+        assert!(matcher.validate(&DescriptorLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn matcher_validate_empty_substring_ok() {
+        let matcher = DescriptorMatcher::Substring {
+            value: String::new(),
+        };
+        assert!(matcher.validate(&DescriptorLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn matcher_validate_complex_regex() {
+        let matcher = DescriptorMatcher::Regex {
+            pattern: r"^(ERROR|WARN|FATAL):\s+.*$".into(),
+        };
+        assert!(matcher.validate(&DescriptorLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn matcher_to_text_match_substring_produces_text_match() {
+        let matcher = DescriptorMatcher::Substring {
+            value: "prompt".into(),
+        };
+        let tm = matcher.to_text_match();
+        // TextMatch is a non-executable descriptor; just verify conversion succeeds
+        assert!(format!("{tm:?}").contains("prompt"));
+    }
+
+    #[test]
+    fn matcher_to_text_match_regex_produces_text_match() {
+        let matcher = DescriptorMatcher::Regex {
+            pattern: r"ERROR:\s+\d+".into(),
+        };
+        let tm = matcher.to_text_match();
+        assert!(format!("{tm:?}").contains("ERROR"));
+    }
+
+    // ========================================================================
+    // DescriptorTrigger serde
+    // ========================================================================
+
+    #[test]
+    fn trigger_serde_roundtrip() {
+        let trigger = DescriptorTrigger {
+            event_types: vec!["stuck".into(), "timeout".into()],
+            agent_types: vec!["codex".into()],
+            rule_ids: vec!["wezterm.stuck".into()],
+        };
+        let json = serde_json::to_string(&trigger).unwrap();
+        let parsed: DescriptorTrigger = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_types, trigger.event_types);
+        assert_eq!(parsed.agent_types, trigger.agent_types);
+        assert_eq!(parsed.rule_ids, trigger.rule_ids);
+    }
+
+    #[test]
+    fn trigger_defaults_empty_fields() {
+        let json = r#"{}"#;
+        let trigger: DescriptorTrigger = serde_json::from_str(json).unwrap();
+        assert!(trigger.event_types.is_empty());
+        assert!(trigger.agent_types.is_empty());
+        assert!(trigger.rule_ids.is_empty());
+    }
+
+    // ========================================================================
+    // DescriptorWorkflow Workflow trait impl
+    // ========================================================================
+
+    #[test]
+    fn workflow_trait_name_and_description() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: my_flow
+description: "Does something cool"
+steps:
+  - type: send_text
+    id: s1
+    text: "x"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        assert_eq!(wf.name(), "my_flow");
+        assert_eq!(wf.description(), "Does something cool");
+    }
+
+    #[test]
+    fn workflow_trait_default_description() {
+        let wf = DescriptorWorkflow::from_yaml_str(minimal_yaml()).unwrap();
+        assert_eq!(wf.description(), "Descriptor workflow");
+    }
+
+    #[test]
+    fn workflow_trait_steps_returns_metadata() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: multi
+steps:
+  - type: wait_for
+    id: w1
+    matcher:
+      kind: substring
+      value: "$"
+  - type: send_text
+    id: t1
+    text: "ls\n"
+  - type: sleep
+    id: s1
+    duration_ms: 500
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let steps = wf.steps();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].name, "w1");
+        assert_eq!(steps[1].name, "t1");
+        assert_eq!(steps[2].name, "s1");
+    }
+
+    // ========================================================================
+    // Validation: edge cases not yet covered
+    // ========================================================================
+
+    #[test]
+    fn validate_wait_for_with_custom_timeout() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: wait_custom
+steps:
+  - type: wait_for
+    id: w1
+    matcher:
+      kind: substring
+      value: "$"
+    timeout_ms: 5000
+"#;
+        assert!(DescriptorWorkflow::from_yaml_str(yaml).is_ok());
+    }
+
+    #[test]
+    fn validate_send_text_with_wait_for() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: send_wait
+steps:
+  - type: send_text
+    id: s1
+    text: "ls\n"
+    wait_for:
+      kind: regex
+      pattern: "\\$"
+    wait_timeout_ms: 3000
+"#;
+        assert!(DescriptorWorkflow::from_yaml_str(yaml).is_ok());
+    }
+
+    #[test]
+    fn validate_max_steps_exactly_at_limit() {
+        let mut steps_yaml = String::new();
+        for i in 0..DESCRIPTOR_MAX_STEPS {
+            steps_yaml.push_str(&format!(
+                "  - type: notify\n    id: s{i}\n    message: \"m\"\n"
+            ));
+        }
+        let yaml = format!(
+            "workflow_schema_version: 1\nname: max_steps\nsteps:\n{steps_yaml}"
+        );
+        assert!(DescriptorWorkflow::from_yaml_str(&yaml).is_ok());
+    }
+
+    #[test]
+    fn validate_one_over_max_steps_fails() {
+        let mut steps_yaml = String::new();
+        for i in 0..=DESCRIPTOR_MAX_STEPS {
+            steps_yaml.push_str(&format!(
+                "  - type: notify\n    id: s{i}\n    message: \"m\"\n"
+            ));
+        }
+        let yaml = format!(
+            "workflow_schema_version: 1\nname: over_max\nsteps:\n{steps_yaml}"
+        );
+        assert!(DescriptorWorkflow::from_yaml_str(&yaml).is_err());
+    }
+
+    #[test]
+    fn validate_loop_max_iterations_boundary() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: loop_max
+steps:
+  - type: loop
+    id: loop1
+    count: 1000
+    body:
+      - type: notify
+        id: inner
+        message: "x"
+"#;
+        assert!(DescriptorWorkflow::from_yaml_str(yaml).is_ok());
+    }
+
+    #[test]
+    fn validate_loop_over_max_iterations_fails() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: loop_over
+steps:
+  - type: loop
+    id: loop1
+    count: 1001
+    body:
+      - type: notify
+        id: inner
+        message: "x"
+"#;
+        assert!(DescriptorWorkflow::from_yaml_str(yaml).is_err());
+    }
+
+    // ========================================================================
+    // DescriptorWorkflow::descriptor() accessor
+    // ========================================================================
+
+    #[test]
+    fn descriptor_accessor_returns_original() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: accessor_test
+description: "Desc"
+steps:
+  - type: notify
+    id: n1
+    message: "hello"
+"#;
+        let wf = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+        let desc = wf.descriptor();
+        assert_eq!(desc.name, "accessor_test");
+        assert_eq!(desc.description.as_deref(), Some("Desc"));
+        assert_eq!(desc.steps.len(), 1);
+        assert!(desc.triggers.is_empty());
+        assert!(desc.on_failure.is_none());
     }
 }

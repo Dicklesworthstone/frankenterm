@@ -4063,3 +4063,317 @@ impl ToolHandler for WaEventsLabelTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db_path() -> Arc<PathBuf> {
+        Arc::new(PathBuf::from("/tmp/test-mcp.db"))
+    }
+
+    fn config() -> Arc<Config> {
+        Arc::new(Config::default())
+    }
+
+    /// Collect definitions for all 29 tools. Guarantees no panics during construction.
+    fn all_definitions() -> Vec<Tool> {
+        let db = db_path();
+        let cfg = config();
+        vec![
+            WaRulesListTool.definition(),
+            WaRulesTestTool.definition(),
+            WaCassSearchTool.definition(),
+            WaCassViewTool.definition(),
+            WaCassStatusTool.definition(),
+            WaStateTool::new(PaneFilterConfig::default()).definition(),
+            WaGetTextTool::new(Arc::clone(&cfg), Some(Arc::clone(&db))).definition(),
+            WaWaitForTool.definition(),
+            WaSearchTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
+            WaEventsTool::new(Arc::clone(&db)).definition(),
+            WaSendTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
+            WaWorkflowRunTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
+            WaTxPlanTool::new(Arc::clone(&cfg)).definition(),
+            WaTxShowTool::new(Arc::clone(&cfg)).definition(),
+            WaTxRunTool::new(Arc::clone(&cfg)).definition(),
+            WaTxRollbackTool::new(Arc::clone(&cfg)).definition(),
+            WaReservationsTool::new(Arc::clone(&db)).definition(),
+            WaReserveTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
+            WaReleaseTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
+            WaAccountsTool::new(Arc::clone(&db)).definition(),
+            WaAccountsRefreshTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
+            WaMissionStateTool::new(Arc::clone(&cfg)).definition(),
+            WaMissionExplainTool::new(Arc::clone(&cfg)).definition(),
+            WaMissionPauseTool::new(Arc::clone(&cfg)).definition(),
+            WaMissionResumeTool::new(Arc::clone(&cfg)).definition(),
+            WaMissionAbortTool::new(Arc::clone(&cfg)).definition(),
+            WaEventsAnnotateTool::new(Arc::clone(&db)).definition(),
+            WaEventsTriageTool::new(Arc::clone(&db)).definition(),
+            WaEventsLabelTool::new(Arc::clone(&db)).definition(),
+        ]
+    }
+
+    // ========================================================================
+    // Tool Count Invariant
+    // ========================================================================
+
+    #[test]
+    fn tool_count_is_29() {
+        assert_eq!(all_definitions().len(), 29);
+    }
+
+    // ========================================================================
+    // All Tool Names Are Unique
+    // ========================================================================
+
+    #[test]
+    fn all_tool_names_are_unique() {
+        let defs = all_definitions();
+        let mut seen = std::collections::HashSet::new();
+        for def in &defs {
+            assert!(seen.insert(&def.name), "Duplicate tool name: {}", def.name);
+        }
+    }
+
+    // ========================================================================
+    // All Tool Names Use wa. Prefix
+    // ========================================================================
+
+    #[test]
+    fn all_tool_names_use_wa_prefix() {
+        for def in all_definitions() {
+            assert!(
+                def.name.starts_with("wa."),
+                "Tool {} missing wa. prefix",
+                def.name
+            );
+        }
+    }
+
+    // ========================================================================
+    // All Tools Have Descriptions
+    // ========================================================================
+
+    #[test]
+    fn all_tools_have_descriptions() {
+        for def in all_definitions() {
+            assert!(
+                def.description.is_some(),
+                "Tool {} missing description",
+                def.name
+            );
+            assert!(
+                !def.description.as_ref().unwrap().is_empty(),
+                "Tool {} has empty description",
+                def.name
+            );
+        }
+    }
+
+    // ========================================================================
+    // All Input Schemas Are Objects
+    // ========================================================================
+
+    #[test]
+    fn all_input_schemas_are_objects() {
+        for def in all_definitions() {
+            let schema_type = def.input_schema.get("type").and_then(|v| v.as_str());
+            assert_eq!(
+                schema_type,
+                Some("object"),
+                "Tool {} input_schema type is {:?}, expected 'object'",
+                def.name,
+                schema_type
+            );
+        }
+    }
+
+    // ========================================================================
+    // All Tools Have Version
+    // ========================================================================
+
+    #[test]
+    fn all_tools_have_version() {
+        for def in all_definitions() {
+            assert!(
+                def.version.is_some(),
+                "Tool {} missing version",
+                def.name
+            );
+        }
+    }
+
+    // ========================================================================
+    // All Tools Have Tags
+    // ========================================================================
+
+    #[test]
+    fn all_tools_have_wa_tag() {
+        for def in all_definitions() {
+            assert!(
+                def.tags.contains(&"wa".to_string()),
+                "Tool {} missing 'wa' tag",
+                def.name
+            );
+        }
+    }
+
+    // ========================================================================
+    // Specific Tool Name Stability
+    // ========================================================================
+
+    #[test]
+    fn core_tool_names_stable() {
+        let expected = [
+            "wa.state",
+            "wa.get_text",
+            "wa.send",
+            "wa.wait_for",
+            "wa.search",
+            "wa.events",
+            "wa.rules_list",
+            "wa.rules_test",
+            "wa.reserve",
+            "wa.release",
+            "wa.reservations",
+            "wa.workflow_run",
+            "wa.accounts",
+        ];
+        let names: Vec<String> = all_definitions().iter().map(|d| d.name.clone()).collect();
+        for expected_name in &expected {
+            assert!(
+                names.contains(&expected_name.to_string()),
+                "Core tool '{}' not found in definitions",
+                expected_name
+            );
+        }
+    }
+
+    #[test]
+    fn mission_tool_names_stable() {
+        let expected = [
+            "wa.mission_state",
+            "wa.mission_explain",
+            "wa.mission_pause",
+            "wa.mission_resume",
+            "wa.mission_abort",
+        ];
+        let names: Vec<String> = all_definitions().iter().map(|d| d.name.clone()).collect();
+        for expected_name in &expected {
+            assert!(
+                names.contains(&expected_name.to_string()),
+                "Mission tool '{}' not found in definitions",
+                expected_name
+            );
+        }
+    }
+
+    #[test]
+    fn tx_tool_names_stable() {
+        let expected = [
+            "wa.tx_plan",
+            "wa.tx_show",
+            "wa.tx_run",
+            "wa.tx_rollback",
+        ];
+        let names: Vec<String> = all_definitions().iter().map(|d| d.name.clone()).collect();
+        for expected_name in &expected {
+            assert!(
+                names.contains(&expected_name.to_string()),
+                "Tx tool '{}' not found in definitions",
+                expected_name
+            );
+        }
+    }
+
+    #[test]
+    fn cass_tool_names_stable() {
+        let expected = ["wa.cass_search", "wa.cass_view", "wa.cass_status"];
+        let names: Vec<String> = all_definitions().iter().map(|d| d.name.clone()).collect();
+        for expected_name in &expected {
+            assert!(
+                names.contains(&expected_name.to_string()),
+                "Cass tool '{}' not found in definitions",
+                expected_name
+            );
+        }
+    }
+
+    #[test]
+    fn annotation_tool_names_stable() {
+        let expected = [
+            "wa.events_annotate",
+            "wa.events_triage",
+            "wa.events_label",
+        ];
+        let names: Vec<String> = all_definitions().iter().map(|d| d.name.clone()).collect();
+        for expected_name in &expected {
+            assert!(
+                names.contains(&expected_name.to_string()),
+                "Annotation tool '{}' not found in definitions",
+                expected_name
+            );
+        }
+    }
+
+    // ========================================================================
+    // Key Parameter Schema Checks
+    // ========================================================================
+
+    #[test]
+    fn state_tool_schema_has_domain_and_pane_id() {
+        let def = WaStateTool::new(PaneFilterConfig::default()).definition();
+        let props = def.input_schema.get("properties").unwrap();
+        assert!(props.get("domain").is_some(), "wa.state missing 'domain' param");
+        assert!(props.get("pane_id").is_some(), "wa.state missing 'pane_id' param");
+    }
+
+    #[test]
+    fn get_text_tool_requires_pane_id() {
+        let def = WaGetTextTool::new(config(), Some(db_path())).definition();
+        let required = def
+            .input_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("wa.get_text should have required fields");
+        let has_pane_id = required.iter().any(|v| v.as_str() == Some("pane_id"));
+        assert!(has_pane_id, "wa.get_text should require pane_id");
+    }
+
+    #[test]
+    fn send_tool_requires_pane_id_and_text() {
+        let def = WaSendTool::new(config(), db_path()).definition();
+        let required = def
+            .input_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("wa.send should have required fields");
+        let names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(names.contains(&"pane_id"), "wa.send should require pane_id");
+        assert!(names.contains(&"text"), "wa.send should require text");
+    }
+
+    #[test]
+    fn search_tool_requires_query() {
+        let def = WaSearchTool::new(config(), db_path()).definition();
+        let required = def
+            .input_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("wa.search should have required fields");
+        let has_query = required.iter().any(|v| v.as_str() == Some("query"));
+        assert!(has_query, "wa.search should require query");
+    }
+
+    #[test]
+    fn reserve_tool_requires_pane_id() {
+        let def = WaReserveTool::new(config(), db_path()).definition();
+        let required = def
+            .input_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("wa.reserve should have required fields");
+        let has_pane_id = required.iter().any(|v| v.as_str() == Some("pane_id"));
+        assert!(has_pane_id, "wa.reserve should require pane_id");
+    }
+}
