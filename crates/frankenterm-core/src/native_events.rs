@@ -19,7 +19,7 @@ use crate::runtime_compat::mpsc;
 use crate::runtime_compat::task::JoinSet;
 use crate::runtime_compat::unix::{self as compat_unix, UnixListener, UnixStream};
 use base64::Engine as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
@@ -84,26 +84,30 @@ pub enum NativeEventError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(Debug, Deserialize)]
-struct WirePaneState {
+/// Pane state snapshot sent over the native event wire protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WirePaneState {
     #[serde(default)]
-    title: String,
+    pub title: String,
     #[serde(default)]
-    rows: u16,
+    pub rows: u16,
     #[serde(default)]
-    cols: u16,
+    pub cols: u16,
     #[serde(default)]
-    is_alt_screen: bool,
+    pub is_alt_screen: bool,
     #[serde(default)]
-    cursor_row: u32,
+    pub cursor_row: u32,
     #[serde(default)]
-    cursor_col: u32,
+    pub cursor_col: u32,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+/// Wire-protocol event type for the native event bridge.
+///
+/// Emitted by frankenterm-gui and consumed by `NativeEventListener`.
+/// Serialized as newline-delimited JSON with `{"type":"variant_name",...}` format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum WireEvent {
+pub enum WireEvent {
     Hello {
         #[serde(default)]
         proto: Option<u32>,

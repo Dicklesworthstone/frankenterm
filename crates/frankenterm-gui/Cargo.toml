@@ -63,6 +63,7 @@ frankenterm-mux-server-impl.workspace = true
 
 # Standard dependencies
 anyhow.workspace = true
+base64.workspace = true
 bitflags.workspace = true
 bytemuck.workspace = true
 chrono.workspace = true

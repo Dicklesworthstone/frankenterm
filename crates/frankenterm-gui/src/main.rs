@@ -39,6 +39,7 @@ use frankenterm_mux_server_impl::update_mux_domains;
 use wezterm_toast_notification::*;
 
 mod colorease;
+mod native_bridge;
 mod commands;
 mod customglyph;
 mod download;
@@ -810,6 +811,27 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         default_domain_name.as_deref(),
         opts.workspace.as_deref(),
     )?;
+
+    // Start the native event bridge if configured.
+    // This subscribes to mux events and pushes them to the ft watch daemon
+    // over a Unix domain socket for real-time event processing.
+    let _native_bridge = {
+        let ft_config = frankenterm_core::config::Config::load().unwrap_or_default();
+        if ft_config.native.enabled {
+            let socket_path = PathBuf::from(&ft_config.native.socket_path);
+            native_bridge::NativeEventBridge::start(&socket_path)
+        } else {
+            // Even if not explicitly enabled, try the default socket path
+            // so it "just works" when ft watch is running.
+            let default_path = PathBuf::from("/tmp/wa/events.sock");
+            if default_path.exists() {
+                log::info!("Native event socket found at default path, enabling bridge");
+                native_bridge::NativeEventBridge::start(&default_path)
+            } else {
+                None
+            }
+        }
+    };
 
     // First, let's see if we can ask an already running wezterm to do this.
     // We must do this before we start the gui frontend as the scheduler
