@@ -977,13 +977,13 @@ fn compensation_outcome_target_states() {
 // concurrent execution. Since the tx types are pure (no shared mutable state),
 // the key invariant is: parallel calls on the same inputs yield identical outputs.
 
-#[tokio::test]
-async fn concurrent_commit_determinism() {
+#[test]
+fn concurrent_commit_determinism() {
     // Run 10 parallel commit phases on identical contracts — all must produce
     // identical reports.
     let handles: Vec<_> = (0..10)
         .map(|_| {
-            tokio::spawn(async move {
+            std::thread::spawn(move || {
                 let contract = build_contract(5, MissionTxState::Prepared);
                 let inputs = success_commit_inputs(5);
                 execute_commit_phase(
@@ -998,10 +998,9 @@ async fn concurrent_commit_determinism() {
         })
         .collect();
 
-    let results: Vec<_> = futures::future::join_all(handles)
-        .await
+    let results: Vec<_> = handles
         .into_iter()
-        .map(|r| r.unwrap())
+        .map(|handle| handle.join().expect("commit thread should not panic"))
         .collect();
 
     let reference = &results[0];
@@ -1026,8 +1025,8 @@ async fn concurrent_commit_determinism() {
     }
 }
 
-#[tokio::test]
-async fn concurrent_compensation_determinism() {
+#[test]
+fn concurrent_compensation_determinism() {
     // Build a commit report, then run 10 parallel compensation phases.
     let contract = build_contract(5, MissionTxState::Prepared);
     let commit_inputs = partial_commit_inputs(5, 3);
@@ -1043,7 +1042,7 @@ async fn concurrent_compensation_determinism() {
     let handles: Vec<_> = (0..10)
         .map(|_| {
             let cr = commit_report.clone();
-            tokio::spawn(async move {
+            std::thread::spawn(move || {
                 let comp_contract = build_contract(5, MissionTxState::Compensating);
                 let comp_inputs = success_comp_inputs(5);
                 execute_compensation_phase(&comp_contract, &cr, &comp_inputs, 20_000).unwrap()
@@ -1051,10 +1050,9 @@ async fn concurrent_compensation_determinism() {
         })
         .collect();
 
-    let results: Vec<_> = futures::future::join_all(handles)
-        .await
+    let results: Vec<_> = handles
         .into_iter()
-        .map(|r| r.unwrap())
+        .map(|handle| handle.join().expect("compensation thread should not panic"))
         .collect();
 
     let reference = &results[0];
@@ -1070,8 +1068,8 @@ async fn concurrent_compensation_determinism() {
     }
 }
 
-#[tokio::test]
-async fn concurrent_idempotency_checks_consistent() {
+#[test]
+fn concurrent_idempotency_checks_consistent() {
     // Run 20 parallel idempotency checks on the same contract/record pair.
     let contract = build_contract(5, MissionTxState::Prepared);
     let record = build_execution_record(&contract, MissionTxState::Committed, Some("h1"), None);
@@ -1080,14 +1078,13 @@ async fn concurrent_idempotency_checks_consistent() {
         .map(|_| {
             let c = contract.clone();
             let r = record.clone();
-            tokio::spawn(async move { validate_tx_idempotency(&c, TxPhase::Commit, Some(&r)) })
+            std::thread::spawn(move || validate_tx_idempotency(&c, TxPhase::Commit, Some(&r)))
         })
         .collect();
 
-    let results: Vec<_> = futures::future::join_all(handles)
-        .await
+    let results: Vec<_> = handles
         .into_iter()
-        .map(|r| r.unwrap())
+        .map(|handle| handle.join().expect("idempotency thread should not panic"))
         .collect();
 
     // All must agree: double-commit blocked
@@ -1104,8 +1101,8 @@ async fn concurrent_idempotency_checks_consistent() {
     }
 }
 
-#[tokio::test]
-async fn concurrent_resume_reconstruction_determinism() {
+#[test]
+fn concurrent_resume_reconstruction_determinism() {
     // Build a commit report, then reconstruct resume state from 10 parallel tasks.
     let contract = build_contract(7, MissionTxState::Prepared);
     let inputs = partial_commit_inputs(7, 4);
@@ -1122,14 +1119,17 @@ async fn concurrent_resume_reconstruction_determinism() {
         .map(|_| {
             let c = contract.clone();
             let cr = commit_report.clone();
-            tokio::spawn(async move { reconstruct_tx_resume_state(&c, Some(&cr), None, 15_000) })
+            std::thread::spawn(move || reconstruct_tx_resume_state(&c, Some(&cr), None, 15_000))
         })
         .collect();
 
-    let results: Vec<_> = futures::future::join_all(handles)
-        .await
+    let results: Vec<_> = handles
         .into_iter()
-        .map(|r| r.unwrap())
+        .map(|handle| {
+            handle
+                .join()
+                .expect("resume reconstruction thread should not panic")
+        })
         .collect();
 
     let reference = &results[0];
@@ -1149,22 +1149,21 @@ async fn concurrent_resume_reconstruction_determinism() {
     }
 }
 
-#[tokio::test]
-async fn concurrent_tx_key_computation_determinism() {
+#[test]
+fn concurrent_tx_key_computation_determinism() {
     // Compute tx idempotency keys from 50 parallel tasks.
     let contract = build_contract(10, MissionTxState::Prepared);
 
     let handles: Vec<_> = (0..50)
         .map(|_| {
             let c = contract.clone();
-            tokio::spawn(async move { TxExecutionRecord::compute_tx_key(&c) })
+            std::thread::spawn(move || TxExecutionRecord::compute_tx_key(&c))
         })
         .collect();
 
-    let results: Vec<_> = futures::future::join_all(handles)
-        .await
+    let results: Vec<_> = handles
         .into_iter()
-        .map(|r| r.unwrap())
+        .map(|handle| handle.join().expect("tx key thread should not panic"))
         .collect();
 
     let reference = &results[0];
@@ -1173,13 +1172,13 @@ async fn concurrent_tx_key_computation_determinism() {
     }
 }
 
-#[tokio::test]
-async fn concurrent_mixed_tx_non_interference() {
+#[test]
+fn concurrent_mixed_tx_non_interference() {
     // Run commits on 10 different tx contracts in parallel — each should
     // produce results independent of the others.
     let handles: Vec<_> = (1..=10)
         .map(|n| {
-            tokio::spawn(async move {
+            std::thread::spawn(move || {
                 let contract = build_contract(n, MissionTxState::Prepared);
                 let inputs = success_commit_inputs(n);
                 let report = execute_commit_phase(
@@ -1195,10 +1194,13 @@ async fn concurrent_mixed_tx_non_interference() {
         })
         .collect();
 
-    let results: Vec<_> = futures::future::join_all(handles)
-        .await
+    let results: Vec<_> = handles
         .into_iter()
-        .map(|r| r.unwrap())
+        .map(|handle| {
+            handle
+                .join()
+                .expect("mixed tx non-interference thread should not panic")
+        })
         .collect();
 
     for (n, report) in &results {
