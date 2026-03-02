@@ -211,11 +211,7 @@ impl MuxPool {
         let (conn, guard) = result.into_parts();
         let client = match conn {
             Some(c) => c,
-            None => match cx::with_cx_async(cx, |_| async {
-                DirectMuxClient::connect(self.mux_config.clone()).await
-            })
-            .await
-            {
+            None => match DirectMuxClient::connect_with_cx(cx, self.mux_config.clone()).await {
                 Ok(client) => {
                     self.connections_created.fetch_add(1, Ordering::Relaxed);
                     client
@@ -439,8 +435,10 @@ impl MuxPool {
     /// List all panes via a pooled connection using explicit `Cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn list_panes_with_cx(&self, cx: &Cx) -> Result<ListPanesResponse, MuxPoolError> {
-        self.execute_with_recovery_with_cx(cx, "list_panes", |client| Box::pin(client.list_panes()))
-            .await
+        self.execute_with_recovery_with_cx(cx, "list_panes", |client| {
+            Box::pin(client.list_panes_with_cx(cx))
+        })
+        .await
     }
 
     /// Get lines from a pane via a pooled connection.
@@ -466,7 +464,7 @@ impl MuxPool {
     ) -> Result<GetLinesResponse, MuxPoolError> {
         self.execute_with_recovery_with_cx(cx, "get_lines", move |client| {
             let lines = lines.clone();
-            Box::pin(client.get_lines(pane_id, lines))
+            Box::pin(client.get_lines_with_cx(cx, pane_id, lines))
         })
         .await
     }
@@ -490,7 +488,7 @@ impl MuxPool {
         pane_id: u64,
     ) -> Result<GetPaneRenderChangesResponse, MuxPoolError> {
         self.execute_with_recovery_with_cx(cx, "get_pane_render_changes", |client| {
-            Box::pin(client.get_pane_render_changes(pane_id))
+            Box::pin(client.get_pane_render_changes_with_cx(cx, pane_id))
         })
         .await
     }
@@ -564,7 +562,10 @@ impl MuxPool {
             .execute_with_recovery_with_cx(cx, "get_pane_render_changes_batch", move |client| {
                 let pane_ids = pane_ids_for_pipeline.clone();
                 Box::pin(async move {
-                    Box::pin(client.get_pane_render_changes_batch(&pane_ids, depth, timeout)).await
+                    Box::pin(
+                        client.get_pane_render_changes_batch_with_cx(cx, &pane_ids, depth, timeout),
+                    )
+                    .await
                 })
             })
             .await;
@@ -587,8 +588,12 @@ impl MuxPool {
                     move |client| {
                         let pane_ids = pane_ids.clone();
                         Box::pin(async move {
-                            Box::pin(client.get_pane_render_changes_batch(&pane_ids, 1, timeout))
-                                .await
+                            Box::pin(
+                                client.get_pane_render_changes_batch_with_cx(
+                                    cx, &pane_ids, 1, timeout,
+                                ),
+                            )
+                            .await
                         })
                     },
                 )
@@ -620,7 +625,7 @@ impl MuxPool {
     ) -> Result<UnitResponse, MuxPoolError> {
         self.execute_with_recovery_with_cx(cx, "write_to_pane", move |client| {
             let data = data.clone();
-            Box::pin(client.write_to_pane(pane_id, data))
+            Box::pin(client.write_to_pane_with_cx(cx, pane_id, data))
         })
         .await
     }
@@ -648,7 +653,7 @@ impl MuxPool {
     ) -> Result<UnitResponse, MuxPoolError> {
         self.execute_with_recovery_with_cx(cx, "send_paste", move |client| {
             let data = data.clone();
-            Box::pin(client.send_paste(pane_id, data))
+            Box::pin(client.send_paste_with_cx(cx, pane_id, data))
         })
         .await
     }
