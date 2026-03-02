@@ -1,0 +1,39 @@
+name: configs-ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - HB_DISABLE_DEPRECATED
+          - HB_MINI
+          - HB_LEAN
+          - HB_TINY
+          - HB_NO_DRAW
+          - HB_NO_PAINT
+
+    name: ${{ matrix.config }}
+
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+    - name: Create main.cc
+      run: |
+        cat <<EOF > main.cc
+        #include "src/harfbuzz.cc"
+        int main() { return 0; }
+        EOF
+    - name: install dependencies
+      run: sudo apt-get install gcc
+    - name: Build with ${{ matrix.config }}
+      run: g++ -std=c++11 main.cc -D${{ matrix.config }}
