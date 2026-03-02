@@ -1,6 +1,6 @@
 # Controlled Beta Feedback Loop (`ft-1u90p.8.7`)
 
-Date: 2026-02-25  
+Date: 2026-03-02  
 Status: In progress (unblocked; instrumentation + checkpoint artifacts active; e2e validation harness active)  
 Depends on: `ft-1u90p.8.1`, `ft-1u90p.8.2`, `ft-1u90p.8.3`, `ft-1u90p.7.5`, `docs/resize-performance-slos.md`  
 Related closure: `ft-1u90p.7.7` (closed 2026-02-22)
@@ -122,12 +122,12 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
 - `tests/e2e/test_ft_1u90p_8_7.sh`
 - `tests/e2e/logs/ft_1u90p_8_7_<RUN_ID>.jsonl`
 
-### Current Checkpoint (2026-02-25)
+### Current Checkpoint (2026-03-02)
 
 - Decision: `HOLD`
 - Basis:
   - instrumentation path verified using deterministic fixture-only alt-screen conformance run
-  - e2e evidence guardrail harness validates baseline/negative/recovery decision paths
+  - e2e evidence guardrail harness revalidated on 2026-03-02 (baseline/negative/recovery)
   - sample sufficiency thresholds for promotion are not yet met
   - real-user feedback ingestion has not started
 - Evidence:
@@ -137,8 +137,9 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
   - `evidence/wa-1u90p.8.7/cohort_daily_summary.json`
   - `evidence/wa-1u90p.8.7/decision_checkpoint_20260222.md`
   - `evidence/wa-1u90p.8.7/decision_checkpoint_20260225.md`
+  - `evidence/wa-1u90p.8.7/decision_checkpoint_20260302.md`
   - `tests/e2e/test_ft_1u90p_8_7.sh`
-  - `tests/e2e/logs/ft_1u90p_8_7_<RUN_ID>.jsonl`
+  - `tests/e2e/logs/ft_1u90p_8_7_20260302_135523.jsonl`
 
 ## Decision Rubric (Promotion / Hold / Rollback)
 
