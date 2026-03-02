@@ -113,3 +113,230 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
         _ => (MCP_ERR_NOT_IMPLEMENTED, None),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // Error Code Constants
+    // ========================================================================
+
+    #[test]
+    fn error_codes_are_unique() {
+        let codes = [
+            MCP_ERR_INVALID_ARGS,
+            MCP_ERR_CONFIG,
+            MCP_ERR_WEZTERM,
+            MCP_ERR_STORAGE,
+            MCP_ERR_POLICY,
+            MCP_ERR_PANE_NOT_FOUND,
+            MCP_ERR_WORKFLOW,
+            MCP_ERR_TIMEOUT,
+            MCP_ERR_NOT_IMPLEMENTED,
+            MCP_ERR_FTS_QUERY,
+            MCP_ERR_RESERVATION_CONFLICT,
+            MCP_ERR_CAUT,
+            MCP_ERR_CASS,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for code in codes {
+            assert!(
+                seen.insert(code),
+                "Duplicate error code: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_codes_have_ft_mcp_prefix() {
+        let codes = [
+            MCP_ERR_INVALID_ARGS,
+            MCP_ERR_CONFIG,
+            MCP_ERR_WEZTERM,
+            MCP_ERR_STORAGE,
+            MCP_ERR_POLICY,
+            MCP_ERR_PANE_NOT_FOUND,
+            MCP_ERR_WORKFLOW,
+            MCP_ERR_TIMEOUT,
+            MCP_ERR_NOT_IMPLEMENTED,
+            MCP_ERR_FTS_QUERY,
+            MCP_ERR_RESERVATION_CONFLICT,
+            MCP_ERR_CAUT,
+            MCP_ERR_CASS,
+        ];
+        for code in codes {
+            assert!(code.starts_with("FT-MCP-"), "Code {code} missing FT-MCP- prefix");
+        }
+    }
+
+    // ========================================================================
+    // McpToolError Construction
+    // ========================================================================
+
+    #[test]
+    fn mcp_tool_error_new() {
+        let err = McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            "bad args".to_string(),
+            Some("fix it".to_string()),
+        );
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert_eq!(err.message, "bad args");
+        assert_eq!(err.hint.as_deref(), Some("fix it"));
+    }
+
+    #[test]
+    fn mcp_tool_error_new_no_hint() {
+        let err = McpToolError::new(MCP_ERR_STORAGE, "db error".to_string(), None);
+        assert_eq!(err.code, MCP_ERR_STORAGE);
+        assert!(err.hint.is_none());
+    }
+
+    #[test]
+    fn mcp_tool_error_from_error_wezterm_not_running() {
+        let err = Error::Wezterm(WeztermError::NotRunning);
+        let mcp_err = McpToolError::from_error(err);
+        assert_eq!(mcp_err.code, MCP_ERR_WEZTERM);
+        assert!(mcp_err.hint.is_some());
+    }
+
+    #[test]
+    fn mcp_tool_error_from_error_pane_not_found() {
+        let err = Error::Wezterm(WeztermError::PaneNotFound(42));
+        let mcp_err = McpToolError::from_error(err);
+        assert_eq!(mcp_err.code, MCP_ERR_PANE_NOT_FOUND);
+        assert!(mcp_err.hint.is_some());
+    }
+
+    // ========================================================================
+    // map_mcp_error Tests
+    // ========================================================================
+
+    #[test]
+    fn map_error_pane_not_found() {
+        let err = Error::Wezterm(WeztermError::PaneNotFound(99));
+        let (code, hint) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_PANE_NOT_FOUND);
+        assert!(hint.unwrap().contains("wa.state"));
+    }
+
+    #[test]
+    fn map_error_timeout() {
+        let err = Error::Wezterm(WeztermError::Timeout(5000));
+        let (code, hint) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_TIMEOUT);
+        assert!(hint.is_some());
+    }
+
+    #[test]
+    fn map_error_not_running() {
+        let err = Error::Wezterm(WeztermError::NotRunning);
+        let (code, hint) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_WEZTERM);
+        assert!(hint.unwrap().contains("running"));
+    }
+
+    #[test]
+    fn map_error_cli_not_found() {
+        let err = Error::Wezterm(WeztermError::CliNotFound);
+        let (code, hint) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_WEZTERM);
+        assert!(hint.unwrap().contains("PATH"));
+    }
+
+    #[test]
+    fn map_error_config() {
+        let err = Error::Config(crate::error::ConfigError::FileNotFound("test.toml".to_string()));
+        let (code, _) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_CONFIG);
+    }
+
+    #[test]
+    fn map_error_storage() {
+        let err = Error::Storage(crate::error::StorageError::Database("db error".to_string()));
+        let (code, _) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_STORAGE);
+    }
+
+    #[test]
+    fn map_error_workflow() {
+        let err = Error::Workflow(crate::error::WorkflowError::Aborted("step failed".to_string()));
+        let (code, _) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_WORKFLOW);
+    }
+
+    #[test]
+    fn map_error_policy() {
+        let err = Error::Policy("denied".to_string());
+        let (code, _) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_POLICY);
+    }
+
+    #[test]
+    fn map_error_runtime_falls_through() {
+        let err = Error::Runtime("unexpected".to_string());
+        let (code, _) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_NOT_IMPLEMENTED);
+    }
+
+    // ========================================================================
+    // map_caut_error Tests
+    // ========================================================================
+
+    #[test]
+    fn map_caut_not_installed() {
+        let err = CautError::NotInstalled;
+        let (code, hint) = map_caut_error(&err);
+        assert_eq!(code, MCP_ERR_CONFIG);
+        assert!(hint.unwrap().contains("caut"));
+    }
+
+    #[test]
+    fn map_caut_timeout() {
+        let err = CautError::Timeout { timeout_secs: 5 };
+        let (code, hint) = map_caut_error(&err);
+        assert_eq!(code, MCP_ERR_TIMEOUT);
+        assert!(hint.is_some());
+    }
+
+    #[test]
+    fn map_caut_other_error_uses_remediation() {
+        let err = CautError::Io {
+            message: "connection refused".to_string(),
+        };
+        let (code, hint) = map_caut_error(&err);
+        assert_eq!(code, MCP_ERR_CAUT);
+        assert!(hint.is_some());
+    }
+
+    // ========================================================================
+    // map_cass_error Tests
+    // ========================================================================
+
+    #[test]
+    fn map_cass_not_installed() {
+        let err = CassError::NotInstalled;
+        let (code, hint) = map_cass_error(&err);
+        assert_eq!(code, MCP_ERR_CONFIG);
+        assert!(hint.unwrap().contains("cass"));
+    }
+
+    #[test]
+    fn map_cass_timeout() {
+        let err = CassError::Timeout { timeout_secs: 5 };
+        let (code, hint) = map_cass_error(&err);
+        assert_eq!(code, MCP_ERR_TIMEOUT);
+        assert!(hint.is_some());
+    }
+
+    #[test]
+    fn map_cass_other_error_uses_remediation() {
+        let err = CassError::Io {
+            message: "pipe broken".to_string(),
+        };
+        let (code, hint) = map_cass_error(&err);
+        assert_eq!(code, MCP_ERR_CASS);
+        assert!(hint.is_some());
+    }
+}
