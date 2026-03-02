@@ -18,7 +18,7 @@
 //!   batched inference for 10x+ throughput versus sequential calls.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::embedder::{EmbedError, Embedder, EmbedderInfo, EmbedderTier};
 
@@ -105,8 +105,8 @@ fn model_display_name(model: &EmbeddingModel) -> String {
 /// Wraps `fastembed::TextEmbedding` for ONNX-accelerated inference.
 /// Thread-safe (`Send + Sync`) via `Arc`.
 pub struct FastEmbedEmbedder {
-    /// The underlying fastembed model (Arc for cheap clone + Send+Sync).
-    inner: Arc<fastembed::TextEmbedding>,
+    /// The underlying fastembed model (Arc<Mutex<..>> because `embed()` requires `&mut self`).
+    inner: Arc<Mutex<fastembed::TextEmbedding>>,
     /// Model identifier for diagnostics.
     model_name: String,
     /// Output embedding dimension.
@@ -160,7 +160,7 @@ impl FastEmbedEmbedder {
         })?;
 
         Ok(Self {
-            inner: Arc::new(text_embedding),
+            inner: Arc::new(Mutex::new(text_embedding)),
             model_name,
             dimension,
             config,
@@ -188,7 +188,7 @@ impl FastEmbedEmbedder {
                 // We need a valid inner, so we'll panic-path here.
                 // Since `new()` is the legacy API, callers should migrate to try_new().
                 Self {
-                    inner: Arc::new(stub_text_embedding()),
+                    inner: Arc::new(Mutex::new(stub_text_embedding())),
                     model_name: model_name_str,
                     dimension,
                     config,
@@ -251,6 +251,8 @@ impl Embedder for FastEmbedEmbedder {
 
         let results = self
             .inner
+            .lock()
+            .map_err(|e| EmbedError::InferenceFailed(format!("fastembed lock poisoned: {}", e)))?
             .embed(vec![text], None)
             .map_err(|e| EmbedError::InferenceFailed(format!("fastembed embed failed: {}", e)))?;
 
@@ -285,6 +287,8 @@ impl Embedder for FastEmbedEmbedder {
         let texts_vec: Vec<&str> = texts.to_vec();
         let results = self
             .inner
+            .lock()
+            .map_err(|e| EmbedError::InferenceFailed(format!("fastembed lock poisoned: {}", e)))?
             .embed(texts_vec, None)
             .map_err(|e| EmbedError::InferenceFailed(format!("fastembed batch failed: {}", e)))?;
 

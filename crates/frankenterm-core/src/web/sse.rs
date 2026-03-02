@@ -157,19 +157,55 @@ where
     }
 }
 
-struct TokioSseStream {
-    rx: mpsc::Receiver<SseEvent>,
+/// Returns a future that completes when the receiver side of the channel is
+/// dropped (i.e. the client disconnected). This bridges the tokio
+/// `Sender::closed()` API for runtimes that only expose `is_closed()`.
+async fn sender_closed<T>(tx: &mpsc::Sender<T>) {
+    // Poll periodically rather than truly registering a waker, since
+    // asupersync `Sender::is_closed` is a simple atomic load.
+    loop {
+        if tx.is_closed() {
+            return;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
-impl TokioSseStream {
+struct SseByteStream {
+    rx: mpsc::Receiver<SseEvent>,
+    #[cfg(feature = "asupersync-runtime")]
+    cx: asupersync::Cx,
+}
+
+impl SseByteStream {
+    #[cfg(feature = "asupersync-runtime")]
+    fn new(rx: mpsc::Receiver<SseEvent>) -> Self {
+        Self {
+            rx,
+            cx: asupersync::Cx::for_testing(),
+        }
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
     fn new(rx: mpsc::Receiver<SseEvent>) -> Self {
         Self { rx }
     }
 }
 
-impl Stream for TokioSseStream {
+impl Stream for SseByteStream {
     type Item = Vec<u8>;
 
+    #[cfg(feature = "asupersync-runtime")]
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.rx.poll_recv(&this.cx, cx) {
+            Poll::Ready(Ok(event)) => Poll::Ready(Some(event.to_bytes())),
+            Poll::Ready(Err(_)) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(event)) => Poll::Ready(Some(event.to_bytes())),
@@ -223,7 +259,7 @@ async fn send_rate_limited_sse(
     }
     *next_emit_at = Instant::now() + min_interval;
 
-    match tx.try_send(event) {
+    match tx.try_send(event).map_err(mpsc::TrySendError::from) {
         Ok(()) => {
             *consecutive_drops = 0;
             true
@@ -388,7 +424,7 @@ pub(super) fn handle_stream_events(
 
             loop {
                 let recv_result = select! {
-                    () = tx.closed() => break,
+                    () = sender_closed(&tx) => break,
                     recv = timeout(
                         Duration::from_secs(STREAM_KEEPALIVE_SECS),
                         subscriber.recv(),
@@ -461,7 +497,7 @@ pub(super) fn handle_stream_events(
             }
         });
 
-        SseResponse::new(TokioSseStream::new(rx)).into_response()
+        SseResponse::new(SseByteStream::new(rx)).into_response()
     })
 }
 
@@ -516,7 +552,7 @@ pub(super) fn handle_stream_deltas(
 
             loop {
                 let recv_result = select! {
-                    () = tx.closed() => break,
+                    () = sender_closed(&tx) => break,
                     recv = timeout(
                         Duration::from_secs(STREAM_KEEPALIVE_SECS),
                         subscriber.recv(),
@@ -622,7 +658,7 @@ pub(super) fn handle_stream_deltas(
             }
         });
 
-        SseResponse::new(TokioSseStream::new(rx)).into_response()
+        SseResponse::new(SseByteStream::new(rx)).into_response()
     })
 }
 
