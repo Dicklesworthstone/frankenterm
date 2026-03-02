@@ -74,7 +74,7 @@ pub async fn read_setting(namespace: &str, key: &str) -> anyhow::Result<OwnedVal
     proxy
         .Read(namespace, key)
         .or(async {
-            async_io::Timer::after(std::time::Duration::from_secs(1)).await;
+            promise::spawn::sleep(std::time::Duration::from_secs(1)).await;
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "Timed out reading from xdg-portal; this indicates a problem \

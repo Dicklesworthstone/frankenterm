@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_executor::Executor;
-use flume::{bounded, unbounded, Receiver, TryRecvError};
+use flume::{Receiver, TryRecvError, bounded, unbounded};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -186,6 +186,13 @@ where
         async_task::spawn_local(future, |runnable| schedule_runnable(runnable, false));
     runnable.schedule();
     task
+}
+
+/// Sleep for the specified duration.
+///
+/// This helper centralizes timer usage so call-sites can remain runtime-agnostic.
+pub async fn sleep(duration: std::time::Duration) {
+    async_io::Timer::after(duration).await;
 }
 
 /// Block the current thread until the passed future completes.

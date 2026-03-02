@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
-use async_io::Timer;
 use async_trait::async_trait;
 use config::ConfigHandle;
 use promise::{Future, Promise};
@@ -28,20 +27,20 @@ use smithay_client_toolkit::reexports::csd_frame::{
 };
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
 use smithay_client_toolkit::seat::pointer::CursorIcon;
+use smithay_client_toolkit::shell::WaylandSurface;
+use smithay_client_toolkit::shell::xdg::XdgSurface;
 use smithay_client_toolkit::shell::xdg::fallback_frame::FallbackFrame;
 use smithay_client_toolkit::shell::xdg::window::{
     DecorationMode, Window as XdgWindow, WindowConfigure, WindowDecorations as Decorations,
     WindowHandler,
 };
-use smithay_client_toolkit::shell::xdg::XdgSurface;
-use smithay_client_toolkit::shell::WaylandSurface;
 use wayland_client::protocol::wl_callback::WlCallback;
 use wayland_client::protocol::wl_keyboard::{Event as WlKeyboardEvent, KeyState};
 use wayland_client::protocol::wl_pointer::{ButtonState, WlPointer};
 use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection as WConnection, Dispatch, Proxy, QueueHandle};
-use wayland_egl::{is_available as egl_is_available, WlEglSurface};
+use wayland_egl::{WlEglSurface, is_available as egl_is_available};
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
 use wezterm_font::FontConfiguration;
@@ -113,7 +112,7 @@ impl KeyRepeatState {
             }
 
             let mut initial = true;
-            Timer::after(delay).await;
+            promise::spawn::sleep(delay).await;
             loop {
                 {
                     let handle = {
@@ -168,7 +167,7 @@ impl KeyRepeatState {
                     st.when = Instant::now();
                 }
 
-                Timer::after(gap).await;
+                promise::spawn::sleep(gap).await;
             }
         })
         .detach();

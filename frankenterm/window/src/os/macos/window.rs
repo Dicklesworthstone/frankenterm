@@ -44,14 +44,14 @@ use raw_window_handle::{
 };
 use std::any::Any;
 use std::cell::RefCell;
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::time::Instant;
 use wezterm_font::FontConfiguration;
-use wezterm_input_types::{is_ascii_control, IntegratedTitleButtonStyle, KeyboardLedStatus};
+use wezterm_input_types::{IntegratedTitleButtonStyle, KeyboardLedStatus, is_ascii_control};
 
 #[allow(non_upper_case_globals)]
 const NSViewLayerContentsPlacementTopLeft: NSInteger = 11;
@@ -1954,11 +1954,7 @@ impl WindowView {
     extern "C" fn has_marked_text(this: &mut Object, _sel: Sel) -> BOOL {
         if let Some(myself) = Self::get_this(this) {
             let inner = myself.inner.borrow();
-            if inner.ime_text.is_empty() {
-                NO
-            } else {
-                YES
-            }
+            if inner.ime_text.is_empty() { NO } else { YES }
         } else {
             NO
         }
@@ -3070,7 +3066,7 @@ impl WindowView {
                 let window_id = inner.window_id;
                 let max_fps = inner.config.max_fps;
                 promise::spawn::spawn(async move {
-                    async_io::Timer::after(std::time::Duration::from_millis(1000 / max_fps as u64))
+                    promise::spawn::sleep(std::time::Duration::from_millis(1000 / max_fps as u64))
                         .await;
                     Connection::with_window_inner(window_id, move |inner| {
                         if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {

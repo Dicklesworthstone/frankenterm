@@ -1,14 +1,14 @@
 use super::*;
 use crate::bitmaps::*;
 use crate::connection::ConnectionOps;
-use crate::os::{xkeysyms, Connection, Window};
+use crate::os::{Connection, Window, xkeysyms};
 use crate::{
     Appearance, Clipboard, DeadKeyStatus, Dimensions, MouseButtons, MouseCursor, MouseEvent,
     MouseEventKind, MousePress, Point, Rect, RequestedWindowGeometry, ResizeIncrement,
     ResolvedGeometry, ScreenPoint, ScreenRect, WindowDecorations, WindowEvent, WindowEventSender,
     WindowOps, WindowState,
 };
-use anyhow::{anyhow, Context as _};
+use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use config::ConfigHandle;
 use promise::{Future, Promise};
@@ -397,7 +397,7 @@ impl XWindowInner {
                 let window_id = self.window_id;
                 let max_fps = self.config.max_fps;
                 promise::spawn::spawn(async move {
-                    async_io::Timer::after(std::time::Duration::from_millis(1000 / max_fps as u64))
+                    promise::spawn::sleep(std::time::Duration::from_millis(1000 / max_fps as u64))
                         .await;
                     XConnection::with_window_inner(window_id, move |inner| {
                         inner.paint_throttled = false;
@@ -573,7 +573,9 @@ impl XWindowInner {
             self.drag_and_drop.src_window = Some(srcwin);
             let moretypes = data[1] & 0x01 != 0;
             let xdndversion = data[1] >> 24 as u8;
-            log::trace!("ClientMessage {msgtype_name}, Version {xdndversion}, more than 3 types: {moretypes}");
+            log::trace!(
+                "ClientMessage {msgtype_name}, Version {xdndversion}, more than 3 types: {moretypes}"
+            );
             if !moretypes {
                 self.drag_and_drop.src_types = data[2..]
                     .into_iter()
@@ -619,7 +621,9 @@ impl XWindowInner {
                 conn.atom_name(self.drag_and_drop.target_type)
             );
         } else if self.drag_and_drop.src_window != Some(srcwin) {
-            log::error!("ClientMessage {msgtype_name} received, but no Xdnd in progress or source window mismatch");
+            log::error!(
+                "ClientMessage {msgtype_name} received, but no Xdnd in progress or source window mismatch"
+            );
         } else if msgtype == conn.atom_xdndposition {
             self.drag_and_drop.time = data[3];
             let (x, y) = (data[2] >> 16 as u16, data[2] as u16);
@@ -760,8 +764,8 @@ impl XWindowInner {
             }
             Event::X(xcb::x::Event::ClientMessage(msg)) => {
                 let type_atom_name = conn.atom_name(msg.r#type());
-                use xcb::x::ClientMessageData;
                 use xcb::XidNew;
+                use xcb::x::ClientMessageData;
                 let xdnd_msgtype_atoms = [
                     conn.atom_xdndenter,
                     conn.atom_xdndposition,
@@ -1619,7 +1623,7 @@ impl XWindowInner {
         // <https://github.com/wezterm/wezterm/issues/2198>
         let window = self.window_id;
         promise::spawn::spawn(async move {
-            async_io::Timer::after(std::time::Duration::from_secs(2)).await;
+            promise::spawn::sleep(std::time::Duration::from_secs(2)).await;
             let conn = Connection::get().unwrap().x11();
             log::trace!("close sending DestroyWindow for {:?}", window);
             conn.send_request_no_reply_log(&xcb::x::DestroyWindow { window });
@@ -2242,10 +2246,6 @@ enum NetWmStateAction {
 
 impl NetWmStateAction {
     fn with_bool(enable: bool) -> Self {
-        if enable {
-            Self::Add
-        } else {
-            Self::Remove
-        }
+        if enable { Self::Add } else { Self::Remove }
     }
 }
