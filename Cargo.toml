@@ -482,14 +482,9 @@ wgpu = "25.0.2"
 wezterm-gui-subcommands = { path = "frankenterm/gui-subcommands", package = "frankenterm-gui-subcommands" }
 wezterm-escape-parser = { path = "frankenterm/escape-parser", package = "frankenterm-escape-parser" }
 wezterm-surface = { path = "frankenterm/surface", package = "frankenterm-surface" }
-# GUI bootstrap crate aliases (ft-1memj.3)
-env-bootstrap = { path = "frankenterm/env-bootstrap" }
+# GUI bootstrap crate (ft-1memj.3)
 tabout = { path = "frankenterm/tabout" }
-mux-lua = { path = "frankenterm/lua-api-crates/mux-lua" }
-url-funcs = { path = "frankenterm/lua-api-crates/url-funcs" }
-window-funcs = { path = "frankenterm/lua-api-crates/window-funcs" }
 frankenterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl" }
-wezterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl", package = "frankenterm-mux-server-impl" }
 
 # Notify: upstream uses 5.0, we use 8.x for frankenterm crates.
 # FrankenTerm config crate pins to 5.0 until migrated.
