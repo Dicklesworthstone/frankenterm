@@ -3131,8 +3131,13 @@ mod tests {
             "never"
         });
         handle.abort();
-        let result = handle.await;
-        assert!(result.is_err());
+        // After abort, the handle should resolve quickly (not wait the full 60s).
+        // Use a timeout to prevent the test from hanging under system load.
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        match result {
+            Ok(inner) => assert!(inner.is_err(), "aborted handle should resolve to Err"),
+            Err(_elapsed) => panic!("handle.await did not resolve within 5s after abort"),
+        }
     }
 
     #[tokio::test]
