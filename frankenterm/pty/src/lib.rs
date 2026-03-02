@@ -405,6 +405,8 @@ pub type NativePtySystem = win::conpty::ConPtySystem;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     // ── PtySize ─────────────────────────────────────────────
 
@@ -859,5 +861,95 @@ mod tests {
         let s = ExitStatus::with_exit_code(u32::MAX);
         assert_eq!(s.exit_code(), u32::MAX);
         assert!(!s.success());
+    }
+
+    fn contains_non_comment_token(line: &str, token: &str) -> bool {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            return false;
+        }
+        line.contains(token)
+    }
+
+    fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
+        if !dir.exists() {
+            return;
+        }
+        let entries = fs::read_dir(dir).expect("read_dir failed");
+        for entry in entries {
+            let entry = entry.expect("failed to read dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_files(&path, files);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn pty_manifest_excludes_smol_and_async_io_dependencies() {
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let manifest = fs::read_to_string(&manifest_path)
+            .unwrap_or_else(|_| panic!("read {:?}", manifest_path));
+
+        let smol_token = format!("{}{}", "smol", ".workspace");
+        let async_hyphen_token = format!("{}{}", "async", "-io");
+        let async_underscore_token = format!("{}{}", "async", "_io");
+
+        for (line_no, line) in manifest.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            assert!(
+                !trimmed.contains(&smol_token),
+                "smol dependency reintroduced at {}:{}",
+                manifest_path.display(),
+                line_no + 1
+            );
+            assert!(
+                !trimmed.contains(&async_hyphen_token),
+                "async-io dependency reintroduced at {}:{}",
+                manifest_path.display(),
+                line_no + 1
+            );
+            assert!(
+                !trimmed.contains(&async_underscore_token),
+                "async_io dependency reintroduced at {}:{}",
+                manifest_path.display(),
+                line_no + 1
+            );
+        }
+    }
+
+    #[test]
+    fn pty_sources_and_examples_exclude_runtime_specific_async_tokens() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect_rust_files(&manifest_dir.join("src"), &mut files);
+        collect_rust_files(&manifest_dir.join("examples"), &mut files);
+
+        let smol_token = format!("{}{}", "smol", "::");
+        let async_io_token = format!("{}{}", "async", "_io::");
+
+        for file in files {
+            let source =
+                fs::read_to_string(&file).unwrap_or_else(|_| panic!("failed to read {:?}", file));
+            for (line_no, line) in source.lines().enumerate() {
+                assert!(
+                    !contains_non_comment_token(line, &smol_token),
+                    "direct smol usage found at {}:{}",
+                    file.display(),
+                    line_no + 1
+                );
+                assert!(
+                    !contains_non_comment_token(line, &async_io_token),
+                    "direct async_io usage found at {}:{}",
+                    file.display(),
+                    line_no + 1
+                );
+            }
+        }
     }
 }

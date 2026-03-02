@@ -39,5 +39,4 @@ winapi = { workspace=true, features = [
 winreg.workspace = true
 
 [dev-dependencies]
-futures.workspace = true
-smol.workspace = true
+asupersync.workspace = true

@@ -1,12 +1,14 @@
 use anyhow::anyhow;
-use futures::prelude::*;
+use asupersync::runtime::RuntimeBuilder;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::io::BufRead;
 
-// This example shows how to use the `smol` crate to use portable_pty
-// in an asynchronous application.
+// This example shows how to use `portable_pty` in an asynchronous application
+// backed by the asupersync runtime.
 
 fn main() -> anyhow::Result<()> {
-    smol::block_on(async {
+    let runtime = RuntimeBuilder::current_thread().build()?;
+    runtime.block_on(async {
         let pty_system = native_pty_system();
 
         let pair = pty_system.openpty(PtySize {
@@ -18,45 +20,61 @@ fn main() -> anyhow::Result<()> {
 
         let cmd = CommandBuilder::new("whoami");
 
-        // Move the slave to another thread to block and spawn a
-        // command.
-        // Note that this implicitly drops slave and closes out
-        // file handles which is important to avoid deadlock
-        // when waiting for the child process!
+        // Move the slave to a blocking worker thread to spawn the command.
+        // This implicitly drops the slave and closes handles, which avoids
+        // deadlocks when waiting for child completion.
         let slave = pair.slave;
-        let mut child = smol::unblock(move || slave.spawn_command(cmd)).await?;
+        let mut child =
+            asupersync::runtime::spawn_blocking(move || slave.spawn_command(cmd)).await?;
 
         {
             // Obtain the writer.
             // When the writer is dropped, EOF will be sent to
-            // the program that was spawned.
-            // It is important to take the writer even if you don't
-            // send anything to its stdin so that EOF can be
-            // generated, otherwise you risk deadlocking yourself.
+            // the spawned program.
             let writer = pair.master.take_writer()?;
-
-            // Explicitly generate EOF
             drop(writer);
         }
 
-        println!(
-            "child status: {:?}",
-            smol::unblock(move || child
+        let child_status = asupersync::runtime::spawn_blocking(move || {
+            child
                 .wait()
-                .map_err(|e| anyhow!("waiting for child: {}", e)))
-            .await?
-        );
+                .map_err(|e| anyhow!("waiting for child: {}", e))
+        })
+        .await?;
+        println!("child status: {:?}", child_status);
 
         let reader = pair.master.try_clone_reader()?;
 
-        // Take care to drop the master after our processes are
-        // done, as some platforms get unhappy if it is dropped
-        // sooner than that.
+        // Take care to drop the master after our processes are done, as some
+        // platforms get unhappy if it is dropped sooner than that.
         drop(pair.master);
 
-        let mut lines = smol::io::BufReader::new(smol::Unblock::new(reader)).lines();
-        while let Some(line) = lines.next().await {
-            let line = line.map_err(|e| anyhow!("problem reading line: {}", e))?;
+        let output_lines =
+            asupersync::runtime::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+                let mut reader = std::io::BufReader::new(reader);
+                let mut lines = Vec::new();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let bytes_read = reader
+                        .read_line(&mut line)
+                        .map_err(|e| anyhow!("problem reading line: {}", e))?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    if line.ends_with('\n') {
+                        line.pop();
+                        if line.ends_with('\r') {
+                            line.pop();
+                        }
+                    }
+                    lines.push(line.clone());
+                }
+                Ok(lines)
+            })
+            .await?;
+
+        for line in output_lines {
             // We print with escapes escaped because the windows conpty
             // implementation synthesizes title change escape sequences
             // in the output stream and it can be confusing to see those
