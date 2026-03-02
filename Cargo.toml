@@ -38,6 +38,16 @@ members = [
     "frankenterm/scripting",
     "frankenterm/surface",
     "frankenterm/uds",
+    # GUI-layer crates (vendored from legacy_wezterm, ft-1memj.2)
+    "frankenterm/frecency",
+    "frankenterm/lfucache",
+    "frankenterm/ratelim",
+    "frankenterm/gui-subcommands",
+    "frankenterm/toast-notification",
+    "frankenterm/open-url",
+    "frankenterm/window",
+    "frankenterm/font",
+    "frankenterm/client",
 ]
 exclude = [
     "frankenterm/char-props/codegen",
@@ -276,6 +286,26 @@ frankenterm-scripting = { path = "frankenterm/scripting" }
 frankenterm-surface = { path = "frankenterm/surface" }
 frankenterm-term = { path = "frankenterm/term" }
 frankenterm-uds = { path = "frankenterm/uds" }
+frecency = { path = "frankenterm/frecency" }
+lfucache = { path = "frankenterm/lfucache" }
+ratelim = { path = "frankenterm/ratelim" }
+frankenterm-gui-subcommands = { path = "frankenterm/gui-subcommands" }
+wezterm-toast-notification = { path = "frankenterm/toast-notification" }
+wezterm-open-url = { path = "frankenterm/open-url" }
+window = { path = "frankenterm/window" }
+wezterm-font = { path = "frankenterm/font" }
+wezterm-client = { path = "frankenterm/client" }
+# Workspace-level name aliases: legacy crate names → vendored frankenterm-* packages.
+# These let vendored GUI-layer crates (window, font, client) resolve their deps
+# using the original WezTerm dep names without modifying every Cargo.toml.
+wezterm-bidi = { path = "frankenterm/bidi", package = "frankenterm-bidi" }
+wezterm-term = { path = "frankenterm/term", package = "frankenterm-term" }
+wezterm-color-types = { path = "frankenterm/color-types", package = "frankenterm-color-types" }
+wezterm-input-types = { path = "frankenterm/input-types", package = "frankenterm-input-types" }
+wezterm-dynamic = { path = "frankenterm/dynamic", package = "frankenterm-dynamic" }
+wezterm-blob-leases = { path = "frankenterm/blob-leases", package = "frankenterm-blob-leases" }
+wezterm-ssh = { path = "frankenterm/ssh", package = "frankenterm-ssh" }
+wezterm-uds = { path = "frankenterm/uds", package = "frankenterm-uds" }
 
 # External deps needed by FrankenTerm crates
 assert_fs = "1.0.4"
@@ -365,6 +395,44 @@ whoami = "1.5"
 winapi = "0.3.9"
 winreg = "0.10"
 zstd = "0.11"
+
+# GUI-layer dependencies (vendored from legacy_wezterm, ft-1memj.2)
+serde_with = { version = "2.0", features = ["chrono_0_4"] }
+ahash = "0.8"
+intrusive-collections = "0.9"
+governor = { version = "0.5", default-features = false, features = ["std"] }
+async-channel = "2.3"
+bytes = "1.0"
+bytemuck = { version = "1.4", features = ["derive"] }
+cairo-rs = { version = "0.18", default-features = false }
+encoding_rs = "0.8"
+gl_generator = "0.14"
+glium = { version = "0.35", default-features = false }
+guillotiere = "0.6"
+libloading = "0.8"
+line_drawing = "0.8"
+memmap2 = "0.9"
+raw-window-handle = "0.6"
+resize = "0.5"
+tiny-skia = "0.11"
+walkdir = "2"
+# Vendored native deps (freetype, harfbuzz, fontconfig)
+freetype = { path = "frankenterm/deps-freetype" }
+harfbuzz = { path = "frankenterm/deps-harfbuzz" }
+fontconfig = { path = "frankenterm/deps-fontconfig" }
+# macOS GUI deps
+cgl = "0.3"
+cocoa = "=0.25.0"
+core-foundation = "=0.10.0"
+core-graphics = "=0.24.0"
+core-text = "=21.0.0"
+objc = "0.2"
+objc2-core-graphics = "0.3"
+plist = "1.7"
+# Additional GUI-layer workspace aliases
+wezterm-gui-subcommands = { path = "frankenterm/gui-subcommands", package = "frankenterm-gui-subcommands" }
+wezterm-escape-parser = { path = "frankenterm/escape-parser", package = "frankenterm-escape-parser" }
+wezterm-surface = { path = "frankenterm/surface", package = "frankenterm-surface" }
 
 # Notify: upstream uses 5.0, we use 8.x for frankenterm crates.
 # FrankenTerm config crate pins to 5.0 until migrated.

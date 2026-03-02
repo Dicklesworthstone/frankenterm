@@ -1,0 +1,13 @@
+[package]
+name = "frecency"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+chrono.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_with.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
