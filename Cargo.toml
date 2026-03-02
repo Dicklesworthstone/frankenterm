@@ -305,7 +305,7 @@ frankenterm-gui-subcommands = { path = "frankenterm/gui-subcommands" }
 wezterm-toast-notification = { path = "frankenterm/toast-notification" }
 wezterm-open-url = { path = "frankenterm/open-url" }
 window = { path = "frankenterm/window" }
-wezterm-font = { path = "frankenterm/font" }
+wezterm-font = { path = "frankenterm/font", features = ["vendor-jetbrains", "vendor-roboto", "vendor-noto-emoji", "vendor-nerd-font-symbols"] }
 wezterm-client = { path = "frankenterm/client" }
 # Workspace-level name aliases: legacy crate names → vendored frankenterm-* packages.
 # These let vendored GUI-layer crates (window, font, client) resolve their deps
