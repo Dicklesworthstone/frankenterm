@@ -78,8 +78,8 @@ fn frankenterm_bootstrap() {
     env_logger::init();
 
     config::assign_version_info(
-        config::wezterm_version(),
-        config::wezterm_target_triple(),
+        concat!("FrankenTerm ", env!("CARGO_PKG_VERSION")),
+        env!("FRANKENTERM_TARGET_TRIPLE"),
     );
 
     // Set executable location env vars
