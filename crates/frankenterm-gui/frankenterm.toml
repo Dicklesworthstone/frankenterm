@@ -63,6 +63,23 @@ tab_bar_at_bottom = false
 name = "local"
 connect_automatically = false
 
+# --- Swap Layouts (Zellij-inspired) ---
+
+# Enable swap layout cycling (Ctrl+Space to cycle).
+# Built-in presets: grid-4, main-side, stacked, main-bottom
+swap_layout_enabled = true
+
+# Layout cycle order. Remove entries to disable specific layouts.
+# swap_layout_cycle = ["grid-4", "main-side", "stacked", "main-bottom"]
+
+# --- Floating Panes ---
+
+# Enable floating pane support (Ctrl+Shift+F to toggle).
+floating_panes_enabled = true
+
+# Default opacity for floating panes (0.0–1.0).
+# floating_pane_opacity = 0.95
+
 # --- Resize Reflow Quality ---
 
 # Enable wrap-quality scorecard telemetry during terminal resize.

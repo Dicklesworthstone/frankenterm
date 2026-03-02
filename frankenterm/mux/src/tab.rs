@@ -1549,7 +1549,7 @@ impl TabInner {
             title: String::new(),
             recency: Recency::default(),
             collapsed_panes: HashSet::new(),
-            layout_cycle: None,
+            layout_cycle: Some(crate::layout::default_cycle()),
             pane_stacks: HashMap::new(),
         }
     }
