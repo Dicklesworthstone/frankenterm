@@ -25433,7 +25433,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 service: ref_service,
             }) = command
             {
-                let caut_service = match parse_accounts_caut_service(ref_service) {
+                let caut_service = match parse_accounts_caut_service(&ref_service) {
                     Some(parsed) => parsed,
                     None => {
                         die(
