@@ -921,3 +921,192 @@ pub(super) struct CapabilityResolution {
     pub capabilities: PaneCapabilities,
     pub _warnings: Vec<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // now_ms Tests
+    // ========================================================================
+
+    #[test]
+    fn now_ms_returns_reasonable_epoch() {
+        let ms = now_ms();
+        // Should be after 2024-01-01 (1704067200000ms)
+        assert!(ms > 1_704_067_200_000, "now_ms returned suspiciously low value: {ms}");
+        // Should be before 2030-01-01 (1893456000000ms)
+        assert!(ms < 1_893_456_000_000, "now_ms returned suspiciously high value: {ms}");
+    }
+
+    #[test]
+    fn now_ms_is_monotonic_ish() {
+        let a = now_ms();
+        let b = now_ms();
+        // b should be >= a (may be equal due to millisecond granularity)
+        assert!(b >= a, "now_ms went backwards: {a} > {b}");
+    }
+
+    // ========================================================================
+    // default_tail Tests
+    // ========================================================================
+
+    #[test]
+    fn default_tail_is_500() {
+        assert_eq!(default_tail(), 500);
+    }
+
+    // ========================================================================
+    // MCP_VERSION Tests
+    // ========================================================================
+
+    #[test]
+    fn mcp_version_is_v1() {
+        assert_eq!(MCP_VERSION, "v1");
+    }
+
+    // ========================================================================
+    // McpEnvelope Tests
+    // ========================================================================
+
+    #[test]
+    fn envelope_success_fields() {
+        let envelope = McpEnvelope::success("hello", 42);
+        assert!(envelope.ok);
+        assert_eq!(envelope.data.as_deref(), Some("hello"));
+        assert!(envelope.error.is_none());
+        assert!(envelope.error_code.is_none());
+        assert!(envelope.hint.is_none());
+        assert_eq!(envelope.elapsed_ms, 42);
+        assert_eq!(envelope.mcp_version, "v1");
+        assert!(envelope.now > 0);
+    }
+
+    #[test]
+    fn envelope_error_fields() {
+        let envelope = McpEnvelope::<()>::error("FT-MCP-0001", "bad input", Some("fix it".to_string()), 10);
+        assert!(!envelope.ok);
+        assert!(envelope.data.is_none());
+        assert_eq!(envelope.error.as_deref(), Some("bad input"));
+        assert_eq!(envelope.error_code.as_deref(), Some("FT-MCP-0001"));
+        assert_eq!(envelope.hint.as_deref(), Some("fix it"));
+        assert_eq!(envelope.elapsed_ms, 10);
+    }
+
+    #[test]
+    fn envelope_error_no_hint() {
+        let envelope = McpEnvelope::<()>::error("FT-MCP-0005", "storage error", None, 0);
+        assert!(!envelope.ok);
+        assert!(envelope.hint.is_none());
+    }
+
+    #[test]
+    fn envelope_success_serializes_to_json() {
+        let envelope = McpEnvelope::success(serde_json::json!({"count": 5}), 100);
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["data"]["count"], 5);
+        assert_eq!(parsed["elapsed_ms"], 100);
+        assert_eq!(parsed["mcp_version"], "v1");
+        // Optional None fields should be absent
+        assert!(parsed.get("error").is_none());
+        assert!(parsed.get("error_code").is_none());
+        assert!(parsed.get("hint").is_none());
+    }
+
+    #[test]
+    fn envelope_error_serializes_to_json() {
+        let envelope = McpEnvelope::<()>::error("ERR", "fail", Some("try again".to_string()), 5);
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["error"], "fail");
+        assert_eq!(parsed["error_code"], "ERR");
+        assert_eq!(parsed["hint"], "try again");
+        assert!(parsed.get("data").is_none());
+    }
+
+    // ========================================================================
+    // StateParams Deserialization
+    // ========================================================================
+
+    #[test]
+    fn state_params_default() {
+        let params = StateParams::default();
+        assert!(params.domain.is_none());
+        assert!(params.agent.is_none());
+        assert!(params.pane_id.is_none());
+    }
+
+    #[test]
+    fn state_params_from_json() {
+        let json = serde_json::json!({"domain": "local", "pane_id": 42});
+        let params: StateParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.domain.as_deref(), Some("local"));
+        assert_eq!(params.pane_id, Some(42));
+        assert!(params.agent.is_none());
+    }
+
+    // ========================================================================
+    // GetTextParams Deserialization
+    // ========================================================================
+
+    #[test]
+    fn get_text_params_defaults() {
+        let json = serde_json::json!({"pane_id": 1});
+        let params: GetTextParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.pane_id, 1);
+        assert_eq!(params.tail, 500); // default_tail()
+        assert!(!params.escapes); // default false
+    }
+
+    #[test]
+    fn get_text_params_override_all() {
+        let json = serde_json::json!({"pane_id": 5, "tail": 100, "escapes": true});
+        let params: GetTextParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.pane_id, 5);
+        assert_eq!(params.tail, 100);
+        assert!(params.escapes);
+    }
+
+    // ========================================================================
+    // IpcPaneState Deserialization
+    // ========================================================================
+
+    #[test]
+    fn ipc_pane_state_minimal_json() {
+        let json = serde_json::json!({"pane_id": 1, "known": true});
+        let state: IpcPaneState = serde_json::from_value(json).unwrap();
+        assert_eq!(state.pane_id, 1);
+        assert!(state.known);
+        assert!(state.observed.is_none());
+        assert!(state.alt_screen.is_none());
+        assert!(state.last_status_at.is_none());
+        assert!(state.in_gap.is_none());
+        assert!(state.cursor_alt_screen.is_none());
+        assert!(state.reason.is_none());
+    }
+
+    #[test]
+    fn ipc_pane_state_full_json() {
+        let json = serde_json::json!({
+            "pane_id": 42,
+            "known": true,
+            "observed": true,
+            "alt_screen": false,
+            "last_status_at": 1234567890,
+            "in_gap": false,
+            "cursor_alt_screen": true,
+            "reason": "test"
+        });
+        let state: IpcPaneState = serde_json::from_value(json).unwrap();
+        assert_eq!(state.pane_id, 42);
+        assert_eq!(state.observed, Some(true));
+        assert_eq!(state.alt_screen, Some(false));
+        assert_eq!(state.last_status_at, Some(1234567890));
+        assert_eq!(state.in_gap, Some(false));
+        assert_eq!(state.cursor_alt_screen, Some(true));
+        assert_eq!(state.reason.as_deref(), Some("test"));
+    }
+}
