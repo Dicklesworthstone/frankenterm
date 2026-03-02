@@ -232,11 +232,15 @@ pub struct Config {
     pub resize_wrap_kp_max_dp_states: usize,
 
     /// Enables wrap-quality scorecard telemetry during resize.
-    #[dynamic(default)]
+    /// When true, each resize records per-line wrap quality metrics (DP vs
+    /// fallback usage, badness deltas) so operators can diagnose reflow issues.
+    #[dynamic(default = "default_true")]
     pub resize_wrap_scorecard_enabled: bool,
 
     /// Enables readability gate evaluation over resize wrap scorecards.
-    #[dynamic(default)]
+    /// When true, aggregate wrap quality is checked after resize; if
+    /// quality falls below thresholds a warning is logged.
+    #[dynamic(default = "default_true")]
     pub resize_wrap_readability_gate_enabled: bool,
 
     /// Max allowed per-line badness delta versus greedy baseline.
@@ -1811,15 +1815,15 @@ fn default_resize_wrap_kp_max_dp_states() -> usize {
 }
 
 fn default_resize_wrap_readability_max_line_badness_delta() -> i64 {
-    0
+    500
 }
 
 fn default_resize_wrap_readability_max_total_badness_delta() -> i64 {
-    0
+    2000
 }
 
 fn default_resize_wrap_readability_max_fallback_ratio_percent() -> u8 {
-    100
+    20
 }
 
 const MAX_SCROLLBACK_LINES: usize = 999_999_999;

@@ -143,10 +143,10 @@ pub(crate) struct ResizeReadabilityGatePolicy {
 impl Default for ResizeReadabilityGatePolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
-            max_line_badness_delta: 0,
-            max_total_badness_delta: 0,
-            max_fallback_ratio_percent: 100,
+            enabled: true,
+            max_line_badness_delta: 500,
+            max_total_badness_delta: 2000,
+            max_fallback_ratio_percent: 20,
         }
     }
 }
@@ -196,7 +196,7 @@ impl Default for ResizeWrapPolicy {
     fn default() -> Self {
         Self {
             kp_cost_model: MonospaceKpCostModel::terminal_default(),
-            scorecard_enabled: false,
+            scorecard_enabled: true,
             readability_gate: ResizeReadabilityGatePolicy::default(),
         }
     }
@@ -2564,7 +2564,12 @@ mod tests {
                 scrollback: 32,
                 kp_cost_model: MonospaceKpCostModel::terminal_default(),
                 scorecard_enabled: false,
-                readability_gate: ResizeReadabilityGatePolicy::default(),
+                readability_gate: ResizeReadabilityGatePolicy {
+                    enabled: false,
+                    max_line_badness_delta: 0,
+                    max_total_badness_delta: 0,
+                    max_fallback_ratio_percent: 100,
+                },
             }
         }
     }
@@ -2646,6 +2651,8 @@ mod tests {
 
     #[test]
     fn resize_wrap_policy_defaults_preserve_hot_path_budget() {
+        // TestTermConfig::default() explicitly disables scorecard for test isolation.
+        // This test verifies the Screen correctly reflects the config it was given.
         let screen = test_screen(3, 4, 96);
         let policy = screen.resize_wrap_policy();
         assert_eq!(
@@ -2654,11 +2661,38 @@ mod tests {
         );
         assert!(
             !policy.scorecard_enabled,
-            "scorecard should be off by default to keep resize hot-path overhead low"
+            "scorecard should reflect TestTermConfig default (disabled for test isolation)"
         );
         assert!(
             !policy.readability_gate.enabled,
-            "readability gate should be opt-in by default"
+            "readability gate should reflect TestTermConfig default (disabled for test isolation)"
+        );
+    }
+
+    #[test]
+    fn resize_wrap_production_defaults_enable_scorecard_and_gate() {
+        // Verify that the production defaults (ResizeWrapPolicy::default())
+        // have scorecard and readability gate enabled with sensible thresholds.
+        let policy = ResizeWrapPolicy::default();
+        assert!(
+            policy.scorecard_enabled,
+            "production default should enable scorecard for resize quality telemetry"
+        );
+        assert!(
+            policy.readability_gate.enabled,
+            "production default should enable readability gate"
+        );
+        assert_eq!(
+            policy.readability_gate.max_line_badness_delta, 500,
+            "production default max_line_badness_delta"
+        );
+        assert_eq!(
+            policy.readability_gate.max_total_badness_delta, 2000,
+            "production default max_total_badness_delta"
+        );
+        assert_eq!(
+            policy.readability_gate.max_fallback_ratio_percent, 20,
+            "production default max_fallback_ratio_percent"
         );
     }
 
@@ -3361,6 +3395,344 @@ mod tests {
             "capture count should increase: {} > {}",
             count_after_second,
             count_after_first
+        );
+    }
+
+    // --- Resize quality / readability gate tests ---
+
+    fn test_screen_with_scorecard(rows: usize, cols: usize) -> Screen {
+        test_screen_with_config(
+            rows,
+            cols,
+            96,
+            TestTermConfig {
+                scrollback: 256,
+                kp_cost_model: MonospaceKpCostModel::terminal_default(),
+                scorecard_enabled: true,
+                readability_gate: ResizeReadabilityGatePolicy {
+                    enabled: true,
+                    max_line_badness_delta: 500,
+                    max_total_badness_delta: 2000,
+                    max_fallback_ratio_percent: 20,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn scorecard_records_when_enabled() {
+        let mut screen = test_screen_with_scorecard(3, 10);
+        let attrs = CellAttributes::blank();
+
+        // Insert a line that will wrap (longer than 10 cols)
+        screen.lines = VecDeque::from(vec![
+            Line::from_text_with_wrapped_last_col(
+                "abcdefghijklmnop",
+                &attrs,
+                0,
+            ),
+            Line::from_text("rest", &attrs, 0, None),
+            Line::new(0),
+        ]);
+
+        let cursor = test_cursor(0, 0, 1);
+        let _ = screen.resize(test_size(3, 8, 96), cursor, 1, false);
+
+        assert!(
+            screen.last_resize_wrap_scorecard.is_some(),
+            "scorecard should be populated when scorecard_enabled is true"
+        );
+
+        let scorecard = screen.last_resize_wrap_scorecard.as_ref().unwrap();
+        assert!(
+            scorecard.scored_lines > 0,
+            "scorecard should track at least one scored line"
+        );
+    }
+
+    #[test]
+    fn scorecard_not_recorded_when_disabled() {
+        let mut screen = test_screen(3, 10, 96);
+        let attrs = CellAttributes::blank();
+
+        screen.lines = VecDeque::from(vec![
+            Line::from_text_with_wrapped_last_col(
+                "abcdefghijklmnop",
+                &attrs,
+                0,
+            ),
+            Line::from_text("rest", &attrs, 0, None),
+            Line::new(0),
+        ]);
+
+        let cursor = test_cursor(0, 0, 1);
+        let _ = screen.resize(test_size(3, 8, 96), cursor, 1, false);
+
+        assert!(
+            screen.last_resize_wrap_scorecard.is_none(),
+            "scorecard should be None when scorecard_enabled is false"
+        );
+    }
+
+    #[test]
+    fn gate_status_disabled_when_gate_off() {
+        let scorecard = ResizeWrapScorecard {
+            scored_lines: 10,
+            dp_lines: 5,
+            fallback_lines: 5,
+            greedy_total_cost: 100,
+            selected_total_cost: 200,
+            max_badness_delta: 9999,
+            total_badness_delta: 99999,
+        };
+        let policy = ResizeReadabilityGatePolicy {
+            enabled: false,
+            max_line_badness_delta: 1,
+            max_total_badness_delta: 1,
+            max_fallback_ratio_percent: 1,
+        };
+        assert_eq!(
+            scorecard.gate_status(policy),
+            ResizeWrapGateStatus::Disabled,
+            "gate should report Disabled when not enabled, regardless of metrics"
+        );
+    }
+
+    #[test]
+    fn gate_pass_when_within_thresholds() {
+        let scorecard = ResizeWrapScorecard {
+            scored_lines: 100,
+            dp_lines: 95,
+            fallback_lines: 5,
+            greedy_total_cost: 1000,
+            selected_total_cost: 800,
+            max_badness_delta: 100,
+            total_badness_delta: 500,
+        };
+        let policy = ResizeReadabilityGatePolicy {
+            enabled: true,
+            max_line_badness_delta: 500,
+            max_total_badness_delta: 2000,
+            max_fallback_ratio_percent: 20,
+        };
+        assert_eq!(
+            scorecard.gate_status(policy),
+            ResizeWrapGateStatus::Pass,
+            "gate should pass when all metrics are within thresholds"
+        );
+    }
+
+    #[test]
+    fn gate_fails_on_line_badness_exceeded() {
+        let scorecard = ResizeWrapScorecard {
+            scored_lines: 10,
+            dp_lines: 10,
+            fallback_lines: 0,
+            greedy_total_cost: 100,
+            selected_total_cost: 80,
+            max_badness_delta: 501,
+            total_badness_delta: 501,
+        };
+        let policy = ResizeReadabilityGatePolicy {
+            enabled: true,
+            max_line_badness_delta: 500,
+            max_total_badness_delta: 2000,
+            max_fallback_ratio_percent: 20,
+        };
+        assert_eq!(
+            scorecard.gate_status(policy),
+            ResizeWrapGateStatus::Fail(ResizeWrapGateFailureReason::LineBadnessDeltaExceeded),
+            "gate should fail when max_badness_delta exceeds threshold"
+        );
+    }
+
+    #[test]
+    fn gate_fails_on_total_badness_exceeded() {
+        let scorecard = ResizeWrapScorecard {
+            scored_lines: 10,
+            dp_lines: 10,
+            fallback_lines: 0,
+            greedy_total_cost: 100,
+            selected_total_cost: 80,
+            max_badness_delta: 100,
+            total_badness_delta: 2001,
+        };
+        let policy = ResizeReadabilityGatePolicy {
+            enabled: true,
+            max_line_badness_delta: 500,
+            max_total_badness_delta: 2000,
+            max_fallback_ratio_percent: 20,
+        };
+        assert_eq!(
+            scorecard.gate_status(policy),
+            ResizeWrapGateStatus::Fail(ResizeWrapGateFailureReason::TotalBadnessDeltaExceeded),
+            "gate should fail when total_badness_delta exceeds threshold"
+        );
+    }
+
+    #[test]
+    fn gate_fails_on_fallback_ratio_exceeded() {
+        let scorecard = ResizeWrapScorecard {
+            scored_lines: 10,
+            dp_lines: 7,
+            fallback_lines: 3,
+            greedy_total_cost: 100,
+            selected_total_cost: 80,
+            max_badness_delta: 100,
+            total_badness_delta: 500,
+        };
+        let policy = ResizeReadabilityGatePolicy {
+            enabled: true,
+            max_line_badness_delta: 500,
+            max_total_badness_delta: 2000,
+            max_fallback_ratio_percent: 20,
+        };
+        // 3/10 = 30% > 20% threshold
+        assert_eq!(
+            scorecard.gate_status(policy),
+            ResizeWrapGateStatus::Fail(ResizeWrapGateFailureReason::FallbackRatioExceeded),
+            "gate should fail when fallback ratio exceeds threshold"
+        );
+    }
+
+    #[test]
+    fn gate_pass_at_exact_fallback_boundary() {
+        let scorecard = ResizeWrapScorecard {
+            scored_lines: 10,
+            dp_lines: 8,
+            fallback_lines: 2,
+            greedy_total_cost: 100,
+            selected_total_cost: 80,
+            max_badness_delta: 100,
+            total_badness_delta: 500,
+        };
+        let policy = ResizeReadabilityGatePolicy {
+            enabled: true,
+            max_line_badness_delta: 500,
+            max_total_badness_delta: 2000,
+            max_fallback_ratio_percent: 20,
+        };
+        // 2/10 = 20% == 20% threshold (not exceeded)
+        assert_eq!(
+            scorecard.gate_status(policy),
+            ResizeWrapGateStatus::Pass,
+            "gate should pass when fallback ratio is exactly at threshold"
+        );
+    }
+
+    #[test]
+    fn scorecard_record_line_accumulates_correctly() {
+        let mut scorecard = ResizeWrapScorecard::default();
+
+        scorecard.record_line(MonospaceLineWrapScorecard {
+            mode: MonospaceWrapMode::Dp,
+            greedy_total_cost: 50,
+            selected_total_cost: 40,
+            badness_delta: 100,
+        });
+        scorecard.record_line(MonospaceLineWrapScorecard {
+            mode: MonospaceWrapMode::Fallback,
+            greedy_total_cost: 30,
+            selected_total_cost: 25,
+            badness_delta: 200,
+        });
+        scorecard.record_line(MonospaceLineWrapScorecard {
+            mode: MonospaceWrapMode::Dp,
+            greedy_total_cost: 20,
+            selected_total_cost: 15,
+            badness_delta: 50,
+        });
+
+        assert_eq!(scorecard.scored_lines, 3);
+        assert_eq!(scorecard.dp_lines, 2);
+        assert_eq!(scorecard.fallback_lines, 1);
+        assert_eq!(scorecard.greedy_total_cost, 100);
+        assert_eq!(scorecard.selected_total_cost, 80);
+        assert_eq!(scorecard.max_badness_delta, 200);
+        assert_eq!(scorecard.total_badness_delta, 350);
+    }
+
+    #[test]
+    fn scorecard_machine_payload_contains_all_fields() {
+        let scorecard = ResizeWrapScorecard {
+            scored_lines: 5,
+            dp_lines: 4,
+            fallback_lines: 1,
+            greedy_total_cost: 500,
+            selected_total_cost: 400,
+            max_badness_delta: 100,
+            total_badness_delta: 300,
+        };
+        let policy = ResizeReadabilityGatePolicy {
+            enabled: true,
+            max_line_badness_delta: 500,
+            max_total_badness_delta: 2000,
+            max_fallback_ratio_percent: 20,
+        };
+        let payload = scorecard.to_machine_payload(policy);
+        assert!(payload.contains("\"gate\":\"resize_wrap_readability\""));
+        assert!(payload.contains("\"status\":\"pass\""));
+        assert!(payload.contains("\"reason\":null"));
+        assert!(payload.contains("\"scored_lines\":5"));
+        assert!(payload.contains("\"dp_lines\":4"));
+        assert!(payload.contains("\"fallback_lines\":1"));
+        assert!(payload.contains("\"max_badness_delta\":100"));
+        assert!(payload.contains("\"total_badness_delta\":300"));
+        assert!(payload.contains("\"enabled\":true"));
+        assert!(payload.contains("\"max_line_badness_delta\":500"));
+    }
+
+    #[test]
+    fn scorecard_machine_payload_reports_failure_reason() {
+        let scorecard = ResizeWrapScorecard {
+            scored_lines: 1,
+            dp_lines: 1,
+            fallback_lines: 0,
+            greedy_total_cost: 100,
+            selected_total_cost: 80,
+            max_badness_delta: 600,
+            total_badness_delta: 600,
+        };
+        let policy = ResizeReadabilityGatePolicy {
+            enabled: true,
+            max_line_badness_delta: 500,
+            max_total_badness_delta: 2000,
+            max_fallback_ratio_percent: 20,
+        };
+        let payload = scorecard.to_machine_payload(policy);
+        assert!(payload.contains("\"status\":\"fail\""));
+        assert!(payload.contains("\"reason\":\"line_badness_delta_exceeded\""));
+    }
+
+    #[test]
+    fn fallback_ratio_percent_zero_when_no_lines() {
+        let scorecard = ResizeWrapScorecard::default();
+        assert_eq!(scorecard.fallback_ratio_percent(), 0);
+    }
+
+    #[test]
+    fn line_badness_priority_over_total_badness() {
+        // When both line and total badness exceed thresholds,
+        // line badness should be reported first (checked first).
+        let scorecard = ResizeWrapScorecard {
+            scored_lines: 1,
+            dp_lines: 1,
+            fallback_lines: 0,
+            greedy_total_cost: 100,
+            selected_total_cost: 80,
+            max_badness_delta: 600,
+            total_badness_delta: 3000,
+        };
+        let policy = ResizeReadabilityGatePolicy {
+            enabled: true,
+            max_line_badness_delta: 500,
+            max_total_badness_delta: 2000,
+            max_fallback_ratio_percent: 20,
+        };
+        assert_eq!(
+            scorecard.gate_status(policy),
+            ResizeWrapGateStatus::Fail(ResizeWrapGateFailureReason::LineBadnessDeltaExceeded),
+            "line badness check should take priority over total badness"
         );
     }
 }
