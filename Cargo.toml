@@ -4,6 +4,8 @@ members = [
     "crates/frankenterm",
     "crates/frankenterm-core",
     "crates/frankenterm-gui",
+    "crates/frankenterm-mux-server",
+    "crates/frankenterm-mux-server-impl",
     "crates/frankenterm-alloc",
     "fuzz",
     # FrankenTerm crates (ex-WezTerm, owned in-tree)
@@ -65,6 +67,8 @@ default-members = [
     "crates/frankenterm",
     "crates/frankenterm-core",
     "crates/frankenterm-gui",
+    "crates/frankenterm-mux-server",
+    "crates/frankenterm-mux-server-impl",
     "crates/frankenterm-alloc",
     "fuzz",
 ]
@@ -518,6 +522,7 @@ franken-agent-detection = "0.1.0"
 
 # Internal crates
 frankenterm-core = { path = "crates/frankenterm-core" }
+frankenterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl" }
 frankenterm-alloc = { path = "crates/frankenterm-alloc" }
 
 [profile.release]

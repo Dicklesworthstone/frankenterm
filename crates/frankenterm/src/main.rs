@@ -6939,7 +6939,7 @@ async fn restore_snapshot_checkpoint(
 #[cfg(unix)]
 fn mux_server_pids() -> anyhow::Result<Vec<i32>> {
     let output = std::process::Command::new("pgrep")
-        .args(["-f", "wezterm-mux-server"])
+        .args(["-f", "frankenterm-mux-server"])
         .output()?;
 
     // pgrep returns 1 when no processes matched.
@@ -6968,7 +6968,7 @@ async fn stop_mux_server_processes(stop_timeout: Duration) -> anyhow::Result<Vec
     let initial_pids = mux_server_pids()?;
     if initial_pids.is_empty() {
         return Err(anyhow::anyhow!(
-            "No running `wezterm-mux-server` process found"
+            "No running `frankenterm-mux-server` process found"
         ));
     }
 
@@ -7027,12 +7027,12 @@ async fn start_mux_server_process(
     start_timeout: Duration,
     wezterm_timeout_secs: u64,
 ) -> anyhow::Result<Vec<i32>> {
-    let status = std::process::Command::new("wezterm-mux-server")
+    let status = std::process::Command::new("frankenterm-mux-server")
         .arg("--daemonize")
         .status()?;
     if !status.success() {
         return Err(anyhow::anyhow!(
-            "Failed to start `wezterm-mux-server --daemonize` (exit: {:?})",
+            "Failed to start `frankenterm-mux-server --daemonize` (exit: {:?})",
             status.code()
         ));
     }
@@ -12532,9 +12532,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     SemanticAnomalyConfig, SemanticAnomalyDetector,
                                 };
 
-                                let segments = storage_handle
-                                    .get_segments(pane_id, limit)
-                                    .await?;
+                                let segments = storage_handle.get_segments(pane_id, limit).await?;
                                 let embedder = frankenterm_core::search::HashEmbedder::default();
                                 let mut detector =
                                     SemanticAnomalyDetector::new(SemanticAnomalyConfig::default());
@@ -21081,9 +21079,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 } else {
                     println!("Restart plan:");
                     println!("  1. Capture pre-restart snapshot");
-                    println!("  2. Stop `wezterm-mux-server` (timeout: {stop_timeout}s)");
+                    println!("  2. Stop `frankenterm-mux-server` (timeout: {stop_timeout}s)");
                     println!(
-                        "  3. Start `wezterm-mux-server` (readiness timeout: {start_timeout}s)"
+                        "  3. Start `frankenterm-mux-server` (readiness timeout: {start_timeout}s)"
                     );
                     if skip_restore {
                         println!("  4. Skip restore phase (--skip-restore)");
@@ -34437,7 +34435,7 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
 fn remote_mux_service_unit(mux_path: &str) -> String {
     format!(
         r"[Unit]
-Description=WezTerm Mux Server
+Description=FrankenTerm Mux Server
 After=network.target
 
 [Service]
@@ -34782,9 +34780,9 @@ where
 
     // Step 4: Resolve mux-server path and install user service unit
     let mux_path_output = run_remote_step(
-        "Locate wezterm-mux-server",
+        "Locate frankenterm-mux-server",
         host,
-        "command -v wezterm-mux-server || which wezterm-mux-server 2>/dev/null || echo /usr/bin/wezterm-mux-server",
+        "command -v frankenterm-mux-server || which frankenterm-mux-server 2>/dev/null || echo /usr/bin/frankenterm-mux-server",
         timeout,
         runner,
         &redactor,
@@ -34796,12 +34794,12 @@ where
         .trim()
         .lines()
         .next()
-        .unwrap_or("/usr/bin/wezterm-mux-server")
+        .unwrap_or("/usr/bin/frankenterm-mux-server")
         .trim()
         .to_string();
     let mux_unit = remote_mux_service_unit(&mux_server_path);
 
-    let service_path = "~/.config/systemd/user/wezterm-mux-server.service";
+    let service_path = "~/.config/systemd/user/frankenterm-mux-server.service";
     let check_service_cmd = format!("cat {service_path} 2>/dev/null || true");
     let service_output = run_remote_step(
         "Check mux service unit",
@@ -34856,7 +34854,7 @@ where
         run_remote_step(
             "Enable mux service",
             host,
-            "systemctl --user enable --now wezterm-mux-server",
+            "systemctl --user enable --now frankenterm-mux-server",
             timeout,
             runner,
             &redactor,
@@ -34865,13 +34863,13 @@ where
         )?;
     } else {
         println!("• Would run: systemctl --user daemon-reload");
-        println!("• Would run: systemctl --user enable --now wezterm-mux-server");
+        println!("• Would run: systemctl --user enable --now frankenterm-mux-server");
     }
 
     let status_output = run_remote_step(
         "Check mux service status",
         host,
-        "systemctl --user is-active wezterm-mux-server || true",
+        "systemctl --user is-active frankenterm-mux-server || true",
         timeout,
         runner,
         &redactor,
@@ -34993,7 +34991,7 @@ where
         "  Mode: {}",
         if apply_changes { "apply" } else { "dry-run" }
     );
-    println!("  Next: verify with `ssh {host} 'systemctl --user status wezterm-mux-server'`");
+    println!("  Next: verify with `ssh {host} 'systemctl --user status frankenterm-mux-server'`");
 
     Ok(())
 }
