@@ -1307,6 +1307,18 @@ impl NotificationGate {
 mod tests {
     use super::*;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build compat runtime for test");
+        runtime.block_on(future);
+    }
+
     #[test]
     fn event_serializes() {
         let event = Event::SegmentCaptured {
@@ -1358,170 +1370,188 @@ mod tests {
         assert_eq!(event.pane_id(), None);
     }
 
-    #[tokio::test]
-    async fn publish_with_no_subscribers_counts_drops() {
-        let bus = EventBus::new(10);
+    #[test]
+    fn publish_with_no_subscribers_counts_drops() {
+        run_async_test(async {
+            let bus = EventBus::new(10);
 
-        let count = bus.publish(Event::PaneDisappeared { pane_id: 1 });
-        assert_eq!(count, 0);
+            let count = bus.publish(Event::PaneDisappeared { pane_id: 1 });
+            assert_eq!(count, 0);
 
-        let metrics = bus.metrics().snapshot();
-        assert_eq!(metrics.events_published, 1);
-        assert_eq!(metrics.events_dropped_no_subscribers, 1);
-    }
-
-    #[tokio::test]
-    async fn subscriber_receives_published_events() {
-        let bus = EventBus::new(10);
-        let mut sub = bus.subscribe();
-
-        let _ = bus.publish(Event::PaneDiscovered {
-            pane_id: 1,
-            domain: "local".to_string(),
-            title: "shell".to_string(),
+            let metrics = bus.metrics().snapshot();
+            assert_eq!(metrics.events_published, 1);
+            assert_eq!(metrics.events_dropped_no_subscribers, 1);
         });
-
-        let event = sub.recv().await.unwrap();
-        assert!(matches!(event, Event::PaneDiscovered { pane_id: 1, .. }));
     }
 
-    #[tokio::test]
-    async fn multiple_subscribers_fanout() {
-        let bus = EventBus::new(10);
-        let mut sub1 = bus.subscribe();
-        let mut sub2 = bus.subscribe();
+    #[test]
+    fn subscriber_receives_published_events() {
+        run_async_test(async {
+            let bus = EventBus::new(10);
+            let mut sub = bus.subscribe();
 
-        assert_eq!(bus.subscriber_count(), 2);
-
-        let _ = bus.publish(Event::PaneDisappeared { pane_id: 42 });
-
-        let e1 = sub1.recv().await.unwrap();
-        let e2 = sub2.recv().await.unwrap();
-
-        assert!(matches!(e1, Event::PaneDisappeared { pane_id: 42 }));
-        assert!(matches!(e2, Event::PaneDisappeared { pane_id: 42 }));
-    }
-
-    #[tokio::test]
-    async fn delta_subscriber_only_sees_delta_events() {
-        let bus = EventBus::new(10);
-        let mut delta_sub = bus.subscribe_deltas();
-
-        let _ = bus.publish(Event::SegmentCaptured {
-            pane_id: 5,
-            seq: 1,
-            content_len: 10,
-        });
-
-        let event = delta_sub.recv().await.unwrap();
-        assert!(matches!(event, Event::SegmentCaptured { pane_id: 5, .. }));
-
-        let _ = bus.publish(Event::PaneDiscovered {
-            pane_id: 5,
-            domain: "local".to_string(),
-            title: "shell".to_string(),
-        });
-
-        assert!(delta_sub.try_recv().is_none());
-    }
-
-    #[tokio::test]
-    async fn detection_subscriber_receives_pattern_events() {
-        let bus = EventBus::new(10);
-        let mut detection_sub = bus.subscribe_detections();
-
-        let detection = Detection {
-            rule_id: "codex.test".to_string(),
-            agent_type: crate::patterns::AgentType::Codex,
-            event_type: "test".to_string(),
-            severity: crate::patterns::Severity::Info,
-            confidence: 0.9,
-            extracted: serde_json::json!({}),
-            matched_text: "anchor".to_string(),
-            span: (0, 0),
-        };
-
-        let _ = bus.publish(Event::PatternDetected {
-            pane_id: 1,
-            pane_uuid: None,
-            detection,
-            event_id: None,
-        });
-
-        let event = detection_sub.recv().await.unwrap();
-        assert!(matches!(event, Event::PatternDetected { pane_id: 1, .. }));
-    }
-
-    #[tokio::test]
-    async fn subscriber_drop_decrements_count() {
-        let bus = EventBus::new(10);
-
-        {
-            let _sub1 = bus.subscribe();
-            let _sub2 = bus.subscribe();
-            assert_eq!(bus.subscriber_count(), 2);
-        }
-
-        // After subscribers are dropped
-        assert_eq!(bus.subscriber_count(), 0);
-
-        let metrics = bus.metrics().snapshot();
-        assert_eq!(metrics.active_subscribers, 0);
-    }
-
-    #[tokio::test]
-    async fn try_recv_returns_none_when_empty() {
-        let bus = EventBus::new(10);
-        let mut sub = bus.subscribe();
-
-        assert!(sub.try_recv().is_none());
-    }
-
-    #[tokio::test]
-    async fn try_recv_returns_event_when_available() {
-        let bus = EventBus::new(10);
-        let mut sub = bus.subscribe();
-
-        let _ = bus.publish(Event::PaneDisappeared { pane_id: 1 });
-
-        let result = sub.try_recv();
-        assert!(result.is_some());
-        assert!(matches!(
-            result.unwrap().unwrap(),
-            Event::PaneDisappeared { pane_id: 1 }
-        ));
-    }
-
-    #[tokio::test]
-    async fn backpressure_causes_lag() {
-        // Small capacity to trigger lag
-        let bus = EventBus::new(2);
-        let mut sub = bus.subscribe();
-
-        // Publish more events than capacity
-        for i in 0..5 {
-            let _ = bus.publish(Event::SegmentCaptured {
+            let _ = bus.publish(Event::PaneDiscovered {
                 pane_id: 1,
-                seq: i,
+                domain: "local".to_string(),
+                title: "shell".to_string(),
+            });
+
+            let event = sub.recv().await.unwrap();
+            assert!(matches!(event, Event::PaneDiscovered { pane_id: 1, .. }));
+        });
+    }
+
+    #[test]
+    fn multiple_subscribers_fanout() {
+        run_async_test(async {
+            let bus = EventBus::new(10);
+            let mut sub1 = bus.subscribe();
+            let mut sub2 = bus.subscribe();
+
+            assert_eq!(bus.subscriber_count(), 2);
+
+            let _ = bus.publish(Event::PaneDisappeared { pane_id: 42 });
+
+            let e1 = sub1.recv().await.unwrap();
+            let e2 = sub2.recv().await.unwrap();
+
+            assert!(matches!(e1, Event::PaneDisappeared { pane_id: 42 }));
+            assert!(matches!(e2, Event::PaneDisappeared { pane_id: 42 }));
+        });
+    }
+
+    #[test]
+    fn delta_subscriber_only_sees_delta_events() {
+        run_async_test(async {
+            let bus = EventBus::new(10);
+            let mut delta_sub = bus.subscribe_deltas();
+
+            let _ = bus.publish(Event::SegmentCaptured {
+                pane_id: 5,
+                seq: 1,
                 content_len: 10,
             });
-        }
 
-        // First recv should report lag
-        let result = sub.recv().await;
-        match result {
-            Err(RecvError::Lagged { missed_count }) => {
-                assert!(missed_count > 0);
-            }
-            Ok(_) => {
-                // Might get an event if timing works out, that's ok too
-            }
-            Err(RecvError::Closed) => panic!("unexpected close"),
-        }
+            let event = delta_sub.recv().await.unwrap();
+            assert!(matches!(event, Event::SegmentCaptured { pane_id: 5, .. }));
 
-        // Lag should be tracked in metrics
-        let metrics = bus.metrics().snapshot();
-        assert!(metrics.subscriber_lag_events > 0 || sub.lagged_count() > 0);
+            let _ = bus.publish(Event::PaneDiscovered {
+                pane_id: 5,
+                domain: "local".to_string(),
+                title: "shell".to_string(),
+            });
+
+            assert!(delta_sub.try_recv().is_none());
+        });
+    }
+
+    #[test]
+    fn detection_subscriber_receives_pattern_events() {
+        run_async_test(async {
+            let bus = EventBus::new(10);
+            let mut detection_sub = bus.subscribe_detections();
+
+            let detection = Detection {
+                rule_id: "codex.test".to_string(),
+                agent_type: crate::patterns::AgentType::Codex,
+                event_type: "test".to_string(),
+                severity: crate::patterns::Severity::Info,
+                confidence: 0.9,
+                extracted: serde_json::json!({}),
+                matched_text: "anchor".to_string(),
+                span: (0, 0),
+            };
+
+            let _ = bus.publish(Event::PatternDetected {
+                pane_id: 1,
+                pane_uuid: None,
+                detection,
+                event_id: None,
+            });
+
+            let event = detection_sub.recv().await.unwrap();
+            assert!(matches!(event, Event::PatternDetected { pane_id: 1, .. }));
+        });
+    }
+
+    #[test]
+    fn subscriber_drop_decrements_count() {
+        run_async_test(async {
+            let bus = EventBus::new(10);
+
+            {
+                let _sub1 = bus.subscribe();
+                let _sub2 = bus.subscribe();
+                assert_eq!(bus.subscriber_count(), 2);
+            }
+
+            // After subscribers are dropped
+            assert_eq!(bus.subscriber_count(), 0);
+
+            let metrics = bus.metrics().snapshot();
+            assert_eq!(metrics.active_subscribers, 0);
+        });
+    }
+
+    #[test]
+    fn try_recv_returns_none_when_empty() {
+        run_async_test(async {
+            let bus = EventBus::new(10);
+            let mut sub = bus.subscribe();
+
+            assert!(sub.try_recv().is_none());
+        });
+    }
+
+    #[test]
+    fn try_recv_returns_event_when_available() {
+        run_async_test(async {
+            let bus = EventBus::new(10);
+            let mut sub = bus.subscribe();
+
+            let _ = bus.publish(Event::PaneDisappeared { pane_id: 1 });
+
+            let result = sub.try_recv();
+            assert!(result.is_some());
+            assert!(matches!(
+                result.unwrap().unwrap(),
+                Event::PaneDisappeared { pane_id: 1 }
+            ));
+        });
+    }
+
+    #[test]
+    fn backpressure_causes_lag() {
+        run_async_test(async {
+            // Small capacity to trigger lag
+            let bus = EventBus::new(2);
+            let mut sub = bus.subscribe();
+
+            // Publish more events than capacity
+            for i in 0..5 {
+                let _ = bus.publish(Event::SegmentCaptured {
+                    pane_id: 1,
+                    seq: i,
+                    content_len: 10,
+                });
+            }
+
+            // First recv should report lag
+            let result = sub.recv().await;
+            match result {
+                Err(RecvError::Lagged { missed_count }) => {
+                    assert!(missed_count > 0);
+                }
+                Ok(_) => {
+                    // Might get an event if timing works out, that's ok too
+                }
+                Err(RecvError::Closed) => panic!("unexpected close"),
+            }
+
+            // Lag should be tracked in metrics
+            let metrics = bus.metrics().snapshot();
+            assert!(metrics.subscriber_lag_events > 0 || sub.lagged_count() > 0);
+        });
     }
 
     #[test]
@@ -1572,22 +1602,26 @@ mod tests {
         assert_eq!(bus.capacity(), 1000);
     }
 
-    #[tokio::test]
-    async fn recv_error_display() {
-        let err = RecvError::Closed;
-        assert_eq!(format!("{err}"), "event bus closed");
+    #[test]
+    fn recv_error_display() {
+        run_async_test(async {
+            let err = RecvError::Closed;
+            assert_eq!(format!("{err}"), "event bus closed");
 
-        let err = RecvError::Lagged { missed_count: 42 };
-        assert_eq!(format!("{err}"), "subscriber lagged, missed 42 events");
+            let err = RecvError::Lagged { missed_count: 42 };
+            assert_eq!(format!("{err}"), "subscriber lagged, missed 42 events");
+        });
     }
 
-    #[tokio::test]
-    async fn uptime_increases() {
-        let bus = EventBus::new(10);
-        let t1 = bus.uptime();
-        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
-        let t2 = bus.uptime();
-        assert!(t2 > t1);
+    #[test]
+    fn uptime_increases() {
+        run_async_test(async {
+            let bus = EventBus::new(10);
+            let t1 = bus.uptime();
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            let t2 = bus.uptime();
+            assert!(t2 > t1);
+        });
     }
 
     // ========================================================================

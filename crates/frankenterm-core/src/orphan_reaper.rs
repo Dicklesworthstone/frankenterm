@@ -315,6 +315,18 @@ fn kill_process(_pid: u32) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("create runtime");
+        runtime.block_on(future);
+    }
+
     #[test]
     fn parse_etime_seconds_only() {
         assert_eq!(parse_etime("42").unwrap(), 42);
@@ -641,49 +653,58 @@ mod tests {
 
     // ---- Async reap_orphans ----
 
-    #[tokio::test]
-    async fn reap_orphans_async_returns_report() {
-        let report = reap_orphans(999_999).await;
-        assert!(report.killed_pids.len() == report.killed);
+    #[test]
+    fn reap_orphans_async_returns_report() {
+        run_async_test(async {
+            let report = reap_orphans(999_999).await;
+            assert!(report.killed_pids.len() == report.killed);
+        });
     }
 
-    #[tokio::test]
-    async fn reap_orphans_async_zero_max_age() {
-        let report = reap_orphans(0).await;
-        assert!(report.killed_pids.len() == report.killed);
+    #[test]
+    fn reap_orphans_async_zero_max_age() {
+        run_async_test(async {
+            let report = reap_orphans(0).await;
+            assert!(report.killed_pids.len() == report.killed);
+        });
     }
 
     // ---- run_orphan_reaper disabled ----
 
-    #[tokio::test]
-    async fn run_orphan_reaper_disabled_returns_immediately() {
-        let mut config = CliConfig::default();
-        config.orphan_reap_interval_seconds = 0; // disabled
-        let shutdown = Arc::new(AtomicBool::new(false));
+    #[test]
+    fn run_orphan_reaper_disabled_returns_immediately() {
+        run_async_test(async {
+            let mut config = CliConfig::default();
+            config.orphan_reap_interval_seconds = 0; // disabled
+            let shutdown = Arc::new(AtomicBool::new(false));
 
-        // Should return immediately when interval is 0
-        let handle = crate::runtime_compat::task::spawn(run_orphan_reaper(config, shutdown));
-        let result = crate::runtime_compat::timeout(Duration::from_millis(100), handle).await;
-        assert!(result.is_ok(), "disabled reaper should return immediately");
+            // Should return immediately when interval is 0
+            let handle = crate::runtime_compat::task::spawn(run_orphan_reaper(config, shutdown));
+            let result = crate::runtime_compat::timeout(Duration::from_millis(100), handle).await;
+            assert!(result.is_ok(), "disabled reaper should return immediately");
+        });
     }
 
     // ---- run_orphan_reaper shutdown ----
 
-    #[tokio::test]
-    async fn run_orphan_reaper_responds_to_shutdown() {
-        let mut config = CliConfig::default();
-        config.orphan_reap_interval_seconds = 1; // 1 second interval
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
+    #[test]
+    fn run_orphan_reaper_responds_to_shutdown() {
+        run_async_test(async {
+            let mut config = CliConfig::default();
+            config.orphan_reap_interval_seconds = 1; // 1 second interval
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_clone = shutdown.clone();
 
-        let handle = crate::runtime_compat::task::spawn(run_orphan_reaper(config, shutdown_clone));
+            let handle =
+                crate::runtime_compat::task::spawn(run_orphan_reaper(config, shutdown_clone));
 
-        // Signal shutdown after a short delay
-        crate::runtime_compat::sleep(Duration::from_millis(50)).await;
-        shutdown.store(true, Ordering::Relaxed);
+            // Signal shutdown after a short delay
+            crate::runtime_compat::sleep(Duration::from_millis(50)).await;
+            shutdown.store(true, Ordering::Relaxed);
 
-        // Should exit within a reasonable time (after current sleep)
-        let result = crate::runtime_compat::timeout(Duration::from_secs(3), handle).await;
-        assert!(result.is_ok(), "reaper should respond to shutdown signal");
+            // Should exit within a reasonable time (after current sleep)
+            let result = crate::runtime_compat::timeout(Duration::from_secs(3), handle).await;
+            assert!(result.is_ok(), "reaper should respond to shutdown signal");
+        });
     }
 }

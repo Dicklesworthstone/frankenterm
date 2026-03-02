@@ -716,6 +716,7 @@ mod tests {
         RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
         RecorderIngressKind, RecorderTextEncoding,
     };
+    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1448,7 +1449,7 @@ mod tests {
         let storage = MockMigrationStorage::healthy();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = tokio::runtime::Builder::new_current_thread()
+        let manifest = RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .unwrap()

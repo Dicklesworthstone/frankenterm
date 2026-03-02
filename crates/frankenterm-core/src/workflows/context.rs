@@ -200,11 +200,11 @@ impl WorkflowContext {
     /// - Emits audit entries
     /// - Only sends if allowed
     ///
-    /// Note: The injector lock (tokio::sync::Mutex) is intentionally held across
+    /// Note: The injector lock (`runtime_compat::Mutex`) is intentionally held across
     /// the `.await` because `inject()` requires `&mut self` for the entire
     /// policy-check-then-send operation. This is safe because:
     /// 1. `inject()` does not re-acquire this lock (no re-entrant locking)
-    /// 2. tokio::sync::Mutex is designed for async contexts
+    /// 2. `runtime_compat::Mutex` is designed for async contexts
     /// 3. The lock ensures atomicity of policy evaluation + send
     pub async fn send_text(
         &mut self,
@@ -331,6 +331,7 @@ impl WorkflowContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
     #[allow(unused_imports)]
     use crate::storage::PaneRecord;
 
@@ -439,7 +440,10 @@ mod tests {
             retry_delay_ms: 500,
         };
         let cloned = config.clone();
-        assert_eq!(cloned.default_wait_timeout_ms, config.default_wait_timeout_ms);
+        assert_eq!(
+            cloned.default_wait_timeout_ms,
+            config.default_wait_timeout_ms
+        );
         assert_eq!(cloned.max_step_retries, config.max_step_retries);
         assert_eq!(cloned.retry_delay_ms, config.retry_delay_ms);
     }
@@ -452,16 +456,13 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
-            let tmp = std::env::temp_dir().join(format!(
-                "ft_test_ctx_{}_{}.db",
-                std::process::id(),
-                id,
-            ));
+            let tmp =
+                std::env::temp_dir().join(format!("ft_test_ctx_{}_{}.db", std::process::id(), id,));
             Arc::new(StorageHandle::new(tmp.to_str().unwrap()).await.unwrap())
         })
     }
@@ -469,12 +470,7 @@ mod tests {
     #[test]
     fn workflow_context_new_defaults() {
         let storage = make_storage();
-        let ctx = WorkflowContext::new(
-            storage,
-            42,
-            PaneCapabilities::prompt(),
-            "exec-001",
-        );
+        let ctx = WorkflowContext::new(storage, 42, PaneCapabilities::prompt(), "exec-001");
         assert_eq!(ctx.pane_id(), 42);
         assert_eq!(ctx.execution_id(), "exec-001");
         assert!(ctx.trigger().is_none());
@@ -487,12 +483,7 @@ mod tests {
     #[test]
     fn workflow_context_capabilities() {
         let storage = make_storage();
-        let ctx = WorkflowContext::new(
-            storage,
-            1,
-            PaneCapabilities::running(),
-            "exec-002",
-        );
+        let ctx = WorkflowContext::new(storage, 1, PaneCapabilities::running(), "exec-002");
         let caps = ctx.capabilities();
         assert!(caps.command_running);
     }
@@ -500,12 +491,7 @@ mod tests {
     #[test]
     fn workflow_context_update_capabilities() {
         let storage = make_storage();
-        let mut ctx = WorkflowContext::new(
-            storage,
-            1,
-            PaneCapabilities::unknown(),
-            "exec-003",
-        );
+        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "exec-003");
         assert!(!ctx.capabilities().prompt_active);
 
         ctx.update_capabilities(PaneCapabilities::prompt());
@@ -515,13 +501,8 @@ mod tests {
     #[test]
     fn workflow_context_with_trigger() {
         let storage = make_storage();
-        let ctx = WorkflowContext::new(
-            storage,
-            1,
-            PaneCapabilities::unknown(),
-            "exec-004",
-        )
-        .with_trigger(serde_json::json!({"rule_id": "test.detected"}));
+        let ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "exec-004")
+            .with_trigger(serde_json::json!({"rule_id": "test.detected"}));
 
         let trigger = ctx.trigger().unwrap();
         assert_eq!(trigger["rule_id"], "test.detected");
@@ -535,13 +516,8 @@ mod tests {
             max_step_retries: 10,
             retry_delay_ms: 5_000,
         };
-        let ctx = WorkflowContext::new(
-            storage,
-            1,
-            PaneCapabilities::unknown(),
-            "exec-005",
-        )
-        .with_config(custom_config);
+        let ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "exec-005")
+            .with_config(custom_config);
 
         assert_eq!(ctx.config().default_wait_timeout_ms, 120_000);
         assert_eq!(ctx.config().max_step_retries, 10);
@@ -552,12 +528,7 @@ mod tests {
     #[test]
     fn workflow_context_pane_meta_set_and_get() {
         let storage = make_storage();
-        let mut ctx = WorkflowContext::new(
-            storage,
-            1,
-            PaneCapabilities::unknown(),
-            "exec-006",
-        );
+        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "exec-006");
 
         // Default metadata is empty
         assert!(ctx.pane_meta().domain.is_none());
@@ -577,25 +548,15 @@ mod tests {
     fn workflow_context_storage_access() {
         let storage = make_storage();
         let expected_path = storage.db_path().to_string();
-        let ctx = WorkflowContext::new(
-            storage,
-            1,
-            PaneCapabilities::unknown(),
-            "exec-007",
-        );
+        let ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "exec-007");
         assert_eq!(ctx.storage().db_path(), expected_path);
     }
 
     #[test]
     fn workflow_context_clone() {
         let storage = make_storage();
-        let ctx = WorkflowContext::new(
-            storage,
-            99,
-            PaneCapabilities::alt_screen(),
-            "exec-008",
-        )
-        .with_trigger(serde_json::json!({"key": "value"}));
+        let ctx = WorkflowContext::new(storage, 99, PaneCapabilities::alt_screen(), "exec-008")
+            .with_trigger(serde_json::json!({"key": "value"}));
 
         let cloned = ctx.clone();
         assert_eq!(cloned.pane_id(), 99);
@@ -610,12 +571,7 @@ mod tests {
     #[test]
     fn workflow_context_set_action_plan() {
         let storage = make_storage();
-        let mut ctx = WorkflowContext::new(
-            storage,
-            1,
-            PaneCapabilities::unknown(),
-            "exec-009",
-        );
+        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "exec-009");
 
         assert!(!ctx.has_action_plan());
         assert!(ctx.action_plan().is_none());
@@ -643,12 +599,7 @@ mod tests {
     #[test]
     fn workflow_context_get_step_plan() {
         let storage = make_storage();
-        let mut ctx = WorkflowContext::new(
-            storage,
-            1,
-            PaneCapabilities::unknown(),
-            "exec-010",
-        );
+        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "exec-010");
 
         let plan = crate::plan::ActionPlan::builder("Plan", "ws-2")
             .add_step(crate::plan::StepPlan::new(
@@ -681,12 +632,7 @@ mod tests {
     #[test]
     fn workflow_context_get_step_idempotency_key() {
         let storage = make_storage();
-        let mut ctx = WorkflowContext::new(
-            storage,
-            1,
-            PaneCapabilities::unknown(),
-            "exec-011",
-        );
+        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "exec-011");
 
         let plan = crate::plan::ActionPlan::builder("Plan", "ws-3")
             .add_step(crate::plan::StepPlan::new(

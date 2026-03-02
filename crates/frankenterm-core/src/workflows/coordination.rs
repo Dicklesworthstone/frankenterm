@@ -1232,7 +1232,10 @@ mod tests {
         ];
         let groups = build_pane_groups(&panes, &PaneGroupStrategy::ByProject);
         assert_eq!(groups.len(), 3);
-        let a_group = groups.iter().find(|g| g.name == "/home/user/proj-a").unwrap();
+        let a_group = groups
+            .iter()
+            .find(|g| g.name == "/home/user/proj-a")
+            .unwrap();
         assert_eq!(a_group.pane_ids, vec![1, 3]);
         let unknown_group = groups.iter().find(|g| g.name == "unknown").unwrap();
         assert_eq!(unknown_group.pane_ids, vec![4]);
@@ -1272,7 +1275,10 @@ mod tests {
     #[test]
     fn infer_agent_claude() {
         assert_eq!(infer_agent_from_title("Claude Code"), Some("claude_code"));
-        assert_eq!(infer_agent_from_title("claude-code v2"), Some("claude_code"));
+        assert_eq!(
+            infer_agent_from_title("claude-code v2"),
+            Some("claude_code")
+        );
     }
 
     #[test]
@@ -1542,7 +1548,7 @@ mod tests {
         ];
         let texts = resolve_pause_texts(&panes);
         // All should be Ctrl-C (\x03)
-        for (_, text) in &texts {
+        for text in texts.values() {
             assert_eq!(*text, "\x03");
         }
     }
@@ -1663,9 +1669,7 @@ mod tests {
             snippet: "// TODO: fix this".to_string(),
             suggestion: "Address this TODO".to_string(),
         });
-        report
-            .counts
-            .insert("TODO/FIXME".to_string(), 1);
+        report.counts.insert("TODO/FIXME".to_string(), 1);
         let summary = report.human_summary();
         assert!(summary.contains("Found 1 items"));
         assert!(summary.contains("src/main.rs:42"));
@@ -1698,13 +1702,21 @@ mod tests {
         let dir = std::env::temp_dir().join("ft_coord_test_panic");
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("test.rs");
-        std::fs::write(&file, "let x = foo.unwrap();\nlet y = bar.expect(\"msg\");\n").unwrap();
+        std::fs::write(
+            &file,
+            "let x = foo.unwrap();\nlet y = bar.expect(\"msg\");\n",
+        )
+        .unwrap();
 
         let patterns = TextScanPatterns::new();
         let mut kind_counts = HashMap::new();
         let findings = scan_file_text(&file, &dir, &patterns, 10, &mut kind_counts);
 
-        assert!(findings.iter().any(|f| f.kind == UnstickFindingKind::PanicSite));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.kind == UnstickFindingKind::PanicSite)
+        );
         assert!(findings.len() >= 2);
 
         let _ = std::fs::remove_dir_all(&dir);

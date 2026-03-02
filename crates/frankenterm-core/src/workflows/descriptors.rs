@@ -961,11 +961,11 @@ steps:
 
     #[test]
     fn validate_empty_steps() {
-        let yaml = r#"
+        let yaml = r"
 workflow_schema_version: 1
 name: empty
 steps: []
-"#;
+";
         let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("at least one step"), "got: {msg}");
@@ -979,9 +979,7 @@ steps: []
                 "  - type: send_text\n    id: s{i}\n    text: \"x\"\n"
             ));
         }
-        let yaml = format!(
-            "workflow_schema_version: 1\nname: big\nsteps:\n{steps}"
-        );
+        let yaml = format!("workflow_schema_version: 1\nname: big\nsteps:\n{steps}");
         let err = WorkflowDescriptor::from_yaml_str(&yaml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("too many steps"), "got: {msg}");
@@ -1022,14 +1020,14 @@ steps:
 
     #[test]
     fn validate_sleep_too_long() {
-        let yaml = r#"
+        let yaml = r"
 workflow_schema_version: 1
 name: long_sleep
 steps:
   - type: sleep
     id: s1
     duration_ms: 999999
-"#;
+";
         let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("sleep duration_ms too large"), "got: {msg}");
@@ -1109,7 +1107,7 @@ steps:
 
     #[test]
     fn validate_loop_empty_body() {
-        let yaml = r#"
+        let yaml = r"
 workflow_schema_version: 1
 name: empty_loop
 steps:
@@ -1117,7 +1115,7 @@ steps:
     id: loop1
     count: 5
     body: []
-"#;
+";
         let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("at least one step"), "got: {msg}");
