@@ -608,4 +608,84 @@ resize_wrap_readability_gate_enabled = false
         assert!(!cfg.resize_wrap_scorecard_enabled);
         assert!(!cfg.resize_wrap_readability_gate_enabled);
     }
+
+    #[test]
+    fn ssh_domain_config_parses() {
+        let toml_str = r#"
+[[ssh_domains]]
+name = "production"
+remote_address = "10.0.0.5:22"
+username = "deploy"
+connect_automatically = false
+
+[[ssh_domains]]
+name = "staging"
+remote_address = "staging.example.com"
+"#;
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        )
+        .unwrap();
+        let domains = cfg.ssh_domains.expect("ssh_domains should be Some");
+        assert_eq!(domains.len(), 2);
+        assert_eq!(domains[0].name, "production");
+        assert_eq!(domains[0].remote_address, "10.0.0.5:22");
+        assert_eq!(domains[0].username.as_deref(), Some("deploy"));
+        assert!(!domains[0].connect_automatically);
+        assert_eq!(domains[1].name, "staging");
+        assert_eq!(domains[1].remote_address, "staging.example.com");
+        assert!(domains[1].username.is_none());
+    }
+
+    #[test]
+    fn ssh_domain_defaults_from_ssh_config() {
+        // When no ssh_domains specified, ssh_domains() auto-discovers from ~/.ssh/config
+        let toml_str = r#"
+scrollback_lines = 5000
+"#;
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        )
+        .unwrap();
+        // When not explicitly set, ssh_domains is None (auto-discovered at runtime)
+        assert!(cfg.ssh_domains.is_none());
+        // The ssh_domains() method will auto-discover; just verify the field is unset
+    }
+
+    #[test]
+    fn ssh_domain_with_options() {
+        let toml_str = r#"
+[[ssh_domains]]
+name = "custom"
+remote_address = "myhost.local"
+multiplexing = "None"
+no_agent_auth = true
+"#;
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        )
+        .unwrap();
+        let domains = cfg.ssh_domains.expect("ssh_domains should be Some");
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].name, "custom");
+        assert!(domains[0].no_agent_auth);
+    }
 }

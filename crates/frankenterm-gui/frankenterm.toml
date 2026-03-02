@@ -107,6 +107,25 @@ resize_wrap_readability_max_fallback_ratio_percent = 20
 # resize_wrap_kp_lookahead_limit = 64
 # resize_wrap_kp_max_dp_states = 8192
 
+# --- SSH Domains ---
+
+# SSH domains are auto-discovered from ~/.ssh/config by default.
+# Add explicit entries to override or add custom connections:
+#
+# [[ssh_domains]]
+# name = "production"
+# remote_address = "10.0.0.5:22"
+# username = "deploy"
+# # multiplexing = "WezTerm"  # "WezTerm" (mux) or "None" (direct SSH)
+# # ssh_backend = "LibSsh"    # "LibSsh" (default) or "Ssh2"
+# # connect_automatically = false
+# # default_prog = ["/bin/bash", "-l"]
+#
+# [[ssh_domains]]
+# name = "staging"
+# remote_address = "staging.example.com"
+# username = "admin"
+
 # --- Performance ---
 
 # Frame rate cap
