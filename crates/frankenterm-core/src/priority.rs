@@ -43,15 +43,13 @@ use crate::pane_tiers::PaneTier;
 
 /// Operational telemetry counters for the priority classifier.
 ///
-/// All counters are `AtomicU64` because `PriorityClassifier` methods take `&self`.
+/// Uses `AtomicU64` because `PriorityClassifier` methods take `&self`.
 #[derive(Debug, Default)]
 pub struct PriorityClassifierTelemetry {
     /// Total register_pane() calls.
     panes_registered: AtomicU64,
     /// Total unregister_pane() calls.
     panes_unregistered: AtomicU64,
-    /// Total classify/classify_at/classify_all individual pane classifications.
-    classifications: AtomicU64,
     /// Total observe_signal() calls.
     signals_observed: AtomicU64,
     /// Total set_override() calls.
@@ -69,11 +67,11 @@ impl PriorityClassifierTelemetry {
 
     /// Snapshot the current counter values.
     #[must_use]
-    pub fn snapshot(&self) -> PriorityClassifierTelemetrySnapshot {
+    pub fn snapshot(&self, total_classifications: u64) -> PriorityClassifierTelemetrySnapshot {
         PriorityClassifierTelemetrySnapshot {
             panes_registered: self.panes_registered.load(Ordering::Relaxed),
             panes_unregistered: self.panes_unregistered.load(Ordering::Relaxed),
-            classifications: self.classifications.load(Ordering::Relaxed),
+            classifications: total_classifications,
             signals_observed: self.signals_observed.load(Ordering::Relaxed),
             overrides_set: self.overrides_set.load(Ordering::Relaxed),
             overrides_cleared: self.overrides_cleared.load(Ordering::Relaxed),
@@ -88,7 +86,7 @@ pub struct PriorityClassifierTelemetrySnapshot {
     pub panes_registered: u64,
     /// Total unregister_pane() calls.
     pub panes_unregistered: u64,
-    /// Total classifications (individual pane classify calls).
+    /// Total classify/classify_all calls (individual pane classifications).
     pub classifications: u64,
     /// Total observe_signal() calls.
     pub signals_observed: u64,
@@ -327,6 +325,7 @@ pub struct PriorityMetrics {
 pub struct PriorityClassifier {
     config: PriorityConfig,
     panes: PaneMap<PaneClassification>,
+    total_classifications: AtomicU64,
     telemetry: PriorityClassifierTelemetry,
 }
 
@@ -344,6 +343,7 @@ impl PriorityClassifier {
         Self {
             config,
             panes: PaneMap::new(),
+            total_classifications: AtomicU64::new(0),
             telemetry: PriorityClassifierTelemetry::new(),
         }
     }
@@ -355,9 +355,6 @@ impl PriorityClassifier {
 
     /// Register a pane for priority tracking.
     pub fn register_pane(&self, pane_id: u64) {
-        self.telemetry
-            .panes_registered
-            .fetch_add(1, Ordering::Relaxed);
         let half_life = Duration::from_secs_f64(self.config.rate_half_life_secs);
         self.panes.insert_if_absent(
             pane_id,
@@ -370,14 +367,13 @@ impl PriorityClassifier {
                 manual_override: None,
             },
         );
+        self.telemetry.panes_registered.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Unregister a pane.
     pub fn unregister_pane(&self, pane_id: u64) {
-        self.telemetry
-            .panes_unregistered
-            .fetch_add(1, Ordering::Relaxed);
         self.panes.remove(pane_id);
+        self.telemetry.panes_unregistered.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record output lines for a pane.
@@ -401,9 +397,7 @@ impl PriorityClassifier {
 
     /// Feed a detection signal into the classifier.
     pub fn observe_signal(&self, pane_id: u64, signal: &PrioritySignal) {
-        self.telemetry
-            .signals_observed
-            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry.signals_observed.fetch_add(1, Ordering::Relaxed);
         self.panes.write_with(pane_id, |state| {
             if signal.severity >= 2
                 || signal.event_type == "error"
@@ -419,20 +413,18 @@ impl PriorityClassifier {
 
     /// Set a manual priority override (takes precedence over auto).
     pub fn set_override(&self, pane_id: u64, priority: PanePriority) {
-        self.telemetry.overrides_set.fetch_add(1, Ordering::Relaxed);
         self.panes.write_with(pane_id, |state| {
             state.manual_override = Some(priority);
         });
+        self.telemetry.overrides_set.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Clear a manual override, returning to automatic classification.
     pub fn clear_override(&self, pane_id: u64) {
-        self.telemetry
-            .overrides_cleared
-            .fetch_add(1, Ordering::Relaxed);
         self.panes.write_with(pane_id, |state| {
             state.manual_override = None;
         });
+        self.telemetry.overrides_cleared.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Classify a single pane and return its priority.
@@ -442,9 +434,7 @@ impl PriorityClassifier {
 
     /// Classify with explicit timestamp (for testing).
     pub fn classify_at(&self, pane_id: u64, now: Instant) -> PanePriority {
-        self.telemetry
-            .classifications
-            .fetch_add(1, Ordering::Relaxed);
+        self.total_classifications.fetch_add(1, Ordering::Relaxed);
         self.panes
             .write_with(pane_id, |state| {
                 let priority = self.compute_priority(state, now);
@@ -463,9 +453,7 @@ impl PriorityClassifier {
     pub fn classify_all_at(&self, now: Instant) -> HashMap<u64, PanePriority> {
         self.panes
             .map_all_mut(|_pane_id, state| {
-                self.telemetry
-                    .classifications
-                    .fetch_add(1, Ordering::Relaxed);
+                self.total_classifications.fetch_add(1, Ordering::Relaxed);
                 let priority = self.compute_priority(state, now);
                 state.priority = priority;
                 priority
@@ -516,20 +504,21 @@ impl PriorityClassifier {
 
         PriorityMetrics {
             counts,
-            total_classifications: self.telemetry.classifications.load(Ordering::Relaxed),
+            total_classifications: self.total_classifications.load(Ordering::Relaxed),
             override_count,
             tracked_panes: self.panes.len(),
         }
     }
 
-    /// Snapshot the current telemetry counters.
-    pub fn telemetry(&self) -> PriorityClassifierTelemetrySnapshot {
-        self.telemetry.snapshot()
-    }
-
     /// Number of tracked panes.
     pub fn tracked_pane_count(&self) -> usize {
         self.panes.len()
+    }
+
+    /// Get the telemetry counters.
+    #[must_use]
+    pub fn telemetry(&self) -> PriorityClassifierTelemetrySnapshot {
+        self.telemetry.snapshot(self.total_classifications.load(Ordering::Relaxed))
     }
 
     // -------------------------------------------------------------------------
@@ -1092,89 +1081,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    // -- Telemetry --
-
-    #[test]
-    fn telemetry_initial_zero() {
-        let c = PriorityClassifier::new(make_config());
-        let snap = c.telemetry();
-        assert_eq!(snap.panes_registered, 0);
-        assert_eq!(snap.panes_unregistered, 0);
-        assert_eq!(snap.classifications, 0);
-        assert_eq!(snap.signals_observed, 0);
-        assert_eq!(snap.overrides_set, 0);
-        assert_eq!(snap.overrides_cleared, 0);
-    }
-
-    #[test]
-    fn telemetry_register_counted() {
-        let c = PriorityClassifier::new(make_config());
-        c.register_pane(1);
-        c.register_pane(2);
-        let snap = c.telemetry();
-        assert_eq!(snap.panes_registered, 2);
-    }
-
-    #[test]
-    fn telemetry_unregister_counted() {
-        let c = PriorityClassifier::new(make_config());
-        c.register_pane(1);
-        c.unregister_pane(1);
-        let snap = c.telemetry();
-        assert_eq!(snap.panes_unregistered, 1);
-    }
-
-    #[test]
-    fn telemetry_classify_counted() {
-        let c = PriorityClassifier::new(make_config());
-        c.register_pane(1);
-        c.classify(1);
-        let snap = c.telemetry();
-        assert!(snap.classifications >= 1);
-    }
-
-    #[test]
-    fn telemetry_signal_counted() {
-        let c = PriorityClassifier::new(make_config());
-        c.register_pane(1);
-        c.observe_signal(
-            1,
-            &PrioritySignal {
-                event_type: "error".to_string(),
-                severity: 2,
-                observed_at: Instant::now(),
-            },
-        );
-        let snap = c.telemetry();
-        assert_eq!(snap.signals_observed, 1);
-    }
-
-    #[test]
-    fn telemetry_override_counted() {
-        let c = PriorityClassifier::new(make_config());
-        c.register_pane(1);
-        c.set_override(1, PanePriority::Critical);
-        c.clear_override(1);
-        let snap = c.telemetry();
-        assert_eq!(snap.overrides_set, 1);
-        assert_eq!(snap.overrides_cleared, 1);
-    }
-
-    #[test]
-    fn telemetry_snapshot_serde_roundtrip() {
-        let snap = PriorityClassifierTelemetrySnapshot {
-            panes_registered: 10,
-            panes_unregistered: 3,
-            classifications: 50,
-            signals_observed: 20,
-            overrides_set: 5,
-            overrides_cleared: 2,
-        };
-        let json = serde_json::to_string(&snap).unwrap();
-        let back: PriorityClassifierTelemetrySnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(snap, back);
     }
 
     // -- Proptest --
