@@ -835,6 +835,26 @@ pub mod process {
 #[cfg(feature = "asupersync-runtime")]
 pub mod io {
     pub use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Read some bytes from an async reader into `buf`, returning how many
+    /// bytes were read. Polyfill for tokio's `AsyncReadExt::read` which
+    /// asupersync does not yet provide.
+    pub async fn read<R: asupersync::io::AsyncRead + Unpin>(
+        reader: &mut R,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        std::future::poll_fn(|cx| {
+            let mut read_buf = asupersync::io::ReadBuf::new(buf);
+            match std::pin::Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
+                std::task::Poll::Ready(Ok(())) => {
+                    std::task::Poll::Ready(Ok(read_buf.filled().len()))
+                }
+                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        })
+        .await
+    }
 }
 
 /// Async I/O traits for the active runtime.
@@ -844,6 +864,15 @@ pub mod io {
 #[cfg(not(feature = "asupersync-runtime"))]
 pub mod io {
     pub use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Read some bytes from an async reader into `buf`, returning how many
+    /// bytes were read. Delegates to `AsyncReadExt::read`.
+    pub async fn read<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        <R as tokio::io::AsyncReadExt>::read(reader, buf).await
+    }
 }
 
 /// Async networking primitives for the active runtime.

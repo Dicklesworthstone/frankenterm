@@ -444,7 +444,8 @@ impl MetricsServer {
             );
         }
 
-        let listener = TcpListener::bind(&self.bind).await?;
+        let bind_addr = self.bind.clone();
+        let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let prefix = sanitize_prefix(&self.prefix);
         let collector = Arc::clone(&self.collector);
@@ -486,7 +487,7 @@ async fn handle_connection(
     collector: Arc<dyn MetricsCollector>,
 ) -> Result<()> {
     let mut buf = [0_u8; 8192];
-    let read_len = socket.read(&mut buf).await?;
+    let read_len = crate::runtime_compat::io::read(&mut socket, &mut buf).await?;
     if read_len == 0 {
         return Ok(());
     }
@@ -522,7 +523,14 @@ async fn handle_connection(
 
     // Explicitly shut down the write half to ensure the TCP connection is
     // terminated cleanly rather than relying on implicit drop.
-    let _ = socket.shutdown().await;
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let _ = socket.shutdown(std::net::Shutdown::Both);
+    }
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        let _ = socket.shutdown().await;
+    }
 
     Ok(())
 }
