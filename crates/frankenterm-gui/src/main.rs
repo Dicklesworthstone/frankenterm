@@ -56,9 +56,9 @@ struct Opt {
 }
 
 fn parse_config_override(s: &str) -> Result<(String, String), String> {
-    let eq_pos = s.find('=').ok_or_else(|| {
-        format!("expected 'name=value', got '{s}'")
-    })?;
+    let eq_pos = s
+        .find('=')
+        .ok_or_else(|| format!("expected 'name=value', got '{s}'"))?;
     Ok((s[..eq_pos].to_string(), s[eq_pos + 1..].to_string()))
 }
 
@@ -78,8 +78,7 @@ fn main() -> anyhow::Result<()> {
 
     // Validate vendored crate integration by exercising key types.
     // This proves the vendored mux/term/config crates are linked correctly.
-    validate_vendored_integration()
-        .context("vendored crate integration check failed")?;
+    validate_vendored_integration().context("vendored crate integration check failed")?;
 
     if opts.skip_config {
         tracing::info!("configuration loading skipped (--skip-config)");
@@ -113,29 +112,44 @@ fn main() -> anyhow::Result<()> {
 /// key types from mux, term, config, and codec.
 fn validate_vendored_integration() -> anyhow::Result<()> {
     // Exercise config types
-    let _config_key_assignment = config::keyassignment::KeyAssignment::Nop;
+    assert!(
+        matches!(
+            config::keyassignment::KeyAssignment::Nop,
+            config::keyassignment::KeyAssignment::Nop
+        ),
+        "config crate: KeyAssignment enum must be accessible"
+    );
     tracing::debug!("config crate: key assignment types accessible");
 
     // Exercise termwiz types
-    let _cell_attrs = termwiz::cell::CellAttributes::default();
+    let _ = termwiz::cell::CellAttributes::default();
     tracing::debug!("termwiz crate: cell attributes accessible");
 
     // Exercise codec types
-    let _pdu = codec::Pdu::Ping(codec::Ping {});
+    let _ = codec::Pdu::Ping(codec::Ping {});
     tracing::debug!("codec crate: PDU types accessible");
 
     // Exercise mux domain types
-    let _domain_type = mux::domain::DomainState::Detached;
+    assert!(
+        matches!(
+            mux::domain::DomainState::Detached,
+            mux::domain::DomainState::Detached
+        ),
+        "mux crate: DomainState enum must be accessible"
+    );
     tracing::debug!("mux crate: domain types accessible");
 
     // Exercise rangeset
     let mut rs = rangeset::RangeSet::new();
     rs.add_range(0..10);
-    assert!(rs.contains(5));
+    assert!(rs.contains(5), "rangeset: range operations must work");
     tracing::debug!("rangeset crate: range operations functional");
 
     // Exercise escape parser — verify the crate is linked
-    let _esc = frankenterm_escape_parser::Esc::Unspecified { intermediate: None, control: b'c' };
+    let _ = frankenterm_escape_parser::Esc::Unspecified {
+        intermediate: None,
+        control: b'c',
+    };
     tracing::debug!("escape-parser crate: Esc types accessible");
 
     tracing::info!("all vendored crate integration checks passed");
