@@ -2280,6 +2280,7 @@ enum RobotCommands {
     QuickStart,
 
     /// Get all panes as JSON
+    #[command(visible_aliases = ["status", "panes"])]
     State {
         /// Include pane text for each pane in the response
         #[arg(long)]
@@ -2295,6 +2296,7 @@ enum RobotCommands {
     },
 
     /// Get text from a pane
+    #[command(visible_aliases = ["read", "tail"])]
     GetText {
         /// Pane ID (single-pane mode)
         pane_id: Option<u64>,
@@ -2327,6 +2329,7 @@ enum RobotCommands {
     },
 
     /// Send text to a pane
+    #[command(visible_aliases = ["inject", "write"])]
     Send {
         /// Pane ID
         pane_id: u64,
@@ -2352,6 +2355,7 @@ enum RobotCommands {
     },
 
     /// Wait for a pattern in pane output
+    #[command(visible_aliases = ["await", "watch"])]
     WaitFor {
         /// Pane ID
         pane_id: u64,
@@ -2373,6 +2377,7 @@ enum RobotCommands {
     },
 
     /// Search captured output
+    #[command(visible_aliases = ["find", "grep"])]
     Search {
         /// FTS query
         query: String,
@@ -2425,6 +2430,7 @@ enum RobotCommands {
     },
 
     /// Get recent events
+    #[command(visible_aliases = ["event-log", "eventlog"])]
     Events {
         /// Maximum number of events to return
         #[arg(long, default_value = "20")]
@@ -7728,23 +7734,23 @@ fn build_robot_help() -> RobotHelp {
             },
             RobotCommandInfo {
                 name: "state",
-                description: "List panes with metadata (optionally include pane text)",
+                description: "List panes with metadata (aliases: status, panes)",
             },
             RobotCommandInfo {
                 name: "get-text",
-                description: "Fetch recent pane output (single pane or batch)",
+                description: "Fetch recent pane output (aliases: read, tail)",
             },
             RobotCommandInfo {
                 name: "send",
-                description: "Send text to a pane",
+                description: "Send text to a pane (aliases: inject, write)",
             },
             RobotCommandInfo {
                 name: "wait-for",
-                description: "Wait for a pattern on a pane",
+                description: "Wait for a pattern on a pane (aliases: await, watch)",
             },
             RobotCommandInfo {
                 name: "search",
-                description: "Search captured output",
+                description: "Search captured output (aliases: find, grep)",
             },
             RobotCommandInfo {
                 name: "search-explain",
@@ -7772,7 +7778,7 @@ fn build_robot_help() -> RobotHelp {
             },
             RobotCommandInfo {
                 name: "events",
-                description: "Fetch recent events (optional workflow preview)",
+                description: "Fetch recent events (aliases: event-log, eventlog)",
             },
             RobotCommandInfo {
                 name: "agents list",
@@ -8133,6 +8139,7 @@ fn build_robot_quick_start() -> RobotQuickStartData {
             "Use 'now' timestamp in responses to track freshness",
             "Pane IDs are stable within a backend session (current bridge: WezTerm) but may change across restarts",
             "Use --format toon for compact output when piping robot results between agents",
+            "NTM-compat aliases are supported: status->state, read->get-text, inject->send, await->wait-for",
         ],
         error_handling: QuickStartErrorHandling {
             common_codes: vec![
@@ -42204,6 +42211,28 @@ log_level = "debug"
     }
 
     #[test]
+    fn cli_robot_state_alias_status_parses() {
+        let cli = Cli::try_parse_from(["ft", "robot", "status"])
+            .expect("robot status alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::State {
+                    include_text,
+                    tail,
+                    escapes,
+                }) => {
+                    assert!(!include_text);
+                    assert_eq!(tail, 50);
+                    assert!(!escapes);
+                }
+                _ => panic!("expected RobotCommands::State"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
     fn cli_robot_agents_list_parses() {
         let cli = Cli::try_parse_from(["ft", "robot", "agents", "list"])
             .expect("robot agents list should parse");
@@ -42291,6 +42320,133 @@ log_level = "debug"
                     assert!(!escapes);
                 }
                 _ => panic!("expected RobotCommands::GetText"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_get_text_alias_read_parses() {
+        let cli = Cli::try_parse_from(["ft", "robot", "read", "3", "--tail", "12"])
+            .expect("robot read alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::GetText {
+                    pane_id,
+                    panes,
+                    all,
+                    tail,
+                    escapes,
+                }) => {
+                    assert_eq!(pane_id, Some(3));
+                    assert_eq!(panes, None);
+                    assert!(!all);
+                    assert_eq!(tail, 12);
+                    assert!(!escapes);
+                }
+                _ => panic!("expected RobotCommands::GetText"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_send_alias_inject_parses() {
+        let cli = Cli::try_parse_from(["ft", "robot", "inject", "2", "echo hi", "--dry-run"])
+            .expect("robot inject alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Send {
+                    pane_id,
+                    text,
+                    dry_run,
+                    wait_for,
+                    timeout_secs,
+                    wait_for_regex,
+                }) => {
+                    assert_eq!(pane_id, 2);
+                    assert_eq!(text, "echo hi");
+                    assert!(dry_run);
+                    assert_eq!(wait_for, None);
+                    assert_eq!(timeout_secs, 30);
+                    assert!(!wait_for_regex);
+                }
+                _ => panic!("expected RobotCommands::Send"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_wait_for_alias_await_parses() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "await",
+            "4",
+            "ready>",
+            "--timeout-secs",
+            "60",
+            "--regex",
+        ])
+        .expect("robot await alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::WaitFor {
+                    pane_id,
+                    pattern,
+                    timeout_secs,
+                    tail,
+                    regex,
+                }) => {
+                    assert_eq!(pane_id, 4);
+                    assert_eq!(pattern, "ready>");
+                    assert_eq!(timeout_secs, 60);
+                    assert_eq!(tail, 200);
+                    assert!(regex);
+                }
+                _ => panic!("expected RobotCommands::WaitFor"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_events_alias_event_log_parses() {
+        let cli = Cli::try_parse_from(["ft", "robot", "event-log", "--limit", "5"])
+            .expect("robot event-log alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Events {
+                    limit,
+                    pane,
+                    rule_id,
+                    event_type,
+                    triage_state,
+                    label,
+                    unhandled,
+                    since,
+                    would_handle,
+                    dry_run,
+                    command,
+                }) => {
+                    assert_eq!(limit, 5);
+                    assert_eq!(pane, None);
+                    assert_eq!(rule_id, None);
+                    assert_eq!(event_type, None);
+                    assert_eq!(triage_state, None);
+                    assert_eq!(label, None);
+                    assert!(!unhandled);
+                    assert_eq!(since, None);
+                    assert!(!would_handle);
+                    assert!(!dry_run);
+                    assert!(command.is_none());
+                }
+                _ => panic!("expected RobotCommands::Events"),
             },
             _ => panic!("expected Robot command"),
         }
