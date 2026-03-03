@@ -1,0 +1,1307 @@
+// =============================================================================
+// Native fleet launcher with weighted agent orchestration (ft-3681t.3.1)
+//
+// First-class fleet launch semantics: weighted model/program mix, role
+// allocation, startup orchestration, and deterministic topology initialization
+// backed by native mux profiles and the lifecycle engine.
+// =============================================================================
+
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::session_profiles::{
+    AgentIdentitySpec, ProfileRegistry, ProfileRole, SessionProfile, SpawnCommand,
+};
+use crate::session_topology::{
+    LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
+    MuxPaneLifecycleState, SessionLifecycleState, WindowLifecycleState,
+};
+
+// =============================================================================
+// Fleet specification types
+// =============================================================================
+
+/// Top-level specification for launching a fleet of agent panes.
+///
+/// A `FleetSpec` describes the desired fleet composition using weighted model/program
+/// mix entries and optional role constraints. The launcher resolves this into a
+/// concrete `LaunchPlan` with deterministic slot assignments.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FleetSpec {
+    /// Fleet name for identification and logging.
+    pub name: String,
+    /// Human-readable description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Workspace identifier for lifecycle registration.
+    pub workspace_id: String,
+    /// Domain for lifecycle identity (e.g., "local", "ssh:host").
+    #[serde(default = "default_domain")]
+    pub domain: String,
+    /// Weighted mix of agent programs/models to deploy.
+    pub mix: Vec<AgentMixEntry>,
+    /// Total number of panes to launch. If 0, derived from mix weights.
+    #[serde(default)]
+    pub total_panes: u32,
+    /// Fleet template name to use for layout (optional).
+    #[serde(default)]
+    pub fleet_template: Option<String>,
+    /// Working directory for all panes (unless overridden by profile).
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    /// Startup ordering strategy.
+    #[serde(default)]
+    pub startup_strategy: StartupStrategy,
+    /// Generation counter for lifecycle identity scoping.
+    #[serde(default = "default_generation")]
+    pub generation: u64,
+    /// Tags for the fleet.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+fn default_domain() -> String {
+    "local".to_string()
+}
+
+fn default_generation() -> u64 {
+    1
+}
+
+/// Weighted entry in the agent mix.
+///
+/// Each entry specifies a program/model combination with a weight that
+/// determines how many panes of this type are allocated relative to others.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentMixEntry {
+    /// Agent program (e.g., "claude-code", "codex-cli", "gemini-cli").
+    pub program: String,
+    /// Agent model (e.g., "opus-4.1", "gpt5-codex").
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Relative weight for this program/model combo (default 1).
+    #[serde(default = "default_mix_weight")]
+    pub weight: u32,
+    /// Profile to use for panes of this type (defaults to "agent-worker").
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Task description template. `{index}` is replaced with the slot index.
+    #[serde(default)]
+    pub task_template: Option<String>,
+    /// Extra environment variables for this entry.
+    #[serde(default)]
+    pub environment: HashMap<String, String>,
+    /// Role assignment for this entry.
+    #[serde(default)]
+    pub role: Option<ProfileRole>,
+}
+
+fn default_mix_weight() -> u32 {
+    1
+}
+
+/// Strategy for ordering pane startup within a fleet launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupStrategy {
+    /// Launch all panes simultaneously.
+    #[default]
+    Parallel,
+    /// Launch panes one at a time in order.
+    Sequential,
+    /// Launch panes in waves (groups determined by role priority).
+    Phased,
+}
+
+// =============================================================================
+// Launch plan types
+// =============================================================================
+
+/// A concrete, executable plan for launching a fleet.
+///
+/// Produced by `FleetLauncher::plan()` from a `FleetSpec`. Contains fully
+/// resolved slot assignments, lifecycle identities, and startup ordering.
+#[derive(Debug, Clone)]
+pub struct LaunchPlan {
+    /// Fleet name.
+    pub name: String,
+    /// Resolved pane slots in launch order.
+    pub slots: Vec<LaunchSlot>,
+    /// Layout template to apply (if any).
+    pub layout_template: Option<String>,
+    /// Startup strategy.
+    pub strategy: StartupStrategy,
+    /// Startup phases (used when strategy=Phased).
+    pub phases: Vec<LaunchPhase>,
+    /// Generation for lifecycle scoping.
+    pub generation: u64,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Domain.
+    pub domain: String,
+    /// When this plan was created (epoch ms).
+    pub planned_at: u64,
+    /// Validation warnings (non-fatal issues detected during planning).
+    pub warnings: Vec<String>,
+}
+
+/// A single slot in a launch plan.
+#[derive(Debug, Clone)]
+pub struct LaunchSlot {
+    /// Slot index (0-based, determines launch order for sequential).
+    pub index: u32,
+    /// Label for this slot.
+    pub label: String,
+    /// Agent identity spec for this slot.
+    pub agent_identity: AgentIdentitySpec,
+    /// Resolved profile for this pane.
+    pub profile: SessionProfile,
+    /// Merged environment variables.
+    pub environment: HashMap<String, String>,
+    /// Spawn command (from profile or mix entry).
+    pub spawn_command: Option<SpawnCommand>,
+    /// Working directory.
+    pub working_directory: Option<String>,
+    /// Bootstrap commands to run after spawn.
+    pub bootstrap_commands: Vec<String>,
+    /// Lifecycle identity for registry registration.
+    pub lifecycle_identity: LifecycleIdentity,
+    /// Phase index (for phased startup).
+    pub phase: u32,
+    /// Source mix entry index.
+    pub mix_entry_index: usize,
+}
+
+/// A launch phase groups slots that should start together.
+#[derive(Debug, Clone)]
+pub struct LaunchPhase {
+    /// Phase index (0-based).
+    pub index: u32,
+    /// Label for this phase.
+    pub label: String,
+    /// Slot indices in this phase.
+    pub slot_indices: Vec<u32>,
+}
+
+// =============================================================================
+// Launch outcome types
+// =============================================================================
+
+/// Outcome of executing a launch plan.
+#[derive(Debug, Clone)]
+pub struct LaunchOutcome {
+    /// Fleet name.
+    pub name: String,
+    /// Per-slot results.
+    pub slot_outcomes: Vec<SlotOutcome>,
+    /// Overall fleet status.
+    pub status: FleetLaunchStatus,
+    /// Lifecycle registry snapshot after registration.
+    pub registry_snapshot: Vec<crate::session_topology::LifecycleEntityRecord>,
+    /// When the launch completed (epoch ms).
+    pub completed_at: u64,
+    /// Total slots attempted.
+    pub total_slots: u32,
+    /// Slots successfully registered.
+    pub successful_slots: u32,
+    /// Slots that failed registration.
+    pub failed_slots: u32,
+}
+
+/// Per-slot outcome.
+#[derive(Debug, Clone)]
+pub struct SlotOutcome {
+    pub index: u32,
+    pub label: String,
+    pub status: SlotStatus,
+    pub lifecycle_identity: LifecycleIdentity,
+    pub error: Option<String>,
+}
+
+/// Status of a single slot launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotStatus {
+    /// Successfully registered in lifecycle engine.
+    Registered,
+    /// Failed to register.
+    Failed,
+    /// Skipped (e.g., due to earlier failure in sequential mode).
+    Skipped,
+}
+
+/// Overall fleet launch status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetLaunchStatus {
+    /// All slots launched successfully.
+    Complete,
+    /// Some slots failed but fleet is partially operational.
+    Partial,
+    /// All slots failed.
+    Failed,
+}
+
+// =============================================================================
+// Fleet launcher errors
+// =============================================================================
+
+/// Errors that can occur during fleet planning or launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetLaunchError {
+    /// Fleet spec has no mix entries.
+    EmptyMix,
+    /// Total weight is zero (all mix entries have weight 0).
+    ZeroWeight,
+    /// Referenced profile not found in registry.
+    ProfileNotFound(String),
+    /// Referenced fleet template not found.
+    TemplateNotFound(String),
+    /// Lifecycle registration failed for a slot.
+    RegistrationFailed { slot_index: u32, reason: String },
+    /// Fleet spec validation failed.
+    ValidationFailed(String),
+}
+
+impl std::fmt::Display for FleetLaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyMix => write!(f, "fleet spec has no mix entries"),
+            Self::ZeroWeight => write!(f, "total mix weight is zero"),
+            Self::ProfileNotFound(name) => {
+                write!(f, "profile '{name}' not found in registry")
+            }
+            Self::TemplateNotFound(name) => {
+                write!(f, "fleet template '{name}' not found in registry")
+            }
+            Self::RegistrationFailed { slot_index, reason } => {
+                write!(f, "slot {slot_index} registration failed: {reason}")
+            }
+            Self::ValidationFailed(msg) => write!(f, "fleet spec validation failed: {msg}"),
+        }
+    }
+}
+
+// =============================================================================
+// Fleet launcher
+// =============================================================================
+
+/// Orchestrates deterministic fleet launches from fleet specifications.
+///
+/// The launcher resolves a `FleetSpec` into a `LaunchPlan` using the profile
+/// registry for configuration and then executes the plan by registering
+/// entities in the lifecycle registry.
+#[derive(Debug)]
+pub struct FleetLauncher<'a> {
+    profile_registry: &'a ProfileRegistry,
+}
+
+impl<'a> FleetLauncher<'a> {
+    /// Create a new fleet launcher backed by a profile registry.
+    #[must_use]
+    pub fn new(profile_registry: &'a ProfileRegistry) -> Self {
+        Self { profile_registry }
+    }
+
+    /// Plan a fleet launch from a spec without executing it.
+    ///
+    /// Resolves weighted mix entries into concrete slot assignments, validates
+    /// all referenced profiles exist, and produces a `LaunchPlan` ready for
+    /// execution.
+    pub fn plan(&self, spec: &FleetSpec) -> Result<LaunchPlan, FleetLaunchError> {
+        // Validate spec
+        if spec.mix.is_empty() {
+            return Err(FleetLaunchError::EmptyMix);
+        }
+
+        let total_weight: u32 = spec.mix.iter().map(|e| e.weight).sum();
+        if total_weight == 0 {
+            return Err(FleetLaunchError::ZeroWeight);
+        }
+
+        // Determine total pane count
+        let total_panes = if spec.total_panes > 0 {
+            spec.total_panes
+        } else {
+            total_weight
+        };
+
+        // Validate referenced profiles
+        let mut warnings = Vec::new();
+        for (i, entry) in spec.mix.iter().enumerate() {
+            let profile_name = entry.profile.as_deref().unwrap_or("agent-worker");
+            if self.profile_registry.get_profile(profile_name).is_none() {
+                return Err(FleetLaunchError::ProfileNotFound(profile_name.to_string()));
+            }
+            if entry.weight == 0 {
+                warnings.push(format!("mix entry {i} ({}) has weight 0, will get no slots", entry.program));
+            }
+        }
+
+        // Validate fleet template if specified
+        if let Some(template_name) = &spec.fleet_template {
+            if self
+                .profile_registry
+                .get_fleet_template(template_name)
+                .is_none()
+            {
+                return Err(FleetLaunchError::TemplateNotFound(template_name.clone()));
+            }
+        }
+
+        // Allocate slots using weighted distribution
+        let allocations = allocate_weighted(total_panes, &spec.mix);
+
+        // Build launch slots
+        let mut slots = Vec::with_capacity(total_panes as usize);
+        let mut global_index: u32 = 0;
+
+        for (mix_idx, (entry, count)) in spec.mix.iter().zip(allocations.iter()).enumerate() {
+            for local_idx in 0..*count {
+                let profile_name = entry.profile.as_deref().unwrap_or("agent-worker");
+                let profile = self
+                    .profile_registry
+                    .get_profile(profile_name)
+                    .cloned()
+                    .expect("validated above");
+
+                // Build merged environment
+                let mut environment = profile.environment.clone();
+                for (k, v) in &entry.environment {
+                    environment.insert(k.clone(), v.clone());
+                }
+                environment.insert("FT_FLEET_NAME".to_string(), spec.name.clone());
+                environment.insert("FT_SLOT_INDEX".to_string(), global_index.to_string());
+                environment.insert("FT_MIX_ENTRY".to_string(), entry.program.clone());
+
+                // Build agent identity
+                let task = entry.task_template.as_ref().map(|t| {
+                    t.replace("{index}", &global_index.to_string())
+                        .replace("{local_index}", &local_idx.to_string())
+                        .replace("{program}", &entry.program)
+                });
+
+                let agent_identity = AgentIdentitySpec {
+                    program: entry.program.clone(),
+                    model: entry.model.clone(),
+                    task: task.or_else(|| {
+                        Some(format!("{} worker #{}", entry.program, global_index))
+                    }),
+                };
+
+                // Build label
+                let label = format!(
+                    "{}-{}-{}",
+                    spec.name,
+                    entry.program.replace(' ', "-"),
+                    local_idx
+                );
+
+                // Build lifecycle identity
+                let lifecycle_identity = LifecycleIdentity::new(
+                    LifecycleEntityKind::Pane,
+                    &spec.workspace_id,
+                    &spec.domain,
+                    u64::from(global_index),
+                    spec.generation,
+                );
+
+                // Determine phase for phased startup
+                let phase = match spec.startup_strategy {
+                    StartupStrategy::Phased => phase_for_role(
+                        entry.role.unwrap_or(profile.role),
+                    ),
+                    _ => 0,
+                };
+
+                // Determine working directory
+                let working_directory = spec
+                    .working_directory
+                    .clone()
+                    .or_else(|| profile.working_directory.clone());
+
+                slots.push(LaunchSlot {
+                    index: global_index,
+                    label,
+                    agent_identity,
+                    profile: profile.clone(),
+                    environment,
+                    spawn_command: profile.spawn_command.clone(),
+                    working_directory,
+                    bootstrap_commands: profile.bootstrap_commands.clone(),
+                    lifecycle_identity,
+                    phase,
+                    mix_entry_index: mix_idx,
+                });
+
+                global_index += 1;
+            }
+        }
+
+        // Build phases for phased startup
+        let phases = if spec.startup_strategy == StartupStrategy::Phased {
+            build_phases(&slots)
+        } else {
+            vec![LaunchPhase {
+                index: 0,
+                label: "all".to_string(),
+                slot_indices: (0..slots.len() as u32).collect(),
+            }]
+        };
+
+        Ok(LaunchPlan {
+            name: spec.name.clone(),
+            slots,
+            layout_template: spec.fleet_template.clone(),
+            strategy: spec.startup_strategy,
+            phases,
+            generation: spec.generation,
+            workspace_id: spec.workspace_id.clone(),
+            domain: spec.domain.clone(),
+            planned_at: epoch_ms(),
+            warnings,
+        })
+    }
+
+    /// Execute a launch plan by registering entities in the lifecycle registry.
+    ///
+    /// Creates session, window, and pane entities for each slot. Returns a
+    /// `LaunchOutcome` with per-slot results.
+    pub fn execute(
+        &self,
+        plan: &LaunchPlan,
+        registry: &mut LifecycleRegistry,
+    ) -> LaunchOutcome {
+        let timestamp = epoch_ms();
+        let mut slot_outcomes = Vec::with_capacity(plan.slots.len());
+        let mut successful: u32 = 0;
+        let mut failed: u32 = 0;
+
+        // Register session entity (one per fleet launch)
+        let session_identity = LifecycleIdentity::new(
+            LifecycleEntityKind::Session,
+            &plan.workspace_id,
+            &plan.domain,
+            0,
+            plan.generation,
+        );
+        let _ = registry.register_entity(
+            session_identity,
+            LifecycleState::Session(SessionLifecycleState::Active),
+            timestamp,
+        );
+
+        // Register window entity (one per fleet launch)
+        let window_identity = LifecycleIdentity::new(
+            LifecycleEntityKind::Window,
+            &plan.workspace_id,
+            &plan.domain,
+            0,
+            plan.generation,
+        );
+        let _ = registry.register_entity(
+            window_identity,
+            LifecycleState::Window(WindowLifecycleState::Active),
+            timestamp,
+        );
+
+        // Register pane entities per slot
+        for slot in &plan.slots {
+            let result = registry.register_entity(
+                slot.lifecycle_identity.clone(),
+                LifecycleState::Pane(MuxPaneLifecycleState::Provisioning),
+                timestamp,
+            );
+
+            match result {
+                Ok(_) => {
+                    successful += 1;
+                    slot_outcomes.push(SlotOutcome {
+                        index: slot.index,
+                        label: slot.label.clone(),
+                        status: SlotStatus::Registered,
+                        lifecycle_identity: slot.lifecycle_identity.clone(),
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    failed += 1;
+                    slot_outcomes.push(SlotOutcome {
+                        index: slot.index,
+                        label: slot.label.clone(),
+                        status: SlotStatus::Failed,
+                        lifecycle_identity: slot.lifecycle_identity.clone(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+
+        let status = if failed == 0 {
+            FleetLaunchStatus::Complete
+        } else if successful == 0 {
+            FleetLaunchStatus::Failed
+        } else {
+            FleetLaunchStatus::Partial
+        };
+
+        LaunchOutcome {
+            name: plan.name.clone(),
+            slot_outcomes,
+            status,
+            registry_snapshot: registry.snapshot(),
+            completed_at: epoch_ms(),
+            total_slots: plan.slots.len() as u32,
+            successful_slots: successful,
+            failed_slots: failed,
+        }
+    }
+
+    /// Plan and execute in one step.
+    pub fn launch(
+        &self,
+        spec: &FleetSpec,
+        registry: &mut LifecycleRegistry,
+    ) -> Result<LaunchOutcome, FleetLaunchError> {
+        let plan = self.plan(spec)?;
+        Ok(self.execute(&plan, registry))
+    }
+}
+
+// =============================================================================
+// Weighted allocation algorithm
+// =============================================================================
+
+/// Distribute `total` slots across mix entries proportional to their weights.
+///
+/// Uses largest-remainder method (Hamilton's method) for deterministic,
+/// proportionally fair allocation with no wasted slots.
+fn allocate_weighted(total: u32, mix: &[AgentMixEntry]) -> Vec<u32> {
+    if mix.is_empty() || total == 0 {
+        return vec![0; mix.len()];
+    }
+
+    let total_weight: u32 = mix.iter().map(|e| e.weight).sum();
+    if total_weight == 0 {
+        return vec![0; mix.len()];
+    }
+
+    let total_f = f64::from(total);
+    let weight_f = f64::from(total_weight);
+
+    // Compute exact quotas
+    let quotas: Vec<f64> = mix
+        .iter()
+        .map(|e| f64::from(e.weight) * total_f / weight_f)
+        .collect();
+
+    // Floor allocations
+    let mut allocations: Vec<u32> = quotas.iter().map(|q| *q as u32).collect();
+    let allocated: u32 = allocations.iter().sum();
+    let mut remainder = total.saturating_sub(allocated);
+
+    // Distribute remainders by largest fractional part
+    if remainder > 0 {
+        let mut fractional_parts: Vec<(usize, f64)> = quotas
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (i, q - f64::from(*q as u32)))
+            .collect();
+        fractional_parts.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (idx, _) in fractional_parts {
+            if remainder == 0 {
+                break;
+            }
+            allocations[idx] += 1;
+            remainder -= 1;
+        }
+    }
+
+    allocations
+}
+
+/// Determine launch phase for a role (lower phase = earlier startup).
+fn phase_for_role(role: ProfileRole) -> u32 {
+    match role {
+        ProfileRole::Service => 0,      // Services start first
+        ProfileRole::Monitor => 1,      // Monitors start second
+        ProfileRole::BuildRunner => 2,  // Build runners third
+        ProfileRole::AgentWorker => 3,  // Agent workers fourth
+        ProfileRole::TestRunner => 3,   // Test runners with agents
+        ProfileRole::DevShell => 4,     // Dev shells last
+        ProfileRole::Custom => 3,       // Custom roles with agents
+    }
+}
+
+/// Build launch phases from slot assignments.
+fn build_phases(slots: &[LaunchSlot]) -> Vec<LaunchPhase> {
+    let mut phase_map: HashMap<u32, Vec<u32>> = HashMap::new();
+    for slot in slots {
+        phase_map
+            .entry(slot.phase)
+            .or_default()
+            .push(slot.index);
+    }
+
+    let mut phases: Vec<LaunchPhase> = phase_map
+        .into_iter()
+        .map(|(index, slot_indices)| LaunchPhase {
+            index,
+            label: phase_label(index),
+            slot_indices,
+        })
+        .collect();
+    phases.sort_by_key(|p| p.index);
+    phases
+}
+
+fn phase_label(index: u32) -> String {
+    match index {
+        0 => "services".to_string(),
+        1 => "monitors".to_string(),
+        2 => "builders".to_string(),
+        3 => "workers".to_string(),
+        4 => "interactive".to_string(),
+        n => format!("phase-{n}"),
+    }
+}
+
+// =============================================================================
+// Utility
+// =============================================================================
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // -------------------------------------------------------------------------
+    // Helper: build a minimal profile registry with defaults
+    // -------------------------------------------------------------------------
+
+    fn test_registry() -> ProfileRegistry {
+        let mut reg = ProfileRegistry::new();
+        reg.register_defaults();
+        reg
+    }
+
+    fn basic_spec(name: &str, mix: Vec<AgentMixEntry>) -> FleetSpec {
+        FleetSpec {
+            name: name.to_string(),
+            description: None,
+            workspace_id: "test-workspace".to_string(),
+            domain: "local".to_string(),
+            mix,
+            total_panes: 0,
+            fleet_template: None,
+            working_directory: None,
+            startup_strategy: StartupStrategy::default(),
+            generation: 1,
+            tags: vec![],
+        }
+    }
+
+    fn agent_mix(program: &str, weight: u32) -> AgentMixEntry {
+        AgentMixEntry {
+            program: program.to_string(),
+            model: None,
+            weight,
+            profile: None,
+            task_template: None,
+            environment: HashMap::new(),
+            role: None,
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Weighted allocation tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn allocate_weighted_equal_weights() {
+        let mix = vec![agent_mix("a", 1), agent_mix("b", 1), agent_mix("c", 1)];
+        let alloc = allocate_weighted(6, &mix);
+        assert_eq!(alloc, vec![2, 2, 2]);
+    }
+
+    #[test]
+    fn allocate_weighted_unequal() {
+        let mix = vec![agent_mix("a", 3), agent_mix("b", 1)];
+        let alloc = allocate_weighted(8, &mix);
+        assert_eq!(alloc, vec![6, 2]);
+    }
+
+    #[test]
+    fn allocate_weighted_remainder_distribution() {
+        let mix = vec![agent_mix("a", 1), agent_mix("b", 1), agent_mix("c", 1)];
+        let alloc = allocate_weighted(7, &mix);
+        // 7/3 = 2.33 each; two entries get 3, one gets 2. Total must be 7.
+        let total: u32 = alloc.iter().sum();
+        assert_eq!(total, 7);
+        assert!(alloc.iter().all(|&a| a == 2 || a == 3));
+    }
+
+    #[test]
+    fn allocate_weighted_single_entry() {
+        let mix = vec![agent_mix("a", 5)];
+        let alloc = allocate_weighted(10, &mix);
+        assert_eq!(alloc, vec![10]);
+    }
+
+    #[test]
+    fn allocate_weighted_zero_total() {
+        let mix = vec![agent_mix("a", 1), agent_mix("b", 1)];
+        let alloc = allocate_weighted(0, &mix);
+        assert_eq!(alloc, vec![0, 0]);
+    }
+
+    #[test]
+    fn allocate_weighted_zero_weight_entry() {
+        let mix = vec![agent_mix("a", 3), agent_mix("b", 0), agent_mix("c", 1)];
+        let alloc = allocate_weighted(8, &mix);
+        assert_eq!(alloc[1], 0); // zero-weight gets no slots
+        let total: u32 = alloc.iter().sum();
+        assert_eq!(total, 8);
+    }
+
+    #[test]
+    fn allocate_weighted_empty_mix() {
+        let alloc = allocate_weighted(5, &[]);
+        assert!(alloc.is_empty());
+    }
+
+    #[test]
+    fn allocate_weighted_one_slot_three_entries() {
+        let mix = vec![agent_mix("a", 1), agent_mix("b", 1), agent_mix("c", 1)];
+        let alloc = allocate_weighted(1, &mix);
+        let total: u32 = alloc.iter().sum();
+        assert_eq!(total, 1);
+        // Exactly one entry gets a slot
+        assert_eq!(alloc.iter().filter(|&&a| a == 1).count(), 1);
+    }
+
+    #[test]
+    fn allocate_weighted_large_fleet() {
+        let mix = vec![
+            agent_mix("claude-code", 5),
+            agent_mix("codex-cli", 3),
+            agent_mix("gemini-cli", 2),
+        ];
+        let alloc = allocate_weighted(100, &mix);
+        assert_eq!(alloc, vec![50, 30, 20]);
+    }
+
+    #[test]
+    fn allocate_weighted_preserves_total() {
+        let mix = vec![
+            agent_mix("a", 7),
+            agent_mix("b", 3),
+            agent_mix("c", 11),
+            agent_mix("d", 2),
+        ];
+        for total in 1..=50 {
+            let alloc = allocate_weighted(total, &mix);
+            let sum: u32 = alloc.iter().sum();
+            assert_eq!(sum, total, "total mismatch for total={total}");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // FleetSpec validation tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn plan_empty_mix_fails() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("empty", vec![]);
+        assert_eq!(launcher.plan(&spec).unwrap_err(), FleetLaunchError::EmptyMix);
+    }
+
+    #[test]
+    fn plan_zero_weight_fails() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("zero", vec![agent_mix("a", 0)]);
+        assert_eq!(
+            launcher.plan(&spec).unwrap_err(),
+            FleetLaunchError::ZeroWeight
+        );
+    }
+
+    #[test]
+    fn plan_missing_profile_fails() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut entry = agent_mix("a", 1);
+        entry.profile = Some("nonexistent-profile".to_string());
+        let spec = basic_spec("bad-profile", vec![entry]);
+        assert!(matches!(
+            launcher.plan(&spec).unwrap_err(),
+            FleetLaunchError::ProfileNotFound(_)
+        ));
+    }
+
+    #[test]
+    fn plan_missing_fleet_template_fails() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut spec = basic_spec("bad-template", vec![agent_mix("a", 1)]);
+        spec.fleet_template = Some("nonexistent-template".to_string());
+        assert!(matches!(
+            launcher.plan(&spec).unwrap_err(),
+            FleetLaunchError::TemplateNotFound(_)
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // LaunchPlan tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn plan_single_entry_produces_correct_slots() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("single", vec![agent_mix("claude-code", 3)]);
+        let plan = launcher.plan(&spec).unwrap();
+
+        assert_eq!(plan.slots.len(), 3);
+        assert_eq!(plan.name, "single");
+        for (i, slot) in plan.slots.iter().enumerate() {
+            assert_eq!(slot.index, i as u32);
+            assert_eq!(slot.agent_identity.program, "claude-code");
+            assert_eq!(slot.lifecycle_identity.kind, LifecycleEntityKind::Pane);
+            assert_eq!(slot.lifecycle_identity.workspace_id, "test-workspace");
+            assert_eq!(slot.lifecycle_identity.domain, "local");
+        }
+    }
+
+    #[test]
+    fn plan_mixed_fleet_allocation() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mix = vec![agent_mix("claude-code", 2), agent_mix("codex-cli", 1)];
+        let mut spec = basic_spec("mixed", mix);
+        spec.total_panes = 6;
+
+        let plan = launcher.plan(&spec).unwrap();
+        assert_eq!(plan.slots.len(), 6);
+
+        let claude_count = plan
+            .slots
+            .iter()
+            .filter(|s| s.agent_identity.program == "claude-code")
+            .count();
+        let codex_count = plan
+            .slots
+            .iter()
+            .filter(|s| s.agent_identity.program == "codex-cli")
+            .count();
+        assert_eq!(claude_count, 4); // 2/3 * 6
+        assert_eq!(codex_count, 2); // 1/3 * 6
+    }
+
+    #[test]
+    fn plan_environment_variables_set() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut entry = agent_mix("claude-code", 1);
+        entry.environment.insert("CUSTOM_VAR".to_string(), "custom_val".to_string());
+        let spec = basic_spec("env-test", vec![entry]);
+        let plan = launcher.plan(&spec).unwrap();
+
+        let slot = &plan.slots[0];
+        assert_eq!(slot.environment.get("FT_FLEET_NAME").unwrap(), "env-test");
+        assert_eq!(slot.environment.get("FT_SLOT_INDEX").unwrap(), "0");
+        assert_eq!(slot.environment.get("CUSTOM_VAR").unwrap(), "custom_val");
+    }
+
+    #[test]
+    fn plan_task_template_expansion() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut entry = agent_mix("claude-code", 2);
+        entry.task_template = Some("{program} task #{index}".to_string());
+        let spec = basic_spec("task-tmpl", vec![entry]);
+        let plan = launcher.plan(&spec).unwrap();
+
+        assert_eq!(
+            plan.slots[0].agent_identity.task.as_deref(),
+            Some("claude-code task #0")
+        );
+        assert_eq!(
+            plan.slots[1].agent_identity.task.as_deref(),
+            Some("claude-code task #1")
+        );
+    }
+
+    #[test]
+    fn plan_working_directory_inheritance() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut spec = basic_spec("cwd", vec![agent_mix("a", 1)]);
+        spec.working_directory = Some("/projects/frankenterm".to_string());
+
+        let plan = launcher.plan(&spec).unwrap();
+        assert_eq!(
+            plan.slots[0].working_directory.as_deref(),
+            Some("/projects/frankenterm")
+        );
+    }
+
+    #[test]
+    fn plan_parallel_strategy_single_phase() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("parallel", vec![agent_mix("a", 3)]);
+        let plan = launcher.plan(&spec).unwrap();
+
+        assert_eq!(plan.strategy, StartupStrategy::Parallel);
+        assert_eq!(plan.phases.len(), 1);
+        assert_eq!(plan.phases[0].slot_indices.len(), 3);
+    }
+
+    #[test]
+    fn plan_phased_strategy_groups_by_role() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+
+        let mut monitor = agent_mix("log-viewer", 1);
+        monitor.role = Some(ProfileRole::Monitor);
+
+        let mut service = agent_mix("db-server", 1);
+        service.role = Some(ProfileRole::Service);
+
+        let worker = agent_mix("claude-code", 2);
+
+        let mut spec = basic_spec("phased", vec![monitor, service, worker]);
+        spec.startup_strategy = StartupStrategy::Phased;
+
+        let plan = launcher.plan(&spec).unwrap();
+        assert!(plan.phases.len() >= 2);
+
+        // Services (phase 0) should come before monitors (phase 1) before workers (phase 3)
+        let phase_indices: Vec<u32> = plan.phases.iter().map(|p| p.index).collect();
+        assert!(phase_indices.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn plan_lifecycle_identity_uniqueness() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("unique", vec![agent_mix("a", 5)]);
+        let plan = launcher.plan(&spec).unwrap();
+
+        let keys: Vec<String> = plan
+            .slots
+            .iter()
+            .map(|s| s.lifecycle_identity.stable_key())
+            .collect();
+        let unique_keys: std::collections::HashSet<&str> =
+            keys.iter().map(|s| s.as_str()).collect();
+        assert_eq!(keys.len(), unique_keys.len(), "lifecycle identities must be unique");
+    }
+
+    // -------------------------------------------------------------------------
+    // Launch execution tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn execute_registers_all_entities() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("exec-test", vec![agent_mix("claude-code", 3)]);
+        let plan = launcher.plan(&spec).unwrap();
+
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.execute(&plan, &mut lifecycle);
+
+        assert_eq!(outcome.status, FleetLaunchStatus::Complete);
+        assert_eq!(outcome.total_slots, 3);
+        assert_eq!(outcome.successful_slots, 3);
+        assert_eq!(outcome.failed_slots, 0);
+
+        // 1 session + 1 window + 3 panes = 5 entities
+        assert_eq!(lifecycle.len(), 5);
+    }
+
+    #[test]
+    fn execute_panes_start_in_provisioning() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("prov-test", vec![agent_mix("a", 2)]);
+        let plan = launcher.plan(&spec).unwrap();
+
+        let mut lifecycle = LifecycleRegistry::new();
+        launcher.execute(&plan, &mut lifecycle);
+
+        for slot in &plan.slots {
+            let record = lifecycle.get(&slot.lifecycle_identity).unwrap();
+            assert_eq!(
+                record.state,
+                LifecycleState::Pane(MuxPaneLifecycleState::Provisioning)
+            );
+        }
+    }
+
+    #[test]
+    fn launch_convenience_method() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("launch", vec![agent_mix("claude-code", 2)]);
+
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+
+        assert_eq!(outcome.status, FleetLaunchStatus::Complete);
+        assert_eq!(outcome.successful_slots, 2);
+    }
+
+    #[test]
+    fn slot_outcomes_match_plan_slots() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("match", vec![agent_mix("a", 3), agent_mix("b", 2)]);
+
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+
+        assert_eq!(outcome.slot_outcomes.len(), 5);
+        for outcome_slot in &outcome.slot_outcomes {
+            assert_eq!(outcome_slot.status, SlotStatus::Registered);
+            assert!(outcome_slot.error.is_none());
+        }
+    }
+
+    #[test]
+    fn fleet_launch_status_all_success() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("ok", vec![agent_mix("a", 1)]);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+        assert_eq!(outcome.status, FleetLaunchStatus::Complete);
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase and role tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn phase_for_role_ordering() {
+        // Services < Monitors < BuildRunners < AgentWorkers/TestRunners < DevShells
+        assert!(phase_for_role(ProfileRole::Service) < phase_for_role(ProfileRole::Monitor));
+        assert!(phase_for_role(ProfileRole::Monitor) < phase_for_role(ProfileRole::BuildRunner));
+        assert!(phase_for_role(ProfileRole::BuildRunner) < phase_for_role(ProfileRole::AgentWorker));
+        assert_eq!(phase_for_role(ProfileRole::AgentWorker), phase_for_role(ProfileRole::TestRunner));
+        assert!(phase_for_role(ProfileRole::AgentWorker) < phase_for_role(ProfileRole::DevShell));
+    }
+
+    #[test]
+    fn phase_labels_descriptive() {
+        assert_eq!(phase_label(0), "services");
+        assert_eq!(phase_label(1), "monitors");
+        assert_eq!(phase_label(2), "builders");
+        assert_eq!(phase_label(3), "workers");
+        assert_eq!(phase_label(4), "interactive");
+        assert_eq!(phase_label(99), "phase-99");
+    }
+
+    // -------------------------------------------------------------------------
+    // StartupStrategy tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn startup_strategy_serde_roundtrip() {
+        let strategies = vec![
+            StartupStrategy::Parallel,
+            StartupStrategy::Sequential,
+            StartupStrategy::Phased,
+        ];
+        for strategy in &strategies {
+            let json = serde_json::to_string(strategy).unwrap();
+            let deserialized: StartupStrategy = serde_json::from_str(&json).unwrap();
+            assert_eq!(strategy, &deserialized);
+        }
+    }
+
+    #[test]
+    fn startup_strategy_default_is_parallel() {
+        assert_eq!(StartupStrategy::default(), StartupStrategy::Parallel);
+    }
+
+    // -------------------------------------------------------------------------
+    // FleetSpec serde tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn fleet_spec_serde_roundtrip() {
+        let spec = FleetSpec {
+            name: "test-fleet".to_string(),
+            description: Some("A test fleet".to_string()),
+            workspace_id: "ws-1".to_string(),
+            domain: "local".to_string(),
+            mix: vec![AgentMixEntry {
+                program: "claude-code".to_string(),
+                model: Some("opus-4.1".to_string()),
+                weight: 3,
+                profile: Some("agent-worker".to_string()),
+                task_template: Some("task #{index}".to_string()),
+                environment: {
+                    let mut env = HashMap::new();
+                    env.insert("KEY".to_string(), "val".to_string());
+                    env
+                },
+                role: Some(ProfileRole::AgentWorker),
+            }],
+            total_panes: 6,
+            fleet_template: None,
+            working_directory: Some("/project".to_string()),
+            startup_strategy: StartupStrategy::Phased,
+            generation: 2,
+            tags: vec!["test".to_string()],
+        };
+
+        let json = serde_json::to_string_pretty(&spec).unwrap();
+        let deserialized: FleetSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(spec, deserialized);
+    }
+
+    #[test]
+    fn fleet_spec_minimal_deserialize() {
+        let json = r#"{
+            "name": "minimal",
+            "workspace_id": "ws",
+            "mix": [{"program": "claude-code"}]
+        }"#;
+        let spec: FleetSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.name, "minimal");
+        assert_eq!(spec.domain, "local");
+        assert_eq!(spec.mix[0].weight, 1);
+        assert_eq!(spec.startup_strategy, StartupStrategy::Parallel);
+        assert_eq!(spec.generation, 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Edge case tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn plan_total_panes_override() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut spec = basic_spec("override", vec![agent_mix("a", 1), agent_mix("b", 1)]);
+        spec.total_panes = 10;
+
+        let plan = launcher.plan(&spec).unwrap();
+        assert_eq!(plan.slots.len(), 10);
+        // Equal weights with 10 total = 5 each
+        let a_count = plan
+            .slots
+            .iter()
+            .filter(|s| s.agent_identity.program == "a")
+            .count();
+        assert_eq!(a_count, 5);
+    }
+
+    #[test]
+    fn plan_generation_propagation() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut spec = basic_spec("gen-test", vec![agent_mix("a", 1)]);
+        spec.generation = 42;
+
+        let plan = launcher.plan(&spec).unwrap();
+        assert_eq!(plan.generation, 42);
+        assert_eq!(plan.slots[0].lifecycle_identity.generation, 42);
+    }
+
+    #[test]
+    fn plan_mix_entry_index_tracking() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mix = vec![agent_mix("a", 2), agent_mix("b", 1)];
+        let spec = basic_spec("idx-test", mix);
+
+        let plan = launcher.plan(&spec).unwrap();
+        assert_eq!(plan.slots[0].mix_entry_index, 0);
+        assert_eq!(plan.slots[1].mix_entry_index, 0);
+        assert_eq!(plan.slots[2].mix_entry_index, 1);
+    }
+
+    #[test]
+    fn plan_with_model_specification() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut entry = agent_mix("claude-code", 1);
+        entry.model = Some("opus-4.1".to_string());
+        let spec = basic_spec("model-test", vec![entry]);
+
+        let plan = launcher.plan(&spec).unwrap();
+        assert_eq!(
+            plan.slots[0].agent_identity.model.as_deref(),
+            Some("opus-4.1")
+        );
+    }
+
+    #[test]
+    fn plan_warnings_for_zero_weight_entry() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mix = vec![agent_mix("a", 1), agent_mix("b", 0)];
+        let spec = basic_spec("warn-test", mix);
+        let plan = launcher.plan(&spec).unwrap();
+        assert!(!plan.warnings.is_empty());
+        assert!(plan.warnings[0].contains("weight 0"));
+    }
+
+    #[test]
+    fn execute_session_and_window_entities() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("session-test", vec![agent_mix("a", 1)]);
+        let plan = launcher.plan(&spec).unwrap();
+        let mut lifecycle = LifecycleRegistry::new();
+        launcher.execute(&plan, &mut lifecycle);
+
+        // Verify session entity exists
+        let session_id = LifecycleIdentity::new(
+            LifecycleEntityKind::Session,
+            "test-workspace",
+            "local",
+            0,
+            1,
+        );
+        let session = lifecycle.get(&session_id).unwrap();
+        assert_eq!(
+            session.state,
+            LifecycleState::Session(SessionLifecycleState::Active)
+        );
+
+        // Verify window entity exists
+        let window_id = LifecycleIdentity::new(
+            LifecycleEntityKind::Window,
+            "test-workspace",
+            "local",
+            0,
+            1,
+        );
+        let window = lifecycle.get(&window_id).unwrap();
+        assert_eq!(
+            window.state,
+            LifecycleState::Window(WindowLifecycleState::Active)
+        );
+    }
+}
