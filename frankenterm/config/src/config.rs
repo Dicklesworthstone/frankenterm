@@ -2461,3 +2461,485 @@ fn default_macos_forward_mods() -> Modifiers {
 fn default_colr_rasterizer() -> FontRasterizerSelection {
     FontRasterizerSelection::Harfbuzz
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, Value};
+
+    // ── DroppedFileQuoting::escape ─────────────────────────────
+
+    #[test]
+    fn dropped_file_quoting_none_passthrough() {
+        assert_eq!(DroppedFileQuoting::None.escape("hello world"), "hello world");
+    }
+
+    #[test]
+    fn dropped_file_quoting_none_preserves_special_chars() {
+        assert_eq!(
+            DroppedFileQuoting::None.escape("file name!@#$%"),
+            "file name!@#$%"
+        );
+    }
+
+    #[test]
+    fn dropped_file_quoting_spaces_only_escapes_spaces() {
+        assert_eq!(
+            DroppedFileQuoting::SpacesOnly.escape("hello world"),
+            "hello\\ world"
+        );
+    }
+
+    #[test]
+    fn dropped_file_quoting_spaces_only_no_change_when_no_spaces() {
+        assert_eq!(
+            DroppedFileQuoting::SpacesOnly.escape("no-spaces"),
+            "no-spaces"
+        );
+    }
+
+    #[test]
+    fn dropped_file_quoting_posix_quotes_spaces() {
+        let result = DroppedFileQuoting::Posix.escape("hello world");
+        // shlex should quote strings with spaces
+        assert!(result.contains("hello"), "expected hello in {result}");
+        assert!(result.contains("world"), "expected world in {result}");
+    }
+
+    #[test]
+    fn dropped_file_quoting_posix_no_change_for_simple() {
+        assert_eq!(DroppedFileQuoting::Posix.escape("simple"), "simple");
+    }
+
+    #[test]
+    fn dropped_file_quoting_windows_quotes_spaces() {
+        let result = DroppedFileQuoting::Windows.escape("hello world");
+        assert_eq!(result, "\"hello world\"");
+    }
+
+    #[test]
+    fn dropped_file_quoting_windows_no_quote_simple() {
+        assert_eq!(DroppedFileQuoting::Windows.escape("simple"), "simple");
+    }
+
+    #[test]
+    fn dropped_file_quoting_windows_quotes_tab() {
+        let result = DroppedFileQuoting::Windows.escape("has\ttab");
+        assert_eq!(result, "\"has\ttab\"");
+    }
+
+    #[test]
+    fn dropped_file_quoting_windows_always_quoted() {
+        assert_eq!(
+            DroppedFileQuoting::WindowsAlwaysQuoted.escape("simple"),
+            "\"simple\""
+        );
+    }
+
+    #[test]
+    fn dropped_file_quoting_default_platform() {
+        let dfq = DroppedFileQuoting::default();
+        if cfg!(windows) {
+            assert_eq!(dfq.escape("a b"), "\"a b\"");
+        } else {
+            assert_eq!(dfq.escape("a b"), "a\\ b");
+        }
+    }
+
+    // ── DefaultCursorStyle::effective_shape ─────────────────────
+
+    #[test]
+    fn effective_shape_default_becomes_steady_block() {
+        let style = DefaultCursorStyle::SteadyBlock;
+        assert_eq!(
+            style.effective_shape(CursorShape::Default),
+            CursorShape::SteadyBlock
+        );
+    }
+
+    #[test]
+    fn effective_shape_default_becomes_blinking_bar() {
+        let style = DefaultCursorStyle::BlinkingBar;
+        assert_eq!(
+            style.effective_shape(CursorShape::Default),
+            CursorShape::BlinkingBar
+        );
+    }
+
+    #[test]
+    fn effective_shape_default_becomes_blinking_underline() {
+        let style = DefaultCursorStyle::BlinkingUnderline;
+        assert_eq!(
+            style.effective_shape(CursorShape::Default),
+            CursorShape::BlinkingUnderline
+        );
+    }
+
+    #[test]
+    fn effective_shape_nondefault_preserved() {
+        let style = DefaultCursorStyle::SteadyBlock;
+        assert_eq!(
+            style.effective_shape(CursorShape::BlinkingBar),
+            CursorShape::BlinkingBar
+        );
+    }
+
+    #[test]
+    fn effective_shape_steady_underline() {
+        let style = DefaultCursorStyle::SteadyUnderline;
+        assert_eq!(
+            style.effective_shape(CursorShape::Default),
+            CursorShape::SteadyUnderline
+        );
+    }
+
+    #[test]
+    fn effective_shape_blinking_block() {
+        let style = DefaultCursorStyle::BlinkingBlock;
+        assert_eq!(
+            style.effective_shape(CursorShape::Default),
+            CursorShape::BlinkingBlock
+        );
+    }
+
+    #[test]
+    fn effective_shape_steady_bar() {
+        let style = DefaultCursorStyle::SteadyBar;
+        assert_eq!(
+            style.effective_shape(CursorShape::Default),
+            CursorShape::SteadyBar
+        );
+    }
+
+    // ── validate_domain_name ───────────────────────────────────
+
+    #[test]
+    fn validate_domain_name_local_is_rejected() {
+        assert!(validate_domain_name("local").is_err());
+    }
+
+    #[test]
+    fn validate_domain_name_empty_is_rejected() {
+        assert!(validate_domain_name("").is_err());
+    }
+
+    #[test]
+    fn validate_domain_name_valid_passes() {
+        assert!(validate_domain_name("my-domain").is_ok());
+    }
+
+    #[test]
+    fn validate_domain_name_single_char_passes() {
+        assert!(validate_domain_name("x").is_ok());
+    }
+
+    // ── validate_row_or_col ────────────────────────────────────
+
+    #[test]
+    fn validate_row_or_col_zero_rejected() {
+        assert!(validate_row_or_col(&0).is_err());
+    }
+
+    #[test]
+    fn validate_row_or_col_one_accepted() {
+        assert!(validate_row_or_col(&1).is_ok());
+    }
+
+    #[test]
+    fn validate_row_or_col_large_accepted() {
+        assert!(validate_row_or_col(&1000).is_ok());
+    }
+
+    // ── validate_line_height ───────────────────────────────────
+
+    #[test]
+    fn validate_line_height_zero_rejected() {
+        assert!(validate_line_height(&0.0).is_err());
+    }
+
+    #[test]
+    fn validate_line_height_negative_rejected() {
+        assert!(validate_line_height(&-1.0).is_err());
+    }
+
+    #[test]
+    fn validate_line_height_positive_accepted() {
+        assert!(validate_line_height(&1.5).is_ok());
+    }
+
+    // ── default_hyperlink_rules ────────────────────────────────
+
+    #[test]
+    fn default_hyperlink_rules_returns_six_rules() {
+        let rules = default_hyperlink_rules();
+        assert_eq!(rules.len(), 6, "expected 6 default hyperlink rules");
+    }
+
+    // ── default_*() helpers ────────────────────────────────────
+
+    #[test]
+    fn default_read_timeout_is_sixty_seconds() {
+        assert_eq!(default_read_timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn default_write_timeout_is_sixty_seconds() {
+        assert_eq!(default_write_timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn default_local_echo_threshold_ms_is_some_100() {
+        assert_eq!(default_local_echo_threshold_ms(), Some(100));
+    }
+
+    #[test]
+    fn default_font_size_is_twelve() {
+        assert_eq!(default_font_size(), 12.0);
+    }
+
+    #[test]
+    fn default_term_is_xterm_256color() {
+        assert_eq!(default_term(), "xterm-256color");
+    }
+
+    #[test]
+    fn default_initial_rows_is_24() {
+        assert_eq!(default_initial_rows(), 24);
+    }
+
+    #[test]
+    fn default_initial_cols_is_80() {
+        assert_eq!(default_initial_cols(), 80);
+    }
+
+    #[test]
+    fn default_unicode_version_is_nine() {
+        assert_eq!(default_unicode_version(), 9);
+    }
+
+    #[test]
+    fn default_anim_fps_is_ten() {
+        assert_eq!(default_anim_fps(), 10);
+    }
+
+    #[test]
+    fn default_mux_env_remove_contains_ssh_auth_sock() {
+        let removes = default_mux_env_remove();
+        assert!(removes.contains(&"SSH_AUTH_SOCK".to_string()));
+    }
+
+    #[test]
+    fn default_gui_startup_args_starts_with_start() {
+        let args = default_gui_startup_args();
+        assert_eq!(args, vec!["start"]);
+    }
+
+    #[test]
+    fn default_harfbuzz_features_contains_kern() {
+        let features = default_harfbuzz_features();
+        assert!(features.contains(&"kern".to_string()));
+        assert!(features.contains(&"liga".to_string()));
+        assert!(features.contains(&"clig".to_string()));
+    }
+
+    // ── WindowPadding::default ─────────────────────────────────
+
+    #[test]
+    fn window_padding_default_values() {
+        let pad = WindowPadding::default();
+        assert_eq!(pad.left, Dimension::Cells(1.0));
+        assert_eq!(pad.right, Dimension::Cells(1.0));
+        assert_eq!(pad.top, Dimension::Cells(0.5));
+        assert_eq!(pad.bottom, Dimension::Cells(0.5));
+    }
+
+    // ── DefaultCursorStyle::default ────────────────────────────
+
+    #[test]
+    fn default_cursor_style_is_steady_block() {
+        let style = DefaultCursorStyle::default();
+        matches!(style, DefaultCursorStyle::SteadyBlock);
+    }
+
+    // ── ExitBehavior ───────────────────────────────────────────
+
+    #[test]
+    fn exit_behavior_default_is_close() {
+        assert_eq!(ExitBehavior::default(), ExitBehavior::Close);
+    }
+
+    #[test]
+    fn exit_behavior_eq() {
+        assert_ne!(ExitBehavior::Close, ExitBehavior::Hold);
+        assert_ne!(ExitBehavior::Close, ExitBehavior::CloseOnCleanExit);
+    }
+
+    // ── ExitBehaviorMessaging ──────────────────────────────────
+
+    #[test]
+    fn exit_behavior_messaging_default_is_verbose() {
+        assert_eq!(
+            ExitBehaviorMessaging::default(),
+            ExitBehaviorMessaging::Verbose
+        );
+    }
+
+    // ── WindowCloseConfirmation ────────────────────────────────
+
+    #[test]
+    fn window_close_confirmation_default_is_always_prompt() {
+        matches!(
+            WindowCloseConfirmation::default(),
+            WindowCloseConfirmation::AlwaysPrompt
+        );
+    }
+
+    // ── BoldBrightening ────────────────────────────────────────
+
+    #[test]
+    fn bold_brightening_default_is_bright_and_bold() {
+        matches!(BoldBrightening::default(), BoldBrightening::BrightAndBold);
+    }
+
+    #[test]
+    fn bold_brightening_from_dynamic_string_no() {
+        let val = Value::String("No".into());
+        let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        matches!(result, BoldBrightening::No);
+    }
+
+    #[test]
+    fn bold_brightening_from_dynamic_string_bright_only() {
+        let val = Value::String("BrightOnly".into());
+        let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        matches!(result, BoldBrightening::BrightOnly);
+    }
+
+    #[test]
+    fn bold_brightening_from_dynamic_bool_true() {
+        let val = Value::Bool(true);
+        let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        matches!(result, BoldBrightening::BrightAndBold);
+    }
+
+    #[test]
+    fn bold_brightening_from_dynamic_bool_false() {
+        let val = Value::Bool(false);
+        let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default()).unwrap();
+        matches!(result, BoldBrightening::No);
+    }
+
+    #[test]
+    fn bold_brightening_from_dynamic_invalid_string() {
+        let val = Value::String("InvalidValue".into());
+        let result = BoldBrightening::from_dynamic(&val, FromDynamicOptions::default());
+        assert!(result.is_err());
+    }
+
+    // ── HorizontalWindowContentAlignment ───────────────────────
+
+    #[test]
+    fn horizontal_alignment_default_is_left() {
+        assert_eq!(
+            HorizontalWindowContentAlignment::default(),
+            HorizontalWindowContentAlignment::Left,
+        );
+    }
+
+    // ── VerticalWindowContentAlignment ─────────────────────────
+
+    #[test]
+    fn vertical_alignment_default_is_top() {
+        assert_eq!(
+            VerticalWindowContentAlignment::default(),
+            VerticalWindowContentAlignment::Top,
+        );
+    }
+
+    // ── ImePreeditRendering ────────────────────────────────────
+
+    #[test]
+    fn ime_preedit_rendering_default_is_builtin() {
+        assert_eq!(
+            ImePreeditRendering::default(),
+            ImePreeditRendering::Builtin,
+        );
+    }
+
+    // ── NotificationHandling ───────────────────────────────────
+
+    #[test]
+    fn notification_handling_default_is_always_show() {
+        assert_eq!(
+            NotificationHandling::default(),
+            NotificationHandling::AlwaysShow,
+        );
+    }
+
+    // ── Config::initial_size ───────────────────────────────────
+
+    #[test]
+    fn initial_size_default_config() {
+        let config = Config::default();
+        let size = config.initial_size(96, None);
+        assert_eq!(size.rows, config.initial_rows as usize);
+        assert_eq!(size.cols, config.initial_cols as usize);
+        assert_eq!(size.dpi, 96);
+    }
+
+    #[test]
+    fn initial_size_with_cell_pixel_dims() {
+        let config = Config::default();
+        let size = config.initial_size(144, Some((10, 20)));
+        assert_eq!(size.pixel_width, 10 * config.initial_cols as usize);
+        assert_eq!(size.pixel_height, 20 * config.initial_rows as usize);
+        assert_eq!(size.dpi, 144);
+    }
+
+    #[test]
+    fn initial_size_without_cell_pixel_dims_uses_default_8x16() {
+        let config = Config::default();
+        let size = config.initial_size(96, None);
+        assert_eq!(size.pixel_width, 8 * config.initial_cols as usize);
+        assert_eq!(size.pixel_height, 16 * config.initial_rows as usize);
+    }
+
+    // ── compute_*_dir helpers ──────────────────────────────────
+
+    #[test]
+    fn compute_runtime_dir_returns_ok() {
+        assert!(compute_runtime_dir().is_ok());
+    }
+
+    #[test]
+    fn compute_cache_dir_returns_ok() {
+        assert!(compute_cache_dir().is_ok());
+    }
+
+    #[test]
+    fn compute_data_dir_returns_ok() {
+        assert!(compute_data_dir().is_ok());
+    }
+
+    #[test]
+    fn pki_dir_ends_with_pki() {
+        let dir = pki_dir().unwrap();
+        assert!(
+            dir.ends_with("pki"),
+            "expected pki dir to end with pki, got: {}",
+            dir.display()
+        );
+    }
+
+    // ── NewlineCanon enum ──────────────────────────────────────
+
+    #[test]
+    fn newline_canon_variants_are_distinct() {
+        assert_ne!(NewlineCanon::None, NewlineCanon::LineFeed);
+        assert_ne!(NewlineCanon::LineFeed, NewlineCanon::CarriageReturn);
+        assert_ne!(
+            NewlineCanon::CarriageReturn,
+            NewlineCanon::CarriageReturnAndLineFeed
+        );
+    }
+}
