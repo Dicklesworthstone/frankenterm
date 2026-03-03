@@ -409,6 +409,18 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build retry test runtime");
+        runtime.block_on(future);
+    }
+
     #[test]
     fn delay_calculation_with_backoff() {
         let policy = RetryPolicy {
@@ -464,144 +476,154 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn retry_succeeds_immediately() {
-        let policy = RetryPolicy::default();
-        let call_count = Arc::new(AtomicU32::new(0));
-        let call_count_clone = Arc::clone(&call_count);
+    #[test]
+    fn retry_succeeds_immediately() {
+        run_async_test(async {
+            let policy = RetryPolicy::default();
+            let call_count = Arc::new(AtomicU32::new(0));
+            let call_count_clone = Arc::clone(&call_count);
 
-        let result = with_retry(&policy, || {
-            let count = Arc::clone(&call_count_clone);
-            async move {
-                count.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, Error>(42)
-            }
-        })
-        .await;
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn retry_succeeds_after_failures() {
-        let policy = RetryPolicy {
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(10),
-            backoff_factor: 2.0,
-            jitter_percent: 0.0,
-            max_attempts: Some(5),
-        };
-        let call_count = Arc::new(AtomicU32::new(0));
-        let call_count_clone = Arc::clone(&call_count);
-
-        let result = with_retry(&policy, || {
-            let count = Arc::clone(&call_count_clone);
-            async move {
-                let n = count.fetch_add(1, Ordering::SeqCst);
-                if n < 2 {
-                    Err(Error::Runtime("transient failure".into()))
-                } else {
+            let result = with_retry(&policy, || {
+                let count = Arc::clone(&call_count_clone);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
                     Ok::<_, Error>(42)
                 }
-            }
-        })
-        .await;
+            })
+            .await;
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
-        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), 42);
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        });
     }
 
-    #[tokio::test]
-    async fn retry_exhausts_attempts() {
-        let policy = RetryPolicy {
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(10),
-            backoff_factor: 2.0,
-            jitter_percent: 0.0,
-            max_attempts: Some(3),
-        };
-        let call_count = Arc::new(AtomicU32::new(0));
-        let call_count_clone = Arc::clone(&call_count);
+    #[test]
+    fn retry_succeeds_after_failures() {
+        run_async_test(async {
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(5),
+            };
+            let call_count = Arc::new(AtomicU32::new(0));
+            let call_count_clone = Arc::clone(&call_count);
 
-        let result: Result<i32> = with_retry(&policy, || {
-            let count = Arc::clone(&call_count_clone);
-            async move {
-                count.fetch_add(1, Ordering::SeqCst);
-                Err(Error::Runtime("persistent failure".into()))
-            }
-        })
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(call_count.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn retry_with_outcome_tracks_attempts() {
-        let policy = RetryPolicy {
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(10),
-            backoff_factor: 2.0,
-            jitter_percent: 0.0,
-            max_attempts: Some(5),
-        };
-        let call_count = Arc::new(AtomicU32::new(0));
-        let call_count_clone = Arc::clone(&call_count);
-
-        let outcome = with_retry_outcome(&policy, || {
-            let count = Arc::clone(&call_count_clone);
-            async move {
-                let n = count.fetch_add(1, Ordering::SeqCst);
-                if n < 2 {
-                    Err(Error::Runtime("transient".into()))
-                } else {
-                    Ok::<_, Error>(42)
+            let result = with_retry(&policy, || {
+                let count = Arc::clone(&call_count_clone);
+                async move {
+                    let n = count.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        Err(Error::Runtime("transient failure".into()))
+                    } else {
+                        Ok::<_, Error>(42)
+                    }
                 }
-            }
-        })
-        .await;
+            })
+            .await;
 
-        assert!(outcome.result.is_ok());
-        assert_eq!(outcome.attempts, 3);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), 42);
+            assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        });
     }
 
-    #[tokio::test]
-    async fn circuit_breaker_integration() {
-        use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    #[test]
+    fn retry_exhausts_attempts() {
+        run_async_test(async {
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(3),
+            };
+            let call_count = Arc::new(AtomicU32::new(0));
+            let call_count_clone = Arc::clone(&call_count);
 
-        let policy = RetryPolicy {
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(10),
-            backoff_factor: 2.0,
-            jitter_percent: 0.0,
-            max_attempts: Some(2),
-        };
+            let result: Result<i32> = with_retry(&policy, || {
+                let count = Arc::clone(&call_count_clone);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err(Error::Runtime("persistent failure".into()))
+                }
+            })
+            .await;
 
-        let mut circuit = CircuitBreaker::new(CircuitBreakerConfig::new(
-            1, // Open after 1 failure
-            1,
-            Duration::from_secs(60),
-        ));
+            assert!(result.is_err());
+            assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        });
+    }
 
-        // First call fails and trips circuit
-        let result: Result<i32> = with_retry_and_circuit(&policy, &mut circuit, || async {
-            Err(Error::Runtime("fail".into()))
-        })
-        .await;
-        assert!(result.is_err());
+    #[test]
+    fn retry_with_outcome_tracks_attempts() {
+        run_async_test(async {
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(5),
+            };
+            let call_count = Arc::new(AtomicU32::new(0));
+            let call_count_clone = Arc::clone(&call_count);
 
-        // Circuit should now be open
-        let result: Result<i32> =
-            with_retry_and_circuit(&policy, &mut circuit, || async { Ok(42) }).await;
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("circuit breaker is open"),
-            "Expected circuit breaker error, got: {err_msg}"
-        );
+            let outcome = with_retry_outcome(&policy, || {
+                let count = Arc::clone(&call_count_clone);
+                async move {
+                    let n = count.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        Err(Error::Runtime("transient".into()))
+                    } else {
+                        Ok::<_, Error>(42)
+                    }
+                }
+            })
+            .await;
+
+            assert!(outcome.result.is_ok());
+            assert_eq!(outcome.attempts, 3);
+        });
+    }
+
+    #[test]
+    fn circuit_breaker_integration() {
+        run_async_test(async {
+            use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(2),
+            };
+
+            let mut circuit = CircuitBreaker::new(CircuitBreakerConfig::new(
+                1, // Open after 1 failure
+                1,
+                Duration::from_secs(60),
+            ));
+
+            // First call fails and trips circuit
+            let result: Result<i32> = with_retry_and_circuit(&policy, &mut circuit, || async {
+                Err(Error::Runtime("fail".into()))
+            })
+            .await;
+            assert!(result.is_err());
+
+            // Circuit should now be open
+            let result: Result<i32> =
+                with_retry_and_circuit(&policy, &mut circuit, || async { Ok(42) }).await;
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("circuit breaker is open"),
+                "Expected circuit breaker error, got: {err_msg}"
+            );
+        });
     }
 
     #[test]
@@ -1079,148 +1101,164 @@ mod tests {
 
     // ── with_smart_retry ───────────────────────────────────────────
 
-    #[tokio::test]
-    async fn smart_retry_stops_on_non_retryable_error() {
-        let policy = RetryPolicy {
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(10),
-            backoff_factor: 2.0,
-            jitter_percent: 0.0,
-            max_attempts: Some(5),
-        };
-        let call_count = Arc::new(AtomicU32::new(0));
-        let call_count_clone = Arc::clone(&call_count);
+    #[test]
+    fn smart_retry_stops_on_non_retryable_error() {
+        run_async_test(async {
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(5),
+            };
+            let call_count = Arc::new(AtomicU32::new(0));
+            let call_count_clone = Arc::clone(&call_count);
 
-        let result: Result<i32> = with_smart_retry(&policy, || {
-            let count = Arc::clone(&call_count_clone);
-            async move {
-                count.fetch_add(1, Ordering::SeqCst);
-                Err(Error::Policy("forbidden".into()))
-            }
-        })
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn smart_retry_retries_retryable_errors() {
-        let policy = RetryPolicy {
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(10),
-            backoff_factor: 2.0,
-            jitter_percent: 0.0,
-            max_attempts: Some(5),
-        };
-        let call_count = Arc::new(AtomicU32::new(0));
-        let call_count_clone = Arc::clone(&call_count);
-
-        let result = with_smart_retry(&policy, || {
-            let count = Arc::clone(&call_count_clone);
-            async move {
-                let n = count.fetch_add(1, Ordering::SeqCst);
-                if n < 2 {
-                    Err(Error::Runtime("transient".into()))
-                } else {
-                    Ok::<_, Error>(99)
+            let result: Result<i32> = with_smart_retry(&policy, || {
+                let count = Arc::clone(&call_count_clone);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err(Error::Policy("forbidden".into()))
                 }
-            }
-        })
-        .await;
+            })
+            .await;
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 99);
-        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+            assert!(result.is_err());
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        });
     }
 
-    #[tokio::test]
-    async fn smart_retry_exhausts_attempts_on_retryable_errors() {
-        let policy = RetryPolicy {
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(10),
-            backoff_factor: 2.0,
-            jitter_percent: 0.0,
-            max_attempts: Some(3),
-        };
-        let call_count = Arc::new(AtomicU32::new(0));
-        let call_count_clone = Arc::clone(&call_count);
+    #[test]
+    fn smart_retry_retries_retryable_errors() {
+        run_async_test(async {
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(5),
+            };
+            let call_count = Arc::new(AtomicU32::new(0));
+            let call_count_clone = Arc::clone(&call_count);
 
-        let result: Result<i32> = with_smart_retry(&policy, || {
-            let count = Arc::clone(&call_count_clone);
-            async move {
-                count.fetch_add(1, Ordering::SeqCst);
-                Err(Error::Runtime("always fails".into()))
-            }
-        })
-        .await;
+            let result = with_smart_retry(&policy, || {
+                let count = Arc::clone(&call_count_clone);
+                async move {
+                    let n = count.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        Err(Error::Runtime("transient".into()))
+                    } else {
+                        Ok::<_, Error>(99)
+                    }
+                }
+            })
+            .await;
 
-        assert!(result.is_err());
-        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), 99);
+            assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        });
     }
 
-    #[tokio::test]
-    async fn smart_retry_succeeds_immediately() {
-        let policy = RetryPolicy::default();
-        let result = with_smart_retry(&policy, || async { Ok::<_, Error>(42) }).await;
-        assert_eq!(result.unwrap(), 42);
+    #[test]
+    fn smart_retry_exhausts_attempts_on_retryable_errors() {
+        run_async_test(async {
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(3),
+            };
+            let call_count = Arc::new(AtomicU32::new(0));
+            let call_count_clone = Arc::clone(&call_count);
+
+            let result: Result<i32> = with_smart_retry(&policy, || {
+                let count = Arc::clone(&call_count_clone);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err(Error::Runtime("always fails".into()))
+                }
+            })
+            .await;
+
+            assert!(result.is_err());
+            assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        });
+    }
+
+    #[test]
+    fn smart_retry_succeeds_immediately() {
+        run_async_test(async {
+            let policy = RetryPolicy::default();
+            let result = with_smart_retry(&policy, || async { Ok::<_, Error>(42) }).await;
+            assert_eq!(result.unwrap(), 42);
+        });
     }
 
     // ── with_retry_outcome edge cases ──────────────────────────────
 
-    #[tokio::test]
-    async fn retry_outcome_on_exhaustion_tracks_all_fields() {
-        let policy = RetryPolicy {
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(5),
-            backoff_factor: 1.0,
-            jitter_percent: 0.0,
-            max_attempts: Some(2),
-        };
+    #[test]
+    fn retry_outcome_on_exhaustion_tracks_all_fields() {
+        run_async_test(async {
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(5),
+                backoff_factor: 1.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(2),
+            };
 
-        let outcome: RetryOutcome<i32> = with_retry_outcome(&policy, || async {
-            Err::<i32, Error>(Error::Runtime("fail".into()))
-        })
-        .await;
+            let outcome: RetryOutcome<i32> = with_retry_outcome(&policy, || async {
+                Err::<i32, Error>(Error::Runtime("fail".into()))
+            })
+            .await;
 
-        assert!(outcome.result.is_err());
-        assert_eq!(outcome.attempts, 2);
-        assert!(outcome.elapsed >= Duration::from_millis(1));
+            assert!(outcome.result.is_err());
+            assert_eq!(outcome.attempts, 2);
+            assert!(outcome.elapsed >= Duration::from_millis(1));
+        });
     }
 
-    #[tokio::test]
-    async fn retry_outcome_immediate_success_has_one_attempt() {
-        let policy = RetryPolicy::default();
+    #[test]
+    fn retry_outcome_immediate_success_has_one_attempt() {
+        run_async_test(async {
+            let policy = RetryPolicy::default();
 
-        let outcome = with_retry_outcome(&policy, || async { Ok::<_, Error>("hello") }).await;
+            let outcome =
+                with_retry_outcome(&policy, || async { Ok::<_, Error>("hello") }).await;
 
-        assert!(outcome.result.is_ok());
-        assert_eq!(outcome.attempts, 1);
+            assert!(outcome.result.is_ok());
+            assert_eq!(outcome.attempts, 1);
+        });
     }
 
     // ── with_retry_and_circuit success path ────────────────────────
 
-    #[tokio::test]
-    async fn circuit_records_success_on_retry_success() {
-        use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    #[test]
+    fn circuit_records_success_on_retry_success() {
+        run_async_test(async {
+            use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 
-        let policy = RetryPolicy {
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(10),
-            backoff_factor: 2.0,
-            jitter_percent: 0.0,
-            max_attempts: Some(3),
-        };
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(3),
+            };
 
-        let mut circuit =
-            CircuitBreaker::new(CircuitBreakerConfig::new(3, 1, Duration::from_secs(60)));
+            let mut circuit =
+                CircuitBreaker::new(CircuitBreakerConfig::new(3, 1, Duration::from_secs(60)));
 
-        let result =
-            with_retry_and_circuit(&policy, &mut circuit, || async { Ok::<_, Error>(42) }).await;
+            let result =
+                with_retry_and_circuit(&policy, &mut circuit, || async { Ok::<_, Error>(42) })
+                    .await;
 
-        assert_eq!(result.unwrap(), 42);
-        assert!(circuit.allow());
-        let status = circuit.status();
-        assert_eq!(format!("{:?}", status.state), "Closed");
+            assert_eq!(result.unwrap(), 42);
+            assert!(circuit.allow());
+            let status = circuit.status();
+            assert_eq!(format!("{:?}", status.state), "Closed");
+        });
     }
 }

@@ -822,6 +822,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build protocol_recovery test runtime");
+        runtime.block_on(future);
+    }
+
     #[test]
     fn classify_unexpected_response() {
         assert_eq!(
@@ -1055,132 +1067,196 @@ mod tests {
         assert_eq!(t.health(), ConnectionHealth::Healthy);
     }
 
-    #[tokio::test]
-    async fn engine_succeeds_first_try() {
-        let mut e = RecoveryEngine::new(RecoveryConfig::default());
-        let o = e
-            .execute(
-                |_| async { Ok::<_, String>(42) },
-                |_: &String| ProtocolErrorKind::Transient,
-            )
-            .await;
-        assert_eq!(o.result.unwrap(), 42);
-        assert_eq!(o.attempts, 1);
-        assert_eq!(e.stats().first_try_successes, 1);
+    #[test]
+    fn engine_succeeds_first_try() {
+        run_async_test(async {
+            let mut e = RecoveryEngine::new(RecoveryConfig::default());
+            let o = e
+                .execute(
+                    |_| async { Ok::<_, String>(42) },
+                    |_: &String| ProtocolErrorKind::Transient,
+                )
+                .await;
+            assert_eq!(o.result.unwrap(), 42);
+            assert_eq!(o.attempts, 1);
+            assert_eq!(e.stats().first_try_successes, 1);
+        });
     }
 
-    #[tokio::test]
-    async fn engine_retries_transient() {
-        let cc = Arc::new(AtomicU32::new(0));
-        let cc2 = cc.clone();
-        let config = RecoveryConfig {
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(5),
-            ..RecoveryConfig::default()
-        };
-        let mut e = RecoveryEngine::new(config);
-        let o = e
-            .execute(
-                move |_| {
-                    let cc = cc2.clone();
-                    async move {
-                        let n = cc.fetch_add(1, Ordering::Relaxed);
-                        if n < 2 {
-                            Err("read from mux socket timed out".into())
-                        } else {
-                            Ok(99)
+    #[test]
+    fn engine_retries_transient() {
+        run_async_test(async {
+            let cc = Arc::new(AtomicU32::new(0));
+            let cc2 = cc.clone();
+            let config = RecoveryConfig {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(5),
+                ..RecoveryConfig::default()
+            };
+            let mut e = RecoveryEngine::new(config);
+            let o = e
+                .execute(
+                    move |_| {
+                        let cc = cc2.clone();
+                        async move {
+                            let n = cc.fetch_add(1, Ordering::Relaxed);
+                            if n < 2 {
+                                Err("read from mux socket timed out".into())
+                            } else {
+                                Ok(99)
+                            }
                         }
-                    }
-                },
-                |err: &String| classify_error_message(err),
-            )
-            .await;
-        assert_eq!(o.result.unwrap(), 99);
-        assert_eq!(o.attempts, 3);
-        assert_eq!(e.stats().transient_failures, 2);
+                    },
+                    |err: &String| classify_error_message(err),
+                )
+                .await;
+            assert_eq!(o.result.unwrap(), 99);
+            assert_eq!(o.attempts, 3);
+            assert_eq!(e.stats().transient_failures, 2);
+        });
     }
 
-    #[tokio::test]
-    async fn engine_stops_on_permanent() {
-        let config = RecoveryConfig {
-            initial_delay: Duration::from_millis(1),
-            ..RecoveryConfig::default()
-        };
-        let mut e = RecoveryEngine::new(config);
-        let o = e
-            .execute(
-                |_| async {
-                    Err::<i32, _>("codec version mismatch: local 4 != remote 3".to_string())
-                },
-                |err: &String| classify_error_message(err),
-            )
-            .await;
-        assert!(matches!(o.result.unwrap_err(), RecoveryError::Permanent(_)));
-        assert_eq!(o.attempts, 1);
+    #[test]
+    fn engine_stops_on_permanent() {
+        run_async_test(async {
+            let config = RecoveryConfig {
+                initial_delay: Duration::from_millis(1),
+                ..RecoveryConfig::default()
+            };
+            let mut e = RecoveryEngine::new(config);
+            let o = e
+                .execute(
+                    |_| async {
+                        Err::<i32, _>("codec version mismatch: local 4 != remote 3".to_string())
+                    },
+                    |err: &String| classify_error_message(err),
+                )
+                .await;
+            assert!(matches!(o.result.unwrap_err(), RecoveryError::Permanent(_)));
+            assert_eq!(o.attempts, 1);
+        });
     }
 
-    #[tokio::test]
-    async fn engine_exhausts_retries() {
-        let config = RecoveryConfig {
-            max_retries: 2,
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(2),
-            report_degradation: false,
-            ..RecoveryConfig::default()
-        };
-        let mut e = RecoveryEngine::new(config);
-        let o = e
-            .execute(
-                |_| async { Err::<i32, _>("mux socket disconnected".to_string()) },
-                |err: &String| classify_error_message(err),
-            )
-            .await;
-        assert!(matches!(
-            o.result.unwrap_err(),
-            RecoveryError::RetriesExhausted { .. }
-        ));
-        assert_eq!(o.attempts, 3);
-    }
-
-    #[tokio::test]
-    async fn engine_circuit_breaker_opens() {
-        let config = RecoveryConfig {
-            max_retries: 0,
-            circuit_failure_threshold: 2,
-            circuit_cooldown: Duration::from_secs(60),
-            initial_delay: Duration::from_millis(1),
-            report_degradation: false,
-            ..RecoveryConfig::default()
-        };
-        let mut e = RecoveryEngine::new(config);
-        for _ in 0..2 {
-            let _ = e
+    #[test]
+    fn engine_exhausts_retries() {
+        run_async_test(async {
+            let config = RecoveryConfig {
+                max_retries: 2,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+                report_degradation: false,
+                ..RecoveryConfig::default()
+            };
+            let mut e = RecoveryEngine::new(config);
+            let o = e
                 .execute(
                     |_| async { Err::<i32, _>("mux socket disconnected".to_string()) },
                     |err: &String| classify_error_message(err),
                 )
                 .await;
-        }
-        let o = e
-            .execute(
-                |_| async { Ok::<_, String>(42) },
-                |_: &String| ProtocolErrorKind::Transient,
-            )
-            .await;
-        assert!(matches!(o.result.unwrap_err(), RecoveryError::CircuitOpen));
+            assert!(matches!(
+                o.result.unwrap_err(),
+                RecoveryError::RetriesExhausted { .. }
+            ));
+            assert_eq!(o.attempts, 3);
+        });
     }
 
-    #[tokio::test]
-    async fn engine_permanent_limit() {
-        let config = RecoveryConfig {
-            max_retries: 0,
-            permanent_failure_limit: 2,
-            initial_delay: Duration::from_millis(1),
-            report_degradation: false,
-            ..RecoveryConfig::default()
-        };
-        let mut e = RecoveryEngine::new(config);
-        for _ in 0..2 {
+    #[test]
+    fn engine_circuit_breaker_opens() {
+        run_async_test(async {
+            let config = RecoveryConfig {
+                max_retries: 0,
+                circuit_failure_threshold: 2,
+                circuit_cooldown: Duration::from_secs(60),
+                initial_delay: Duration::from_millis(1),
+                report_degradation: false,
+                ..RecoveryConfig::default()
+            };
+            let mut e = RecoveryEngine::new(config);
+            for _ in 0..2 {
+                let _ = e
+                    .execute(
+                        |_| async { Err::<i32, _>("mux socket disconnected".to_string()) },
+                        |err: &String| classify_error_message(err),
+                    )
+                    .await;
+            }
+            let o = e
+                .execute(
+                    |_| async { Ok::<_, String>(42) },
+                    |_: &String| ProtocolErrorKind::Transient,
+                )
+                .await;
+            assert!(matches!(o.result.unwrap_err(), RecoveryError::CircuitOpen));
+        });
+    }
+
+    #[test]
+    fn engine_permanent_limit() {
+        run_async_test(async {
+            let config = RecoveryConfig {
+                max_retries: 0,
+                permanent_failure_limit: 2,
+                initial_delay: Duration::from_millis(1),
+                report_degradation: false,
+                ..RecoveryConfig::default()
+            };
+            let mut e = RecoveryEngine::new(config);
+            for _ in 0..2 {
+                let _ = e
+                    .execute(
+                        |_| async {
+                            Err::<i32, _>(
+                                "codec version mismatch: local 4 != remote 3".to_string(),
+                            )
+                        },
+                        |err: &String| classify_error_message(err),
+                    )
+                    .await;
+            }
+            let o = e
+                .execute(
+                    |_| async { Ok::<_, String>(42) },
+                    |_: &String| ProtocolErrorKind::Transient,
+                )
+                .await;
+            assert!(matches!(
+                o.result.unwrap_err(),
+                RecoveryError::PermanentLimitReached { .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn engine_disabled() {
+        run_async_test(async {
+            let mut e = RecoveryEngine::new(RecoveryConfig {
+                enabled: false,
+                ..RecoveryConfig::default()
+            });
+            let o = e
+                .execute(
+                    |_| async { Ok::<_, String>(42) },
+                    |_: &String| ProtocolErrorKind::Transient,
+                )
+                .await;
+            assert!(matches!(o.result.unwrap_err(), RecoveryError::Disabled));
+        });
+    }
+
+    #[test]
+    fn engine_permanent_counter_resets() {
+        run_async_test(async {
+            let config = RecoveryConfig {
+                max_retries: 0,
+                permanent_failure_limit: 3,
+                circuit_failure_threshold: 10,
+                initial_delay: Duration::from_millis(1),
+                report_degradation: false,
+                ..RecoveryConfig::default()
+            };
+            let mut e = RecoveryEngine::new(config);
             let _ = e
                 .execute(
                     |_| async {
@@ -1189,61 +1265,15 @@ mod tests {
                     |err: &String| classify_error_message(err),
                 )
                 .await;
-        }
-        let o = e
-            .execute(
-                |_| async { Ok::<_, String>(42) },
-                |_: &String| ProtocolErrorKind::Transient,
-            )
-            .await;
-        assert!(matches!(
-            o.result.unwrap_err(),
-            RecoveryError::PermanentLimitReached { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn engine_disabled() {
-        let mut e = RecoveryEngine::new(RecoveryConfig {
-            enabled: false,
-            ..RecoveryConfig::default()
+            assert_eq!(e.stats().consecutive_permanent, 1);
+            let _ = e
+                .execute(
+                    |_| async { Ok::<_, String>(42) },
+                    |_: &String| ProtocolErrorKind::Transient,
+                )
+                .await;
+            assert_eq!(e.stats().consecutive_permanent, 0);
         });
-        let o = e
-            .execute(
-                |_| async { Ok::<_, String>(42) },
-                |_: &String| ProtocolErrorKind::Transient,
-            )
-            .await;
-        assert!(matches!(o.result.unwrap_err(), RecoveryError::Disabled));
-    }
-
-    #[tokio::test]
-    async fn engine_permanent_counter_resets() {
-        let config = RecoveryConfig {
-            max_retries: 0,
-            permanent_failure_limit: 3,
-            circuit_failure_threshold: 10,
-            initial_delay: Duration::from_millis(1),
-            report_degradation: false,
-            ..RecoveryConfig::default()
-        };
-        let mut e = RecoveryEngine::new(config);
-        let _ = e
-            .execute(
-                |_| async {
-                    Err::<i32, _>("codec version mismatch: local 4 != remote 3".to_string())
-                },
-                |err: &String| classify_error_message(err),
-            )
-            .await;
-        assert_eq!(e.stats().consecutive_permanent, 1);
-        let _ = e
-            .execute(
-                |_| async { Ok::<_, String>(42) },
-                |_: &String| ProtocolErrorKind::Transient,
-            )
-            .await;
-        assert_eq!(e.stats().consecutive_permanent, 0);
     }
 
     #[test]
@@ -1733,110 +1763,126 @@ mod tests {
         assert!(dbg.contains("RecoveryOutcome"));
     }
 
-    #[tokio::test]
-    async fn engine_with_name_works() {
-        let mut e = RecoveryEngine::with_name("test_engine", RecoveryConfig::default());
-        let stats = e.stats();
-        assert_eq!(stats.total_operations, 0);
-        let o = e
-            .execute(
-                |_| async { Ok::<_, String>(42) },
-                |_: &String| ProtocolErrorKind::Transient,
-            )
-            .await;
-        assert_eq!(o.result.unwrap(), 42);
-    }
-
-    #[tokio::test]
-    async fn engine_stats_initial_all_zeros() {
-        let e = RecoveryEngine::new(RecoveryConfig::default());
-        let s = e.stats();
-        assert_eq!(s.total_operations, 0);
-        assert_eq!(s.first_try_successes, 0);
-        assert_eq!(s.retry_successes, 0);
-        assert_eq!(s.total_retries, 0);
-        assert_eq!(s.recoverable_failures, 0);
-        assert_eq!(s.transient_failures, 0);
-        assert_eq!(s.permanent_failures, 0);
-        assert_eq!(s.circuit_rejections, 0);
-        assert_eq!(s.consecutive_permanent, 0);
-    }
-
-    #[tokio::test]
-    async fn engine_circuit_state_accessor() {
-        let e = RecoveryEngine::new(RecoveryConfig::default());
-        assert_eq!(e.circuit_state(), CircuitStateKind::Closed);
-    }
-
-    #[tokio::test]
-    async fn engine_config_accessor() {
-        let config = RecoveryConfig {
-            max_retries: 7,
-            ..RecoveryConfig::default()
-        };
-        let e = RecoveryEngine::new(config);
-        assert_eq!(e.config().max_retries, 7);
-    }
-
-    #[tokio::test]
-    async fn engine_is_available_when_enabled() {
-        let mut e = RecoveryEngine::new(RecoveryConfig::default());
-        assert!(e.is_available());
-    }
-
-    #[tokio::test]
-    async fn engine_is_not_available_when_disabled() {
-        let mut e = RecoveryEngine::new(RecoveryConfig {
-            enabled: false,
-            ..RecoveryConfig::default()
+    #[test]
+    fn engine_with_name_works() {
+        run_async_test(async {
+            let mut e = RecoveryEngine::with_name("test_engine", RecoveryConfig::default());
+            let stats = e.stats();
+            assert_eq!(stats.total_operations, 0);
+            let o = e
+                .execute(
+                    |_| async { Ok::<_, String>(42) },
+                    |_: &String| ProtocolErrorKind::Transient,
+                )
+                .await;
+            assert_eq!(o.result.unwrap(), 42);
         });
-        assert!(!e.is_available());
     }
 
-    #[tokio::test]
-    async fn engine_reset_permanent_counter_works() {
-        let config = RecoveryConfig {
-            max_retries: 0,
-            permanent_failure_limit: 3,
-            circuit_failure_threshold: 10,
-            report_degradation: false,
-            ..RecoveryConfig::default()
-        };
-        let mut e = RecoveryEngine::new(config);
-        let _ = e
-            .execute(
-                |_| async {
-                    Err::<i32, _>("codec version mismatch: local 4 != remote 3".to_string())
-                },
-                |err: &String| classify_error_message(err),
-            )
-            .await;
-        assert_eq!(e.stats().consecutive_permanent, 1);
-        e.reset_permanent_counter();
-        assert_eq!(e.stats().consecutive_permanent, 0);
+    #[test]
+    fn engine_stats_initial_all_zeros() {
+        run_async_test(async {
+            let e = RecoveryEngine::new(RecoveryConfig::default());
+            let s = e.stats();
+            assert_eq!(s.total_operations, 0);
+            assert_eq!(s.first_try_successes, 0);
+            assert_eq!(s.retry_successes, 0);
+            assert_eq!(s.total_retries, 0);
+            assert_eq!(s.recoverable_failures, 0);
+            assert_eq!(s.transient_failures, 0);
+            assert_eq!(s.permanent_failures, 0);
+            assert_eq!(s.circuit_rejections, 0);
+            assert_eq!(s.consecutive_permanent, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn engine_outcome_error_kinds_populated() {
-        let config = RecoveryConfig {
-            max_retries: 2,
-            initial_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(2),
-            report_degradation: false,
-            ..RecoveryConfig::default()
-        };
-        let mut e = RecoveryEngine::new(config);
-        let o = e
-            .execute(
-                |_| async { Err::<i32, _>("mux socket disconnected".to_string()) },
-                |err: &String| classify_error_message(err),
-            )
-            .await;
-        assert_eq!(o.error_kinds.len(), 3);
-        assert!(
-            o.error_kinds
-                .iter()
-                .all(|k| *k == ProtocolErrorKind::Recoverable)
-        );
+    #[test]
+    fn engine_circuit_state_accessor() {
+        run_async_test(async {
+            let e = RecoveryEngine::new(RecoveryConfig::default());
+            assert_eq!(e.circuit_state(), CircuitStateKind::Closed);
+        });
+    }
+
+    #[test]
+    fn engine_config_accessor() {
+        run_async_test(async {
+            let config = RecoveryConfig {
+                max_retries: 7,
+                ..RecoveryConfig::default()
+            };
+            let e = RecoveryEngine::new(config);
+            assert_eq!(e.config().max_retries, 7);
+        });
+    }
+
+    #[test]
+    fn engine_is_available_when_enabled() {
+        run_async_test(async {
+            let mut e = RecoveryEngine::new(RecoveryConfig::default());
+            assert!(e.is_available());
+        });
+    }
+
+    #[test]
+    fn engine_is_not_available_when_disabled() {
+        run_async_test(async {
+            let mut e = RecoveryEngine::new(RecoveryConfig {
+                enabled: false,
+                ..RecoveryConfig::default()
+            });
+            assert!(!e.is_available());
+        });
+    }
+
+    #[test]
+    fn engine_reset_permanent_counter_works() {
+        run_async_test(async {
+            let config = RecoveryConfig {
+                max_retries: 0,
+                permanent_failure_limit: 3,
+                circuit_failure_threshold: 10,
+                report_degradation: false,
+                ..RecoveryConfig::default()
+            };
+            let mut e = RecoveryEngine::new(config);
+            let _ = e
+                .execute(
+                    |_| async {
+                        Err::<i32, _>("codec version mismatch: local 4 != remote 3".to_string())
+                    },
+                    |err: &String| classify_error_message(err),
+                )
+                .await;
+            assert_eq!(e.stats().consecutive_permanent, 1);
+            e.reset_permanent_counter();
+            assert_eq!(e.stats().consecutive_permanent, 0);
+        });
+    }
+
+    #[test]
+    fn engine_outcome_error_kinds_populated() {
+        run_async_test(async {
+            let config = RecoveryConfig {
+                max_retries: 2,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+                report_degradation: false,
+                ..RecoveryConfig::default()
+            };
+            let mut e = RecoveryEngine::new(config);
+            let o = e
+                .execute(
+                    |_| async { Err::<i32, _>("mux socket disconnected".to_string()) },
+                    |err: &String| classify_error_message(err),
+                )
+                .await;
+            assert_eq!(o.error_kinds.len(), 3);
+            assert!(
+                o.error_kinds
+                    .iter()
+                    .all(|k| *k == ProtocolErrorKind::Recoverable)
+            );
+        });
     }
 }
