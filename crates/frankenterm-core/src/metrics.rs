@@ -1081,12 +1081,13 @@ mod pure_tests {
 mod tests {
     use super::*;
     use crate::runtime_compat::io::{AsyncReadExt, AsyncWriteExt};
+    use crate::runtime_compat::CompatRuntime;
 
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
     {
-        let runtime = crate::runtime_compat::RuntimeBuilder::new_current_thread()
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("create runtime");

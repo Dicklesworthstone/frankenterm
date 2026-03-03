@@ -409,12 +409,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{channel, spmc_channel};
+    use crate::runtime_compat::CompatRuntime;
 
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
     {
-        let runtime = crate::runtime_compat::Builder::new_current_thread()
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build compat runtime for test");

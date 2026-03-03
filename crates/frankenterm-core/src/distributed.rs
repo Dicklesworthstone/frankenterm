@@ -1101,6 +1101,7 @@ pub fn evaluate_readiness(config: &DistributedConfig) -> ReadinessReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::CompatRuntime;
 
     #[test]
     fn resolve_expected_token_from_file_supports_rotation() {
@@ -1183,7 +1184,7 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        let runtime = crate::runtime_compat::RuntimeBuilder::new_current_thread()
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("create runtime");

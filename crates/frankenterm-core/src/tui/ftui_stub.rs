@@ -3350,6 +3350,7 @@ pub fn run_tui<Q: QueryClient + Send + Sync + 'static>(
 mod tests {
     use super::*;
     use crate::circuit_breaker::CircuitBreakerStatus;
+    use crate::tui::ftui_compat::StyleSpec;
     use crate::tui::query::{
         EventFilters, EventView, HealthStatus, HistoryEntryView, PaneView, QueryError,
         SearchResultView, TriageItemView, WorkflowProgressView,
@@ -7956,7 +7957,7 @@ mod tests {
                 correlation_style: StyleSpec::new(),
             },
         ];
-        model.view_state.current_view = super::state::View::Timeline;
+        model.view_state.current_view = View::Timeline;
         assert_eq!(model.timeline_selected, 0);
 
         // Press Down
@@ -7981,7 +7982,7 @@ mod tests {
     #[test]
     fn timeline_key_zoom_in_out() {
         let mut model = make_model(MockQuery::healthy());
-        model.view_state.current_view = super::state::View::Timeline;
+        model.view_state.current_view = View::Timeline;
         assert_eq!(model.timeline_zoom, 0);
 
         let plus = ftui::KeyEvent {
