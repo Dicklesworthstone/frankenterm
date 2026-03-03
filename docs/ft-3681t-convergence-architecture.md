@@ -308,3 +308,42 @@ their finalized inventories to be merged into:
 
 Until those are finalized, this document remains the architecture contract and
 interface boundary baseline for implementation beads.
+
+## 10. Implementation Anchor Map (ft-3681t.1.5)
+
+This appendix captures concrete, current code anchors for the architecture
+contract so traceability checks can be performed mechanically.
+
+### 10.1 Anchor Table
+
+| Anchor ID | Architecture Contract | Code Anchor(s) | Probe |
+|---|---|---|---|
+| `A-CLI-001` | CLI dispatch routes `watch` and `robot` into stable runtime entry points | `crates/frankenterm/src/main.rs::run`, `run_watcher_with_backoff`, `run_watcher` | `rg -n "async fn run\\(|run_watcher_with_backoff|run_watcher" crates/frankenterm/src/main.rs` |
+| `A-OBS-001` | Observation path is passive-first: discover -> capture -> persist -> detect -> publish | `crates/frankenterm-core/src/runtime.rs::ObservationRuntime::start`, `spawn_discovery_task`, `spawn_capture_task`, `spawn_persistence_task` | `rg -n "ObservationRuntime|spawn_discovery_task|spawn_capture_task|spawn_persistence_task" crates/frankenterm-core/src/runtime.rs` |
+| `A-OBS-002` | Detection events are persisted, then published for workflow fanout | `crates/frankenterm-core/src/runtime.rs::spawn_persistence_task` (`record_event` followed by `Event::PatternDetected` publish in the persistence path) | `rg -n "record_event\\(|Event::PatternDetected" crates/frankenterm-core/src/runtime.rs` |
+| `A-PAT-001` | Pattern engine uses anchor-first candidate generation with optional regex extraction and context dedupe | `crates/frankenterm-core/src/patterns.rs::PatternEngine::detect`, `detect_with_context` | `rg -n "pub fn detect\\(|detect_with_context\\(" crates/frankenterm-core/src/patterns.rs` |
+| `A-EVT-001` | Event bus supports typed fanout for deltas/detections/signals | `crates/frankenterm-core/src/events.rs::EventBus::publish`, `subscribe_detections`, `subscribe_deltas`, `subscribe_signals` | `rg -n "pub fn publish\\(|subscribe_detections|subscribe_deltas|subscribe_signals" crates/frankenterm-core/src/events.rs` |
+| `A-WF-001` | Workflow runtime is event-driven from detection bus and lock-mediated | `crates/frankenterm-core/src/workflows/runner.rs::WorkflowRunner::run`, `handle_detection`, `run_workflow` | `rg -n "pub async fn run\\(|handle_detection\\(|run_workflow\\(" crates/frankenterm-core/src/workflows/runner.rs` |
+| `A-POL-001` | Mutations are policy mediated with explicit allow/deny/require_approval outcomes | `crates/frankenterm-core/src/policy.rs::PolicyDecision`, `PolicyEngine::authorize` | `rg -n "pub enum PolicyDecision|pub fn authorize\\(" crates/frankenterm-core/src/policy.rs` |
+| `A-POL-002` | Mutation execution path is policy-gated and auditable | `crates/frankenterm-core/src/policy.rs::PolicyGatedInjector::send_text`, `inject` | `rg -n "pub async fn send_text\\(|async fn inject\\(" crates/frankenterm-core/src/policy.rs` |
+| `A-STO-001` | Storage substrate is SQLite+WAL with bounded async writer and read-side search | `crates/frankenterm-core/src/storage.rs::StorageHandle::with_config`, `record_event`, `search_with_results` | `rg -n "journal_mode = WAL|with_config\\(|record_event\\(|search_with_results\\(" crates/frankenterm-core/src/storage.rs` |
+| `A-STO-002` | Policy/MCP actions are persisted through redacted audit records | `crates/frankenterm-core/src/storage.rs::record_audit_action_redacted` | `rg -n "record_audit_action_redacted" crates/frankenterm-core/src/storage.rs` |
+| `A-MCP-001` | MCP server exposes robot-parity tools/resources and wraps storage-affecting tools with audit middleware | `crates/frankenterm-core/src/mcp_bridge.rs::build_server_with_db` (`AuditedToolHandler` registrations) | `rg -n "build_server_with_db|AuditedToolHandler" crates/frankenterm-core/src/mcp_bridge.rs` |
+| `A-MCP-002` | MCP tool execution emits audit trail entries (non-blocking, best effort) | `crates/frankenterm-core/src/mcp.rs::record_mcp_audit_sync`, `record_mcp_audit` | `rg -n "record_mcp_audit_sync|record_mcp_audit\\(" crates/frankenterm-core/src/mcp.rs` |
+
+### 10.2 Current Reality Notes
+
+- Native control remains on the WezTerm compatibility bridge in current code paths
+  (`wezterm_handle_from_config` wiring in watcher and robot handlers).
+- The passive observation contract is concretely implemented in the runtime
+  persistence task; mutation surfaces are separated via policy-gated injectors.
+- This appendix is intentionally anchored to symbols/probes so
+  `ft-3681t.1.5` and `ft-3681t.1.5.1` can validate traceability without waiting
+  on prose updates.
+
+### 10.3 Probe Conventions
+
+- Run probe commands from repository root (`/Users/jemanuel/projects/frankenterm`).
+- A probe passes when it returns one or more matches for the referenced symbol path.
+- For probes with multiple matches, reviewers should confirm at least one match is
+  in the intended implementation function named in the anchor table.
