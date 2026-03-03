@@ -584,6 +584,10 @@ impl<T: MissionMailTransport> MissionAgentMailKernel<T> {
         metadata.insert("workspace_id".to_string(), launch_plan.workspace_id.clone());
         metadata.insert("domain".to_string(), launch_plan.domain.clone());
         metadata.insert("generation".to_string(), launch_plan.generation.to_string());
+        metadata.insert(
+            "strategy".to_string(),
+            startup_strategy_label(launch_plan.strategy).to_string(),
+        );
         metadata.insert("phase_index".to_string(), phase_index.to_string());
         metadata.insert("started_slots".to_string(), started_slots.to_string());
         metadata.insert(
@@ -1486,6 +1490,36 @@ mod tests {
                 .get("successful_slots")
                 .map(String::as_str),
             Some("6")
+        );
+    }
+
+    #[test]
+    fn emit_fleet_launch_progress_update_includes_strategy_metadata() {
+        let transport = MockTransport::default();
+        let kernel = MissionAgentMailKernel::new(transport);
+        let plan = sample_launch_plan();
+
+        let report = kernel.emit_fleet_launch_progress_update_at(
+            1_500,
+            vec!["AgentA".to_string()],
+            &plan,
+            1,
+            2,
+            "corr-fleet-3",
+            Some("scenario-c".to_string()),
+        );
+
+        assert_eq!(report.delivered.len(), 1);
+        let sent = kernel.transport.sent();
+        let envelope = parse_envelope_from_body(&sent[0].body).expect("parse envelope");
+        assert_eq!(envelope.reason_code, "mission.fleet_launch_progress");
+        assert_eq!(
+            envelope.metadata.get("strategy").map(String::as_str),
+            Some("phased")
+        );
+        assert_eq!(
+            envelope.metadata.get("phase_index").map(String::as_str),
+            Some("1")
         );
     }
 }

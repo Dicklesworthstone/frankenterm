@@ -263,6 +263,10 @@ fn fleet_launch_emitters_roundtrip_with_fleet_context() {
         start_env.context.canonical_thread_id(),
         "fleet-launch-fleet-zeta-g9"
     );
+    assert_eq!(
+        start_env.metadata.get("strategy").map(String::as_str),
+        Some("phased")
+    );
 
     let progress_env = by_reason
         .get("mission.fleet_launch_progress")
@@ -274,6 +278,10 @@ fn fleet_launch_emitters_roundtrip_with_fleet_context() {
             .get("started_slots")
             .map(String::as_str),
         Some("2")
+    );
+    assert_eq!(
+        progress_env.metadata.get("strategy").map(String::as_str),
+        Some("phased")
     );
 
     let outcome_env = by_reason
