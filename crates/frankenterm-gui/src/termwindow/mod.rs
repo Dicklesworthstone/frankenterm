@@ -568,7 +568,7 @@ impl TermWindow {
         match RenderState::new(ctx, &self.fonts, &self.render_metrics, ATLAS_SIZE) {
             Ok(render_state) => {
                 log::debug!(
-                    "OpenGL initialized! {} wezterm version: {}",
+                    "OpenGL initialized! {} FrankenTerm version: {}",
                     render_info,
                     config::wezterm_version(),
                 );
@@ -826,7 +826,7 @@ impl TermWindow {
 
         let window = Window::new_window(
             &get_window_class(),
-            "wezterm",
+            "FrankenTerm",
             geometry,
             Some(&config),
             Rc::clone(&fontconfig),

@@ -7,7 +7,6 @@ use mux::termwiztermtab::TermWizTerminal;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use termwiz::cell::CellAttributes;
 use termwiz::input::{InputEvent, KeyCode, KeyEvent};
 use termwiz::lineedit::*;
 use termwiz::surface::Change;
@@ -165,7 +164,7 @@ pub fn show_debug_overlay(
 
     term.render(&[Change::Text(format!(
         "Debug Overlay\r\n\
-         wezterm version: {version} {triple}\r\n\
+         FrankenTerm version: {version} {triple}\r\n\
          Window Environment: {connection_info}\r\n\
          Lua Version: {lua_version}\r\n\
          {opengl_info}\r\n\

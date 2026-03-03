@@ -420,7 +420,7 @@ impl CommandDef {
         commands.retain(|cmd| !cmd.menubar.is_empty());
 
         // Prefer to put the menus in this order
-        let mut order: Vec<&'static str> = vec!["WezTerm", "Shell", "Edit", "View", "Window"];
+        let mut order: Vec<&'static str> = vec!["FrankenTerm", "Shell", "Edit", "View", "Window"];
         // Add any other menus on the end
         for cmd in &commands {
             if !order.contains(&cmd.menubar[0]) {
@@ -440,11 +440,11 @@ impl CommandDef {
                         // macOS will insert stuff at the top and bottom, so we add
                         // a separator to tidy things up a bit
                         menu.add_item(&MenuItem::new_separator());
-                    } else if cmd.menubar[0] == "WezTerm" {
+                    } else if cmd.menubar[0] == "FrankenTerm" {
                         menu.assign_as_app_menu();
 
                         let about_item = MenuItem::new_with(
-                            &format!("WezTerm {}", config::wezterm_version()),
+                            &format!("FrankenTerm {}", config::wezterm_version()),
                             Some(wezterm_perform_key_assignment_sel),
                             "",
                         );
@@ -745,7 +745,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
                 .into(),
             keys: vec![(Modifiers::SUPER, "h".into())],
             args: &[],
-            menubar: &["WezTerm"],
+            menubar: &["FrankenTerm"],
             icon: None,
         },
         SpawnWindow => CommandDef {
@@ -1268,15 +1268,15 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             doc: "Reloads the configuration file".into(),
             keys: vec![(Modifiers::SUPER, "r".into())],
             args: &[],
-            menubar: &["WezTerm"],
+            menubar: &["FrankenTerm"],
             icon: Some("md_reload"),
         },
         QuitApplication => CommandDef {
-            brief: "Quit WezTerm".into(),
-            doc: "Quits WezTerm".into(),
+            brief: "Quit FrankenTerm".into(),
+            doc: "Quits FrankenTerm".into(),
             keys: vec![(Modifiers::SUPER, "q".into())],
             args: &[],
-            menubar: &["WezTerm"],
+            menubar: &["FrankenTerm"],
             icon: Some("oct_stop"),
         },
         MoveTabRelative(-1) => CommandDef {
@@ -1671,25 +1671,25 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_pipe_disconnected"),
         },
         OpenUri(uri) => match uri.as_ref() {
-            "https://wezterm.org/" => CommandDef {
+            "https://github.com/Dicklesworthstone/frankenterm" => CommandDef {
                 brief: "Documentation".into(),
-                doc: "Visit the wezterm documentation website".into(),
+                doc: "Visit the FrankenTerm project page".into(),
                 keys: vec![],
                 args: &[],
                 menubar: &["Help"],
                 icon: Some("md_help"),
             },
-            "https://github.com/wezterm/wezterm/discussions/" => CommandDef {
+            "https://github.com/Dicklesworthstone/frankenterm/discussions/" => CommandDef {
                 brief: "Discuss on GitHub".into(),
-                doc: "Visit wezterm's GitHub discussion".into(),
+                doc: "Visit FrankenTerm's GitHub discussions".into(),
                 keys: vec![],
                 args: &[],
                 menubar: &["Help"],
                 icon: Some("oct_comment_discussion"),
             },
-            "https://github.com/wezterm/wezterm/issues/" => CommandDef {
+            "https://github.com/Dicklesworthstone/frankenterm/issues/" => CommandDef {
                 brief: "Search or report issue on GitHub".into(),
-                doc: "Visit wezterm's GitHub issues".into(),
+                doc: "Visit FrankenTerm's GitHub issues".into(),
                 keys: vec![],
                 args: &[],
                 menubar: &["Help"],
@@ -2237,9 +2237,9 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ShowLauncher,
         ShowTabNavigator,
         // ----------------- Help
-        OpenUri("https://wezterm.org/".to_string()),
-        OpenUri("https://github.com/wezterm/wezterm/discussions/".to_string()),
-        OpenUri("https://github.com/wezterm/wezterm/issues/".to_string()),
+        OpenUri("https://github.com/Dicklesworthstone/frankenterm".to_string()),
+        OpenUri("https://github.com/Dicklesworthstone/frankenterm/discussions/".to_string()),
+        OpenUri("https://github.com/Dicklesworthstone/frankenterm/issues/".to_string()),
         ShowDebugOverlay,
         // ----------------- Misc
         OpenLinkAtMouseCursor,
