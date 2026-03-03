@@ -349,6 +349,7 @@ pub mod suggestions;
 pub mod survival;
 pub mod swarm_work_queue;
 pub mod swarm_scheduler;
+pub mod swarm_pipeline;
 pub mod tailer;
 #[cfg(feature = "recorder-lexical")]
 pub mod tantivy_ingest;
