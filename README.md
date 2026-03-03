@@ -389,6 +389,7 @@ ft config reload             # Hot-reload config (SIGHUP)
 ```
 
 For the full command matrix (human + robot + MCP), see `docs/cli-reference.md`.
+For GUI onboarding and WezTerm migration, see `docs/frankenterm-gui-user-guide.md`.
 
 ---
 
