@@ -24,6 +24,11 @@ use frankenterm_core::swarm_work_queue::{SwarmWorkQueue, WorkItem, WorkItemStatu
 // Test helpers
 // =============================================================================
 
+/// Convert &str to String for work queue API calls.
+fn s(val: &str) -> String {
+    val.to_string()
+}
+
 fn test_fleet_spec(name: &str, panes: u32) -> FleetSpec {
     FleetSpec {
         name: name.to_string(),
@@ -197,8 +202,8 @@ fn work_queue_dispatches_only_ready_items() {
     assert_eq!(ready[0].id, "a");
 
     // Assign and complete "a"
-    queue.assign("a", "agent-1").unwrap();
-    queue.complete("a", "agent-1", None).unwrap();
+    queue.assign(&s("a"), &s("agent-1")).unwrap();
+    queue.complete(&s("a"), &s("agent-1"), None).unwrap();
 
     // Now "b" and "c" should be ready
     let ready = queue.ready_items();
@@ -208,7 +213,7 @@ fn work_queue_dispatches_only_ready_items() {
     assert!(ready_ids.contains(&"c"));
 
     // "d" still blocked
-    let status_d = queue.item_status("d").unwrap();
+    let status_d = queue.item_status(&s("d")).unwrap();
     assert_eq!(status_d, WorkItemStatus::Blocked);
 }
 
@@ -223,21 +228,21 @@ fn work_queue_full_dag_completion_flow() {
     queue.enqueue(work_item("sink", 2, &["left", "right"])).unwrap();
 
     // Complete entire DAG
-    queue.assign("root", "agent-1").unwrap();
-    queue.complete("root", "agent-1", None).unwrap();
+    queue.assign(&s("root"), &s("agent-1")).unwrap();
+    queue.complete(&s("root"), &s("agent-1"), None).unwrap();
 
-    queue.assign("left", "agent-1").unwrap();
-    queue.assign("right", "agent-2").unwrap();
-    queue.complete("left", "agent-1", None).unwrap();
-    queue.complete("right", "agent-2", None).unwrap();
+    queue.assign(&s("left"), &s("agent-1")).unwrap();
+    queue.assign(&s("right"), &s("agent-2")).unwrap();
+    queue.complete(&s("left"), &s("agent-1"), None).unwrap();
+    queue.complete(&s("right"), &s("agent-2"), None).unwrap();
 
     // Sink should now be ready
     let ready = queue.ready_items();
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].id, "sink");
 
-    queue.assign("sink", "agent-1").unwrap();
-    queue.complete("sink", "agent-1", None).unwrap();
+    queue.assign(&s("sink"), &s("agent-1")).unwrap();
+    queue.complete(&s("sink"), &s("agent-1"), None).unwrap();
 
     // All items completed
     let stats = queue.stats();
@@ -384,18 +389,18 @@ fn e2e_fleet_launch_then_work_dispatch() {
     // Use slot labels as agent IDs
     let agent_ids: Vec<String> = plan.slots.iter().map(|s| s.label.clone()).collect();
 
-    queue.assign("task-1", &agent_ids[0]).unwrap();
-    queue.assign("task-2", &agent_ids[1]).unwrap();
+    queue.assign(&s("task-1"), &agent_ids[0]).unwrap();
+    queue.assign(&s("task-2"), &agent_ids[1]).unwrap();
 
     // 4. Complete tasks and verify unblocking
-    queue.complete("task-1", &agent_ids[0], None).unwrap();
+    queue.complete(&s("task-1"), &agent_ids[0], None).unwrap();
     let ready = queue.ready_items();
     assert!(
         ready.iter().any(|r| r.id == "task-3"),
         "task-3 should be unblocked after task-1 completion"
     );
 
-    queue.complete("task-2", &agent_ids[1], None).unwrap();
+    queue.complete(&s("task-2"), &agent_ids[1], None).unwrap();
     let ready = queue.ready_items();
     assert!(
         ready.iter().any(|r| r.id == "task-4"),
@@ -446,7 +451,7 @@ fn work_queue_snapshot_preserves_state_across_restore() {
 
     queue.enqueue(work_item("a", 0, &[])).unwrap();
     queue.enqueue(work_item("b", 1, &["a"])).unwrap();
-    queue.assign("a", "agent-1").unwrap();
+    queue.assign(&s("a"), &s("agent-1")).unwrap();
 
     // Take snapshot
     let snapshot = queue.snapshot();
@@ -455,10 +460,10 @@ fn work_queue_snapshot_preserves_state_across_restore() {
     let restored = SwarmWorkQueue::restore(snapshot, test_queue_config());
 
     // Verify state preserved
-    let status_a = restored.item_status("a").unwrap();
+    let status_a = restored.item_status(&s("a")).unwrap();
     assert_eq!(status_a, WorkItemStatus::InProgress);
 
-    let status_b = restored.item_status("b").unwrap();
+    let status_b = restored.item_status(&s("b")).unwrap();
     assert_eq!(status_b, WorkItemStatus::Blocked);
 }
 
