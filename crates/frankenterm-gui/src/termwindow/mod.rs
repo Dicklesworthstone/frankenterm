@@ -3185,9 +3185,9 @@ impl TermWindow {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
                 };
-                // Cycle forward in the first non-trivial stack (slot 0)
-                if tab.stack_count() > 0 {
-                    tab.cycle_stack(0);
+                // Cycle forward in the first non-trivial stack.
+                if let Some(slot_index) = tab.first_nontrivial_stack_slot_index() {
+                    tab.cycle_stack(slot_index);
                 }
             }
             CycleStackBackward => {
@@ -3196,9 +3196,9 @@ impl TermWindow {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
                 };
-                // Cycle backward in the first non-trivial stack (slot 0).
-                if tab.stack_count() > 0 {
-                    tab.cycle_stack_backward(0);
+                // Cycle backward in the first non-trivial stack.
+                if let Some(slot_index) = tab.first_nontrivial_stack_slot_index() {
+                    tab.cycle_stack_backward(slot_index);
                 }
             }
             KillStuckAgents => {

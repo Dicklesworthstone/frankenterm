@@ -1413,6 +1413,11 @@ impl Tab {
         self.inner.lock().stack_count()
     }
 
+    /// Returns the first stack slot index that has more than one pane.
+    pub fn first_nontrivial_stack_slot_index(&self) -> Option<usize> {
+        self.inner.lock().first_nontrivial_stack_slot_index()
+    }
+
     /// Returns all stacked pane IDs across all slots.
     pub fn all_stacked_pane_ids(&self) -> Vec<PaneId> {
         self.inner.lock().all_stacked_pane_ids()
@@ -2182,6 +2187,14 @@ impl TabInner {
     /// Returns the number of pane stacks.
     fn stack_count(&self) -> usize {
         self.pane_stacks.len()
+    }
+
+    /// Returns the first stack slot index that has more than one pane.
+    fn first_nontrivial_stack_slot_index(&self) -> Option<usize> {
+        self.pane_stacks
+            .iter()
+            .filter_map(|(slot_index, stack)| (!stack.is_single()).then_some(*slot_index))
+            .min()
     }
 
     /// Returns all stacked pane IDs across all slots.
@@ -6343,6 +6356,55 @@ mod test {
         );
         let current = tab.iter_panes_ignoring_zoom()[0].pane.pane_id();
         assert_eq!(current, visible_before);
+    }
+
+    #[test]
+    fn first_nontrivial_stack_slot_index_identifies_cycleable_stack() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(5);
+        tab.set_layout_cycle(default_cycle());
+
+        let mut layout_index = 0usize;
+        let slot_index = loop {
+            if tab.swap_to_layout_index(layout_index).is_none() {
+                panic!("expected at least one layout with a non-trivial pane stack");
+            }
+            if let Some(slot) = tab.first_nontrivial_stack_slot_index() {
+                break slot;
+            }
+            layout_index += 1;
+        };
+
+        let visible_before: Vec<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|p| p.pane.pane_id())
+            .collect();
+
+        tab.cycle_stack(slot_index)
+            .expect("forward cycle should succeed");
+        let visible_after_forward: Vec<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|p| p.pane.pane_id())
+            .collect();
+        assert_ne!(
+            visible_after_forward, visible_before,
+            "forward cycle should change visible tree panes"
+        );
+
+        tab.cycle_stack_backward(slot_index)
+            .expect("backward cycle should succeed");
+        let visible_after_backward: Vec<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|p| p.pane.pane_id())
+            .collect();
+        assert_eq!(
+            visible_after_backward, visible_before,
+            "backward cycle should restore original visible tree panes"
+        );
     }
 
     #[test]
