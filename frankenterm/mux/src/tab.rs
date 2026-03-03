@@ -1398,6 +1398,11 @@ impl Tab {
         self.inner.lock().cycle_stack(slot_index)
     }
 
+    /// Cycle to the previous pane in a stack at the given slot index.
+    pub fn cycle_stack_backward(&self, slot_index: usize) -> Option<PaneId> {
+        self.inner.lock().cycle_stack_backward(slot_index)
+    }
+
     /// Returns the current layout name, if a cycle is active.
     pub fn current_layout_name(&self) -> Option<String> {
         self.inner.lock().current_layout_name()
@@ -2132,6 +2137,25 @@ impl TabInner {
 
         let old_pane_id = stack.active_pane().pane_id();
         stack.cycle_next();
+        let new_pane = stack.active_pane().clone();
+        let new_pane_id = new_pane.pane_id();
+
+        // Swap the visible pane in the tree leaf.
+        self.replace_pane_in_tree(old_pane_id, new_pane);
+
+        Some(new_pane_id)
+    }
+
+    /// Cycle to the previous pane in a stack at the given slot index.
+    /// Returns the newly visible pane ID, or None if no stack at that slot.
+    fn cycle_stack_backward(&mut self, slot_index: usize) -> Option<PaneId> {
+        let stack = self.pane_stacks.get_mut(&slot_index)?;
+        if stack.is_single() {
+            return None; // nothing to cycle
+        }
+
+        let old_pane_id = stack.active_pane().pane_id();
+        stack.cycle_prev();
         let new_pane = stack.active_pane().clone();
         let new_pane_id = new_pane.pane_id();
 
@@ -6262,6 +6286,66 @@ mod test {
     }
 
     #[test]
+    fn cycle_stack_backward_returns_to_previous_visible_pane() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(3);
+        tab.set_layout_cycle(default_cycle());
+        tab.swap_to_layout_index(2); // stacked layout
+
+        let visible_before = tab.iter_panes_ignoring_zoom()[0].pane.pane_id();
+        let visible_after_forward = tab.cycle_stack(0).expect("forward cycle should succeed");
+        assert_ne!(
+            visible_after_forward, visible_before,
+            "Forward cycle should change visible pane"
+        );
+
+        let visible_after_backward = tab
+            .cycle_stack_backward(0)
+            .expect("backward cycle should succeed");
+        assert_eq!(
+            visible_after_backward, visible_before,
+            "Backward cycle should return to the previously visible pane"
+        );
+        let current = tab.iter_panes_ignoring_zoom()[0].pane.pane_id();
+        assert_eq!(current, visible_before);
+    }
+
+    #[test]
+    fn cycle_stack_backward_single_pane_stack_returns_none() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(1);
+        tab.set_layout_cycle(default_cycle());
+        tab.swap_to_layout_index(2); // stacked layout with one pane
+
+        let visible_before = tab.iter_panes_ignoring_zoom()[0].pane.pane_id();
+        assert!(
+            tab.cycle_stack_backward(0).is_none(),
+            "Single-pane stack should not cycle backward"
+        );
+        let current = tab.iter_panes_ignoring_zoom()[0].pane.pane_id();
+        assert_eq!(current, visible_before);
+    }
+
+    #[test]
+    fn cycle_stack_backward_invalid_slot_returns_none() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(3);
+        tab.set_layout_cycle(default_cycle());
+        tab.swap_to_layout_index(2); // stacked layout in slot 0
+
+        let visible_before = tab.iter_panes_ignoring_zoom()[0].pane.pane_id();
+        assert!(
+            tab.cycle_stack_backward(999).is_none(),
+            "Unknown stack slot should return None"
+        );
+        let current = tab.iter_panes_ignoring_zoom()[0].pane.pane_id();
+        assert_eq!(current, visible_before);
+    }
+
+    #[test]
     fn swap_without_cycle_returns_none() {
         let (tab, _size) = make_tab_with_n_panes(2);
         assert!(
@@ -6591,5 +6675,99 @@ mod test {
         let stacked_ids: HashSet<PaneId> = tab.all_stacked_pane_ids().into_iter().collect();
         let all: HashSet<PaneId> = tree_ids.union(&stacked_ids).copied().collect();
         assert_eq!(all.len(), 3, "All 3 panes should survive zoom + swap");
+    }
+
+    #[test]
+    fn swap_layout_pane_count_mismatch_overflow_stacks() {
+        use crate::layout::{default_cycle, grid_4};
+
+        // Create 6 panes, then swap to grid-4 (4 slots) — 2 extras must be stacked.
+        let (tab, _size) = make_tab_with_n_panes(6);
+        tab.set_layout_cycle(default_cycle());
+
+        // grid-4 is the default (index 0).
+        tab.swap_to_layout_index(0);
+        let name = tab.current_layout_name().unwrap();
+        assert_eq!(name, "grid-4");
+
+        let tree_panes: HashSet<PaneId> = tab
+            .iter_panes_ignoring_zoom()
+            .iter()
+            .map(|p| p.pane.pane_id())
+            .collect();
+        let stacked_panes: HashSet<PaneId> = tab.all_stacked_pane_ids().into_iter().collect();
+        let total = tree_panes.len() + stacked_panes.len();
+
+        assert_eq!(total, 6, "All 6 panes must survive (tree + stacked)");
+        assert_eq!(
+            tree_panes.len(),
+            grid_4().arrangement.slot_count(),
+            "Tree should have exactly as many leaves as grid-4 slots"
+        );
+        assert_eq!(
+            stacked_panes.len(),
+            2,
+            "2 overflow panes should be stacked in the last slot"
+        );
+    }
+
+    #[test]
+    fn collapse_priority_default_is_normal() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let pane = FakePane::new(1, size);
+        assert_eq!(
+            pane.collapse_priority(),
+            CollapsePriority::Normal,
+            "Default collapse priority should be Normal"
+        );
+    }
+
+    #[test]
+    fn floating_pane_focus_cycle_through_multiple() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 750,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+
+        // Add 3 floating panes.
+        for id in [10, 20, 30] {
+            tab.add_floating_pane(
+                FakePane::new(id, size),
+                FloatingPaneRect {
+                    left: id * 2,
+                    top: id,
+                    width: 20,
+                    height: 10,
+                },
+            );
+        }
+
+        // Last added (30) should be focused.
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 30);
+
+        // Cycle focus: 30 → 10 → 20 → 30
+        assert!(tab.set_floating_pane_focus(10));
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 10);
+
+        assert!(tab.set_floating_pane_focus(20));
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 20);
+
+        assert!(tab.set_floating_pane_focus(30));
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), 30);
+
+        // Non-existent pane returns false.
+        assert!(!tab.set_floating_pane_focus(999));
     }
 }
