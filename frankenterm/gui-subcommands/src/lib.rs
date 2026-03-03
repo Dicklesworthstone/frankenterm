@@ -72,8 +72,9 @@ pub struct StartCommand {
     pub class: Option<String>,
 
     /// Override the default workspace with the provided name.
+    /// `--session` is an alias for this option.
     /// The default is "default".
-    #[arg(long = "workspace")]
+    #[arg(long = "workspace", visible_alias = "session")]
     pub workspace: Option<String>,
 
     /// Override the position for the initial window launched by this process.
@@ -223,8 +224,9 @@ pub struct ConnectCommand {
     pub class: Option<String>,
 
     /// Override the default workspace with the provided name.
+    /// `--session` is an alias for this option.
     /// The default is "default".
-    #[arg(long = "workspace")]
+    #[arg(long = "workspace", visible_alias = "session")]
     pub workspace: Option<String>,
     /// Override the position for the initial window launched by this process.
     ///
@@ -270,4 +272,27 @@ pub struct ShowKeysCommand {
     /// In lua mode, show only the named key table
     #[arg(long)]
     pub key_table: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectCommand, StartCommand};
+    use clap::Parser;
+
+    #[test]
+    fn start_command_accepts_session_alias() {
+        let cmd = StartCommand::parse_from(["frankenterm-gui", "--session", "agent-fleet"]);
+        assert_eq!(cmd.workspace.as_deref(), Some("agent-fleet"));
+    }
+
+    #[test]
+    fn connect_command_accepts_session_alias() {
+        let cmd = ConnectCommand::parse_from([
+            "frankenterm-gui",
+            "production",
+            "--session",
+            "agent-fleet",
+        ]);
+        assert_eq!(cmd.workspace.as_deref(), Some("agent-fleet"));
+    }
 }
