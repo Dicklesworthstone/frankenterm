@@ -882,3 +882,250 @@ fn default_one_point_oh() -> f32 {
 fn default_true() -> bool {
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toml_table_numeric_keys_with_all_numeric() {
+        let mut table = toml::value::Table::new();
+        table.insert("0".to_string(), toml::Value::Integer(10));
+        table.insert("1".to_string(), toml::Value::Integer(20));
+        table.insert("42".to_string(), toml::Value::Integer(30));
+        assert!(toml_table_has_numeric_keys(&table));
+    }
+
+    #[test]
+    fn toml_table_numeric_keys_with_mixed_keys() {
+        let mut table = toml::value::Table::new();
+        table.insert("0".to_string(), toml::Value::Integer(10));
+        table.insert("name".to_string(), toml::Value::String("hello".into()));
+        assert!(!toml_table_has_numeric_keys(&table));
+    }
+
+    #[test]
+    fn toml_table_numeric_keys_empty_is_true() {
+        let table = toml::value::Table::new();
+        assert!(
+            toml_table_has_numeric_keys(&table),
+            "empty table should vacuously satisfy all-numeric"
+        );
+    }
+
+    #[test]
+    fn toml_table_numeric_keys_negative_keys_are_numeric() {
+        let mut table = toml::value::Table::new();
+        table.insert("-1".to_string(), toml::Value::Integer(10));
+        table.insert("-99".to_string(), toml::Value::Integer(20));
+        assert!(toml_table_has_numeric_keys(&table));
+    }
+
+    #[test]
+    fn json_object_numeric_keys_with_all_numeric() {
+        let mut map = serde_json::Map::new();
+        map.insert("0".to_string(), serde_json::Value::Number(10.into()));
+        map.insert("255".to_string(), serde_json::Value::Number(20.into()));
+        assert!(json_object_has_numeric_keys(&map));
+    }
+
+    #[test]
+    fn json_object_numeric_keys_with_non_numeric() {
+        let mut map = serde_json::Map::new();
+        map.insert("color".to_string(), serde_json::Value::String("red".into()));
+        assert!(!json_object_has_numeric_keys(&map));
+    }
+
+    #[test]
+    fn toml_to_dynamic_string() {
+        let val = toml::Value::String("hello".into());
+        let dyn_val = toml_to_dynamic(&val);
+        assert_eq!(dyn_val, Value::String("hello".to_string()));
+    }
+
+    #[test]
+    fn toml_to_dynamic_integer() {
+        let val = toml::Value::Integer(42);
+        let dyn_val = toml_to_dynamic(&val);
+        assert_eq!(dyn_val, 42i64.to_dynamic());
+    }
+
+    #[test]
+    fn toml_to_dynamic_float() {
+        let val = toml::Value::Float(3.14);
+        let dyn_val = toml_to_dynamic(&val);
+        assert_eq!(dyn_val, 3.14f64.to_dynamic());
+    }
+
+    #[test]
+    fn toml_to_dynamic_boolean() {
+        let t = toml::Value::Boolean(true);
+        let f = toml::Value::Boolean(false);
+        assert_eq!(toml_to_dynamic(&t), true.to_dynamic());
+        assert_eq!(toml_to_dynamic(&f), false.to_dynamic());
+    }
+
+    #[test]
+    fn toml_to_dynamic_array() {
+        let arr = toml::Value::Array(vec![
+            toml::Value::Integer(1),
+            toml::Value::Integer(2),
+            toml::Value::Integer(3),
+        ]);
+        let dyn_val = toml_to_dynamic(&arr);
+        let expected = vec![1i64.to_dynamic(), 2i64.to_dynamic(), 3i64.to_dynamic()].to_dynamic();
+        assert_eq!(dyn_val, expected);
+    }
+
+    #[test]
+    fn toml_to_dynamic_table_string_keys() {
+        let mut table = toml::value::Table::new();
+        table.insert("name".to_string(), toml::Value::String("test".into()));
+        let val = toml::Value::Table(table);
+        let dyn_val = toml_to_dynamic(&val);
+
+        match dyn_val {
+            Value::Object(obj) => {
+                let key = Value::String("name".to_string());
+                assert_eq!(obj.get(&key), Some(&Value::String("test".to_string())));
+            }
+            other => panic!("expected Object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toml_to_dynamic_table_numeric_keys() {
+        let mut table = toml::value::Table::new();
+        table.insert("0".to_string(), toml::Value::String("red".into()));
+        table.insert("1".to_string(), toml::Value::String("green".into()));
+        let val = toml::Value::Table(table);
+        let dyn_val = toml_to_dynamic(&val);
+
+        match dyn_val {
+            Value::Object(obj) => {
+                let key_0 = 0isize.to_dynamic();
+                assert_eq!(obj.get(&key_0), Some(&Value::String("red".to_string())));
+            }
+            other => panic!("expected Object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_dynamic_null() {
+        let val = serde_json::Value::Null;
+        assert_eq!(json_to_dynamic(&val), Value::Null);
+    }
+
+    #[test]
+    fn json_to_dynamic_bool() {
+        assert_eq!(
+            json_to_dynamic(&serde_json::Value::Bool(true)),
+            true.to_dynamic()
+        );
+    }
+
+    #[test]
+    fn json_to_dynamic_integer() {
+        let val = serde_json::Value::Number(serde_json::Number::from(99));
+        assert_eq!(json_to_dynamic(&val), 99i64.to_dynamic());
+    }
+
+    #[test]
+    fn json_to_dynamic_float() {
+        let val: serde_json::Value = serde_json::from_str("2.5").unwrap();
+        assert_eq!(json_to_dynamic(&val), 2.5f64.to_dynamic());
+    }
+
+    #[test]
+    fn json_to_dynamic_string() {
+        let val = serde_json::Value::String("world".into());
+        assert_eq!(json_to_dynamic(&val), Value::String("world".to_string()));
+    }
+
+    #[test]
+    fn json_to_dynamic_array() {
+        let val: serde_json::Value = serde_json::json!([1, "two", true]);
+        let dyn_val = json_to_dynamic(&val);
+        match dyn_val {
+            Value::Array(arr) => assert_eq!(arr.len(), 3),
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_dynamic_object_numeric_keys() {
+        let val: serde_json::Value = serde_json::json!({"0": "red", "1": "blue"});
+        let dyn_val = json_to_dynamic(&val);
+        match dyn_val {
+            Value::Object(obj) => {
+                let key_0 = 0isize.to_dynamic();
+                assert_eq!(obj.get(&key_0), Some(&Value::String("red".to_string())));
+            }
+            other => panic!("expected Object with numeric keys, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_dynamic_object_string_keys() {
+        let val: serde_json::Value = serde_json::json!({"color": "red"});
+        let dyn_val = json_to_dynamic(&val);
+        match dyn_val {
+            Value::Object(obj) => {
+                let key = Value::String("color".to_string());
+                assert_eq!(obj.get(&key), Some(&Value::String("red".to_string())));
+            }
+            other => panic!("expected Object with string keys, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_default_schemes_not_empty() {
+        let schemes = build_default_schemes();
+        assert!(
+            schemes.len() > 100,
+            "should have many built-in color schemes, got {}",
+            schemes.len()
+        );
+    }
+
+    #[test]
+    fn build_default_schemes_contains_known_scheme() {
+        let schemes = build_default_schemes();
+        assert!(
+            schemes.contains_key("Solarized (dark) (terminal.sexy)"),
+            "should contain a Solarized scheme"
+        );
+    }
+
+    #[test]
+    fn config_handle_default_config_has_generation_zero() {
+        let handle = ConfigHandle::default_config();
+        assert_eq!(handle.generation(), 0);
+    }
+
+    #[test]
+    fn config_handle_default_config_has_positive_font_size() {
+        let handle = ConfigHandle::default_config();
+        assert!(
+            handle.font_size > 0.0,
+            "default font size should be positive"
+        );
+    }
+
+    #[test]
+    fn test_configuration_uses_defaults() {
+        use_test_configuration();
+        let handle = configuration();
+        assert!(
+            handle.font_size > 0.0,
+            "test configuration should have a valid font size"
+        );
+    }
+
+    #[test]
+    fn default_helpers_return_expected_values() {
+        assert_eq!(default_one_point_oh_f64(), 1.0);
+        assert_eq!(default_one_point_oh(), 1.0f32);
+        assert!(default_true());
+    }
+}
