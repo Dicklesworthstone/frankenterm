@@ -19,8 +19,8 @@ use crate::session_profiles::{
     AgentIdentitySpec, ProfileRegistry, ProfileRole, SessionProfile, SpawnCommand,
 };
 use crate::session_topology::{
-    AgentLifecycleState, LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry,
-    LifecycleState, MuxPaneLifecycleState, SessionLifecycleState, WindowLifecycleState,
+    AgentLifecycleState, LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
+    MuxPaneLifecycleState, SessionLifecycleState, WindowLifecycleState,
 };
 
 // =============================================================================
@@ -344,7 +344,10 @@ impl<'a> FleetLauncher<'a> {
                 return Err(FleetLaunchError::ProfileNotFound(profile_name.to_string()));
             }
             if entry.weight == 0 {
-                warnings.push(format!("mix entry {i} ({}) has weight 0, will get no slots", entry.program));
+                warnings.push(format!(
+                    "mix entry {i} ({}) has weight 0, will get no slots",
+                    entry.program
+                ));
             }
         }
 
@@ -394,17 +397,17 @@ impl<'a> FleetLauncher<'a> {
                 let agent_identity = AgentIdentitySpec {
                     program: entry.program.clone(),
                     model: entry.model.clone(),
-                    task: task.or_else(|| {
-                        Some(format!("{} worker #{}", entry.program, global_index))
-                    }),
+                    task: task
+                        .or_else(|| Some(format!("{} worker #{}", entry.program, global_index))),
                 };
 
-                // Build label
+                // Build label. Use global slot index to guarantee uniqueness even
+                // when multiple mix entries share the same program name.
                 let label = format!(
                     "{}-{}-{}",
                     spec.name,
                     entry.program.replace(' ', "-"),
-                    local_idx
+                    global_index
                 );
 
                 // Build lifecycle identity
@@ -418,9 +421,7 @@ impl<'a> FleetLauncher<'a> {
 
                 // Determine phase for phased startup
                 let phase = match spec.startup_strategy {
-                    StartupStrategy::Phased => phase_for_role(
-                        entry.role.unwrap_or(profile.role),
-                    ),
+                    StartupStrategy::Phased => phase_for_role(entry.role.unwrap_or(profile.role)),
                     _ => 0,
                 };
 
@@ -477,11 +478,7 @@ impl<'a> FleetLauncher<'a> {
     ///
     /// Creates session, window, pane, and agent entities for each slot. Returns a
     /// `LaunchOutcome` with per-slot results.
-    pub fn execute(
-        &self,
-        plan: &LaunchPlan,
-        registry: &mut LifecycleRegistry,
-    ) -> LaunchOutcome {
+    pub fn execute(&self, plan: &LaunchPlan, registry: &mut LifecycleRegistry) -> LaunchOutcome {
         self.execute_with_subsystems(plan, registry, None, None)
     }
 
@@ -503,16 +500,18 @@ impl<'a> FleetLauncher<'a> {
         let mut successful: u32 = 0;
         let mut failed: u32 = 0;
         let mut bootstrap_dispatches: Vec<(u32, usize)> = Vec::new();
+        let sequential = plan.strategy == StartupStrategy::Sequential;
+        let mut sequential_halt: Option<(u32, String)> = None;
 
         // Take a durable-state checkpoint before fleet provisioning
-        let pre_launch_checkpoint = durable_state.as_ref().and_then(|ds| {
-            ds.latest_checkpoint().map(|cp| cp.id)
-        });
+        let mut pre_launch_checkpoint = durable_state
+            .as_ref()
+            .and_then(|ds| ds.latest_checkpoint().map(|cp| cp.id));
         if let Some(ds) = durable_state {
             let mut metadata = HashMap::new();
             metadata.insert("fleet_name".to_string(), plan.name.clone());
             metadata.insert("total_slots".to_string(), plan.slots.len().to_string());
-            let _ = ds.checkpoint(
+            let checkpoint = ds.checkpoint(
                 registry,
                 format!("pre-fleet-launch:{}", plan.name),
                 CheckpointTrigger::FleetProvisioning {
@@ -520,6 +519,7 @@ impl<'a> FleetLauncher<'a> {
                 },
                 metadata,
             );
+            pre_launch_checkpoint = Some(checkpoint.id);
         }
 
         // Register session entity (one per fleet launch)
@@ -552,6 +552,19 @@ impl<'a> FleetLauncher<'a> {
 
         // Register pane + agent entities per slot
         for slot in &plan.slots {
+            if let Some((failed_slot, failed_reason)) = &sequential_halt {
+                slot_outcomes.push(SlotOutcome {
+                    index: slot.index,
+                    label: slot.label.clone(),
+                    status: SlotStatus::Skipped,
+                    lifecycle_identity: slot.lifecycle_identity.clone(),
+                    error: Some(format!(
+                        "sequential launch halted after slot {failed_slot} failed: {failed_reason}",
+                    )),
+                });
+                continue;
+            }
+
             // Register the pane entity
             let result = registry.register_entity(
                 slot.lifecycle_identity.clone(),
@@ -559,32 +572,44 @@ impl<'a> FleetLauncher<'a> {
                 timestamp,
             );
 
-            // Register a corresponding agent entity for this slot
-            let agent_identity = LifecycleIdentity::new(
-                LifecycleEntityKind::Agent,
-                &plan.workspace_id,
-                &plan.domain,
-                u64::from(slot.index),
-                plan.generation,
-            );
-            let _ = registry.register_entity(
-                agent_identity,
-                LifecycleState::Agent(AgentLifecycleState::Registered),
-                timestamp,
-            );
-
             match result {
                 Ok(_) => {
+                    // Register corresponding agent entity only after pane registration
+                    // succeeds, so failed panes don't leave orphan agents.
+                    let agent_identity = LifecycleIdentity::new(
+                        LifecycleEntityKind::Agent,
+                        &plan.workspace_id,
+                        &plan.domain,
+                        u64::from(slot.index),
+                        plan.generation,
+                    );
+                    if let Err(e) = registry.register_entity(
+                        agent_identity,
+                        LifecycleState::Agent(AgentLifecycleState::Registered),
+                        timestamp,
+                    ) {
+                        failed += 1;
+                        let error =
+                            format!("agent registration failed after pane registration: {e}");
+                        if sequential {
+                            sequential_halt = Some((slot.index, error.clone()));
+                        }
+                        slot_outcomes.push(SlotOutcome {
+                            index: slot.index,
+                            label: slot.label.clone(),
+                            status: SlotStatus::Failed,
+                            lifecycle_identity: slot.lifecycle_identity.clone(),
+                            error: Some(error),
+                        });
+                        continue;
+                    }
+
                     successful += 1;
 
                     // Dispatch bootstrap commands through CommandRouter if available
                     if let Some(ref mut cmd_router) = router {
                         let cmd_count = dispatch_bootstrap_commands(
-                            cmd_router,
-                            slot,
-                            registry,
-                            &plan.name,
-                            timestamp,
+                            cmd_router, slot, registry, &plan.name, timestamp,
                         );
                         bootstrap_dispatches.push((slot.index, cmd_count));
                     }
@@ -599,12 +624,16 @@ impl<'a> FleetLauncher<'a> {
                 }
                 Err(e) => {
                     failed += 1;
+                    let error = e.to_string();
+                    if sequential {
+                        sequential_halt = Some((slot.index, error.clone()));
+                    }
                     slot_outcomes.push(SlotOutcome {
                         index: slot.index,
                         label: slot.label.clone(),
                         status: SlotStatus::Failed,
                         lifecycle_identity: slot.lifecycle_identity.clone(),
-                        error: Some(e.to_string()),
+                        error: Some(error),
                     });
                 }
             }
@@ -711,13 +740,13 @@ fn allocate_weighted(total: u32, mix: &[AgentMixEntry]) -> Vec<u32> {
 /// Determine launch phase for a role (lower phase = earlier startup).
 fn phase_for_role(role: ProfileRole) -> u32 {
     match role {
-        ProfileRole::Service => 0,      // Services start first
-        ProfileRole::Monitor => 1,      // Monitors start second
-        ProfileRole::BuildRunner => 2,  // Build runners third
-        ProfileRole::AgentWorker => 3,  // Agent workers fourth
-        ProfileRole::TestRunner => 3,   // Test runners with agents
-        ProfileRole::DevShell => 4,     // Dev shells last
-        ProfileRole::Custom => 3,       // Custom roles with agents
+        ProfileRole::Service => 0,     // Services start first
+        ProfileRole::Monitor => 1,     // Monitors start second
+        ProfileRole::BuildRunner => 2, // Build runners third
+        ProfileRole::AgentWorker => 3, // Agent workers fourth
+        ProfileRole::TestRunner => 3,  // Test runners with agents
+        ProfileRole::DevShell => 4,    // Dev shells last
+        ProfileRole::Custom => 3,      // Custom roles with agents
     }
 }
 
@@ -725,10 +754,7 @@ fn phase_for_role(role: ProfileRole) -> u32 {
 fn build_phases(slots: &[LaunchSlot]) -> Vec<LaunchPhase> {
     let mut phase_map: HashMap<u32, Vec<u32>> = HashMap::new();
     for slot in slots {
-        phase_map
-            .entry(slot.phase)
-            .or_default()
-            .push(slot.index);
+        phase_map.entry(slot.phase).or_default().push(slot.index);
     }
 
     let mut phases: Vec<LaunchPhase> = phase_map
@@ -806,6 +832,15 @@ fn dispatch_bootstrap_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
     // -------------------------------------------------------------------------
     // Helper: build a minimal profile registry with defaults
     // -------------------------------------------------------------------------
@@ -946,7 +981,10 @@ mod tests {
         let reg = test_registry();
         let launcher = FleetLauncher::new(&reg);
         let spec = basic_spec("empty", vec![]);
-        assert_eq!(launcher.plan(&spec).unwrap_err(), FleetLaunchError::EmptyMix);
+        assert_eq!(
+            launcher.plan(&spec).unwrap_err(),
+            FleetLaunchError::EmptyMix
+        );
     }
 
     #[test]
@@ -1033,11 +1071,49 @@ mod tests {
     }
 
     #[test]
+    fn plan_labels_remain_unique_when_program_repeats() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mix = vec![
+            AgentMixEntry {
+                program: "claude-code".to_string(),
+                model: Some("model-a".to_string()),
+                weight: 1,
+                profile: None,
+                task_template: None,
+                environment: HashMap::new(),
+                role: None,
+            },
+            AgentMixEntry {
+                program: "claude-code".to_string(),
+                model: Some("model-b".to_string()),
+                weight: 1,
+                profile: None,
+                task_template: None,
+                environment: HashMap::new(),
+                role: None,
+            },
+        ];
+        let spec = basic_spec("dup-program", mix);
+        let plan = launcher.plan(&spec).unwrap();
+
+        let labels: Vec<&str> = plan.slots.iter().map(|slot| slot.label.as_str()).collect();
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "slot labels must stay unique even when program names repeat"
+        );
+    }
+
+    #[test]
     fn plan_environment_variables_set() {
         let reg = test_registry();
         let launcher = FleetLauncher::new(&reg);
         let mut entry = agent_mix("claude-code", 1);
-        entry.environment.insert("CUSTOM_VAR".to_string(), "custom_val".to_string());
+        entry
+            .environment
+            .insert("CUSTOM_VAR".to_string(), "custom_val".to_string());
         let spec = basic_spec("env-test", vec![entry]);
         let plan = launcher.plan(&spec).unwrap();
 
@@ -1130,7 +1206,11 @@ mod tests {
             .collect();
         let unique_keys: std::collections::HashSet<&str> =
             keys.iter().map(|s| s.as_str()).collect();
-        assert_eq!(keys.len(), unique_keys.len(), "lifecycle identities must be unique");
+        assert_eq!(
+            keys.len(),
+            unique_keys.len(),
+            "lifecycle identities must be unique"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1205,6 +1285,57 @@ mod tests {
     }
 
     #[test]
+    fn execute_sequential_halts_after_first_failure_and_skips_remaining_slots() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut spec = basic_spec("sequential-halt", vec![agent_mix("a", 3)]);
+        spec.startup_strategy = StartupStrategy::Sequential;
+        let plan = launcher.plan(&spec).unwrap();
+
+        let mut lifecycle = LifecycleRegistry::new();
+        let forced_first = &plan.slots[0];
+        lifecycle
+            .register_entity(
+                forced_first.lifecycle_identity.clone(),
+                LifecycleState::Pane(MuxPaneLifecycleState::Provisioning),
+                999,
+            )
+            .unwrap();
+
+        let outcome = launcher.execute(&plan, &mut lifecycle);
+        assert_eq!(outcome.status, FleetLaunchStatus::Failed);
+        assert_eq!(outcome.total_slots, 3);
+        assert_eq!(outcome.successful_slots, 0);
+        assert_eq!(outcome.failed_slots, 1);
+        assert_eq!(outcome.slot_outcomes.len(), 3);
+        assert_eq!(outcome.slot_outcomes[0].status, SlotStatus::Failed);
+        assert_eq!(outcome.slot_outcomes[1].status, SlotStatus::Skipped);
+        assert_eq!(outcome.slot_outcomes[2].status, SlotStatus::Skipped);
+        assert!(
+            outcome.slot_outcomes[1]
+                .error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("sequential launch halted after slot 0 failed"))
+        );
+        assert!(
+            outcome.slot_outcomes[2]
+                .error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("sequential launch halted after slot 0 failed"))
+        );
+
+        let snapshot = lifecycle.snapshot();
+        let pane_count = snapshot
+            .iter()
+            .filter(|record| matches!(record.state, LifecycleState::Pane(_)))
+            .count();
+        assert_eq!(
+            pane_count, 1,
+            "later sequential slots must not register panes"
+        );
+    }
+
+    #[test]
     fn fleet_launch_status_all_success() {
         let reg = test_registry();
         let launcher = FleetLauncher::new(&reg);
@@ -1212,6 +1343,46 @@ mod tests {
         let mut lifecycle = LifecycleRegistry::new();
         let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
         assert_eq!(outcome.status, FleetLaunchStatus::Complete);
+    }
+
+    #[test]
+    fn launch_outcome_registry_snapshot_is_queryable() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("snapshot", vec![agent_mix("a", 2), agent_mix("b", 1)]);
+        let plan = launcher.plan(&spec).unwrap();
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.execute(&plan, &mut lifecycle);
+
+        assert_eq!(outcome.status, FleetLaunchStatus::Complete);
+        assert_eq!(outcome.total_slots, 3);
+        assert_eq!(outcome.successful_slots, 3);
+        assert_eq!(outcome.failed_slots, 0);
+        assert!(outcome.completed_at >= plan.planned_at);
+
+        let snapshot = &outcome.registry_snapshot;
+        let session_count = snapshot
+            .iter()
+            .filter(|r| matches!(r.state, LifecycleState::Session(_)))
+            .count();
+        let window_count = snapshot
+            .iter()
+            .filter(|r| matches!(r.state, LifecycleState::Window(_)))
+            .count();
+        let pane_count = snapshot
+            .iter()
+            .filter(|r| matches!(r.state, LifecycleState::Pane(_)))
+            .count();
+        let agent_count = snapshot
+            .iter()
+            .filter(|r| matches!(r.state, LifecycleState::Agent(_)))
+            .count();
+
+        assert_eq!(session_count, 1);
+        assert_eq!(window_count, 1);
+        assert_eq!(pane_count, 3);
+        assert_eq!(agent_count, 3);
+        assert_eq!(snapshot.len(), 8);
     }
 
     // -------------------------------------------------------------------------
@@ -1223,8 +1394,13 @@ mod tests {
         // Services < Monitors < BuildRunners < AgentWorkers/TestRunners < DevShells
         assert!(phase_for_role(ProfileRole::Service) < phase_for_role(ProfileRole::Monitor));
         assert!(phase_for_role(ProfileRole::Monitor) < phase_for_role(ProfileRole::BuildRunner));
-        assert!(phase_for_role(ProfileRole::BuildRunner) < phase_for_role(ProfileRole::AgentWorker));
-        assert_eq!(phase_for_role(ProfileRole::AgentWorker), phase_for_role(ProfileRole::TestRunner));
+        assert!(
+            phase_for_role(ProfileRole::BuildRunner) < phase_for_role(ProfileRole::AgentWorker)
+        );
+        assert_eq!(
+            phase_for_role(ProfileRole::AgentWorker),
+            phase_for_role(ProfileRole::TestRunner)
+        );
         assert!(phase_for_role(ProfileRole::AgentWorker) < phase_for_role(ProfileRole::DevShell));
     }
 
@@ -1410,13 +1586,8 @@ mod tests {
         );
 
         // Verify window entity exists
-        let window_id = LifecycleIdentity::new(
-            LifecycleEntityKind::Window,
-            "test-workspace",
-            "local",
-            0,
-            1,
-        );
+        let window_id =
+            LifecycleIdentity::new(LifecycleEntityKind::Window, "test-workspace", "local", 0, 1);
         let window = lifecycle.get(&window_id).unwrap();
         assert_eq!(
             window.state,
@@ -1458,22 +1629,58 @@ mod tests {
     fn execute_agent_count_matches_pane_count() {
         let reg = test_registry();
         let launcher = FleetLauncher::new(&reg);
-        let spec = basic_spec("agent-pane-match", vec![
-            agent_mix("claude-code", 3),
-            agent_mix("codex-cli", 2),
-        ]);
+        let spec = basic_spec(
+            "agent-pane-match",
+            vec![agent_mix("claude-code", 3), agent_mix("codex-cli", 2)],
+        );
         let mut lifecycle = LifecycleRegistry::new();
         launcher.launch(&spec, &mut lifecycle).unwrap();
 
         let snapshot = lifecycle.snapshot();
-        let agent_count = snapshot.iter().filter(|r| {
-            matches!(r.state, LifecycleState::Agent(_))
-        }).count();
-        let pane_count = snapshot.iter().filter(|r| {
-            matches!(r.state, LifecycleState::Pane(_))
-        }).count();
+        let agent_count = snapshot
+            .iter()
+            .filter(|r| matches!(r.state, LifecycleState::Agent(_)))
+            .count();
+        let pane_count = snapshot
+            .iter()
+            .filter(|r| matches!(r.state, LifecycleState::Pane(_)))
+            .count();
         assert_eq!(agent_count, pane_count);
         assert_eq!(agent_count, 5);
+    }
+
+    #[test]
+    fn execute_does_not_register_agent_when_pane_registration_fails() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("agent-no-orphan", vec![agent_mix("claude-code", 1)]);
+        let plan = launcher.plan(&spec).unwrap();
+
+        let mut lifecycle = LifecycleRegistry::new();
+        lifecycle
+            .register_entity(
+                plan.slots[0].lifecycle_identity.clone(),
+                LifecycleState::Pane(MuxPaneLifecycleState::Provisioning),
+                now_ms(),
+            )
+            .unwrap();
+
+        let outcome = launcher.execute(&plan, &mut lifecycle);
+        assert_eq!(outcome.status, FleetLaunchStatus::Failed);
+        assert_eq!(outcome.successful_slots, 0);
+        assert_eq!(outcome.failed_slots, 1);
+
+        let agent_id = LifecycleIdentity::new(
+            LifecycleEntityKind::Agent,
+            &plan.workspace_id,
+            &plan.domain,
+            u64::from(plan.slots[0].index),
+            plan.generation,
+        );
+        assert!(
+            lifecycle.get(&agent_id).is_none(),
+            "agent must not be registered when pane registration fails"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1490,12 +1697,8 @@ mod tests {
         let mut lifecycle = LifecycleRegistry::new();
         let mut durable = DurableStateManager::new();
 
-        let outcome = launcher.execute_with_subsystems(
-            &plan,
-            &mut lifecycle,
-            Some(&mut durable),
-            None,
-        );
+        let outcome =
+            launcher.execute_with_subsystems(&plan, &mut lifecycle, Some(&mut durable), None);
 
         assert_eq!(outcome.status, FleetLaunchStatus::Complete);
         // Checkpoint should have been taken
@@ -1513,15 +1716,44 @@ mod tests {
         let mut lifecycle = LifecycleRegistry::new();
         let mut durable = DurableStateManager::new();
 
-        let outcome = launcher.launch_with_subsystems(
-            &spec,
-            &mut lifecycle,
-            Some(&mut durable),
-            None,
-        ).unwrap();
+        let outcome = launcher
+            .launch_with_subsystems(&spec, &mut lifecycle, Some(&mut durable), None)
+            .unwrap();
 
         assert_eq!(outcome.status, FleetLaunchStatus::Complete);
         assert_eq!(durable.checkpoint_count(), 1);
+    }
+
+    #[test]
+    fn execute_with_durable_state_reports_new_checkpoint_id() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("checkpoint-id", vec![agent_mix("a", 1)]);
+        let plan = launcher.plan(&spec).unwrap();
+
+        let mut lifecycle = LifecycleRegistry::new();
+        let mut durable = DurableStateManager::new();
+        let existing_id = durable
+            .checkpoint(
+                &lifecycle,
+                "existing",
+                CheckpointTrigger::Manual,
+                HashMap::new(),
+            )
+            .id;
+
+        let outcome =
+            launcher.execute_with_subsystems(&plan, &mut lifecycle, Some(&mut durable), None);
+
+        assert_eq!(outcome.status, FleetLaunchStatus::Complete);
+        assert_eq!(durable.checkpoint_count(), 2);
+        let latest_id = durable.latest_checkpoint().map(|cp| cp.id);
+        assert_eq!(outcome.pre_launch_checkpoint, latest_id);
+        assert_ne!(
+            outcome.pre_launch_checkpoint,
+            Some(existing_id),
+            "outcome should reference the newly-created pre-launch checkpoint"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1530,28 +1762,28 @@ mod tests {
 
     #[test]
     fn execute_with_router_dispatches_bootstrap_commands() {
-        let reg = test_registry();
+        let mut reg = test_registry();
+        let mut profile = reg.get_profile("agent-worker").unwrap().clone();
+        profile.name = "agent-worker-bootstrap".to_string();
+        profile.bootstrap_commands = vec!["echo warmup".to_string(), "echo ready".to_string()];
+        reg.register_profile(profile);
+
         let launcher = FleetLauncher::new(&reg);
 
-        let mut entry = agent_mix("claude-code", 1);
-        entry.profile = Some("agent-worker".to_string());
+        let mut entry = agent_mix("claude-code", 2);
+        entry.profile = Some("agent-worker-bootstrap".to_string());
         let spec = basic_spec("bootstrap-test", vec![entry]);
         let plan = launcher.plan(&spec).unwrap();
 
         let mut lifecycle = LifecycleRegistry::new();
         let mut router = CommandRouter::new();
 
-        let outcome = launcher.execute_with_subsystems(
-            &plan,
-            &mut lifecycle,
-            None,
-            Some(&mut router),
-        );
+        let outcome =
+            launcher.execute_with_subsystems(&plan, &mut lifecycle, None, Some(&mut router));
 
         assert_eq!(outcome.status, FleetLaunchStatus::Complete);
-        // Bootstrap dispatches should be tracked
-        // (actual dispatch count depends on profile's bootstrap_commands)
-        assert_eq!(outcome.bootstrap_dispatches.len(), 1);
+        assert_eq!(outcome.bootstrap_dispatches.len(), 2);
+        assert_eq!(outcome.bootstrap_dispatches, vec![(0, 2), (1, 2)]);
     }
 
     #[test]

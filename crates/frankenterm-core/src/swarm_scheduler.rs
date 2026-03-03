@@ -1672,7 +1672,7 @@ mod tests {
         let mut scheduler = SwarmScheduler::new(test_config());
         let mut queue = SwarmWorkQueue::new(WorkQueueConfig {
             max_concurrent_per_agent: 3,
-            heartbeat_timeout_ms: 1000, // very short timeout
+            heartbeat_timeout_ms: 0, // immediate timeout
             max_retries: 2,
             anti_starvation: false,
             starvation_threshold_ms: 60_000,
@@ -1684,7 +1684,9 @@ mod tests {
         queue.enqueue(make_item("w1", 0)).unwrap();
         queue.assign(&"w1".to_string(), &agent).unwrap();
 
-        // Wait for heartbeat timeout
+        // Ensure at least 1ms passes so reclaim_timed_out detects elapsed > 0
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
         let decision = scheduler.evaluate(&mut queue, 5000);
         match decision {
             SchedulerDecision::ReclaimStale { reclaimed_items } => {
