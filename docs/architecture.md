@@ -17,6 +17,95 @@ ft runtime backends (current compatibility bridge includes WezTerm CLI)
   -> Robot Mode API + MCP (stdio)
 ```
 
+## Code-grounded module map (current implementation)
+
+### Workspace boundary
+
+- `crates/frankenterm`: primary CLI binary (`ft`) and command dispatch.
+- `crates/frankenterm-core`: runtime/control-plane library (ingest, storage, patterns, events, workflows, policy, robot types).
+- `crates/frankenterm-gui`: custom GUI terminal binary.
+- `crates/frankenterm-mux-server` + `crates/frankenterm-mux-server-impl`: headless mux server entry/implementation.
+- `frankenterm/*`: in-tree vendored FrankenTerm (ex-WezTerm) subsystem crates.
+
+### CLI entry + command dispatch (`crates/frankenterm/src/main.rs`)
+
+- `main()` bootstraps runtime threads and calls async `run(robot_mode)`.
+- `run()` parses `Commands` and routes to:
+  - watcher path via `run_watcher_with_backoff(...)` -> `run_watcher(...)`
+  - robot path via `Commands::Robot { ... }` and `RobotCommands`
+  - other control-plane surfaces (events, workflows, diagnostics, export, replay, mcp, simulate, etc.).
+- Robot responses are normalized through `RobotResponse<T>`:
+  - `ok`, `data`, `error`, `error_code`, `hint`, `elapsed_ms`, `version`, `now`
+  - emitted as JSON or TOON via `print_robot_response(...)`.
+
+### Watcher lifecycle wiring (`run_watcher(...)`)
+
+Watcher startup currently wires these components in-process:
+
+1. `StorageHandle` initialization (`frankenterm_core::storage`).
+2. `PatternEngine` initialization (`frankenterm_core::patterns`).
+3. `EventBus` creation (`frankenterm_core::events::EventBus`).
+4. Optional notification pipeline subscribers.
+5. Optional workflow auto-handler:
+   - `WorkflowRunner` + `WorkflowEngine` + `PaneWorkflowLockManager`
+   - built-in workflows (compaction/usage/session/auth/process-triage families).
+6. `ObservationRuntime::new(...).with_event_bus(...).with_wezterm_handle(...)`.
+7. Optional supporting services:
+   - distributed listener (feature-gated)
+   - IPC server
+   - saved-search scheduler
+   - metrics server (feature-gated)
+   - snapshot engine
+   - scheduled backups
+   - orphan reaper
+   - mux watchdog.
+
+### Observation runtime internals (`crates/frankenterm-core/src/runtime.rs`)
+
+`ObservationRuntime::start()` spawns cooperative tasks for:
+
+- pane discovery (`spawn_discovery_task`)
+- capture collection (`spawn_capture_task`; plus native push event task when enabled)
+- capture relay and queueing
+- persistence + detection (`spawn_persistence_task`)
+- maintenance/retention and snapshot triggers.
+
+Core passive loop contract: observe/store/detect only. Side effects are delegated to workflow/policy layers.
+
+### Core data-plane modules (`crates/frankenterm-core/src/*`)
+
+- `wezterm.rs`: backend adapter trait (`WeztermInterface`) and concrete handle construction.
+- `ingest.rs`: pane discovery, fingerprinting, delta extraction, gap generation, ingest telemetry.
+- `storage.rs`: SQLite schema, migrations, WAL mode, FTS5 index/triggers, writer queue, query APIs.
+- `patterns.rs`: rule packs, anchor/regex matching, telemetry, detection objects.
+- `events.rs`: bounded broadcast fanout and typed event stream (`PatternDetected`, `GapDetected`, workflow lifecycle, user-var events).
+- `workflows/`: durable workflow trait/execution engine/runner/locks and step orchestration.
+- `policy.rs`: action authorization model (`ActionKind`, `ActorKind`, `PolicyDecision`) and gating helpers.
+
+### Storage model (authoritative persistence seam)
+
+`storage.rs` defines append- and event-oriented tables including:
+
+- `panes`, `output_segments`, `output_gaps`
+- `events`
+- `workflow_executions`, `workflow_step_logs`, `workflow_action_plans`
+- `audit_actions`, `action_undo`, `approval_tokens`
+- plus FTS (`output_segments_fts`) and maintenance/config tables.
+
+This schema is the contract behind status/search/events/workflow/audit CLI and robot surfaces.
+
+### Robot mode + policy seam
+
+- Robot command handling lives in `crates/frankenterm/src/main.rs` under `RobotCommands`.
+- Robot read paths (`state`, `get-text`, `search`, `events`) use WezTerm/storage + policy checks.
+- Robot/action paths (`send`, workflow run, approvals) are routed through policy-gated injectors and workflow runners.
+- MCP mirrors this model through feature-gated core modules (`mcp*` in `frankenterm-core` + `Commands::Mcp` in CLI).
+
+### Feature-gated boundaries (current)
+
+- Optional surfaces are enabled via crate features (`mcp`, `web`, `distributed`, `metrics`, `tui`, `ftui`, `sync`, `semantic-search`, `native-wezterm`, etc.).
+- Current operational backend remains WezTerm compatibility bridge (`wezterm.rs` + vendored integrations), while native/runtime expansion continues in `frankenterm-core`.
+
 ## Deterministic state (OSC 133)
 
 - ft relies on OSC 133 prompt markers to infer prompt-active vs command-running.
