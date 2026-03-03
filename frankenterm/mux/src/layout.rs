@@ -737,4 +737,203 @@ mod tests {
         let deserialized: SwapLayout = serde_json::from_str(&json).unwrap();
         assert_eq!(layout, deserialized);
     }
+
+    // --- LayoutCycle select and index tests ---
+
+    #[test]
+    fn layout_cycle_select_valid_index() {
+        let mut cycle = default_cycle();
+        assert!(cycle.select(2));
+        assert_eq!(cycle.current().name, "stacked");
+        assert_eq!(cycle.current_index(), 2);
+    }
+
+    #[test]
+    fn layout_cycle_select_out_of_range() {
+        let mut cycle = default_cycle();
+        assert!(!cycle.select(99));
+        // Index unchanged after failed select
+        assert_eq!(cycle.current_index(), 0);
+    }
+
+    #[test]
+    fn layout_cycle_len_and_layouts() {
+        let cycle = default_cycle();
+        assert_eq!(cycle.len(), 4);
+        assert!(!cycle.is_empty());
+        let names: Vec<&str> = cycle.layouts().iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, vec!["grid-4", "main-side", "stacked", "main-bottom"]);
+    }
+
+    #[test]
+    fn layout_cycle_advance_then_prev_returns_to_start() {
+        let mut cycle = default_cycle();
+        cycle.advance();
+        cycle.advance();
+        cycle.prev();
+        cycle.prev();
+        assert_eq!(cycle.current().name, "grid-4");
+    }
+
+    #[test]
+    fn layout_cycle_single_layout_cycles_to_self() {
+        let single = LayoutCycle::new(vec![stacked()]);
+        let mut cycle = single;
+        assert_eq!(cycle.advance().name, "stacked");
+        assert_eq!(cycle.prev().name, "stacked");
+    }
+
+    // --- Built-in preset tests ---
+
+    #[test]
+    fn preset_slot_counts() {
+        assert_eq!(grid_4().arrangement.slot_count(), 4);
+        assert_eq!(main_side().arrangement.slot_count(), 3);
+        assert_eq!(stacked().arrangement.slot_count(), 1);
+        assert_eq!(main_bottom().arrangement.slot_count(), 3);
+    }
+
+    #[test]
+    fn all_presets_have_main_slot() {
+        assert!(grid_4().arrangement.has_main_slot());
+        assert!(main_side().arrangement.has_main_slot());
+        assert!(stacked().arrangement.has_main_slot());
+        assert!(main_bottom().arrangement.has_main_slot());
+    }
+
+    #[test]
+    fn all_presets_serialize_roundtrip() {
+        for layout in &[grid_4(), main_side(), stacked(), main_bottom()] {
+            let json = serde_json::to_string(layout).unwrap();
+            let rt: SwapLayout = serde_json::from_str(&json).unwrap();
+            assert_eq!(layout, &rt, "roundtrip failed for {}", layout.name);
+        }
+    }
+
+    // --- Split size edge cases ---
+
+    #[test]
+    fn compute_split_sizes_tiny_terminal() {
+        let size = TerminalSize {
+            rows: 2,
+            cols: 3,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 96,
+        };
+        let (first, second) = compute_split_sizes(SplitDirection::Horizontal, 0.5, size);
+        // With 3 cols - 1 separator = 2; each side >= 1
+        assert!(first.cols >= 1);
+        assert!(second.cols >= 1);
+
+        let (first, second) = compute_split_sizes(SplitDirection::Vertical, 0.5, size);
+        assert!(first.rows >= 1);
+        assert!(second.rows >= 1);
+    }
+
+    #[test]
+    fn compute_split_sizes_preserves_dpi() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 144,
+        };
+        let (first, second) = compute_split_sizes(SplitDirection::Horizontal, 0.5, size);
+        assert_eq!(first.dpi, 144);
+        assert_eq!(second.dpi, 144);
+    }
+
+    #[test]
+    fn compute_split_sizes_asymmetric_ratio() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 96,
+        };
+        let (first, second) = compute_split_sizes(SplitDirection::Horizontal, 0.7, size);
+        // 100 - 1 = 99 total; 70% ~= 69, 30% ~= 30
+        assert!(first.cols > second.cols, "70/30 split should give more to first");
+        assert_eq!(first.cols + second.cols + 1, 100);
+    }
+
+    // --- LayoutArrangement structure tests ---
+
+    #[test]
+    fn nested_split_slot_count() {
+        // 3-deep: split(split(slot, slot), split(slot, split(slot, slot))) = 5 slots
+        let deep = LayoutArrangement::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutArrangement::Split {
+                direction: SplitDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(LayoutArrangement::Slot { is_main: true }),
+                second: Box::new(LayoutArrangement::Slot { is_main: false }),
+            }),
+            second: Box::new(LayoutArrangement::Split {
+                direction: SplitDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(LayoutArrangement::Slot { is_main: false }),
+                second: Box::new(LayoutArrangement::Split {
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(LayoutArrangement::Slot { is_main: false }),
+                    second: Box::new(LayoutArrangement::Slot { is_main: false }),
+                }),
+            }),
+        };
+        assert_eq!(deep.slot_count(), 5);
+        assert!(deep.has_main_slot());
+    }
+
+    #[test]
+    fn no_main_slot_in_tree() {
+        let tree = LayoutArrangement::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutArrangement::Slot { is_main: false }),
+            second: Box::new(LayoutArrangement::Slot { is_main: false }),
+        };
+        assert!(!tree.has_main_slot());
+    }
+
+    // --- main_bottom preset structure ---
+
+    #[test]
+    fn main_bottom_is_vertical_split_with_helpers() {
+        let layout = main_bottom();
+        assert_eq!(layout.name, "main-bottom");
+        match &layout.arrangement {
+            LayoutArrangement::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                assert_eq!(*direction, SplitDirection::Vertical);
+                assert!((ratio - 0.7).abs() < 0.01);
+                // First child should be main slot
+                match first.as_ref() {
+                    LayoutArrangement::Slot { is_main } => assert!(is_main),
+                    _ => panic!("Expected main slot as first child"),
+                }
+                // Second child should be a horizontal split with 2 helper slots
+                match second.as_ref() {
+                    LayoutArrangement::Split {
+                        direction, ratio, ..
+                    } => {
+                        assert_eq!(*direction, SplitDirection::Horizontal);
+                        assert!((ratio - 0.5).abs() < 0.01);
+                    }
+                    _ => panic!("Expected horizontal split as second child"),
+                }
+            }
+            _ => panic!("Expected vertical split at root"),
+        }
+    }
+
 }
