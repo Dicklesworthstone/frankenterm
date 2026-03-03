@@ -1309,7 +1309,10 @@ impl LifecycleRegistry {
                 // Duplicate pane rows can appear during connector/list races.
                 // Preserve the strongest observed bootstrap state.
                 if pane.is_active
-                    && matches!(existing.state, LifecycleState::Pane(MuxPaneLifecycleState::Ready))
+                    && matches!(
+                        existing.state,
+                        LifecycleState::Pane(MuxPaneLifecycleState::Ready)
+                    )
                 {
                     existing.state = LifecycleState::Pane(MuxPaneLifecycleState::Running);
                     existing.updated_at_ms = timestamp_ms;
@@ -3136,6 +3139,24 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_registry_bootstrap_duplicate_pane_rows_keep_running_state() {
+        let panes = vec![
+            make_pane(20, 10, 100, 24, 80, Some("/a"), Some("a"), false),
+            make_pane(20, 10, 100, 24, 80, Some("/a"), Some("a"), true),
+        ];
+        let registry = LifecycleRegistry::bootstrap_from_panes(&panes, 4, 550).unwrap();
+
+        assert_eq!(registry.entity_count_by_kind(LifecycleEntityKind::Pane), 1);
+        let pane_id = LifecycleIdentity::from_pane_info(&panes[0], 4);
+        let record = registry.get(&pane_id).unwrap();
+        assert_eq!(
+            record.state,
+            LifecycleState::Pane(MuxPaneLifecycleState::Running)
+        );
+        assert_eq!(record.version, 0);
+    }
+
+    #[test]
     fn lifecycle_registry_rejects_invalid_context() {
         let mut registry = LifecycleRegistry::new();
         let identity = LifecycleIdentity::new(LifecycleEntityKind::Pane, "ws", "local", 11, 0);
@@ -3158,6 +3179,12 @@ mod tests {
         assert_eq!(
             err,
             LifecycleEngineError::InvalidContext { field: "component" }
+        );
+        let rejection = registry.transition_log().last().unwrap();
+        assert_eq!(rejection.decision, LifecycleDecision::Rejected);
+        assert_eq!(
+            rejection.error_code.as_deref(),
+            Some("native_mux.lifecycle.invalid_context")
         );
     }
 }
