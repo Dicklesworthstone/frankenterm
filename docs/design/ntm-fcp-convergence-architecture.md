@@ -107,6 +107,31 @@ Connector capabilities should be embedded as a native subsystem, not an aftertho
 4. Parallelization readiness: each execution track has dependency order, claim rules, and non-overlapping file ownership guidance.
 5. No-regression guardrails: every convergence milestone includes baseline comparisons for latency, error rate, and operator recovery time.
 
+## Machine-Checkable Traceability Pack (`ft-3681t.1.5.1`)
+
+This contract now includes a machine-checkable baseline matrix and validation scaffold:
+
+- Matrix artifact: `docs/design/ntm-fcp-traceability-matrix.json`
+- Rust validator tests: `crates/frankenterm-core/tests/ntm_fcp_traceability_matrix.rs`
+- E2E harness: `tests/e2e/test_ft_3681t_1_5_1_traceability_matrix.sh`
+
+### Validation Commands
+
+Use remote offload for cargo-heavy checks:
+
+```bash
+rch exec -- cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features -- --nocapture
+tests/e2e/test_ft_3681t_1_5_1_traceability_matrix.sh
+```
+
+### Matrix Contract Rules
+
+1. Every entry must have a unique `capability_id`.
+2. High/medium gaps must map to at least one `ft-*` bead.
+3. All `implementation_anchors` must resolve to existing in-repo paths.
+4. `status`/`gap_severity` combinations must be coherent (`gap` cannot have `none`; `implemented` cannot have `medium`/`high`).
+5. This matrix is the baseline artifact for future T1/T2 reconciliation and drift checks.
+
 ## Immediate Follow-On Actions
 
 1. Merge T1/T2 inventories into a single machine-readable matrix artifact for T3 consumption.

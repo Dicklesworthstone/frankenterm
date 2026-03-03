@@ -1,0 +1,266 @@
+{
+  "schema_version": "1.0.0",
+  "artifact": "ntm-fcp-traceability-matrix",
+  "bead_id": "ft-3681t.1.5.1",
+  "generated_at_utc": "2026-03-03T01:45:00Z",
+  "entries": [
+    {
+      "capability_id": "ft.runtime.observation",
+      "capability_name": "Runtime observation loop with discovery/capture/delta flow",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": [
+        "ft-3681t.2.1",
+        "ft-3681t.2.2"
+      ],
+      "surfaces": [
+        "ft watch",
+        "ft status"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/runtime.rs",
+        "crates/frankenterm-core/src/ingest.rs"
+      ],
+      "evidence_notes": "Watcher bootstraps ObservationRuntime and enforces periodic discovery/capture loops."
+    },
+    {
+      "capability_id": "ft.runtime.single_writer_lock",
+      "capability_name": "Single-writer daemon lock for watcher safety",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": [
+        "ft-3681t.2.1"
+      ],
+      "surfaces": [
+        "ft watch",
+        "ft status"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/lock.rs",
+        "crates/frankenterm/src/main.rs"
+      ],
+      "evidence_notes": "Watcher lock metadata tracks pid/start time and blocks concurrent writers."
+    },
+    {
+      "capability_id": "ft.robot.api.envelope",
+      "capability_name": "Machine-readable robot envelope and schema contract",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": [
+        "ft-3681t.4.1",
+        "ft-3681t.4.4"
+      ],
+      "surfaces": [
+        "ft robot state/get-text/send/wait-for/search/events",
+        "ft mcp serve"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/robot_types.rs",
+        "docs/json-schema/wa-robot-envelope.json"
+      ],
+      "evidence_notes": "Robot responses consistently expose ok/data/error/error_code/hint/elapsed/version/now."
+    },
+    {
+      "capability_id": "ft.patterns.detection",
+      "capability_name": "Pattern detection with telemetry and structured extraction",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": [
+        "ft-3681t.3.5"
+      ],
+      "surfaces": [
+        "ft rules *",
+        "ft robot rules *",
+        "ft events"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/patterns.rs",
+        "crates/frankenterm-core/src/events.rs"
+      ],
+      "evidence_notes": "Pattern engine emits typed detections with confidence/severity and extraction payloads."
+    },
+    {
+      "capability_id": "ft.events.bounded_fanout",
+      "capability_name": "Bounded event-bus fanout with lag/drop accounting",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": [
+        "ft-3681t.3.5",
+        "ft-3681t.7.1"
+      ],
+      "surfaces": [
+        "workflow triggers",
+        "notification routing",
+        "robot events feed"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/events.rs"
+      ],
+      "evidence_notes": "EventBus routes by channel type and tracks subscriber lag/drop telemetry."
+    },
+    {
+      "capability_id": "ft.policy.authorization",
+      "capability_name": "Action authorization with deny/approval/rate-limit semantics",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": [
+        "ft-3681t.6.1",
+        "ft-3681t.6.2"
+      ],
+      "surfaces": [
+        "ft send",
+        "ft robot send",
+        "workflow action execution"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/policy.rs",
+        "crates/frankenterm-core/src/approval.rs",
+        "crates/frankenterm-core/src/command_guard.rs"
+      ],
+      "evidence_notes": "Policy action kinds and actor kinds are explicit and audit-friendly."
+    },
+    {
+      "capability_id": "ft.storage.workflow_audit",
+      "capability_name": "Durable event/workflow/audit persistence with FTS support",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": [
+        "ft-3681t.7.1",
+        "ft-3681t.7.5"
+      ],
+      "surfaces": [
+        "ft search",
+        "ft events",
+        "ft workflow status",
+        "ft audit"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/storage.rs"
+      ],
+      "evidence_notes": "SQLite schema tracks output segments, events, workflows, approvals, and audit actions."
+    },
+    {
+      "capability_id": "ft.session.snapshot_restore",
+      "capability_name": "Session snapshot/restore foundation",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "low",
+      "mapped_bead_ids": [
+        "ft-3681t.2.5",
+        "ft-3681t.8.3"
+      ],
+      "surfaces": [
+        "ft snapshot *",
+        "ft session *",
+        "ft watch restore prompts"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/snapshot_engine.rs",
+        "crates/frankenterm-core/src/session_restore.rs"
+      ],
+      "evidence_notes": "Core snapshot/restore primitives exist; migration/import hardening continues in ft-3681t.8.*."
+    },
+    {
+      "capability_id": "ft.distributed.agent_streaming",
+      "capability_name": "Distributed agent/aggregator streaming mode",
+      "source_domain": "frankenterm",
+      "status": "partial",
+      "gap_severity": "medium",
+      "mapped_bead_ids": [
+        "ft-nu4.4.3",
+        "ft-nu4.4.3.2"
+      ],
+      "surfaces": [
+        "ft distributed agent"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/distributed.rs",
+        "crates/frankenterm/src/main.rs"
+      ],
+      "evidence_notes": "Feature-gated pathway exists; production hardening and protocol maturity remain open."
+    },
+    {
+      "capability_id": "ntm.swarm.launcher_weighted",
+      "capability_name": "Native weighted swarm launcher and live rebalance",
+      "source_domain": "ntm",
+      "status": "gap",
+      "gap_severity": "high",
+      "mapped_bead_ids": [
+        "ft-3681t.3.1",
+        "ft-3681t.3.2"
+      ],
+      "surfaces": [
+        "future ft swarm launch/rebalance surfaces"
+      ],
+      "implementation_anchors": [
+        "docs/design/ntm-fcp-convergence-architecture.md"
+      ],
+      "evidence_notes": "Explicitly tracked in convergence program; awaiting native swarm runtime implementation."
+    },
+    {
+      "capability_id": "ntm.work_claim_kernel",
+      "capability_name": "Dependency-aware work claim and handoff semantics",
+      "source_domain": "ntm",
+      "status": "gap",
+      "gap_severity": "medium",
+      "mapped_bead_ids": [
+        "ft-3681t.3.3",
+        "ft-3681t.3.4"
+      ],
+      "surfaces": [
+        "mission/beads/agent-mail convergence surfaces"
+      ],
+      "implementation_anchors": [
+        "docs/design/ntm-fcp-convergence-architecture.md"
+      ],
+      "evidence_notes": "Current coordination is externalized to Agent Mail + Beads; native integration remains open."
+    },
+    {
+      "capability_id": "fcp.host_runtime_native",
+      "capability_name": "Connector host runtime and protocol embedding",
+      "source_domain": "fcp",
+      "status": "gap",
+      "gap_severity": "high",
+      "mapped_bead_ids": [
+        "ft-3681t.5.1",
+        "ft-3681t.5.2",
+        "ft-3681t.5.3"
+      ],
+      "surfaces": [
+        "future connector lifecycle/runtime APIs"
+      ],
+      "implementation_anchors": [
+        "docs/design/ntm-fcp-convergence-architecture.md"
+      ],
+      "evidence_notes": "No first-class connector fabric module is merged yet; design contracts exist."
+    },
+    {
+      "capability_id": "fcp.connector_bridge_inbound_outbound",
+      "capability_name": "Connector-to-workflow and workflow-to-connector bridges",
+      "source_domain": "fcp",
+      "status": "gap",
+      "gap_severity": "medium",
+      "mapped_bead_ids": [
+        "ft-3681t.5.6",
+        "ft-3681t.5.7",
+        "ft-3681t.5.8"
+      ],
+      "surfaces": [
+        "future connector event bus adapters"
+      ],
+      "implementation_anchors": [
+        "docs/design/ntm-fcp-convergence-architecture.md"
+      ],
+      "evidence_notes": "Bridges are specified in architecture contract but not yet implemented."
+    }
+  ]
+}
