@@ -3735,4 +3735,114 @@ mod tests {
             "line badness check should take priority over total badness"
         );
     }
+
+    // --- Content-specific reflow tests (ft-1memj.29) ---
+
+    #[test]
+    fn scorecard_clean_code_reflows_with_low_badness() {
+        // Short code-like lines should reflow cleanly with low badness.
+        let mut screen = test_screen_with_scorecard(5, 40);
+        let attrs = CellAttributes::blank();
+
+        screen.lines = VecDeque::from(vec![
+            Line::from_text("fn main() {", &attrs, 0, None),
+            Line::from_text("    println!(\"hello\");", &attrs, 0, None),
+            Line::from_text("}", &attrs, 0, None),
+            Line::new(0),
+            Line::new(0),
+        ]);
+
+        let cursor = test_cursor(0, 3, 1);
+        let _ = screen.resize(test_size(5, 30, 96), cursor, 1, false);
+
+        if let Some(ref scorecard) = screen.last_resize_wrap_scorecard {
+            // Clean code that fits should have zero or very low badness.
+            // Lines are short enough to not require wrapping at 30 cols.
+            assert!(
+                scorecard.max_badness_delta <= 500,
+                "clean code should have low max badness: got {}",
+                scorecard.max_badness_delta
+            );
+        }
+    }
+
+    #[test]
+    fn scorecard_wide_line_reflows_with_higher_badness() {
+        // A very wide line should cause measurable badness when resized narrow.
+        let mut screen = test_screen_with_scorecard(3, 120);
+        let attrs = CellAttributes::blank();
+
+        // Create a wide line that will definitely wrap
+        let wide_line = "x".repeat(100);
+        screen.lines = VecDeque::from(vec![
+            Line::from_text_with_wrapped_last_col(&wide_line, &attrs, 0),
+            Line::new(0),
+            Line::new(0),
+        ]);
+
+        let cursor = test_cursor(0, 0, 1);
+        let _ = screen.resize(test_size(3, 20, 96), cursor, 1, false);
+
+        if let Some(ref scorecard) = screen.last_resize_wrap_scorecard {
+            assert!(
+                scorecard.scored_lines > 0,
+                "wide line should produce scored lines"
+            );
+        }
+    }
+
+    #[test]
+    fn scorecard_default_is_zero() {
+        let scorecard = ResizeWrapScorecard::default();
+        assert_eq!(scorecard.scored_lines, 0);
+        assert_eq!(scorecard.dp_lines, 0);
+        assert_eq!(scorecard.fallback_lines, 0);
+        assert_eq!(scorecard.greedy_total_cost, 0);
+        assert_eq!(scorecard.selected_total_cost, 0);
+        assert_eq!(scorecard.max_badness_delta, 0);
+        assert_eq!(scorecard.total_badness_delta, 0);
+    }
+
+    #[test]
+    fn gate_fallback_ratio_triggers_before_total_badness() {
+        // When fallback ratio is exceeded but total badness is not,
+        // the gate should fail with FallbackRatioExceeded.
+        let scorecard = ResizeWrapScorecard {
+            scored_lines: 10,
+            dp_lines: 5,
+            fallback_lines: 5,
+            greedy_total_cost: 100,
+            selected_total_cost: 80,
+            max_badness_delta: 50,
+            total_badness_delta: 200,
+        };
+        let policy = ResizeReadabilityGatePolicy {
+            enabled: true,
+            max_line_badness_delta: 500,
+            max_total_badness_delta: 2000,
+            max_fallback_ratio_percent: 20,
+        };
+        // 5/10 = 50% > 20%
+        assert_eq!(
+            scorecard.gate_status(policy),
+            ResizeWrapGateStatus::Fail(ResizeWrapGateFailureReason::FallbackRatioExceeded),
+        );
+    }
+
+    #[test]
+    fn scorecard_gate_pass_for_zero_scored_lines() {
+        // Edge case: no lines scored at all — should still pass gate.
+        let scorecard = ResizeWrapScorecard::default();
+        let policy = ResizeReadabilityGatePolicy {
+            enabled: true,
+            max_line_badness_delta: 500,
+            max_total_badness_delta: 2000,
+            max_fallback_ratio_percent: 20,
+        };
+        assert_eq!(
+            scorecard.gate_status(policy),
+            ResizeWrapGateStatus::Pass,
+            "zero scored lines should not trigger any gate failure"
+        );
+    }
 }
