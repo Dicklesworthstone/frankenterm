@@ -302,4 +302,273 @@ mod test {
             actions
         );
     }
+
+    // --- SixelBuilder unit tests ---
+
+    #[test]
+    fn builder_default_params() {
+        let builder = SixelBuilder::new(&[]);
+        assert_eq!(builder.sixel.pan, 2); // default
+        assert_eq!(builder.sixel.pad, 1);
+        assert!(!builder.sixel.background_is_transparent);
+        assert!(builder.sixel.horizontal_grid_size.is_none());
+        assert!(builder.sixel.data.is_empty());
+    }
+
+    #[test]
+    fn builder_pan_values() {
+        // param 7,8,9 -> pan=1
+        assert_eq!(SixelBuilder::new(&[7]).sixel.pan, 1);
+        assert_eq!(SixelBuilder::new(&[8]).sixel.pan, 1);
+        assert_eq!(SixelBuilder::new(&[9]).sixel.pan, 1);
+        // param 0,1,5,6 -> pan=2
+        assert_eq!(SixelBuilder::new(&[0]).sixel.pan, 2);
+        assert_eq!(SixelBuilder::new(&[1]).sixel.pan, 2);
+        assert_eq!(SixelBuilder::new(&[5]).sixel.pan, 2);
+        assert_eq!(SixelBuilder::new(&[6]).sixel.pan, 2);
+        // param 3,4 -> pan=3
+        assert_eq!(SixelBuilder::new(&[3]).sixel.pan, 3);
+        assert_eq!(SixelBuilder::new(&[4]).sixel.pan, 3);
+        // param 2 -> pan=5
+        assert_eq!(SixelBuilder::new(&[2]).sixel.pan, 5);
+        // unknown -> pan=2
+        assert_eq!(SixelBuilder::new(&[99]).sixel.pan, 2);
+    }
+
+    #[test]
+    fn builder_transparent_background() {
+        let b = SixelBuilder::new(&[0, 1]);
+        assert!(b.sixel.background_is_transparent);
+
+        let b = SixelBuilder::new(&[0, 0]);
+        assert!(!b.sixel.background_is_transparent);
+
+        let b = SixelBuilder::new(&[0, 2]);
+        assert!(!b.sixel.background_is_transparent);
+    }
+
+    #[test]
+    fn builder_horizontal_grid_size() {
+        let b = SixelBuilder::new(&[0, 0, 42]);
+        assert_eq!(b.sixel.horizontal_grid_size, Some(42));
+    }
+
+    #[test]
+    fn builder_push_data_bytes() {
+        let mut b = SixelBuilder::new(&[]);
+        // 0x3f is '?' -> data value 0
+        b.push(0x3f);
+        // 0x7e is '~' -> data value 63
+        b.push(0x7e);
+        b.finish();
+        assert_eq!(b.sixel.data, vec![SixelData::Data(0), SixelData::Data(63)]);
+    }
+
+    #[test]
+    fn builder_push_carriage_return() {
+        let mut b = SixelBuilder::new(&[]);
+        b.push(b'$');
+        b.finish();
+        assert_eq!(b.sixel.data, vec![SixelData::CarriageReturn]);
+    }
+
+    #[test]
+    fn builder_push_newline() {
+        let mut b = SixelBuilder::new(&[]);
+        b.push(b'-');
+        b.finish();
+        assert_eq!(b.sixel.data, vec![SixelData::NewLine]);
+    }
+
+    #[test]
+    fn builder_repeat_command() {
+        let mut b = SixelBuilder::new(&[]);
+        // '!' starts repeat command
+        b.push(b'!');
+        // parameter: 5
+        b.push(b'5');
+        // data byte 'A' (0x41) -> data value 0x41 - 0x3f = 2
+        b.push(0x41);
+        b.finish();
+        assert_eq!(
+            b.sixel.data,
+            vec![SixelData::Repeat {
+                repeat_count: 5,
+                data: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn builder_select_color() {
+        let mut b = SixelBuilder::new(&[]);
+        // '#' with only color number selects that color
+        b.push(b'#');
+        b.push(b'3');
+        b.finish();
+        assert_eq!(
+            b.sixel.data,
+            vec![SixelData::SelectColorMapEntry(3)]
+        );
+    }
+
+    #[test]
+    fn builder_define_rgb_color() {
+        let mut b = SixelBuilder::new(&[]);
+        // '#' with 5 params (color_number;system;r;g;b)
+        // system=2 means RGB
+        b.push(b'#');
+        b.push(b'1'); // color number
+        b.push(b';');
+        b.push(b'2'); // system = RGB
+        b.push(b';');
+        b.push(b'1'); b.push(b'0'); b.push(b'0'); // r = 100%
+        b.push(b';');
+        b.push(b'0'); // g = 0%
+        b.push(b';');
+        b.push(b'0'); // b = 0%
+        b.finish();
+        assert_eq!(
+            b.sixel.data,
+            vec![SixelData::DefineColorMapRGB {
+                color_number: 1,
+                rgb: RgbColor::new_8bpc(255, 0, 0),
+            }]
+        );
+    }
+
+    #[test]
+    fn builder_define_hsl_color() {
+        let mut b = SixelBuilder::new(&[]);
+        b.push(b'#');
+        b.push(b'2'); // color number
+        b.push(b';');
+        b.push(b'1'); // system = HLS
+        b.push(b';');
+        b.push(b'1'); b.push(b'2'); b.push(b'0'); // hue = 120
+        b.push(b';');
+        b.push(b'5'); b.push(b'0'); // lightness = 50
+        b.push(b';');
+        b.push(b'1'); b.push(b'0'); b.push(b'0'); // saturation = 100
+        b.finish();
+        assert_eq!(
+            b.sixel.data,
+            vec![SixelData::DefineColorMapHSL {
+                color_number: 2,
+                hue_angle: 120,
+                lightness: 50,
+                saturation: 100,
+            }]
+        );
+    }
+
+    #[test]
+    fn builder_raster_attributes() {
+        let mut b = SixelBuilder::new(&[]);
+        // '"' sets raster attributes: pan;pad;width;height
+        b.push(b'"');
+        b.push(b'3'); // pan
+        b.push(b';');
+        b.push(b'2'); // pad
+        b.push(b';');
+        b.push(b'1'); b.push(b'0'); // width = 10
+        b.push(b';');
+        b.push(b'2'); b.push(b'0'); // height = 20
+        b.finish();
+        assert_eq!(b.sixel.pan, 3);
+        assert_eq!(b.sixel.pad, 2);
+        assert_eq!(b.sixel.pixel_width, Some(10));
+        assert_eq!(b.sixel.pixel_height, Some(20));
+    }
+
+    #[test]
+    fn builder_raster_attributes_defaults() {
+        let mut b = SixelBuilder::new(&[]);
+        // '"' with no params uses defaults
+        b.push(b'"');
+        b.finish();
+        assert_eq!(b.sixel.pan, 2); // default
+        assert_eq!(b.sixel.pad, 1); // default
+    }
+
+    #[test]
+    fn builder_overflow_size_clears_data() {
+        let mut b = SixelBuilder::new(&[]);
+        // Push some data first
+        b.push(0x3f); // Data(0)
+
+        // Set raster attributes with huge dimensions
+        b.push(b'"');
+        // pan
+        b.push(b'1');
+        b.push(b';');
+        // pad
+        b.push(b'1');
+        b.push(b';');
+        // width = 99999
+        for c in b"99999" {
+            b.push(*c);
+        }
+        b.push(b';');
+        // height = 99999
+        for c in b"99999" {
+            b.push(*c);
+        }
+        b.finish();
+        // 99999 * 99999 > MAX_SIXEL_SIZE, so data should be cleared
+        assert!(b.sixel.data.is_empty());
+        assert!(b.sixel.pixel_width.is_none());
+        assert!(b.sixel.pixel_height.is_none());
+    }
+
+    #[test]
+    fn builder_multi_digit_repeat() {
+        let mut b = SixelBuilder::new(&[]);
+        b.push(b'!');
+        b.push(b'1');
+        b.push(b'2');
+        b.push(b'3');
+        b.push(0x3f); // data byte -> value 0
+        b.finish();
+        assert_eq!(
+            b.sixel.data,
+            vec![SixelData::Repeat {
+                repeat_count: 123,
+                data: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn builder_sequence_of_commands() {
+        let mut b = SixelBuilder::new(&[]);
+        // Data, CR, Data, NL
+        b.push(0x40); // '@' -> data value 1
+        b.push(b'$'); // carriage return
+        b.push(0x41); // 'A' -> data value 2
+        b.push(b'-'); // newline
+        b.finish();
+        assert_eq!(
+            b.sixel.data,
+            vec![
+                SixelData::Data(1),
+                SixelData::CarriageReturn,
+                SixelData::Data(2),
+                SixelData::NewLine,
+            ]
+        );
+    }
+
+    #[test]
+    fn builder_max_params_overflow() {
+        let mut b = SixelBuilder::new(&[]);
+        // '#' command with more than MAX_PARAMS (5) semicolons
+        b.push(b'#');
+        for i in 0..7 {
+            b.push(b'0' + i);
+            b.push(b';');
+        }
+        // Should not panic even with excess params
+        b.finish();
+    }
 }

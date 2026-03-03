@@ -1989,4 +1989,644 @@ mod test {
             );
         }
     }
+
+    // --- normalize_shift_to_upper_case tests ---
+
+    #[test]
+    fn normalize_shift_lowercase_becomes_uppercase() {
+        let key = KeyCode::Char('a');
+        assert_eq!(
+            key.normalize_shift_to_upper_case(Modifiers::SHIFT),
+            KeyCode::Char('A')
+        );
+    }
+
+    #[test]
+    fn normalize_shift_uppercase_stays_uppercase() {
+        let key = KeyCode::Char('A');
+        assert_eq!(
+            key.normalize_shift_to_upper_case(Modifiers::SHIFT),
+            KeyCode::Char('A')
+        );
+    }
+
+    #[test]
+    fn normalize_no_shift_lowercase_stays() {
+        let key = KeyCode::Char('z');
+        assert_eq!(
+            key.normalize_shift_to_upper_case(Modifiers::NONE),
+            KeyCode::Char('z')
+        );
+    }
+
+    #[test]
+    fn normalize_shift_non_alpha_unchanged() {
+        let key = KeyCode::Char('1');
+        assert_eq!(
+            key.normalize_shift_to_upper_case(Modifiers::SHIFT),
+            KeyCode::Char('1')
+        );
+    }
+
+    #[test]
+    fn normalize_shift_non_ascii_lowercase_unchanged() {
+        // Non-ASCII lowercase like 'é' should not be uppercased
+        // (only ascii_lowercase is handled)
+        let key = KeyCode::Char('é');
+        assert_eq!(
+            key.normalize_shift_to_upper_case(Modifiers::SHIFT),
+            KeyCode::Char('é')
+        );
+    }
+
+    #[test]
+    fn normalize_shift_non_char_keycode_unchanged() {
+        let key = KeyCode::Enter;
+        assert_eq!(
+            key.normalize_shift_to_upper_case(Modifiers::SHIFT),
+            KeyCode::Enter
+        );
+    }
+
+    #[test]
+    fn normalize_shift_with_additional_modifiers() {
+        // SHIFT | CTRL should still uppercase
+        let key = KeyCode::Char('b');
+        assert_eq!(
+            key.normalize_shift_to_upper_case(Modifiers::SHIFT | Modifiers::CTRL),
+            KeyCode::Char('B')
+        );
+    }
+
+    // --- is_modifier tests ---
+
+    #[test]
+    fn is_modifier_returns_true_for_all_modifiers() {
+        let modifier_keys = [
+            KeyCode::Hyper,
+            KeyCode::Super,
+            KeyCode::Meta,
+            KeyCode::Shift,
+            KeyCode::LeftShift,
+            KeyCode::RightShift,
+            KeyCode::Control,
+            KeyCode::LeftControl,
+            KeyCode::RightControl,
+            KeyCode::Alt,
+            KeyCode::LeftAlt,
+            KeyCode::RightAlt,
+            KeyCode::LeftWindows,
+            KeyCode::RightWindows,
+        ];
+        for key in modifier_keys {
+            assert!(key.is_modifier(), "{:?} should be a modifier", key);
+        }
+    }
+
+    #[test]
+    fn is_modifier_returns_false_for_regular_keys() {
+        let non_modifier_keys = [
+            KeyCode::Char('a'),
+            KeyCode::Enter,
+            KeyCode::Escape,
+            KeyCode::Tab,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::UpArrow,
+            KeyCode::DownArrow,
+            KeyCode::LeftArrow,
+            KeyCode::RightArrow,
+            KeyCode::Function(1),
+            KeyCode::Insert,
+            KeyCode::CapsLock,
+            KeyCode::NumLock,
+            KeyCode::ScrollLock,
+            KeyCode::Menu,
+            KeyCode::Numpad0,
+        ];
+        for key in non_modifier_keys {
+            assert!(!key.is_modifier(), "{:?} should NOT be a modifier", key);
+        }
+    }
+
+    // --- is_ambiguous_ascii_ctrl tests ---
+
+    #[test]
+    fn ambiguous_ctrl_chars() {
+        assert!(is_ambiguous_ascii_ctrl('i'));
+        assert!(is_ambiguous_ascii_ctrl('I'));
+        assert!(is_ambiguous_ascii_ctrl('m'));
+        assert!(is_ambiguous_ascii_ctrl('M'));
+        assert!(is_ambiguous_ascii_ctrl('['));
+        assert!(is_ambiguous_ascii_ctrl('{'));
+        assert!(is_ambiguous_ascii_ctrl('@'));
+    }
+
+    #[test]
+    fn non_ambiguous_ctrl_chars() {
+        assert!(!is_ambiguous_ascii_ctrl('a'));
+        assert!(!is_ambiguous_ascii_ctrl('c'));
+        assert!(!is_ambiguous_ascii_ctrl('z'));
+        assert!(!is_ambiguous_ascii_ctrl('0'));
+        assert!(!is_ambiguous_ascii_ctrl(' '));
+    }
+
+    // --- is_ascii tests ---
+
+    #[test]
+    fn is_ascii_for_ascii_chars() {
+        assert!(is_ascii('a'));
+        assert!(is_ascii('Z'));
+        assert!(is_ascii('0'));
+        assert!(is_ascii(' '));
+        assert!(is_ascii('\x00'));
+        assert!(is_ascii('\x7f'));
+    }
+
+    #[test]
+    fn is_ascii_for_non_ascii_chars() {
+        assert!(!is_ascii('\u{80}'));
+        assert!(!is_ascii('é'));
+        assert!(!is_ascii('日'));
+        assert!(!is_ascii('\u{FFFF}'));
+    }
+
+    // --- KeyboardEncoding equality tests ---
+
+    #[test]
+    fn keyboard_encoding_eq() {
+        assert_eq!(KeyboardEncoding::Xterm, KeyboardEncoding::Xterm);
+        assert_eq!(KeyboardEncoding::CsiU, KeyboardEncoding::CsiU);
+        assert_eq!(KeyboardEncoding::Win32, KeyboardEncoding::Win32);
+        assert_ne!(KeyboardEncoding::Xterm, KeyboardEncoding::CsiU);
+        assert_ne!(KeyboardEncoding::CsiU, KeyboardEncoding::Win32);
+    }
+
+    #[test]
+    fn keyboard_encoding_kitty_flags_matter() {
+        use crate::escape::csi::KittyKeyboardFlags;
+        let enc1 = KeyboardEncoding::Kitty(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES);
+        let enc2 = KeyboardEncoding::Kitty(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES);
+        let enc3 = KeyboardEncoding::Kitty(KittyKeyboardFlags::REPORT_EVENT_TYPES);
+        assert_eq!(enc1, enc2);
+        assert_ne!(enc1, enc3);
+    }
+
+    // --- encode edge cases ---
+
+    #[test]
+    fn encode_is_down_false_returns_empty() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        let result = KeyCode::Char('a').encode(Modifiers::NONE, mode, false).unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn encode_plain_char_no_modifiers() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::Char('x').encode(Modifiers::NONE, mode, true).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn encode_enter_no_modifiers() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::Enter.encode(Modifiers::NONE, mode, true).unwrap(),
+            "\r"
+        );
+    }
+
+    #[test]
+    fn encode_enter_newline_mode() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: true,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::Enter.encode(Modifiers::NONE, mode, true).unwrap(),
+            "\r\n"
+        );
+    }
+
+    #[test]
+    fn encode_escape_no_modifiers() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::Escape.encode(Modifiers::NONE, mode, true).unwrap(),
+            "\x1b"
+        );
+    }
+
+    #[test]
+    fn encode_backspace_plain() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::Backspace.encode(Modifiers::NONE, mode, true).unwrap(),
+            "\x7f"
+        );
+    }
+
+    #[test]
+    fn encode_backspace_with_alt() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::Backspace.encode(Modifiers::ALT, mode, true).unwrap(),
+            "\x1b\x7f"
+        );
+    }
+
+    #[test]
+    fn encode_delete_no_modifiers() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::Delete.encode(Modifiers::NONE, mode, true).unwrap(),
+            "\x1b[3~"
+        );
+    }
+
+    #[test]
+    fn encode_insert_no_modifiers() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::Insert.encode(Modifiers::NONE, mode, true).unwrap(),
+            "\x1b[2~"
+        );
+    }
+
+    #[test]
+    fn encode_application_cursor_mode() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: true,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::UpArrow.encode(Modifiers::NONE, mode, true).unwrap(),
+            "\x1bOA"
+        );
+        assert_eq!(
+            KeyCode::DownArrow.encode(Modifiers::NONE, mode, true).unwrap(),
+            "\x1bOB"
+        );
+        assert_eq!(
+            KeyCode::RightArrow.encode(Modifiers::NONE, mode, true).unwrap(),
+            "\x1bOC"
+        );
+        assert_eq!(
+            KeyCode::LeftArrow.encode(Modifiers::NONE, mode, true).unwrap(),
+            "\x1bOD"
+        );
+    }
+
+    #[test]
+    fn encode_arrow_with_shift() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::UpArrow.encode(Modifiers::SHIFT, mode, true).unwrap(),
+            "\x1b[1;2A"
+        );
+    }
+
+    #[test]
+    fn encode_arrow_with_ctrl() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::LeftArrow.encode(Modifiers::CTRL, mode, true).unwrap(),
+            "\x1b[1;5D"
+        );
+    }
+
+    #[test]
+    fn encode_f5_through_f12() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        let expected = [
+            (5, "\x1b[15~"),
+            (6, "\x1b[17~"),
+            (7, "\x1b[18~"),
+            (8, "\x1b[19~"),
+            (9, "\x1b[20~"),
+            (10, "\x1b[21~"),
+            (11, "\x1b[23~"),
+            (12, "\x1b[24~"),
+        ];
+        for (n, seq) in expected {
+            assert_eq!(
+                KeyCode::Function(n).encode(Modifiers::NONE, mode, true).unwrap(),
+                seq,
+                "F{}",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn encode_f1_with_shift() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::Function(1).encode(Modifiers::SHIFT, mode, true).unwrap(),
+            "\x1b[1;2P"
+        );
+    }
+
+    #[test]
+    fn encode_modifier_keys_produce_empty() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        let modifier_keys = [
+            KeyCode::Control,
+            KeyCode::Shift,
+            KeyCode::Alt,
+            KeyCode::Super,
+            KeyCode::Hyper,
+            KeyCode::Meta,
+            KeyCode::CapsLock,
+            KeyCode::NumLock,
+        ];
+        for key in modifier_keys {
+            assert_eq!(
+                key.encode(Modifiers::NONE, mode, true).unwrap(),
+                "",
+                "{:?} should encode to empty",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn encode_alt_char() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::Char('a').encode(Modifiers::ALT, mode, true).unwrap(),
+            "\x1ba"
+        );
+    }
+
+    #[test]
+    fn encode_csiu_mode() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::CsiU,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        // In CSI-u mode, ambiguous ctrl chars get CSI-u encoding
+        assert_eq!(
+            KeyCode::Char('i').encode(Modifiers::CTRL, mode, true).unwrap(),
+            "\x1b[105;5u"
+        );
+    }
+
+    // --- KeyEvent and type tests ---
+
+    #[test]
+    fn key_event_clone_eq() {
+        let ke = KeyEvent {
+            key: KeyCode::Char('x'),
+            modifiers: Modifiers::CTRL | Modifiers::ALT,
+        };
+        let ke2 = ke.clone();
+        assert_eq!(ke, ke2);
+    }
+
+    #[test]
+    fn mouse_event_clone_eq() {
+        let me = MouseEvent {
+            x: 10,
+            y: 20,
+            mouse_buttons: MouseButtons::LEFT,
+            modifiers: Modifiers::SHIFT,
+        };
+        let me2 = me.clone();
+        assert_eq!(me, me2);
+    }
+
+    #[test]
+    fn pixel_mouse_event_clone_eq() {
+        let pme = PixelMouseEvent {
+            x_pixels: 100,
+            y_pixels: 200,
+            mouse_buttons: MouseButtons::RIGHT,
+            modifiers: Modifiers::NONE,
+        };
+        let pme2 = pme.clone();
+        assert_eq!(pme, pme2);
+    }
+
+    #[test]
+    fn input_event_variants() {
+        let key_ev = InputEvent::Key(KeyEvent {
+            key: KeyCode::Char('a'),
+            modifiers: Modifiers::NONE,
+        });
+        let resize_ev = InputEvent::Resized { cols: 80, rows: 24 };
+        let paste_ev = InputEvent::Paste("hello".to_string());
+        let wake_ev = InputEvent::Wake;
+
+        // Ensure all variants are distinct
+        assert_ne!(key_ev, resize_ev);
+        assert_ne!(resize_ev, paste_ev);
+        assert_ne!(paste_ev, wake_ev);
+    }
+
+    #[test]
+    fn keycode_char_del_normalizes_to_delete_in_encode() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        // \x7f should be treated as Delete
+        assert_eq!(
+            KeyCode::Char('\x7f').encode(Modifiers::NONE, mode, true).unwrap(),
+            "\x1b[3~"
+        );
+    }
+
+    #[test]
+    fn keycode_char_bs_normalizes_to_backspace_in_encode() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        // \x08 should be treated as Backspace
+        assert_eq!(
+            KeyCode::Char('\x08').encode(Modifiers::NONE, mode, true).unwrap(),
+            "\x7f"
+        );
+    }
+
+    #[test]
+    fn encode_page_up_down_with_modifiers() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            modify_other_keys: None,
+        };
+        assert_eq!(
+            KeyCode::PageUp.encode(Modifiers::NONE, mode, true).unwrap(),
+            "\x1b[5~"
+        );
+        assert_eq!(
+            KeyCode::PageDown.encode(Modifiers::NONE, mode, true).unwrap(),
+            "\x1b[6~"
+        );
+        assert_eq!(
+            KeyCode::PageUp.encode(Modifiers::CTRL, mode, true).unwrap(),
+            "\x1b[5;5~"
+        );
+    }
+
+    // --- parse edge cases ---
+
+    #[test]
+    fn parse_empty_input() {
+        let mut p = InputParser::new();
+        let inputs = p.parse_as_vec(b"", NO_MORE);
+        assert!(inputs.is_empty());
+    }
+
+    #[test]
+    fn parse_single_escape() {
+        let mut p = InputParser::new();
+        let inputs = p.parse_as_vec(b"\x1b", NO_MORE);
+        assert_eq!(
+            inputs,
+            vec![InputEvent::Key(KeyEvent {
+                modifiers: Modifiers::NONE,
+                key: KeyCode::Escape,
+            })]
+        );
+    }
+
+    #[test]
+    fn parse_bracketed_paste() {
+        let mut p = InputParser::new();
+        let inputs = p.parse_as_vec(b"\x1b[200~pasted text\x1b[201~", NO_MORE);
+        assert_eq!(inputs, vec![InputEvent::Paste("pasted text".to_owned())]);
+    }
+
+    #[test]
+    fn parse_f1_through_f4_ss3() {
+        let mut p = InputParser::new();
+        let inputs = p.parse_as_vec(b"\x1bOP\x1bOQ\x1bOR\x1bOS", NO_MORE);
+        assert_eq!(inputs.len(), 4);
+        assert_eq!(
+            inputs[0],
+            InputEvent::Key(KeyEvent {
+                modifiers: Modifiers::NONE,
+                key: KeyCode::Function(1),
+            })
+        );
+        assert_eq!(
+            inputs[3],
+            InputEvent::Key(KeyEvent {
+                modifiers: Modifiers::NONE,
+                key: KeyCode::Function(4),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_home_end_csi() {
+        let mut p = InputParser::new();
+        let inputs = p.parse_as_vec(b"\x1b[H\x1b[F", NO_MORE);
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(
+            inputs[0],
+            InputEvent::Key(KeyEvent {
+                modifiers: Modifiers::NONE,
+                key: KeyCode::Home,
+            })
+        );
+        assert_eq!(
+            inputs[1],
+            InputEvent::Key(KeyEvent {
+                modifiers: Modifiers::NONE,
+                key: KeyCode::End,
+            })
+        );
+    }
 }
