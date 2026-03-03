@@ -313,6 +313,18 @@ fn redact_step_log(mut step: WorkflowStepLogRecord, redactor: &Redactor) -> Work
 mod tests {
     use super::*;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build export test runtime");
+        runtime.block_on(future);
+    }
+
     #[test]
     fn export_kind_from_str_loose() {
         assert_eq!(
@@ -454,8 +466,9 @@ mod tests {
         assert_eq!(parsed["content"], "hello");
     }
 
-    #[tokio::test]
-    async fn export_segments_to_buffer() {
+    #[test]
+    fn export_segments_to_buffer() {
+        run_async_test(async {
         // Create temp DB
         let tmp = std::env::temp_dir().join(format!("wa_test_export_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
@@ -513,10 +526,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_with_redaction() {
+    #[test]
+    fn export_with_redaction() {
+        run_async_test(async {
         let tmp =
             std::env::temp_dir().join(format!("wa_test_export_redact_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
@@ -573,10 +588,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_with_pane_filter() {
+    #[test]
+    fn export_with_pane_filter() {
+        run_async_test(async {
         let tmp =
             std::env::temp_dir().join(format!("wa_test_export_filter_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
@@ -629,10 +646,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_pretty_format() {
+    #[test]
+    fn export_pretty_format() {
+        run_async_test(async {
         let tmp =
             std::env::temp_dir().join(format!("wa_test_export_pretty_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
@@ -675,10 +694,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_audit_with_actor_filter() {
+    #[test]
+    fn export_audit_with_actor_filter() {
+        run_async_test(async {
         let tmp =
             std::env::temp_dir().join(format!("wa_test_export_audit_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
@@ -801,10 +822,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_audit_redacts_fields() {
+    #[test]
+    fn export_audit_redacts_fields() {
+        run_async_test(async {
         let tmp = std::env::temp_dir().join(format!(
             "wa_test_export_audit_redact_{}.db",
             std::process::id()
@@ -880,6 +903,7 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
     // =========================================================================
@@ -1590,8 +1614,9 @@ mod tests {
     // End-to-end export tests for less-covered kinds
     // =========================================================================
 
-    #[tokio::test]
-    async fn export_empty_produces_header_only() {
+    #[test]
+    fn export_empty_produces_header_only() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("empty").await;
 
         // Export events (none exist) — should produce header with count=0
@@ -1617,10 +1642,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_gaps_end_to_end() {
+    #[test]
+    fn export_gaps_end_to_end() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("gaps").await;
 
         // Need a segment first (record_gap requires last_seq)
@@ -1653,10 +1680,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_events_end_to_end() {
+    #[test]
+    fn export_events_end_to_end() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("events_e2e").await;
 
         let event = StoredEvent {
@@ -1700,10 +1729,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_events_with_redaction() {
+    #[test]
+    fn export_events_with_redaction() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("events_redact").await;
 
         let event = StoredEvent {
@@ -1749,10 +1780,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_sessions_end_to_end() {
+    #[test]
+    fn export_sessions_end_to_end() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("sessions").await;
 
         let session = crate::storage::AgentSessionRecord {
@@ -1797,10 +1830,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_reservations_end_to_end() {
+    #[test]
+    fn export_reservations_end_to_end() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("reservations").await;
 
         storage
@@ -1836,10 +1871,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_workflows_with_step_logs() {
+    #[test]
+    fn export_workflows_with_step_logs() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("workflows").await;
 
         let wf = crate::storage::WorkflowRecord {
@@ -1910,10 +1947,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_workflows_redacts_step_logs() {
+    #[test]
+    fn export_workflows_redacts_step_logs() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("wf_redact").await;
 
         let wf = crate::storage::WorkflowRecord {
@@ -1980,10 +2019,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_segment_schema_validation() {
+    #[test]
+    fn export_segment_schema_validation() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("seg_schema").await;
         storage
             .append_segment(1, "schema test content", None)
@@ -2018,10 +2059,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_header_version_matches_crate() {
+    #[test]
+    fn export_header_version_matches_crate() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("version").await;
 
         let opts = ExportOptions {
@@ -2046,6 +2089,7 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
     #[test]
@@ -2600,8 +2644,9 @@ mod tests {
         assert_eq!(records[1]["id"], 2);
     }
 
-    #[tokio::test]
-    async fn export_multiple_segments_count() {
+    #[test]
+    fn export_multiple_segments_count() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("multi_seg").await;
 
         for i in 0..5 {
@@ -2640,10 +2685,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_header_exported_at_ms_is_recent() {
+    #[test]
+    fn export_header_exported_at_ms_is_recent() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("timestamp").await;
 
         let before_ms = std::time::SystemTime::now()
@@ -2686,10 +2733,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_header_reflects_query_filters() {
+    #[test]
+    fn export_header_reflects_query_filters() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("query_hdr").await;
 
         let opts = ExportOptions {
@@ -2718,10 +2767,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_empty_all_kinds_produce_header() {
+    #[test]
+    fn export_empty_all_kinds_produce_header() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("empty_all").await;
 
         let kinds = [
@@ -2776,10 +2827,12 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
-    #[tokio::test]
-    async fn export_redact_false_does_not_alter_content() {
+    #[test]
+    fn export_redact_false_does_not_alter_content() {
+        run_async_test(async {
         let (storage, tmp) = test_db_with_pane("no_redact").await;
 
         let secret = "sk-abc123def456ghi789jkl012mno345pqr678stu901v";
@@ -2812,6 +2865,7 @@ mod tests {
 
         storage.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&tmp);
+        });
     }
 
     // -----------------------------------------------------------------------
