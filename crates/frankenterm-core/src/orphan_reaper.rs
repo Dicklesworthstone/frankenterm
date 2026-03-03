@@ -689,31 +689,21 @@ mod tests {
 
     #[test]
     fn run_orphan_reaper_responds_to_shutdown() {
-        // Run the reaper inline (no task::spawn) to avoid TLS-after-destruction
-        // panics that occur when the current_thread runtime drops while a spawned
-        // task's sleep timer is still registered.
+        // Pre-signal shutdown so the reaper exits on its first loop iteration.
+        // We avoid spawning background tasks or concurrent sleeps because the
+        // current_thread runtime's TLS cleanup can panic when multiple runtimes
+        // are created/dropped across test threads in the same process.
         run_async_test(async {
             let mut config = CliConfig::default();
-            config.orphan_reap_interval_seconds = 1; // 1 second interval
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let shutdown_clone = shutdown.clone();
+            config.orphan_reap_interval_seconds = 1;
+            let shutdown = Arc::new(AtomicBool::new(true)); // pre-signaled
 
-            // Signal shutdown before the first sleep completes
-            let signal_task = crate::runtime_compat::task::spawn(async move {
-                crate::runtime_compat::sleep(Duration::from_millis(50)).await;
-                shutdown_clone.store(true, Ordering::Relaxed);
-            });
-
-            // Run reaper inline — it will see shutdown after the 1s sleep
             let result = crate::runtime_compat::timeout(
                 Duration::from_secs(3),
-                run_orphan_reaper(config, shutdown.clone()),
+                run_orphan_reaper(config, shutdown),
             )
             .await;
             assert!(result.is_ok(), "reaper should respond to shutdown signal");
-
-            // Ensure the signal task also completes before runtime drops
-            let _ = signal_task.await;
         });
     }
 }
