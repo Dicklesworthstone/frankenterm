@@ -1317,7 +1317,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                 ),
                 description: "Claude Code session start banner".to_string(),
                 remediation: None,
-                workflow: None,
+                workflow: Some("handle_session_start_context".to_string()),
                 manual_fix: None,
                 preview_command: None,
                 learn_more_url: None,

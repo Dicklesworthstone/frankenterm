@@ -772,6 +772,564 @@ impl Workflow for HandleProcessTriageLifecycle {
 }
 
 // ============================================================================
+// HandleSessionStartContext — inject startup context from cass (ft-2l9kn)
+// ============================================================================
+
+/// Default cooldown window in milliseconds (10 minutes).
+/// Session-start context injection events within this window for the same pane are suppressed.
+pub const SESSION_START_CONTEXT_COOLDOWN_MS: i64 = 10 * 60 * 1000;
+const SESSION_START_CASS_HINT_LIMIT: usize = 3;
+const SESSION_START_CASS_TIMEOUT_SECS: u64 = 8;
+const SESSION_START_CASS_LOOKBACK_DAYS: u32 = 30;
+const SESSION_START_QUERY_MAX_CHARS: usize = 180;
+const SESSION_START_HINT_MAX_CHARS: usize = 160;
+
+static SESSION_START_BEAD_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:ft|wa)-[a-z0-9][a-z0-9.-]*\b").expect("valid bead id regex")
+});
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionStartCassHintsLookup {
+    pub query: Option<String>,
+    pub query_candidates: Vec<String>,
+    pub workspace: Option<String>,
+    pub hints: Vec<String>,
+    pub error: Option<String>,
+    pub bead_id: Option<String>,
+    pub pane_title: Option<String>,
+    pub pane_cwd: Option<String>,
+}
+
+/// Inject startup context hints when a session starts.
+///
+/// This workflow runs on `session.start` events, performs a bounded cass lookup
+/// for related historical sessions, persists an audit decision, and injects a
+/// startup prompt into the pane.
+pub struct HandleSessionStartContext {
+    cooldown_ms: i64,
+}
+
+impl HandleSessionStartContext {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cooldown_ms: SESSION_START_CONTEXT_COOLDOWN_MS,
+        }
+    }
+
+    /// Create with a custom cooldown (useful for tests).
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn with_cooldown_ms(cooldown_ms: i64) -> Self {
+        Self { cooldown_ms }
+    }
+
+    fn compact_whitespace(input: &str) -> String {
+        input.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn truncate_chars(input: &str, max_chars: usize) -> String {
+        input.chars().take(max_chars).collect()
+    }
+
+    fn quote_for_shell_command(value: &str) -> String {
+        serde_json::to_string(value).unwrap_or_else(|_| {
+            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{escaped}\"")
+        })
+    }
+
+    fn push_candidate(candidates: &mut Vec<String>, candidate: Option<String>) {
+        let Some(raw) = candidate else {
+            return;
+        };
+        let compact = Self::compact_whitespace(raw.trim());
+        if compact.is_empty() {
+            return;
+        }
+        let truncated = Self::truncate_chars(&compact, SESSION_START_QUERY_MAX_CHARS);
+        if candidates
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&truncated))
+        {
+            return;
+        }
+        candidates.push(truncated);
+    }
+
+    fn extract_bead_id(input: &str) -> Option<String> {
+        SESSION_START_BEAD_ID_RE
+            .find(input)
+            .map(|m| m.as_str().to_ascii_lowercase())
+    }
+
+    fn pane_tail_context(path: &str) -> Option<String> {
+        let components: Vec<String> = std::path::Path::new(path)
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+                _ => None,
+            })
+            .collect();
+
+        if components.is_empty() {
+            return None;
+        }
+
+        let mut tail: Vec<String> = components.into_iter().rev().take(2).collect();
+        tail.reverse();
+        Some(tail.join("/"))
+    }
+
+    fn workspace_for_pane(pane: &crate::storage::PaneRecord) -> Option<String> {
+        let cwd = pane.cwd.as_deref()?;
+        Self::workspace_from_cwd(cwd)
+    }
+
+    fn workspace_from_cwd(cwd: &str) -> Option<String> {
+        let parsed = crate::wezterm::CwdInfo::parse(cwd);
+        if parsed.is_remote || parsed.path.is_empty() {
+            return None;
+        }
+        Some(parsed.path)
+    }
+
+    fn cass_agent_from_trigger(trigger: &serde_json::Value) -> Option<CassAgent> {
+        trigger
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .and_then(CassAgent::from_slug)
+    }
+
+    fn query_candidates(
+        trigger: &serde_json::Value,
+        pane: Option<&crate::storage::PaneRecord>,
+    ) -> (Vec<String>, Option<String>) {
+        let mut candidates = Vec::new();
+
+        let title = pane
+            .and_then(|record| record.title.as_deref())
+            .map(ToString::to_string);
+        let cwd = pane
+            .and_then(|record| record.cwd.as_deref())
+            .map(ToString::to_string);
+        let matched_text = trigger
+            .get("matched_text")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+        let extracted_message = trigger
+            .get("extracted")
+            .and_then(|value| value.get("message"))
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string);
+
+        let bead_id = title
+            .as_deref()
+            .and_then(Self::extract_bead_id)
+            .or_else(|| matched_text.as_deref().and_then(Self::extract_bead_id))
+            .or_else(|| extracted_message.as_deref().and_then(Self::extract_bead_id));
+
+        Self::push_candidate(&mut candidates, bead_id.clone());
+
+        Self::push_candidate(&mut candidates, title);
+        Self::push_candidate(
+            &mut candidates,
+            cwd.and_then(|raw| Self::workspace_from_cwd(&raw))
+                .and_then(|workspace| Self::pane_tail_context(&workspace)),
+        );
+        Self::push_candidate(&mut candidates, extracted_message);
+        Self::push_candidate(&mut candidates, matched_text);
+
+        let model = trigger
+            .get("extracted")
+            .and_then(|value| value.get("model"))
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string);
+        Self::push_candidate(&mut candidates, model);
+
+        let agent_type = trigger
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("agent");
+        Self::push_candidate(
+            &mut candidates,
+            Some(format!("{agent_type} session startup context")),
+        );
+
+        (candidates, bead_id)
+    }
+
+    fn format_cass_hint(hit: &CassSearchHit) -> Option<String> {
+        let snippet = hit
+            .content
+            .as_deref()
+            .map(Self::compact_whitespace)
+            .unwrap_or_default();
+        if snippet.is_empty() {
+            return None;
+        }
+
+        let source_path = hit
+            .source_path
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        let line_suffix = hit
+            .line_number
+            .map_or_else(String::new, |line| format!(":{line}"));
+        let compact_snippet = Self::truncate_chars(&snippet, SESSION_START_HINT_MAX_CHARS);
+
+        Some(format!("{source_path}{line_suffix} - {compact_snippet}"))
+    }
+
+    async fn lookup_cass_hints(
+        storage: &StorageHandle,
+        pane_id: u64,
+        trigger: &serde_json::Value,
+    ) -> SessionStartCassHintsLookup {
+        let pane = match storage.get_pane(pane_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                return SessionStartCassHintsLookup {
+                    query: None,
+                    query_candidates: vec![],
+                    workspace: None,
+                    hints: vec![],
+                    error: Some(format!("pane_lookup_failed: {error}")),
+                    bead_id: None,
+                    pane_title: None,
+                    pane_cwd: None,
+                };
+            }
+        };
+
+        let (query_candidates, bead_id) = Self::query_candidates(trigger, pane.as_ref());
+        let Some(first_query) = query_candidates.first().cloned() else {
+            return SessionStartCassHintsLookup {
+                query: None,
+                query_candidates,
+                workspace: None,
+                hints: vec![],
+                error: Some("no_query_candidates".to_string()),
+                bead_id,
+                pane_title: pane.as_ref().and_then(|record| record.title.clone()),
+                pane_cwd: pane.as_ref().and_then(|record| record.cwd.clone()),
+            };
+        };
+
+        let workspace = pane.as_ref().and_then(Self::workspace_for_pane);
+        let options = SearchOptions {
+            limit: Some(SESSION_START_CASS_HINT_LIMIT),
+            offset: None,
+            agent: Self::cass_agent_from_trigger(trigger),
+            workspace: workspace.clone(),
+            days: Some(SESSION_START_CASS_LOOKBACK_DAYS),
+            fields: Some("minimal".to_string()),
+            max_tokens: Some(220),
+        };
+
+        let cass = CassClient::new().with_timeout_secs(SESSION_START_CASS_TIMEOUT_SECS);
+        let mut last_error: Option<String> = None;
+
+        for query in &query_candidates {
+            match cass.search(query, &options).await {
+                Ok(result) => {
+                    let hints = result
+                        .hits
+                        .iter()
+                        .filter_map(Self::format_cass_hint)
+                        .take(SESSION_START_CASS_HINT_LIMIT)
+                        .collect::<Vec<_>>();
+                    if !hints.is_empty() {
+                        return SessionStartCassHintsLookup {
+                            query: Some(query.clone()),
+                            query_candidates,
+                            workspace,
+                            hints,
+                            error: None,
+                            bead_id,
+                            pane_title: pane.as_ref().and_then(|record| record.title.clone()),
+                            pane_cwd: pane.as_ref().and_then(|record| record.cwd.clone()),
+                        };
+                    }
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                }
+            }
+        }
+
+        SessionStartCassHintsLookup {
+            query: Some(first_query),
+            query_candidates,
+            workspace,
+            hints: vec![],
+            error: last_error,
+            bead_id,
+            pane_title: pane.as_ref().and_then(|record| record.title.clone()),
+            pane_cwd: pane.as_ref().and_then(|record| record.cwd.clone()),
+        }
+    }
+
+    pub fn build_context_prompt(
+        trigger: &serde_json::Value,
+        cass_lookup: &SessionStartCassHintsLookup,
+    ) -> String {
+        let agent_type = trigger
+            .get("agent_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let model = trigger
+            .get("extracted")
+            .and_then(|value| value.get("model"))
+            .and_then(|value| value.as_str());
+
+        let mut lines = vec![
+            "Session startup context bootstrap.".to_string(),
+            format!("Agent type: {agent_type}"),
+        ];
+        if let Some(model_name) = model {
+            lines.push(format!("Model: {model_name}"));
+        }
+        if let Some(bead_id) = cass_lookup.bead_id.as_deref() {
+            lines.push(format!("Detected bead/task hint: {bead_id}"));
+        }
+        if let Some(title) = cass_lookup.pane_title.as_deref() {
+            lines.push(format!("Pane title: {title}"));
+        }
+        if let Some(cwd) = cass_lookup.pane_cwd.as_deref() {
+            lines.push(format!("Pane cwd: {cwd}"));
+        }
+
+        if !cass_lookup.hints.is_empty() {
+            lines.push(String::new());
+            lines.push("Related fixes from past sessions (cass):".to_string());
+            for hint in &cass_lookup.hints {
+                lines.push(format!("- {hint}"));
+            }
+        } else if let Some(error) = cass_lookup.error.as_deref() {
+            lines.push(String::new());
+            lines.push(format!("Cass lookup unavailable: {error}"));
+        } else {
+            lines.push(String::new());
+            lines.push("No direct cass matches found yet.".to_string());
+        }
+
+        if let Some(query) = cass_lookup.query.as_deref() {
+            lines.push(String::new());
+            lines.push(format!("Cass query: {query}"));
+            let quoted_query = Self::quote_for_shell_command(query);
+            lines.push(format!(
+                "Try: ft robot cass search {quoted_query} --limit 3"
+            ));
+        }
+        if let Some(workspace) = cass_lookup.workspace.as_deref() {
+            lines.push(format!("Cass workspace filter: {workspace}"));
+        }
+
+        lines.push(String::new());
+        lines.push(
+            "Keep AGENTS.md + README.md + current bead acceptance criteria in focus.".to_string(),
+        );
+        lines.push("If uncertain on next work, run: bv --robot-triage".to_string());
+
+        let mut prompt = lines.join("\n");
+        prompt.push('\n');
+        prompt
+    }
+}
+
+impl Default for HandleSessionStartContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Workflow for HandleSessionStartContext {
+    fn name(&self) -> &'static str {
+        "handle_session_start_context"
+    }
+
+    fn description(&self) -> &'static str {
+        "Inject startup context hints from cass when a session starts"
+    }
+
+    fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+        detection.event_type == "session.start"
+    }
+
+    fn trigger_event_types(&self) -> &'static [&'static str] {
+        &["session.start"]
+    }
+
+    fn supported_agent_types(&self) -> &'static [&'static str] {
+        &["claude_code", "codex", "gemini"]
+    }
+
+    fn requires_pane(&self) -> bool {
+        true
+    }
+
+    fn requires_approval(&self) -> bool {
+        false
+    }
+
+    fn is_destructive(&self) -> bool {
+        false
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        vec![
+            WorkflowStep::new(
+                "check_cooldown",
+                "Skip if startup context was recently injected for this pane",
+            ),
+            WorkflowStep::new(
+                "inject_startup_context",
+                "Lookup cass hints and inject startup context prompt",
+            ),
+        ]
+    }
+
+    fn execute_step(
+        &self,
+        ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+        let execution_id = ctx.execution_id().to_string();
+        let cooldown_ms = self.cooldown_ms;
+
+        Box::pin(async move {
+            match step_idx {
+                // Step 0: Check cooldown to prevent repeated session-start injection spam.
+                0 => {
+                    let since = now_ms() - cooldown_ms;
+                    let query = crate::storage::AuditQuery {
+                        pane_id: Some(pane_id),
+                        action_kind: Some("session_start_context".to_string()),
+                        since: Some(since),
+                        limit: Some(1),
+                        ..Default::default()
+                    };
+
+                    match storage.get_audit_actions(query).await {
+                        Ok(recent) if !recent.is_empty() => {
+                            tracing::info!(
+                                pane_id,
+                                last_context_ts = recent[0].ts,
+                                "handle_session_start_context: within cooldown, skipping"
+                            );
+                            StepResult::done(serde_json::json!({
+                                "status": "cooldown_skipped",
+                                "pane_id": pane_id,
+                                "last_context_ts": recent[0].ts,
+                            }))
+                        }
+                        Ok(_) => StepResult::cont(),
+                        Err(error) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %error,
+                                "handle_session_start_context: cooldown check failed, proceeding"
+                            );
+                            StepResult::cont()
+                        }
+                    }
+                }
+
+                // Step 1: Query cass, record audit decision, and inject startup prompt.
+                1 => {
+                    let lookup = Self::lookup_cass_hints(&storage, pane_id, &trigger).await;
+                    let prompt = Self::build_context_prompt(&trigger, &lookup);
+                    let result = if lookup.hints.is_empty() {
+                        if lookup.error.is_some() {
+                            "lookup_error"
+                        } else {
+                            "no_hints"
+                        }
+                    } else {
+                        "hints_injected"
+                    };
+
+                    let rule_id = trigger
+                        .get("rule_id")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string);
+                    let event_type = trigger
+                        .get("event_type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown");
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown");
+
+                    let audit = crate::storage::AuditActionRecord {
+                        id: 0,
+                        ts: now_ms(),
+                        actor_kind: "workflow".to_string(),
+                        actor_id: Some(execution_id.clone()),
+                        correlation_id: None,
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: "session_start_context".to_string(),
+                        policy_decision: "allow".to_string(),
+                        decision_reason: None,
+                        rule_id,
+                        input_summary: Some(format!(
+                            "Session start context injection for {agent_type}"
+                        )),
+                        verification_summary: None,
+                        decision_context: Some(
+                            serde_json::to_string(&serde_json::json!({
+                                "event_type": event_type,
+                                "query": lookup.query,
+                                "query_candidates": lookup.query_candidates,
+                                "workspace": lookup.workspace,
+                                "bead_id": lookup.bead_id,
+                                "pane_title": lookup.pane_title,
+                                "pane_cwd": lookup.pane_cwd,
+                                "hints": lookup.hints,
+                                "lookup_error": lookup.error,
+                            }))
+                            .unwrap_or_default(),
+                        ),
+                        result: result.to_string(),
+                    };
+
+                    match storage.record_audit_action(audit).await {
+                        Ok(audit_id) => {
+                            tracing::info!(
+                                pane_id,
+                                audit_id,
+                                result,
+                                "handle_session_start_context: recorded session-start context decision"
+                            );
+                            StepResult::send_text(prompt)
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                pane_id,
+                                error = %error,
+                                "handle_session_start_context: failed to record audit decision"
+                            );
+                            StepResult::abort(format!(
+                                "Failed to record session_start_context decision: {error}"
+                            ))
+                        }
+                    }
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
+}
+
+// ============================================================================
 // HandleAuthRequired — centralize auth recovery (wa-nu4.2.2.4)
 // ============================================================================
 
@@ -2688,6 +3246,152 @@ mod tests {
     }
 
     // ========================================================================
+    // HandleSessionStartContext
+    // ========================================================================
+
+    #[test]
+    fn handle_session_start_context_metadata() {
+        let workflow = HandleSessionStartContext::new();
+        assert_eq!(workflow.name(), "handle_session_start_context");
+        assert_eq!(workflow.trigger_event_types(), ["session.start"]);
+        assert!(!workflow.is_destructive());
+        assert!(!workflow.requires_approval());
+        assert!(workflow.requires_pane());
+    }
+
+    #[test]
+    fn handle_session_start_context_handles_session_start_only() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleSessionStartContext::new();
+        let session_start = Detection {
+            rule_id: "claude_code.banner".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "session.start".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::json!({"model":"claude-opus-4-6"}),
+            matched_text: "Claude Code v1.0".to_string(),
+            span: (0, 0),
+        };
+        assert!(workflow.handles(&session_start));
+
+        let auth_error = Detection {
+            event_type: "auth.error".to_string(),
+            ..session_start
+        };
+        assert!(!workflow.handles(&auth_error));
+    }
+
+    #[test]
+    fn handle_session_start_context_query_candidates_prefer_bead_id() {
+        let trigger = serde_json::json!({
+            "agent_type": "claude_code",
+            "event_type": "session.start",
+            "matched_text": "Claude Code v1.0",
+            "extracted": {"model": "claude-opus-4-6"},
+        });
+        let pane = crate::storage::PaneRecord {
+            pane_id: 77,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: Some(1),
+            tab_id: Some(1),
+            title: Some("Working on ft-2l9kn cass integration".to_string()),
+            cwd: Some("/Users/jemanuel/projects/frankenterm".to_string()),
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+
+        let (candidates, bead_id) =
+            HandleSessionStartContext::query_candidates(&trigger, Some(&pane));
+        assert_eq!(bead_id.as_deref(), Some("ft-2l9kn"));
+        assert!(
+            candidates.iter().any(|entry| entry == "ft-2l9kn"),
+            "expected bead id query candidate in {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn handle_session_start_context_build_prompt_includes_hints() {
+        let trigger = serde_json::json!({
+            "agent_type": "claude_code",
+            "event_type": "session.start",
+            "extracted": {"model": "claude-opus-4-6"},
+        });
+        let lookup = SessionStartCassHintsLookup {
+            query: Some("ft-2l9kn".to_string()),
+            query_candidates: vec!["ft-2l9kn".to_string()],
+            workspace: Some("/Users/jemanuel/projects/frankenterm".to_string()),
+            hints: vec!["/tmp/session.md:42 - use rch for cargo".to_string()],
+            error: None,
+            bead_id: Some("ft-2l9kn".to_string()),
+            pane_title: Some("ft-2l9kn".to_string()),
+            pane_cwd: Some("/Users/jemanuel/projects/frankenterm".to_string()),
+        };
+
+        let prompt = HandleSessionStartContext::build_context_prompt(&trigger, &lookup);
+        assert!(prompt.contains("Session startup context bootstrap."));
+        assert!(prompt.contains("Related fixes from past sessions (cass):"));
+        assert!(prompt.contains("ft robot cass search \"ft-2l9kn\" --limit 3"));
+    }
+
+    #[test]
+    fn handle_session_start_context_build_prompt_no_hints_still_guides() {
+        let trigger = serde_json::json!({
+            "agent_type": "claude_code",
+            "event_type": "session.start",
+        });
+        let lookup = SessionStartCassHintsLookup {
+            query: Some("claude_code session startup context".to_string()),
+            query_candidates: vec!["claude_code session startup context".to_string()],
+            workspace: None,
+            hints: vec![],
+            error: None,
+            bead_id: None,
+            pane_title: None,
+            pane_cwd: None,
+        };
+
+        let prompt = HandleSessionStartContext::build_context_prompt(&trigger, &lookup);
+        assert!(prompt.contains("No direct cass matches found yet."));
+        assert!(
+            prompt.contains(
+                "Keep AGENTS.md + README.md + current bead acceptance criteria in focus."
+            )
+        );
+    }
+
+    #[test]
+    fn handle_session_start_context_build_prompt_escapes_query_quotes() {
+        let trigger = serde_json::json!({
+            "agent_type": "claude_code",
+            "event_type": "session.start",
+        });
+        let lookup = SessionStartCassHintsLookup {
+            query: Some("fix \"quoted\" regression".to_string()),
+            query_candidates: vec!["fix \"quoted\" regression".to_string()],
+            workspace: None,
+            hints: vec![],
+            error: None,
+            bead_id: None,
+            pane_title: None,
+            pane_cwd: None,
+        };
+
+        let prompt = HandleSessionStartContext::build_context_prompt(&trigger, &lookup);
+        assert!(
+            prompt
+                .contains("Try: ft robot cass search \"fix \\\"quoted\\\" regression\" --limit 3"),
+            "prompt must include shell-safe quoted query: {prompt}"
+        );
+    }
+
+    // ========================================================================
     // ResumeSessionConfig defaults
     // ========================================================================
 
@@ -2788,7 +3492,11 @@ mod tests {
         let config = ResumeSessionConfig::default();
         let result = build_resume_step_result("sess-123", &config);
         match &result {
-            StepResult::SendText { text, wait_for, wait_timeout_ms } => {
+            StepResult::SendText {
+                text,
+                wait_for,
+                wait_timeout_ms,
+            } => {
                 assert!(text.contains("sess-123"));
                 assert!(wait_for.is_some());
                 assert_eq!(*wait_timeout_ms, Some(config.resume_timeout_ms));
@@ -2806,7 +3514,11 @@ mod tests {
         let config = ResumeSessionConfig::default();
         let result = build_proceed_step_result(&config);
         match &result {
-            StepResult::SendText { text, wait_for, wait_timeout_ms } => {
+            StepResult::SendText {
+                text,
+                wait_for,
+                wait_timeout_ms,
+            } => {
                 assert_eq!(text, "proceed.\n");
                 assert!(wait_for.is_some());
                 assert_eq!(*wait_timeout_ms, Some(config.proceed_timeout_ms));

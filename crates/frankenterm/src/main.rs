@@ -6826,6 +6826,7 @@ fn build_workflow_by_name(
         ),
         Arc::new(frankenterm_core::workflows::HandleUsageLimits::new()),
         Arc::new(frankenterm_core::workflows::HandleSessionEnd::new()),
+        Arc::new(frankenterm_core::workflows::HandleSessionStartContext::new()),
         Arc::new(frankenterm_core::workflows::HandleAuthRequired::new()),
         Arc::new(frankenterm_core::workflows::HandleClaudeCodeLimits::new()),
         Arc::new(frankenterm_core::workflows::HandleGeminiQuota::new()),
@@ -7305,6 +7306,15 @@ fn resolve_workflow(
         )),
         "handle_usage_limits" => Some(std::sync::Arc::new(
             frankenterm_core::workflows::HandleUsageLimits::new(),
+        )),
+        "handle_session_end" => Some(std::sync::Arc::new(
+            frankenterm_core::workflows::HandleSessionEnd::new(),
+        )),
+        "handle_session_start_context" => Some(std::sync::Arc::new(
+            frankenterm_core::workflows::HandleSessionStartContext::new(),
+        )),
+        "handle_auth_required" => Some(std::sync::Arc::new(
+            frankenterm_core::workflows::HandleAuthRequired::new(),
         )),
         "handle_claude_code_limits" => Some(std::sync::Arc::new(
             frankenterm_core::workflows::HandleClaudeCodeLimits::new(),
@@ -11116,6 +11126,9 @@ async fn run_watcher(
             frankenterm_core::workflows::HandleSessionEnd::new(),
         ));
         workflow_runner.register_workflow(Arc::new(
+            frankenterm_core::workflows::HandleSessionStartContext::new(),
+        ));
+        workflow_runner.register_workflow(Arc::new(
             frankenterm_core::workflows::HandleAuthRequired::new(),
         ));
         workflow_runner.register_workflow(Arc::new(
@@ -11128,7 +11141,7 @@ async fn run_watcher(
             frankenterm_core::workflows::HandleProcessTriageLifecycle::new(),
         ));
         tracing::info!(
-            "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_auth_required, handle_claude_code_limits, handle_gemini_quota, handle_process_triage_lifecycle"
+            "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_session_start_context, handle_auth_required, handle_claude_code_limits, handle_gemini_quota, handle_process_triage_lifecycle"
         );
 
         // Spawn workflow runner event loop
@@ -15022,7 +15035,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             ),
                                             enabled: true,
                                             trigger_event_types: Some(vec![
-                                                "session_end".to_string(),
+                                                "session.summary".to_string(),
+                                                "session.end".to_string(),
+                                            ]),
+                                            requires_pane: Some(true),
+                                        },
+                                        RobotWorkflowInfo {
+                                            name: "handle_session_start_context".to_string(),
+                                            description: Some(
+                                                "Inject startup context hints from cass when a \
+                                                 session starts"
+                                                    .to_string(),
+                                            ),
+                                            enabled: true,
+                                            trigger_event_types: Some(vec![
+                                                "session.start".to_string(),
                                             ]),
                                             requires_pane: Some(true),
                                         },
@@ -15035,7 +15062,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             ),
                                             enabled: true,
                                             trigger_event_types: Some(vec![
-                                                "auth_required".to_string(),
+                                                "auth.device_code".to_string(),
+                                                "auth.error".to_string(),
                                             ]),
                                             requires_pane: Some(true),
                                         },
@@ -15050,6 +15078,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             trigger_event_types: Some(vec![
                                                 "usage.warning".to_string(),
                                                 "usage.reached".to_string(),
+                                                "rate_limit.detected".to_string(),
                                             ]),
                                             requires_pane: Some(true),
                                         },
@@ -15064,6 +15093,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             trigger_event_types: Some(vec![
                                                 "usage.warning".to_string(),
                                                 "usage.reached".to_string(),
+                                                "rate_limit.detected".to_string(),
                                             ]),
                                             requires_pane: Some(true),
                                         },
@@ -19520,6 +19550,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         ),
                         Arc::new(frankenterm_core::workflows::HandleUsageLimits::new()),
                         Arc::new(frankenterm_core::workflows::HandleSessionEnd::new()),
+                        Arc::new(frankenterm_core::workflows::HandleSessionStartContext::new()),
                         Arc::new(frankenterm_core::workflows::HandleAuthRequired::new()),
                         Arc::new(frankenterm_core::workflows::HandleClaudeCodeLimits::new()),
                         Arc::new(frankenterm_core::workflows::HandleGeminiQuota::new()),
@@ -19655,6 +19686,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         ));
                         runner.register_workflow(Arc::new(
                             frankenterm_core::workflows::HandleSessionEnd::new(),
+                        ));
+                        runner.register_workflow(Arc::new(
+                            frankenterm_core::workflows::HandleSessionStartContext::new(),
                         ));
                         runner.register_workflow(Arc::new(
                             frankenterm_core::workflows::HandleAuthRequired::new(),
@@ -20068,7 +20102,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             payload["resize_control_plane_watchdog"] =
                                 serde_json::to_value(&watchdog).unwrap_or(serde_json::Value::Null);
                             let ladder =
-                                frankenterm_core::runtime::derive_resize_degradation_ladder(&watchdog);
+                                frankenterm_core::runtime::derive_resize_degradation_ladder(
+                                    &watchdog,
+                                );
                             payload["resize_degradation_ladder"] =
                                 serde_json::to_value(ladder).unwrap_or(serde_json::Value::Null);
                         }
@@ -20091,11 +20127,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         print!("{resize_output}");
                         let checks =
                             HealthSnapshotRenderer::resize_dashboard_diagnostic_checks(dash);
-                        if checks.iter().all(|c| c.status == frankenterm_core::output::HealthDiagnosticStatus::Ok) {
+                        if checks.iter().all(|c| {
+                            c.status == frankenterm_core::output::HealthDiagnosticStatus::Ok
+                        }) {
                             println!("  All resize quality checks: OK");
                         }
                     } else {
-                        println!("  Resize dashboard: no data (watcher not running or no resize events yet)");
+                        println!(
+                            "  Resize dashboard: no data (watcher not running or no resize events yet)"
+                        );
                     }
                 }
             } else {
@@ -22383,6 +22423,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     ));
                     runner.register_workflow(std::sync::Arc::new(
                         frankenterm_core::workflows::HandleSessionEnd::new(),
+                    ));
+                    runner.register_workflow(std::sync::Arc::new(
+                        frankenterm_core::workflows::HandleSessionStartContext::new(),
                     ));
                     runner.register_workflow(std::sync::Arc::new(
                         frankenterm_core::workflows::HandleAuthRequired::new(),
@@ -41002,7 +41045,7 @@ log_level = "debug"
     }
 
     #[test]
-    fn robot_workflow_list_returns_all_four_workflows() {
+    fn robot_workflow_list_returns_all_builtin_workflows() {
         // Replicate the hardcoded list from the List handler to verify completeness.
         let workflows: Vec<RobotWorkflowInfo> = vec![
             RobotWorkflowInfo {
@@ -41027,7 +41070,17 @@ log_level = "debug"
                     "Capture and store structured session summary on agent session end".to_string(),
                 ),
                 enabled: true,
-                trigger_event_types: Some(vec!["session_end".to_string()]),
+                trigger_event_types: Some(vec![
+                    "session.summary".to_string(),
+                    "session.end".to_string(),
+                ]),
+                requires_pane: Some(true),
+            },
+            RobotWorkflowInfo {
+                name: "handle_session_start_context".to_string(),
+                description: Some("Inject startup context hints from cass when a session starts".to_string()),
+                enabled: true,
+                trigger_event_types: Some(vec!["session.start".to_string()]),
                 requires_pane: Some(true),
             },
             RobotWorkflowInfo {
@@ -41037,7 +41090,10 @@ log_level = "debug"
                         .to_string(),
                 ),
                 enabled: true,
-                trigger_event_types: Some(vec!["auth_required".to_string()]),
+                trigger_event_types: Some(vec![
+                    "auth.device_code".to_string(),
+                    "auth.error".to_string(),
+                ]),
                 requires_pane: Some(true),
             },
             RobotWorkflowInfo {
@@ -41049,6 +41105,7 @@ log_level = "debug"
                 trigger_event_types: Some(vec![
                     "usage.warning".to_string(),
                     "usage.reached".to_string(),
+                    "rate_limit.detected".to_string(),
                 ]),
                 requires_pane: Some(true),
             },
@@ -41061,6 +41118,7 @@ log_level = "debug"
                 trigger_event_types: Some(vec![
                     "usage.warning".to_string(),
                     "usage.reached".to_string(),
+                    "rate_limit.detected".to_string(),
                 ]),
                 requires_pane: Some(true),
             },
@@ -41075,11 +41133,12 @@ log_level = "debug"
             },
         ];
 
-        assert_eq!(workflows.len(), 7, "must list exactly 7 workflows");
+        assert_eq!(workflows.len(), 8, "must list exactly 8 workflows");
         let names: Vec<&str> = workflows.iter().map(|w| w.name.as_str()).collect();
         assert!(names.contains(&"handle_compaction"));
         assert!(names.contains(&"handle_usage_limits"));
         assert!(names.contains(&"handle_session_end"));
+        assert!(names.contains(&"handle_session_start_context"));
         assert!(names.contains(&"handle_auth_required"));
         assert!(names.contains(&"handle_claude_code_limits"));
         assert!(names.contains(&"handle_gemini_quota"));
@@ -41088,6 +41147,59 @@ log_level = "debug"
             workflows.iter().all(|w| w.enabled),
             "all workflows must be enabled"
         );
+
+        let triggers_for = |name: &str| {
+            workflows
+                .iter()
+                .find(|wf| wf.name == name)
+                .and_then(|wf| wf.trigger_event_types.as_ref())
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            triggers_for("handle_session_end"),
+            vec!["session.summary".to_string(), "session.end".to_string()]
+        );
+        assert_eq!(
+            triggers_for("handle_auth_required"),
+            vec!["auth.device_code".to_string(), "auth.error".to_string()]
+        );
+        assert_eq!(
+            triggers_for("handle_claude_code_limits"),
+            vec![
+                "usage.warning".to_string(),
+                "usage.reached".to_string(),
+                "rate_limit.detected".to_string(),
+            ]
+        );
+        assert_eq!(
+            triggers_for("handle_gemini_quota"),
+            vec![
+                "usage.warning".to_string(),
+                "usage.reached".to_string(),
+                "rate_limit.detected".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_workflow_supports_all_builtin_workflow_names() {
+        let config = frankenterm_core::config::WorkflowsConfig::default();
+        for name in [
+            "handle_compaction",
+            "handle_usage_limits",
+            "handle_session_end",
+            "handle_session_start_context",
+            "handle_auth_required",
+            "handle_claude_code_limits",
+            "handle_gemini_quota",
+            "handle_process_triage_lifecycle",
+        ] {
+            assert!(
+                resolve_workflow(name, &config).is_some(),
+                "resolve_workflow should resolve '{name}'"
+            );
+        }
     }
 
     #[test]
