@@ -1938,7 +1938,7 @@ fn validate_scrollback_hot_lines(value: &usize) -> Result<(), String> {
 }
 
 fn validate_scrollback_warm_max_mb(value: &usize) -> Result<(), String> {
-    const MAX_SCROLLBACK_WARM_MB: usize = 1024 * 1024;
+    const MAX_SCROLLBACK_WARM_MB: usize = 1024;
     if *value > MAX_SCROLLBACK_WARM_MB {
         return Err(format!(
             "Illegal value {value} for scrollback_warm_max_mb; it must be <= {MAX_SCROLLBACK_WARM_MB}"

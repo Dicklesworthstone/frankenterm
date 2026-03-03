@@ -612,22 +612,17 @@ impl ScrollbackTieringState {
     }
 }
 
-fn scrollback_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
-    if allow_scrollback {
-        config.scrollback_size()
-    } else {
-        0
-    }
-}
-
 fn scrollback_hot_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
     if !allow_scrollback {
         return 0;
     }
-    let total = config.scrollback_size().max(1);
+    let total = config.scrollback_size();
     let tier = config.scrollback_tier_config();
     if !tier.enabled {
         return total;
+    }
+    if total == 0 {
+        return 0;
     }
     tier.hot_lines.max(1).min(total)
 }
@@ -702,10 +697,6 @@ impl Screen {
     #[cfg(test)]
     fn force_resize_commit_rollback(&mut self, cause: LastGoodFrameRollbackCause) {
         self.forced_rollback_cause = Some(cause);
-    }
-
-    fn scrollback_size(&self) -> usize {
-        scrollback_size(&self.config, self.allow_scrollback)
     }
 
     fn hot_scrollback_size(&self) -> usize {
@@ -3529,6 +3520,64 @@ mod tests {
         assert!(
             screen.scrollback_tiering.warm_spill_lines_total > 0,
             "scrollback beyond hot budget should spill into tier accounting"
+        );
+    }
+
+    #[test]
+    fn zero_scrollback_preserves_no_history_without_tiering() {
+        let mut screen = test_screen_with_config(
+            2,
+            4,
+            96,
+            TestTermConfig {
+                scrollback: 0,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: false,
+                    hot_lines: 0,
+                    warm_max_bytes: 0,
+                },
+                ..TestTermConfig::default()
+            },
+        );
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+
+        for seq in 1..=16 {
+            screen.scroll_up(&region, 1, seq, CellAttributes::blank(), bidi_mode());
+        }
+
+        assert_eq!(
+            screen.scrollback_rows(),
+            screen.physical_rows,
+            "zero scrollback should retain only the visible rows"
+        );
+    }
+
+    #[test]
+    fn zero_scrollback_preserves_no_history_with_tiering_enabled() {
+        let mut screen = test_screen_with_config(
+            2,
+            4,
+            96,
+            TestTermConfig {
+                scrollback: 0,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1000,
+                    warm_max_bytes: 64 * 1024 * 1024,
+                },
+                ..TestTermConfig::default()
+            },
+        );
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+
+        for seq in 1..=16 {
+            screen.scroll_up(&region, 1, seq, CellAttributes::blank(), bidi_mode());
+        }
+
+        assert_eq!(
+            screen.scrollback_rows(),
+            screen.physical_rows,
+            "tiered mode must not override an explicit zero scrollback budget"
         );
     }
 
