@@ -6,7 +6,7 @@
 // reproducible and codified rather than ad-hoc.
 // =============================================================================
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -229,6 +229,26 @@ pub struct FleetTemplate {
     /// Layout template to use for arranging the panes.
     #[serde(default)]
     pub layout_template: Option<String>,
+    /// Startup orchestration mode for this fleet.
+    #[serde(default)]
+    pub startup_strategy: FleetStartupStrategy,
+    /// Optional topology profile for deterministic native mux initialization.
+    ///
+    /// If unset, `layout_template` acts as the fallback topology initializer.
+    #[serde(default)]
+    pub topology_profile: Option<String>,
+}
+
+/// Startup orchestration strategy for a fleet.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetStartupStrategy {
+    /// Launch pane slots in deterministic phase order. Slots in the same phase
+    /// may be launched in parallel by downstream executors.
+    #[default]
+    Phased,
+    /// Launch pane slots one-by-one in deterministic order.
+    Serial,
 }
 
 /// A single slot in a fleet template.
@@ -245,6 +265,12 @@ pub struct FleetSlot {
     /// Additional environment for this specific slot.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Relative launch weight for this slot (higher = earlier within a phase).
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+    /// Startup phase; lower phases launch before higher phases.
+    #[serde(default)]
+    pub startup_phase: u16,
 }
 
 // =============================================================================
@@ -494,14 +520,28 @@ impl ProfileRegistry {
                 panes.push(ResolvedFleetPane {
                     label: slot.label.clone(),
                     resolved,
+                    weight: slot.weight.max(1),
+                    startup_phase: slot.startup_phase,
+                    launch_order: 0,
                 });
             }
         }
 
+        let launch_plan = FleetLaunchPlan::from_resolved(
+            &fleet.name,
+            fleet.startup_strategy,
+            fleet.topology_profile.as_ref(),
+            fleet.layout_template.as_ref(),
+            &mut panes,
+        );
+
         Some(ResolvedFleet {
             name: fleet.name.clone(),
             layout_template: fleet.layout_template.clone(),
+            startup_strategy: fleet.startup_strategy,
+            topology_profile: fleet.topology_profile.clone(),
             panes,
+            launch_plan,
         })
     }
 }
@@ -520,7 +560,10 @@ pub struct ResolvedProfile {
 pub struct ResolvedFleet {
     pub name: String,
     pub layout_template: Option<String>,
+    pub startup_strategy: FleetStartupStrategy,
+    pub topology_profile: Option<String>,
     pub panes: Vec<ResolvedFleetPane>,
+    pub launch_plan: FleetLaunchPlan,
 }
 
 /// A single resolved pane in a fleet.
@@ -528,6 +571,126 @@ pub struct ResolvedFleet {
 pub struct ResolvedFleetPane {
     pub label: String,
     pub resolved: ResolvedProfile,
+    pub weight: u32,
+    pub startup_phase: u16,
+    pub launch_order: usize,
+}
+
+/// Deterministic launch metadata derived from a resolved fleet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetLaunchPlan {
+    /// Fleet name this plan was derived from.
+    pub fleet: String,
+    /// Startup strategy selected by the fleet template.
+    pub startup_strategy: FleetStartupStrategy,
+    /// Topology initializer for deterministic native mux arrangement.
+    pub topology_initializer: Option<String>,
+    /// Slot labels in deterministic launch order.
+    pub deterministic_order: Vec<String>,
+    /// Startup phases in execution order with deterministic per-phase ordering.
+    pub phases: Vec<FleetLaunchPhase>,
+    /// Aggregate launch weight across all slots.
+    pub total_weight: u32,
+    /// Weighted program mix summary (queryable by downstream schedulers).
+    pub program_mix: Vec<FleetProgramMix>,
+}
+
+/// Deterministic startup phase group.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetLaunchPhase {
+    pub phase: u16,
+    pub slots: Vec<String>,
+}
+
+/// Weighted program distribution summary for the fleet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetProgramMix {
+    pub program: String,
+    pub slot_count: u32,
+    pub total_weight: u32,
+    pub slots: Vec<String>,
+}
+
+impl FleetLaunchPlan {
+    fn from_resolved(
+        fleet: &str,
+        startup_strategy: FleetStartupStrategy,
+        topology_profile: Option<&String>,
+        layout_template: Option<&String>,
+        panes: &mut [ResolvedFleetPane],
+    ) -> Self {
+        // Deterministic global ordering:
+        // 1) startup phase asc
+        // 2) weight desc (heavier slots first)
+        // 3) label asc
+        // 4) stable index asc
+        let mut indices: Vec<usize> = (0..panes.len()).collect();
+        indices.sort_by(|&a, &b| {
+            panes[a]
+                .startup_phase
+                .cmp(&panes[b].startup_phase)
+                .then_with(|| panes[b].weight.cmp(&panes[a].weight))
+                .then_with(|| panes[a].label.cmp(&panes[b].label))
+                .then_with(|| a.cmp(&b))
+        });
+
+        for (position, idx) in indices.iter().copied().enumerate() {
+            panes[idx].launch_order = position;
+        }
+
+        let deterministic_order = indices
+            .iter()
+            .map(|idx| panes[*idx].label.clone())
+            .collect::<Vec<_>>();
+
+        let mut phase_map: BTreeMap<u16, Vec<String>> = BTreeMap::new();
+        let mut mix_map: BTreeMap<String, FleetProgramMix> = BTreeMap::new();
+        let mut total_weight = 0_u32;
+
+        for idx in indices {
+            let pane = &panes[idx];
+            total_weight = total_weight.saturating_add(pane.weight);
+            phase_map
+                .entry(pane.startup_phase)
+                .or_default()
+                .push(pane.label.clone());
+
+            let program = pane
+                .resolved
+                .agent_identity
+                .as_ref()
+                .map(|identity| identity.program.clone())
+                .unwrap_or_else(|| "shell".to_string());
+            let entry = mix_map.entry(program.clone()).or_insert_with(|| FleetProgramMix {
+                program,
+                slot_count: 0,
+                total_weight: 0,
+                slots: Vec::new(),
+            });
+            entry.slot_count = entry.slot_count.saturating_add(1);
+            entry.total_weight = entry.total_weight.saturating_add(pane.weight);
+            entry.slots.push(pane.label.clone());
+        }
+
+        let phases = phase_map
+            .into_iter()
+            .map(|(phase, slots)| FleetLaunchPhase { phase, slots })
+            .collect::<Vec<_>>();
+
+        let program_mix = mix_map.into_values().collect::<Vec<_>>();
+
+        Self {
+            fleet: fleet.to_string(),
+            startup_strategy,
+            topology_initializer: topology_profile
+                .cloned()
+                .or_else(|| layout_template.cloned()),
+            deterministic_order,
+            phases,
+            total_weight,
+            program_mix,
+        }
+    }
 }
 
 // =============================================================================
@@ -545,6 +708,10 @@ pub enum ProfileValidationError {
     SlotRefNotFound { fleet: String, slot: String, ref_name: String },
     /// Fleet has no slots.
     EmptyFleet { name: String },
+    /// Fleet has duplicate slot labels.
+    DuplicateSlotLabel { fleet: String, label: String },
+    /// Fleet slot weight must be non-zero.
+    InvalidSlotWeight { fleet: String, slot: String },
     /// Bootstrap command is empty.
     EmptyBootstrapCommand { profile: String, index: usize },
 }
@@ -564,6 +731,12 @@ impl std::fmt::Display for ProfileValidationError {
             }
             Self::EmptyFleet { name } => {
                 write!(f, "fleet template '{name}' has no slots")
+            }
+            Self::DuplicateSlotLabel { fleet, label } => {
+                write!(f, "fleet '{fleet}' contains duplicate slot label '{label}'")
+            }
+            Self::InvalidSlotWeight { fleet, slot } => {
+                write!(f, "fleet '{fleet}' slot '{slot}' has invalid zero weight")
             }
             Self::EmptyBootstrapCommand { profile, index } => {
                 write!(f, "profile '{profile}' has empty bootstrap command at index {index}")
@@ -609,7 +782,20 @@ impl ProfileRegistry {
                     name: fleet.name.clone(),
                 });
             }
+            let mut labels = HashSet::new();
             for slot in &fleet.slots {
+                if !labels.insert(slot.label.clone()) {
+                    errors.push(ProfileValidationError::DuplicateSlotLabel {
+                        fleet: fleet.name.clone(),
+                        label: slot.label.clone(),
+                    });
+                }
+                if slot.weight == 0 {
+                    errors.push(ProfileValidationError::InvalidSlotWeight {
+                        fleet: fleet.name.clone(),
+                        slot: slot.label.clone(),
+                    });
+                }
                 if let Some(persona_name) = &slot.persona {
                     if !self.personas.contains_key(persona_name) {
                         errors.push(ProfileValidationError::SlotRefNotFound {
@@ -926,15 +1112,21 @@ mod tests {
                     persona: None,
                     profile: Some("dev-shell".into()),
                     env: HashMap::new(),
+                    weight: 2,
+                    startup_phase: 0,
                 },
                 FleetSlot {
                     label: "worker-1".into(),
                     persona: Some("builder".into()),
                     profile: None,
                     env: HashMap::new(),
+                    weight: 1,
+                    startup_phase: 1,
                 },
             ],
             layout_template: Some("side-by-side".into()),
+            startup_strategy: FleetStartupStrategy::Phased,
+            topology_profile: Some("swarm-default".into()),
         };
 
         let json = serde_json::to_string(&fleet).unwrap();
@@ -951,7 +1143,11 @@ mod tests {
             name: "worker-persona".into(),
             profile_name: "agent-worker".into(),
             env_overrides: HashMap::new(),
-            agent_identity: None,
+            agent_identity: Some(AgentIdentitySpec {
+                program: "codex-cli".into(),
+                model: Some("gpt-5-codex".into()),
+                task: Some("worker".into()),
+            }),
             description: None,
         });
 
@@ -964,6 +1160,8 @@ mod tests {
                     persona: None,
                     profile: Some("dev-shell".into()),
                     env: HashMap::new(),
+                    weight: 3,
+                    startup_phase: 0,
                 },
                 FleetSlot {
                     label: "worker".into(),
@@ -974,9 +1172,13 @@ mod tests {
                         m.insert("SLOT_ID".into(), "w1".into());
                         m
                     },
+                    weight: 1,
+                    startup_phase: 1,
                 },
             ],
             layout_template: Some("side-by-side".into()),
+            startup_strategy: FleetStartupStrategy::Phased,
+            topology_profile: Some("swarm-1+3".into()),
         });
 
         let fleet = reg.resolve_fleet("my-fleet").unwrap();
@@ -988,6 +1190,102 @@ mod tests {
         assert_eq!(
             fleet.panes[1].resolved.environment.get("SLOT_ID").map(|s| s.as_str()),
             Some("w1")
+        );
+        assert_eq!(fleet.panes[0].launch_order, 0);
+        assert_eq!(fleet.panes[1].launch_order, 1);
+        assert_eq!(fleet.launch_plan.deterministic_order, vec!["primary", "worker"]);
+        assert_eq!(
+            fleet.launch_plan.topology_initializer.as_deref(),
+            Some("swarm-1+3")
+        );
+        assert_eq!(fleet.launch_plan.total_weight, 4);
+        assert_eq!(fleet.launch_plan.program_mix.len(), 2);
+        assert_eq!(fleet.launch_plan.program_mix[0].program, "codex-cli");
+        assert_eq!(fleet.launch_plan.program_mix[0].slot_count, 1);
+        assert_eq!(fleet.launch_plan.program_mix[0].total_weight, 1);
+        assert_eq!(fleet.launch_plan.program_mix[1].program, "shell");
+        assert_eq!(fleet.launch_plan.program_mix[1].slot_count, 1);
+        assert_eq!(fleet.launch_plan.program_mix[1].total_weight, 3);
+    }
+
+    #[test]
+    fn resolve_fleet_launch_order_deterministic_by_phase_weight_and_label() {
+        let mut reg = ProfileRegistry::new();
+        reg.register_defaults();
+        reg.register_persona(Persona {
+            name: "agent-a".into(),
+            profile_name: "agent-worker".into(),
+            env_overrides: HashMap::new(),
+            agent_identity: Some(AgentIdentitySpec {
+                program: "claude-code".into(),
+                model: None,
+                task: None,
+            }),
+            description: None,
+        });
+        reg.register_persona(Persona {
+            name: "agent-b".into(),
+            profile_name: "agent-worker".into(),
+            env_overrides: HashMap::new(),
+            agent_identity: Some(AgentIdentitySpec {
+                program: "codex-cli".into(),
+                model: None,
+                task: None,
+            }),
+            description: None,
+        });
+
+        reg.register_fleet_template(FleetTemplate {
+            name: "ordering".into(),
+            description: None,
+            slots: vec![
+                FleetSlot {
+                    label: "zeta".into(),
+                    persona: Some("agent-a".into()),
+                    profile: None,
+                    env: HashMap::new(),
+                    weight: 1,
+                    startup_phase: 1,
+                },
+                FleetSlot {
+                    label: "alpha".into(),
+                    persona: Some("agent-b".into()),
+                    profile: None,
+                    env: HashMap::new(),
+                    weight: 2,
+                    startup_phase: 0,
+                },
+                FleetSlot {
+                    label: "beta".into(),
+                    persona: None,
+                    profile: Some("dev-shell".into()),
+                    env: HashMap::new(),
+                    weight: 2,
+                    startup_phase: 0,
+                },
+            ],
+            layout_template: Some("grid-2x2".into()),
+            startup_strategy: FleetStartupStrategy::Serial,
+            topology_profile: None,
+        });
+
+        let fleet = reg.resolve_fleet("ordering").expect("fleet resolves");
+        assert_eq!(
+            fleet.launch_plan.deterministic_order,
+            vec!["alpha", "beta", "zeta"]
+        );
+        assert_eq!(fleet.panes.iter().find(|p| p.label == "alpha").unwrap().launch_order, 0);
+        assert_eq!(fleet.panes.iter().find(|p| p.label == "beta").unwrap().launch_order, 1);
+        assert_eq!(fleet.panes.iter().find(|p| p.label == "zeta").unwrap().launch_order, 2);
+        assert_eq!(fleet.launch_plan.phases.len(), 2);
+        assert_eq!(fleet.launch_plan.phases[0].phase, 0);
+        assert_eq!(fleet.launch_plan.phases[0].slots, vec!["alpha", "beta"]);
+        assert_eq!(fleet.launch_plan.phases[1].phase, 1);
+        assert_eq!(fleet.launch_plan.phases[1].slots, vec!["zeta"]);
+        // topology_profile is None; fall back to layout template.
+        assert_eq!(
+            fleet.launch_plan.topology_initializer.as_deref(),
+            Some("grid-2x2")
         );
     }
 
@@ -1034,6 +1332,8 @@ mod tests {
             description: None,
             slots: vec![],
             layout_template: None,
+            startup_strategy: FleetStartupStrategy::Phased,
+            topology_profile: None,
         });
 
         let errors = reg.validate();
@@ -1054,14 +1354,61 @@ mod tests {
                 persona: Some("nonexistent".into()),
                 profile: None,
                 env: HashMap::new(),
+                weight: 1,
+                startup_phase: 0,
             }],
             layout_template: None,
+            startup_strategy: FleetStartupStrategy::Phased,
+            topology_profile: None,
         });
 
         let errors = reg.validate();
         assert!(errors.iter().any(|e| matches!(
             e,
             ProfileValidationError::SlotRefNotFound { fleet, .. } if fleet == "bad-fleet"
+        )));
+    }
+
+    #[test]
+    fn validate_duplicate_slot_labels_and_zero_weight() {
+        let mut reg = ProfileRegistry::new();
+        reg.register_defaults();
+        reg.register_fleet_template(FleetTemplate {
+            name: "bad-weights".into(),
+            description: None,
+            slots: vec![
+                FleetSlot {
+                    label: "dup".into(),
+                    persona: None,
+                    profile: Some("dev-shell".into()),
+                    env: HashMap::new(),
+                    weight: 0,
+                    startup_phase: 0,
+                },
+                FleetSlot {
+                    label: "dup".into(),
+                    persona: None,
+                    profile: Some("monitor".into()),
+                    env: HashMap::new(),
+                    weight: 1,
+                    startup_phase: 1,
+                },
+            ],
+            layout_template: None,
+            startup_strategy: FleetStartupStrategy::Phased,
+            topology_profile: None,
+        });
+
+        let errors = reg.validate();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ProfileValidationError::DuplicateSlotLabel { fleet, label }
+                if fleet == "bad-weights" && label == "dup"
+        )));
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ProfileValidationError::InvalidSlotWeight { fleet, slot }
+                if fleet == "bad-weights" && slot == "dup"
         )));
     }
 
