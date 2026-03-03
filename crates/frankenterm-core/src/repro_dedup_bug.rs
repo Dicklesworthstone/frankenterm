@@ -1,15 +1,14 @@
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
     use crate::patterns::{DetectionContext, PatternEngine};
 
-    // Mocking time is hard in Rust without a crate, but we can test the logic
-    // by exposing a "clear_expired" method or similar.
-    // For now, let's just demonstrate the "forever suppression" behavior.
-
     #[test]
-    fn reproduction_dedup_suppresses_forever() {
+    fn reproduction_dedup_suppresses_and_expires() {
         let engine = PatternEngine::new();
         let mut context = DetectionContext::new();
+        // Set a very short TTL to test expiration
+        context.set_ttl(Duration::from_millis(10));
 
         // Define a test text that triggers a rule
         let text = "Usage limit reached for all Pro models"; // triggers gemini.usage.reached
@@ -22,12 +21,11 @@ mod tests {
         let detections2 = engine.detect_with_context(text, &mut context);
         assert!(detections2.is_empty(), "Should be deduplicated immediately");
 
-        // In the current implementation, this will stay suppressed forever
-        // (until 1000 other keys push it out).
-        // We want to verify that we can't easily "expire" it.
+        // Wait for TTL to expire
+        std::thread::sleep(Duration::from_millis(15));
 
-        // Simulating "5 hours later" is impossible with the current struct
-        // because it doesn't store time.
-        // This confirms the architectural missing feature.
+        // Third detection after TTL
+        let detections3 = engine.detect_with_context(text, &mut context);
+        assert!(!detections3.is_empty(), "Should detect again after TTL expiration");
     }
 }

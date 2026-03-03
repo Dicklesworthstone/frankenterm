@@ -51,6 +51,15 @@ impl McpToolError {
             hint,
         }
     }
+
+    pub(crate) fn from_cass_error(err: CassError) -> Self {
+        let (code, hint) = map_cass_error(&err);
+        Self {
+            code,
+            message: err.to_string(),
+            hint,
+        }
+    }
 }
 
 pub(crate) fn map_caut_error(error: &CautError) -> (&'static str, Option<String>) {

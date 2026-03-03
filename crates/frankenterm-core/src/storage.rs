@@ -9353,7 +9353,15 @@ fn writer_loop(
         // Single-command batches skip the transaction wrapper (SQLite
         // auto-commits each statement anyway).
         let use_txn = batch.len() > 1 && !batch.iter().all(is_control_command);
-        let mut txn_open = use_txn && conn.execute_batch("BEGIN IMMEDIATE").is_ok();
+        let mut txn_open = false;
+        if use_txn {
+            match conn.execute_batch("BEGIN IMMEDIATE") {
+                Ok(_) => txn_open = true,
+                Err(err) => {
+                    tracing::warn!(%err, "Failed to start batch transaction, falling back to individual statements");
+                }
+            }
+        }
 
         let mut should_break = false;
         for cmd in batch {
