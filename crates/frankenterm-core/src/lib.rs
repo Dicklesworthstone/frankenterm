@@ -106,6 +106,7 @@ pub mod cleanup;
 pub mod code_scanner;
 pub mod command_guard;
 pub mod command_transport;
+pub mod connector_host_runtime;
 pub mod compact_bitset;
 pub mod completion_token;
 pub mod concurrent_map;
@@ -143,6 +144,7 @@ pub mod disk_pressure;
 #[cfg(feature = "disk-pressure")]
 pub mod disk_scoring;
 pub mod docs_gen;
+pub mod durable_state;
 pub mod drift;
 pub mod dry_run;
 pub mod edit_distance;
