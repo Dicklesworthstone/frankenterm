@@ -307,6 +307,7 @@ pub mod sequence_model;
 pub mod session_correlation;
 pub mod session_dna;
 pub mod session_pane_state;
+pub mod session_profiles;
 pub mod session_restore;
 #[cfg(feature = "session-resume")]
 pub mod session_resume;
