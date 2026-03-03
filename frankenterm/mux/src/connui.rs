@@ -60,7 +60,7 @@ struct ConnectionUIImpl {
     rx: Receiver<UIRequest>,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum CloseStatus {
     Explicit,
     Implicit,
@@ -451,4 +451,93 @@ pub fn show_configuration_error_message(err: &str) {
     let mut wrapped = textwrap::fill(&err, 78);
     wrapped.push_str("\n");
     ui.output_str(&wrapped);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_multi_line_prompt_single_line() {
+        let (preamble, prompt) = ConnectionUI::split_multi_line_prompt("Password: ");
+        assert!(preamble.is_none());
+        assert_eq!(prompt, "Password: ");
+    }
+
+    #[test]
+    fn split_multi_line_prompt_two_lines() {
+        let (preamble, prompt) = ConnectionUI::split_multi_line_prompt("Hello\nPassword: ");
+        assert_eq!(preamble, Some("Hello\r\n".to_string()));
+        assert_eq!(prompt, "Password: ");
+    }
+
+    #[test]
+    fn split_multi_line_prompt_three_lines() {
+        let (preamble, prompt) =
+            ConnectionUI::split_multi_line_prompt("Line1\nLine2\nPassword: ");
+        assert!(preamble.is_some());
+        let pre = preamble.unwrap();
+        assert!(pre.contains("Line1"));
+        assert!(pre.contains("Line2"));
+        assert_eq!(prompt, "Password: ");
+    }
+
+    #[test]
+    fn split_multi_line_prompt_empty_string() {
+        let (preamble, prompt) = ConnectionUI::split_multi_line_prompt("");
+        assert!(preamble.is_none());
+        assert_eq!(prompt, "");
+    }
+
+    #[test]
+    fn split_multi_line_prompt_trailing_newline() {
+        let (preamble, prompt) = ConnectionUI::split_multi_line_prompt("Header\n");
+        assert_eq!(preamble, Some("Header\r\n".to_string()));
+        assert_eq!(prompt, "");
+    }
+
+    #[test]
+    fn password_prompt_host_highlight_empty_line() {
+        let host = PasswordPromptHost::default();
+        let (output, cursor) = host.highlight_line("", 0);
+        assert!(output.is_empty());
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn password_prompt_host_highlight_replaces_chars() {
+        let host = PasswordPromptHost::default();
+        let (output, _cursor) = host.highlight_line("abc", 0);
+        // Each grapheme cluster gets replaced with the key emoji
+        assert_eq!(output.len(), 3);
+        for elem in &output {
+            match elem {
+                OutputElement::Text(t) => assert_eq!(t, "🔑"),
+                _ => panic!("expected Text element"),
+            }
+        }
+    }
+
+    #[test]
+    fn password_prompt_host_cursor_position_scales() {
+        let host = PasswordPromptHost::default();
+        let (_output, cursor_0) = host.highlight_line("abc", 0);
+        let (_output, cursor_2) = host.highlight_line("abc", 2);
+        assert_eq!(cursor_0, 0);
+        assert!(cursor_2 > cursor_0, "cursor at pos 2 should be after pos 0");
+    }
+
+    #[test]
+    fn close_status_equality() {
+        assert_eq!(CloseStatus::Explicit, CloseStatus::Explicit);
+        assert_eq!(CloseStatus::Implicit, CloseStatus::Implicit);
+        assert_ne!(CloseStatus::Explicit, CloseStatus::Implicit);
+    }
+
+    #[test]
+    fn connection_ui_params_default() {
+        let params = ConnectionUIParams::default();
+        assert!(!params.disable_close_delay);
+        assert!(params.window_id.is_none());
+    }
 }
