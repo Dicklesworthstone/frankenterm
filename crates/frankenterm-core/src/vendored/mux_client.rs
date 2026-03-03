@@ -2991,6 +2991,46 @@ mod tests {
     }
 
     #[test]
+    fn pane_delta_try_send_succeeds_after_capacity_is_freed() {
+        run_async_test(async {
+            let (tx, mut rx) = mpsc::channel(1);
+            assert!(pane_delta_try_send(
+                &tx,
+                PaneDelta::Gap {
+                    pane_id: 11,
+                    reason: "first".to_string(),
+                },
+            ));
+            assert!(!pane_delta_try_send(
+                &tx,
+                PaneDelta::Gap {
+                    pane_id: 11,
+                    reason: "second".to_string(),
+                },
+            ));
+
+            let drained = pane_delta_recv(&mut rx)
+                .await
+                .expect("first delta should drain");
+            match drained {
+                PaneDelta::Gap { pane_id, reason } => {
+                    assert_eq!(pane_id, 11);
+                    assert_eq!(reason, "first");
+                }
+                other => panic!("expected first gap delta, got {:?}", other),
+            }
+
+            assert!(pane_delta_try_send(
+                &tx,
+                PaneDelta::Gap {
+                    pane_id: 11,
+                    reason: "third".to_string(),
+                },
+            ));
+        });
+    }
+
+    #[test]
     fn pane_delta_try_send_returns_false_when_receiver_closed() {
         run_async_test(async {
             let (tx, rx) = mpsc::channel(1);
