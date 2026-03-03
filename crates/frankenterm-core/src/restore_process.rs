@@ -708,6 +708,19 @@ mod tests {
         map
     }
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build restore_process test runtime");
+        runtime.block_on(future);
+    }
+
     #[test]
     fn plan_shell_pane() {
         let launcher = test_launcher();
@@ -1057,64 +1070,68 @@ mod tests {
         std::sync::Arc::new(mock) as WeztermHandle
     }
 
-    #[tokio::test]
-    async fn execute_shell_launch() {
-        let wez = mock_with_panes(&[100]).await;
-        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
-        let plans = vec![ProcessPlan {
-            old_pane_id: 1,
-            new_pane_id: 100,
-            action: LaunchAction::LaunchShell {
-                shell: "bash".into(),
-                cwd: PathBuf::from("/home/user"),
-            },
-            state_warning: None,
-        }];
-
-        let report = launcher.execute(&plans).await;
-        assert_eq!(report.shells_launched, 1);
-        assert_eq!(report.failed, 0);
-    }
-
-    #[tokio::test]
-    async fn execute_mixed_plan() {
-        let wez = mock_with_panes(&[100, 200, 300]).await;
-        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
-        let plans = vec![
-            ProcessPlan {
+    #[test]
+    fn execute_shell_launch() {
+        run_async_test(async {
+            let wez = mock_with_panes(&[100]).await;
+            let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+            let plans = vec![ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
                 action: LaunchAction::LaunchShell {
-                    shell: "zsh".into(),
-                    cwd: PathBuf::from("/project"),
+                    shell: "bash".into(),
+                    cwd: PathBuf::from("/home/user"),
                 },
                 state_warning: None,
-            },
-            ProcessPlan {
-                old_pane_id: 2,
-                new_pane_id: 200,
-                action: LaunchAction::Skip {
-                    reason: "no process info".into(),
-                },
-                state_warning: None,
-            },
-            ProcessPlan {
-                old_pane_id: 3,
-                new_pane_id: 300,
-                action: LaunchAction::Manual {
-                    hint: "Was running vim".into(),
-                    original_process: "vim".into(),
-                },
-                state_warning: None,
-            },
-        ];
+            }];
 
-        let report = launcher.execute(&plans).await;
-        assert_eq!(report.shells_launched, 1);
-        assert_eq!(report.skipped, 1);
-        assert_eq!(report.manual, 1);
-        assert_eq!(report.failed, 0);
-        assert_eq!(report.results.len(), 3);
+            let report = launcher.execute(&plans).await;
+            assert_eq!(report.shells_launched, 1);
+            assert_eq!(report.failed, 0);
+        });
+    }
+
+    #[test]
+    fn execute_mixed_plan() {
+        run_async_test(async {
+            let wez = mock_with_panes(&[100, 200, 300]).await;
+            let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+            let plans = vec![
+                ProcessPlan {
+                    old_pane_id: 1,
+                    new_pane_id: 100,
+                    action: LaunchAction::LaunchShell {
+                        shell: "zsh".into(),
+                        cwd: PathBuf::from("/project"),
+                    },
+                    state_warning: None,
+                },
+                ProcessPlan {
+                    old_pane_id: 2,
+                    new_pane_id: 200,
+                    action: LaunchAction::Skip {
+                        reason: "no process info".into(),
+                    },
+                    state_warning: None,
+                },
+                ProcessPlan {
+                    old_pane_id: 3,
+                    new_pane_id: 300,
+                    action: LaunchAction::Manual {
+                        hint: "Was running vim".into(),
+                        original_process: "vim".into(),
+                    },
+                    state_warning: None,
+                },
+            ];
+
+            let report = launcher.execute(&plans).await;
+            assert_eq!(report.shells_launched, 1);
+            assert_eq!(report.skipped, 1);
+            assert_eq!(report.manual, 1);
+            assert_eq!(report.failed, 0);
+            assert_eq!(report.results.len(), 3);
+        });
     }
 
     // =========================================================================
@@ -1905,116 +1922,126 @@ mod tests {
     // Execute — additional scenarios
     // =========================================================================
 
-    #[tokio::test]
-    async fn execute_empty_plans() {
-        let wez = mock_with_panes(&[]).await;
-        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
-        let report = launcher.execute(&[]).await;
-        assert_eq!(report.results.len(), 0);
-        assert_eq!(report.shells_launched, 0);
-        assert_eq!(report.failed, 0);
+    #[test]
+    fn execute_empty_plans() {
+        run_async_test(async {
+            let wez = mock_with_panes(&[]).await;
+            let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+            let report = launcher.execute(&[]).await;
+            assert_eq!(report.results.len(), 0);
+            assert_eq!(report.shells_launched, 0);
+            assert_eq!(report.failed, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn execute_skip_only() {
-        let wez = mock_with_panes(&[]).await;
-        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
-        let plans = vec![
-            ProcessPlan {
+    #[test]
+    fn execute_skip_only() {
+        run_async_test(async {
+            let wez = mock_with_panes(&[]).await;
+            let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+            let plans = vec![
+                ProcessPlan {
+                    old_pane_id: 1,
+                    new_pane_id: 100,
+                    action: LaunchAction::Skip {
+                        reason: "disabled".into(),
+                    },
+                    state_warning: None,
+                },
+                ProcessPlan {
+                    old_pane_id: 2,
+                    new_pane_id: 200,
+                    action: LaunchAction::Skip {
+                        reason: "no info".into(),
+                    },
+                    state_warning: None,
+                },
+            ];
+            let report = launcher.execute(&plans).await;
+            assert_eq!(report.skipped, 2);
+            assert_eq!(report.shells_launched, 0);
+            assert_eq!(report.agents_launched, 0);
+            assert_eq!(report.results.len(), 2);
+            assert!(report.results.iter().all(|r| r.success));
+        });
+    }
+
+    #[test]
+    fn execute_manual_only() {
+        run_async_test(async {
+            let wez = mock_with_panes(&[]).await;
+            let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+            let plans = vec![ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
-                action: LaunchAction::Skip {
-                    reason: "disabled".into(),
+                action: LaunchAction::Manual {
+                    hint: "Restart vim manually".into(),
+                    original_process: "vim".into(),
                 },
                 state_warning: None,
-            },
-            ProcessPlan {
-                old_pane_id: 2,
-                new_pane_id: 200,
-                action: LaunchAction::Skip {
-                    reason: "no info".into(),
-                },
-                state_warning: None,
-            },
-        ];
-        let report = launcher.execute(&plans).await;
-        assert_eq!(report.skipped, 2);
-        assert_eq!(report.shells_launched, 0);
-        assert_eq!(report.agents_launched, 0);
-        assert_eq!(report.results.len(), 2);
-        assert!(report.results.iter().all(|r| r.success));
+            }];
+            let report = launcher.execute(&plans).await;
+            assert_eq!(report.manual, 1);
+            assert_eq!(report.shells_launched, 0);
+            assert!(report.results[0].success);
+        });
     }
 
-    #[tokio::test]
-    async fn execute_manual_only() {
-        let wez = mock_with_panes(&[]).await;
-        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
-        let plans = vec![ProcessPlan {
-            old_pane_id: 1,
-            new_pane_id: 100,
-            action: LaunchAction::Manual {
-                hint: "Restart vim manually".into(),
-                original_process: "vim".into(),
-            },
-            state_warning: None,
-        }];
-        let report = launcher.execute(&plans).await;
-        assert_eq!(report.manual, 1);
-        assert_eq!(report.shells_launched, 0);
-        assert!(report.results[0].success);
-    }
-
-    #[tokio::test]
-    async fn execute_agent_launch() {
-        let wez = mock_with_panes(&[100]).await;
-        let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
-        let plans = vec![ProcessPlan {
-            old_pane_id: 1,
-            new_pane_id: 100,
-            action: LaunchAction::LaunchAgent {
-                command: "cd /proj && claude".into(),
-                cwd: PathBuf::from("/proj"),
-                agent_type: "claude_code".into(),
-            },
-            state_warning: Some("new session warning".into()),
-        }];
-        let report = launcher.execute(&plans).await;
-        assert_eq!(report.agents_launched, 1);
-        assert_eq!(report.failed, 0);
-        assert!(report.results[0].success);
-    }
-
-    #[tokio::test]
-    async fn execute_report_result_order_preserved() {
-        let wez = mock_with_panes(&[100, 200]).await;
-        let launcher = ProcessLauncher::new(
-            wez,
-            LaunchConfig {
-                launch_delay_ms: 0,
-                ..Default::default()
-            },
-        );
-        let plans = vec![
-            ProcessPlan {
+    #[test]
+    fn execute_agent_launch() {
+        run_async_test(async {
+            let wez = mock_with_panes(&[100]).await;
+            let launcher = ProcessLauncher::new(wez, LaunchConfig::default());
+            let plans = vec![ProcessPlan {
                 old_pane_id: 1,
                 new_pane_id: 100,
-                action: LaunchAction::LaunchShell {
-                    shell: "bash".into(),
-                    cwd: PathBuf::from("/a"),
+                action: LaunchAction::LaunchAgent {
+                    command: "cd /proj && claude".into(),
+                    cwd: PathBuf::from("/proj"),
+                    agent_type: "claude_code".into(),
                 },
-                state_warning: None,
-            },
-            ProcessPlan {
-                old_pane_id: 2,
-                new_pane_id: 200,
-                action: LaunchAction::Skip {
-                    reason: "skip".into(),
+                state_warning: Some("new session warning".into()),
+            }];
+            let report = launcher.execute(&plans).await;
+            assert_eq!(report.agents_launched, 1);
+            assert_eq!(report.failed, 0);
+            assert!(report.results[0].success);
+        });
+    }
+
+    #[test]
+    fn execute_report_result_order_preserved() {
+        run_async_test(async {
+            let wez = mock_with_panes(&[100, 200]).await;
+            let launcher = ProcessLauncher::new(
+                wez,
+                LaunchConfig {
+                    launch_delay_ms: 0,
+                    ..Default::default()
                 },
-                state_warning: None,
-            },
-        ];
-        let report = launcher.execute(&plans).await;
-        assert_eq!(report.results[0].old_pane_id, 1);
-        assert_eq!(report.results[1].old_pane_id, 2);
+            );
+            let plans = vec![
+                ProcessPlan {
+                    old_pane_id: 1,
+                    new_pane_id: 100,
+                    action: LaunchAction::LaunchShell {
+                        shell: "bash".into(),
+                        cwd: PathBuf::from("/a"),
+                    },
+                    state_warning: None,
+                },
+                ProcessPlan {
+                    old_pane_id: 2,
+                    new_pane_id: 200,
+                    action: LaunchAction::Skip {
+                        reason: "skip".into(),
+                    },
+                    state_warning: None,
+                },
+            ];
+            let report = launcher.execute(&plans).await;
+            assert_eq!(report.results[0].old_pane_id, 1);
+            assert_eq!(report.results[1].old_pane_id, 2);
+        });
     }
 }

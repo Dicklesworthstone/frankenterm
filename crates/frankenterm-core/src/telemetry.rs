@@ -1219,6 +1219,18 @@ mod tests {
         }
     }
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build telemetry test runtime");
+        runtime.block_on(future);
+    }
+
     // -- Config ---------------------------------------------------------------
 
     #[test]
@@ -2119,30 +2131,32 @@ mod tests {
         assert!(collector.is_shutdown());
     }
 
-    #[tokio::test]
-    async fn collector_run_and_shutdown() {
-        let collector = Arc::new(TelemetryCollector::new(TelemetryConfig {
-            sample_interval: Duration::from_millis(50),
-            mux_server_pid: 0,
-            ..Default::default()
-        }));
+    #[test]
+    fn collector_run_and_shutdown() {
+        run_async_test(async {
+            let collector = Arc::new(TelemetryCollector::new(TelemetryConfig {
+                sample_interval: Duration::from_millis(50),
+                mux_server_pid: 0,
+                ..Default::default()
+            }));
 
-        let c = Arc::clone(&collector);
-        let handle = crate::runtime_compat::task::spawn(async move {
-            c.run().await;
+            let c = Arc::clone(&collector);
+            let handle = crate::runtime_compat::task::spawn(async move {
+                c.run().await;
+            });
+
+            // Let it collect a few samples (macOS subprocess sampling is slow)
+            crate::runtime_compat::sleep(Duration::from_millis(500)).await;
+            collector.shutdown();
+            handle.await.unwrap();
+
+            // Should have collected at least 1 sample (first tick is immediate)
+            assert!(
+                collector.sample_count() >= 1,
+                "sample_count={}, expected >= 1",
+                collector.sample_count()
+            );
         });
-
-        // Let it collect a few samples (macOS subprocess sampling is slow)
-        crate::runtime_compat::sleep(Duration::from_millis(500)).await;
-        collector.shutdown();
-        handle.await.unwrap();
-
-        // Should have collected at least 1 sample (first tick is immediate)
-        assert!(
-            collector.sample_count() >= 1,
-            "sample_count={}, expected >= 1",
-            collector.sample_count()
-        );
     }
 
     #[test]
