@@ -384,6 +384,18 @@ mod tests {
         let _ = std::fs::remove_file(format!("{db_str}-shm"));
     }
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build secrets test runtime");
+        runtime.block_on(future);
+    }
+
     // ========================================================================
     // Hashing stability
     // ========================================================================
@@ -926,174 +938,184 @@ mod tests {
     // scan_storage_from: batch + max_segments logic
     // ========================================================================
 
-    #[tokio::test]
-    async fn scan_storage_empty_database() {
-        let (storage, db_path) = setup_storage("empty").await;
+    #[test]
+    fn scan_storage_empty_database() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("empty").await;
 
-        let engine = SecretScanEngine::new();
-        let report = engine
-            .scan_storage(&storage, SecretScanOptions::default())
-            .await
-            .expect("scan");
+            let engine = SecretScanEngine::new();
+            let report = engine
+                .scan_storage(&storage, SecretScanOptions::default())
+                .await
+                .expect("scan");
 
-        assert_eq!(report.scanned_segments, 0);
-        assert_eq!(report.scanned_bytes, 0);
-        assert_eq!(report.matches_total, 0);
-        assert!(report.samples.is_empty());
-        assert_eq!(report.report_version, SECRET_SCAN_REPORT_VERSION);
+            assert_eq!(report.scanned_segments, 0);
+            assert_eq!(report.scanned_bytes, 0);
+            assert_eq!(report.matches_total, 0);
+            assert!(report.samples.is_empty());
+            assert_eq!(report.report_version, SECRET_SCAN_REPORT_VERSION);
 
-        teardown(storage, &db_path).await;
+            teardown(storage, &db_path).await;
+        });
     }
 
-    #[tokio::test]
-    async fn scan_storage_with_secrets_finds_matches() {
-        let (storage, db_path) = setup_storage("matches").await;
+    #[test]
+    fn scan_storage_with_secrets_finds_matches() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("matches").await;
 
-        // Insert segments with secrets
-        storage
-            .append_segment(
-                1,
-                "export OPENAI_API_KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
-                None,
-            )
-            .await
-            .expect("insert segment");
-        storage
-            .append_segment(1, "Hello, no secrets here.", None)
-            .await
-            .expect("insert segment");
-        storage
-            .append_segment(1, "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
-            .await
-            .expect("insert segment");
-
-        let engine = SecretScanEngine::new();
-        let report = engine
-            .scan_storage(&storage, SecretScanOptions::default())
-            .await
-            .expect("scan");
-
-        assert_eq!(report.scanned_segments, 3);
-        assert!(report.matches_total >= 2, "should find at least 2 secrets");
-        assert!(!report.samples.is_empty(), "should have sample records");
-        // No raw secrets in samples
-        for sample in &report.samples {
-            assert_eq!(sample.secret_hash.len(), 64);
-            assert_ne!(
-                sample.secret_hash,
-                "sk-abc1234567890abcdef1234567890abcdef12345678"
-            );
-        }
-
-        teardown(storage, &db_path).await;
-    }
-
-    #[tokio::test]
-    async fn scan_storage_max_segments_caps_scan() {
-        let (storage, db_path) = setup_storage("max").await;
-
-        // Insert 5 segments
-        for i in 0..5u64 {
+            // Insert segments with secrets
             storage
-                .append_segment(1, &format!("content {i}"), None)
+                .append_segment(
+                    1,
+                    "export OPENAI_API_KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
+                    None,
+                )
+                .await
+                .expect("insert segment");
+            storage
+                .append_segment(1, "Hello, no secrets here.", None)
+                .await
+                .expect("insert segment");
+            storage
+                .append_segment(1, "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
+                .await
+                .expect("insert segment");
+
+            let engine = SecretScanEngine::new();
+            let report = engine
+                .scan_storage(&storage, SecretScanOptions::default())
+                .await
+                .expect("scan");
+
+            assert_eq!(report.scanned_segments, 3);
+            assert!(report.matches_total >= 2, "should find at least 2 secrets");
+            assert!(!report.samples.is_empty(), "should have sample records");
+            // No raw secrets in samples
+            for sample in &report.samples {
+                assert_eq!(sample.secret_hash.len(), 64);
+                assert_ne!(
+                    sample.secret_hash,
+                    "sk-abc1234567890abcdef1234567890abcdef12345678"
+                );
+            }
+
+            teardown(storage, &db_path).await;
+        });
+    }
+
+    #[test]
+    fn scan_storage_max_segments_caps_scan() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("max").await;
+
+            // Insert 5 segments
+            for i in 0..5u64 {
+                storage
+                    .append_segment(1, &format!("content {i}"), None)
+                    .await
+                    .expect("insert");
+            }
+
+            let engine = SecretScanEngine::new();
+            let options = SecretScanOptions {
+                max_segments: Some(3),
+                batch_size: 2, // force multiple batches
+                ..Default::default()
+            };
+            let report = engine.scan_storage(&storage, options).await.expect("scan");
+
+            assert_eq!(report.scanned_segments, 3, "should stop at max_segments");
+
+            teardown(storage, &db_path).await;
+        });
+    }
+
+    #[test]
+    fn scan_storage_zero_batch_size_defaults() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("batchzero").await;
+
+            storage
+                .append_segment(1, "clean text", None)
                 .await
                 .expect("insert");
-        }
 
-        let engine = SecretScanEngine::new();
-        let options = SecretScanOptions {
-            max_segments: Some(3),
-            batch_size: 2, // force multiple batches
-            ..Default::default()
-        };
-        let report = engine.scan_storage(&storage, options).await.expect("scan");
+            let engine = SecretScanEngine::new();
+            let options = SecretScanOptions {
+                batch_size: 0, // should default to 1000
+                ..Default::default()
+            };
+            let report = engine.scan_storage(&storage, options).await.expect("scan");
+            assert_eq!(report.scanned_segments, 1);
 
-        assert_eq!(report.scanned_segments, 3, "should stop at max_segments");
-
-        teardown(storage, &db_path).await;
-    }
-
-    #[tokio::test]
-    async fn scan_storage_zero_batch_size_defaults() {
-        let (storage, db_path) = setup_storage("batchzero").await;
-
-        storage
-            .append_segment(1, "clean text", None)
-            .await
-            .expect("insert");
-
-        let engine = SecretScanEngine::new();
-        let options = SecretScanOptions {
-            batch_size: 0, // should default to 1000
-            ..Default::default()
-        };
-        let report = engine.scan_storage(&storage, options).await.expect("scan");
-        assert_eq!(report.scanned_segments, 1);
-
-        teardown(storage, &db_path).await;
+            teardown(storage, &db_path).await;
+        });
     }
 
     // ========================================================================
     // Incremental scan resume
     // ========================================================================
 
-    #[tokio::test]
-    async fn scan_storage_incremental_resumes_from_checkpoint() {
-        let (storage, db_path) = setup_storage("incr").await;
+    #[test]
+    fn scan_storage_incremental_resumes_from_checkpoint() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("incr").await;
 
-        // Insert initial segments
-        for i in 0..3u64 {
-            storage
-                .append_segment(
-                    1,
-                    &format!("line {i}: sk-abc{i}234567890abcdef1234567890abcdef12345678"),
-                    None,
-                )
+            // Insert initial segments
+            for i in 0..3u64 {
+                storage
+                    .append_segment(
+                        1,
+                        &format!("line {i}: sk-abc{i}234567890abcdef1234567890abcdef12345678"),
+                        None,
+                    )
+                    .await
+                    .expect("insert");
+            }
+
+            let engine = SecretScanEngine::new();
+            let options = SecretScanOptions::default();
+
+            // First incremental scan
+            let report1 = engine
+                .scan_storage_incremental(&storage, options.clone())
                 .await
-                .expect("insert");
-        }
+                .expect("first scan");
 
-        let engine = SecretScanEngine::new();
-        let options = SecretScanOptions::default();
+            assert_eq!(report1.scanned_segments, 3);
+            let first_matches = report1.matches_total;
+            assert!(first_matches > 0);
 
-        // First incremental scan
-        let report1 = engine
-            .scan_storage_incremental(&storage, options.clone())
-            .await
-            .expect("first scan");
+            // Insert 2 more segments
+            for i in 3..5u64 {
+                storage
+                    .append_segment(
+                        1,
+                        &format!("line {i}: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345678{i}"),
+                        None,
+                    )
+                    .await
+                    .expect("insert");
+            }
 
-        assert_eq!(report1.scanned_segments, 3);
-        let first_matches = report1.matches_total;
-        assert!(first_matches > 0);
-
-        // Insert 2 more segments
-        for i in 3..5u64 {
-            storage
-                .append_segment(
-                    1,
-                    &format!("line {i}: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345678{i}"),
-                    None,
-                )
+            // Second incremental scan - should only scan new segments
+            let report2 = engine
+                .scan_storage_incremental(&storage, options)
                 .await
-                .expect("insert");
-        }
+                .expect("second scan");
 
-        // Second incremental scan - should only scan new segments
-        let report2 = engine
-            .scan_storage_incremental(&storage, options)
-            .await
-            .expect("second scan");
+            assert_eq!(
+                report2.scanned_segments, 2,
+                "incremental should only scan new segments"
+            );
+            assert!(
+                report2.resume_after_id.is_some(),
+                "should have resume point"
+            );
 
-        assert_eq!(
-            report2.scanned_segments, 2,
-            "incremental should only scan new segments"
-        );
-        assert!(
-            report2.resume_after_id.is_some(),
-            "should have resume point"
-        );
-
-        teardown(storage, &db_path).await;
+            teardown(storage, &db_path).await;
+        });
     }
 
     // ========================================================================
@@ -1173,43 +1195,45 @@ mod tests {
     // Pane ID filtering (scan_storage_from behavior)
     // ========================================================================
 
-    #[tokio::test]
-    async fn scan_storage_filters_by_pane_id() {
-        let (storage, db_path) = setup_storage("pane").await;
+    #[test]
+    fn scan_storage_filters_by_pane_id() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("pane").await;
 
-        // Also register pane 2 for this test
-        storage
-            .upsert_pane(make_pane(2))
-            .await
-            .expect("register pane 2");
+            // Also register pane 2 for this test
+            storage
+                .upsert_pane(make_pane(2))
+                .await
+                .expect("register pane 2");
 
-        // Pane 1: has secret
-        storage
-            .append_segment(1, "sk-abc1234567890abcdef1234567890abcdef12345678", None)
-            .await
-            .expect("insert");
+            // Pane 1: has secret
+            storage
+                .append_segment(1, "sk-abc1234567890abcdef1234567890abcdef12345678", None)
+                .await
+                .expect("insert");
 
-        // Pane 2: has secret
-        storage
-            .append_segment(2, "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
-            .await
-            .expect("insert");
+            // Pane 2: has secret
+            storage
+                .append_segment(2, "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
+                .await
+                .expect("insert");
 
-        let engine = SecretScanEngine::new();
+            let engine = SecretScanEngine::new();
 
-        // Scan only pane 1
-        let options = SecretScanOptions {
-            pane_id: Some(1),
-            ..Default::default()
-        };
-        let report = engine.scan_storage(&storage, options).await.expect("scan");
+            // Scan only pane 1
+            let options = SecretScanOptions {
+                pane_id: Some(1),
+                ..Default::default()
+            };
+            let report = engine.scan_storage(&storage, options).await.expect("scan");
 
-        // Should only find secrets from pane 1
-        for sample in &report.samples {
-            assert_eq!(sample.pane_id, 1);
-        }
+            // Should only find secrets from pane 1
+            for sample in &report.samples {
+                assert_eq!(sample.pane_id, 1);
+            }
 
-        teardown(storage, &db_path).await;
+            teardown(storage, &db_path).await;
+        });
     }
 
     // ========================================================================
@@ -1232,258 +1256,268 @@ mod tests {
 
     /// E2E: insert diverse secret patterns as fixtures, run scan, verify
     /// that the report JSON never contains any raw secret value.
-    #[tokio::test]
-    async fn e2e_fixtures_report_never_contains_raw_secrets() {
-        let (storage, db_path) = setup_storage("e2e_fixtures").await;
+    #[test]
+    fn e2e_fixtures_report_never_contains_raw_secrets() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("e2e_fixtures").await;
 
-        // Insert each secret as a distinct segment
-        for (label, secret) in E2E_SECRETS {
-            storage
-                .append_segment(1, &format!("{label}_key={secret}"), None)
+            // Insert each secret as a distinct segment
+            for (label, secret) in E2E_SECRETS {
+                storage
+                    .append_segment(1, &format!("{label}_key={secret}"), None)
+                    .await
+                    .expect("insert fixture");
+            }
+
+            let engine = SecretScanEngine::new();
+            let report = engine
+                .scan_storage(&storage, SecretScanOptions::default())
                 .await
-                .expect("insert fixture");
-        }
+                .expect("scan");
 
-        let engine = SecretScanEngine::new();
-        let report = engine
-            .scan_storage(&storage, SecretScanOptions::default())
-            .await
-            .expect("scan");
+            // Serialize full report to JSON
+            let json = serde_json::to_string_pretty(&report).expect("serialize report");
 
-        // Serialize full report to JSON
-        let json = serde_json::to_string_pretty(&report).expect("serialize report");
+            // Verify no raw secret appears anywhere in the JSON
+            for (_label, secret) in E2E_SECRETS {
+                assert!(
+                    !json.contains(secret),
+                    "JSON must not contain raw secret: {secret}"
+                );
+            }
 
-        // Verify no raw secret appears anywhere in the JSON
-        for (_label, secret) in E2E_SECRETS {
+            // Verify scan actually found matches
             assert!(
-                !json.contains(secret),
-                "JSON must not contain raw secret: {secret}"
+                report.matches_total >= E2E_SECRETS.len() as u64,
+                "should find at least {} secrets, got {}",
+                E2E_SECRETS.len(),
+                report.matches_total
             );
-        }
 
-        // Verify scan actually found matches
-        assert!(
-            report.matches_total >= E2E_SECRETS.len() as u64,
-            "should find at least {} secrets, got {}",
-            E2E_SECRETS.len(),
-            report.matches_total
-        );
+            // All samples have valid hashes (64-char hex)
+            for sample in &report.samples {
+                assert_eq!(
+                    sample.secret_hash.len(),
+                    64,
+                    "sample hash should be 64 hex chars"
+                );
+                assert!(
+                    sample.secret_hash.chars().all(|c| c.is_ascii_hexdigit()),
+                    "hash should be hex"
+                );
+            }
 
-        // All samples have valid hashes (64-char hex)
-        for sample in &report.samples {
-            assert_eq!(
-                sample.secret_hash.len(),
-                64,
-                "sample hash should be 64 hex chars"
-            );
-            assert!(
-                sample.secret_hash.chars().all(|c| c.is_ascii_hexdigit()),
-                "hash should be hex"
-            );
-        }
-
-        teardown(storage, &db_path).await;
+            teardown(storage, &db_path).await;
+        });
     }
 
     /// E2E: incremental scan skips already-scanned segments.
-    #[tokio::test]
-    async fn e2e_incremental_scan_skips_prior_segments() {
-        let (storage, db_path) = setup_storage("e2e_incr").await;
+    #[test]
+    fn e2e_incremental_scan_skips_prior_segments() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("e2e_incr").await;
 
-        // Phase 1: insert 3 segments with secrets
-        for i in 0..3u64 {
+            // Phase 1: insert 3 segments with secrets
+            for i in 0..3u64 {
+                storage
+                    .append_segment(
+                        1,
+                        &format!("phase1-{i}: sk-key{i}234567890abcdef1234567890abcdef12345678"),
+                        None,
+                    )
+                    .await
+                    .expect("insert phase1");
+            }
+
+            let engine = SecretScanEngine::new();
+            let opts = SecretScanOptions::default();
+
+            let r1 = engine
+                .scan_storage_incremental(&storage, opts.clone())
+                .await
+                .expect("scan1");
+            assert_eq!(r1.scanned_segments, 3);
+            let phase1_matches = r1.matches_total;
+
+            // Phase 2: insert 2 more segments (one clean, one with secret)
+            storage
+                .append_segment(1, "phase2: clean output", None)
+                .await
+                .expect("insert phase2 clean");
             storage
                 .append_segment(
                     1,
-                    &format!("phase1-{i}: sk-key{i}234567890abcdef1234567890abcdef12345678"),
+                    "phase2: ghp_NEWTOKEN123456789012345678901234567890",
                     None,
                 )
                 .await
-                .expect("insert phase1");
-        }
+                .expect("insert phase2 secret");
 
-        let engine = SecretScanEngine::new();
-        let opts = SecretScanOptions::default();
+            let r2 = engine
+                .scan_storage_incremental(&storage, opts.clone())
+                .await
+                .expect("scan2");
 
-        let r1 = engine
-            .scan_storage_incremental(&storage, opts.clone())
-            .await
-            .expect("scan1");
-        assert_eq!(r1.scanned_segments, 3);
-        let phase1_matches = r1.matches_total;
+            // Should only scan the 2 new segments
+            assert_eq!(
+                r2.scanned_segments, 2,
+                "second scan should only cover new segments"
+            );
+            // Phase 2 had 1 secret
+            assert!(r2.matches_total >= 1, "should find the new secret");
 
-        // Phase 2: insert 2 more segments (one clean, one with secret)
-        storage
-            .append_segment(1, "phase2: clean output", None)
-            .await
-            .expect("insert phase2 clean");
-        storage
-            .append_segment(
-                1,
-                "phase2: ghp_NEWTOKEN123456789012345678901234567890",
-                None,
-            )
-            .await
-            .expect("insert phase2 secret");
+            // Phase 3: no new segments → zero work
+            let r3 = engine
+                .scan_storage_incremental(&storage, opts)
+                .await
+                .expect("scan3");
+            assert_eq!(r3.scanned_segments, 0, "no new segments means no work");
 
-        let r2 = engine
-            .scan_storage_incremental(&storage, opts.clone())
-            .await
-            .expect("scan2");
+            // Verify the cumulative coverage
+            assert!(
+                phase1_matches + r2.matches_total >= 4,
+                "total matches across phases should be >= 4"
+            );
 
-        // Should only scan the 2 new segments
-        assert_eq!(
-            r2.scanned_segments, 2,
-            "second scan should only cover new segments"
-        );
-        // Phase 2 had 1 secret
-        assert!(r2.matches_total >= 1, "should find the new secret");
-
-        // Phase 3: no new segments → zero work
-        let r3 = engine
-            .scan_storage_incremental(&storage, opts)
-            .await
-            .expect("scan3");
-        assert_eq!(r3.scanned_segments, 0, "no new segments means no work");
-
-        // Verify the cumulative coverage
-        assert!(
-            phase1_matches + r2.matches_total >= 4,
-            "total matches across phases should be >= 4"
-        );
-
-        teardown(storage, &db_path).await;
+            teardown(storage, &db_path).await;
+        });
     }
 
     /// E2E: report JSON artifact is deterministic and stable.
-    #[tokio::test]
-    async fn e2e_report_json_artifact_stable() {
-        let (storage, db_path) = setup_storage("e2e_json").await;
+    #[test]
+    fn e2e_report_json_artifact_stable() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("e2e_json").await;
 
-        // Insert fixtures
-        storage
-            .append_segment(
-                1,
-                "export KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
-                None,
-            )
-            .await
-            .expect("insert");
-        storage
-            .append_segment(1, "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
-            .await
-            .expect("insert");
+            // Insert fixtures
+            storage
+                .append_segment(
+                    1,
+                    "export KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
+                    None,
+                )
+                .await
+                .expect("insert");
+            storage
+                .append_segment(1, "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
+                .await
+                .expect("insert");
 
-        let engine = SecretScanEngine::new();
+            let engine = SecretScanEngine::new();
 
-        // Run two consecutive scans on the same data
-        let r1 = engine
-            .scan_storage(&storage, SecretScanOptions::default())
-            .await
-            .expect("scan1");
-        let r2 = engine
-            .scan_storage(&storage, SecretScanOptions::default())
-            .await
-            .expect("scan2");
+            // Run two consecutive scans on the same data
+            let r1 = engine
+                .scan_storage(&storage, SecretScanOptions::default())
+                .await
+                .expect("scan1");
+            let r2 = engine
+                .scan_storage(&storage, SecretScanOptions::default())
+                .await
+                .expect("scan2");
 
-        // Core metrics should be identical
-        assert_eq!(r1.scanned_segments, r2.scanned_segments);
-        assert_eq!(r1.scanned_bytes, r2.scanned_bytes);
-        assert_eq!(r1.matches_total, r2.matches_total);
-        assert_eq!(r1.matches_by_pattern, r2.matches_by_pattern);
-        assert_eq!(r1.samples.len(), r2.samples.len());
+            // Core metrics should be identical
+            assert_eq!(r1.scanned_segments, r2.scanned_segments);
+            assert_eq!(r1.scanned_bytes, r2.scanned_bytes);
+            assert_eq!(r1.matches_total, r2.matches_total);
+            assert_eq!(r1.matches_by_pattern, r2.matches_by_pattern);
+            assert_eq!(r1.samples.len(), r2.samples.len());
 
-        // Sample hashes should be identical (deterministic SHA-256)
-        for (s1, s2) in r1.samples.iter().zip(r2.samples.iter()) {
-            assert_eq!(s1.secret_hash, s2.secret_hash, "hashes should be stable");
-            assert_eq!(s1.pattern, s2.pattern);
-            assert_eq!(s1.segment_id, s2.segment_id);
-            assert_eq!(s1.match_len, s2.match_len);
-        }
+            // Sample hashes should be identical (deterministic SHA-256)
+            for (s1, s2) in r1.samples.iter().zip(r2.samples.iter()) {
+                assert_eq!(s1.secret_hash, s2.secret_hash, "hashes should be stable");
+                assert_eq!(s1.pattern, s2.pattern);
+                assert_eq!(s1.segment_id, s2.segment_id);
+                assert_eq!(s1.match_len, s2.match_len);
+            }
 
-        // Verify report_version is set
-        assert_eq!(r1.report_version, SECRET_SCAN_REPORT_VERSION);
+            // Verify report_version is set
+            assert_eq!(r1.report_version, SECRET_SCAN_REPORT_VERSION);
 
-        teardown(storage, &db_path).await;
+            teardown(storage, &db_path).await;
+        });
     }
 
     /// E2E: multi-pattern segment produces correct per-pattern counts.
-    #[tokio::test]
-    async fn e2e_multi_pattern_per_segment_counts() {
-        let (storage, db_path) = setup_storage("e2e_multi").await;
+    #[test]
+    fn e2e_multi_pattern_per_segment_counts() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("e2e_multi").await;
 
-        // Single segment with multiple secret types
-        let content = concat!(
-            "OPENAI=sk-abc1234567890abcdef1234567890abcdef12345678 ",
-            "GH=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ",
-            "STRIPE=sk_live_abcdefghijklmnopqrstuvwxyz0123 ",
-            "DB=postgres://root:hunter2@db:5432/prod",
-        );
-        storage
-            .append_segment(1, content, None)
-            .await
-            .expect("insert");
+            // Single segment with multiple secret types
+            let content = concat!(
+                "OPENAI=sk-abc1234567890abcdef1234567890abcdef12345678 ",
+                "GH=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ",
+                "STRIPE=sk_live_abcdefghijklmnopqrstuvwxyz0123 ",
+                "DB=postgres://root:hunter2@db:5432/prod",
+            );
+            storage
+                .append_segment(1, content, None)
+                .await
+                .expect("insert");
 
-        let engine = SecretScanEngine::new();
-        let report = engine
-            .scan_storage(&storage, SecretScanOptions::default())
-            .await
-            .expect("scan");
+            let engine = SecretScanEngine::new();
+            let report = engine
+                .scan_storage(&storage, SecretScanOptions::default())
+                .await
+                .expect("scan");
 
-        // Should detect at least 4 different patterns
-        assert!(
-            report.matches_total >= 4,
-            "should find at least 4 secrets in multi-pattern segment, got {}",
-            report.matches_total
-        );
+            // Should detect at least 4 different patterns
+            assert!(
+                report.matches_total >= 4,
+                "should find at least 4 secrets in multi-pattern segment, got {}",
+                report.matches_total
+            );
 
-        // matches_by_pattern should have multiple keys
-        assert!(
-            report.matches_by_pattern.len() >= 3,
-            "should have at least 3 distinct patterns, got {:?}",
-            report.matches_by_pattern.keys().collect::<Vec<_>>()
-        );
+            // matches_by_pattern should have multiple keys
+            assert!(
+                report.matches_by_pattern.len() >= 3,
+                "should have at least 3 distinct patterns, got {:?}",
+                report.matches_by_pattern.keys().collect::<Vec<_>>()
+            );
 
-        // Serialize and verify no raw secrets
-        let json = serde_json::to_string(&report).expect("serialize");
-        assert!(!json.contains("hunter2"), "no raw DB password in JSON");
-        assert!(
-            !json.contains("sk-abc1234567890"),
-            "no raw OpenAI key in JSON"
-        );
+            // Serialize and verify no raw secrets
+            let json = serde_json::to_string(&report).expect("serialize");
+            assert!(!json.contains("hunter2"), "no raw DB password in JSON");
+            assert!(
+                !json.contains("sk-abc1234567890"),
+                "no raw OpenAI key in JSON"
+            );
 
-        teardown(storage, &db_path).await;
+            teardown(storage, &db_path).await;
+        });
     }
 
     /// E2E: sample_limit is respected across scan_storage (not just scan_segment).
-    #[tokio::test]
-    async fn e2e_sample_limit_across_storage() {
-        let (storage, db_path) = setup_storage("e2e_limit").await;
+    #[test]
+    fn e2e_sample_limit_across_storage() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("e2e_limit").await;
 
-        // Insert many segments, each with a secret
-        for i in 0..20u64 {
-            storage
-                .append_segment(1, &format!("password=super_secret_pass_{i:03}xx"), None)
-                .await
-                .expect("insert");
-        }
+            // Insert many segments, each with a secret
+            for i in 0..20u64 {
+                storage
+                    .append_segment(1, &format!("password=super_secret_pass_{i:03}xx"), None)
+                    .await
+                    .expect("insert");
+            }
 
-        let engine = SecretScanEngine::new();
-        let options = SecretScanOptions {
-            sample_limit: 5,
-            ..Default::default()
-        };
-        let report = engine.scan_storage(&storage, options).await.expect("scan");
+            let engine = SecretScanEngine::new();
+            let options = SecretScanOptions {
+                sample_limit: 5,
+                ..Default::default()
+            };
+            let report = engine.scan_storage(&storage, options).await.expect("scan");
 
-        assert_eq!(report.scanned_segments, 20);
-        assert!(report.matches_total >= 20, "should count all matches");
-        assert!(
-            report.samples.len() <= 5,
-            "samples should be capped at limit: got {}",
-            report.samples.len()
-        );
+            assert_eq!(report.scanned_segments, 20);
+            assert!(report.matches_total >= 20, "should count all matches");
+            assert!(
+                report.samples.len() <= 5,
+                "samples should be capped at limit: got {}",
+                report.samples.len()
+            );
 
-        teardown(storage, &db_path).await;
+            teardown(storage, &db_path).await;
+        });
     }
 
     // ── Batch: DarkBadger wa-1u90p.7.1 ───────────────────────────────────

@@ -932,28 +932,42 @@ mod tests {
         assert_eq!(parsed.components.len(), 4);
     }
 
-    #[tokio::test]
-    async fn watchdog_shuts_down_on_signal() {
-        let heartbeats = Arc::new(HeartbeatRegistry::new());
-        heartbeats.record_discovery();
-        heartbeats.record_capture();
-        heartbeats.record_persistence();
-        heartbeats.record_maintenance();
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build watchdog test runtime");
+        runtime.block_on(future);
+    }
 
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let config = WatchdogConfig {
-            check_interval: Duration::from_millis(10),
-            ..WatchdogConfig::default()
-        };
+    #[test]
+    fn watchdog_shuts_down_on_signal() {
+        run_async_test(async {
+            let heartbeats = Arc::new(HeartbeatRegistry::new());
+            heartbeats.record_discovery();
+            heartbeats.record_capture();
+            heartbeats.record_persistence();
+            heartbeats.record_maintenance();
 
-        let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let config = WatchdogConfig {
+                check_interval: Duration::from_millis(10),
+                ..WatchdogConfig::default()
+            };
 
-        // Let it run a few ticks.
-        crate::runtime_compat::sleep(Duration::from_millis(50)).await;
+            let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
 
-        shutdown.store(true, Ordering::SeqCst);
-        handle.join().await;
-        // If we get here, shutdown worked.
+            // Let it run a few ticks.
+            crate::runtime_compat::sleep(Duration::from_millis(50)).await;
+
+            shutdown.store(true, Ordering::SeqCst);
+            handle.join().await;
+            // If we get here, shutdown worked.
+        });
     }
 
     #[test]
@@ -1055,75 +1069,83 @@ mod tests {
         assert_eq!(report.total_checks, 0);
     }
 
-    #[tokio::test]
-    async fn mux_watchdog_records_successful_check() {
-        let config = MuxWatchdogConfig::default();
-        let wezterm = crate::wezterm::mock_wezterm_handle();
-        let mut watchdog = MuxWatchdog::new(config, wezterm);
+    #[test]
+    fn mux_watchdog_records_successful_check() {
+        run_async_test(async {
+            let config = MuxWatchdogConfig::default();
+            let wezterm = crate::wezterm::mock_wezterm_handle();
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
 
-        let sample = watchdog.check().await;
-        assert!(sample.ping_ok);
-        assert_eq!(sample.status, HealthStatus::Healthy);
-        assert_eq!(sample.warning_count, 0);
-        assert!(sample.watchdog_warnings.is_empty());
-        assert_eq!(watchdog.consecutive_failures, 0);
-        assert_eq!(watchdog.total_checks, 1);
-        assert_eq!(watchdog.history.len(), 1);
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            assert_eq!(sample.status, HealthStatus::Healthy);
+            assert_eq!(sample.warning_count, 0);
+            assert!(sample.watchdog_warnings.is_empty());
+            assert_eq!(watchdog.consecutive_failures, 0);
+            assert_eq!(watchdog.total_checks, 1);
+            assert_eq!(watchdog.history.len(), 1);
+        });
     }
 
-    #[tokio::test]
-    async fn mux_watchdog_detects_failure() {
-        let config = MuxWatchdogConfig {
-            failure_threshold: 2,
-            ..MuxWatchdogConfig::default()
-        };
-        let wezterm = crate::wezterm::mock_wezterm_handle_failing();
-        let mut watchdog = MuxWatchdog::new(config, wezterm);
+    #[test]
+    fn mux_watchdog_detects_failure() {
+        run_async_test(async {
+            let config = MuxWatchdogConfig {
+                failure_threshold: 2,
+                ..MuxWatchdogConfig::default()
+            };
+            let wezterm = crate::wezterm::mock_wezterm_handle_failing();
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
 
-        // First failure: degraded
-        let sample = watchdog.check().await;
-        assert!(!sample.ping_ok);
-        assert_eq!(sample.status, HealthStatus::Degraded);
-        assert_eq!(watchdog.consecutive_failures, 1);
+            // First failure: degraded
+            let sample = watchdog.check().await;
+            assert!(!sample.ping_ok);
+            assert_eq!(sample.status, HealthStatus::Degraded);
+            assert_eq!(watchdog.consecutive_failures, 1);
 
-        // Second failure: critical (meets threshold)
-        let sample = watchdog.check().await;
-        assert_eq!(sample.status, HealthStatus::Critical);
-        assert_eq!(watchdog.consecutive_failures, 2);
+            // Second failure: critical (meets threshold)
+            let sample = watchdog.check().await;
+            assert_eq!(sample.status, HealthStatus::Critical);
+            assert_eq!(watchdog.consecutive_failures, 2);
+        });
     }
 
-    #[tokio::test]
-    async fn mux_watchdog_resets_on_success() {
-        let config = MuxWatchdogConfig::default();
-        let wezterm = crate::wezterm::mock_wezterm_handle();
-        let mut watchdog = MuxWatchdog::new(config, wezterm);
+    #[test]
+    fn mux_watchdog_resets_on_success() {
+        run_async_test(async {
+            let config = MuxWatchdogConfig::default();
+            let wezterm = crate::wezterm::mock_wezterm_handle();
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
 
-        // Simulate prior failures
-        watchdog.consecutive_failures = 5;
-        watchdog.total_failures = 5;
+            // Simulate prior failures
+            watchdog.consecutive_failures = 5;
+            watchdog.total_failures = 5;
 
-        let sample = watchdog.check().await;
-        assert!(sample.ping_ok);
-        assert_eq!(watchdog.consecutive_failures, 0);
-        // total_failures should NOT reset
-        assert_eq!(watchdog.total_failures, 5);
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            assert_eq!(watchdog.consecutive_failures, 0);
+            // total_failures should NOT reset
+            assert_eq!(watchdog.total_failures, 5);
+        });
     }
 
-    #[tokio::test]
-    async fn mux_watchdog_history_bounded() {
-        let config = MuxWatchdogConfig {
-            history_capacity: 3,
-            ..MuxWatchdogConfig::default()
-        };
-        let wezterm = crate::wezterm::mock_wezterm_handle();
-        let mut watchdog = MuxWatchdog::new(config, wezterm);
+    #[test]
+    fn mux_watchdog_history_bounded() {
+        run_async_test(async {
+            let config = MuxWatchdogConfig {
+                history_capacity: 3,
+                ..MuxWatchdogConfig::default()
+            };
+            let wezterm = crate::wezterm::mock_wezterm_handle();
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
 
-        for _ in 0..5 {
-            watchdog.check().await;
-        }
+            for _ in 0..5 {
+                watchdog.check().await;
+            }
 
-        assert_eq!(watchdog.history.len(), 3, "history should be bounded");
-        assert_eq!(watchdog.total_checks, 5);
+            assert_eq!(watchdog.history.len(), 3, "history should be bounded");
+            assert_eq!(watchdog.total_checks, 5);
+        });
     }
 
     // ── HeartbeatRegistry additional tests ─────────────────────────
@@ -1332,61 +1354,67 @@ mod tests {
 
     // ── WatchdogHandle ─────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn watchdog_handle_signal_shutdown() {
-        let heartbeats = Arc::new(HeartbeatRegistry::new());
-        heartbeats.record_discovery();
-        heartbeats.record_capture();
-        heartbeats.record_persistence();
-        heartbeats.record_maintenance();
+    #[test]
+    fn watchdog_handle_signal_shutdown() {
+        run_async_test(async {
+            let heartbeats = Arc::new(HeartbeatRegistry::new());
+            heartbeats.record_discovery();
+            heartbeats.record_capture();
+            heartbeats.record_persistence();
+            heartbeats.record_maintenance();
 
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let config = WatchdogConfig {
-            check_interval: Duration::from_millis(10),
-            ..WatchdogConfig::default()
-        };
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let config = WatchdogConfig {
+                check_interval: Duration::from_millis(10),
+                ..WatchdogConfig::default()
+            };
 
-        let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+            let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
 
-        crate::runtime_compat::sleep(Duration::from_millis(30)).await;
+            crate::runtime_compat::sleep(Duration::from_millis(30)).await;
 
-        // Use handle's own signal_shutdown instead of the external flag
-        handle.signal_shutdown();
-        handle.join().await;
+            // Use handle's own signal_shutdown instead of the external flag
+            handle.signal_shutdown();
+            handle.join().await;
+        });
     }
 
     // ── MuxWatchdog additional tests ───────────────────────────────
 
-    #[tokio::test]
-    async fn mux_watchdog_report_reflects_latest_check() {
-        let config = MuxWatchdogConfig::default();
-        let wezterm = crate::wezterm::mock_wezterm_handle();
-        let mut watchdog = MuxWatchdog::new(config, wezterm);
+    #[test]
+    fn mux_watchdog_report_reflects_latest_check() {
+        run_async_test(async {
+            let config = MuxWatchdogConfig::default();
+            let wezterm = crate::wezterm::mock_wezterm_handle();
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
 
-        assert!(watchdog.report().latest_sample.is_none());
+            assert!(watchdog.report().latest_sample.is_none());
 
-        watchdog.check().await;
-        let report = watchdog.report();
-        assert!(report.latest_sample.is_some());
-        assert_eq!(report.total_checks, 1);
+            watchdog.check().await;
+            let report = watchdog.report();
+            assert!(report.latest_sample.is_some());
+            assert_eq!(report.total_checks, 1);
+        });
     }
 
-    #[tokio::test]
-    async fn mux_watchdog_total_failures_accumulate() {
-        let config = MuxWatchdogConfig {
-            failure_threshold: 10,
-            ..MuxWatchdogConfig::default()
-        };
-        let wezterm = crate::wezterm::mock_wezterm_handle_failing();
-        let mut watchdog = MuxWatchdog::new(config, wezterm);
+    #[test]
+    fn mux_watchdog_total_failures_accumulate() {
+        run_async_test(async {
+            let config = MuxWatchdogConfig {
+                failure_threshold: 10,
+                ..MuxWatchdogConfig::default()
+            };
+            let wezterm = crate::wezterm::mock_wezterm_handle_failing();
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
 
-        for _ in 0..3 {
-            watchdog.check().await;
-        }
+            for _ in 0..3 {
+                watchdog.check().await;
+            }
 
-        assert_eq!(watchdog.total_failures, 3);
-        assert_eq!(watchdog.total_checks, 3);
-        assert_eq!(watchdog.consecutive_failures, 3);
+            assert_eq!(watchdog.total_failures, 3);
+            assert_eq!(watchdog.total_checks, 3);
+            assert_eq!(watchdog.consecutive_failures, 3);
+        });
     }
 
     #[test]
@@ -1609,34 +1637,38 @@ mod tests {
         assert_eq!(warning_status_from_line("plain note"), None);
     }
 
-    #[tokio::test]
-    async fn mux_watchdog_escalates_on_critical_watchdog_warning() {
-        let mock = Arc::new(crate::wezterm::MockWezterm::new());
-        mock.set_watchdog_warnings(vec!["critical: shard 2 circuit open".to_string()])
-            .await;
-        let wezterm: crate::wezterm::WeztermHandle = mock;
-        let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
+    #[test]
+    fn mux_watchdog_escalates_on_critical_watchdog_warning() {
+        run_async_test(async {
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.set_watchdog_warnings(vec!["critical: shard 2 circuit open".to_string()])
+                .await;
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+            let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
 
-        let sample = watchdog.check().await;
-        assert!(sample.ping_ok);
-        assert_eq!(sample.status, HealthStatus::Critical);
-        assert_eq!(sample.warning_count, 1);
-        assert!(sample.watchdog_warnings[0].contains("critical"));
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            assert_eq!(sample.status, HealthStatus::Critical);
+            assert_eq!(sample.warning_count, 1);
+            assert!(sample.watchdog_warnings[0].contains("critical"));
+        });
     }
 
-    #[tokio::test]
-    async fn mux_watchdog_warning_probe_failure_marks_degraded() {
-        let mock = Arc::new(crate::wezterm::MockWezterm::new());
-        mock.set_watchdog_warning_error(Some("probe transport unavailable".to_string()))
-            .await;
-        let wezterm: crate::wezterm::WeztermHandle = mock;
-        let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
+    #[test]
+    fn mux_watchdog_warning_probe_failure_marks_degraded() {
+        run_async_test(async {
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.set_watchdog_warning_error(Some("probe transport unavailable".to_string()))
+                .await;
+            let wezterm: crate::wezterm::WeztermHandle = mock;
+            let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
 
-        let sample = watchdog.check().await;
-        assert!(sample.ping_ok);
-        assert_eq!(sample.status, HealthStatus::Degraded);
-        assert_eq!(sample.warning_count, 1);
-        assert!(sample.watchdog_warnings[0].contains("failed to query"));
+            let sample = watchdog.check().await;
+            assert!(sample.ping_ok);
+            assert_eq!(sample.status, HealthStatus::Degraded);
+            assert_eq!(sample.warning_count, 1);
+            assert!(sample.watchdog_warnings[0].contains("failed to query"));
+        });
     }
 
     // -- MuxHealthReport --

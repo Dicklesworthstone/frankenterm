@@ -557,6 +557,18 @@ mod tests {
         }
     }
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build session_correlation test runtime");
+        runtime.block_on(future);
+    }
+
     #[test]
     fn correlate_single_candidate() {
         let start_ms = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
@@ -1053,50 +1065,58 @@ mod tests {
 
     // ── DB-backed tests ──
 
-    #[tokio::test]
-    async fn correlate_and_persist_override_updates_session() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("ft.db");
-        let db_path_str = db_path.to_string_lossy().to_string();
-        let handle = StorageHandle::new(&db_path_str).await.unwrap();
+    #[test]
+    fn correlate_and_persist_override_updates_session() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("ft.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let handle = StorageHandle::new(&db_path_str).await.unwrap();
 
-        let now = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+            let now = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
 
-        let pane = PaneRecord {
-            pane_id: 1,
-            pane_uuid: None,
-            domain: "local".to_string(),
-            window_id: None,
-            tab_id: None,
-            title: None,
-            cwd: Some(dir.path().to_string_lossy().to_string()),
-            tty_name: None,
-            first_seen_at: now,
-            last_seen_at: now,
-            observed: true,
-            ignore_reason: None,
-            last_decision_at: None,
-        };
-        handle.upsert_pane(pane).await.unwrap();
+            let pane = PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: Some(dir.path().to_string_lossy().to_string()),
+                tty_name: None,
+                first_seen_at: now,
+                last_seen_at: now,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            handle.upsert_pane(pane).await.unwrap();
 
-        let mut session = AgentSessionRecord::new_start(1, "claude_code");
-        session.started_at = now;
-        let session_id = handle.upsert_agent_session(session).await.unwrap();
+            let mut session = AgentSessionRecord::new_start(1, "claude_code");
+            session.started_at = now;
+            let session_id = handle.upsert_agent_session(session).await.unwrap();
 
-        let mut options = CassCorrelationOptions::default();
-        options.override_session_id = Some("cass-override".to_string());
+            let mut options = CassCorrelationOptions::default();
+            options.override_session_id = Some("cass-override".to_string());
 
-        let cass = CassClient::new();
-        let correlation =
-            correlate_and_persist_for_pane(&handle, &cass, 1, CassAgent::ClaudeCode, now, &options)
-                .await
-                .unwrap();
+            let cass = CassClient::new();
+            let correlation = correlate_and_persist_for_pane(
+                &handle,
+                &cass,
+                1,
+                CassAgent::ClaudeCode,
+                now,
+                &options,
+            )
+            .await
+            .unwrap();
 
-        let updated = handle.get_agent_session(session_id).await.unwrap().unwrap();
-        assert_eq!(updated.external_id.as_deref(), Some("cass-override"));
-        assert!(updated.external_meta.is_some());
-        assert_eq!(correlation.status, CorrelationStatus::Linked);
+            let updated = handle.get_agent_session(session_id).await.unwrap().unwrap();
+            assert_eq!(updated.external_id.as_deref(), Some("cass-override"));
+            assert!(updated.external_meta.is_some());
+            assert_eq!(correlation.status, CorrelationStatus::Linked);
 
-        handle.shutdown().await.unwrap();
+            handle.shutdown().await.unwrap();
+        });
     }
 }

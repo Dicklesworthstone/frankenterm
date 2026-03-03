@@ -3997,6 +3997,19 @@ async fn find_workflow_start_action_id(
 mod tests {
     use super::*;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build policy test runtime");
+        runtime.block_on(future);
+    }
+
     // ========================================================================
     // Rate Limiter Tests
     // ========================================================================
@@ -4283,85 +4296,91 @@ mod tests {
         assert!(matches!(outcome, CommandGateOutcome::Allow));
     }
 
-    #[tokio::test]
-    async fn injector_emits_policy_decision_to_replay_capture() {
-        let sink = std::sync::Arc::new(crate::replay_capture::CollectingCaptureSink::new());
-        let adapter = std::sync::Arc::new(crate::replay_capture::CaptureAdapter::new(
-            sink.clone(),
-            crate::replay_capture::CaptureConfig::default(),
-        ));
+    #[test]
+    fn injector_emits_policy_decision_to_replay_capture() {
+        run_async_test(async {
+            let sink = std::sync::Arc::new(crate::replay_capture::CollectingCaptureSink::new());
+            let adapter = std::sync::Arc::new(crate::replay_capture::CaptureAdapter::new(
+                sink.clone(),
+                crate::replay_capture::CaptureConfig::default(),
+            ));
 
-        let mut injector = PolicyGatedInjector::new(
-            PolicyEngine::strict(),
-            crate::wezterm::default_wezterm_handle(),
-        );
-        injector.set_decision_capture(adapter);
+            let mut injector = PolicyGatedInjector::new(
+                PolicyEngine::strict(),
+                crate::wezterm::default_wezterm_handle(),
+            );
+            injector.set_decision_capture(adapter);
 
-        let mut caps = PaneCapabilities::prompt();
-        caps.alt_screen = Some(true);
+            let mut caps = PaneCapabilities::prompt();
+            caps.alt_screen = Some(true);
 
-        let result = injector
-            .send_text(1, "echo hi", ActorKind::Robot, &caps, None)
-            .await;
-        assert!(
-            matches!(result, InjectionResult::Denied { .. }),
-            "expected deny when alt_screen is active"
-        );
+            let result = injector
+                .send_text(1, "echo hi", ActorKind::Robot, &caps, None)
+                .await;
+            assert!(
+                matches!(result, InjectionResult::Denied { .. }),
+                "expected deny when alt_screen is active"
+            );
 
-        let events = sink.recorder_events();
-        assert_eq!(events.len(), 1);
-        match &events[0].payload {
-            crate::recording::RecorderEventPayload::ControlMarker { details, .. } => {
-                assert_eq!(details["decision_type"], "PolicyEvaluation");
-                assert_eq!(details["rule_id"], "policy.alt_screen");
+            let events = sink.recorder_events();
+            assert_eq!(events.len(), 1);
+            match &events[0].payload {
+                crate::recording::RecorderEventPayload::ControlMarker { details, .. } => {
+                    assert_eq!(details["decision_type"], "PolicyEvaluation");
+                    assert_eq!(details["rule_id"], "policy.alt_screen");
+                }
+                other => panic!("expected control marker, got {other:?}"),
             }
-            other => panic!("expected control marker, got {other:?}"),
-        }
+        });
     }
 
-    #[tokio::test]
-    async fn e2e_trauma_guard_deny_injects_synthetic_feedback() {
-        let injector = PolicyGatedInjector::permissive(crate::wezterm::MockWezterm::new());
-        let _pane = injector.client.add_default_pane(1).await;
-        let decision = PolicyDecision::deny_with_rule(
-            "Trauma Guard blocked command (recurring_failure_loop)",
-            TRAUMA_LOOP_BLOCK_RULE_ID,
-        );
+    #[test]
+    fn e2e_trauma_guard_deny_injects_synthetic_feedback() {
+        run_async_test(async {
+            let injector = PolicyGatedInjector::permissive(crate::wezterm::MockWezterm::new());
+            let _pane = injector.client.add_default_pane(1).await;
+            let decision = PolicyDecision::deny_with_rule(
+                "Trauma Guard blocked command (recurring_failure_loop)",
+                TRAUMA_LOOP_BLOCK_RULE_ID,
+            );
 
-        injector.maybe_inject_trauma_feedback(1, &decision).await;
+            injector.maybe_inject_trauma_feedback(1, &decision).await;
 
-        let pane = injector
-            .client
-            .pane_state(1)
-            .await
-            .expect("pane 1 should exist");
-        assert!(
-            pane.content.contains(TRAUMA_FEEDBACK_PREFIX),
-            "synthetic trauma feedback should be injected into pane content"
-        );
-        assert!(
-            pane.content.contains("EXECUTION BLOCKED"),
-            "feedback should include explicit block wording"
-        );
+            let pane = injector
+                .client
+                .pane_state(1)
+                .await
+                .expect("pane 1 should exist");
+            assert!(
+                pane.content.contains(TRAUMA_FEEDBACK_PREFIX),
+                "synthetic trauma feedback should be injected into pane content"
+            );
+            assert!(
+                pane.content.contains("EXECUTION BLOCKED"),
+                "feedback should include explicit block wording"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn e2e_non_trauma_deny_does_not_inject_synthetic_feedback() {
-        let injector = PolicyGatedInjector::permissive(crate::wezterm::MockWezterm::new());
-        let _pane = injector.client.add_default_pane(1).await;
-        let decision = PolicyDecision::deny_with_rule("alt screen active", "policy.alt_screen");
+    #[test]
+    fn e2e_non_trauma_deny_does_not_inject_synthetic_feedback() {
+        run_async_test(async {
+            let injector = PolicyGatedInjector::permissive(crate::wezterm::MockWezterm::new());
+            let _pane = injector.client.add_default_pane(1).await;
+            let decision = PolicyDecision::deny_with_rule("alt screen active", "policy.alt_screen");
 
-        injector.maybe_inject_trauma_feedback(1, &decision).await;
+            injector.maybe_inject_trauma_feedback(1, &decision).await;
 
-        let pane = injector
-            .client
-            .pane_state(1)
-            .await
-            .expect("pane 1 should exist");
-        assert!(
-            pane.content.is_empty(),
-            "non-trauma deny should not inject trauma feedback"
-        );
+            let pane = injector
+                .client
+                .pane_state(1)
+                .await
+                .expect("pane 1 should exist");
+            assert!(
+                pane.content.is_empty(),
+                "non-trauma deny should not inject trauma feedback"
+            );
+        });
     }
 
     // ========================================================================

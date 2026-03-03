@@ -359,6 +359,19 @@ mod tests {
         }
     }
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build recorder_lexical_ingest test runtime");
+        runtime.block_on(future);
+    }
+
     // =========================================================================
     // Index creation and opening
     // =========================================================================
@@ -541,154 +554,158 @@ mod tests {
     // Integration with IncrementalIndexer
     // =========================================================================
 
-    #[tokio::test]
-    async fn full_pipeline_with_tantivy_writer() {
+    #[test]
+    fn full_pipeline_with_tantivy_writer() {
         use crate::recorder_storage::{
             AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
             RecorderStorage,
         };
         use crate::tantivy_ingest::{IncrementalIndexer, IndexerConfig, LEXICAL_INDEXER_CONSUMER};
 
-        let dir = tempdir().unwrap();
+        run_async_test(async {
+            let dir = tempdir().unwrap();
 
-        // Set up append-log storage
-        let storage_config = AppendLogStorageConfig {
-            data_path: dir.path().join("events.log"),
-            state_path: dir.path().join("state.json"),
-            queue_capacity: 4,
-            max_batch_events: 256,
-            max_batch_bytes: 1024 * 1024,
-            max_idempotency_entries: 64,
-        };
-        let storage = AppendLogRecorderStorage::open(storage_config.clone()).unwrap();
+            // Set up append-log storage
+            let storage_config = AppendLogStorageConfig {
+                data_path: dir.path().join("events.log"),
+                state_path: dir.path().join("state.json"),
+                queue_capacity: 4,
+                max_batch_events: 256,
+                max_batch_bytes: 1024 * 1024,
+                max_idempotency_entries: 64,
+            };
+            let storage = AppendLogRecorderStorage::open(storage_config.clone()).unwrap();
 
-        // Populate with events
-        let events = vec![
-            sample_event("ev-1", "cargo build --release"),
-            sample_event("ev-2", "cargo test"),
-            egress_event("ev-3", "Compiling frankenterm v0.1.0"),
-        ];
-        storage
-            .append_batch(AppendRequest {
-                batch_id: "batch-1".to_string(),
-                events,
-                required_durability: DurabilityLevel::Appended,
-                producer_ts_ms: 1_700_000_000_000,
-            })
-            .await
-            .unwrap();
+            // Populate with events
+            let events = vec![
+                sample_event("ev-1", "cargo build --release"),
+                sample_event("ev-2", "cargo test"),
+                egress_event("ev-3", "Compiling frankenterm v0.1.0"),
+            ];
+            storage
+                .append_batch(AppendRequest {
+                    batch_id: "batch-1".to_string(),
+                    events,
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1_700_000_000_000,
+                })
+                .await
+                .unwrap();
 
-        // Create Tantivy index and writer
-        let indexer_config = LexicalIndexerConfig {
-            index_dir: dir.path().join("tantivy-idx"),
-            writer_memory_bytes: 15_000_000,
-        };
-        let lexical_indexer = LexicalIndexer::open(indexer_config).unwrap();
-        let writer = lexical_indexer
-            .create_writer_with_memory(15_000_000)
-            .unwrap();
+            // Create Tantivy index and writer
+            let indexer_config = LexicalIndexerConfig {
+                index_dir: dir.path().join("tantivy-idx"),
+                writer_memory_bytes: 15_000_000,
+            };
+            let lexical_indexer = LexicalIndexer::open(indexer_config).unwrap();
+            let writer = lexical_indexer
+                .create_writer_with_memory(15_000_000)
+                .unwrap();
 
-        // Run incremental indexer
-        let pipeline_config = IndexerConfig {
-            source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
-                data_path: storage_config.data_path.clone(),
-            },
-            consumer_id: LEXICAL_INDEXER_CONSUMER.to_string(),
-            batch_size: 10,
-            dedup_on_replay: true,
-            max_batches: 0,
-            expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
-        };
+            // Run incremental indexer
+            let pipeline_config = IndexerConfig {
+                source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                    data_path: storage_config.data_path.clone(),
+                },
+                consumer_id: LEXICAL_INDEXER_CONSUMER.to_string(),
+                batch_size: 10,
+                dedup_on_replay: true,
+                max_batches: 0,
+                expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            };
 
-        let mut pipeline = IncrementalIndexer::new(pipeline_config, writer);
-        let result = pipeline.run(&storage).await.unwrap();
+            let mut pipeline = IncrementalIndexer::new(pipeline_config, writer);
+            let result = pipeline.run(&storage).await.unwrap();
 
-        assert_eq!(result.events_read, 3);
-        assert_eq!(result.events_indexed, 3);
-        assert!(result.caught_up);
+            assert_eq!(result.events_read, 3);
+            assert_eq!(result.events_indexed, 3);
+            assert!(result.caught_up);
 
-        // Verify docs are searchable
-        assert_eq!(lexical_indexer.doc_count().unwrap(), 3);
+            // Verify docs are searchable
+            assert_eq!(lexical_indexer.doc_count().unwrap(), 3);
+        });
     }
 
-    #[tokio::test]
-    async fn incremental_pipeline_resumes_from_checkpoint() {
+    #[test]
+    fn incremental_pipeline_resumes_from_checkpoint() {
         use crate::recorder_storage::{
             AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
             RecorderStorage,
         };
         use crate::tantivy_ingest::{IncrementalIndexer, IndexerConfig};
 
-        let dir = tempdir().unwrap();
+        run_async_test(async {
+            let dir = tempdir().unwrap();
 
-        let storage_config = AppendLogStorageConfig {
-            data_path: dir.path().join("events.log"),
-            state_path: dir.path().join("state.json"),
-            queue_capacity: 4,
-            max_batch_events: 256,
-            max_batch_bytes: 1024 * 1024,
-            max_idempotency_entries: 64,
-        };
-        let storage = AppendLogRecorderStorage::open(storage_config.clone()).unwrap();
+            let storage_config = AppendLogStorageConfig {
+                data_path: dir.path().join("events.log"),
+                state_path: dir.path().join("state.json"),
+                queue_capacity: 4,
+                max_batch_events: 256,
+                max_batch_bytes: 1024 * 1024,
+                max_idempotency_entries: 64,
+            };
+            let storage = AppendLogRecorderStorage::open(storage_config.clone()).unwrap();
 
-        // Append 4 events
-        let events: Vec<_> = (0..4)
-            .map(|i| sample_event(&format!("ev-{i}"), &format!("cmd-{i}")))
-            .collect();
-        storage
-            .append_batch(AppendRequest {
-                batch_id: "b1".to_string(),
-                events,
-                required_durability: DurabilityLevel::Appended,
-                producer_ts_ms: 1_700_000_000_000,
-            })
-            .await
-            .unwrap();
+            // Append 4 events
+            let events: Vec<_> = (0..4)
+                .map(|i| sample_event(&format!("ev-{i}"), &format!("cmd-{i}")))
+                .collect();
+            storage
+                .append_batch(AppendRequest {
+                    batch_id: "b1".to_string(),
+                    events,
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1_700_000_000_000,
+                })
+                .await
+                .unwrap();
 
-        let indexer_config = LexicalIndexerConfig {
-            index_dir: dir.path().join("tantivy-idx"),
-            writer_memory_bytes: 15_000_000,
-        };
-        let lexical_indexer = LexicalIndexer::open(indexer_config).unwrap();
+            let indexer_config = LexicalIndexerConfig {
+                index_dir: dir.path().join("tantivy-idx"),
+                writer_memory_bytes: 15_000_000,
+            };
+            let lexical_indexer = LexicalIndexer::open(indexer_config).unwrap();
 
-        // First run: index first 2 (batch_size=2, max_batches=1)
-        let pipeline_config = IndexerConfig {
-            source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
-                data_path: storage_config.data_path.clone(),
-            },
-            consumer_id: "resume-test".to_string(),
-            batch_size: 2,
-            dedup_on_replay: true,
-            max_batches: 1,
-            expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
-        };
+            // First run: index first 2 (batch_size=2, max_batches=1)
+            let pipeline_config = IndexerConfig {
+                source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                    data_path: storage_config.data_path.clone(),
+                },
+                consumer_id: "resume-test".to_string(),
+                batch_size: 2,
+                dedup_on_replay: true,
+                max_batches: 1,
+                expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            };
 
-        let writer1 = lexical_indexer
-            .create_writer_with_memory(15_000_000)
-            .unwrap();
-        let mut pipeline1 = IncrementalIndexer::new(pipeline_config.clone(), writer1);
-        let r1 = pipeline1.run(&storage).await.unwrap();
-        assert_eq!(r1.events_indexed, 2);
-        assert!(!r1.caught_up);
+            let writer1 = lexical_indexer
+                .create_writer_with_memory(15_000_000)
+                .unwrap();
+            let mut pipeline1 = IncrementalIndexer::new(pipeline_config.clone(), writer1);
+            let r1 = pipeline1.run(&storage).await.unwrap();
+            assert_eq!(r1.events_indexed, 2);
+            assert!(!r1.caught_up);
 
-        // Drop the first writer to release the index lock
-        drop(pipeline1);
+            // Drop the first writer to release the index lock
+            drop(pipeline1);
 
-        // Second run: should resume at event 2 and index remaining 2
-        let pipeline_config2 = IndexerConfig {
-            max_batches: 0,
-            ..pipeline_config
-        };
-        let writer2 = lexical_indexer
-            .create_writer_with_memory(15_000_000)
-            .unwrap();
-        let mut pipeline2 = IncrementalIndexer::new(pipeline_config2, writer2);
-        let r2 = pipeline2.run(&storage).await.unwrap();
-        assert_eq!(r2.events_indexed, 2);
-        assert!(r2.caught_up);
+            // Second run: should resume at event 2 and index remaining 2
+            let pipeline_config2 = IndexerConfig {
+                max_batches: 0,
+                ..pipeline_config
+            };
+            let writer2 = lexical_indexer
+                .create_writer_with_memory(15_000_000)
+                .unwrap();
+            let mut pipeline2 = IncrementalIndexer::new(pipeline_config2, writer2);
+            let r2 = pipeline2.run(&storage).await.unwrap();
+            assert_eq!(r2.events_indexed, 2);
+            assert!(r2.caught_up);
 
-        // All 4 docs should be in the index
-        assert_eq!(lexical_indexer.doc_count().unwrap(), 4);
+            // All 4 docs should be in the index
+            assert_eq!(lexical_indexer.doc_count().unwrap(), 4);
+        });
     }
 
     // =========================================================================
