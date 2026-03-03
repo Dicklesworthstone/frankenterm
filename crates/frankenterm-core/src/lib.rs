@@ -169,6 +169,7 @@ pub mod fenwick_tree;
 pub mod fibonacci_heap;
 pub mod gc;
 pub mod graph_scoring;
+pub mod headless_mux_server;
 pub mod hyperloglog;
 pub mod incident_bundle;
 pub mod ingest;
