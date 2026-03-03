@@ -936,4 +936,131 @@ mod tests {
         }
     }
 
+    // --- SwapLayout construction and naming tests ---
+
+    #[test]
+    fn swap_layout_create_named() {
+        let layout = SwapLayout {
+            name: "my-custom-layout".to_string(),
+            description: Some("A custom test layout".to_string()),
+            arrangement: LayoutArrangement::Split {
+                direction: SplitDirection::Horizontal,
+                ratio: 0.6,
+                first: Box::new(LayoutArrangement::Slot { is_main: true }),
+                second: Box::new(LayoutArrangement::Slot { is_main: false }),
+            },
+        };
+        assert_eq!(layout.name, "my-custom-layout");
+        assert_eq!(
+            layout.description.as_deref(),
+            Some("A custom test layout")
+        );
+        assert_eq!(layout.arrangement.slot_count(), 2);
+        assert!(layout.arrangement.has_main_slot());
+    }
+
+    #[test]
+    fn swap_layout_create_without_description() {
+        let layout = SwapLayout {
+            name: "minimal".to_string(),
+            description: None,
+            arrangement: LayoutArrangement::Slot { is_main: true },
+        };
+        assert_eq!(layout.name, "minimal");
+        assert!(layout.description.is_none());
+    }
+
+    #[test]
+    fn swap_layout_persistence_via_json_roundtrip() {
+        // Simulate layout persistence: serialize to JSON, deserialize back
+        let layouts = vec![grid_4(), main_side(), stacked(), main_bottom()];
+        let json = serde_json::to_string(&layouts).unwrap();
+        let restored: Vec<SwapLayout> = serde_json::from_str(&json).unwrap();
+        assert_eq!(layouts.len(), restored.len());
+        for (orig, rest) in layouts.iter().zip(restored.iter()) {
+            assert_eq!(orig.name, rest.name);
+            assert_eq!(orig.arrangement.slot_count(), rest.arrangement.slot_count());
+            assert_eq!(orig, rest);
+        }
+    }
+
+    #[test]
+    fn layout_cycle_from_custom_layouts() {
+        let custom = SwapLayout {
+            name: "custom-3x1".to_string(),
+            description: None,
+            arrangement: LayoutArrangement::Split {
+                direction: SplitDirection::Horizontal,
+                ratio: 0.33,
+                first: Box::new(LayoutArrangement::Slot { is_main: true }),
+                second: Box::new(LayoutArrangement::Split {
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(LayoutArrangement::Slot { is_main: false }),
+                    second: Box::new(LayoutArrangement::Slot { is_main: false }),
+                }),
+            },
+        };
+        let cycle = LayoutCycle::new(vec![stacked(), custom.clone()]);
+        assert_eq!(cycle.len(), 2);
+        assert_eq!(cycle.current().name, "stacked");
+        let mut cycle = cycle;
+        let next = cycle.advance();
+        assert_eq!(next.name, "custom-3x1");
+        assert_eq!(next.arrangement.slot_count(), 3);
+    }
+
+    // --- Compute split size additional edge cases ---
+
+    #[test]
+    fn compute_split_sizes_one_col_terminal() {
+        // Terminal with only 1 column: separator alone would be 1,
+        // so effective cols = 0. The function should still produce valid sizes.
+        let size = TerminalSize {
+            rows: 10,
+            cols: 1,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 96,
+        };
+        let (first, second) = compute_split_sizes(SplitDirection::Horizontal, 0.5, size);
+        // Both sides should be at least 1 col (clamped)
+        assert!(first.cols >= 1);
+        assert!(second.cols >= 1);
+    }
+
+    #[test]
+    fn compute_split_sizes_one_row_terminal() {
+        let size = TerminalSize {
+            rows: 1,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 96,
+        };
+        let (first, second) = compute_split_sizes(SplitDirection::Vertical, 0.5, size);
+        assert!(first.rows >= 1);
+        assert!(second.rows >= 1);
+    }
+
+    // --- LayoutArrangement deep nesting ---
+
+    #[test]
+    fn arrangement_equality() {
+        let a = grid_4().arrangement;
+        let b = grid_4().arrangement;
+        assert_eq!(a, b);
+
+        let c = main_side().arrangement;
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn swap_layout_clone_is_independent() {
+        let original = grid_4();
+        let mut cloned = original.clone();
+        cloned.name = "modified".to_string();
+        assert_eq!(original.name, "grid-4");
+        assert_eq!(cloned.name, "modified");
+    }
 }
