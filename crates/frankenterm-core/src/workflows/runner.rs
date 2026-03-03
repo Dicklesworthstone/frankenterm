@@ -457,7 +457,7 @@ impl WorkflowRunner {
                     "workflow_error",
                     "error",
                     Some(&reason),
-                    Some(start_step),
+                    Some(current_step),
                     None,
                     start_action_id,
                 )
@@ -1233,8 +1233,13 @@ impl WorkflowRunner {
                                 ),
                                 _ => "unknown".to_string(),
                             };
-                            let abort_reason =
-                                format!("Text injection requires approval (code: {code})");
+                            // Workflows do not currently suspend to wait for manual approval of steps.
+                            // The approval code may be 'unknown' if not persisted by the injector.
+                            let abort_reason = if code == "unknown" {
+                                "Text injection requires human approval (workflow aborted)".to_string()
+                            } else {
+                                format!("Text injection requires approval (code: {code})")
+                            };
 
                             tracing::warn!(
                                 pane_id,
@@ -1249,6 +1254,18 @@ impl WorkflowRunner {
                                     execution_id,
                                     error = %e,
                                     "Failed to fail execution"
+                                );
+                            }
+
+                            // Mark trigger event as handled (with requires_approval status)
+                            if let Err(e) = self
+                                .mark_trigger_event_handled(execution_id, "requires_approval")
+                                .await
+                            {
+                                tracing::warn!(
+                                    execution_id,
+                                    error = %e,
+                                    "Failed to mark trigger event as handled"
                                 );
                             }
 
