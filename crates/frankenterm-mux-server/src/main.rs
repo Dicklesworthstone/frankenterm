@@ -146,6 +146,11 @@ fn run() -> anyhow::Result<()> {
         log::error!("problem spawning listeners: {:?}", e);
         e
     })?;
+    log::info!(
+        "frankenterm-mux-server-ready unix_domains={} tls_servers={}",
+        config.unix_domains.len(),
+        config.tls_servers.len()
+    );
 
     let activity = Activity::new();
 

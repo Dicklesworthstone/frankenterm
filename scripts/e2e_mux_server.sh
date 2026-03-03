@@ -10,6 +10,7 @@ FT_BIN="${FT_BIN:-ft}"
 SOCKET_PATH="${SOCKET_PATH:-}"
 LOG_PATH="${LOG_PATH:-/tmp/frankenterm-mux-server.e2e.log}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-20}"
+MAX_BINARY_BYTES="${MAX_BINARY_BYTES:-20971520}" # 20 MiB budget
 DRY_RUN=0
 
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -97,14 +98,38 @@ start_server() {
       return 1
     fi
     sleep 1
-    # Give server a chance to initialize before follow-up steps.
-    if grep -qiE "listening|mux-startup|local" "$LOG_PATH" 2>/dev/null; then
+    # Prefer explicit readiness marker; keep legacy fallback patterns for compatibility.
+    if grep -qiE "frankenterm-mux-server-ready|listening|mux-startup" "$LOG_PATH" 2>/dev/null; then
       return 0
     fi
   done
 
   # If server is still alive after timeout, treat startup as successful.
   kill -0 "$server_pid" 2>/dev/null
+}
+
+check_binary_size_budget() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "[DRY-RUN] binary size <= ${MAX_BINARY_BYTES} bytes"
+    return 0
+  fi
+
+  local server_path=""
+  if [[ "$SERVER_BIN" == */* ]]; then
+    server_path="$SERVER_BIN"
+  else
+    server_path="$(command -v "$SERVER_BIN" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$server_path" || ! -f "$server_path" ]]; then
+    log "cannot resolve binary path for size check: $SERVER_BIN"
+    return 1
+  fi
+
+  local binary_size
+  binary_size="$(wc -c <"$server_path" | tr -d '[:space:]')"
+  log "binary_size_bytes=${binary_size} budget_bytes=${MAX_BINARY_BYTES} path=${server_path}"
+  [[ "$binary_size" -le "$MAX_BINARY_BYTES" ]]
 }
 
 check_socket() {
@@ -209,6 +234,7 @@ graceful_shutdown() {
 main() {
   log "e2e_mux_server: starting"
   run_step "start frankenterm-mux-server" start_server || true
+  run_step "binary size budget" check_binary_size_budget || true
   run_step "verify socket path" check_socket || true
   run_step "ft robot state" robot_state || true
   run_step "ft robot send + search" robot_send_and_search || true

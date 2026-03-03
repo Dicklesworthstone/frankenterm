@@ -43884,6 +43884,7 @@ log_level = "debug"
         })));
         assert!(should_auto_install_bundled_font(Some(&Commands::Status {
             health: false,
+            resize: false,
             format: "auto".to_string(),
             domain: None,
             agent: None,

@@ -972,12 +972,16 @@ async fn pane_delta_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) {
     #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::for_testing();
-        let _ = tx.send(&cx, delta).await;
+        if let Ok(permit) = tx.reserve(&cx).await {
+            permit.send(delta);
+        }
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]
     {
-        let _ = tx.send(delta).await;
+        if let Ok(permit) = tx.reserve().await {
+            permit.send(delta);
+        }
     }
 }
 
@@ -2890,6 +2894,47 @@ mod tests {
             subscription_poll_delay(&config, true),
             Duration::from_millis(25)
         );
+    }
+
+    #[test]
+    fn pane_delta_send_delivers_via_reserve_commit() {
+        run_async_test(async {
+            let (tx, mut rx) = mpsc::channel(4);
+            pane_delta_send(
+                &tx,
+                PaneDelta::Gap {
+                    pane_id: 99,
+                    reason: "reserve-commit".to_string(),
+                },
+            )
+            .await;
+            let received = pane_delta_recv(&mut rx)
+                .await
+                .expect("delta should be delivered");
+            match received {
+                PaneDelta::Gap { pane_id, reason } => {
+                    assert_eq!(pane_id, 99);
+                    assert_eq!(reason, "reserve-commit");
+                }
+                other => panic!("expected gap delta, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn pane_delta_send_is_noop_when_receiver_closed() {
+        run_async_test(async {
+            let (tx, rx) = mpsc::channel(1);
+            drop(rx);
+            pane_delta_send(
+                &tx,
+                PaneDelta::Ended {
+                    pane_id: 1,
+                    reason: "receiver-closed".to_string(),
+                },
+            )
+            .await;
+        });
     }
 
     #[test]

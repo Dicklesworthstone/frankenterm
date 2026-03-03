@@ -289,6 +289,11 @@ impl SwarmWorkQueue {
         Self::new(WorkQueueConfig::default())
     }
 
+    /// Access queue configuration.
+    pub fn config(&self) -> &WorkQueueConfig {
+        &self.config
+    }
+
     // =========================================================================
     // Enqueue / dependency management
     // =========================================================================
@@ -1162,7 +1167,7 @@ mod tests {
         q.enqueue(item("a", 0, &[])).unwrap();
         q.enqueue(item("b", 0, &["a"])).unwrap();
 
-        assert!(q.would_create_cycle(&"a".into(), &["b".into()]));
+        assert!(q.would_create_cycle(&"a".to_string(), &["b".to_string()]));
     }
 
     #[test]
@@ -1172,7 +1177,7 @@ mod tests {
         q.enqueue(item("b", 0, &["a"])).unwrap();
         q.enqueue(item("c", 0, &["b"])).unwrap();
 
-        assert!(q.would_create_cycle(&"a".into(), &["c".into()]));
+        assert!(q.would_create_cycle(&"a".to_string(), &["c".to_string()]));
     }
 
     #[test]
@@ -1182,8 +1187,8 @@ mod tests {
         q.enqueue(item("b", 0, &["a"])).unwrap();
         q.enqueue(item("c", 0, &["a"])).unwrap();
 
-        assert!(!q.would_create_cycle(&"b".into(), &["a".into()])); // b→a already exists, no new cycle
-        assert!(!q.would_create_cycle(&"c".into(), &["a".into()])); // c→a already exists
+        assert!(!q.would_create_cycle(&"b".to_string(), &["a".to_string()])); // b→a already exists, no new cycle
+        assert!(!q.would_create_cycle(&"c".to_string(), &["a".to_string()])); // c→a already exists
     }
 
     // =========================================================================

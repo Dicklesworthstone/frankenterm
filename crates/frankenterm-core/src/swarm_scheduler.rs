@@ -607,7 +607,7 @@ impl SwarmScheduler {
     }
 
     /// Evaluate without mutating the queue (read-only analysis).
-    pub fn evaluate_readonly(&self, stats: &QueueStats, now_ms: u64) -> QueuePressure {
+    pub fn evaluate_readonly(&self, stats: &QueueStats, _now_ms: u64) -> QueuePressure {
         let max_concurrent = 3; // default; caller should provide
         self.compute_pressure(stats, max_concurrent)
     }
@@ -807,14 +807,14 @@ impl SwarmScheduler {
         let overloaded: Vec<_> = snapshots
             .iter()
             .zip(loads.iter())
-            .filter(|(_, &l)| l > avg_load + self.config.rebalance_imbalance_threshold / 2.0)
+            .filter(|entry| *entry.1 > avg_load + self.config.rebalance_imbalance_threshold / 2.0)
             .map(|(s, _)| s)
             .collect();
 
         let underloaded: Vec<_> = snapshots
             .iter()
             .zip(loads.iter())
-            .filter(|(_, &l)| l < avg_load - self.config.rebalance_imbalance_threshold / 2.0)
+            .filter(|entry| *entry.1 < avg_load - self.config.rebalance_imbalance_threshold / 2.0)
             .map(|(s, _)| s)
             .collect();
 
@@ -915,6 +915,8 @@ impl SwarmScheduler {
     // Helpers
     // =========================================================================
 
+    /// Get the current wall-clock time in milliseconds since the Unix epoch.
+    #[allow(dead_code)]
     fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
