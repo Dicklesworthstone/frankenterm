@@ -16,8 +16,8 @@
 //! If no WASM config is found, returns `None` and the caller falls through
 //! to the next config format.
 
-use crate::{LoadedConfig, CONFIG_DIRS, CONFIG_FILE_OVERRIDE};
-use anyhow::{anyhow, Context};
+use crate::{CONFIG_DIRS, CONFIG_FILE_OVERRIDE, LoadedConfig};
+use anyhow::{Context, anyhow};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
 use std::path::{Path, PathBuf};
 
@@ -309,6 +309,18 @@ mod tests {
 
         let mut ovr_map = std::collections::BTreeMap::new();
         ovr_map.insert(Value::String("scrollback_lines".into()), Value::U64(7777));
+        ovr_map.insert(
+            Value::String("scrollback_tiered_enabled".into()),
+            Value::Bool(true),
+        );
+        ovr_map.insert(
+            Value::String("scrollback_hot_lines".into()),
+            Value::U64(888),
+        );
+        ovr_map.insert(
+            Value::String("scrollback_warm_max_mb".into()),
+            Value::U64(12),
+        );
         let overrides = Value::Object(ovr_map.into());
 
         let result = try_load_wasm_file(&wasm_path, &overrides, &*evaluator)
@@ -316,6 +328,9 @@ mod tests {
             .unwrap();
         let cfg = result.config.unwrap();
         assert_eq!(cfg.scrollback_lines, 7777);
+        assert!(cfg.scrollback_tiered_enabled);
+        assert_eq!(cfg.scrollback_hot_lines, 888);
+        assert_eq!(cfg.scrollback_warm_max_mb, 12);
     }
 
     #[test]

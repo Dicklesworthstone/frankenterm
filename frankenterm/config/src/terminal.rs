@@ -1,9 +1,9 @@
 //! Bridge our gui config into the terminal crate configuration
 
-use crate::{configuration, ConfigHandle, NewlineCanon};
+use crate::{ConfigHandle, NewlineCanon, configuration};
+use frankenterm_term::MonospaceKpCostModel;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::config::BidiMode;
-use frankenterm_term::MonospaceKpCostModel;
 use std::sync::Mutex;
 use termwiz::cell::UnicodeVersion;
 
@@ -51,6 +51,17 @@ impl frankenterm_term::TerminalConfiguration for TermConfig {
 
     fn scrollback_size(&self) -> usize {
         self.configuration().scrollback_lines
+    }
+
+    fn scrollback_tier_config(&self) -> frankenterm_term::config::ScrollbackTierConfig {
+        let config = self.configuration();
+        let hot_lines = config.scrollback_hot_lines.min(config.scrollback_lines);
+        let warm_max_bytes = config.scrollback_warm_max_mb.saturating_mul(1024 * 1024);
+        frankenterm_term::config::ScrollbackTierConfig {
+            enabled: config.scrollback_tiered_enabled,
+            hot_lines,
+            warm_max_bytes,
+        }
     }
 
     fn resize_wrap_kp_cost_model(&self) -> MonospaceKpCostModel {
@@ -206,6 +217,19 @@ mod tests {
             Value::String("resize_wrap_readability_max_fallback_ratio_percent".into()),
             Value::U64(37),
         );
+        overrides.insert(Value::String("scrollback_lines".into()), Value::U64(5000));
+        overrides.insert(
+            Value::String("scrollback_tiered_enabled".into()),
+            Value::Bool(true),
+        );
+        overrides.insert(
+            Value::String("scrollback_hot_lines".into()),
+            Value::U64(1200),
+        );
+        overrides.insert(
+            Value::String("scrollback_warm_max_mb".into()),
+            Value::U64(64),
+        );
 
         let handle = crate::overridden_config(&Value::Object(overrides.into()))
             .expect("override parsing to succeed");
@@ -230,5 +254,9 @@ mod tests {
             term_config.resize_wrap_readability_max_fallback_ratio_percent(),
             37
         );
+        let tier = term_config.scrollback_tier_config();
+        assert!(tier.enabled);
+        assert_eq!(tier.hot_lines, 1200);
+        assert_eq!(tier.warm_max_bytes, 64 * 1024 * 1024);
     }
 }

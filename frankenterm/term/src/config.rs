@@ -1,5 +1,5 @@
 use crate::color::ColorPalette;
-use downcast_rs::{impl_downcast, Downcast};
+use downcast_rs::{Downcast, impl_downcast};
 use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::UnicodeVersion;
 use frankenterm_surface::line::MonospaceKpCostModel;
@@ -265,6 +265,26 @@ impl Default for NewlineCanon {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbackTierConfig {
+    /// Enables tier-aware scrollback budgeting in the terminal model.
+    pub enabled: bool,
+    /// Maximum number of scrollback lines kept in the in-memory hot tier.
+    pub hot_lines: usize,
+    /// Approximate byte budget for warm-tier accounting.
+    pub warm_max_bytes: usize,
+}
+
+impl Default for ScrollbackTierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hot_lines: 1000,
+            warm_max_bytes: 0,
+        }
+    }
+}
+
 /// TerminalConfiguration allows for the embedding application to pass configuration
 /// information to the Terminal.
 /// The configuration can be changed at runtime; provided that the implementation
@@ -283,6 +303,18 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
     /// Returns the size of the scrollback in terms of the number of rows.
     fn scrollback_size(&self) -> usize {
         3500
+    }
+
+    /// Tiered scrollback budgeting controls.
+    ///
+    /// By default this is disabled and the terminal retains all configured
+    /// scrollback rows in memory.
+    fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+        ScrollbackTierConfig {
+            enabled: false,
+            hot_lines: self.scrollback_size().max(1),
+            warm_max_bytes: 0,
+        }
     }
 
     /// Cost model used by resize-time bounded KP wrapping.
