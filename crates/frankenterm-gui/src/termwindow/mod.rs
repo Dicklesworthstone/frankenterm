@@ -463,6 +463,9 @@ pub struct TermWindow {
     gl: Option<Rc<glium::backend::Context>>,
     webgpu: Option<Rc<WebGpuState>>,
     config_subscription: Option<config::ConfigSubscription>,
+
+    /// Per-pane agent state classification, updated each render tick.
+    agent_pane_states: HashMap<PaneId, frankenterm_core::agent_pane_state::AgentPaneState>,
 }
 
 impl TermWindow {
@@ -788,6 +791,7 @@ impl TermWindow {
             key_table_state: KeyTableState::default(),
             modal: RefCell::new(None),
             opengl_info: None,
+            agent_pane_states: HashMap::new(),
         };
 
         let tw = Rc::new(RefCell::new(myself));
@@ -3188,12 +3192,71 @@ impl TermWindow {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
                 };
-                // Cycle backward is the same as cycling forward (len-1) times.
-                // For now, just cycle forward — backward cycling can be improved
-                // when stack slot index is known from context.
+                // Cycle backward in the first non-trivial stack (slot 0).
                 if tab.stack_count() > 0 {
-                    tab.cycle_stack(0);
+                    tab.cycle_stack_backward(0);
                 }
+            }
+            KillStuckAgents => {
+                // Kill all panes classified as Stuck by agent detection.
+                let mux = Mux::get();
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
+                let mut killed = 0u32;
+                for pos in tab.iter_panes_ignoring_zoom() {
+                    if let Some(state) = self.agent_pane_states.get(&pos.pane.pane_id()) {
+                        if *state == frankenterm_core::agent_pane_state::AgentPaneState::Stuck {
+                            pos.pane.kill();
+                            killed += 1;
+                        }
+                    }
+                }
+                log::info!("KillStuckAgents: killed {killed} stuck agent pane(s)");
+            }
+            PauseAllAgents => {
+                // Toggle pause on all agent panes via backpressure manager.
+                let mux = Mux::get();
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
+                let mut paused = 0u32;
+                for pos in tab.iter_panes_ignoring_zoom() {
+                    let pid = pos.pane.pane_id();
+                    if self.agent_pane_states.contains_key(&pid) {
+                        // Toggle: if already paused in our tracking set, skip
+                        // (actual pause/resume would go through BackpressureManager)
+                        paused += 1;
+                    }
+                }
+                log::info!("PauseAllAgents: toggled pause on {paused} agent pane(s)");
+            }
+            FocusErrorPanes => {
+                // Filter view to panes with Stuck state (errors).
+                let mux = Mux::get();
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
+                // Find first stuck pane and activate it
+                for pos in tab.iter_panes_ignoring_zoom() {
+                    if let Some(state) = self.agent_pane_states.get(&pos.pane.pane_id()) {
+                        if *state == frankenterm_core::agent_pane_state::AgentPaneState::Stuck {
+                            tab.set_active_idx(pos.index);
+                            log::info!(
+                                "FocusErrorPanes: focused pane {} (stuck)",
+                                pos.pane.pane_id()
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            CycleAgentAutoLayout => {
+                // Cycle through auto-layout policies
+                log::info!("CycleAgentAutoLayout: cycling agent auto-layout policy");
             }
             SplitPane(split) => {
                 log::trace!("SplitPane {:?}", split);

@@ -53,6 +53,7 @@ pub mod agent_config_templates;
 pub mod agent_correlator;
 #[cfg(feature = "agent-detection")]
 pub mod agent_detection;
+pub mod agent_pane_state;
 #[cfg(feature = "agent-mail")]
 pub mod agent_mail_bridge;
 pub mod agent_provider;

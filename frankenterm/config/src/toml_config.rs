@@ -14,8 +14,8 @@
 //! If no TOML config is found, returns `None` and the caller falls through
 //! to Lua config or defaults.
 
-use crate::{toml_to_dynamic, LoadedConfig, CONFIG_DIRS, CONFIG_FILE_OVERRIDE, HOME_DIR};
-use anyhow::{anyhow, Context};
+use crate::{CONFIG_DIRS, CONFIG_FILE_OVERRIDE, HOME_DIR, LoadedConfig, toml_to_dynamic};
+use anyhow::{Context, anyhow};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
 use std::path::{Path, PathBuf};
 
@@ -251,6 +251,9 @@ mod tests {
     fn basic_toml_fields_parse() {
         let toml_str = r#"
 scrollback_lines = 10000
+scrollback_tiered_enabled = true
+scrollback_hot_lines = 1200
+scrollback_warm_max_mb = 48
 font_size = 14.0
 color_scheme = "Catppuccin Mocha"
 "#;
@@ -265,8 +268,45 @@ color_scheme = "Catppuccin Mocha"
         )
         .unwrap();
         assert_eq!(cfg.scrollback_lines, 10000);
+        assert!(cfg.scrollback_tiered_enabled);
+        assert_eq!(cfg.scrollback_hot_lines, 1200);
+        assert_eq!(cfg.scrollback_warm_max_mb, 48);
         assert!((cfg.font_size - 14.0).abs() < 0.01);
         assert_eq!(cfg.color_scheme.as_deref(), Some("Catppuccin Mocha"));
+    }
+
+    #[test]
+    fn agent_detection_config_from_toml() {
+        let toml_str = r#"
+agent_detection_enabled = true
+agent_active_threshold_ms = 3000
+agent_thinking_threshold_ms = 8000
+agent_stuck_threshold_ms = 45000
+agent_idle_threshold_ms = 90000
+agent_show_name_overlay = false
+agent_show_backpressure = true
+agent_border_width = 3
+agent_auto_layout = "by_activity"
+"#;
+        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let dynamic = toml_to_dynamic(&toml_value);
+        let cfg = Config::from_dynamic(
+            &dynamic,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Warn,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        )
+        .unwrap();
+        assert!(cfg.agent_detection_enabled);
+        assert_eq!(cfg.agent_active_threshold_ms, 3000);
+        assert_eq!(cfg.agent_thinking_threshold_ms, 8000);
+        assert_eq!(cfg.agent_stuck_threshold_ms, 45000);
+        assert_eq!(cfg.agent_idle_threshold_ms, 90000);
+        assert!(!cfg.agent_show_name_overlay);
+        assert!(cfg.agent_show_backpressure);
+        assert_eq!(cfg.agent_border_width, 3);
+        assert_eq!(cfg.agent_auto_layout, "by_activity");
     }
 
     #[test]
@@ -457,7 +497,10 @@ bottom = 12
                 deprecated_fields: UnknownFieldAction::Warn,
             },
         );
-        assert!(cfg.is_ok(), "window_padding config should parse without error");
+        assert!(
+            cfg.is_ok(),
+            "window_padding config should parse without error"
+        );
     }
 
     #[test]

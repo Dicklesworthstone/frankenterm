@@ -21,16 +21,16 @@ use crate::tls::{TlsDomainClient, TlsDomainServer};
 use crate::units::Dimension;
 use crate::unix::UnixDomain;
 use crate::wsl::WslDomain;
+use crate::{
+    CONFIG_DIRS, CellWidth, GpuInfo, IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig,
+    MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop, WebGpuPowerPreference,
+    default_one_point_oh, default_one_point_oh_f64, default_true,
+    default_win32_acrylic_accent_color,
+};
 #[cfg(feature = "lua")]
 use crate::{
-    default_config_with_overrides_applied, CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP,
-    HOME_DIR,
-};
-use crate::{
-    default_one_point_oh, default_one_point_oh_f64, default_true,
-    default_win32_acrylic_accent_color, CellWidth, GpuInfo, IntegratedTitleButtonColor,
-    KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop,
-    WebGpuPowerPreference, CONFIG_DIRS,
+    CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
+    default_config_with_overrides_applied,
 };
 use anyhow::Context;
 use frankenterm_bidi::ParagraphDirectionHint;
@@ -211,6 +211,62 @@ pub struct Config {
         validate = "validate_scrollback_lines"
     )]
     pub scrollback_lines: usize,
+
+    /// Enables tier-aware scrollback budgeting in the terminal model.
+    #[dynamic(default = "default_scrollback_tiered_enabled")]
+    pub scrollback_tiered_enabled: bool,
+
+    /// Hot-tier in-memory scrollback line budget when tiering is enabled.
+    #[dynamic(
+        default = "default_scrollback_hot_lines",
+        validate = "validate_scrollback_hot_lines"
+    )]
+    pub scrollback_hot_lines: usize,
+
+    /// Warm-tier accounting budget (MiB) when tiering is enabled.
+    #[dynamic(
+        default = "default_scrollback_warm_max_mb",
+        validate = "validate_scrollback_warm_max_mb"
+    )]
+    pub scrollback_warm_max_mb: usize,
+
+    // -- Agent pane state detection --
+
+    /// Enable agent pane state detection and visual indicators.
+    #[dynamic(default = "default_true")]
+    pub agent_detection_enabled: bool,
+
+    /// Output recency threshold for Active state (ms). Default: 5000.
+    #[dynamic(default = "default_agent_active_threshold_ms")]
+    pub agent_active_threshold_ms: u64,
+
+    /// Silence after input before Thinking state (ms). Default: 5000.
+    #[dynamic(default = "default_agent_thinking_threshold_ms")]
+    pub agent_thinking_threshold_ms: u64,
+
+    /// Silence after input before Stuck state (ms). Default: 30000.
+    #[dynamic(default = "default_agent_stuck_threshold_ms")]
+    pub agent_stuck_threshold_ms: u64,
+
+    /// No input+output silence before Idle state (ms). Default: 60000.
+    #[dynamic(default = "default_agent_idle_threshold_ms")]
+    pub agent_idle_threshold_ms: u64,
+
+    /// Show agent name overlay in pane title bar.
+    #[dynamic(default = "default_true")]
+    pub agent_show_name_overlay: bool,
+
+    /// Show backpressure tier indicator in pane chrome.
+    #[dynamic(default = "default_true")]
+    pub agent_show_backpressure: bool,
+
+    /// Border width (px) for agent state indicator. Default: 2.
+    #[dynamic(default = "default_agent_border_width")]
+    pub agent_border_width: u32,
+
+    /// Auto-layout policy for agent panes: by_status, by_activity, by_domain, manual.
+    #[dynamic(default = "default_agent_auto_layout")]
+    pub agent_auto_layout: String,
 
     /// Cubic slack multiplier used by resize-time bounded KP wrapping.
     #[dynamic(default = "default_resize_wrap_kp_badness_scale")]
@@ -997,7 +1053,7 @@ impl Config {
     pub fn update_ulimit(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
-            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
+            use nix::sys::resource::{Resource, getrlimit, rlim_t, setrlimit};
             use std::convert::TryInto;
 
             let (no_file_soft, no_file_hard) = getrlimit(Resource::RLIMIT_NOFILE)?;
@@ -1026,7 +1082,7 @@ impl Config {
 
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
+            use nix::sys::resource::{Resource, getrlimit, rlim_t, setrlimit};
             use std::convert::TryInto;
 
             let (nproc_soft, nproc_hard) = getrlimit(Resource::RLIMIT_NPROC)?;
@@ -1798,6 +1854,42 @@ fn default_scrollback_lines() -> usize {
     3500
 }
 
+fn default_scrollback_tiered_enabled() -> bool {
+    false
+}
+
+fn default_scrollback_hot_lines() -> usize {
+    1000
+}
+
+fn default_scrollback_warm_max_mb() -> usize {
+    50
+}
+
+fn default_agent_active_threshold_ms() -> u64 {
+    5_000
+}
+
+fn default_agent_thinking_threshold_ms() -> u64 {
+    5_000
+}
+
+fn default_agent_stuck_threshold_ms() -> u64 {
+    30_000
+}
+
+fn default_agent_idle_threshold_ms() -> u64 {
+    60_000
+}
+
+fn default_agent_border_width() -> u32 {
+    2
+}
+
+fn default_agent_auto_layout() -> String {
+    "by_status".to_string()
+}
+
 fn default_resize_wrap_kp_badness_scale() -> u64 {
     10_000
 }
@@ -1831,6 +1923,25 @@ fn validate_scrollback_lines(value: &usize) -> Result<(), String> {
     if *value > MAX_SCROLLBACK_LINES {
         return Err(format!(
             "Illegal value {value} for scrollback_lines; it must be <= {MAX_SCROLLBACK_LINES}!"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scrollback_hot_lines(value: &usize) -> Result<(), String> {
+    if *value == 0 || *value > MAX_SCROLLBACK_LINES {
+        return Err(format!(
+            "Illegal value {value} for scrollback_hot_lines; it must be in 1..={MAX_SCROLLBACK_LINES}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scrollback_warm_max_mb(value: &usize) -> Result<(), String> {
+    const MAX_SCROLLBACK_WARM_MB: usize = 1024 * 1024;
+    if *value > MAX_SCROLLBACK_WARM_MB {
+        return Err(format!(
+            "Illegal value {value} for scrollback_warm_max_mb; it must be <= {MAX_SCROLLBACK_WARM_MB}"
         ));
     }
     Ok(())

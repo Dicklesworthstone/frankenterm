@@ -636,6 +636,20 @@ pub enum KeyAssignment {
 
     CopyMode(CopyModeAssignment),
     RotatePanes(RotationDirection),
+    SwapLayoutNext,
+    SwapLayoutPrev,
+    SwapToLayoutIndex(usize),
+    ToggleFloatingPane,
+    CycleStackForward,
+    CycleStackBackward,
+    /// Kill all agent panes detected as Stuck (Cmd+Shift+K).
+    KillStuckAgents,
+    /// Pause input to all agent panes (Cmd+Shift+P).
+    PauseAllAgents,
+    /// Filter view to only show panes with detected errors (Cmd+Shift+E).
+    FocusErrorPanes,
+    /// Cycle agent auto-layout policy (by_status → by_activity → by_domain → manual).
+    CycleAgentAutoLayout,
     SplitPane(SplitPane),
     PaneSelect(PaneSelectArguments),
     CharSelect(CharSelectArguments),

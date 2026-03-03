@@ -2,12 +2,12 @@ use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator};
 use crate::selection::SelectionRange;
 use crate::termwindow::box_model::*;
 use crate::termwindow::render::{
-    same_hyperlink, CursorProperties, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
-    RenderScreenLineParams,
+    CursorProperties, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
+    RenderScreenLineParams, same_hyperlink,
 };
 use crate::termwindow::{ScrollHit, UIItem, UIItemType};
-use ::window::bitmaps::TextureRect;
 use ::window::DeadKeyStatus;
+use ::window::bitmaps::TextureRect;
 use anyhow::Context;
 use config::VisualBellTarget;
 use mux::pane::{PaneId, WithPaneLines};
@@ -218,6 +218,55 @@ impl crate::TermWindow {
                 } else {
                     Some(config.inactive_pane_hsb)
                 });
+            }
+        }
+
+        // Agent state border overlay: draw colored border around agent panes.
+        if self.config.agent_detection_enabled {
+            if let Some(agent_state) = self.agent_pane_states.get(&pane_id) {
+                if let Some((r, g, b, a)) = agent_state.border_color_rgba() {
+                    let border_w = self.config.agent_border_width.max(1) as f32;
+                    let color = LinearRgba::with_components(
+                        r as f32 / 255.0,
+                        g as f32 / 255.0,
+                        b as f32 / 255.0,
+                        a as f32 / 255.0,
+                    );
+                    let (bx, by, bw, bh) = (
+                        background_rect.origin.x,
+                        background_rect.origin.y,
+                        background_rect.size.width,
+                        background_rect.size.height,
+                    );
+                    // Top edge
+                    self.filled_rectangle(
+                        layers,
+                        2,
+                        euclid::rect(bx, by, bw, border_w),
+                        color,
+                    )?;
+                    // Bottom edge
+                    self.filled_rectangle(
+                        layers,
+                        2,
+                        euclid::rect(bx, by + bh - border_w, bw, border_w),
+                        color,
+                    )?;
+                    // Left edge
+                    self.filled_rectangle(
+                        layers,
+                        2,
+                        euclid::rect(bx, by, border_w, bh),
+                        color,
+                    )?;
+                    // Right edge
+                    self.filled_rectangle(
+                        layers,
+                        2,
+                        euclid::rect(bx + bw - border_w, by, border_w, bh),
+                        color,
+                    )?;
+                }
             }
         }
 

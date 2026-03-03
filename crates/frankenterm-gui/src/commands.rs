@@ -1,15 +1,15 @@
 use crate::inputmap::InputMap;
+use KeyAssignment::*;
 use config::keyassignment::*;
 use config::window::WindowLevel;
 use config::{ConfigHandle, DeferredKeyCode};
-use mux::domain::DomainState;
 use mux::Mux;
+use mux::domain::DomainState;
 use ordered_float::NotNan;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::convert::TryFrom;
 use window::{KeyCode, Modifiers};
-use KeyAssignment::*;
 
 /// Describes an argument/parameter/context that is required
 /// in order for the command to have meaning.
@@ -1625,7 +1625,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         ShowLauncherArgs(_) | ShowLauncher => CommandDef {
             brief: "Show the launcher".into(),
             doc: "Shows the launcher menu".into(),
-            keys: vec![],
+            keys: vec![(Modifiers::SUPER, "s".into())],
             args: &[ArgType::ActiveWindow],
             menubar: &["Shell"],
             icon: None,
@@ -2028,6 +2028,38 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window", "Stack"],
             icon: Some("md_layers"),
         },
+        KillStuckAgents => CommandDef {
+            brief: "Kill All Stuck Agents".into(),
+            doc: "Terminate all agent panes detected as stuck".into(),
+            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "k".into())],
+            args: &[ArgType::ActiveTab],
+            menubar: &["Window", "Agents"],
+            icon: Some("md_cancel"),
+        },
+        PauseAllAgents => CommandDef {
+            brief: "Pause All Agents".into(),
+            doc: "Pause input to all agent-controlled panes".into(),
+            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "o".into())],
+            args: &[ArgType::ActiveTab],
+            menubar: &["Window", "Agents"],
+            icon: Some("md_pause_circle"),
+        },
+        FocusErrorPanes => CommandDef {
+            brief: "Focus Error Panes".into(),
+            doc: "Jump to the next pane with detected errors (stuck agents)".into(),
+            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "e".into())],
+            args: &[ArgType::ActiveTab],
+            menubar: &["Window", "Agents"],
+            icon: Some("md_error"),
+        },
+        CycleAgentAutoLayout => CommandDef {
+            brief: "Cycle Agent Auto-Layout".into(),
+            doc: "Cycle through agent pane auto-layout policies".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveTab],
+            menubar: &["Window", "Agents"],
+            icon: Some("md_grid_view"),
+        },
         SplitPane(split) => {
             let direction = split.direction;
             CommandDef {
@@ -2153,6 +2185,11 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ToggleFloatingPane,
         CycleStackForward,
         CycleStackBackward,
+        // --- Agent swarm mass operations ---
+        KillStuckAgents,
+        PauseAllAgents,
+        FocusErrorPanes,
+        CycleAgentAutoLayout,
         ActivateTab(0),
         ActivateTab(1),
         ActivateTab(2),

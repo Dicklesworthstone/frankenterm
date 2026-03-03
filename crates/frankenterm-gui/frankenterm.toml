@@ -2,7 +2,7 @@
 # Copy to ~/.config/frankenterm/frankenterm.toml to customize.
 #
 # Docs: all keys map to WezTerm config, with TOML syntax.
-# Migration: frankenterm setup migrate-config (converts wezterm.lua)
+# Migration: see docs/extensions/migration-guide.md (wezterm.lua -> frankenterm.toml)
 
 # --- Appearance ---
 
@@ -106,6 +106,35 @@ resize_wrap_readability_max_fallback_ratio_percent = 20
 # resize_wrap_kp_forced_break_penalty = 5000
 # resize_wrap_kp_lookahead_limit = 64
 # resize_wrap_kp_max_dp_states = 8192
+
+# --- Agent Detection ---
+
+# Agent pane state detection: color-coded borders for AI agent panes.
+# States: Active (green), Thinking (yellow), Stuck (red), Idle (gray).
+agent_detection_enabled = true
+
+# Timing thresholds (milliseconds) for state classification:
+# agent_active_threshold_ms = 5000    # Output within this → Active
+# agent_thinking_threshold_ms = 5000  # Input sent, no output yet → Thinking
+# agent_stuck_threshold_ms = 30000    # No output after input for this long → Stuck
+# agent_idle_threshold_ms = 60000     # No I/O for this long → Idle
+
+# Show agent name and provider overlay in pane title bar.
+agent_show_name_overlay = true
+
+# Show backpressure tier (Green/Yellow/Red/Black) in pane chrome.
+agent_show_backpressure = true
+
+# Border width (pixels) for agent state indicator.
+# agent_border_width = 2
+
+# Auto-layout policy for agent panes: by_status, by_activity, by_domain, manual.
+# agent_auto_layout = "by_status"
+
+# Mass operations:
+#   Cmd+Shift+K  Kill all stuck agents
+#   Cmd+Shift+O  Pause all agent input
+#   Cmd+Shift+E  Focus next error/stuck pane
 
 # --- SSH Domains ---
 
