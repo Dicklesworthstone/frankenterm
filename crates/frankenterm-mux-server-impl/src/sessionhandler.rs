@@ -1505,4 +1505,182 @@ mod tests {
             other => panic!("expected ErrorResponse, got {other:?}"),
         }
     }
+
+    fn test_client_id(name: &str, pid: u32) -> ClientId {
+        ClientId {
+            hostname: format!("{name}.local"),
+            username: "testuser".to_string(),
+            pid,
+            epoch: 1000,
+            id: 0,
+            ssh_auth_sock: None,
+        }
+    }
+
+    #[test]
+    fn set_client_id_proxy_stores_proxy_identity() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        let proxy_id = test_client_id("proxy-host", 999);
+        handler.process_one(DecodedPdu {
+            serial: 500,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: proxy_id.clone(),
+                is_proxy: true,
+            }),
+        });
+
+        let resp = take_response(&captured);
+        assert_eq!(resp.serial, 500);
+        assert_eq!(resp.pdu, Pdu::UnitResponse(UnitResponse {}));
+
+        // Proxy identity should be stored
+        assert!(handler.proxy_client_id.is_some());
+        let stored = handler.proxy_client_id.as_ref().unwrap();
+        assert_eq!(stored.hostname, "proxy-host.local");
+        assert_eq!(stored.pid, 999);
+    }
+
+    #[test]
+    fn set_client_id_proxy_only_stores_first_proxy() {
+        let (sender, _captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        let first_proxy = test_client_id("first-proxy", 100);
+        handler.process_one(DecodedPdu {
+            serial: 1,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: first_proxy,
+                is_proxy: true,
+            }),
+        });
+
+        let second_proxy = test_client_id("second-proxy", 200);
+        handler.process_one(DecodedPdu {
+            serial: 2,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: second_proxy,
+                is_proxy: true,
+            }),
+        });
+
+        // First proxy should be kept, second ignored
+        let stored = handler.proxy_client_id.as_ref().unwrap();
+        assert_eq!(stored.hostname, "first-proxy.local");
+        assert_eq!(stored.pid, 100);
+    }
+
+    #[test]
+    fn get_codec_version_returns_version_info() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 600,
+            pdu: Pdu::GetCodecVersion(GetCodecVersion {}),
+        });
+
+        let resp = take_response(&captured);
+        assert_eq!(resp.serial, 600);
+        match resp.pdu {
+            Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                codec_vers,
+                version_string,
+                executable_path,
+                ..
+            }) => {
+                assert_eq!(codec_vers, CODEC_VERSION);
+                assert!(!version_string.is_empty(), "version string should not be empty");
+                assert!(
+                    executable_path.to_string_lossy().len() > 0,
+                    "executable path should be non-empty"
+                );
+            }
+            other => panic!("expected GetCodecVersionResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catch_helper_forwards_ok() {
+        let (sender, captured) = capturing_sender();
+        let serial = 700;
+        let send_response = {
+            let sender = sender.clone();
+            move |result: anyhow::Result<Pdu>| {
+                let pdu = match result {
+                    Ok(pdu) => pdu,
+                    Err(err) => Pdu::ErrorResponse(ErrorResponse {
+                        reason: format!("{err:#}"),
+                    }),
+                };
+                sender.send(DecodedPdu { pdu, serial }).ok();
+            }
+        };
+
+        fn catch<F, SND>(f: F, send_response: SND)
+        where
+            F: FnOnce() -> anyhow::Result<Pdu>,
+            SND: Fn(anyhow::Result<Pdu>),
+        {
+            send_response(f());
+        }
+
+        catch(|| Ok(Pdu::UnitResponse(UnitResponse {})), send_response);
+
+        let resp = take_response(&captured);
+        assert_eq!(resp.pdu, Pdu::UnitResponse(UnitResponse {}));
+    }
+
+    #[test]
+    fn catch_helper_forwards_error() {
+        let (sender, captured) = capturing_sender();
+        let serial = 701;
+        let send_response = {
+            let sender = sender.clone();
+            move |result: anyhow::Result<Pdu>| {
+                let pdu = match result {
+                    Ok(pdu) => pdu,
+                    Err(err) => Pdu::ErrorResponse(ErrorResponse {
+                        reason: format!("{err:#}"),
+                    }),
+                };
+                sender.send(DecodedPdu { pdu, serial }).ok();
+            }
+        };
+
+        fn catch<F, SND>(f: F, send_response: SND)
+        where
+            F: FnOnce() -> anyhow::Result<Pdu>,
+            SND: Fn(anyhow::Result<Pdu>),
+        {
+            send_response(f());
+        }
+
+        catch(|| anyhow::bail!("something went wrong"), send_response);
+
+        let resp = take_response(&captured);
+        match resp.pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                assert!(
+                    reason.contains("something went wrong"),
+                    "error should propagate message, got: {reason}"
+                );
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_per_pane_entries_are_independent() {
+        let (sender, _captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        let pp1 = handler.per_pane(10);
+        let pp2 = handler.per_pane(20);
+
+        // Modify one, verify the other is unaffected
+        pp1.lock().unwrap().seqno = 42;
+        assert_eq!(pp2.lock().unwrap().seqno, 0);
+    }
 }
