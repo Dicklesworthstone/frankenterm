@@ -346,28 +346,28 @@ unsafe trait ExtendStatic {
 unsafe impl<'a, T: 'static> ExtendStatic for Ref<'a, T> {
     type T = Ref<'static, T>;
     unsafe fn extend_lifetime(self) -> Self::T {
-        std::mem::transmute(self)
+        unsafe { std::mem::transmute(self) }
     }
 }
 
 unsafe impl<'a, T: 'static> ExtendStatic for RefMut<'a, T> {
     type T = RefMut<'static, T>;
     unsafe fn extend_lifetime(self) -> Self::T {
-        std::mem::transmute(self)
+        unsafe { std::mem::transmute(self) }
     }
 }
 
 unsafe impl<'a> ExtendStatic for wgpu::BufferSlice<'a> {
     type T = wgpu::BufferSlice<'static>;
     unsafe fn extend_lifetime(self) -> Self::T {
-        std::mem::transmute(self)
+        unsafe { std::mem::transmute(self) }
     }
 }
 
 unsafe impl<'a> ExtendStatic for MappedQuads<'a> {
     type T = MappedQuads<'static>;
     unsafe fn extend_lifetime(self) -> Self::T {
-        std::mem::transmute(self)
+        unsafe { std::mem::transmute(self) }
     }
 }
 
@@ -376,7 +376,7 @@ unsafe impl<'a, T: ?Sized + ::window::glium::buffer::Content + 'static> ExtendSt
 {
     type T = BufferMutSlice<'static, T>;
     unsafe fn extend_lifetime(self) -> Self::T {
-        std::mem::transmute(self)
+        unsafe { std::mem::transmute(self) }
     }
 }
 
