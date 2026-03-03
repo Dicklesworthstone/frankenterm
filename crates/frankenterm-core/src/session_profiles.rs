@@ -237,6 +237,9 @@ pub struct FleetTemplate {
     /// If unset, `layout_template` acts as the fallback topology initializer.
     #[serde(default)]
     pub topology_profile: Option<String>,
+    /// Optional weighted target mix by agent program (e.g. codex-cli/claude-code).
+    #[serde(default)]
+    pub program_mix_targets: Vec<FleetProgramTarget>,
 }
 
 /// Startup orchestration strategy for a fleet.
@@ -249,6 +252,14 @@ pub enum FleetStartupStrategy {
     Phased,
     /// Launch pane slots one-by-one in deterministic order.
     Serial,
+}
+
+/// Weighted target for a specific agent program in a fleet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetProgramTarget {
+    pub program: String,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
 }
 
 /// A single slot in a fleet template.
@@ -532,6 +543,7 @@ impl ProfileRegistry {
             fleet.startup_strategy,
             fleet.topology_profile.as_ref(),
             fleet.layout_template.as_ref(),
+            &fleet.program_mix_targets,
             &mut panes,
         );
 
@@ -593,6 +605,9 @@ pub struct FleetLaunchPlan {
     pub total_weight: u32,
     /// Weighted program mix summary (queryable by downstream schedulers).
     pub program_mix: Vec<FleetProgramMix>,
+    /// Weighted target-vs-actual deltas for each program in the union of
+    /// configured targets and resolved fleet panes.
+    pub program_mix_deltas: Vec<FleetProgramMixDelta>,
 }
 
 /// Deterministic startup phase group.
@@ -611,12 +626,23 @@ pub struct FleetProgramMix {
     pub slots: Vec<String>,
 }
 
+/// Delta between configured weighted targets and resolved weighted mix.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetProgramMixDelta {
+    pub program: String,
+    pub target_weight: u32,
+    pub actual_weight: u32,
+    pub actual_slots: u32,
+    pub weight_delta: i64,
+}
+
 impl FleetLaunchPlan {
     fn from_resolved(
         fleet: &str,
         startup_strategy: FleetStartupStrategy,
         topology_profile: Option<&String>,
         layout_template: Option<&String>,
+        program_mix_targets: &[FleetProgramTarget],
         panes: &mut [ResolvedFleetPane],
     ) -> Self {
         // Deterministic global ordering:
@@ -661,12 +687,14 @@ impl FleetLaunchPlan {
                 .as_ref()
                 .map(|identity| identity.program.clone())
                 .unwrap_or_else(|| "shell".to_string());
-            let entry = mix_map.entry(program.clone()).or_insert_with(|| FleetProgramMix {
-                program,
-                slot_count: 0,
-                total_weight: 0,
-                slots: Vec::new(),
-            });
+            let entry = mix_map
+                .entry(program.clone())
+                .or_insert_with(|| FleetProgramMix {
+                    program,
+                    slot_count: 0,
+                    total_weight: 0,
+                    slots: Vec::new(),
+                });
             entry.slot_count = entry.slot_count.saturating_add(1);
             entry.total_weight = entry.total_weight.saturating_add(pane.weight);
             entry.slots.push(pane.label.clone());
@@ -678,6 +706,7 @@ impl FleetLaunchPlan {
             .collect::<Vec<_>>();
 
         let program_mix = mix_map.into_values().collect::<Vec<_>>();
+        let program_mix_deltas = Self::build_program_mix_deltas(program_mix_targets, &program_mix);
 
         Self {
             fleet: fleet.to_string(),
@@ -689,7 +718,54 @@ impl FleetLaunchPlan {
             phases,
             total_weight,
             program_mix,
+            program_mix_deltas,
         }
+    }
+
+    fn build_program_mix_deltas(
+        program_mix_targets: &[FleetProgramTarget],
+        program_mix: &[FleetProgramMix],
+    ) -> Vec<FleetProgramMixDelta> {
+        let mut target_by_program: BTreeMap<String, u32> = BTreeMap::new();
+        for target in program_mix_targets {
+            let entry = target_by_program.entry(target.program.clone()).or_default();
+            *entry = entry.saturating_add(target.weight);
+        }
+
+        let mut actual_by_program: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+        for mix in program_mix {
+            actual_by_program
+                .entry(mix.program.clone())
+                .and_modify(|(slots, weight)| {
+                    *slots = slots.saturating_add(mix.slot_count);
+                    *weight = weight.saturating_add(mix.total_weight);
+                })
+                .or_insert((mix.slot_count, mix.total_weight));
+        }
+
+        let mut programs: BTreeMap<String, ()> = BTreeMap::new();
+        for program in target_by_program.keys() {
+            programs.insert(program.clone(), ());
+        }
+        for program in actual_by_program.keys() {
+            programs.insert(program.clone(), ());
+        }
+
+        programs
+            .into_keys()
+            .map(|program| {
+                let target_weight = target_by_program.get(&program).copied().unwrap_or(0);
+                let (actual_slots, actual_weight) =
+                    actual_by_program.get(&program).copied().unwrap_or((0, 0));
+                FleetProgramMixDelta {
+                    program,
+                    target_weight,
+                    actual_weight,
+                    actual_slots,
+                    weight_delta: i64::from(actual_weight) - i64::from(target_weight),
+                }
+            })
+            .collect()
     }
 }
 
@@ -705,13 +781,23 @@ pub enum ProfileValidationError {
     /// Persona references a non-existent profile.
     ProfileNotFound { persona: String, profile: String },
     /// Fleet slot references a non-existent persona/profile.
-    SlotRefNotFound { fleet: String, slot: String, ref_name: String },
+    SlotRefNotFound {
+        fleet: String,
+        slot: String,
+        ref_name: String,
+    },
     /// Fleet has no slots.
     EmptyFleet { name: String },
     /// Fleet has duplicate slot labels.
     DuplicateSlotLabel { fleet: String, label: String },
     /// Fleet slot weight must be non-zero.
     InvalidSlotWeight { fleet: String, slot: String },
+    /// Program target entry has an empty program id.
+    EmptyProgramMixTarget { fleet: String },
+    /// Program target has invalid zero weight.
+    InvalidProgramMixWeight { fleet: String, program: String },
+    /// Fleet contains duplicate program targets.
+    DuplicateProgramMixTarget { fleet: String, program: String },
     /// Bootstrap command is empty.
     EmptyBootstrapCommand { profile: String, index: usize },
 }
@@ -721,9 +807,16 @@ impl std::fmt::Display for ProfileValidationError {
         match self {
             Self::EmptyName => write!(f, "profile name cannot be empty"),
             Self::ProfileNotFound { persona, profile } => {
-                write!(f, "persona '{persona}' references unknown profile '{profile}'")
+                write!(
+                    f,
+                    "persona '{persona}' references unknown profile '{profile}'"
+                )
             }
-            Self::SlotRefNotFound { fleet, slot, ref_name } => {
+            Self::SlotRefNotFound {
+                fleet,
+                slot,
+                ref_name,
+            } => {
                 write!(
                     f,
                     "fleet '{fleet}' slot '{slot}' references unknown '{ref_name}'"
@@ -738,8 +831,29 @@ impl std::fmt::Display for ProfileValidationError {
             Self::InvalidSlotWeight { fleet, slot } => {
                 write!(f, "fleet '{fleet}' slot '{slot}' has invalid zero weight")
             }
+            Self::EmptyProgramMixTarget { fleet } => {
+                write!(
+                    f,
+                    "fleet '{fleet}' contains program mix target with empty program"
+                )
+            }
+            Self::InvalidProgramMixWeight { fleet, program } => {
+                write!(
+                    f,
+                    "fleet '{fleet}' program target '{program}' has invalid zero weight"
+                )
+            }
+            Self::DuplicateProgramMixTarget { fleet, program } => {
+                write!(
+                    f,
+                    "fleet '{fleet}' contains duplicate program target '{program}'"
+                )
+            }
             Self::EmptyBootstrapCommand { profile, index } => {
-                write!(f, "profile '{profile}' has empty bootstrap command at index {index}")
+                write!(
+                    f,
+                    "profile '{profile}' has empty bootstrap command at index {index}"
+                )
             }
         }
     }
@@ -812,6 +926,29 @@ impl ProfileRegistry {
                             ref_name: profile_name.clone(),
                         });
                     }
+                }
+            }
+
+            let mut target_programs = HashSet::new();
+            for target in &fleet.program_mix_targets {
+                let program = target.program.trim();
+                if program.is_empty() {
+                    errors.push(ProfileValidationError::EmptyProgramMixTarget {
+                        fleet: fleet.name.clone(),
+                    });
+                    continue;
+                }
+                if !target_programs.insert(program.to_string()) {
+                    errors.push(ProfileValidationError::DuplicateProgramMixTarget {
+                        fleet: fleet.name.clone(),
+                        program: program.to_string(),
+                    });
+                }
+                if target.weight == 0 {
+                    errors.push(ProfileValidationError::InvalidProgramMixWeight {
+                        fleet: fleet.name.clone(),
+                        program: program.to_string(),
+                    });
                 }
             }
         }
@@ -1127,6 +1264,16 @@ mod tests {
             layout_template: Some("side-by-side".into()),
             startup_strategy: FleetStartupStrategy::Phased,
             topology_profile: Some("swarm-default".into()),
+            program_mix_targets: vec![
+                FleetProgramTarget {
+                    program: "shell".into(),
+                    weight: 2,
+                },
+                FleetProgramTarget {
+                    program: "builder".into(),
+                    weight: 1,
+                },
+            ],
         };
 
         let json = serde_json::to_string(&fleet).unwrap();
@@ -1179,6 +1326,16 @@ mod tests {
             layout_template: Some("side-by-side".into()),
             startup_strategy: FleetStartupStrategy::Phased,
             topology_profile: Some("swarm-1+3".into()),
+            program_mix_targets: vec![
+                FleetProgramTarget {
+                    program: "shell".into(),
+                    weight: 3,
+                },
+                FleetProgramTarget {
+                    program: "codex-cli".into(),
+                    weight: 1,
+                },
+            ],
         });
 
         let fleet = reg.resolve_fleet("my-fleet").unwrap();
@@ -1188,12 +1345,19 @@ mod tests {
         assert_eq!(fleet.panes[0].resolved.profile.role, ProfileRole::DevShell);
         assert_eq!(fleet.panes[1].label, "worker");
         assert_eq!(
-            fleet.panes[1].resolved.environment.get("SLOT_ID").map(|s| s.as_str()),
+            fleet.panes[1]
+                .resolved
+                .environment
+                .get("SLOT_ID")
+                .map(|s| s.as_str()),
             Some("w1")
         );
         assert_eq!(fleet.panes[0].launch_order, 0);
         assert_eq!(fleet.panes[1].launch_order, 1);
-        assert_eq!(fleet.launch_plan.deterministic_order, vec!["primary", "worker"]);
+        assert_eq!(
+            fleet.launch_plan.deterministic_order,
+            vec!["primary", "worker"]
+        );
         assert_eq!(
             fleet.launch_plan.topology_initializer.as_deref(),
             Some("swarm-1+3")
@@ -1206,6 +1370,15 @@ mod tests {
         assert_eq!(fleet.launch_plan.program_mix[1].program, "shell");
         assert_eq!(fleet.launch_plan.program_mix[1].slot_count, 1);
         assert_eq!(fleet.launch_plan.program_mix[1].total_weight, 3);
+        assert_eq!(fleet.launch_plan.program_mix_deltas.len(), 2);
+        assert_eq!(fleet.launch_plan.program_mix_deltas[0].program, "codex-cli");
+        assert_eq!(fleet.launch_plan.program_mix_deltas[0].target_weight, 1);
+        assert_eq!(fleet.launch_plan.program_mix_deltas[0].actual_weight, 1);
+        assert_eq!(fleet.launch_plan.program_mix_deltas[0].weight_delta, 0);
+        assert_eq!(fleet.launch_plan.program_mix_deltas[1].program, "shell");
+        assert_eq!(fleet.launch_plan.program_mix_deltas[1].target_weight, 3);
+        assert_eq!(fleet.launch_plan.program_mix_deltas[1].actual_weight, 3);
+        assert_eq!(fleet.launch_plan.program_mix_deltas[1].weight_delta, 0);
     }
 
     #[test]
@@ -1267,6 +1440,20 @@ mod tests {
             layout_template: Some("grid-2x2".into()),
             startup_strategy: FleetStartupStrategy::Serial,
             topology_profile: None,
+            program_mix_targets: vec![
+                FleetProgramTarget {
+                    program: "codex-cli".into(),
+                    weight: 2,
+                },
+                FleetProgramTarget {
+                    program: "claude-code".into(),
+                    weight: 1,
+                },
+                FleetProgramTarget {
+                    program: "shell".into(),
+                    weight: 2,
+                },
+            ],
         });
 
         let fleet = reg.resolve_fleet("ordering").expect("fleet resolves");
@@ -1274,9 +1461,33 @@ mod tests {
             fleet.launch_plan.deterministic_order,
             vec!["alpha", "beta", "zeta"]
         );
-        assert_eq!(fleet.panes.iter().find(|p| p.label == "alpha").unwrap().launch_order, 0);
-        assert_eq!(fleet.panes.iter().find(|p| p.label == "beta").unwrap().launch_order, 1);
-        assert_eq!(fleet.panes.iter().find(|p| p.label == "zeta").unwrap().launch_order, 2);
+        assert_eq!(
+            fleet
+                .panes
+                .iter()
+                .find(|p| p.label == "alpha")
+                .unwrap()
+                .launch_order,
+            0
+        );
+        assert_eq!(
+            fleet
+                .panes
+                .iter()
+                .find(|p| p.label == "beta")
+                .unwrap()
+                .launch_order,
+            1
+        );
+        assert_eq!(
+            fleet
+                .panes
+                .iter()
+                .find(|p| p.label == "zeta")
+                .unwrap()
+                .launch_order,
+            2
+        );
         assert_eq!(fleet.launch_plan.phases.len(), 2);
         assert_eq!(fleet.launch_plan.phases[0].phase, 0);
         assert_eq!(fleet.launch_plan.phases[0].slots, vec!["alpha", "beta"]);
@@ -1287,6 +1498,16 @@ mod tests {
             fleet.launch_plan.topology_initializer.as_deref(),
             Some("grid-2x2")
         );
+        assert_eq!(fleet.launch_plan.program_mix_deltas.len(), 3);
+        assert_eq!(
+            fleet.launch_plan.program_mix_deltas[0].program,
+            "claude-code"
+        );
+        assert_eq!(fleet.launch_plan.program_mix_deltas[0].weight_delta, 0);
+        assert_eq!(fleet.launch_plan.program_mix_deltas[1].program, "codex-cli");
+        assert_eq!(fleet.launch_plan.program_mix_deltas[1].weight_delta, 0);
+        assert_eq!(fleet.launch_plan.program_mix_deltas[2].program, "shell");
+        assert_eq!(fleet.launch_plan.program_mix_deltas[2].weight_delta, 0);
     }
 
     #[test]
@@ -1334,6 +1555,7 @@ mod tests {
             layout_template: None,
             startup_strategy: FleetStartupStrategy::Phased,
             topology_profile: None,
+            program_mix_targets: vec![],
         });
 
         let errors = reg.validate();
@@ -1360,6 +1582,7 @@ mod tests {
             layout_template: None,
             startup_strategy: FleetStartupStrategy::Phased,
             topology_profile: None,
+            program_mix_targets: vec![],
         });
 
         let errors = reg.validate();
@@ -1397,6 +1620,7 @@ mod tests {
             layout_template: None,
             startup_strategy: FleetStartupStrategy::Phased,
             topology_profile: None,
+            program_mix_targets: vec![],
         });
 
         let errors = reg.validate();
@@ -1409,6 +1633,57 @@ mod tests {
             e,
             ProfileValidationError::InvalidSlotWeight { fleet, slot }
                 if fleet == "bad-weights" && slot == "dup"
+        )));
+    }
+
+    #[test]
+    fn validate_program_mix_target_errors() {
+        let mut reg = ProfileRegistry::new();
+        reg.register_defaults();
+        reg.register_fleet_template(FleetTemplate {
+            name: "bad-program-mix".into(),
+            description: None,
+            slots: vec![FleetSlot {
+                label: "primary".into(),
+                persona: None,
+                profile: Some("dev-shell".into()),
+                env: HashMap::new(),
+                weight: 1,
+                startup_phase: 0,
+            }],
+            layout_template: Some("side-by-side".into()),
+            startup_strategy: FleetStartupStrategy::Phased,
+            topology_profile: None,
+            program_mix_targets: vec![
+                FleetProgramTarget {
+                    program: " ".into(),
+                    weight: 1,
+                },
+                FleetProgramTarget {
+                    program: "codex-cli".into(),
+                    weight: 0,
+                },
+                FleetProgramTarget {
+                    program: "codex-cli".into(),
+                    weight: 2,
+                },
+            ],
+        });
+
+        let errors = reg.validate();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ProfileValidationError::EmptyProgramMixTarget { fleet } if fleet == "bad-program-mix"
+        )));
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ProfileValidationError::InvalidProgramMixWeight { fleet, program }
+                if fleet == "bad-program-mix" && program == "codex-cli"
+        )));
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ProfileValidationError::DuplicateProgramMixTarget { fleet, program }
+                if fleet == "bad-program-mix" && program == "codex-cli"
         )));
     }
 

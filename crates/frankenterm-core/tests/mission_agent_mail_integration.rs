@@ -3,6 +3,9 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+use frankenterm_core::fleet_launcher::{
+    FleetLaunchStatus, LaunchOutcome, LaunchPlan, StartupStrategy,
+};
 use frankenterm_core::mission_agent_mail::{
     AckRequirementReport, CoordinationEventKind, CoordinationEventRequest,
     CoordinationInboxMessage, MissionAgentMailKernel, MissionCoordinationContext,
@@ -180,5 +183,111 @@ fn explicit_event_request_roundtrips_through_loopback_inbox() {
             .get("step")
             .map(String::as_str),
         Some("2")
+    );
+}
+
+#[test]
+fn fleet_launch_emitters_roundtrip_with_fleet_context() {
+    let kernel = MissionAgentMailKernel::new(LoopbackTransport::default());
+    let plan = LaunchPlan {
+        name: "fleet-zeta".to_string(),
+        slots: Vec::new(),
+        layout_template: None,
+        strategy: StartupStrategy::Phased,
+        phases: Vec::new(),
+        generation: 9,
+        workspace_id: "ws-prod".to_string(),
+        domain: "local".to_string(),
+        planned_at: 100,
+        warnings: Vec::new(),
+    };
+
+    let start = kernel.emit_fleet_launch_start_notice_at(
+        30_000,
+        vec!["Ops".to_string()],
+        &plan,
+        "corr-fleet-001",
+        Some("scenario-fleet".to_string()),
+    );
+    assert_eq!(start.delivered.len(), 1);
+
+    let progress = kernel.emit_fleet_launch_progress_update_at(
+        30_100,
+        vec!["Ops".to_string()],
+        &plan,
+        1,
+        2,
+        "corr-fleet-001",
+        Some("scenario-fleet".to_string()),
+    );
+    assert_eq!(progress.delivered.len(), 1);
+
+    let outcome = LaunchOutcome {
+        name: "fleet-zeta".to_string(),
+        slot_outcomes: Vec::new(),
+        status: FleetLaunchStatus::Partial,
+        registry_snapshot: Vec::new(),
+        completed_at: 30_200,
+        total_slots: 4,
+        successful_slots: 3,
+        failed_slots: 1,
+        pre_launch_checkpoint: Some(77),
+        bootstrap_dispatches: vec![(0, 2)],
+    };
+    let finish = kernel.emit_fleet_launch_outcome_notice_at(
+        30_200,
+        vec!["Ops".to_string()],
+        &outcome,
+        "ws-prod",
+        "local",
+        9,
+        "corr-fleet-001",
+        Some("scenario-fleet".to_string()),
+    );
+    assert_eq!(finish.delivered.len(), 1);
+
+    let inbox = kernel.consume_inbox("Ops");
+    assert_eq!(inbox.parsed.len(), 3);
+
+    let mut by_reason = HashMap::new();
+    for message in inbox.parsed {
+        by_reason.insert(message.envelope.reason_code.clone(), message.envelope);
+    }
+
+    let start_env = by_reason
+        .get("mission.fleet_launch_start")
+        .expect("start notice envelope");
+    assert!(start_env.ack_required);
+    assert_eq!(start_env.context.fleet_id.as_deref(), Some("fleet-zeta"));
+    assert_eq!(
+        start_env.context.canonical_thread_id(),
+        "fleet-launch-fleet-zeta-g9"
+    );
+
+    let progress_env = by_reason
+        .get("mission.fleet_launch_progress")
+        .expect("progress envelope");
+    assert!(!progress_env.ack_required);
+    assert_eq!(
+        progress_env
+            .metadata
+            .get("started_slots")
+            .map(String::as_str),
+        Some("2")
+    );
+
+    let outcome_env = by_reason
+        .get("mission.fleet_launch_outcome")
+        .expect("outcome envelope");
+    assert_eq!(
+        outcome_env.metadata.get("status").map(String::as_str),
+        Some("partial")
+    );
+    assert_eq!(
+        outcome_env
+            .metadata
+            .get("successful_slots")
+            .map(String::as_str),
+        Some("3")
     );
 }

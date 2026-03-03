@@ -14,20 +14,18 @@ use frankenterm_core::command_transport::{
     CommandContext, CommandDeduplicator, CommandKind, CommandRequest, CommandRouter, CommandScope,
     CommandTransportError, InterruptSignal,
 };
-use frankenterm_core::durable_state::{
-    CheckpointTrigger, DurableStateError, DurableStateManager,
-};
+use frankenterm_core::durable_state::{CheckpointTrigger, DurableStateError, DurableStateManager};
 use frankenterm_core::headless_mux_server::{
     HeadlessMuxServer, RemoteRequest, RemoteResponse, ServerConfig, ServerNodeId,
 };
 use frankenterm_core::session_profiles::{
-    AgentIdentitySpec, FleetTemplate, FleetSlot, Persona, ProfilePolicy, ProfileRegistry,
-    ProfileRole, ResourceHints, SessionProfile,
+    AgentIdentitySpec, FleetProgramTarget, FleetSlot, FleetStartupStrategy, FleetTemplate, Persona,
+    ProfilePolicy, ProfileRegistry, ProfileRole, ResourceHints, SessionProfile,
 };
 use frankenterm_core::session_topology::{
     LifecycleDecision, LifecycleEntityKind, LifecycleEvent, LifecycleIdentity, LifecycleRegistry,
-    LifecycleState, LifecycleTransitionContext, LifecycleTransitionRequest,
-    MuxPaneLifecycleState, SessionLifecycleState, WindowLifecycleState,
+    LifecycleState, LifecycleTransitionContext, LifecycleTransitionRequest, MuxPaneLifecycleState,
+    SessionLifecycleState, WindowLifecycleState,
 };
 
 // =============================================================================
@@ -385,7 +383,12 @@ fn diff_detects_state_transitions_between_checkpoints() {
     let mut mgr = DurableStateManager::new();
 
     let cp1 = mgr
-        .checkpoint(&registry, "before", CheckpointTrigger::Manual, HashMap::new())
+        .checkpoint(
+            &registry,
+            "before",
+            CheckpointTrigger::Manual,
+            HashMap::new(),
+        )
         .id;
 
     // Transition pane 1
@@ -399,7 +402,12 @@ fn diff_detects_state_transitions_between_checkpoints() {
         .unwrap();
 
     let cp2 = mgr
-        .checkpoint(&registry, "after", CheckpointTrigger::Manual, HashMap::new())
+        .checkpoint(
+            &registry,
+            "after",
+            CheckpointTrigger::Manual,
+            HashMap::new(),
+        )
         .id;
 
     let diff = mgr.diff(cp1, cp2).unwrap();
@@ -437,7 +445,12 @@ fn checkpoint_json_roundtrip_preserves_state() {
     let registry = fleet_registry(3);
     let mut mgr = DurableStateManager::new();
 
-    mgr.checkpoint(&registry, "first", CheckpointTrigger::Manual, HashMap::new());
+    mgr.checkpoint(
+        &registry,
+        "first",
+        CheckpointTrigger::Manual,
+        HashMap::new(),
+    );
     mgr.checkpoint(
         &registry,
         "second",
@@ -772,27 +785,47 @@ fn fleet_template_resolves_to_correct_slot_count() {
                 profile: Some("agent-worker".to_string()),
                 persona: None,
                 env: HashMap::new(),
+                weight: 1,
+                startup_phase: 0,
             },
             FleetSlot {
                 label: "agent-2".to_string(),
                 profile: Some("agent-worker".to_string()),
                 persona: None,
                 env: HashMap::new(),
+                weight: 1,
+                startup_phase: 0,
             },
             FleetSlot {
                 label: "agent-3".to_string(),
                 profile: Some("agent-worker".to_string()),
                 persona: None,
                 env: HashMap::new(),
+                weight: 1,
+                startup_phase: 0,
             },
             FleetSlot {
                 label: "monitor-1".to_string(),
                 profile: Some("monitor".to_string()),
                 persona: None,
                 env: HashMap::new(),
+                weight: 1,
+                startup_phase: 1,
             },
         ],
         layout_template: None,
+        startup_strategy: FleetStartupStrategy::Phased,
+        topology_profile: None,
+        program_mix_targets: vec![
+            FleetProgramTarget {
+                program: "shell".to_string(),
+                weight: 3,
+            },
+            FleetProgramTarget {
+                program: "monitor".to_string(),
+                weight: 1,
+            },
+        ],
     };
     reg.register_fleet_template(template);
 
@@ -946,7 +979,9 @@ fn e2e_fleet_provision_command_fail_rollback_recover() {
         reason: "recover from mass disconnect".to_string(),
     }) {
         RemoteResponse::RollbackComplete {
-            restored, removed: _, ..
+            restored,
+            removed: _,
+            ..
         } => {
             assert!(restored >= 3, "3 orphaned panes should be restored");
         }
