@@ -13,6 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::fleet_launcher::{FleetLaunchStatus, LaunchOutcome, LaunchPlan};
 use crate::mission_loop::ConflictDetectionReport;
 
 const COORDINATION_ENVELOPE_MARKER: &str = "[ft-coordination-envelope]";
@@ -518,6 +519,162 @@ impl<T: MissionMailTransport> MissionAgentMailKernel<T> {
         )
     }
 
+    /// Emit a fleet-launch start notice derived from a launch plan.
+    ///
+    /// The emitted context and metadata link directly to fleet topology inputs
+    /// so downstream schedulers/auditors can correlate launch intent with
+    /// subsequent progress and outcome events.
+    #[must_use]
+    pub fn emit_fleet_launch_start_notice_at(
+        &self,
+        now_ms: i64,
+        recipients: Vec<String>,
+        launch_plan: &LaunchPlan,
+        correlation_id: &str,
+        scenario_id: Option<String>,
+    ) -> MissionMailDispatchReport {
+        let context = fleet_context_from_plan(launch_plan, correlation_id, scenario_id);
+        let mut metadata = HashMap::new();
+        metadata.insert("workspace_id".to_string(), launch_plan.workspace_id.clone());
+        metadata.insert("domain".to_string(), launch_plan.domain.clone());
+        metadata.insert("generation".to_string(), launch_plan.generation.to_string());
+        metadata.insert(
+            "strategy".to_string(),
+            format!("{:?}", launch_plan.strategy),
+        );
+        metadata.insert(
+            "planned_slots".to_string(),
+            launch_plan.slots.len().to_string(),
+        );
+
+        self.emit_event_at(
+            now_ms,
+            CoordinationEventRequest {
+                kind: CoordinationEventKind::StartNotice,
+                summary: format!("fleet launch start: {}", launch_plan.name),
+                body: format!(
+                    "Launching fleet '{}' with {} planned slot(s).",
+                    launch_plan.name,
+                    launch_plan.slots.len()
+                ),
+                recipients,
+                ack_required: true,
+                context,
+                reason_code: "mission.fleet_launch_start".to_string(),
+                error_code: None,
+                metadata,
+            },
+        )
+    }
+
+    /// Emit a fleet-launch progress update for a specific startup phase.
+    #[must_use]
+    pub fn emit_fleet_launch_progress_update_at(
+        &self,
+        now_ms: i64,
+        recipients: Vec<String>,
+        launch_plan: &LaunchPlan,
+        phase_index: u32,
+        started_slots: usize,
+        correlation_id: &str,
+        scenario_id: Option<String>,
+    ) -> MissionMailDispatchReport {
+        let context = fleet_context_from_plan(launch_plan, correlation_id, scenario_id);
+        let mut metadata = HashMap::new();
+        metadata.insert("workspace_id".to_string(), launch_plan.workspace_id.clone());
+        metadata.insert("domain".to_string(), launch_plan.domain.clone());
+        metadata.insert("generation".to_string(), launch_plan.generation.to_string());
+        metadata.insert("phase_index".to_string(), phase_index.to_string());
+        metadata.insert("started_slots".to_string(), started_slots.to_string());
+        metadata.insert(
+            "total_slots".to_string(),
+            launch_plan.slots.len().to_string(),
+        );
+
+        self.emit_event_at(
+            now_ms,
+            CoordinationEventRequest {
+                kind: CoordinationEventKind::ProgressUpdate,
+                summary: format!("fleet launch progress: {}", launch_plan.name),
+                body: format!(
+                    "Phase {phase_index}: started {started_slots}/{} slot(s).",
+                    launch_plan.slots.len()
+                ),
+                recipients,
+                ack_required: false,
+                context,
+                reason_code: "mission.fleet_launch_progress".to_string(),
+                error_code: None,
+                metadata,
+            },
+        )
+    }
+
+    /// Emit a fleet-launch outcome notice derived from launch execution output.
+    #[must_use]
+    pub fn emit_fleet_launch_outcome_notice_at(
+        &self,
+        now_ms: i64,
+        recipients: Vec<String>,
+        launch_outcome: &LaunchOutcome,
+        workspace_id: &str,
+        domain: &str,
+        generation: u64,
+        correlation_id: &str,
+        scenario_id: Option<String>,
+    ) -> MissionMailDispatchReport {
+        let context = fleet_context_from_outcome(
+            launch_outcome,
+            workspace_id,
+            domain,
+            generation,
+            correlation_id,
+            scenario_id,
+        );
+        let mut metadata = HashMap::new();
+        metadata.insert("workspace_id".to_string(), workspace_id.to_string());
+        metadata.insert("domain".to_string(), domain.to_string());
+        metadata.insert("generation".to_string(), generation.to_string());
+        metadata.insert(
+            "status".to_string(),
+            fleet_status_label(launch_outcome.status).to_string(),
+        );
+        metadata.insert(
+            "successful_slots".to_string(),
+            launch_outcome.successful_slots.to_string(),
+        );
+        metadata.insert(
+            "failed_slots".to_string(),
+            launch_outcome.failed_slots.to_string(),
+        );
+        metadata.insert(
+            "total_slots".to_string(),
+            launch_outcome.total_slots.to_string(),
+        );
+
+        self.emit_event_at(
+            now_ms,
+            CoordinationEventRequest {
+                kind: CoordinationEventKind::ProgressUpdate,
+                summary: format!("fleet launch outcome: {}", launch_outcome.name),
+                body: format!(
+                    "Launch outcome for '{}': status={}, success={}/{}, failed={}.",
+                    launch_outcome.name,
+                    fleet_status_label(launch_outcome.status),
+                    launch_outcome.successful_slots,
+                    launch_outcome.total_slots,
+                    launch_outcome.failed_slots
+                ),
+                recipients,
+                ack_required: false,
+                context,
+                reason_code: "mission.fleet_launch_outcome".to_string(),
+                error_code: None,
+                metadata,
+            },
+        )
+    }
+
     /// Emit contention signals from mission-loop conflict detection output.
     #[must_use]
     pub fn emit_conflict_signals_at(
@@ -778,6 +935,63 @@ fn sanitize_token(input: &str) -> String {
         }
     }
     token.trim_matches('-').to_string()
+}
+
+fn fleet_context_from_plan(
+    launch_plan: &LaunchPlan,
+    correlation_id: &str,
+    scenario_id: Option<String>,
+) -> MissionCoordinationContext {
+    MissionCoordinationContext {
+        mission_id: format!(
+            "fleet-launch:{}:g{}",
+            launch_plan.name, launch_plan.generation
+        ),
+        fleet_id: Some(launch_plan.name.clone()),
+        bead_id: None,
+        assignment_id: None,
+        thread_id: Some(format!(
+            "fleet-launch-{}-g{}",
+            sanitize_token(&launch_plan.name),
+            launch_plan.generation
+        )),
+        correlation_id: correlation_id.to_string(),
+        scenario_id,
+    }
+}
+
+fn fleet_context_from_outcome(
+    launch_outcome: &LaunchOutcome,
+    workspace_id: &str,
+    domain: &str,
+    generation: u64,
+    correlation_id: &str,
+    scenario_id: Option<String>,
+) -> MissionCoordinationContext {
+    MissionCoordinationContext {
+        mission_id: format!(
+            "fleet-launch:{}:{}:{}:g{}",
+            workspace_id, domain, launch_outcome.name, generation
+        ),
+        fleet_id: Some(launch_outcome.name.clone()),
+        bead_id: None,
+        assignment_id: None,
+        thread_id: Some(format!(
+            "fleet-launch-{}-g{}",
+            sanitize_token(&launch_outcome.name),
+            generation
+        )),
+        correlation_id: correlation_id.to_string(),
+        scenario_id,
+    }
+}
+
+fn fleet_status_label(status: FleetLaunchStatus) -> &'static str {
+    match status {
+        FleetLaunchStatus::Complete => "complete",
+        FleetLaunchStatus::Partial => "partial",
+        FleetLaunchStatus::Failed => "failed",
+    }
 }
 
 #[cfg(feature = "agent-mail")]
@@ -1168,5 +1382,98 @@ mod tests {
         let report = kernel.emit_acknowledgements_at(9_000, "AgentA", &pending, "");
         assert!(report.delivered.is_empty());
         assert_eq!(report.failed.len(), 1);
+    }
+
+    fn sample_launch_plan() -> LaunchPlan {
+        LaunchPlan {
+            name: "fleet-alpha".to_string(),
+            slots: Vec::new(),
+            layout_template: None,
+            strategy: crate::fleet_launcher::StartupStrategy::Phased,
+            phases: Vec::new(),
+            generation: 7,
+            workspace_id: "ws-1".to_string(),
+            domain: "local".to_string(),
+            planned_at: 42,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn sample_launch_outcome(status: FleetLaunchStatus) -> LaunchOutcome {
+        LaunchOutcome {
+            name: "fleet-alpha".to_string(),
+            slot_outcomes: Vec::new(),
+            status,
+            registry_snapshot: Vec::new(),
+            completed_at: 55,
+            total_slots: 8,
+            successful_slots: 6,
+            failed_slots: 2,
+            pre_launch_checkpoint: None,
+            bootstrap_dispatches: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn emit_fleet_launch_start_notice_includes_fleet_metadata() {
+        let transport = MockTransport::default();
+        let kernel = MissionAgentMailKernel::new(transport);
+        let plan = sample_launch_plan();
+
+        let report = kernel.emit_fleet_launch_start_notice_at(
+            1_000,
+            vec!["AgentA".to_string()],
+            &plan,
+            "corr-fleet-1",
+            Some("scenario-a".to_string()),
+        );
+
+        assert_eq!(report.delivered.len(), 1);
+        let sent = kernel.transport.sent();
+        let envelope = parse_envelope_from_body(&sent[0].body).expect("parse envelope");
+        assert_eq!(envelope.reason_code, "mission.fleet_launch_start");
+        assert_eq!(envelope.context.fleet_id.as_deref(), Some("fleet-alpha"));
+        assert_eq!(
+            envelope.metadata.get("planned_slots").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            envelope.metadata.get("generation").map(String::as_str),
+            Some("7")
+        );
+    }
+
+    #[test]
+    fn emit_fleet_launch_outcome_notice_labels_status() {
+        let transport = MockTransport::default();
+        let kernel = MissionAgentMailKernel::new(transport);
+        let outcome = sample_launch_outcome(FleetLaunchStatus::Partial);
+
+        let report = kernel.emit_fleet_launch_outcome_notice_at(
+            2_000,
+            vec!["AgentA".to_string()],
+            &outcome,
+            "ws-1",
+            "local",
+            7,
+            "corr-fleet-2",
+            Some("scenario-b".to_string()),
+        );
+
+        assert_eq!(report.delivered.len(), 1);
+        let sent = kernel.transport.sent();
+        let envelope = parse_envelope_from_body(&sent[0].body).expect("parse envelope");
+        assert_eq!(envelope.reason_code, "mission.fleet_launch_outcome");
+        assert_eq!(
+            envelope.metadata.get("status").map(String::as_str),
+            Some("partial")
+        );
+        assert_eq!(
+            envelope
+                .metadata
+                .get("successful_slots")
+                .map(String::as_str),
+            Some("6")
+        );
     }
 }

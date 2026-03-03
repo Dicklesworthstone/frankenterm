@@ -601,6 +601,8 @@ pub struct FleetLaunchPlan {
     pub deterministic_order: Vec<String>,
     /// Startup phases in execution order with deterministic per-phase ordering.
     pub phases: Vec<FleetLaunchPhase>,
+    /// Per-slot launch metadata in deterministic order.
+    pub slot_metadata: Vec<FleetLaunchSlotMetadata>,
     /// Aggregate launch weight across all slots.
     pub total_weight: u32,
     /// Weighted program mix summary (queryable by downstream schedulers).
@@ -615,6 +617,25 @@ pub struct FleetLaunchPlan {
 pub struct FleetLaunchPhase {
     pub phase: u16,
     pub slots: Vec<String>,
+}
+
+/// Per-slot launch metadata for downstream scheduler queries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetLaunchSlotMetadata {
+    /// Slot label.
+    pub label: String,
+    /// Startup phase this slot belongs to.
+    pub startup_phase: u16,
+    /// Deterministic launch order index (0-based).
+    pub launch_order: usize,
+    /// Weighted launch priority contribution.
+    pub weight: u32,
+    /// Program associated with this slot (or `shell` fallback).
+    pub program: String,
+    /// Resolved persona identifier for this slot.
+    pub persona: String,
+    /// Resolved profile identifier for this slot.
+    pub profile: String,
 }
 
 /// Weighted program distribution summary for the fleet.
@@ -634,6 +655,15 @@ pub struct FleetProgramMixDelta {
     pub actual_weight: u32,
     pub actual_slots: u32,
     pub weight_delta: i64,
+}
+
+/// Invariant violation for launch-plan metadata projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetLaunchInvariantViolation {
+    /// Stable reason code for downstream diagnostics.
+    pub reason_code: String,
+    /// Human-readable detail for triage.
+    pub detail: String,
 }
 
 impl FleetLaunchPlan {
@@ -664,40 +694,48 @@ impl FleetLaunchPlan {
             panes[idx].launch_order = position;
         }
 
-        let deterministic_order = indices
+        let slot_metadata = indices
             .iter()
-            .map(|idx| panes[*idx].label.clone())
+            .map(|idx| {
+                let pane = &panes[*idx];
+                FleetLaunchSlotMetadata {
+                    label: pane.label.clone(),
+                    startup_phase: pane.startup_phase,
+                    launch_order: pane.launch_order,
+                    weight: pane.weight,
+                    program: Self::slot_program(pane),
+                    persona: pane.resolved.persona_name.clone(),
+                    profile: pane.resolved.profile.name.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let deterministic_order = slot_metadata
+            .iter()
+            .map(|slot| slot.label.clone())
             .collect::<Vec<_>>();
 
         let mut phase_map: BTreeMap<u16, Vec<String>> = BTreeMap::new();
         let mut mix_map: BTreeMap<String, FleetProgramMix> = BTreeMap::new();
         let mut total_weight = 0_u32;
 
-        for idx in indices {
-            let pane = &panes[idx];
-            total_weight = total_weight.saturating_add(pane.weight);
+        for slot in &slot_metadata {
+            total_weight = total_weight.saturating_add(slot.weight);
             phase_map
-                .entry(pane.startup_phase)
+                .entry(slot.startup_phase)
                 .or_default()
-                .push(pane.label.clone());
+                .push(slot.label.clone());
 
-            let program = pane
-                .resolved
-                .agent_identity
-                .as_ref()
-                .map(|identity| identity.program.clone())
-                .unwrap_or_else(|| "shell".to_string());
             let entry = mix_map
-                .entry(program.clone())
+                .entry(slot.program.clone())
                 .or_insert_with(|| FleetProgramMix {
-                    program,
+                    program: slot.program.clone(),
                     slot_count: 0,
                     total_weight: 0,
                     slots: Vec::new(),
                 });
             entry.slot_count = entry.slot_count.saturating_add(1);
-            entry.total_weight = entry.total_weight.saturating_add(pane.weight);
-            entry.slots.push(pane.label.clone());
+            entry.total_weight = entry.total_weight.saturating_add(slot.weight);
+            entry.slots.push(slot.label.clone());
         }
 
         let phases = phase_map
@@ -716,10 +754,19 @@ impl FleetLaunchPlan {
                 .or_else(|| layout_template.cloned()),
             deterministic_order,
             phases,
+            slot_metadata,
             total_weight,
             program_mix,
             program_mix_deltas,
         }
+    }
+
+    fn slot_program(pane: &ResolvedFleetPane) -> String {
+        pane.resolved
+            .agent_identity
+            .as_ref()
+            .map(|identity| identity.program.clone())
+            .unwrap_or_else(|| "shell".to_string())
     }
 
     fn build_program_mix_deltas(
@@ -766,6 +813,172 @@ impl FleetLaunchPlan {
                 }
             })
             .collect()
+    }
+
+    /// Look up a slot metadata record by label.
+    pub fn slot(&self, label: &str) -> Option<&FleetLaunchSlotMetadata> {
+        self.slot_metadata.iter().find(|slot| slot.label == label)
+    }
+
+    /// Return all slots for a startup phase in deterministic order.
+    pub fn slots_for_phase(&self, phase: u16) -> Vec<&FleetLaunchSlotMetadata> {
+        self.slot_metadata
+            .iter()
+            .filter(|slot| slot.startup_phase == phase)
+            .collect()
+    }
+
+    /// Return the aggregate launch weight for a given program.
+    pub fn program_weight(&self, program: &str) -> u32 {
+        self.program_mix
+            .iter()
+            .find(|entry| entry.program == program)
+            .map_or(0, |entry| entry.total_weight)
+    }
+
+    /// Validate deterministic launch-plan invariants and emit reason-coded violations.
+    pub fn invariant_violations(&self) -> Vec<FleetLaunchInvariantViolation> {
+        let mut violations = Vec::new();
+
+        if self.deterministic_order.len() != self.slot_metadata.len() {
+            violations.push(FleetLaunchInvariantViolation {
+                reason_code: "fleet.launch_plan.slot_count_mismatch".to_string(),
+                detail: format!(
+                    "deterministic_order has {} entries but slot_metadata has {}",
+                    self.deterministic_order.len(),
+                    self.slot_metadata.len()
+                ),
+            });
+        }
+
+        let mut by_order = self.slot_metadata.iter().collect::<Vec<_>>();
+        by_order.sort_by(|a, b| a.launch_order.cmp(&b.launch_order));
+        for (expected_order, slot) in by_order.iter().enumerate() {
+            if slot.launch_order != expected_order {
+                violations.push(FleetLaunchInvariantViolation {
+                    reason_code: "fleet.launch_plan.launch_order_non_contiguous".to_string(),
+                    detail: format!(
+                        "slot '{}' has launch_order {}, expected {}",
+                        slot.label, slot.launch_order, expected_order
+                    ),
+                });
+            }
+        }
+
+        let expected_order = by_order
+            .iter()
+            .map(|slot| slot.label.clone())
+            .collect::<Vec<_>>();
+        if expected_order != self.deterministic_order {
+            violations.push(FleetLaunchInvariantViolation {
+                reason_code: "fleet.launch_plan.deterministic_order_mismatch".to_string(),
+                detail: format!(
+                    "expected deterministic order {:?} but found {:?}",
+                    expected_order, self.deterministic_order
+                ),
+            });
+        }
+
+        for phase in &self.phases {
+            let expected_phase_slots = self
+                .slots_for_phase(phase.phase)
+                .into_iter()
+                .map(|slot| slot.label.clone())
+                .collect::<Vec<_>>();
+            if expected_phase_slots != phase.slots {
+                violations.push(FleetLaunchInvariantViolation {
+                    reason_code: "fleet.launch_plan.phase_slots_mismatch".to_string(),
+                    detail: format!(
+                        "phase {} expected slots {:?} but found {:?}",
+                        phase.phase, expected_phase_slots, phase.slots
+                    ),
+                });
+            }
+
+            for label in &phase.slots {
+                if self.slot(label).is_none() {
+                    violations.push(FleetLaunchInvariantViolation {
+                        reason_code: "fleet.launch_plan.phase_slot_unknown".to_string(),
+                        detail: format!("phase {} references unknown slot '{}'", phase.phase, label),
+                    });
+                }
+            }
+        }
+
+        let summed_weight = self
+            .slot_metadata
+            .iter()
+            .fold(0_u64, |acc, slot| acc.saturating_add(u64::from(slot.weight)));
+        if summed_weight > u64::from(u32::MAX) {
+            violations.push(FleetLaunchInvariantViolation {
+                reason_code: "fleet.launch_plan.weight_overflow".to_string(),
+                detail: format!(
+                    "summed slot weight {} exceeds u32::MAX ({})",
+                    summed_weight,
+                    u32::MAX
+                ),
+            });
+        }
+        let expected_total = summed_weight.min(u64::from(u32::MAX)) as u32;
+        if self.total_weight != expected_total {
+            violations.push(FleetLaunchInvariantViolation {
+                reason_code: "fleet.launch_plan.total_weight_mismatch".to_string(),
+                detail: format!(
+                    "total_weight={}, expected {} from slot metadata",
+                    self.total_weight, expected_total
+                ),
+            });
+        }
+
+        let mut expected_mix: BTreeMap<String, (u32, u32, Vec<String>)> = BTreeMap::new();
+        for slot in &self.slot_metadata {
+            let entry = expected_mix
+                .entry(slot.program.clone())
+                .or_insert_with(|| (0, 0, Vec::new()));
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = entry.1.saturating_add(slot.weight);
+            entry.2.push(slot.label.clone());
+        }
+        let actual_mix = self
+            .program_mix
+            .iter()
+            .map(|entry| {
+                (
+                    entry.program.clone(),
+                    (entry.slot_count, entry.total_weight, entry.slots.clone()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if expected_mix != actual_mix {
+            violations.push(FleetLaunchInvariantViolation {
+                reason_code: "fleet.launch_plan.program_mix_mismatch".to_string(),
+                detail: format!(
+                    "program_mix {:?} does not match slot metadata aggregation {:?}",
+                    self.program_mix, expected_mix
+                ),
+            });
+        }
+
+        for delta in &self.program_mix_deltas {
+            let (expected_slots, expected_weight) = expected_mix
+                .get(&delta.program)
+                .map_or((0, 0), |(slots, weight, _)| (*slots, *weight));
+            if delta.actual_slots != expected_slots || delta.actual_weight != expected_weight {
+                violations.push(FleetLaunchInvariantViolation {
+                    reason_code: "fleet.launch_plan.program_mix_delta_mismatch".to_string(),
+                    detail: format!(
+                        "program '{}' delta actual_slots/weight=({},{}) expected ({},{})",
+                        delta.program,
+                        delta.actual_slots,
+                        delta.actual_weight,
+                        expected_slots,
+                        expected_weight
+                    ),
+                });
+            }
+        }
+
+        violations
     }
 }
 
@@ -1379,6 +1592,30 @@ mod tests {
         assert_eq!(fleet.launch_plan.program_mix_deltas[1].target_weight, 3);
         assert_eq!(fleet.launch_plan.program_mix_deltas[1].actual_weight, 3);
         assert_eq!(fleet.launch_plan.program_mix_deltas[1].weight_delta, 0);
+        assert_eq!(fleet.launch_plan.slot_metadata.len(), 2);
+        assert_eq!(fleet.launch_plan.slot_metadata[0].label, "primary");
+        assert_eq!(fleet.launch_plan.slot_metadata[0].launch_order, 0);
+        assert_eq!(fleet.launch_plan.slot_metadata[0].program, "shell");
+        assert_eq!(fleet.launch_plan.slot_metadata[0].persona, "dev-shell");
+        assert_eq!(fleet.launch_plan.slot_metadata[1].label, "worker");
+        assert_eq!(fleet.launch_plan.slot_metadata[1].launch_order, 1);
+        assert_eq!(fleet.launch_plan.slot_metadata[1].program, "codex-cli");
+        assert_eq!(
+            fleet.launch_plan.slot("worker").map(|slot| slot.profile.as_str()),
+            Some("agent-worker")
+        );
+        assert_eq!(
+            fleet
+                .launch_plan
+                .slots_for_phase(1)
+                .into_iter()
+                .map(|slot| slot.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["worker"]
+        );
+        assert_eq!(fleet.launch_plan.program_weight("shell"), 3);
+        assert_eq!(fleet.launch_plan.program_weight("codex-cli"), 1);
+        assert!(fleet.launch_plan.invariant_violations().is_empty());
     }
 
     #[test]
@@ -1508,6 +1745,74 @@ mod tests {
         assert_eq!(fleet.launch_plan.program_mix_deltas[1].weight_delta, 0);
         assert_eq!(fleet.launch_plan.program_mix_deltas[2].program, "shell");
         assert_eq!(fleet.launch_plan.program_mix_deltas[2].weight_delta, 0);
+        assert_eq!(
+            fleet
+                .launch_plan
+                .slot_metadata
+                .iter()
+                .map(|slot| slot.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "zeta"]
+        );
+        assert!(fleet.launch_plan.invariant_violations().is_empty());
+    }
+
+    #[test]
+    fn launch_plan_invariant_violations_emit_reason_codes() {
+        let mut reg = ProfileRegistry::new();
+        reg.register_defaults();
+        reg.register_fleet_template(FleetTemplate {
+            name: "broken-view".into(),
+            description: None,
+            slots: vec![
+                FleetSlot {
+                    label: "one".into(),
+                    persona: None,
+                    profile: Some("dev-shell".into()),
+                    env: HashMap::new(),
+                    weight: 2,
+                    startup_phase: 0,
+                },
+                FleetSlot {
+                    label: "two".into(),
+                    persona: None,
+                    profile: Some("monitor".into()),
+                    env: HashMap::new(),
+                    weight: 1,
+                    startup_phase: 1,
+                },
+            ],
+            layout_template: Some("split".into()),
+            startup_strategy: FleetStartupStrategy::Phased,
+            topology_profile: None,
+            program_mix_targets: vec![FleetProgramTarget {
+                program: "shell".into(),
+                weight: 3,
+            }],
+        });
+
+        let mut launch_plan = reg
+            .resolve_fleet("broken-view")
+            .expect("fleet resolves")
+            .launch_plan;
+        launch_plan.deterministic_order = vec!["two".into(), "one".into()];
+        launch_plan.phases[0].slots = vec!["ghost".into()];
+        launch_plan.total_weight = 1;
+        launch_plan.program_mix[0].total_weight = 999;
+        launch_plan.program_mix_deltas[0].actual_weight = 999;
+
+        let violations = launch_plan.invariant_violations();
+        let codes = violations
+            .iter()
+            .map(|violation| violation.reason_code.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(codes.contains(&"fleet.launch_plan.deterministic_order_mismatch"));
+        assert!(codes.contains(&"fleet.launch_plan.phase_slots_mismatch"));
+        assert!(codes.contains(&"fleet.launch_plan.phase_slot_unknown"));
+        assert!(codes.contains(&"fleet.launch_plan.total_weight_mismatch"));
+        assert!(codes.contains(&"fleet.launch_plan.program_mix_mismatch"));
+        assert!(codes.contains(&"fleet.launch_plan.program_mix_delta_mismatch"));
     }
 
     #[test]
