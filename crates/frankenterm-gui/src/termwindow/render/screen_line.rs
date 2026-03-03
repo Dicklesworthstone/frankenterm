@@ -1,22 +1,22 @@
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
-use crate::termwindow::render::{
-    resolve_fg_color_attr, same_hyperlink, update_next_frame_time, ClusterStyleCache,
-    ComputeCellFgBgParams, ComputeCellFgBgResult, LineToElementParams, LineToElementShape,
-    RenderScreenLineParams, RenderScreenLineResult,
-};
 use crate::termwindow::LineToElementShapeItem;
+use crate::termwindow::render::{
+    ClusterStyleCache, ComputeCellFgBgParams, ComputeCellFgBgResult, LineToElementParams,
+    LineToElementShape, RenderScreenLineParams, RenderScreenLineResult, resolve_fg_color_attr,
+    same_hyperlink, update_next_frame_time,
+};
 use ::window::DeadKeyStatus;
 use anyhow::Context;
 use config::{HsbTransform, TextStyle};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
-use termwiz::cell::{unicode_column_width, Blink};
+use termwiz::cell::{Blink, unicode_column_width};
 use termwiz::color::LinearRgba;
 use termwiz::surface::CursorShape;
 use wezterm_bidi::Direction;
-use wezterm_term::color::ColorAttribute;
 use wezterm_term::CellAttributes;
+use wezterm_term::color::ColorAttribute;
 
 impl crate::TermWindow {
     /// "Render" a line of the terminal screen into the vertex buffer.

@@ -1,7 +1,7 @@
-use crate::termwindow::box_model::ComputedElement;
 use crate::TermWindow;
+use crate::termwindow::box_model::ComputedElement;
 use config::keyassignment::KeyAssignment;
-use downcast_rs::{impl_downcast, Downcast};
+use downcast_rs::{Downcast, impl_downcast};
 use std::cell::Ref;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent};
 

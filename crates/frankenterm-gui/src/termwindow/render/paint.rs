@@ -1,6 +1,6 @@
 use crate::termwindow::{RenderFrame, TermWindowNotif};
-use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::WindowOps;
+use ::window::bitmaps::atlas::OutOfTextureSpace;
 use anyhow::Context;
 use smol::Timer;
 use std::time::{Duration, Instant};

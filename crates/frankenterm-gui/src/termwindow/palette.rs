@@ -8,8 +8,8 @@ use crate::termwindow::render::corners::{
 };
 use crate::termwindow::{DimensionContext, GuiWin, TermWindow};
 use crate::utilsprites::RenderMetrics;
-use config::keyassignment::KeyAssignment;
 use config::Dimension;
+use config::keyassignment::KeyAssignment;
 use frecency::Frecency;
 use luahelper::{from_lua_value_dynamic, impl_lua_conversion_dynamic};
 use mux_lua::MuxPane;
@@ -23,8 +23,8 @@ use std::path::PathBuf;
 use termwiz::nerdfonts::NERD_FONTS;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent};
-use window::color::LinearRgba;
 use window::Modifiers;
+use window::color::LinearRgba;
 
 struct MatchResults {
     selection: String,
@@ -269,20 +269,19 @@ impl CommandPalette {
         let border = term_window.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
 
-        let mut elements =
-            vec![
-                Element::new(&font, ElementContent::Text(format!("> {selection}_")))
-                    .colors(ElementColors {
-                        border: BorderColor::default(),
-                        bg: LinearRgba::TRANSPARENT.into(),
-                        text: term_window
-                            .config
-                            .command_palette_fg_color
-                            .to_linear()
-                            .into(),
-                    })
-                    .display(DisplayType::Block),
-            ];
+        let mut elements = vec![
+            Element::new(&font, ElementContent::Text(format!("> {selection}_")))
+                .colors(ElementColors {
+                    border: BorderColor::default(),
+                    bg: LinearRgba::TRANSPARENT.into(),
+                    text: term_window
+                        .config
+                        .command_palette_fg_color
+                        .to_linear()
+                        .into(),
+                })
+                .display(DisplayType::Block),
+        ];
 
         for (display_idx, command) in matches
             .matches

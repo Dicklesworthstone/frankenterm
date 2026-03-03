@@ -1,9 +1,9 @@
+use crate::Dimensions;
 use crate::color::LinearRgba;
 use crate::glyphcache::LoadState;
 use crate::quad::{QuadAllocator, QuadTrait};
 use crate::termwindow::RenderState;
 use crate::utilsprites::RenderMetrics;
-use crate::Dimensions;
 use anyhow::Context;
 use config::{
     BackgroundHorizontalAlignment, BackgroundLayer, BackgroundRepeat, BackgroundSize,

@@ -11,7 +11,7 @@ use crate::termwindow::{BorrowedShapeCacheKey, RenderState, ShapedInfo, TermWind
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::{TextureCoord, TextureRect, TextureSize};
 use ::window::{DeadKeyStatus, PointF, RectF, SizeF, WindowOps};
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use config::{
     BoldBrightening, ConfigHandle, DimensionContext, HorizontalWindowContentAlignment, TextStyle,
     VerticalWindowContentAlignment, VisualBellTarget,

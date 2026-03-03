@@ -1,6 +1,6 @@
 use crate::colorease::ColorEaseUniform;
-use crate::termwindow::webgpu::ShaderUniform;
 use crate::termwindow::RenderFrame;
+use crate::termwindow::webgpu::ShaderUniform;
 use crate::uniforms::UniformBuilder;
 use ::window::glium;
 use ::window::glium::uniforms::{

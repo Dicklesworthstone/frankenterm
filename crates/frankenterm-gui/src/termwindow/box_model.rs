@@ -13,10 +13,10 @@ use config::{Dimension, DimensionContext};
 use finl_unicode::grapheme_clusters::Graphemes;
 use std::cell::RefCell;
 use std::rc::Rc;
-use termwiz::cell::{grapheme_column_width, Presentation};
+use termwiz::cell::{Presentation, grapheme_column_width};
 use termwiz::surface::Line;
-use wezterm_font::units::PixelUnit;
 use wezterm_font::LoadedFont;
+use wezterm_font::units::PixelUnit;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use window::bitmaps::atlas::Sprite;
 
@@ -846,11 +846,7 @@ impl super::TermWindow {
                         }
                         None => false,
                     } && matches!(self.current_mouse_capture, None | Some(MouseCapture::UI));
-                if hovering {
-                    hc
-                } else {
-                    &element.colors
-                }
+                if hovering { hc } else { &element.colors }
             }
             None => &element.colors,
         };

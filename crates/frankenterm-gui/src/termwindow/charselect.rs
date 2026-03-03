@@ -1,17 +1,17 @@
+use crate::TermWindow;
 use crate::overlay::selector::{matcher_pattern, matcher_score};
+use crate::termwindow::DimensionContext;
 use crate::termwindow::box_model::*;
 use crate::termwindow::modal::Modal;
 use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
 };
-use crate::termwindow::DimensionContext;
 use crate::utilsprites::RenderMetrics;
-use crate::TermWindow;
+use config::Dimension;
 use config::keyassignment::{
     CharSelectArguments, CharSelectGroup, ClipboardCopyDestination, KeyAssignment,
 };
-use config::Dimension;
 use emojis::{Emoji, Group};
 use frecency::Frecency;
 use rayon::prelude::*;
@@ -417,16 +417,18 @@ impl CharSelector {
             CharSelectGroup::ShortCodes => "Short Codes",
         };
 
-        let mut elements = vec![Element::new(
-            &font,
-            ElementContent::Text(format!("{label}: {selection}_")),
-        )
-        .colors(ElementColors {
-            border: BorderColor::default(),
-            bg: LinearRgba::TRANSPARENT.into(),
-            text: term_window.config.char_select_fg_color.to_linear().into(),
-        })
-        .display(DisplayType::Block)];
+        let mut elements = vec![
+            Element::new(
+                &font,
+                ElementContent::Text(format!("{label}: {selection}_")),
+            )
+            .colors(ElementColors {
+                border: BorderColor::default(),
+                bg: LinearRgba::TRANSPARENT.into(),
+                text: term_window.config.char_select_fg_color.to_linear().into(),
+            })
+            .display(DisplayType::Block),
+        ];
 
         for (display_idx, alias) in matches
             .matches
