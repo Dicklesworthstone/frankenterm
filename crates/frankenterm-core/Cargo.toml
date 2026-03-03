@@ -53,6 +53,7 @@ zstd.workspace = true
 
 base64 = "0.22.1"
 crossbeam.workspace = true
+shlex.workspace = true
 
 # FrankenTerm crates (optional, in-tree ex-WezTerm)
 codec = { workspace = true, optional = true }

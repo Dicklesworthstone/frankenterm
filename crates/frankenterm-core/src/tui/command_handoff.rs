@@ -23,6 +23,7 @@
 //! # Deletion criterion
 //! Remove when ftui's native subprocess/command model replaces this (FTUI-09.3).
 
+use std::io::IsTerminal;
 use std::process::ExitStatus;
 
 use super::terminal_session::{SessionError, SessionPhase, TerminalSession};
@@ -128,14 +129,32 @@ pub fn execute<S: TerminalSession>(
 
 /// Execute the command and capture the result.
 fn execute_inner(command: &str) -> CommandResult {
-    let mut parts = command.split_whitespace();
-    let program = parts.next().unwrap(); // Caller verified non-empty
+    let Some(parts) = shlex::split(command) else {
+        let msg = "Command parse error: unbalanced quotes or escape sequence";
+        crate::gated_println!("\n{msg}");
+        return CommandResult {
+            command: command.to_string(),
+            status: None,
+            launch_error: Some(msg.to_string()),
+        };
+    };
+    if parts.is_empty() {
+        let msg = "Command parse error: empty command after parsing";
+        crate::gated_println!("\n{msg}");
+        return CommandResult {
+            command: command.to_string(),
+            status: None,
+            launch_error: Some(msg.to_string()),
+        };
+    }
+    let program = &parts[0];
+    let args = &parts[1..];
 
     // Print the command so the operator sees what's running.
     // Gate-aware: asserts not Active in debug builds (FTUI-03.2.a).
     crate::gated_println!("Running: {command}\n");
 
-    match std::process::Command::new(program).args(parts).status() {
+    match std::process::Command::new(program).args(args).status() {
         Ok(status) => {
             crate::gated_println!("\nExit status: {status}");
             CommandResult {
@@ -157,12 +176,21 @@ fn execute_inner(command: &str) -> CommandResult {
 
 /// Block until the operator presses Enter.
 fn wait_for_enter(result: &CommandResult) {
+    wait_for_enter_with_mode(result, std::io::stdin().is_terminal());
+}
+
+fn wait_for_enter_with_mode(result: &CommandResult, interactive_stdin: bool) {
     if result.success() {
         crate::gated_println!("\nPress Enter to return to the TUI...");
     } else {
         crate::gated_println!(
             "\nCommand completed with errors. Press Enter to return to the TUI..."
         );
+    }
+
+    if !interactive_stdin {
+        crate::gated_println!("\nNon-interactive stdin detected; skipping Enter prompt.");
+        return;
     }
 
     let mut buf = String::new();
@@ -227,6 +255,26 @@ mod tests {
             launch_error: Some("not found".to_string()),
         };
         assert!(!result.success());
+    }
+
+    #[test]
+    fn execute_inner_reports_parse_error_for_unbalanced_quotes() {
+        let result = execute_inner("echo \"unterminated");
+        assert!(!result.success());
+        assert!(result.status.is_none());
+        assert!(
+            result
+                .launch_error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("parse error"))
+        );
+    }
+
+    #[test]
+    fn execute_inner_supports_shell_quoted_args() {
+        let result = execute_inner("echo \"hello quoted world\"");
+        assert!(result.success());
+        assert!(result.launch_error.is_none());
     }
 
     #[test]
@@ -527,6 +575,18 @@ mod tests {
         assert!(matches!(err, SessionError::InvalidPhase { .. }));
         // Original mode preserved
         assert_eq!(session.phase(), SessionPhase::Active);
+    }
+
+    #[test]
+    fn wait_for_enter_skips_read_when_non_interactive() {
+        let result = CommandResult {
+            command: "echo hi".to_string(),
+            status: None,
+            launch_error: Some("failed".to_string()),
+        };
+
+        // Should return immediately and not block on stdin reads.
+        wait_for_enter_with_mode(&result, false);
     }
 
     #[test]
