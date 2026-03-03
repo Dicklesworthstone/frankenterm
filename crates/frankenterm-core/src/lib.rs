@@ -353,6 +353,7 @@ pub mod test_artifacts;
 pub mod time_series;
 pub mod token_bucket;
 pub mod topological_sort;
+pub mod topology_orchestration;
 pub mod trauma_guard;
 pub mod treap;
 pub mod trie;
