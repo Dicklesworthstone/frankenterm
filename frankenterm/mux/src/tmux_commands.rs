@@ -1324,4 +1324,141 @@ mod tests {
         assert!(backlog.contains_key(&22));
         assert!(!backlog.contains_key(&33));
     }
+
+    #[test]
+    fn parse_sigil_number_dollar_prefix() {
+        assert_eq!(parse_sigil_number("$5").unwrap(), 5);
+    }
+
+    #[test]
+    fn parse_sigil_number_percent_prefix() {
+        assert_eq!(parse_sigil_number("%42").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_sigil_number_at_prefix() {
+        assert_eq!(parse_sigil_number("@100").unwrap(), 100);
+    }
+
+    #[test]
+    fn parse_sigil_number_zero() {
+        assert_eq!(parse_sigil_number("@0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_sigil_number_empty_after_sigil_is_error() {
+        assert!(parse_sigil_number("$").is_err());
+    }
+
+    #[test]
+    fn parse_sigil_number_no_chars_is_error() {
+        assert!(parse_sigil_number("").is_err());
+    }
+
+    #[test]
+    fn parse_sigil_number_non_numeric_is_error() {
+        assert!(parse_sigil_number("$abc").is_err());
+    }
+
+    #[test]
+    fn send_keys_get_command_formats_hex_bytes() {
+        let cmd = SendKeys {
+            keys: vec![0x48, 0x69],
+            pane: 7,
+        };
+        let output = cmd.get_command(0);
+        assert!(output.starts_with("send-keys -t %7 "));
+        assert!(output.contains("0x48"));
+        assert!(output.contains("0x69"));
+    }
+
+    #[test]
+    fn send_keys_get_command_empty_keys() {
+        let cmd = SendKeys {
+            keys: vec![],
+            pane: 3,
+        };
+        let output = cmd.get_command(0);
+        assert!(output.contains("send-keys -t %3"));
+    }
+
+    #[test]
+    fn capture_pane_get_command_includes_pane_id_and_history() {
+        let cmd = CapturePane {
+            pane_id: 12,
+            history_limit: 1000,
+        };
+        let output = cmd.get_command(0);
+        assert!(output.contains("capture-pane"));
+        assert!(output.contains("-t %12"));
+        assert!(output.contains("-S -1000"));
+    }
+
+    #[test]
+    fn new_window_get_command() {
+        let cmd = NewWindow;
+        assert_eq!(cmd.get_command(0), "new-window\n");
+    }
+
+    #[test]
+    fn list_commands_get_command() {
+        let cmd = ListCommands;
+        assert_eq!(cmd.get_command(0), "list-commands\n");
+    }
+
+    #[test]
+    fn split_pane_horizontal_get_command() {
+        let cmd = SplitPane {
+            pane_id: 5,
+            direction: SplitDirection::Horizontal,
+        };
+        assert_eq!(cmd.get_command(0), "split-window -h -t %5\n");
+    }
+
+    #[test]
+    fn split_pane_vertical_get_command() {
+        let cmd = SplitPane {
+            pane_id: 9,
+            direction: SplitDirection::Vertical,
+        };
+        assert_eq!(cmd.get_command(0), "split-window -v -t %9\n");
+    }
+
+    #[test]
+    fn select_window_get_command() {
+        let cmd = SelectWindow { window_id: 3 };
+        assert_eq!(cmd.get_command(0), "select-window -t @3\n");
+    }
+
+    #[test]
+    fn select_pane_get_command() {
+        let cmd = SelectPane { pane_id: 17 };
+        assert_eq!(cmd.get_command(0), "select-pane -t %17\n");
+    }
+
+    #[test]
+    fn attach_done_get_command() {
+        let cmd = AttachDone;
+        assert_eq!(cmd.get_command(0), "list-session\n");
+    }
+
+    #[test]
+    fn pane_item_debug_includes_fields() {
+        let item = PaneItem {
+            session_id: 1,
+            window_id: 2,
+            pane_id: 3,
+            _pane_index: 0,
+            cursor_x: 10,
+            cursor_y: 20,
+            pane_width: 80,
+            pane_height: 24,
+            pane_left: 0,
+            pane_top: 0,
+            pane_active: true,
+        };
+        let debug = format!("{:?}", item);
+        assert!(debug.contains("session_id: 1"));
+        assert!(debug.contains("pane_active: true"));
+    }
 }
