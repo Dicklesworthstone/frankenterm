@@ -1,6 +1,7 @@
 use frankenterm_core::connector_host_runtime::{
-    ConnectorFailureClass, ConnectorHostConfig, ConnectorHostRuntime, ConnectorHostRuntimeError,
-    ConnectorLifecyclePhase, ConnectorProtocolVersion, ConnectorRuntimeUsage, StartupProbeResult,
+    ConnectorCapability, ConnectorFailureClass, ConnectorHostConfig, ConnectorHostRuntime,
+    ConnectorHostRuntimeError, ConnectorLifecyclePhase, ConnectorOperationRequest,
+    ConnectorProtocolVersion, ConnectorRuntimeUsage, StartupProbeResult,
 };
 
 fn usage_within_budget() -> ConnectorRuntimeUsage {
@@ -131,4 +132,108 @@ fn connector_host_runtime_integration_upgrade_and_failed_start_recovery() {
             .iter()
             .any(|record| record.reason_code == "lifecycle.upgrade.applied")
     );
+}
+
+#[test]
+fn connector_host_runtime_integration_sandbox_fail_closed_contract() {
+    let mut config = ConnectorHostConfig::default();
+    config.sandbox.capability_envelope.allowed_capabilities =
+        vec![ConnectorCapability::ReadState];
+    let mut runtime = ConnectorHostRuntime::new(config).unwrap();
+    runtime.start(100).unwrap();
+    runtime.observe_usage(120, usage_within_budget()).unwrap();
+
+    let err = runtime
+        .authorize_operation(
+            130,
+            ConnectorOperationRequest::new(
+                "connector.invoke",
+                "corr-sandbox-deny",
+                ConnectorCapability::Invoke,
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err,
+        ConnectorHostRuntimeError::SandboxViolation {
+            zone_id: "zone.default".to_string(),
+            capability: ConnectorCapability::Invoke,
+            reason_code: "sandbox.denied.capability.invoke".to_string(),
+        }
+    );
+
+    let snapshot = runtime.health_snapshot(140);
+    assert_eq!(snapshot.phase, ConnectorLifecyclePhase::Failed);
+    assert_eq!(snapshot.sandbox_zone_id, "zone.default");
+    assert_eq!(
+        snapshot
+            .last_sandbox_decision
+            .as_ref()
+            .expect("sandbox decision expected")
+            .reason_code,
+        "sandbox.denied.capability.invoke"
+    );
+    assert_eq!(
+        snapshot
+            .last_failure
+            .as_ref()
+            .expect("failure expected")
+            .class,
+        ConnectorFailureClass::Policy
+    );
+}
+
+#[test]
+fn connector_host_runtime_integration_sandbox_allows_scoped_targets() {
+    let mut config = ConnectorHostConfig::default();
+    config.sandbox.capability_envelope.allowed_capabilities = vec![
+        ConnectorCapability::Invoke,
+        ConnectorCapability::FilesystemRead,
+        ConnectorCapability::NetworkEgress,
+    ];
+    config.sandbox.capability_envelope.filesystem_read_prefixes =
+        vec!["/var/connectors/".to_string()];
+    config.sandbox.capability_envelope.network_allow_hosts =
+        vec!["*.svc.local".to_string()];
+    let mut runtime = ConnectorHostRuntime::new(config).unwrap();
+    runtime.start(1_000).unwrap();
+    runtime.observe_usage(1_010, usage_within_budget()).unwrap();
+
+    let fs_envelope = runtime
+        .authorize_operation(
+            1_020,
+            ConnectorOperationRequest::new(
+                "connector.fs.read",
+                "corr-fs",
+                ConnectorCapability::FilesystemRead,
+            )
+            .with_target("/var/connectors/state.json"),
+        )
+        .unwrap();
+    assert_eq!(fs_envelope.zone_id, "zone.default");
+    assert_eq!(fs_envelope.capability, ConnectorCapability::FilesystemRead);
+    assert_eq!(
+        fs_envelope.target.as_deref(),
+        Some("/var/connectors/state.json")
+    );
+
+    let net_envelope = runtime
+        .authorize_operation(
+            1_030,
+            ConnectorOperationRequest::new(
+                "connector.network.call",
+                "corr-net",
+                ConnectorCapability::NetworkEgress,
+            )
+            .with_target("api.svc.local"),
+        )
+        .unwrap();
+    assert_eq!(
+        net_envelope.target.as_deref(),
+        Some("api.svc.local")
+    );
+
+    let decisions = runtime.sandbox_decision_history();
+    assert_eq!(decisions.len(), 2);
+    assert!(decisions.iter().all(|decision| decision.allowed));
 }

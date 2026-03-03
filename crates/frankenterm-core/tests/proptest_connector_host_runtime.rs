@@ -16,7 +16,7 @@ use proptest::prelude::*;
 use frankenterm_core::connector_host_runtime::{
     ConnectorFailureClass, ConnectorHostConfig, ConnectorHostRuntime, ConnectorHostRuntimeError,
     ConnectorLifecyclePhase, ConnectorProtocolVersion, ConnectorRuntimeBudgets,
-    ConnectorRuntimeUsage, StartupProbeResult,
+    ConnectorRuntimeUsage, ConnectorSandboxZone, StartupProbeResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -61,6 +61,7 @@ fn arb_valid_config() -> impl Strategy<Value = ConnectorHostConfig> {
                 startup_timeout_ms,
                 heartbeat_interval_ms,
                 failure_backoff_ms,
+                sandbox: ConnectorSandboxZone::default(),
             }
         },
     )

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const TRANSITION_HISTORY_CAPACITY: usize = 64;
+const SANDBOX_DECISION_HISTORY_CAPACITY: usize = 128;
 
 /// Protocol version shared between the FrankenTerm control plane and connector host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -128,6 +129,264 @@ impl ConnectorRuntimeBudgets {
     }
 }
 
+/// Capability gates available to connector operations inside sandbox zones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorCapability {
+    Invoke,
+    ReadState,
+    StreamEvents,
+    FilesystemRead,
+    FilesystemWrite,
+    NetworkEgress,
+    SecretBroker,
+    ProcessExec,
+}
+
+impl ConnectorCapability {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Invoke => "invoke",
+            Self::ReadState => "read_state",
+            Self::StreamEvents => "stream_events",
+            Self::FilesystemRead => "filesystem_read",
+            Self::FilesystemWrite => "filesystem_write",
+            Self::NetworkEgress => "network_egress",
+            Self::SecretBroker => "secret_broker",
+            Self::ProcessExec => "process_exec",
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectorCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Explicit capability envelope and target constraints for connector execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorCapabilityEnvelope {
+    pub allowed_capabilities: Vec<ConnectorCapability>,
+    pub filesystem_read_prefixes: Vec<String>,
+    pub filesystem_write_prefixes: Vec<String>,
+    pub network_allow_hosts: Vec<String>,
+    pub allowed_exec_commands: Vec<String>,
+}
+
+impl Default for ConnectorCapabilityEnvelope {
+    fn default() -> Self {
+        Self {
+            allowed_capabilities: vec![
+                ConnectorCapability::Invoke,
+                ConnectorCapability::ReadState,
+                ConnectorCapability::StreamEvents,
+            ],
+            filesystem_read_prefixes: Vec::new(),
+            filesystem_write_prefixes: Vec::new(),
+            network_allow_hosts: Vec::new(),
+            allowed_exec_commands: Vec::new(),
+        }
+    }
+}
+
+impl ConnectorCapabilityEnvelope {
+    pub fn validate(&self) -> Result<(), ConnectorHostRuntimeError> {
+        if self.allowed_capabilities.is_empty() {
+            return Err(ConnectorHostRuntimeError::InvalidConfig {
+                reason: "allowed_capabilities must not be empty".to_string(),
+            });
+        }
+        for prefix in &self.filesystem_read_prefixes {
+            if prefix.trim().is_empty() {
+                return Err(ConnectorHostRuntimeError::InvalidConfig {
+                    reason: "filesystem_read_prefixes must not contain empty values".to_string(),
+                });
+            }
+        }
+        for prefix in &self.filesystem_write_prefixes {
+            if prefix.trim().is_empty() {
+                return Err(ConnectorHostRuntimeError::InvalidConfig {
+                    reason: "filesystem_write_prefixes must not contain empty values".to_string(),
+                });
+            }
+        }
+        for host in &self.network_allow_hosts {
+            if host.trim().is_empty() {
+                return Err(ConnectorHostRuntimeError::InvalidConfig {
+                    reason: "network_allow_hosts must not contain empty values".to_string(),
+                });
+            }
+        }
+        for command in &self.allowed_exec_commands {
+            if command.trim().is_empty() {
+                return Err(ConnectorHostRuntimeError::InvalidConfig {
+                    reason: "allowed_exec_commands must not contain empty values".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn allows_capability(&self, capability: ConnectorCapability) -> bool {
+        self.allowed_capabilities.contains(&capability)
+    }
+
+    #[must_use]
+    pub fn allows_target(&self, capability: ConnectorCapability, target: Option<&str>) -> bool {
+        match capability {
+            ConnectorCapability::FilesystemRead => target.is_some_and(|path| {
+                self.filesystem_read_prefixes
+                    .iter()
+                    .any(|prefix| path_is_within_prefix(path, prefix))
+            }),
+            ConnectorCapability::FilesystemWrite => target.is_some_and(|path| {
+                self.filesystem_write_prefixes
+                    .iter()
+                    .any(|prefix| path_is_within_prefix(path, prefix))
+            }),
+            ConnectorCapability::NetworkEgress => target.is_some_and(|host| {
+                self.network_allow_hosts.iter().any(|allowed| {
+                    if allowed.starts_with("*.") {
+                        host.ends_with(&allowed[1..])
+                    } else {
+                        host == allowed
+                    }
+                })
+            }),
+            ConnectorCapability::ProcessExec => target.is_some_and(|command| {
+                self.allowed_exec_commands
+                    .iter()
+                    .any(|allowed| allowed == command)
+            }),
+            ConnectorCapability::Invoke
+            | ConnectorCapability::ReadState
+            | ConnectorCapability::StreamEvents
+            | ConnectorCapability::SecretBroker => true,
+        }
+    }
+}
+
+fn normalize_absolute_path(path: &str) -> Option<Vec<String>> {
+    use std::path::Component;
+
+    let mut saw_root = false;
+    let mut parts: Vec<String> = Vec::new();
+
+    for component in std::path::Path::new(path).components() {
+        match component {
+            Component::RootDir => saw_root = true,
+            Component::CurDir => {}
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return None;
+                }
+            }
+            Component::Prefix(_) => return None,
+        }
+    }
+
+    if !saw_root {
+        return None;
+    }
+
+    Some(parts)
+}
+
+fn path_is_within_prefix(path: &str, prefix: &str) -> bool {
+    let Some(path_parts) = normalize_absolute_path(path) else {
+        return false;
+    };
+    let Some(prefix_parts) = normalize_absolute_path(prefix) else {
+        return false;
+    };
+
+    if prefix_parts.len() > path_parts.len() {
+        return false;
+    }
+
+    path_parts
+        .iter()
+        .zip(prefix_parts.iter())
+        .all(|(candidate, required)| candidate == required)
+}
+
+/// Sandbox zone boundary for connector runtime operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorSandboxZone {
+    pub zone_id: String,
+    pub fail_closed: bool,
+    pub capability_envelope: ConnectorCapabilityEnvelope,
+}
+
+impl Default for ConnectorSandboxZone {
+    fn default() -> Self {
+        Self {
+            zone_id: "zone.default".to_string(),
+            fail_closed: true,
+            capability_envelope: ConnectorCapabilityEnvelope::default(),
+        }
+    }
+}
+
+impl ConnectorSandboxZone {
+    pub fn validate(&self) -> Result<(), ConnectorHostRuntimeError> {
+        if self.zone_id.trim().is_empty() {
+            return Err(ConnectorHostRuntimeError::InvalidConfig {
+                reason: "sandbox.zone_id must not be empty".to_string(),
+            });
+        }
+        self.capability_envelope.validate()
+    }
+}
+
+/// Auditable sandbox decision for each operation authorization attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorSandboxDecision {
+    pub decision_id: String,
+    pub at_ms: u64,
+    pub zone_id: String,
+    pub action: String,
+    pub capability: ConnectorCapability,
+    pub target: Option<String>,
+    pub allowed: bool,
+    pub reason_code: String,
+}
+
+/// Input used for sandbox authorization of connector operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorOperationRequest {
+    pub action: String,
+    pub correlation_id: String,
+    pub capability: ConnectorCapability,
+    pub target: Option<String>,
+}
+
+impl ConnectorOperationRequest {
+    #[must_use]
+    pub fn new(
+        action: impl Into<String>,
+        correlation_id: impl Into<String>,
+        capability: ConnectorCapability,
+    ) -> Self {
+        Self {
+            action: action.into(),
+            correlation_id: correlation_id.into(),
+            capability,
+            target: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.target = Some(target.into());
+        self
+    }
+}
+
 /// Host runtime configuration for connector embedding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorHostConfig {
@@ -143,6 +402,8 @@ pub struct ConnectorHostConfig {
     pub heartbeat_interval_ms: u64,
     /// Backoff before retry after failures in milliseconds.
     pub failure_backoff_ms: u64,
+    /// Sandbox zone and capability envelope constraints for connector execution.
+    pub sandbox: ConnectorSandboxZone,
 }
 
 impl Default for ConnectorHostConfig {
@@ -154,6 +415,7 @@ impl Default for ConnectorHostConfig {
             startup_timeout_ms: 10_000,
             heartbeat_interval_ms: 1_000,
             failure_backoff_ms: 5_000,
+            sandbox: ConnectorSandboxZone::default(),
         }
     }
 }
@@ -181,6 +443,7 @@ impl ConnectorHostConfig {
                 reason: "failure_backoff_ms must be > 0".to_string(),
             });
         }
+        self.sandbox.validate()?;
         self.budgets.validate()
     }
 }
@@ -331,9 +594,11 @@ pub struct ConnectorHealthSnapshot {
     pub last_heartbeat_at_ms: Option<u64>,
     pub heartbeat_age_ms: Option<u64>,
     pub active_failures: u32,
+    pub sandbox_zone_id: String,
     pub budgets: ConnectorRuntimeBudgets,
     pub latest_usage: Option<ConnectorRuntimeUsage>,
     pub last_failure: Option<ConnectorFailure>,
+    pub last_sandbox_decision: Option<ConnectorSandboxDecision>,
 }
 
 /// Protocol envelope for connector operations.
@@ -342,8 +607,12 @@ pub struct ConnectorOperationEnvelope {
     pub operation_id: String,
     pub correlation_id: String,
     pub host_id: String,
+    pub zone_id: String,
     pub protocol_version: ConnectorProtocolVersion,
     pub action: String,
+    pub capability: ConnectorCapability,
+    pub target: Option<String>,
+    pub decision_id: String,
     pub issued_at_ms: u64,
 }
 
@@ -357,8 +626,10 @@ pub struct ConnectorHostRuntime {
     last_upgrade_at_ms: Option<u64>,
     active_failures: u32,
     operation_seq: u64,
+    sandbox_decision_seq: u64,
     latest_usage: Option<ConnectorRuntimeUsage>,
     transition_history: VecDeque<ConnectorLifecycleTransition>,
+    sandbox_decisions: VecDeque<ConnectorSandboxDecision>,
 }
 
 impl ConnectorHostRuntime {
@@ -373,8 +644,10 @@ impl ConnectorHostRuntime {
             last_upgrade_at_ms: None,
             active_failures: 0,
             operation_seq: 0,
+            sandbox_decision_seq: 0,
             latest_usage: None,
             transition_history: VecDeque::with_capacity(TRANSITION_HISTORY_CAPACITY),
+            sandbox_decisions: VecDeque::with_capacity(SANDBOX_DECISION_HISTORY_CAPACITY),
         })
     }
 
@@ -396,6 +669,12 @@ impl ConnectorHostRuntime {
         self.transition_history.iter().cloned().collect()
     }
 
+    /// Sandbox decision history (oldest to newest).
+    #[must_use]
+    pub fn sandbox_decision_history(&self) -> Vec<ConnectorSandboxDecision> {
+        self.sandbox_decisions.iter().cloned().collect()
+    }
+
     /// Start the host with a healthy startup probe.
     pub fn start(&mut self, now_ms: u64) -> Result<(), ConnectorHostRuntimeError> {
         self.start_with_probe(now_ms, StartupProbeResult::Healthy)
@@ -408,7 +687,10 @@ impl ConnectorHostRuntime {
         probe: StartupProbeResult,
     ) -> Result<(), ConnectorHostRuntimeError> {
         let from = self.state.phase();
-        if matches!(from, ConnectorLifecyclePhase::Starting | ConnectorLifecyclePhase::Running) {
+        if matches!(
+            from,
+            ConnectorLifecyclePhase::Starting | ConnectorLifecyclePhase::Running
+        ) {
             return Err(ConnectorHostRuntimeError::InvalidTransition {
                 from,
                 to: ConnectorLifecyclePhase::Starting,
@@ -416,10 +698,18 @@ impl ConnectorHostRuntime {
             });
         }
 
-        self.transition(now_ms, ConnectorLifecycleState::Starting, "lifecycle.start.requested");
+        self.transition(
+            now_ms,
+            ConnectorLifecycleState::Starting,
+            "lifecycle.start.requested",
+        );
         match probe {
             StartupProbeResult::Healthy => {
-                self.transition(now_ms, ConnectorLifecycleState::Running, "lifecycle.start.ready");
+                self.transition(
+                    now_ms,
+                    ConnectorLifecycleState::Running,
+                    "lifecycle.start.ready",
+                );
                 self.last_heartbeat_at_ms = Some(now_ms);
                 Ok(())
             }
@@ -450,7 +740,11 @@ impl ConnectorHostRuntime {
                 reason: "host is already stopped".to_string(),
             });
         }
-        self.transition(now_ms, ConnectorLifecycleState::Stopped, "lifecycle.stop.requested");
+        self.transition(
+            now_ms,
+            ConnectorLifecycleState::Stopped,
+            "lifecycle.stop.requested",
+        );
         self.last_heartbeat_at_ms = None;
         self.latest_usage = None;
         Ok(())
@@ -583,40 +877,128 @@ impl ConnectorHostRuntime {
         action: impl Into<String>,
         correlation_id: impl Into<String>,
     ) -> Result<ConnectorOperationEnvelope, ConnectorHostRuntimeError> {
+        let action = action.into();
+        let correlation_id = correlation_id.into();
+        let capability = infer_capability_from_action(&action);
+        self.authorize_operation(
+            now_ms,
+            ConnectorOperationRequest::new(action, correlation_id, capability),
+        )
+    }
+
+    /// Authorize a connector operation against sandbox zone and capability envelope.
+    pub fn authorize_operation(
+        &mut self,
+        now_ms: u64,
+        request: ConnectorOperationRequest,
+    ) -> Result<ConnectorOperationEnvelope, ConnectorHostRuntimeError> {
         if self.state.phase() != ConnectorLifecyclePhase::Running {
             return Err(ConnectorHostRuntimeError::HostNotRunnable {
                 phase: self.state.phase(),
             });
         }
 
-        let action = action.into();
-        if action.trim().is_empty() {
+        if request.action.trim().is_empty() {
             return Err(ConnectorHostRuntimeError::InvalidConfig {
                 reason: "action must not be empty".to_string(),
             });
         }
 
-        let correlation_id = correlation_id.into();
-        if correlation_id.trim().is_empty() {
+        if request.correlation_id.trim().is_empty() {
             return Err(ConnectorHostRuntimeError::InvalidConfig {
                 reason: "correlation_id must not be empty".to_string(),
             });
         }
 
-        self.operation_seq = self
-            .operation_seq
-            .checked_add(1)
-            .ok_or_else(|| ConnectorHostRuntimeError::InvalidConfig {
+        let capability_allowed = self
+            .config
+            .sandbox
+            .capability_envelope
+            .allows_capability(request.capability);
+        let target_allowed = self
+            .config
+            .sandbox
+            .capability_envelope
+            .allows_target(request.capability, request.target.as_deref());
+
+        self.sandbox_decision_seq = self.sandbox_decision_seq.checked_add(1).ok_or_else(|| {
+            ConnectorHostRuntimeError::InvalidConfig {
+                reason: "sandbox decision sequence overflow".to_string(),
+            }
+        })?;
+        let decision_id = format!(
+            "{}-sd-{:016x}",
+            self.config.host_id, self.sandbox_decision_seq
+        );
+
+        if !capability_allowed || !target_allowed {
+            let reason_code = if !capability_allowed {
+                format!("sandbox.denied.capability.{}", request.capability)
+            } else {
+                format!("sandbox.denied.target.{}", request.capability)
+            };
+            let decision = ConnectorSandboxDecision {
+                decision_id: decision_id.clone(),
+                at_ms: now_ms,
+                zone_id: self.config.sandbox.zone_id.clone(),
+                action: request.action.clone(),
+                capability: request.capability,
+                target: request.target.clone(),
+                allowed: false,
+                reason_code: reason_code.clone(),
+            };
+            self.record_sandbox_decision(decision);
+
+            if self.config.sandbox.fail_closed {
+                self.active_failures = self.active_failures.saturating_add(1);
+                let failure = ConnectorFailure {
+                    class: ConnectorFailureClass::Policy,
+                    reason_code: reason_code.clone(),
+                    observed_at_ms: now_ms,
+                };
+                self.transition(
+                    now_ms,
+                    ConnectorLifecycleState::Failed(failure),
+                    "lifecycle.failed.sandbox_violation",
+                );
+            }
+
+            return Err(ConnectorHostRuntimeError::SandboxViolation {
+                zone_id: self.config.sandbox.zone_id.clone(),
+                capability: request.capability,
+                reason_code,
+            });
+        }
+
+        let allowed_decision = ConnectorSandboxDecision {
+            decision_id: decision_id.clone(),
+            at_ms: now_ms,
+            zone_id: self.config.sandbox.zone_id.clone(),
+            action: request.action.clone(),
+            capability: request.capability,
+            target: request.target.clone(),
+            allowed: true,
+            reason_code: "sandbox.allowed".to_string(),
+        };
+        self.record_sandbox_decision(allowed_decision);
+
+        self.operation_seq = self.operation_seq.checked_add(1).ok_or_else(|| {
+            ConnectorHostRuntimeError::InvalidConfig {
                 reason: "operation sequence overflow".to_string(),
-            })?;
+            }
+        })?;
         let operation_id = format!("{}-op-{:016x}", self.config.host_id, self.operation_seq);
 
         Ok(ConnectorOperationEnvelope {
             operation_id,
-            correlation_id,
+            correlation_id: request.correlation_id,
             host_id: self.config.host_id.clone(),
+            zone_id: self.config.sandbox.zone_id.clone(),
             protocol_version: self.config.protocol_version,
-            action,
+            action: request.action,
+            capability: request.capability,
+            target: request.target,
+            decision_id,
             issued_at_ms: now_ms,
         })
     }
@@ -648,18 +1030,22 @@ impl ConnectorHostRuntime {
             last_heartbeat_at_ms: self.last_heartbeat_at_ms,
             heartbeat_age_ms,
             active_failures: self.active_failures,
+            sandbox_zone_id: self.config.sandbox.zone_id.clone(),
             budgets: self.config.budgets,
             latest_usage: self.latest_usage,
             last_failure: self.state.failure().cloned(),
+            last_sandbox_decision: self.sandbox_decisions.back().cloned(),
         }
     }
 
-    fn transition(
-        &mut self,
-        at_ms: u64,
-        to_state: ConnectorLifecycleState,
-        reason_code: &str,
-    ) {
+    fn record_sandbox_decision(&mut self, decision: ConnectorSandboxDecision) {
+        self.sandbox_decisions.push_back(decision);
+        while self.sandbox_decisions.len() > SANDBOX_DECISION_HISTORY_CAPACITY {
+            self.sandbox_decisions.pop_front();
+        }
+    }
+
+    fn transition(&mut self, at_ms: u64, to_state: ConnectorLifecycleState, reason_code: &str) {
         let transition = ConnectorLifecycleTransition {
             at_ms,
             from: self.state.phase(),
@@ -684,6 +1070,16 @@ fn ensure_reason_code(reason_code: &str) -> Result<(), ConnectorHostRuntimeError
     Ok(())
 }
 
+fn infer_capability_from_action(action: &str) -> ConnectorCapability {
+    if action.contains("stream") {
+        return ConnectorCapability::StreamEvents;
+    }
+    if action.contains("state") || action.contains("status") || action.contains("ping") {
+        return ConnectorCapability::ReadState;
+    }
+    ConnectorCapability::Invoke
+}
+
 /// Deterministic connector-runtime error taxonomy.
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -705,6 +1101,12 @@ pub enum ConnectorHostRuntimeError {
     BudgetExceeded { dimension: String },
     #[error("host is not runnable in phase {phase}")]
     HostNotRunnable { phase: ConnectorLifecyclePhase },
+    #[error("sandbox violation in zone {zone_id} for capability {capability}: {reason_code}")]
+    SandboxViolation {
+        zone_id: String,
+        capability: ConnectorCapability,
+        reason_code: String,
+    },
     #[error("protocol upgrade rejected: {reason}")]
     ProtocolUpgradeRejected { reason: String },
 }
@@ -800,10 +1202,17 @@ mod tests {
         let mut runtime = ConnectorHostRuntime::new(ConnectorHostConfig::default()).unwrap();
         runtime.start(100).unwrap();
         runtime
-            .upgrade_and_restart(200, ConnectorProtocolVersion::new(1, 1, 0), StartupProbeResult::healthy())
+            .upgrade_and_restart(
+                200,
+                ConnectorProtocolVersion::new(1, 1, 0),
+                StartupProbeResult::healthy(),
+            )
             .unwrap();
 
-        assert_eq!(runtime.config().protocol_version, ConnectorProtocolVersion::new(1, 1, 0));
+        assert_eq!(
+            runtime.config().protocol_version,
+            ConnectorProtocolVersion::new(1, 1, 0)
+        );
         assert_eq!(runtime.state().phase(), ConnectorLifecyclePhase::Running);
     }
 
@@ -823,6 +1232,9 @@ mod tests {
         assert!(op1.operation_id < op2.operation_id);
         assert_eq!(op1.protocol_version, ConnectorProtocolVersion::new(1, 0, 0));
         assert_eq!(op2.protocol_version, ConnectorProtocolVersion::new(1, 0, 0));
+        assert_eq!(op1.zone_id, "zone.default");
+        assert_eq!(op1.capability, ConnectorCapability::Invoke);
+        assert!(op1.decision_id < op2.decision_id);
     }
 
     #[test]
@@ -845,7 +1257,10 @@ mod tests {
         for i in 0..100 {
             runtime.transition(i, ConnectorLifecycleState::Stopped, "test.transition");
         }
-        assert_eq!(runtime.transition_history().len(), TRANSITION_HISTORY_CAPACITY);
+        assert_eq!(
+            runtime.transition_history().len(),
+            TRANSITION_HISTORY_CAPACITY
+        );
     }
 
     #[test]
@@ -858,6 +1273,183 @@ mod tests {
             ConnectorHostRuntimeError::InvalidConfig {
                 reason: "max_inflight_ops must be > 0".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn connector_host_runtime_sandbox_denies_missing_capability_fail_closed() {
+        let mut config = ConnectorHostConfig::default();
+        config.sandbox.capability_envelope.allowed_capabilities =
+            vec![ConnectorCapability::ReadState];
+        let mut runtime = ConnectorHostRuntime::new(config).unwrap();
+        runtime.start(100).unwrap();
+        runtime.observe_usage(110, usage_within_budget()).unwrap();
+
+        let err = runtime
+            .authorize_operation(
+                120,
+                ConnectorOperationRequest::new(
+                    "connector.invoke",
+                    "corr-deny-capability",
+                    ConnectorCapability::Invoke,
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ConnectorHostRuntimeError::SandboxViolation {
+                zone_id: "zone.default".to_string(),
+                capability: ConnectorCapability::Invoke,
+                reason_code: "sandbox.denied.capability.invoke".to_string(),
+            }
+        );
+        assert_eq!(runtime.state().phase(), ConnectorLifecyclePhase::Failed);
+        assert_eq!(runtime.sandbox_decision_history().len(), 1);
+        assert!(
+            !runtime
+                .sandbox_decision_history()
+                .last()
+                .expect("expected denial decision")
+                .allowed
+        );
+    }
+
+    #[test]
+    fn connector_host_runtime_sandbox_enforces_target_allowlists() {
+        let mut config = ConnectorHostConfig::default();
+        config.sandbox.capability_envelope.allowed_capabilities = vec![
+            ConnectorCapability::Invoke,
+            ConnectorCapability::NetworkEgress,
+        ];
+        config.sandbox.capability_envelope.network_allow_hosts =
+            vec!["api.frankenterm.dev".to_string()];
+        let mut runtime = ConnectorHostRuntime::new(config).unwrap();
+        runtime.start(100).unwrap();
+        runtime.observe_usage(105, usage_within_budget()).unwrap();
+
+        let denied = runtime.authorize_operation(
+            110,
+            ConnectorOperationRequest::new(
+                "connector.network.call",
+                "corr-net-deny",
+                ConnectorCapability::NetworkEgress,
+            )
+            .with_target("evil.example.com"),
+        );
+        assert_eq!(
+            denied.unwrap_err(),
+            ConnectorHostRuntimeError::SandboxViolation {
+                zone_id: "zone.default".to_string(),
+                capability: ConnectorCapability::NetworkEgress,
+                reason_code: "sandbox.denied.target.network_egress".to_string(),
+            }
+        );
+
+        runtime
+            .restart_with_probe(120, StartupProbeResult::healthy())
+            .unwrap();
+        runtime.observe_usage(121, usage_within_budget()).unwrap();
+        let allowed = runtime
+            .authorize_operation(
+                125,
+                ConnectorOperationRequest::new(
+                    "connector.network.call",
+                    "corr-net-allow",
+                    ConnectorCapability::NetworkEgress,
+                )
+                .with_target("api.frankenterm.dev"),
+            )
+            .unwrap();
+        assert_eq!(allowed.target.as_deref(), Some("api.frankenterm.dev"));
+        assert_eq!(allowed.capability, ConnectorCapability::NetworkEgress);
+
+        let decisions = runtime.sandbox_decision_history();
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(
+            decisions.iter().filter(|decision| decision.allowed).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn connector_host_runtime_sandbox_filesystem_prefix_is_boundary_safe() {
+        let mut config = ConnectorHostConfig::default();
+        config.sandbox.fail_closed = false;
+        config.sandbox.capability_envelope.allowed_capabilities = vec![
+            ConnectorCapability::Invoke,
+            ConnectorCapability::FilesystemRead,
+        ];
+        config.sandbox.capability_envelope.filesystem_read_prefixes =
+            vec!["/workspace/safe".to_string()];
+        let mut runtime = ConnectorHostRuntime::new(config).unwrap();
+        runtime.start(100).unwrap();
+        runtime.observe_usage(105, usage_within_budget()).unwrap();
+
+        let allowed = runtime
+            .authorize_operation(
+                110,
+                ConnectorOperationRequest::new(
+                    "connector.fs.read",
+                    "corr-fs-allow",
+                    ConnectorCapability::FilesystemRead,
+                )
+                .with_target("/workspace/safe/file.txt"),
+            )
+            .unwrap();
+        assert_eq!(allowed.target.as_deref(), Some("/workspace/safe/file.txt"));
+
+        let boundary_bypass = runtime
+            .authorize_operation(
+                120,
+                ConnectorOperationRequest::new(
+                    "connector.fs.read",
+                    "corr-fs-boundary",
+                    ConnectorCapability::FilesystemRead,
+                )
+                .with_target("/workspace/safe2/file.txt"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            boundary_bypass,
+            ConnectorHostRuntimeError::SandboxViolation { .. }
+        ));
+
+        let traversal_bypass = runtime
+            .authorize_operation(
+                130,
+                ConnectorOperationRequest::new(
+                    "connector.fs.read",
+                    "corr-fs-traversal",
+                    ConnectorCapability::FilesystemRead,
+                )
+                .with_target("/workspace/safe/../secrets.txt"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            traversal_bypass,
+            ConnectorHostRuntimeError::SandboxViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn connector_host_runtime_sandbox_decision_history_is_bounded() {
+        let mut runtime = ConnectorHostRuntime::new(ConnectorHostConfig::default()).unwrap();
+        runtime.start(1).unwrap();
+        runtime.observe_usage(2, usage_within_budget()).unwrap();
+
+        for index in 0..200_u64 {
+            let _ = runtime.authorize_operation(
+                10 + index,
+                ConnectorOperationRequest::new(
+                    format!("connector.invoke.{index}"),
+                    format!("corr-{index}"),
+                    ConnectorCapability::Invoke,
+                ),
+            );
+        }
+        assert_eq!(
+            runtime.sandbox_decision_history().len(),
+            SANDBOX_DECISION_HISTORY_CAPACITY
         );
     }
 }
