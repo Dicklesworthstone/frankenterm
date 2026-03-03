@@ -3327,6 +3327,28 @@ mod tests {
         runtime.block_on(future);
     }
 
+    /// Like `run_async_test`, but runs the runtime on a dedicated thread so that
+    /// TLS destructors don't collide with other tests running in parallel.
+    /// Use for tests that spawn background tasks via `task::spawn`.
+    fn run_async_test_isolated<F>(f: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let result = std::thread::Builder::new()
+            .name("runtime-test-isolated".into())
+            .spawn(move || {
+                let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("failed to build runtime for runtime tests");
+                runtime.block_on(f());
+            })
+            .expect("failed to spawn isolated test thread")
+            .join();
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     async fn send_mpsc<T>(tx: &mpsc::Sender<T>, value: T) {
         #[cfg(feature = "asupersync-runtime")]
         {
@@ -3582,7 +3604,7 @@ mod tests {
 
     #[test]
     fn runtime_startup_shutdown_with_mock_wezterm_is_clean() {
-        run_async_test(async {
+        run_async_test_isolated(|| async {
             let (_dir, db_path) = temp_db_path();
             let storage = StorageHandle::new(&db_path).await.unwrap();
             let engine = PatternEngine::new();
@@ -3621,7 +3643,7 @@ mod tests {
 
     #[test]
     fn runtime_emits_replay_capture_events_when_adapter_is_enabled() {
-        run_async_test(async {
+        run_async_test_isolated(|| async {
             let (_dir, db_path) = temp_db_path();
             let storage = StorageHandle::new(&db_path).await.unwrap();
             let engine = PatternEngine::new();
