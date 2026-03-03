@@ -565,6 +565,26 @@ impl<'a> FleetLauncher<'a> {
                 continue;
             }
 
+            // Check for pre-existing pane entity (conflict detection)
+            if registry.get(&slot.lifecycle_identity).is_some() {
+                failed += 1;
+                let error = format!(
+                    "pane entity already registered: {}",
+                    slot.lifecycle_identity.stable_key(),
+                );
+                if sequential {
+                    sequential_halt = Some((slot.index, error.clone()));
+                }
+                slot_outcomes.push(SlotOutcome {
+                    index: slot.index,
+                    label: slot.label.clone(),
+                    status: SlotStatus::Failed,
+                    lifecycle_identity: slot.lifecycle_identity.clone(),
+                    error: Some(error),
+                });
+                continue;
+            }
+
             // Register the pane entity
             let result = registry.register_entity(
                 slot.lifecycle_identity.clone(),
