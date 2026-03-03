@@ -45,8 +45,8 @@ use mux::pane::{
 };
 use mux::renderable::RenderableDimensions;
 use mux::tab::{
-    FloatingPaneRect, PositionedPane, PositionedSplit, SplitDirection, SplitRequest,
-    SplitSize as MuxSplitSize, Tab, TabId,
+    PositionedPane, PositionedSplit, SplitDirection, SplitRequest, SplitSize as MuxSplitSize, Tab,
+    TabId,
 };
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};

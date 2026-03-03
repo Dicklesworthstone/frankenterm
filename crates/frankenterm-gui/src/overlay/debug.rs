@@ -1,15 +1,13 @@
 use crate::scripting::guiwin::GuiWin;
 use chrono::prelude::*;
 use futures::FutureExt;
-use log::Level;
 use luahelper::ValuePrinter;
 use mlua::Value;
 use mux::termwiztermtab::TermWizTerminal;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use termwiz::cell::{AttributeChange, CellAttributes, Intensity};
-use termwiz::color::AnsiColor;
+use termwiz::cell::CellAttributes;
 use termwiz::input::{InputEvent, KeyCode, KeyEvent};
 use termwiz::lineedit::*;
 use termwiz::surface::Change;

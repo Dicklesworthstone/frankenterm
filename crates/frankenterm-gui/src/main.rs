@@ -123,10 +123,10 @@ fn frankenterm_bootstrap() {
 #[derive(Debug, Parser)]
 #[command(
     about = "FrankenTerm — Swarm-Native Terminal Emulator\nhttps://github.com/Dicklesworthstone/frankenterm",
-    version = config::wezterm_version()
+    version = concat!("FrankenTerm ", env!("CARGO_PKG_VERSION"))
 )]
 struct Opt {
-    /// Skip loading wezterm.lua
+    /// Skip loading configuration file
     #[arg(long, short = 'n')]
     skip_config: bool,
 
@@ -178,7 +178,7 @@ enum SubCommand {
     #[command(name = "serial", about = "Open a serial port")]
     Serial(SerialCommand),
 
-    #[command(name = "connect", about = "Connect to wezterm multiplexer")]
+    #[command(name = "connect", about = "Connect to FrankenTerm multiplexer")]
     Connect(ConnectCommand),
 
     #[command(name = "ls-fonts", about = "Display information about fonts")]
@@ -646,7 +646,7 @@ impl Publish {
                         Ok(res) => {
                             log::info!(
                                 "Spawned your command via the existing GUI instance. \
-                             Use wezterm start --always-new-process if you do not want this behavior. \
+                             Use frankenterm-gui start --always-new-process if you do not want this behavior. \
                              Result={:?}",
                                 res
                             );
@@ -800,7 +800,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         }
     };
 
-    // First, let's see if we can ask an already running wezterm to do this.
+    // First, let's see if we can ask an already running instance to do this.
     // We must do this before we start the gui frontend as the scheduler
     // requirements are different.
     let mut publish = Publish::resolve(
@@ -1039,7 +1039,7 @@ pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyho
                     if let Some(block) = info.only_char.and_then(BlockKey::from_char) {
                         texture.replace(glyph_cache.cached_block(block, &render_metrics)?);
                         println!(
-                            "{:2} {:4} {:12} drawn by wezterm because custom_block_glyphs=true: {:?}",
+                            "{:2} {:4} {:12} drawn by FrankenTerm because custom_block_glyphs=true: {:?}",
                             info.cluster, text, escaped, block
                         );
                         is_custom = true;
@@ -1090,7 +1090,7 @@ pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyho
                                         (px & 0xff) as u8,
                                     );
                                     // Use regular RGB for other terminals, but then
-                                    // set RGBA for wezterm
+                                    // set RGBA for FrankenTerm
                                     glyph.push_str(&format!(
                                 "\x1b[38:2::{r}:{g}:{b}m\x1b[38:6::{r}:{g}:{b}:{a}m\u{2588}\x1b[0m"
                             ));
@@ -1219,7 +1219,7 @@ fn run() -> anyhow::Result<()> {
     {
         unsafe {
             ::windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
-                ::windows::core::PCWSTR(wide_string("org.wezfurlong.wezterm").as_ptr()),
+                ::windows::core::PCWSTR(wide_string("com.frankenterm.gui").as_ptr()),
             )
             .unwrap();
         }
