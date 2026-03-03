@@ -13,7 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::fleet_launcher::{FleetLaunchStatus, LaunchOutcome, LaunchPlan};
+use crate::fleet_launcher::{FleetLaunchStatus, LaunchOutcome, LaunchPlan, StartupStrategy};
 use crate::mission_loop::ConflictDetectionReport;
 
 const COORDINATION_ENVELOPE_MARKER: &str = "[ft-coordination-envelope]";
@@ -540,7 +540,7 @@ impl<T: MissionMailTransport> MissionAgentMailKernel<T> {
         metadata.insert("generation".to_string(), launch_plan.generation.to_string());
         metadata.insert(
             "strategy".to_string(),
-            format!("{:?}", launch_plan.strategy),
+            startup_strategy_label(launch_plan.strategy).to_string(),
         );
         metadata.insert(
             "planned_slots".to_string(),
@@ -994,6 +994,14 @@ fn fleet_status_label(status: FleetLaunchStatus) -> &'static str {
     }
 }
 
+fn startup_strategy_label(strategy: StartupStrategy) -> &'static str {
+    match strategy {
+        StartupStrategy::Parallel => "parallel",
+        StartupStrategy::Sequential => "sequential",
+        StartupStrategy::Phased => "phased",
+    }
+}
+
 #[cfg(feature = "agent-mail")]
 impl MissionMailTransport for crate::agent_mail_bridge::AgentMailBridge {
     fn send_message(&self, to: &str, subject: &str, body: &str) -> Result<String, String> {
@@ -1440,6 +1448,10 @@ mod tests {
         assert_eq!(
             envelope.metadata.get("generation").map(String::as_str),
             Some("7")
+        );
+        assert_eq!(
+            envelope.metadata.get("strategy").map(String::as_str),
+            Some("phased")
         );
     }
 

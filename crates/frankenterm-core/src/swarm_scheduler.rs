@@ -551,12 +551,11 @@ impl SwarmScheduler {
         let pressure = self.compute_pressure(&stats, max_concurrent);
 
         // Step 2: Assign ready work to agents with capacity
-        let ready = queue.ready_items();
-        if !ready.is_empty() {
+        if stats.ready > 0 {
             let mut assignments = Vec::new();
             let snapshots = self.agent_snapshots(queue, max_concurrent);
             for snap in &snapshots {
-                if snap.active_items < snap.max_items && !ready.is_empty() {
+                if snap.active_items < snap.max_items {
                     // Agent has capacity — try to pull work
                     match queue.pull(&snap.agent_id) {
                         Ok(assignment) => {
