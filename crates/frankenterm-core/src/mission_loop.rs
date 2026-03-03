@@ -1453,17 +1453,6 @@ fn generate_conflict_messages(conflict: &AssignmentConflict) -> Vec<Deconflictio
         }
     };
 
-    let body = format!(
-        "**Conflict detected** ({})\n\n{}\n\nBeads: {}\nAgents: {}\n\n**Resolution:** {}\n\nReason: `{}` | Error: `{}`",
-        conflict.conflict_id,
-        conflict_desc,
-        conflict.involved_beads.join(", "),
-        conflict.involved_agents.join(", "),
-        resolution_desc,
-        conflict.reason_code,
-        conflict.error_code,
-    );
-
     let thread_id = conflict
         .involved_beads
         .first()
@@ -1472,6 +1461,22 @@ fn generate_conflict_messages(conflict: &AssignmentConflict) -> Vec<Deconflictio
 
     // Send to all involved agents.
     for agent in &conflict.involved_agents {
+        let (handoff_role, handoff_action, handoff_continuity) =
+            handoff_contract_for_recipient(conflict, agent, &thread_id);
+        let body = format!(
+            "**Conflict detected** ({})\n\n{}\n\nBeads: {}\nAgents: {}\n\n**Resolution:** {}\n\n**Handoff contract**\n- role: `{}`\n- action: `{}`\n- thread_id: `{}`\n- continuity: {}\n\nReason: `{}` | Error: `{}`",
+            conflict.conflict_id,
+            conflict_desc,
+            conflict.involved_beads.join(", "),
+            conflict.involved_agents.join(", "),
+            resolution_desc,
+            handoff_role,
+            handoff_action,
+            thread_id,
+            handoff_continuity,
+            conflict.reason_code,
+            conflict.error_code,
+        );
         messages.push(DeconflictionMessage {
             recipient: agent.clone(),
             subject: format!(
@@ -1479,7 +1484,7 @@ fn generate_conflict_messages(conflict: &AssignmentConflict) -> Vec<Deconflictio
                 conflict.reason_code,
                 conflict.involved_beads.join(", ")
             ),
-            body: body.clone(),
+            body,
             thread_id: thread_id.clone(),
             importance: match conflict.conflict_type {
                 ConflictType::FileReservationOverlap => "high".to_string(),
@@ -1491,6 +1496,65 @@ fn generate_conflict_messages(conflict: &AssignmentConflict) -> Vec<Deconflictio
     }
 
     messages
+}
+
+fn handoff_contract_for_recipient(
+    conflict: &AssignmentConflict,
+    recipient: &str,
+    thread_id: &str,
+) -> (String, String, String) {
+    match &conflict.resolution {
+        ConflictResolution::AutoResolved {
+            winner_agent,
+            loser_agent,
+            ..
+        } => {
+            if recipient == winner_agent {
+                (
+                    "winner".to_string(),
+                    "retain_assignment".to_string(),
+                    format!(
+                        "Continue execution and publish status updates in `{}` to preserve continuity.",
+                        thread_id
+                    ),
+                )
+            } else if recipient == loser_agent {
+                (
+                    "loser".to_string(),
+                    "yield_assignment".to_string(),
+                    format!(
+                        "Yield immediately, stop conflicting edits, and acknowledge handoff in `{}`.",
+                        thread_id
+                    ),
+                )
+            } else {
+                (
+                    "participant".to_string(),
+                    "observe_resolution".to_string(),
+                    format!(
+                        "Track follow-up in `{}` and do not mutate overlapping scope until resolved.",
+                        thread_id
+                    ),
+                )
+            }
+        }
+        ConflictResolution::Deferred { retry_after_ms } => (
+            "participant".to_string(),
+            "hold_and_retry".to_string(),
+            format!(
+                "Hold current state and retry deconfliction after {}ms in `{}`.",
+                retry_after_ms, thread_id
+            ),
+        ),
+        ConflictResolution::PendingManualResolution => (
+            "participant".to_string(),
+            "await_manual_resolution".to_string(),
+            format!(
+                "Pause conflicting work and wait for operator decision in `{}`.",
+                thread_id
+            ),
+        ),
+    }
 }
 
 // ── Operator override controls (ft-1i2ge.5.6) ───────────────────────────────
@@ -3556,7 +3620,69 @@ mod tests {
         assert!(msg.subject.contains("reservation_overlap"));
         assert!(msg.body.contains("Conflict detected"));
         assert!(msg.body.contains("FTM2001"));
+        assert!(msg.body.contains("Handoff contract"));
         assert_eq!(msg.importance, "high");
+    }
+
+    #[test]
+    fn conflict_detection_auto_resolved_messages_include_handoff_roles() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![
+            make_assignment("bead-x", "agent1", 1.0),
+            make_assignment("bead-x", "agent2", 0.5),
+        ]);
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
+
+        assert_eq!(report.messages.len(), 2);
+        let winner_msg = report
+            .messages
+            .iter()
+            .find(|m| m.recipient == "agent1")
+            .expect("winner message");
+        let loser_msg = report
+            .messages
+            .iter()
+            .find(|m| m.recipient == "agent2")
+            .expect("loser message");
+
+        assert!(winner_msg.body.contains("- role: `winner`"));
+        assert!(winner_msg.body.contains("- action: `retain_assignment`"));
+        assert!(winner_msg.body.contains("- thread_id: `bead-x`"));
+        assert!(loser_msg.body.contains("- role: `loser`"));
+        assert!(loser_msg.body.contains("- action: `yield_assignment`"));
+        assert!(loser_msg.body.contains("- thread_id: `bead-x`"));
+    }
+
+    #[test]
+    fn conflict_detection_manual_resolution_message_has_explicit_wait_action() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            conflict_detection: ConflictDetectionConfig {
+                strategy: DeconflictionStrategy::ManualResolution,
+                ..ConflictDetectionConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        let aset = make_assignment_set(vec![
+            make_assignment("bead-x", "agent1", 1.0),
+            make_assignment("bead-x", "agent2", 0.5),
+        ]);
+        let issues = vec![sample_detail("bead-x", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
+
+        assert!(!report.messages.is_empty());
+        assert!(
+            report
+                .messages
+                .iter()
+                .all(|m| m.body.contains("- role: `participant`"))
+        );
+        assert!(
+            report
+                .messages
+                .iter()
+                .all(|m| m.body.contains("- action: `await_manual_resolution`"))
+        );
     }
 
     #[test]
