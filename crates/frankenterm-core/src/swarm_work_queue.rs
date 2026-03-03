@@ -1315,15 +1315,15 @@ mod tests {
 
         assert_eq!(q.item_status(&"c".into()), Some(WorkItemStatus::Blocked));
 
-        // Complete a
-        q.pull(&"agent".into()).unwrap(); // pulls "a" (higher priority by order)
+        // Complete a — use assign() to target the specific item
+        q.assign(&"a".into(), &"agent".into()).unwrap();
         q.complete(&"a".into(), &"agent".into(), None).unwrap();
 
         // c still blocked (b not done)
         assert_eq!(q.item_status(&"c".into()), Some(WorkItemStatus::Blocked));
 
         // Complete b
-        q.pull(&"agent".into()).unwrap();
+        q.assign(&"b".into(), &"agent".into()).unwrap();
         q.complete(&"b".into(), &"agent".into(), None).unwrap();
 
         // Now c is ready
@@ -1415,6 +1415,9 @@ mod tests {
         q.pull(&"agent".into()).unwrap();
 
         assert_eq!(q.item_status(&"a".into()), Some(WorkItemStatus::InProgress));
+
+        // Ensure at least 1ms passes so elapsed > 0 satisfies the > timeout check
+        std::thread::sleep(std::time::Duration::from_millis(2));
 
         let reclaimed = q.reclaim_timed_out();
         assert_eq!(reclaimed, vec!["a".to_string()]);
@@ -1564,19 +1567,19 @@ mod tests {
         q.enqueue(item("join", 0, &["left", "right"])).unwrap();
 
         // Complete root → left and right become ready
-        q.pull(&"a".into()).unwrap();
+        q.assign(&"root".into(), &"a".into()).unwrap();
         q.complete(&"root".into(), &"a".into(), None).unwrap();
         assert_eq!(q.item_status(&"left".into()), Some(WorkItemStatus::Ready));
         assert_eq!(q.item_status(&"right".into()), Some(WorkItemStatus::Ready));
         assert_eq!(q.item_status(&"join".into()), Some(WorkItemStatus::Blocked));
 
         // Complete left → join still blocked
-        q.pull(&"a".into()).unwrap();
+        q.assign(&"left".into(), &"a".into()).unwrap();
         q.complete(&"left".into(), &"a".into(), None).unwrap();
         assert_eq!(q.item_status(&"join".into()), Some(WorkItemStatus::Blocked));
 
         // Complete right → join now ready
-        q.pull(&"a".into()).unwrap();
+        q.assign(&"right".into(), &"a".into()).unwrap();
         q.complete(&"right".into(), &"a".into(), None).unwrap();
         assert_eq!(q.item_status(&"join".into()), Some(WorkItemStatus::Ready));
     }
