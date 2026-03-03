@@ -2781,3 +2781,205 @@ impl TerminalState {
             .unwrap_or(self.keyboard_encoding)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── TabStop ────────────────────────────────────────────────
+
+    #[test]
+    fn tabstop_new_default_spacing() {
+        let ts = TabStop::new(80, 8);
+        assert!(ts.tabs[0], "column 0 should be a tab stop");
+        assert!(ts.tabs[8], "column 8 should be a tab stop");
+        assert!(ts.tabs[16], "column 16 should be a tab stop");
+        assert!(!ts.tabs[1], "column 1 should not be a tab stop");
+        assert!(!ts.tabs[7], "column 7 should not be a tab stop");
+    }
+
+    #[test]
+    fn tabstop_new_width_four() {
+        let ts = TabStop::new(20, 4);
+        for i in 0..20 {
+            assert_eq!(ts.tabs[i], i % 4 == 0, "col {} mismatch", i);
+        }
+    }
+
+    #[test]
+    fn tabstop_find_next_from_zero() {
+        let ts = TabStop::new(80, 8);
+        assert_eq!(ts.find_next_tab_stop(0), Some(8));
+    }
+
+    #[test]
+    fn tabstop_find_next_from_middle() {
+        let ts = TabStop::new(80, 8);
+        assert_eq!(ts.find_next_tab_stop(5), Some(8));
+    }
+
+    #[test]
+    fn tabstop_find_next_past_last_returns_none() {
+        let ts = TabStop::new(80, 8);
+        // Last tab stop is at 72 (8*9)
+        assert_eq!(ts.find_next_tab_stop(72), None);
+    }
+
+    #[test]
+    fn tabstop_find_prev_from_column_ten() {
+        let ts = TabStop::new(80, 8);
+        assert_eq!(ts.find_prev_tab_stop(10), Some(8));
+    }
+
+    #[test]
+    fn tabstop_find_prev_from_column_eight() {
+        let ts = TabStop::new(80, 8);
+        assert_eq!(ts.find_prev_tab_stop(8), Some(0));
+    }
+
+    #[test]
+    fn tabstop_find_prev_from_column_zero() {
+        let ts = TabStop::new(80, 8);
+        assert_eq!(ts.find_prev_tab_stop(0), None);
+    }
+
+    #[test]
+    fn tabstop_set_tab_stop() {
+        let mut ts = TabStop::new(80, 8);
+        assert!(!ts.tabs[5]);
+        ts.set_tab_stop(5);
+        assert!(ts.tabs[5]);
+    }
+
+    #[test]
+    fn tabstop_set_then_find_custom_stop() {
+        let mut ts = TabStop::new(80, 8);
+        ts.set_tab_stop(3);
+        assert_eq!(ts.find_next_tab_stop(1), Some(3));
+    }
+
+    #[test]
+    fn tabstop_resize_larger() {
+        let mut ts = TabStop::new(40, 8);
+        assert_eq!(ts.tabs.len(), 40);
+        ts.resize(80);
+        assert_eq!(ts.tabs.len(), 80);
+        assert!(ts.tabs[40], "column 40 should be a tab stop after resize");
+        assert!(ts.tabs[48], "column 48 should be a tab stop after resize");
+    }
+
+    #[test]
+    fn tabstop_resize_smaller_no_shrink() {
+        let mut ts = TabStop::new(80, 8);
+        ts.resize(40);
+        // Resize doesn't shrink, only grows
+        assert_eq!(ts.tabs.len(), 80);
+    }
+
+    #[test]
+    fn tabstop_clear_at_position() {
+        let mut ts = TabStop::new(80, 8);
+        assert!(ts.tabs[8]);
+        ts.clear(
+            TabulationClear::ClearCharacterTabStopAtActivePosition,
+            8,
+            false,
+        );
+        assert!(!ts.tabs[8]);
+        // Other tab stops unaffected
+        assert!(ts.tabs[16]);
+    }
+
+    #[test]
+    fn tabstop_clear_all() {
+        let mut ts = TabStop::new(80, 8);
+        ts.clear(TabulationClear::ClearAllCharacterTabStops, 0, false);
+        for i in 0..80 {
+            assert!(!ts.tabs[i], "col {} should be cleared", i);
+        }
+    }
+
+    #[test]
+    fn tabstop_find_next_after_clear_all() {
+        let mut ts = TabStop::new(80, 8);
+        ts.clear(TabulationClear::ClearAllCharacterTabStops, 0, false);
+        assert_eq!(ts.find_next_tab_stop(0), None);
+    }
+
+    #[test]
+    fn tabstop_find_prev_beyond_width() {
+        let ts = TabStop::new(10, 4);
+        // col > width should still work due to .min()
+        assert_eq!(ts.find_prev_tab_stop(100), Some(8));
+    }
+
+    // ── CharSet ────────────────────────────────────────────────
+
+    #[test]
+    fn charset_eq() {
+        assert_eq!(CharSet::Ascii, CharSet::Ascii);
+        assert_ne!(CharSet::Ascii, CharSet::Uk);
+        assert_ne!(CharSet::Uk, CharSet::DecLineDrawing);
+    }
+
+    #[test]
+    fn charset_debug() {
+        let debug = format!("{:?}", CharSet::DecLineDrawing);
+        assert!(debug.contains("DecLineDrawing"));
+    }
+
+    #[test]
+    fn charset_clone() {
+        let a = CharSet::Uk;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    // ── MouseEncoding ──────────────────────────────────────────
+
+    #[test]
+    fn mouse_encoding_eq() {
+        assert_eq!(MouseEncoding::X10, MouseEncoding::X10);
+        assert_ne!(MouseEncoding::X10, MouseEncoding::SGR);
+        assert_ne!(MouseEncoding::SGR, MouseEncoding::SgrPixels);
+    }
+
+    #[test]
+    fn mouse_encoding_debug() {
+        let debug = format!("{:?}", MouseEncoding::SgrPixels);
+        assert!(debug.contains("SgrPixels"));
+    }
+
+    // ── ScreenOrAlt ────────────────────────────────────────────
+
+    #[test]
+    fn saved_cursor_debug() {
+        let sc = SavedCursor {
+            position: CursorPosition::default(),
+            wrap_next: false,
+            pen: CellAttributes::default(),
+            dec_origin_mode: false,
+            g0_charset: CharSet::Ascii,
+            g1_charset: CharSet::Ascii,
+        };
+        let debug = format!("{sc:?}");
+        assert!(debug.contains("SavedCursor"));
+    }
+
+    #[test]
+    fn saved_cursor_clone() {
+        let sc = SavedCursor {
+            position: CursorPosition::default(),
+            wrap_next: true,
+            pen: CellAttributes::default(),
+            dec_origin_mode: true,
+            g0_charset: CharSet::DecLineDrawing,
+            g1_charset: CharSet::Uk,
+        };
+        let sc2 = sc.clone();
+        assert_eq!(sc2.wrap_next, true);
+        assert_eq!(sc2.dec_origin_mode, true);
+        assert_eq!(sc2.g0_charset, CharSet::DecLineDrawing);
+        assert_eq!(sc2.g1_charset, CharSet::Uk);
+    }
+}

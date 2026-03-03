@@ -2,15 +2,15 @@
 use super::*;
 use crate::config::BidiMode;
 use crossbeam::thread;
+use frankenterm_surface::SequenceNo;
 use frankenterm_surface::line::{
     LineWrapScorecard as MonospaceLineWrapScorecard, MonospaceKpCostModel, MonospaceWrapMode,
 };
-use frankenterm_surface::SequenceNo;
 use log::{debug, warn};
-use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use termwiz::input::KeyboardEncoding;
 
 /// Holds the model of a screen.  This can either be the primary screen
@@ -36,6 +36,7 @@ pub struct Screen {
 
     /// config so we can access Maximum number of lines of scrollback
     config: Arc<dyn TerminalConfiguration>,
+    scrollback_tiering: ScrollbackTieringState,
 
     /// Whether scrollback is allowed; this is another way of saying
     /// that we're the primary rather than the alternate screen.
@@ -69,6 +70,7 @@ const MAX_REFLOW_BATCH_LOGICAL_LINES: usize = 64;
 const REFLOW_OVERSCAN_ROW_MULTIPLIER: usize = 1;
 const REFLOW_OVERSCAN_ROW_CAP: usize = 256;
 const COLD_SCROLLBACK_BACKLOG_DEPTH_CAP: usize = 1_048_576;
+const SCROLLBACK_WARM_MAX_BYTES_CAP: usize = 1024 * 1024 * 1024;
 const LAST_GOOD_FRAME_MAX_BYTES_MULTIPLIER: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,6 +399,22 @@ struct LogicalLineWrapCache {
     wrap_key_order: VecDeque<WrapCacheKey>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ScrollbackSpillOutcome {
+    cold_lines_evicted: usize,
+    cold_bytes_evicted: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ScrollbackTieringState {
+    warm_line_bytes: VecDeque<usize>,
+    warm_bytes: usize,
+    warm_spill_lines_total: u64,
+    warm_spill_bytes_total: u64,
+    cold_spill_lines_total: u64,
+    cold_spill_bytes_total: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ColdScrollbackReflowWorker {
     active_intent: Option<SequenceNo>,
@@ -550,12 +568,68 @@ impl LogicalLineWrapCache {
     }
 }
 
+impl ScrollbackTieringState {
+    fn record_spill(&mut self, line_bytes: usize, warm_max_bytes: usize) -> ScrollbackSpillOutcome {
+        let mut outcome = ScrollbackSpillOutcome::default();
+        let bounded_line_bytes = line_bytes.max(std::mem::size_of::<Line>());
+        self.warm_spill_lines_total = self.warm_spill_lines_total.saturating_add(1);
+        self.warm_spill_bytes_total = self
+            .warm_spill_bytes_total
+            .saturating_add(bounded_line_bytes as u64);
+
+        if warm_max_bytes == 0 {
+            self.cold_spill_lines_total = self.cold_spill_lines_total.saturating_add(1);
+            self.cold_spill_bytes_total = self
+                .cold_spill_bytes_total
+                .saturating_add(bounded_line_bytes as u64);
+            outcome.cold_lines_evicted = 1;
+            outcome.cold_bytes_evicted = bounded_line_bytes;
+            return outcome;
+        }
+
+        self.warm_line_bytes.push_back(bounded_line_bytes);
+        self.warm_bytes = self.warm_bytes.saturating_add(bounded_line_bytes);
+
+        while self.warm_bytes > warm_max_bytes {
+            if let Some(evicted) = self.warm_line_bytes.pop_front() {
+                self.warm_bytes = self.warm_bytes.saturating_sub(evicted);
+                self.cold_spill_lines_total = self.cold_spill_lines_total.saturating_add(1);
+                self.cold_spill_bytes_total =
+                    self.cold_spill_bytes_total.saturating_add(evicted as u64);
+                outcome.cold_lines_evicted = outcome.cold_lines_evicted.saturating_add(1);
+                outcome.cold_bytes_evicted = outcome.cold_bytes_evicted.saturating_add(evicted);
+            } else {
+                self.warm_bytes = 0;
+                break;
+            }
+        }
+
+        outcome
+    }
+
+    fn warm_resident_lines(&self) -> usize {
+        self.warm_line_bytes.len()
+    }
+}
+
 fn scrollback_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
     if allow_scrollback {
         config.scrollback_size()
     } else {
         0
     }
+}
+
+fn scrollback_hot_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
+    if !allow_scrollback {
+        return 0;
+    }
+    let total = config.scrollback_size().max(1);
+    let tier = config.scrollback_tier_config();
+    if !tier.enabled {
+        return total;
+    }
+    tier.hot_lines.max(1).min(total)
 }
 
 impl Screen {
@@ -573,7 +647,7 @@ impl Screen {
         let physical_cols = size.cols.max(1);
 
         let mut lines =
-            VecDeque::with_capacity(physical_rows + scrollback_size(config, allow_scrollback));
+            VecDeque::with_capacity(physical_rows + scrollback_hot_size(config, allow_scrollback));
         for _ in 0..physical_rows {
             let mut line = Line::new(seqno);
             bidi_mode.apply_to_line(&mut line, seqno);
@@ -583,6 +657,7 @@ impl Screen {
         Screen {
             lines,
             config: Arc::clone(config),
+            scrollback_tiering: ScrollbackTieringState::default(),
             allow_scrollback,
             physical_rows,
             physical_cols,
@@ -631,6 +706,62 @@ impl Screen {
 
     fn scrollback_size(&self) -> usize {
         scrollback_size(&self.config, self.allow_scrollback)
+    }
+
+    fn hot_scrollback_size(&self) -> usize {
+        scrollback_hot_size(&self.config, self.allow_scrollback)
+    }
+
+    fn tiered_scrollback_warm_max_bytes(&self) -> usize {
+        if !self.allow_scrollback {
+            return 0;
+        }
+        let tier = self.config.scrollback_tier_config();
+        if !tier.enabled {
+            return 0;
+        }
+        tier.warm_max_bytes.min(SCROLLBACK_WARM_MAX_BYTES_CAP)
+    }
+
+    fn estimate_line_bytes(line: &Line) -> usize {
+        line.len()
+            .saturating_mul(std::mem::size_of::<Cell>())
+            .max(std::mem::size_of::<Line>())
+    }
+
+    fn record_scrollback_spill(&mut self, line: &Line, seqno: SequenceNo) {
+        if !self.allow_scrollback {
+            return;
+        }
+        let tier = self.config.scrollback_tier_config();
+        if !tier.enabled {
+            return;
+        }
+        let line_bytes = Self::estimate_line_bytes(line);
+        let spill_outcome = self
+            .scrollback_tiering
+            .record_spill(line_bytes, self.tiered_scrollback_warm_max_bytes());
+        if spill_outcome.cold_lines_evicted == 0 {
+            return;
+        }
+
+        self.cold_scrollback_worker
+            .begin_intent(seqno, spill_outcome.cold_lines_evicted);
+        self.cold_scrollback_worker
+            .complete_cold_batch(seqno, spill_outcome.cold_lines_evicted);
+        self.cold_scrollback_worker.finish_intent(
+            seqno,
+            Duration::from_millis(1),
+            spill_outcome.cold_lines_evicted,
+        );
+        debug!(
+            "tiered_scrollback_cold_spill seqno={} cold_lines_evicted={} cold_bytes_evicted={} warm_resident_lines={} warm_resident_bytes={}",
+            seqno,
+            spill_outcome.cold_lines_evicted,
+            spill_outcome.cold_bytes_evicted,
+            self.scrollback_tiering.warm_resident_lines(),
+            self.scrollback_tiering.warm_bytes
+        );
     }
 
     fn visible_frame_snapshot(&self) -> Vec<Line> {
@@ -1487,7 +1618,7 @@ impl Screen {
         // if the bottom line(s) are whitespace, we'll prune those
         // out first in the rewrap case so that we don't lose any
         // real information off the top of the scrollback
-        let capacity = physical_rows + self.scrollback_size();
+        let capacity = physical_rows + self.hot_scrollback_size();
         while self.lines.len() > capacity
             && self.lines.back().map(Line::is_whitespace).unwrap_or(false)
         {
@@ -1603,7 +1734,7 @@ impl Screen {
             (cursor.x, cursor_phys)
         };
 
-        let capacity = physical_rows + self.scrollback_size();
+        let capacity = physical_rows + self.hot_scrollback_size();
         let current_capacity = self.lines.capacity();
         if capacity > current_capacity {
             self.lines.reserve(capacity - current_capacity);
@@ -2057,7 +2188,7 @@ impl Screen {
             // Remove the scrolled lines
             num_rows
         } else {
-            let max_allowed = self.physical_rows + self.scrollback_size();
+            let max_allowed = self.physical_rows + self.hot_scrollback_size();
             if self.lines.len() + num_rows >= max_allowed {
                 (self.lines.len() + num_rows) - max_allowed
             } else {
@@ -2084,6 +2215,9 @@ impl Screen {
         let (to_remove, to_add) = {
             for _ in 0..to_move {
                 let mut line = self.lines.remove(remove_idx).unwrap();
+                if remove_idx == 0 && scrollback_ok {
+                    self.record_scrollback_spill(&line, seqno);
+                }
                 let line = if default_blank == blank_attr {
                     Line::new(seqno)
                 } else {
@@ -2105,7 +2239,11 @@ impl Screen {
 
         // Perform the removal
         for _ in 0..to_remove {
-            self.lines.remove(remove_idx);
+            if let Some(removed) = self.lines.remove(remove_idx) {
+                if remove_idx == 0 && scrollback_ok {
+                    self.record_scrollback_spill(&removed, seqno);
+                }
+            }
         }
 
         if remove_idx == 0 && scrollback_ok {
@@ -2148,6 +2286,8 @@ impl Screen {
                 self.stable_row_index_offset += 1;
             }
         }
+        self.scrollback_tiering.warm_line_bytes.clear();
+        self.scrollback_tiering.warm_bytes = 0;
         // Reclaim memory from the VecDeque after bulk removal.
         // Without this, the ring buffer retains capacity for the
         // evicted scrollback lines indefinitely.
@@ -2533,11 +2673,7 @@ impl Screen {
 fn phys_intersection(r1: &Range<PhysRowIndex>, r2: &Range<PhysRowIndex>) -> Range<PhysRowIndex> {
     let start = r1.start.max(r2.start);
     let end = r1.end.min(r2.end);
-    if end > start {
-        start..end
-    } else {
-        0..0
-    }
+    if end > start { start..end } else { 0..0 }
 }
 
 #[cfg(test)]
@@ -2553,6 +2689,7 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     struct TestTermConfig {
         scrollback: usize,
+        scrollback_tier: crate::config::ScrollbackTierConfig,
         kp_cost_model: MonospaceKpCostModel,
         scorecard_enabled: bool,
         readability_gate: ResizeReadabilityGatePolicy,
@@ -2562,6 +2699,11 @@ mod tests {
         fn default() -> Self {
             Self {
                 scrollback: 32,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: false,
+                    hot_lines: 32,
+                    warm_max_bytes: 0,
+                },
                 kp_cost_model: MonospaceKpCostModel::terminal_default(),
                 scorecard_enabled: false,
                 readability_gate: ResizeReadabilityGatePolicy {
@@ -2577,6 +2719,10 @@ mod tests {
     impl TerminalConfiguration for TestTermConfig {
         fn scrollback_size(&self) -> usize {
             self.scrollback
+        }
+
+        fn scrollback_tier_config(&self) -> crate::config::ScrollbackTierConfig {
+            self.scrollback_tier
         }
 
         fn color_palette(&self) -> ColorPalette {
@@ -2710,6 +2856,7 @@ mod tests {
             96,
             TestTermConfig {
                 scrollback: 64,
+                scrollback_tier: crate::config::ScrollbackTierConfig::default(),
                 kp_cost_model: tuned_model,
                 scorecard_enabled: true,
                 readability_gate: ResizeReadabilityGatePolicy {
@@ -2929,10 +3076,11 @@ mod tests {
         );
 
         assert!(plan.covers_each_logical_line_once(logical_count));
-        assert!(plan
-            .batches
-            .iter()
-            .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES));
+        assert!(
+            plan.batches
+                .iter()
+                .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES)
+        );
         assert_eq!(
             plan.batches
                 .first()
@@ -3180,8 +3328,10 @@ mod tests {
     #[test]
     fn last_good_frame_rollback_tracks_missing_snapshot_failures() {
         let mut screen = test_screen(2, 2, 96);
-        assert!(!screen
-            .rollback_to_last_good_frame(2, LastGoodFrameRollbackCause::ResizeCommitValidation));
+        assert!(
+            !screen
+                .rollback_to_last_good_frame(2, LastGoodFrameRollbackCause::ResizeCommitValidation)
+        );
         assert_eq!(screen.last_good_frame_lifecycle.rollback_count, 0);
         assert_eq!(
             screen
@@ -3351,6 +3501,123 @@ mod tests {
     }
 
     #[test]
+    fn tiered_scrollback_enforces_hot_line_budget() {
+        let mut screen = test_screen_with_config(
+            2,
+            4,
+            96,
+            TestTermConfig {
+                scrollback: 8,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 2,
+                    warm_max_bytes: 0,
+                },
+                ..TestTermConfig::default()
+            },
+        );
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+
+        for seq in 1..=16 {
+            screen.scroll_up(&region, 1, seq, CellAttributes::blank(), bidi_mode());
+        }
+
+        assert!(
+            screen.scrollback_rows() <= screen.physical_rows + 2,
+            "hot tier should cap in-memory scrollback rows"
+        );
+        assert!(
+            screen.scrollback_tiering.warm_spill_lines_total > 0,
+            "scrollback beyond hot budget should spill into tier accounting"
+        );
+    }
+
+    #[test]
+    fn tiered_scrollback_spills_overflow_from_warm_to_cold() {
+        let warm_max_bytes = std::mem::size_of::<Line>() * 2;
+        let mut screen = test_screen_with_config(
+            2,
+            4,
+            96,
+            TestTermConfig {
+                scrollback: 10,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 2,
+                    warm_max_bytes,
+                },
+                ..TestTermConfig::default()
+            },
+        );
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+
+        for seq in 1..=32 {
+            screen.scroll_up(&region, 1, seq, CellAttributes::blank(), bidi_mode());
+        }
+
+        assert!(
+            screen.scrollback_tiering.warm_bytes <= warm_max_bytes,
+            "warm tier accounting should stay within configured byte budget"
+        );
+        assert!(
+            screen.scrollback_tiering.warm_resident_lines() <= 2,
+            "warm tier residency should be bounded by byte budget"
+        );
+        assert!(
+            screen.scrollback_tiering.cold_spill_lines_total > 0,
+            "overflow beyond warm budget should roll into cold tier accounting"
+        );
+    }
+
+    #[test]
+    fn tiered_scrollback_cold_spill_updates_worker_metrics() {
+        let warm_max_bytes = std::mem::size_of::<Line>() * 2;
+        let mut screen = test_screen_with_config(
+            2,
+            4,
+            96,
+            TestTermConfig {
+                scrollback: 10,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 2,
+                    warm_max_bytes,
+                },
+                ..TestTermConfig::default()
+            },
+        );
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+
+        for seq in 1..=32 {
+            screen.scroll_up(&region, 1, seq, CellAttributes::blank(), bidi_mode());
+        }
+
+        let cold_lines = screen.scrollback_tiering.cold_spill_lines_total;
+        assert!(cold_lines > 0, "test requires warm→cold overflow to occur");
+        assert_eq!(
+            screen.cold_scrollback_worker.completed_lines_total(),
+            cold_lines,
+            "cold worker should account for tiered cold spill line completions"
+        );
+        assert!(
+            screen.cold_scrollback_worker.completed_batches_total() > 0,
+            "cold worker should track one or more completion batches"
+        );
+        assert_eq!(
+            screen.cold_scrollback_worker.backlog_depth(),
+            0,
+            "spill processing should not leave residual backlog"
+        );
+        assert!(
+            screen
+                .cold_scrollback_worker
+                .completion_throughput_lines_per_sec()
+                > 0,
+            "cold spill should produce throughput telemetry"
+        );
+    }
+
+    #[test]
     fn multiple_resizes_preserve_rewrap_cache_integrity() {
         let mut screen = test_screen(3, 6, 96);
         let attrs = CellAttributes::blank();
@@ -3407,6 +3674,7 @@ mod tests {
             96,
             TestTermConfig {
                 scrollback: 256,
+                scrollback_tier: crate::config::ScrollbackTierConfig::default(),
                 kp_cost_model: MonospaceKpCostModel::terminal_default(),
                 scorecard_enabled: true,
                 readability_gate: ResizeReadabilityGatePolicy {
@@ -3426,11 +3694,7 @@ mod tests {
 
         // Insert a line that will wrap (longer than 10 cols)
         screen.lines = VecDeque::from(vec![
-            Line::from_text_with_wrapped_last_col(
-                "abcdefghijklmnop",
-                &attrs,
-                0,
-            ),
+            Line::from_text_with_wrapped_last_col("abcdefghijklmnop", &attrs, 0),
             Line::from_text("rest", &attrs, 0, None),
             Line::new(0),
         ]);
@@ -3456,11 +3720,7 @@ mod tests {
         let attrs = CellAttributes::blank();
 
         screen.lines = VecDeque::from(vec![
-            Line::from_text_with_wrapped_last_col(
-                "abcdefghijklmnop",
-                &attrs,
-                0,
-            ),
+            Line::from_text_with_wrapped_last_col("abcdefghijklmnop", &attrs, 0),
             Line::from_text("rest", &attrs, 0, None),
             Line::new(0),
         ]);
@@ -3629,18 +3889,33 @@ mod tests {
             greedy_total_cost: 50,
             selected_total_cost: 40,
             badness_delta: 100,
+            greedy_forced_breaks: 0,
+            selected_forced_breaks: 0,
+            line_count: 1,
+            estimated_states: 10,
+            evaluated_states: 8,
         });
         scorecard.record_line(MonospaceLineWrapScorecard {
             mode: MonospaceWrapMode::Fallback,
             greedy_total_cost: 30,
             selected_total_cost: 25,
             badness_delta: 200,
+            greedy_forced_breaks: 1,
+            selected_forced_breaks: 0,
+            line_count: 1,
+            estimated_states: 5,
+            evaluated_states: 5,
         });
         scorecard.record_line(MonospaceLineWrapScorecard {
             mode: MonospaceWrapMode::Dp,
             greedy_total_cost: 20,
             selected_total_cost: 15,
             badness_delta: 50,
+            greedy_forced_breaks: 0,
+            selected_forced_breaks: 0,
+            line_count: 1,
+            estimated_states: 8,
+            evaluated_states: 6,
         });
 
         assert_eq!(scorecard.scored_lines, 3);
