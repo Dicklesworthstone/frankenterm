@@ -1622,17 +1622,17 @@ fn has_trauma_bypass_prefix(text: &str) -> bool {
         trimmed = stripped.trim_start();
     }
 
-    for token in trimmed.split_whitespace() {
-        let cleaned = token.trim_end_matches([';', '&', '|']);
-        let Some((key, value)) = cleaned.split_once('=') else {
-            break;
-        };
-        if !is_shell_identifier(key) {
-            break;
+    while let Some(mat) = VAR_ASSIGN.find(trimmed) {
+        let assign_str = trimmed[..mat.end()].trim_end();
+        if let Some((key, value)) = assign_str.split_once('=') {
+            if !is_shell_identifier(key) {
+                break;
+            }
+            if key == TRAUMA_BYPASS_ENV && (value == "1" || value == "\"1\"" || value == "'1'") {
+                return true;
+            }
         }
-        if key == TRAUMA_BYPASS_ENV && value == "1" {
-            return true;
-        }
+        trimmed = &trimmed[mat.end()..];
     }
 
     false
@@ -4096,6 +4096,12 @@ mod tests {
         assert!(has_trauma_bypass_prefix("FT_BYPASS_TRAUMA=1 cargo test"));
         assert!(has_trauma_bypass_prefix(
             "FOO=bar FT_BYPASS_TRAUMA=1 cargo test -p core"
+        ));
+        assert!(has_trauma_bypass_prefix(
+            "FOO=\"with spaces\" FT_BYPASS_TRAUMA=1 cargo test"
+        ));
+        assert!(has_trauma_bypass_prefix(
+            "FT_BYPASS_TRAUMA=\"1\" cargo test"
         ));
         assert!(!has_trauma_bypass_prefix("FT_BYPASS_TRAUMA=0 cargo test"));
         assert!(!has_trauma_bypass_prefix("cargo test FT_BYPASS_TRAUMA=1"));
