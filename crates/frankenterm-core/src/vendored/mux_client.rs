@@ -986,7 +986,12 @@ async fn pane_delta_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) {
 }
 
 fn pane_delta_try_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) -> bool {
-    tx.try_send(delta).is_ok()
+    if let Ok(permit) = tx.try_reserve() {
+        permit.send(delta);
+        true
+    } else {
+        false
+    }
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)] // mut needed for tokio borrow_and_update path
@@ -2934,6 +2939,70 @@ mod tests {
                 },
             )
             .await;
+        });
+    }
+
+    #[test]
+    fn pane_delta_try_send_delivers_via_reserve_commit() {
+        run_async_test(async {
+            let (tx, mut rx) = mpsc::channel(1);
+            let sent = pane_delta_try_send(
+                &tx,
+                PaneDelta::Gap {
+                    pane_id: 7,
+                    reason: "try-reserve".to_string(),
+                },
+            );
+            assert!(sent);
+            let received = pane_delta_recv(&mut rx)
+                .await
+                .expect("delta should be delivered");
+            match received {
+                PaneDelta::Gap { pane_id, reason } => {
+                    assert_eq!(pane_id, 7);
+                    assert_eq!(reason, "try-reserve");
+                }
+                other => panic!("expected gap delta, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn pane_delta_try_send_returns_false_when_full() {
+        run_async_test(async {
+            let (tx, _rx) = mpsc::channel(1);
+            let first = pane_delta_try_send(
+                &tx,
+                PaneDelta::Gap {
+                    pane_id: 1,
+                    reason: "first".to_string(),
+                },
+            );
+            assert!(first);
+            let second = pane_delta_try_send(
+                &tx,
+                PaneDelta::Gap {
+                    pane_id: 1,
+                    reason: "second".to_string(),
+                },
+            );
+            assert!(!second);
+        });
+    }
+
+    #[test]
+    fn pane_delta_try_send_returns_false_when_receiver_closed() {
+        run_async_test(async {
+            let (tx, rx) = mpsc::channel(1);
+            drop(rx);
+            let sent = pane_delta_try_send(
+                &tx,
+                PaneDelta::Ended {
+                    pane_id: 2,
+                    reason: "closed".to_string(),
+                },
+            );
+            assert!(!sent);
         });
     }
 
