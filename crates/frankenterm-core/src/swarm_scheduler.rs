@@ -134,17 +134,11 @@ pub struct AgentLoadSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SchedulerDecision {
     /// No action needed — fleet is healthy and balanced.
-    Noop {
-        reason: String,
-    },
+    Noop { reason: String },
     /// Pull work from the queue and assign to underutilized agents.
-    AssignWork {
-        assignments: Vec<WorkAssignment>,
-    },
+    AssignWork { assignments: Vec<WorkAssignment> },
     /// Rebalance work across agents to reduce load imbalance.
-    Rebalance {
-        moves: Vec<RebalanceMove>,
-    },
+    Rebalance { moves: Vec<RebalanceMove> },
     /// Scale fleet up to handle increased queue pressure.
     ScaleUp {
         additional_agents: u32,
@@ -156,9 +150,7 @@ pub enum SchedulerDecision {
         reason: String,
     },
     /// Reclaim work items from timed-out agents.
-    ReclaimStale {
-        reclaimed_items: Vec<WorkItemId>,
-    },
+    ReclaimStale { reclaimed_items: Vec<WorkItemId> },
 }
 
 /// A work item → agent assignment.
@@ -212,20 +204,11 @@ pub enum ScaleEventType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SchedulerError {
     /// Circuit breaker is tripped — no scale operations allowed.
-    CircuitBreakerActive {
-        tripped_at: u64,
-        resets_at: u64,
-    },
+    CircuitBreakerActive { tripped_at: u64, resets_at: u64 },
     /// Fleet is already at maximum size.
-    AtMaxCapacity {
-        current: u32,
-        max: u32,
-    },
+    AtMaxCapacity { current: u32, max: u32 },
     /// Fleet is already at minimum size.
-    AtMinCapacity {
-        current: u32,
-        min: u32,
-    },
+    AtMinCapacity { current: u32, min: u32 },
     /// Cooldown period has not elapsed.
     CooldownActive {
         operation: String,
@@ -256,7 +239,10 @@ impl std::fmt::Display for SchedulerError {
             Self::CooldownActive {
                 operation,
                 remaining_ms,
-            } => write!(f, "{operation} cooldown active ({remaining_ms}ms remaining)"),
+            } => write!(
+                f,
+                "{operation} cooldown active ({remaining_ms}ms remaining)"
+            ),
             Self::NoAgentsAvailable => write!(f, "no agents available"),
             Self::NoReadyWork => write!(f, "no ready work items"),
         }
@@ -369,9 +355,21 @@ impl SwarmScheduler {
             consecutive_scale_ops: self.consecutive_scale_ops,
             circuit_breaker_tripped_at: self.circuit_breaker_tripped_at,
             scale_history: self.scale_history.clone(),
-            agent_first_seen: self.agent_first_seen.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-            agent_completed: self.agent_completed.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-            agent_failed: self.agent_failed.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            agent_first_seen: self
+                .agent_first_seen
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            agent_completed: self
+                .agent_completed
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            agent_failed: self
+                .agent_failed
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             sequence: self.sequence,
         }
     }
@@ -407,7 +405,9 @@ impl SwarmScheduler {
 
     /// Register an agent with the scheduler (records first-seen time).
     pub fn register_agent(&mut self, agent_id: &AgentSlotId, now_ms: u64) {
-        self.agent_first_seen.entry(agent_id.clone()).or_insert(now_ms);
+        self.agent_first_seen
+            .entry(agent_id.clone())
+            .or_insert(now_ms);
         self.agent_completed.entry(agent_id.clone()).or_insert(0);
         self.agent_failed.entry(agent_id.clone()).or_insert(0);
     }
@@ -463,9 +463,9 @@ impl SwarmScheduler {
         stats: &QueueStats,
         max_concurrent_per_agent: u32,
     ) -> QueuePressure {
-        let non_terminal = stats.total_items.saturating_sub(
-            stats.completed + stats.failed + stats.cancelled,
-        );
+        let non_terminal = stats
+            .total_items
+            .saturating_sub(stats.completed + stats.failed + stats.cancelled);
         let ready_ratio = if non_terminal > 0 {
             stats.ready as f64 / non_terminal as f64
         } else {
@@ -476,6 +476,10 @@ impl SwarmScheduler {
         let capacity = active.saturating_mul(max_concurrent_per_agent);
         let utilization = if capacity > 0 {
             stats.in_progress as f64 / capacity as f64
+        } else if stats.ready > 0 || stats.in_progress > 0 {
+            // No schedulable capacity while work is waiting/running: treat as
+            // saturated so autoscaling can recover from zero-capacity stalls.
+            1.0
         } else {
             0.0
         };
@@ -511,11 +515,7 @@ impl SwarmScheduler {
     /// 4. Scale up if pressure exceeds threshold
     /// 5. Scale down if pressure is very low
     /// 6. Noop if everything is healthy
-    pub fn evaluate(
-        &mut self,
-        queue: &mut SwarmWorkQueue,
-        now_ms: u64,
-    ) -> SchedulerDecision {
+    pub fn evaluate(&mut self, queue: &mut SwarmWorkQueue, now_ms: u64) -> SchedulerDecision {
         self.last_evaluation_ms = now_ms;
         self.sequence += 1;
 
@@ -606,22 +606,26 @@ impl SwarmScheduler {
     }
 
     /// Evaluate without mutating the queue (read-only analysis).
-    pub fn evaluate_readonly(&self, stats: &QueueStats, _now_ms: u64) -> QueuePressure {
-        let max_concurrent = 3; // default; caller should provide
-        self.compute_pressure(stats, max_concurrent)
+    pub fn evaluate_readonly(
+        &self,
+        stats: &QueueStats,
+        max_concurrent_per_agent: u32,
+        _now_ms: u64,
+    ) -> QueuePressure {
+        self.compute_pressure(stats, max_concurrent_per_agent)
     }
 
     // =========================================================================
     // Scale-up logic
     // =========================================================================
 
-    fn try_scale_up(
-        &mut self,
-        pressure: &QueuePressure,
-        now_ms: u64,
-    ) -> Option<SchedulerDecision> {
+    fn try_scale_up(&mut self, pressure: &QueuePressure, now_ms: u64) -> Option<SchedulerDecision> {
         // Check cooldown
-        if now_ms < self.last_scale_up_ms.saturating_add(self.config.scale_up_cooldown_ms) {
+        if now_ms
+            < self
+                .last_scale_up_ms
+                .saturating_add(self.config.scale_up_cooldown_ms)
+        {
             return None;
         }
 
@@ -689,7 +693,11 @@ impl SwarmScheduler {
         now_ms: u64,
     ) -> Option<SchedulerDecision> {
         // Check cooldown
-        if now_ms < self.last_scale_down_ms.saturating_add(self.config.scale_down_cooldown_ms) {
+        if now_ms
+            < self
+                .last_scale_down_ms
+                .saturating_add(self.config.scale_down_cooldown_ms)
+        {
             return None;
         }
 
@@ -729,8 +737,8 @@ impl SwarmScheduler {
         });
 
         // Only remove enough to stay above min and not remove too many at once
-        let max_remove = (pressure.active_agents - self.config.min_fleet_size)
-            .min(self.config.max_scale_step);
+        let max_remove =
+            (pressure.active_agents - self.config.min_fleet_size).min(self.config.max_scale_step);
         removable.truncate(max_remove as usize);
 
         if removable.is_empty() {
@@ -1082,6 +1090,24 @@ mod tests {
         assert_eq!(pressure.failure_rate, 2.0 / 5.0);
     }
 
+    #[test]
+    fn pressure_with_ready_work_and_zero_capacity_is_saturated() {
+        let scheduler = SwarmScheduler::with_defaults();
+        let stats = QueueStats {
+            total_items: 3,
+            blocked: 0,
+            ready: 3,
+            in_progress: 0,
+            completed: 0,
+            failed: 0,
+            cancelled: 0,
+            active_agents: 0,
+            completion_log_size: 0,
+        };
+        let pressure = scheduler.compute_pressure(&stats, 3);
+        assert_eq!(pressure.utilization, 1.0);
+    }
+
     // =========================================================================
     // Agent tracking tests
     // =========================================================================
@@ -1189,6 +1215,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn evaluate_scales_up_when_ready_work_exists_with_zero_capacity() {
+        let mut scheduler = SwarmScheduler::new(test_config());
+        let mut queue = make_queue();
+        queue.enqueue(make_item("w1", 0)).unwrap();
+
+        match scheduler.evaluate(&mut queue, 5000) {
+            SchedulerDecision::ScaleUp {
+                additional_agents, ..
+            } => assert!(additional_agents >= 1),
+            other => panic!("expected ScaleUp, got {other:?}"),
+        }
+    }
+
     // =========================================================================
     // Scale-up tests
     // =========================================================================
@@ -1212,7 +1252,9 @@ mod tests {
         // First call will try to assign w3 but agent is at capacity, resulting in noop
         // or scale-up depending on utilization
         match &decision {
-            SchedulerDecision::ScaleUp { additional_agents, .. } => {
+            SchedulerDecision::ScaleUp {
+                additional_agents, ..
+            } => {
                 assert!(*additional_agents >= 1);
             }
             SchedulerDecision::Noop { .. } => {
@@ -1315,10 +1357,7 @@ mod tests {
         let result = scheduler.try_scale_down(&queue, &pressure, 10_000);
         assert!(result.is_some());
         match result.unwrap() {
-            SchedulerDecision::ScaleDown {
-                remove_agents,
-                ..
-            } => {
+            SchedulerDecision::ScaleDown { remove_agents, .. } => {
                 assert!(!remove_agents.is_empty());
                 // Should not remove a1 (has active work)
                 assert!(!remove_agents.contains(&"a1".to_string()));
@@ -1558,10 +1597,7 @@ mod tests {
                 current: 16,
                 max: 16,
             },
-            SchedulerError::AtMinCapacity {
-                current: 1,
-                min: 1,
-            },
+            SchedulerError::AtMinCapacity { current: 1, min: 1 },
             SchedulerError::CooldownActive {
                 operation: "scale-up".to_string(),
                 remaining_ms: 500,
@@ -1596,6 +1632,28 @@ mod tests {
         let pressure = compute_queue_pressure(&queue);
         assert_eq!(pressure.utilization, 0.0);
         assert_eq!(pressure.ready_ratio, 0.0);
+    }
+
+    #[test]
+    fn evaluate_readonly_uses_caller_capacity_hint() {
+        let scheduler = SwarmScheduler::with_defaults();
+        let stats = QueueStats {
+            total_items: 8,
+            blocked: 0,
+            ready: 0,
+            in_progress: 4,
+            completed: 2,
+            failed: 0,
+            cancelled: 0,
+            active_agents: 2,
+            completion_log_size: 0,
+        };
+
+        let pressure_tight = scheduler.evaluate_readonly(&stats, 2, 1000);
+        let pressure_loose = scheduler.evaluate_readonly(&stats, 4, 1000);
+        assert!(pressure_tight.utilization > pressure_loose.utilization);
+        assert_eq!(pressure_tight.utilization, 1.0);
+        assert_eq!(pressure_loose.utilization, 0.5);
     }
 
     // =========================================================================
@@ -1747,9 +1805,7 @@ mod tests {
 
         let result = scheduler.try_scale_down(&queue, &pressure, 10_000);
         match result {
-            Some(SchedulerDecision::ScaleDown {
-                remove_agents, ..
-            }) => {
+            Some(SchedulerDecision::ScaleDown { remove_agents, .. }) => {
                 // Should prefer removing the lazy agent first
                 assert_eq!(remove_agents[0], "lazy");
             }
