@@ -1070,6 +1070,18 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build recorder_storage test runtime");
+        runtime.block_on(future);
+    }
+
     fn sample_event(event_id: &str, pane_id: u64, sequence: u64, text: &str) -> RecorderEvent {
         RecorderEvent {
             schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
@@ -1198,8 +1210,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn append_assigns_monotonic_offsets() {
+    #[test]
+    fn append_assigns_monotonic_offsets() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -1231,10 +1243,10 @@ mod tests {
         assert_eq!(r2.first_offset.ordinal, 2);
         assert!(r2.first_offset.byte_offset > r1.first_offset.byte_offset);
         assert_eq!(r2.last_offset.ordinal, 2);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn duplicate_batch_id_is_idempotent() {
+    #[test]
+    fn duplicate_batch_id_is_idempotent() { run_async_test(async {
         let dir = tempdir().unwrap();
         let cfg = test_config(dir.path());
         let data_path = cfg.data_path.clone();
@@ -1264,10 +1276,10 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(before_len, after_len);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn checkpoint_commit_is_monotonic_and_persisted() {
+    #[test]
+    fn checkpoint_commit_is_monotonic_and_persisted() { run_async_test(async {
         let dir = tempdir().unwrap();
         let cfg = test_config(dir.path());
         let state_path = cfg.state_path.clone();
@@ -1327,10 +1339,10 @@ mod tests {
             .unwrap();
         assert_eq!(persisted.upto_offset.ordinal, 0);
         assert!(state_path.exists());
-    }
+    }); }
 
-    #[tokio::test]
-    async fn startup_truncates_torn_tail_and_recovers_ordinal() {
+    #[test]
+    fn startup_truncates_torn_tail_and_recovers_ordinal() { run_async_test(async {
         let dir = tempdir().unwrap();
         let cfg = test_config(dir.path());
 
@@ -1368,10 +1380,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.first_offset.ordinal, 1);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn rejects_batch_larger_than_configured_byte_limit() {
+    #[test]
+    fn rejects_batch_larger_than_configured_byte_limit() { run_async_test(async {
         let dir = tempdir().unwrap();
         let mut cfg = test_config(dir.path());
         cfg.max_batch_bytes = 32;
@@ -1393,7 +1405,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
-    }
+    }); }
 
     // ── Config validation ────────────────────────────────────────────
 
@@ -1437,8 +1449,8 @@ mod tests {
 
     // ── Request validation ───────────────────────────────────────────
 
-    #[tokio::test]
-    async fn rejects_empty_batch_id() {
+    #[test]
+    fn rejects_empty_batch_id() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -1453,10 +1465,10 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
-    }
+    }); }
 
-    #[tokio::test]
-    async fn rejects_empty_events_list() {
+    #[test]
+    fn rejects_empty_events_list() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -1471,10 +1483,10 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
-    }
+    }); }
 
-    #[tokio::test]
-    async fn rejects_batch_exceeding_event_count_limit() {
+    #[test]
+    fn rejects_batch_exceeding_event_count_limit() { run_async_test(async {
         let dir = tempdir().unwrap();
         let mut cfg = test_config(dir.path());
         cfg.max_batch_events = 2;
@@ -1495,12 +1507,12 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, RecorderStorageError::InvalidRequest { .. }));
-    }
+    }); }
 
     // ── Idempotency cache eviction ───────────────────────────────────
 
-    #[tokio::test]
-    async fn idempotency_cache_evicts_oldest_when_full() {
+    #[test]
+    fn idempotency_cache_evicts_oldest_when_full() { run_async_test(async {
         let dir = tempdir().unwrap();
         let mut cfg = test_config(dir.path());
         cfg.max_idempotency_entries = 3;
@@ -1562,12 +1574,12 @@ mod tests {
             .len();
 
         assert_eq!(data_len_before2, data_len_after2, "b3 should be cached");
-    }
+    }); }
 
     // ── Health and lag metrics ────────────────────────────────────────
 
-    #[tokio::test]
-    async fn health_reports_correct_state() {
+    #[test]
+    fn health_reports_correct_state() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -1594,10 +1606,10 @@ mod tests {
         let h2 = storage.health().await;
         assert!(h2.latest_offset.is_some());
         assert_eq!(h2.latest_offset.unwrap().ordinal, 0);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn lag_metrics_track_consumer_offsets() {
+    #[test]
+    fn lag_metrics_track_consumer_offsets() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -1653,12 +1665,12 @@ mod tests {
         assert_eq!(lag.consumers[0].offsets_behind, 2); // 4 - 2
         assert_eq!(lag.consumers[1].consumer.0, "search");
         assert_eq!(lag.consumers[1].offsets_behind, 0); // 4 - 4
-    }
+    }); }
 
     // ── Checkpoint regression ────────────────────────────────────────
 
-    #[tokio::test]
-    async fn checkpoint_regression_returns_error() {
+    #[test]
+    fn checkpoint_regression_returns_error() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -1697,10 +1709,10 @@ mod tests {
             RecorderStorageError::CheckpointRegression { .. }
         ));
         assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn health_records_checkpoint_regression_diagnostic() {
+    #[test]
+    fn health_records_checkpoint_regression_diagnostic() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
         let consumer = CheckpointConsumerId("diag-consumer".to_string());
@@ -1760,10 +1772,10 @@ mod tests {
         let healthy = storage.health().await;
         assert!(!healthy.degraded);
         assert!(healthy.last_error.is_none());
-    }
+    }); }
 
-    #[tokio::test]
-    async fn health_records_append_diagnostic_and_clears_on_success() {
+    #[test]
+    fn health_records_append_diagnostic_and_clears_on_success() { run_async_test(async {
         let dir = tempdir().unwrap();
         let mut cfg = test_config(dir.path());
         cfg.max_batch_bytes = 1200;
@@ -1799,12 +1811,12 @@ mod tests {
         let healthy = storage.health().await;
         assert!(!healthy.degraded);
         assert!(healthy.last_error.is_none());
-    }
+    }); }
 
     // ── Read checkpoint for unknown consumer ─────────────────────────
 
-    #[tokio::test]
-    async fn read_checkpoint_unknown_consumer_returns_none() {
+    #[test]
+    fn read_checkpoint_unknown_consumer_returns_none() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -1814,12 +1826,12 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none());
-    }
+    }); }
 
     // ── Flush modes ──────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn flush_buffered_and_durable() {
+    #[test]
+    fn flush_buffered_and_durable() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -1841,12 +1853,12 @@ mod tests {
         // Flush durable
         let stats_dur = storage.flush(FlushMode::Durable).await.unwrap();
         assert_eq!(stats_dur.backend, RecorderBackendKind::AppendLog);
-    }
+    }); }
 
     // ── Durability levels ────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn enqueued_durability_does_not_fsync() {
+    #[test]
+    fn enqueued_durability_does_not_fsync() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -1862,10 +1874,10 @@ mod tests {
 
         assert_eq!(resp.committed_durability, DurabilityLevel::Enqueued);
         assert_eq!(resp.accepted_count, 1);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn fsync_durability_committed() {
+    #[test]
+    fn fsync_durability_committed() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -1882,12 +1894,12 @@ mod tests {
         assert_eq!(resp.committed_durability, DurabilityLevel::Fsync);
         // State should be persisted (fsync does persist_state)
         assert!(dir.path().join("state.json").exists());
-    }
+    }); }
 
     // ── Reopen persistence ───────────────────────────────────────────
 
-    #[tokio::test]
-    async fn reopen_continues_ordinals() {
+    #[test]
+    fn reopen_continues_ordinals() { run_async_test(async {
         let dir = tempdir().unwrap();
         let cfg = test_config(dir.path());
 
@@ -1921,7 +1933,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.first_offset.ordinal, 3);
-    }
+    }); }
 
     // ── Error classification ─────────────────────────────────────────
 
@@ -1951,12 +1963,12 @@ mod tests {
 
     // ── Backend kind ─────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn backend_kind_is_append_log() {
+    #[test]
+    fn backend_kind_is_append_log() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
         assert_eq!(storage.backend_kind(), RecorderBackendKind::AppendLog);
-    }
+    }); }
 
     // ── Serde roundtrips ─────────────────────────────────────────────
 
@@ -2023,8 +2035,8 @@ mod tests {
 
     // ── Multi-batch ordering ─────────────────────────────────────────
 
-    #[tokio::test]
-    async fn multi_batch_accepted_count_correct() {
+    #[test]
+    fn multi_batch_accepted_count_correct() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -2046,12 +2058,12 @@ mod tests {
         assert_eq!(resp.accepted_count, 4);
         assert_eq!(resp.first_offset.ordinal, 0);
         assert_eq!(resp.last_offset.ordinal, 3);
-    }
+    }); }
 
     // ── Open with empty data file ────────────────────────────────────
 
-    #[tokio::test]
-    async fn open_with_empty_data_file() {
+    #[test]
+    fn open_with_empty_data_file() { run_async_test(async {
         let dir = tempdir().unwrap();
         let cfg = test_config(dir.path());
 
@@ -2062,12 +2074,12 @@ mod tests {
         let storage = AppendLogRecorderStorage::open(cfg).unwrap();
         let h = storage.health().await;
         assert!(h.latest_offset.is_none());
-    }
+    }); }
 
     // ── Lag with no consumers ────────────────────────────────────────
 
-    #[tokio::test]
-    async fn lag_with_no_consumers() {
+    #[test]
+    fn lag_with_no_consumers() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -2084,7 +2096,7 @@ mod tests {
         let lag = storage.lag_metrics().await.unwrap();
         assert!(lag.consumers.is_empty());
         assert!(lag.latest_offset.is_some());
-    }
+    }); }
 
     // -----------------------------------------------------------------------
     // Batch — RubyBeaver wa-1u90p.7.1
@@ -2305,8 +2317,8 @@ mod tests {
         assert!(cfg.state_path.to_str().unwrap().contains("state.json"));
     }
 
-    #[tokio::test]
-    async fn multiple_consumers_checkpoint_advance() {
+    #[test]
+    fn multiple_consumers_checkpoint_advance() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -2358,20 +2370,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(alpha.upto_offset.ordinal, 2);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn lag_metrics_empty_store() {
+    #[test]
+    fn lag_metrics_empty_store() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
         let lag = storage.lag_metrics().await.unwrap();
         assert!(lag.latest_offset.is_none());
         assert!(lag.consumers.is_empty());
-    }
+    }); }
 
-    #[tokio::test]
-    async fn flush_empty_store() {
+    #[test]
+    fn flush_empty_store() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -2381,10 +2393,10 @@ mod tests {
 
         let stats_dur = storage.flush(FlushMode::Durable).await.unwrap();
         assert!(stats_dur.latest_offset.is_none());
-    }
+    }); }
 
-    #[tokio::test]
-    async fn single_event_accepted_count_is_one() {
+    #[test]
+    fn single_event_accepted_count_is_one() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -2400,10 +2412,10 @@ mod tests {
 
         assert_eq!(resp.accepted_count, 1);
         assert_eq!(resp.first_offset, resp.last_offset);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn byte_offset_monotonicity_across_batches() {
+    #[test]
+    fn byte_offset_monotonicity_across_batches() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -2430,10 +2442,10 @@ mod tests {
                 window[0]
             );
         }
-    }
+    }); }
 
-    #[tokio::test]
-    async fn reopen_preserves_checkpoints_across_restart() {
+    #[test]
+    fn reopen_preserves_checkpoints_across_restart() { run_async_test(async {
         let dir = tempdir().unwrap();
         let cfg = test_config(dir.path());
 
@@ -2476,10 +2488,10 @@ mod tests {
         assert_eq!(cp.upto_offset.ordinal, 0);
         assert_eq!(cp.schema_version, "v1");
         assert_eq!(cp.committed_at_ms, 500);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn health_with_latest_offset_after_multi_event_batch() {
+    #[test]
+    fn health_with_latest_offset_after_multi_event_batch() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -2503,10 +2515,10 @@ mod tests {
         assert_eq!(latest.ordinal, 2);
         assert!(!h.degraded);
         assert_eq!(h.queue_depth, 0);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn appended_durability_persists_state() {
+    #[test]
+    fn appended_durability_persists_state() { run_async_test(async {
         let dir = tempdir().unwrap();
         let cfg = test_config(dir.path());
         let state_path = cfg.state_path.clone();
@@ -2532,10 +2544,10 @@ mod tests {
         let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(state.get("next_ordinal").is_some());
         assert_eq!(state["next_ordinal"], 1);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn response_backend_always_append_log() {
+    #[test]
+    fn response_backend_always_append_log() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -2551,10 +2563,10 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.backend, RecorderBackendKind::AppendLog);
         }
-    }
+    }); }
 
-    #[tokio::test]
-    async fn committed_at_ms_is_nonzero() {
+    #[test]
+    fn committed_at_ms_is_nonzero() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -2572,7 +2584,7 @@ mod tests {
             resp.committed_at_ms > 0,
             "committed_at_ms should be a valid epoch timestamp"
         );
-    }
+    }); }
 
     #[test]
     fn health_with_last_error_is_degraded() {
@@ -2632,8 +2644,8 @@ mod tests {
         assert_eq!(back, lag);
     }
 
-    #[tokio::test]
-    async fn torn_tail_with_only_length_prefix_no_payload() {
+    #[test]
+    fn torn_tail_with_only_length_prefix_no_payload() { run_async_test(async {
         let dir = tempdir().unwrap();
         let cfg = test_config(dir.path());
 
@@ -2668,10 +2680,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.first_offset.ordinal, 0);
         assert_eq!(resp.first_offset.byte_offset, 0);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn segment_id_preserved_across_reopen() {
+    #[test]
+    fn segment_id_preserved_across_reopen() { run_async_test(async {
         let dir = tempdir().unwrap();
         let cfg = test_config(dir.path());
 
@@ -2702,10 +2714,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp2.first_offset.segment_id, 0);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn flush_updates_flushed_at_ms() {
+    #[test]
+    fn flush_updates_flushed_at_ms() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
@@ -2730,12 +2742,12 @@ mod tests {
             stats2.flushed_at_ms >= stats.flushed_at_ms,
             "subsequent flush timestamp should be >= previous"
         );
-    }
+    }); }
 
     // ── DarkBadger wa-1u90p.7.1 ──────────────────────────────────────
 
-    #[tokio::test]
-    async fn whitespace_only_batch_id_rejected() {
+    #[test]
+    fn whitespace_only_batch_id_rejected() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
         let err = storage
@@ -2752,7 +2764,7 @@ mod tests {
             "whitespace-only batch_id should be rejected"
         );
         assert_eq!(err.class(), RecorderStorageErrorClass::TerminalData);
-    }
+    }); }
 
     #[test]
     fn corrupt_record_error_class_is_corruption() {
@@ -2800,8 +2812,8 @@ mod tests {
         cfg.validate().expect("default config should be valid");
     }
 
-    #[tokio::test]
-    async fn checkpoint_noop_when_same_ordinal() {
+    #[test]
+    fn checkpoint_noop_when_same_ordinal() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
         let _ = storage
@@ -2830,10 +2842,10 @@ mod tests {
         // Same ordinal → noop
         let outcome2 = storage.commit_checkpoint(checkpoint).await.unwrap();
         assert_eq!(outcome2, CheckpointCommitOutcome::NoopAlreadyAdvanced);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn lag_consumers_sorted_alphabetically() {
+    #[test]
+    fn lag_consumers_sorted_alphabetically() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
         let _ = storage
@@ -2870,7 +2882,7 @@ mod tests {
             .map(|c| c.consumer.0.as_str())
             .collect();
         assert_eq!(names, vec!["alpha", "middle", "zebra"]);
-    }
+    }); }
 
     #[test]
     fn recorder_offset_clone_eq() {
@@ -2914,8 +2926,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn health_queue_depth_reflects_zero_when_idle() {
+    #[test]
+    fn health_queue_depth_reflects_zero_when_idle() { run_async_test(async {
         let dir = tempdir().unwrap();
         let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
         let health = storage.health().await;
@@ -2923,7 +2935,7 @@ mod tests {
         assert!(!health.degraded);
         assert!(health.last_error.is_none());
         assert!(health.latest_offset.is_none());
-    }
+    }); }
 
     #[test]
     fn recorder_storage_lag_serde_roundtrip() {

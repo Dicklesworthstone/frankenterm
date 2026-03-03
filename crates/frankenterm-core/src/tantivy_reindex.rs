@@ -1207,6 +1207,18 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tantivy_reindex test runtime");
+        runtime.block_on(future);
+    }
+
     // -- test helpers --
 
     fn sample_event(event_id: &str, pane_id: u64, sequence: u64, text: &str) -> RecorderEvent {
@@ -1458,8 +1470,8 @@ mod tests {
     // Full reindex tests
     // =========================================================================
 
-    #[tokio::test]
-    async fn full_reindex_cold_start() {
+    #[test]
+    fn full_reindex_cold_start() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1491,10 +1503,10 @@ mod tests {
         assert!(progress.caught_up);
         assert_eq!(progress.current_ordinal, Some(4));
         assert!(pipeline.writer().cleared);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn full_reindex_resumes_from_checkpoint() {
+    #[test]
+    fn full_reindex_resumes_from_checkpoint() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1531,10 +1543,10 @@ mod tests {
 
         // Verify docs start from ordinal 3
         assert_eq!(pipeline2.writer().docs[0].event_id, "e3");
-    }
+        }); }
 
-    #[tokio::test]
-    async fn full_reindex_empty_log() {
+    #[test]
+    fn full_reindex_empty_log() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1555,10 +1567,10 @@ mod tests {
         assert_eq!(progress.events_read, 0);
         assert_eq!(progress.events_indexed, 0);
         assert!(progress.caught_up);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn full_reindex_no_clear() {
+    #[test]
+    fn full_reindex_no_clear() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1581,10 +1593,10 @@ mod tests {
         assert_eq!(progress.events_indexed, 1);
         assert_eq!(progress.docs_cleared, 0);
         assert!(!pipeline.writer().cleared);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn full_reindex_batch_size_zero_errors() {
+    #[test]
+    fn full_reindex_batch_size_zero_errors() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1600,14 +1612,14 @@ mod tests {
         let mut pipeline = ReindexPipeline::new(MockReindexWriter::new());
         let err = pipeline.full_reindex(&storage, &config).await.unwrap_err();
         assert!(matches!(err, IndexerError::Config(_)));
-    }
+        }); }
 
     // =========================================================================
     // Backfill tests — ordinal range
     // =========================================================================
 
-    #[tokio::test]
-    async fn backfill_ordinal_range() {
+    #[test]
+    fn backfill_ordinal_range() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1642,10 +1654,10 @@ mod tests {
             .map(|d| d.event_id.as_str())
             .collect();
         assert_eq!(event_ids, vec!["e3", "e4", "e5", "e6"]);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn backfill_ordinal_range_resumes() {
+    #[test]
+    fn backfill_ordinal_range_resumes() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1691,14 +1703,14 @@ mod tests {
         let mut p4 = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
         let r4 = p4.backfill(&storage, &config_unlimited).await.unwrap();
         assert!(r4.caught_up);
-    }
+        }); }
 
     // =========================================================================
     // Backfill tests — time range
     // =========================================================================
 
-    #[tokio::test]
-    async fn backfill_time_range() {
+    #[test]
+    fn backfill_time_range() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1741,10 +1753,10 @@ mod tests {
             .map(|d| d.event_id.as_str())
             .collect();
         assert_eq!(ids, vec!["e1", "e2", "e3"]);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn backfill_all_range() {
+    #[test]
+    fn backfill_all_range() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1771,10 +1783,10 @@ mod tests {
 
         assert_eq!(progress.events_indexed, 3);
         assert_eq!(progress.events_filtered, 0);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn backfill_schema_mismatch_skipped() {
+    #[test]
+    fn backfill_schema_mismatch_skipped() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1802,10 +1814,10 @@ mod tests {
 
         assert_eq!(progress.events_indexed, 1);
         assert_eq!(progress.events_skipped, 1);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn backfill_rejected_docs_skipped() {
+    #[test]
+    fn backfill_rejected_docs_skipped() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1839,10 +1851,10 @@ mod tests {
 
         assert_eq!(progress.events_indexed, 2);
         assert_eq!(progress.events_skipped, 1);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn backfill_dedup_rejected_docs_commit_delete_mutations() {
+    #[test]
+    fn backfill_dedup_rejected_docs_commit_delete_mutations() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1879,10 +1891,10 @@ mod tests {
         assert_eq!(pipeline.backfill_writer().deleted_ids.len(), 2);
         // Dedup deletes are index mutations and must be committed before checkpoint advance.
         assert_eq!(pipeline.backfill_writer().commits, 1);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn backfill_batch_size_zero_errors() {
+    #[test]
+    fn backfill_batch_size_zero_errors() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1898,14 +1910,14 @@ mod tests {
         let mut pipeline = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
         let err = pipeline.backfill(&storage, &config).await.unwrap_err();
         assert!(matches!(err, IndexerError::Config(_)));
-    }
+        }); }
 
     // =========================================================================
     // Integrity checker tests
     // =========================================================================
 
-    #[tokio::test]
-    async fn integrity_check_consistent() {
+    #[test]
+    fn integrity_check_consistent() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1939,10 +1951,10 @@ mod tests {
         assert!(report.missing_from_index.is_empty());
         assert!(report.offset_mismatches.is_empty());
         assert_eq!(report.total_index_docs, Some(5));
-    }
+        }); }
 
-    #[tokio::test]
-    async fn integrity_check_missing_docs() {
+    #[test]
+    fn integrity_check_missing_docs() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -1975,10 +1987,10 @@ mod tests {
         assert_eq!(report.missing_from_index.len(), 2);
         assert!(report.missing_from_index.contains(&"e3".to_string()));
         assert!(report.missing_from_index.contains(&"e4".to_string()));
-    }
+        }); }
 
-    #[tokio::test]
-    async fn integrity_check_offset_mismatch() {
+    #[test]
+    fn integrity_check_offset_mismatch() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2010,10 +2022,10 @@ mod tests {
         assert_eq!(report.offset_mismatches[0].event_id, "e1");
         assert_eq!(report.offset_mismatches[0].expected_offset, 1);
         assert_eq!(report.offset_mismatches[0].actual_offset, 999);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn integrity_check_with_ordinal_range() {
+    #[test]
+    fn integrity_check_with_ordinal_range() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2043,10 +2055,10 @@ mod tests {
         assert!(report.is_consistent);
         assert_eq!(report.checked_range.events_checked, 4);
         assert_eq!(report.index_matches, 4);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn integrity_check_max_events() {
+    #[test]
+    fn integrity_check_max_events() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2075,10 +2087,10 @@ mod tests {
         let report = IntegrityChecker::check(&lookup, &config).unwrap();
         assert_eq!(report.checked_range.events_checked, 3);
         assert!(report.is_consistent);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn integrity_check_empty_log() {
+    #[test]
+    fn integrity_check_empty_log() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let _storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2097,10 +2109,10 @@ mod tests {
         let report = IntegrityChecker::check(&lookup, &config).unwrap();
         assert!(report.is_consistent);
         assert_eq!(report.log_events_scanned, 0);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn integrity_check_skips_wrong_schema() {
+    #[test]
+    fn integrity_check_skips_wrong_schema() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2129,7 +2141,7 @@ mod tests {
         assert_eq!(report.log_events_scanned, 2);
         assert_eq!(report.checked_range.events_checked, 1);
         assert_eq!(report.index_matches, 1);
-    }
+        }); }
 
     // =========================================================================
     // Default config tests
@@ -2508,8 +2520,8 @@ mod tests {
     // Integration: reindex then integrity check
     // =========================================================================
 
-    #[tokio::test]
-    async fn reindex_then_integrity_check_consistent() {
+    #[test]
+    fn reindex_then_integrity_check_consistent() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2552,12 +2564,12 @@ mod tests {
         let report = IntegrityChecker::check(&lookup, &check_config).unwrap();
         assert!(report.is_consistent);
         assert_eq!(report.index_matches, 8);
-    }
+        }); }
 
     // ── Batch: DarkBadger wa-1u90p.7.1 ──────────────────────────────────
 
-    #[tokio::test]
-    async fn reindex_dedup_calls_delete_before_add() {
+    #[test]
+    fn reindex_dedup_calls_delete_before_add() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2592,10 +2604,10 @@ mod tests {
         assert_eq!(deleted.len(), 2);
         assert!(deleted.contains(&"e0".to_string()));
         assert!(deleted.contains(&"e1".to_string()));
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_no_dedup_skips_delete() {
+    #[test]
+    fn reindex_no_dedup_skips_delete() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2627,10 +2639,10 @@ mod tests {
 
         // With dedup_on_replay=false, no deletes should be issued
         assert!(pipeline.writer().deleted_ids.is_empty());
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_dedup_delete_failure_propagates() {
+    #[test]
+    fn reindex_dedup_delete_failure_propagates() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2655,10 +2667,10 @@ mod tests {
 
         let err = pipeline.full_reindex(&storage, &config).await.unwrap_err();
         assert!(matches!(err, IndexerError::IndexWrite(_)));
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_commit_failure_propagates() {
+    #[test]
+    fn reindex_commit_failure_propagates() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2682,10 +2694,10 @@ mod tests {
         let mut pipeline = ReindexPipeline::new(writer);
         let err = pipeline.full_reindex(&storage, &config).await;
         assert!(err.is_err());
-    }
+        }); }
 
-    #[tokio::test]
-    async fn backfill_commit_failure_propagates() {
+    #[test]
+    fn backfill_commit_failure_propagates() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2709,35 +2721,35 @@ mod tests {
         let mut pipeline = ReindexPipeline::new_for_backfill(writer);
         let err = pipeline.backfill(&storage, &config).await;
         assert!(err.is_err());
-    }
+        }); }
 
-    #[tokio::test]
-    async fn pipeline_writer_accessor() {
+    #[test]
+    fn pipeline_writer_accessor() { run_async_test(async {
         let writer = MockReindexWriter::new();
         let pipeline = ReindexPipeline::new(writer);
         // writer() returns a reference to the inner writer
         assert!(!pipeline.writer().cleared);
         assert_eq!(pipeline.writer().docs.len(), 0);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn pipeline_into_writer_consumes() {
+    #[test]
+    fn pipeline_into_writer_consumes() { run_async_test(async {
         let writer = MockReindexWriter::new();
         let pipeline = ReindexPipeline::new(writer);
         let recovered = pipeline.into_writer();
         assert_eq!(recovered.commits, 0);
         assert!(!recovered.cleared);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn pipeline_backfill_writer_accessor() {
+    #[test]
+    fn pipeline_backfill_writer_accessor() { run_async_test(async {
         let writer = MockReindexWriter::new();
         let pipeline = ReindexPipeline::new_for_backfill(writer);
         assert_eq!(pipeline.backfill_writer().docs.len(), 0);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_multi_batch_progress_accumulates() {
+    #[test]
+    fn reindex_multi_batch_progress_accumulates() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2768,10 +2780,10 @@ mod tests {
         assert_eq!(progress.batches_committed, 4);
         assert!(progress.caught_up);
         assert_eq!(progress.current_ordinal, Some(9));
-    }
+        }); }
 
-    #[tokio::test]
-    async fn integrity_report_with_mixed_issues() {
+    #[test]
+    fn integrity_report_with_mixed_issues() { run_async_test(async {
         // Test a report that has BOTH missing and mismatched entries
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
@@ -2807,7 +2819,7 @@ mod tests {
         assert_eq!(report.offset_mismatches.len(), 1); // e1
         assert_eq!(report.offset_mismatches[0].event_id, "e1");
         assert_eq!(report.offset_mismatches[0].actual_offset, 777);
-    }
+        }); }
 
     #[test]
     fn reindex_progress_equality() {
@@ -2862,8 +2874,8 @@ mod tests {
         assert_eq!(back.missing_from_index.len(), 1);
     }
 
-    #[tokio::test]
-    async fn backfill_then_integrity_check_partial() {
+    #[test]
+    fn backfill_then_integrity_check_partial() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -2919,7 +2931,7 @@ mod tests {
         let full_report = IntegrityChecker::check(&lookup, &full_check).unwrap();
         assert!(!full_report.is_consistent);
         assert_eq!(full_report.missing_from_index.len(), 5); // e0-e2, e8-e9
-    }
+        }); }
 
     // =========================================================================
     // Deterministic range reindex [from, to) — E2.F2.T2
@@ -3027,8 +3039,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn reindex_range_from_to_exclusive() {
+    #[test]
+    fn reindex_range_from_to_exclusive() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -3079,10 +3091,10 @@ mod tests {
             .map(|d| d.event_id.as_str())
             .collect();
         assert_eq!(ids, vec!["e5", "e6", "e7"]);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_range_empty_produces_zero_documents() {
+    #[test]
+    fn reindex_range_empty_produces_zero_documents() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -3119,10 +3131,10 @@ mod tests {
         assert_eq!(progress.events_indexed, 0);
         assert_eq!(progress.events_read, 0);
         assert!(pipeline.backfill_writer().docs.is_empty());
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_range_single_event() {
+    #[test]
+    fn reindex_range_single_event() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -3165,10 +3177,10 @@ mod tests {
 
         assert_eq!(progress.events_indexed, 1);
         assert_eq!(pipeline.backfill_writer().docs[0].event_id, "e3");
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_replay_same_range_idempotent() {
+    #[test]
+    fn reindex_replay_same_range_idempotent() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -3243,10 +3255,10 @@ mod tests {
             .collect();
         assert_eq!(ids1, ids2);
         assert_eq!(ids1, vec!["e2", "e3", "e4", "e5"]);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_range_parity_across_backends() {
+    #[test]
+    fn reindex_range_parity_across_backends() { run_async_test(async {
         // Tests that the same range produces identical documents from
         // an AppendLog backend and an in-memory "FrankenSqlite-like" backend.
         let dir = tempdir().unwrap();
@@ -3332,10 +3344,10 @@ mod tests {
             assert_eq!(al_doc.log_offset, mem_doc.log_offset);
             assert_eq!(al_doc.sequence, mem_doc.sequence);
         }
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_range_batch_size_zero_errors() {
+    #[test]
+    fn reindex_range_batch_size_zero_errors() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -3369,10 +3381,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, IndexerError::Config(_)));
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_range_schema_mismatch_skipped() {
+    #[test]
+    fn reindex_range_schema_mismatch_skipped() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -3415,10 +3427,10 @@ mod tests {
 
         assert_eq!(progress.events_indexed, 2);
         assert_eq!(progress.events_skipped, 1);
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_range_reversed_bounds_empty() {
+    #[test]
+    fn reindex_range_reversed_bounds_empty() { run_async_test(async {
         // [8, 3) should produce zero documents (to < from)
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
@@ -3462,7 +3474,7 @@ mod tests {
 
         assert_eq!(progress.events_indexed, 0);
         assert_eq!(progress.events_read, 0);
-    }
+        }); }
 
     #[test]
     fn exclusive_ordinal_range_debug() {
@@ -3520,8 +3532,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn reindex_progress_callback_called() {
+    #[test]
+    fn reindex_progress_callback_called() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -3571,10 +3583,10 @@ mod tests {
             "expected >= 2 progress calls, got {}",
             calls.len()
         );
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_progress_percentage_monotonic() {
+    #[test]
+    fn reindex_progress_percentage_monotonic() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -3627,10 +3639,10 @@ mod tests {
                 i
             );
         }
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_stats_accurate_event_count() {
+    #[test]
+    fn reindex_stats_accurate_event_count() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -3680,10 +3692,10 @@ mod tests {
         assert!(stats.caught_up);
         // final_ordinal may be the boundary event that triggered the stop
         assert!(stats.final_ordinal.is_some());
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_complete_callback_with_stats() {
+    #[test]
+    fn reindex_complete_callback_with_stats() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -3731,10 +3743,10 @@ mod tests {
         assert_eq!(stats.indexed_count, 5);
         assert!(stats.caught_up);
         assert!(stats.duration_ms < 10_000); // should finish in well under 10s
-    }
+        }); }
 
-    #[tokio::test]
-    async fn reindex_complete_callback_on_empty_range() {
+    #[test]
+    fn reindex_complete_callback_on_empty_range() { run_async_test(async {
         let dir = tempdir().unwrap();
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -3773,7 +3785,7 @@ mod tests {
         assert_eq!(complete_calls.len(), 1);
         assert_eq!(complete_calls[0].indexed_count, 0);
         assert_eq!(stats.indexed_count, 0);
-    }
+        }); }
 
     #[test]
     fn reindex_stats_from_progress_computes_throughput() {

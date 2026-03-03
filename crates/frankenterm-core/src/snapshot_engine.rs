@@ -1604,20 +1604,22 @@ mod tests {
         assert!(!engine.is_immediate_trigger(SnapshotTrigger::Event));
     }
 
-    #[tokio::test]
-    async fn emit_trigger_sends_to_channel() {
-        let (_tmp, db_path) = setup_test_db();
-        let engine = SnapshotEngine::new(db_path, intelligent_config(5.0));
+    #[test]
+    fn emit_trigger_sends_to_channel() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path, intelligent_config(5.0));
 
-        assert!(engine.emit_trigger(SnapshotTrigger::WorkCompleted));
-        assert!(engine.emit_trigger(SnapshotTrigger::StateTransition));
+            assert!(engine.emit_trigger(SnapshotTrigger::WorkCompleted));
+            assert!(engine.emit_trigger(SnapshotTrigger::StateTransition));
 
-        let mut rx = engine.trigger_rx.lock().await.take().unwrap();
-        assert_eq!(recv_trigger(&mut rx).await, SnapshotTrigger::WorkCompleted);
-        assert_eq!(
-            recv_trigger(&mut rx).await,
-            SnapshotTrigger::StateTransition
-        );
+            let mut rx = engine.trigger_rx.lock().await.take().unwrap();
+            assert_eq!(recv_trigger(&mut rx).await, SnapshotTrigger::WorkCompleted);
+            assert_eq!(
+                recv_trigger(&mut rx).await,
+                SnapshotTrigger::StateTransition
+            );
+        });
     }
 
     fn checkpoint_count(db_path: &str) -> i64 {
