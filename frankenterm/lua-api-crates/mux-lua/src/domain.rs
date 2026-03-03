@@ -16,7 +16,7 @@ impl MuxDomain {
 impl UserData for MuxDomain {
     fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
         methods.add_meta_method(mlua::MetaMethod::ToString, |_, this, _: ()| {
-            Ok(format!("MuxDomain(pane_id:{}, pid:{})", this.0, unsafe {
+            Ok(format!("MuxDomain(domain_id:{}, pid:{})", this.0, unsafe {
                 libc::getpid()
             }))
         });

@@ -120,7 +120,7 @@ impl UserData for MuxTab {
         methods.add_method("rotate_clockwise", |_, this, _: ()| {
             let mux = get_mux()?;
             let tab = this.resolve(&mux)?;
-            tab.rotate_counter_clockwise();
+            tab.rotate_clockwise();
             Ok(())
         });
 
