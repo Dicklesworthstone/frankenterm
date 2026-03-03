@@ -10,6 +10,12 @@ pub use fastmcp::{
     Content as FrameworkContent, McpContext as FrameworkMcpContext, McpError as FrameworkMcpError,
     McpResult as FrameworkMcpResult, Tool as FrameworkTool,
 };
+#[cfg(any(feature = "mcp", feature = "mcp-client"))]
+#[allow(unused_imports)]
+pub use fastmcp::memory::create_memory_transport_pair as framework_create_memory_transport_pair;
+#[cfg(any(feature = "mcp", feature = "mcp-client"))]
+#[allow(unused_imports)]
+pub use fastmcp::testing::TestClient as FrameworkTestClient;
 
 #[cfg(feature = "mcp-client")]
 #[allow(unused_imports)]

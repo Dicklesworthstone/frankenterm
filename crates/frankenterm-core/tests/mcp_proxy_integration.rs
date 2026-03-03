@@ -1,14 +1,8 @@
 #![cfg(all(feature = "mcp", feature = "mcp-client"))]
 
-mod mcp_test_framework {
-    pub use fastmcp::Content as FrameworkContent;
-    pub use fastmcp::memory::create_memory_transport_pair as framework_create_memory_transport_pair;
-    pub use fastmcp::testing::TestClient as FrameworkTestClient;
-}
-
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
-use mcp_test_framework::{
+use frankenterm_core::mcp_framework::{
     FrameworkContent, FrameworkTestClient, framework_create_memory_transport_pair,
 };
 use rusqlite::{Connection, OptionalExtension};

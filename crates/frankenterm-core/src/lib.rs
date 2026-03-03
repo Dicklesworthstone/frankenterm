@@ -190,7 +190,8 @@ pub mod lru_cache;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 #[cfg(any(feature = "mcp", feature = "mcp-client"))]
-mod mcp_framework;
+#[doc(hidden)]
+pub mod mcp_framework;
 #[cfg(feature = "mcp-client")]
 pub mod mcp_client;
 #[cfg(feature = "mcp")]
