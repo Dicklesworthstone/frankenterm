@@ -536,12 +536,14 @@ scrollback_lines = 5000
 
     #[test]
     fn resize_wrap_scorecard_config_loads() {
+        // Use non-default values to prove TOML parsing overrides defaults
+        // (defaults are: 500, 2000, 20)
         let toml_str = r#"
 resize_wrap_scorecard_enabled = true
 resize_wrap_readability_gate_enabled = true
-resize_wrap_readability_max_line_badness_delta = 500
-resize_wrap_readability_max_total_badness_delta = 2000
-resize_wrap_readability_max_fallback_ratio_percent = 20
+resize_wrap_readability_max_line_badness_delta = 1000
+resize_wrap_readability_max_total_badness_delta = 5000
+resize_wrap_readability_max_fallback_ratio_percent = 40
 "#;
         let toml_value: toml::Value = toml_str.parse().unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
@@ -555,9 +557,9 @@ resize_wrap_readability_max_fallback_ratio_percent = 20
         .unwrap();
         assert!(cfg.resize_wrap_scorecard_enabled);
         assert!(cfg.resize_wrap_readability_gate_enabled);
-        assert_eq!(cfg.resize_wrap_readability_max_line_badness_delta, 500);
-        assert_eq!(cfg.resize_wrap_readability_max_total_badness_delta, 2000);
-        assert_eq!(cfg.resize_wrap_readability_max_fallback_ratio_percent, 20);
+        assert_eq!(cfg.resize_wrap_readability_max_line_badness_delta, 1000);
+        assert_eq!(cfg.resize_wrap_readability_max_total_badness_delta, 5000);
+        assert_eq!(cfg.resize_wrap_readability_max_fallback_ratio_percent, 40);
     }
 
     #[test]
@@ -659,7 +661,7 @@ resize_wrap_readability_gate_enabled = false
 name = "production"
 remote_address = "10.0.0.5:22"
 username = "deploy"
-connect_automatically = false
+connect_automatically = true
 
 [[ssh_domains]]
 name = "staging"
@@ -680,10 +682,13 @@ remote_address = "staging.example.com"
         assert_eq!(domains[0].name, "production");
         assert_eq!(domains[0].remote_address, "10.0.0.5:22");
         assert_eq!(domains[0].username.as_deref(), Some("deploy"));
-        assert!(!domains[0].connect_automatically);
+        // connect_automatically defaults to false; verify TOML override to true
+        assert!(domains[0].connect_automatically);
         assert_eq!(domains[1].name, "staging");
         assert_eq!(domains[1].remote_address, "staging.example.com");
         assert!(domains[1].username.is_none());
+        // staging doesn't set connect_automatically, so it should default to false
+        assert!(!domains[1].connect_automatically);
     }
 
     #[test]
@@ -730,5 +735,6 @@ no_agent_auth = true
         assert_eq!(domains.len(), 1);
         assert_eq!(domains[0].name, "custom");
         assert!(domains[0].no_agent_auth);
+        assert_eq!(domains[0].multiplexing, crate::SshMultiplexing::None);
     }
 }

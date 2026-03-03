@@ -67,15 +67,15 @@ connect_automatically = false
 
 # Enable swap layout cycling (Ctrl+Space to cycle).
 # Built-in presets: grid-4, main-side, stacked, main-bottom
-swap_layout_enabled = true
+# swap_layout_enabled = true  # not yet wired to Config — always on
 
 # Layout cycle order. Remove entries to disable specific layouts.
 # swap_layout_cycle = ["grid-4", "main-side", "stacked", "main-bottom"]
 
 # --- Floating Panes ---
 
-# Enable floating pane support (Ctrl+Shift+F to toggle).
-floating_panes_enabled = true
+# Floating pane support (Ctrl+Shift+F to toggle).
+# floating_panes_enabled = true  # not yet wired to Config — always on
 
 # Default opacity for floating panes (0.0–1.0).
 # floating_pane_opacity = 0.95
