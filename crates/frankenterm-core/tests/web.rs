@@ -7,7 +7,7 @@ mod web_tests {
     use frankenterm_core::events::{Event, EventBus};
     use frankenterm_core::patterns::{AgentType, Detection, Severity};
     use frankenterm_core::runtime_compat::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{read, AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
         sleep, task, timeout,
     };
@@ -92,7 +92,7 @@ mod web_tests {
                             break;
                         }
                         let mut chunk = [0_u8; 2048];
-                        match timeout(deadline - now, stream.read(&mut chunk)).await {
+                        match timeout(deadline - now, read(&mut stream, &mut chunk)).await {
                             Ok(Ok(0)) => break,
                             Ok(Ok(n)) => {
                                 buf.extend_from_slice(&chunk[..n]);
@@ -369,7 +369,7 @@ mod web_tests {
         let server_task = task::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let mut req_buf = [0_u8; 512];
-            let _ = timeout(Duration::from_millis(250), stream.read(&mut req_buf)).await;
+            let _ = timeout(Duration::from_millis(250), read(&mut stream, &mut req_buf)).await;
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
