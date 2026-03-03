@@ -129,6 +129,44 @@ assert_log_contains() {
   fi
 }
 
+run_source_scan_expect_no_match() {
+  local label="$1"
+  local decision_path="$2"
+  local input_summary="$3"
+  local pattern="$4"
+  shift 4
+
+  local output_file="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}.scan.log"
+  local artifact
+  artifact="$(basename "${output_file}")"
+
+  emit_log "validation" "${decision_path}" "${input_summary}" "running" "none" "none" "${artifact}"
+
+  set +e
+  (
+    cd "${ROOT_DIR}"
+    rg -n "${pattern}" "$@"
+  ) > "${output_file}" 2>&1
+  local rc=$?
+  set -e
+
+  case ${rc} in
+    1)
+      emit_log "validation" "${decision_path}" "${input_summary}" "passed" "source_scan_no_matches" "none" "${artifact}"
+      ;;
+    0)
+      cat "${output_file}" | tee -a "${STDOUT_FILE}" >/dev/null
+      emit_log "validation" "${decision_path}" "${input_summary}" "failed" "source_scan_detected_forbidden_usage" "SOURCE-SCAN-HIT" "${artifact}"
+      exit 1
+      ;;
+    *)
+      cat "${output_file}" | tee -a "${STDOUT_FILE}" >/dev/null
+      emit_log "validation" "${decision_path}" "${input_summary}" "failed" "source_scan_command_error" "SOURCE-SCAN-ERROR" "${artifact}"
+      exit 1
+      ;;
+  esac
+}
+
 : > "${STDOUT_FILE}"
 
 require_cmd jq
@@ -138,6 +176,27 @@ require_cmd cargo
 
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
 emit_log "preflight" "cargo_target" "target_dir=${TARGET_DIR}" "configured" "none" "none" "$(basename "${LOG_FILE}")"
+
+run_source_scan_expect_no_match \
+  "source_scan_smol_namespace" \
+  "runtime_feature.source_scan.smol_namespace" \
+  "rg -n \\bsmol:: frankenterm/mux/src" \
+  "\\bsmol::" \
+  "frankenterm/mux/src"
+
+run_source_scan_expect_no_match \
+  "source_scan_tokio_namespace" \
+  "runtime_feature.source_scan.tokio_namespace" \
+  "rg -n \\btokio:: frankenterm/mux/src" \
+  "\\btokio::" \
+  "frankenterm/mux/src"
+
+run_source_scan_expect_no_match \
+  "source_scan_runtime_dependency_keys" \
+  "runtime_feature.source_scan.runtime_dependency_keys" \
+  "rg -n ^\\s*(smol|tokio)\\s*= frankenterm/mux/Cargo.toml" \
+  "^\\s*(smol|tokio)\\s*=" \
+  "frankenterm/mux/Cargo.toml"
 
 run_rch_expect_success \
   "nominal_default_runtime" \
