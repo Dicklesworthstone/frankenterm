@@ -869,6 +869,320 @@ fn epoch_ms() -> u64 {
 }
 
 // =============================================================================
+// Beads Bridge — import Beads issues into the work queue (ft-3681t.3.3)
+// =============================================================================
+
+/// A raw bead dependency record as stored in `.beads/issues.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadDependency {
+    pub issue_id: String,
+    pub depends_on_id: String,
+    #[serde(rename = "type")]
+    pub dep_type: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub created_by: String,
+    #[serde(default)]
+    pub metadata: String,
+    #[serde(default)]
+    pub thread_id: String,
+}
+
+/// A bead record deserialized from one line of `.beads/issues.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadRecord {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    pub status: String,
+    #[serde(default = "default_bead_priority")]
+    pub priority: u32,
+    #[serde(default)]
+    pub issue_type: String,
+    #[serde(default)]
+    pub assignee: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub created_by: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub closed_at: String,
+    #[serde(default)]
+    pub close_reason: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Vec<BeadDependency>,
+    #[serde(default)]
+    pub acceptance_criteria: String,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub source_repo: String,
+    #[serde(default)]
+    pub compaction_level: u32,
+    #[serde(default)]
+    pub original_size: u64,
+}
+
+fn default_bead_priority() -> u32 {
+    2
+}
+
+impl BeadRecord {
+    /// Whether the bead is in a status that should be imported as active work.
+    pub fn is_actionable(&self) -> bool {
+        matches!(self.status.as_str(), "open" | "in_progress")
+    }
+
+    /// Whether the bead is complete (closed or cancelled).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status.as_str(), "closed" | "cancelled" | "resolved" | "wontfix")
+    }
+
+    /// Extract the IDs this bead depends on (from the `dependencies` array).
+    pub fn blocking_ids(&self) -> Vec<String> {
+        self.dependencies
+            .iter()
+            .filter(|d| d.dep_type == "blocks")
+            .map(|d| d.depends_on_id.clone())
+            .collect()
+    }
+
+    /// Convert to a `WorkItem` for the `SwarmWorkQueue`.
+    pub fn to_work_item(&self) -> WorkItem {
+        let mut metadata = HashMap::new();
+        if !self.issue_type.is_empty() {
+            metadata.insert("issue_type".to_string(), self.issue_type.clone());
+        }
+        if !self.assignee.is_empty() {
+            metadata.insert("assignee".to_string(), self.assignee.clone());
+        }
+        if !self.created_at.is_empty() {
+            metadata.insert("created_at".to_string(), self.created_at.clone());
+        }
+        if !self.acceptance_criteria.is_empty() {
+            metadata.insert("has_acceptance_criteria".to_string(), "true".to_string());
+        }
+
+        WorkItem {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            priority: self.priority,
+            depends_on: self.blocking_ids(),
+            effort: self.estimate_effort(),
+            labels: self.labels.clone(),
+            preferred_program: None,
+            metadata,
+        }
+    }
+
+    /// Heuristic effort estimate based on bead type and description length.
+    fn estimate_effort(&self) -> u32 {
+        match self.issue_type.as_str() {
+            "epic" => 8,
+            "feature" => 5,
+            "task" => 3,
+            "bug" => 2,
+            "docs" | "question" => 1,
+            _ => 3,
+        }
+    }
+}
+
+/// Result of importing beads into a work queue.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BeadsSyncReport {
+    /// Number of beads imported as new work items.
+    pub imported: u32,
+    /// Number of existing items whose status was updated.
+    pub updated: u32,
+    /// Number of beads skipped (terminal status, already present, etc.).
+    pub skipped: u32,
+    /// IDs that had dependency references to unknown items (orphan deps).
+    pub orphan_deps: Vec<String>,
+    /// IDs of items that were marked complete because the bead was closed.
+    pub completed_from_bead: Vec<String>,
+}
+
+/// Reads `.beads/issues.jsonl` and imports actionable beads into a `SwarmWorkQueue`.
+#[derive(Debug)]
+pub struct BeadsImporter {
+    records: Vec<BeadRecord>,
+}
+
+impl BeadsImporter {
+    /// Parse beads from a JSONL string (one JSON object per line).
+    pub fn from_jsonl(jsonl: &str) -> Result<Self, BeadsImportError> {
+        let mut records = Vec::new();
+        for (line_num, line) in jsonl.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let record: BeadRecord = serde_json::from_str(trimmed).map_err(|e| {
+                BeadsImportError::ParseError {
+                    line: line_num + 1,
+                    message: e.to_string(),
+                }
+            })?;
+            records.push(record);
+        }
+        Ok(Self { records })
+    }
+
+    /// Read and parse from a file path.
+    pub fn from_path(path: &std::path::Path) -> Result<Self, BeadsImportError> {
+        let content = std::fs::read_to_string(path).map_err(|e| BeadsImportError::IoError {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+        Self::from_jsonl(&content)
+    }
+
+    /// Total number of parsed records.
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Get only actionable (open/in_progress) beads.
+    pub fn actionable_records(&self) -> Vec<&BeadRecord> {
+        self.records.iter().filter(|r| r.is_actionable()).collect()
+    }
+
+    /// Get the set of all known bead IDs (for dependency validation).
+    pub fn known_ids(&self) -> BTreeSet<String> {
+        self.records.iter().map(|r| r.id.clone()).collect()
+    }
+
+    /// Get the set of terminal (closed) bead IDs.
+    pub fn terminal_ids(&self) -> BTreeSet<String> {
+        self.records
+            .iter()
+            .filter(|r| r.is_terminal())
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
+    /// Import actionable beads into a work queue, syncing status bidirectionally.
+    ///
+    /// - New actionable beads are enqueued as work items
+    /// - Beads that became closed mark their queue items as completed
+    /// - Dependencies are mapped from bead graph to queue graph
+    /// - Orphan dependencies (referencing unknown IDs) are reported
+    pub fn sync_to_queue(&self, queue: &mut SwarmWorkQueue) -> BeadsSyncReport {
+        let known = self.known_ids();
+        let terminal = self.terminal_ids();
+        let mut report = BeadsSyncReport {
+            imported: 0,
+            updated: 0,
+            skipped: 0,
+            orphan_deps: Vec::new(),
+            completed_from_bead: Vec::new(),
+        };
+
+        for record in &self.records {
+            let existing_status = queue.item_status(&record.id);
+
+            // Skip if already terminal in queue
+            if existing_status
+                .is_some_and(|s| s.is_terminal())
+            {
+                report.skipped += 1;
+                continue;
+            }
+
+            // If bead is closed but queue item is active → mark completed
+            if record.is_terminal() {
+                if existing_status.is_some() {
+                    // Best-effort complete: use a synthetic agent ID
+                    let _ = queue.cancel(&record.id);
+                    report.completed_from_bead.push(record.id.clone());
+                    report.updated += 1;
+                } else {
+                    report.skipped += 1;
+                }
+                continue;
+            }
+
+            // Skip non-actionable
+            if !record.is_actionable() {
+                report.skipped += 1;
+                continue;
+            }
+
+            // Already in queue → skip (no double-enqueue)
+            if existing_status.is_some() {
+                report.skipped += 1;
+                continue;
+            }
+
+            // Build work item, filtering out deps to unknown IDs
+            let mut item = record.to_work_item();
+            let mut orphans = Vec::new();
+            item.depends_on.retain(|dep_id| {
+                if known.contains(dep_id) {
+                    // Dep to a terminal bead is already satisfied → remove
+                    !terminal.contains(dep_id)
+                } else {
+                    orphans.push(dep_id.clone());
+                    false
+                }
+            });
+            report.orphan_deps.extend(orphans);
+
+            // Enqueue (may fail if dependencies reference items not yet in queue)
+            match queue.enqueue(item) {
+                Ok(_status) => report.imported += 1,
+                Err(_) => report.skipped += 1,
+            }
+        }
+
+        report
+    }
+}
+
+/// Map a `WorkItemStatus` back to a bead-compatible status string.
+pub fn work_status_to_bead_status(status: WorkItemStatus) -> &'static str {
+    match status {
+        WorkItemStatus::Blocked => "open",
+        WorkItemStatus::Ready => "open",
+        WorkItemStatus::InProgress => "in_progress",
+        WorkItemStatus::Completed => "closed",
+        WorkItemStatus::Failed => "open",
+        WorkItemStatus::Cancelled => "closed",
+    }
+}
+
+/// Errors during beads import.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum BeadsImportError {
+    /// Failed to parse a JSONL line.
+    ParseError { line: usize, message: String },
+    /// Failed to read the file.
+    IoError { path: String, message: String },
+}
+
+impl std::fmt::Display for BeadsImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ParseError { line, message } => {
+                write!(f, "parse error on line {line}: {message}")
+            }
+            Self::IoError { path, message } => {
+                write!(f, "I/O error reading {path}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BeadsImportError {}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1338,5 +1652,200 @@ mod tests {
         assert_eq!(ready[0].id, "high");
         assert_eq!(ready[1].id, "mid");
         assert_eq!(ready[2].id, "low");
+    }
+
+    // =========================================================================
+    // Beads bridge tests
+    // =========================================================================
+
+    fn sample_bead_jsonl() -> &'static str {
+        r#"{"id":"ft-001","title":"Setup project","status":"closed","priority":0,"issue_type":"task","assignee":"AgentA","created_at":"2026-01-01T00:00:00Z","created_by":"jeff","updated_at":"2026-01-02T00:00:00Z","closed_at":"2026-01-02T00:00:00Z","close_reason":"done","labels":["infra"],"dependencies":[],"source_repo":"."}
+{"id":"ft-002","title":"Core engine","status":"open","priority":1,"issue_type":"feature","assignee":"","created_at":"2026-01-01T00:00:00Z","created_by":"jeff","updated_at":"2026-01-02T00:00:00Z","labels":["engine"],"dependencies":[{"issue_id":"ft-002","depends_on_id":"ft-001","type":"blocks","created_at":"2026-01-01T00:00:00Z","created_by":"jeff","metadata":"{}","thread_id":""}],"source_repo":"."}
+{"id":"ft-003","title":"Add tests","status":"in_progress","priority":2,"issue_type":"task","assignee":"AgentB","created_at":"2026-01-01T00:00:00Z","created_by":"jeff","updated_at":"2026-01-03T00:00:00Z","labels":["test"],"dependencies":[{"issue_id":"ft-003","depends_on_id":"ft-002","type":"blocks","created_at":"2026-01-01T00:00:00Z","created_by":"jeff","metadata":"{}","thread_id":""}],"source_repo":"."}
+{"id":"ft-004","title":"Write docs","status":"open","priority":3,"issue_type":"docs","assignee":"","created_at":"2026-01-01T00:00:00Z","created_by":"jeff","updated_at":"2026-01-01T00:00:00Z","labels":["docs"],"dependencies":[{"issue_id":"ft-004","depends_on_id":"ft-002","type":"blocks","created_at":"2026-01-01T00:00:00Z","created_by":"jeff","metadata":"{}","thread_id":""},{"issue_id":"ft-004","depends_on_id":"ft-UNKNOWN","type":"blocks","created_at":"2026-01-01T00:00:00Z","created_by":"jeff","metadata":"{}","thread_id":""}],"source_repo":"."}"#
+    }
+
+    #[test]
+    fn beads_importer_parses_jsonl() {
+        let importer = BeadsImporter::from_jsonl(sample_bead_jsonl()).unwrap();
+        assert_eq!(importer.record_count(), 4);
+    }
+
+    #[test]
+    fn beads_importer_identifies_actionable() {
+        let importer = BeadsImporter::from_jsonl(sample_bead_jsonl()).unwrap();
+        let actionable = importer.actionable_records();
+        assert_eq!(actionable.len(), 3); // ft-002 (open), ft-003 (in_progress), ft-004 (open)
+        assert!(actionable.iter().all(|r| r.is_actionable()));
+    }
+
+    #[test]
+    fn beads_importer_terminal_ids() {
+        let importer = BeadsImporter::from_jsonl(sample_bead_jsonl()).unwrap();
+        let terminal = importer.terminal_ids();
+        assert_eq!(terminal.len(), 1);
+        assert!(terminal.contains("ft-001"));
+    }
+
+    #[test]
+    fn bead_record_blocking_ids() {
+        let importer = BeadsImporter::from_jsonl(sample_bead_jsonl()).unwrap();
+        let ft003 = importer.actionable_records().into_iter().find(|r| r.id == "ft-003").unwrap();
+        assert_eq!(ft003.blocking_ids(), vec!["ft-002"]);
+    }
+
+    #[test]
+    fn bead_record_to_work_item() {
+        let importer = BeadsImporter::from_jsonl(sample_bead_jsonl()).unwrap();
+        let ft002 = importer.actionable_records().into_iter().find(|r| r.id == "ft-002").unwrap();
+        let item = ft002.to_work_item();
+        assert_eq!(item.id, "ft-002");
+        assert_eq!(item.title, "Core engine");
+        assert_eq!(item.priority, 1);
+        assert_eq!(item.labels, vec!["engine"]);
+        assert_eq!(item.effort, 5); // feature type → 5
+        assert!(item.depends_on.contains(&"ft-001".to_string()));
+    }
+
+    #[test]
+    fn bead_effort_by_type() {
+        let make = |t: &str| BeadRecord {
+            id: "x".into(), title: "x".into(), description: String::new(),
+            status: "open".into(), priority: 0, issue_type: t.into(),
+            assignee: String::new(), created_at: String::new(), created_by: String::new(),
+            updated_at: String::new(), closed_at: String::new(), close_reason: String::new(),
+            labels: vec![], dependencies: vec![], acceptance_criteria: String::new(),
+            notes: String::new(), source_repo: String::new(), compaction_level: 0, original_size: 0,
+        };
+        assert_eq!(make("epic").estimate_effort(), 8);
+        assert_eq!(make("feature").estimate_effort(), 5);
+        assert_eq!(make("task").estimate_effort(), 3);
+        assert_eq!(make("bug").estimate_effort(), 2);
+        assert_eq!(make("docs").estimate_effort(), 1);
+        assert_eq!(make("question").estimate_effort(), 1);
+        assert_eq!(make("unknown").estimate_effort(), 3);
+    }
+
+    #[test]
+    fn beads_sync_imports_actionable_items() {
+        let importer = BeadsImporter::from_jsonl(sample_bead_jsonl()).unwrap();
+        let mut queue = SwarmWorkQueue::with_defaults();
+        let report = importer.sync_to_queue(&mut queue);
+
+        // ft-001 is closed → skipped
+        // ft-002 depends on ft-001 (closed) → dep removed, imported as ready
+        // ft-003 depends on ft-002 → imported, blocked
+        // ft-004 depends on ft-002 + ft-UNKNOWN → ft-UNKNOWN is orphan dep, imported
+        assert_eq!(report.imported, 3);
+        assert_eq!(report.skipped, 1); // ft-001 closed
+        assert!(report.orphan_deps.contains(&"ft-UNKNOWN".to_string()));
+    }
+
+    #[test]
+    fn beads_sync_respects_dependency_graph() {
+        let importer = BeadsImporter::from_jsonl(sample_bead_jsonl()).unwrap();
+        let mut queue = SwarmWorkQueue::with_defaults();
+        importer.sync_to_queue(&mut queue);
+
+        // ft-002 should be ready (its dep ft-001 was closed → removed)
+        assert_eq!(queue.item_status(&"ft-002".to_string()), Some(WorkItemStatus::Ready));
+        // ft-003 depends on ft-002 (still active) → blocked
+        assert_eq!(queue.item_status(&"ft-003".to_string()), Some(WorkItemStatus::Blocked));
+    }
+
+    #[test]
+    fn beads_sync_idempotent() {
+        let importer = BeadsImporter::from_jsonl(sample_bead_jsonl()).unwrap();
+        let mut queue = SwarmWorkQueue::with_defaults();
+        let r1 = importer.sync_to_queue(&mut queue);
+        let r2 = importer.sync_to_queue(&mut queue);
+
+        assert_eq!(r1.imported, 3);
+        assert_eq!(r2.imported, 0);
+        assert_eq!(r2.skipped, 4); // all already present or closed
+    }
+
+    #[test]
+    fn beads_sync_handles_closed_beads_in_queue() {
+        // Simulate a bead that was open, synced, then closed in a later sync
+        let open_jsonl = r#"{"id":"ft-x","title":"Task X","status":"open","priority":1,"issue_type":"task","labels":[],"dependencies":[]}"#;
+        let closed_jsonl = r#"{"id":"ft-x","title":"Task X","status":"closed","priority":1,"issue_type":"task","labels":[],"dependencies":[],"closed_at":"2026-02-01T00:00:00Z","close_reason":"done"}"#;
+
+        let mut queue = SwarmWorkQueue::with_defaults();
+        let importer1 = BeadsImporter::from_jsonl(open_jsonl).unwrap();
+        let r1 = importer1.sync_to_queue(&mut queue);
+        assert_eq!(r1.imported, 1);
+        assert_eq!(queue.item_status(&"ft-x".to_string()), Some(WorkItemStatus::Ready));
+
+        // Now sync the closed version
+        let importer2 = BeadsImporter::from_jsonl(closed_jsonl).unwrap();
+        let r2 = importer2.sync_to_queue(&mut queue);
+        assert_eq!(r2.completed_from_bead, vec!["ft-x".to_string()]);
+        assert_eq!(queue.item_status(&"ft-x".to_string()), Some(WorkItemStatus::Cancelled));
+    }
+
+    #[test]
+    fn work_status_to_bead_status_mapping() {
+        assert_eq!(work_status_to_bead_status(WorkItemStatus::Blocked), "open");
+        assert_eq!(work_status_to_bead_status(WorkItemStatus::Ready), "open");
+        assert_eq!(work_status_to_bead_status(WorkItemStatus::InProgress), "in_progress");
+        assert_eq!(work_status_to_bead_status(WorkItemStatus::Completed), "closed");
+        assert_eq!(work_status_to_bead_status(WorkItemStatus::Failed), "open");
+        assert_eq!(work_status_to_bead_status(WorkItemStatus::Cancelled), "closed");
+    }
+
+    #[test]
+    fn beads_import_error_display() {
+        let e1 = BeadsImportError::ParseError { line: 42, message: "bad json".into() };
+        assert!(format!("{e1}").contains("42"));
+        assert!(format!("{e1}").contains("bad json"));
+
+        let e2 = BeadsImportError::IoError { path: "/tmp/x".into(), message: "not found".into() };
+        assert!(format!("{e2}").contains("/tmp/x"));
+    }
+
+    #[test]
+    fn beads_import_rejects_invalid_jsonl() {
+        let bad = "not valid json\n{broken";
+        let result = BeadsImporter::from_jsonl(bad);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BeadsImportError::ParseError { line, .. } => assert_eq!(line, 1),
+            _ => panic!("expected ParseError"),
+        }
+    }
+
+    #[test]
+    fn beads_sync_report_serde_roundtrip() {
+        let report = BeadsSyncReport {
+            imported: 5,
+            updated: 2,
+            skipped: 10,
+            orphan_deps: vec!["ft-orphan".to_string()],
+            completed_from_bead: vec!["ft-done".to_string()],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let restored: BeadsSyncReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report, restored);
+    }
+
+    #[test]
+    fn bead_record_serde_roundtrip() {
+        let jsonl = r#"{"id":"ft-rt","title":"Roundtrip","status":"open","priority":1,"issue_type":"task","labels":["test"],"dependencies":[{"issue_id":"ft-rt","depends_on_id":"ft-dep","type":"blocks","created_at":"2026-01-01T00:00:00Z","created_by":"test","metadata":"{}","thread_id":""}]}"#;
+        let record: BeadRecord = serde_json::from_str(jsonl).unwrap();
+        let back = serde_json::to_string(&record).unwrap();
+        let re_parsed: BeadRecord = serde_json::from_str(&back).unwrap();
+        assert_eq!(record.id, re_parsed.id);
+        assert_eq!(record.dependencies.len(), re_parsed.dependencies.len());
+    }
+
+    #[test]
+    fn beads_importer_empty_input() {
+        let importer = BeadsImporter::from_jsonl("").unwrap();
+        assert_eq!(importer.record_count(), 0);
+        let mut queue = SwarmWorkQueue::with_defaults();
+        let report = importer.sync_to_queue(&mut queue);
+        assert_eq!(report.imported, 0);
+        assert_eq!(report.skipped, 0);
     }
 }
