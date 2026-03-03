@@ -434,6 +434,18 @@ mod tests {
     use super::*;
     use crate::wezterm::{MockWezterm, WeztermInterface};
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build restore_scrollback test runtime");
+        runtime.block_on(future);
+    }
+
     fn make_injector(mock: Arc<MockWezterm>) -> ScrollbackInjector {
         ScrollbackInjector::new(mock, InjectionConfig::default())
     }
@@ -606,153 +618,167 @@ mod tests {
 
     // --- Injection integration tests ---
 
-    #[tokio::test]
-    async fn inject_single_pane() {
-        let mock = Arc::new(MockWezterm::new());
-        mock.add_default_pane(10).await;
-        let injector = make_injector(mock.clone());
+    #[test]
+    fn inject_single_pane() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(10).await;
+            let injector = make_injector(mock.clone());
 
-        let mut pane_id_map = HashMap::new();
-        pane_id_map.insert(1_u64, 10_u64);
+            let mut pane_id_map = HashMap::new();
+            pane_id_map.insert(1_u64, 10_u64);
 
-        let mut scrollbacks = HashMap::new();
-        scrollbacks.insert(1, mock_scrollback(vec!["line1", "line2", "line3"]));
+            let mut scrollbacks = HashMap::new();
+            scrollbacks.insert(1, mock_scrollback(vec!["line1", "line2", "line3"]));
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
+            let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 1);
-        assert_eq!(report.failure_count(), 0);
-        assert_eq!(report.successes[0].lines_injected, 3);
-        assert!(report.successes[0].bytes_written > 0);
+            assert_eq!(report.success_count(), 1);
+            assert_eq!(report.failure_count(), 0);
+            assert_eq!(report.successes[0].lines_injected, 3);
+            assert!(report.successes[0].bytes_written > 0);
 
-        // Verify content was sent to the mock pane.
-        let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-        assert!(text.contains("line1"));
-        assert!(text.contains("line3"));
+            // Verify content was sent to the mock pane.
+            let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
+            assert!(text.contains("line1"));
+            assert!(text.contains("line3"));
+        });
     }
 
-    #[tokio::test]
-    async fn inject_multiple_panes() {
-        let mock = Arc::new(MockWezterm::new());
-        mock.add_default_pane(10).await;
-        mock.add_default_pane(11).await;
-        let injector = make_injector(mock.clone());
+    #[test]
+    fn inject_multiple_panes() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(10).await;
+            mock.add_default_pane(11).await;
+            let injector = make_injector(mock.clone());
 
-        let mut pane_id_map = HashMap::new();
-        pane_id_map.insert(1_u64, 10_u64);
-        pane_id_map.insert(2_u64, 11_u64);
+            let mut pane_id_map = HashMap::new();
+            pane_id_map.insert(1_u64, 10_u64);
+            pane_id_map.insert(2_u64, 11_u64);
 
-        let mut scrollbacks = HashMap::new();
-        scrollbacks.insert(1, mock_scrollback(vec!["pane1-output"]));
-        scrollbacks.insert(2, mock_scrollback(vec!["pane2-output"]));
+            let mut scrollbacks = HashMap::new();
+            scrollbacks.insert(1, mock_scrollback(vec!["pane1-output"]));
+            scrollbacks.insert(2, mock_scrollback(vec!["pane2-output"]));
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
+            let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 2);
-        assert_eq!(report.failure_count(), 0);
+            assert_eq!(report.success_count(), 2);
+            assert_eq!(report.failure_count(), 0);
+        });
     }
 
-    #[tokio::test]
-    async fn inject_skips_unmapped_panes() {
-        let mock = Arc::new(MockWezterm::new());
-        let injector = make_injector(mock.clone());
+    #[test]
+    fn inject_skips_unmapped_panes() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let injector = make_injector(mock.clone());
 
-        let pane_id_map = HashMap::new(); // Empty — no mappings.
+            let pane_id_map = HashMap::new(); // Empty — no mappings.
 
-        let mut scrollbacks = HashMap::new();
-        scrollbacks.insert(1, mock_scrollback(vec!["data"]));
+            let mut scrollbacks = HashMap::new();
+            scrollbacks.insert(1, mock_scrollback(vec!["data"]));
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
+            let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 0);
-        assert_eq!(report.skipped.len(), 1);
-        assert_eq!(report.skipped[0], 1);
+            assert_eq!(report.success_count(), 0);
+            assert_eq!(report.skipped.len(), 1);
+            assert_eq!(report.skipped[0], 1);
+        });
     }
 
-    #[tokio::test]
-    async fn inject_empty_scrollback() {
-        let mock = Arc::new(MockWezterm::new());
-        mock.add_default_pane(10).await;
-        let injector = make_injector(mock.clone());
+    #[test]
+    fn inject_empty_scrollback() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(10).await;
+            let injector = make_injector(mock.clone());
 
-        let mut pane_id_map = HashMap::new();
-        pane_id_map.insert(1_u64, 10_u64);
+            let mut pane_id_map = HashMap::new();
+            pane_id_map.insert(1_u64, 10_u64);
 
-        let mut scrollbacks = HashMap::new();
-        scrollbacks.insert(1, ScrollbackData::from_segments(vec![]));
+            let mut scrollbacks = HashMap::new();
+            scrollbacks.insert(1, ScrollbackData::from_segments(vec![]));
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
+            let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 1);
-        assert_eq!(report.successes[0].lines_injected, 0);
-        assert_eq!(report.successes[0].bytes_written, 0);
+            assert_eq!(report.success_count(), 1);
+            assert_eq!(report.successes[0].lines_injected, 0);
+            assert_eq!(report.successes[0].bytes_written, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn inject_truncates_large_scrollback() {
-        let mock = Arc::new(MockWezterm::new());
-        mock.add_default_pane(10).await;
-        let config = InjectionConfig {
-            max_lines: 3,
-            ..Default::default()
-        };
-        let injector = ScrollbackInjector::new(mock.clone(), config);
+    #[test]
+    fn inject_truncates_large_scrollback() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(10).await;
+            let config = InjectionConfig {
+                max_lines: 3,
+                ..Default::default()
+            };
+            let injector = ScrollbackInjector::new(mock.clone(), config);
 
-        let mut pane_id_map = HashMap::new();
-        pane_id_map.insert(1_u64, 10_u64);
+            let mut pane_id_map = HashMap::new();
+            pane_id_map.insert(1_u64, 10_u64);
 
-        let lines: Vec<String> = (0..100).map(|i| format!("line-{i}")).collect();
-        let mut scrollbacks = HashMap::new();
-        scrollbacks.insert(1, ScrollbackData::from_segments(lines));
+            let lines: Vec<String> = (0..100).map(|i| format!("line-{i}")).collect();
+            let mut scrollbacks = HashMap::new();
+            scrollbacks.insert(1, ScrollbackData::from_segments(lines));
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
+            let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 1);
-        assert_eq!(report.successes[0].lines_injected, 3);
+            assert_eq!(report.success_count(), 1);
+            assert_eq!(report.successes[0].lines_injected, 3);
 
-        // Should have kept the last 3 lines (97, 98, 99).
-        let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-        assert!(text.contains("line-99"));
-        assert!(text.contains("line-97"));
+            // Should have kept the last 3 lines (97, 98, 99).
+            let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
+            assert!(text.contains("line-99"));
+            assert!(text.contains("line-97"));
+        });
     }
 
-    #[tokio::test]
-    async fn inject_no_scrollbacks() {
-        let mock = Arc::new(MockWezterm::new());
-        let injector = make_injector(mock.clone());
+    #[test]
+    fn inject_no_scrollbacks() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let injector = make_injector(mock.clone());
 
-        let pane_id_map = HashMap::new();
-        let scrollbacks = HashMap::new();
+            let pane_id_map = HashMap::new();
+            let scrollbacks = HashMap::new();
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
+            let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 0);
-        assert_eq!(report.failure_count(), 0);
-        assert_eq!(report.skipped.len(), 0);
+            assert_eq!(report.success_count(), 0);
+            assert_eq!(report.failure_count(), 0);
+            assert_eq!(report.skipped.len(), 0);
+        });
     }
 
-    #[tokio::test]
-    async fn injection_guard_active_during_inject() {
-        let mock = Arc::new(MockWezterm::new());
-        mock.add_default_pane(10).await;
-        let injector = make_injector(mock.clone());
-        let suppressed = injector.suppressed_panes().clone();
+    #[test]
+    fn injection_guard_active_during_inject() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(10).await;
+            let injector = make_injector(mock.clone());
+            let suppressed = injector.suppressed_panes().clone();
 
-        // Before injection: not suppressed.
-        assert!(!InjectionGuard::is_suppressed(&suppressed, 10));
+            // Before injection: not suppressed.
+            assert!(!InjectionGuard::is_suppressed(&suppressed, 10));
 
-        let mut pane_id_map = HashMap::new();
-        pane_id_map.insert(1_u64, 10_u64);
+            let mut pane_id_map = HashMap::new();
+            pane_id_map.insert(1_u64, 10_u64);
 
-        let mut scrollbacks = HashMap::new();
-        scrollbacks.insert(1, mock_scrollback(vec!["test"]));
+            let mut scrollbacks = HashMap::new();
+            scrollbacks.insert(1, mock_scrollback(vec!["test"]));
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
+            let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 1);
+            assert_eq!(report.success_count(), 1);
 
-        // After injection: suppression cleared.
-        assert!(!InjectionGuard::is_suppressed(&suppressed, 10));
+            // After injection: suppression cleared.
+            assert!(!InjectionGuard::is_suppressed(&suppressed, 10));
+        });
     }
 
     // --- ScrollbackData edge cases ---
@@ -1019,35 +1045,37 @@ mod tests {
 
     // --- Chunked injection ---
 
-    #[tokio::test]
-    async fn inject_with_small_chunks() {
-        let mock = Arc::new(MockWezterm::new());
-        mock.add_default_pane(10).await;
-        let config = InjectionConfig {
-            chunk_size: 16, // Very small chunks.
-            inter_chunk_delay_ms: 0,
-            ..Default::default()
-        };
-        let injector = ScrollbackInjector::new(mock.clone(), config);
+    #[test]
+    fn inject_with_small_chunks() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(10).await;
+            let config = InjectionConfig {
+                chunk_size: 16, // Very small chunks.
+                inter_chunk_delay_ms: 0,
+                ..Default::default()
+            };
+            let injector = ScrollbackInjector::new(mock.clone(), config);
 
-        let mut pane_id_map = HashMap::new();
-        pane_id_map.insert(1_u64, 10_u64);
+            let mut pane_id_map = HashMap::new();
+            pane_id_map.insert(1_u64, 10_u64);
 
-        let mut scrollbacks = HashMap::new();
-        scrollbacks.insert(
-            1,
-            mock_scrollback(vec![
-                "this is a longer line that will require multiple chunks",
-            ]),
-        );
+            let mut scrollbacks = HashMap::new();
+            scrollbacks.insert(
+                1,
+                mock_scrollback(vec![
+                    "this is a longer line that will require multiple chunks",
+                ]),
+            );
 
-        let report = injector.inject(&pane_id_map, &scrollbacks).await;
+            let report = injector.inject(&pane_id_map, &scrollbacks).await;
 
-        assert_eq!(report.success_count(), 1);
-        assert!(report.successes[0].chunks_sent > 1);
+            assert_eq!(report.success_count(), 1);
+            assert!(report.successes[0].chunks_sent > 1);
 
-        // All content should arrive.
-        let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
-        assert!(text.contains("multiple chunks"));
+            // All content should arrive.
+            let text: String = WeztermInterface::get_text(&*mock, 10, false).await.unwrap();
+            assert!(text.contains("multiple chunks"));
+        });
     }
 }

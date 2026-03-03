@@ -356,6 +356,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build notifications test runtime");
+        runtime.block_on(future);
+    }
+
     fn test_detection() -> Detection {
         Detection {
             rule_id: "core.codex:usage_reached".to_string(),
@@ -430,69 +442,75 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn pipeline_sends_when_gate_allows() {
-        let filter = EventFilter::allow_all();
-        let gate =
-            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let sender = MockSender::new("mock", Arc::clone(&sent));
-        let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
+    #[test]
+    fn pipeline_sends_when_gate_allows() {
+        run_async_test(async {
+            let filter = EventFilter::allow_all();
+            let gate =
+                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let sender = MockSender::new("mock", Arc::clone(&sent));
+            let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
 
-        let outcome = pipeline
-            .handle_detection(&test_detection(), 7, None, Some(42))
-            .await;
+            let outcome = pipeline
+                .handle_detection(&test_detection(), 7, None, Some(42))
+                .await;
 
-        assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
-        assert_eq!(outcome.deliveries.len(), 1);
-        assert_eq!(sent.lock().unwrap().len(), 1);
+            assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
+            assert_eq!(outcome.deliveries.len(), 1);
+            assert_eq!(sent.lock().unwrap().len(), 1);
+        });
     }
 
-    #[tokio::test]
-    async fn pipeline_filters_events() {
-        let include: Vec<String> = Vec::new();
-        let exclude = vec!["core.*".to_string()];
-        let agent_types: Vec<String> = Vec::new();
-        let filter = EventFilter::from_config(&include, &exclude, None, &agent_types);
-        let gate =
-            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let sender = MockSender::new("mock", Arc::clone(&sent));
-        let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
+    #[test]
+    fn pipeline_filters_events() {
+        run_async_test(async {
+            let include: Vec<String> = Vec::new();
+            let exclude = vec!["core.*".to_string()];
+            let agent_types: Vec<String> = Vec::new();
+            let filter = EventFilter::from_config(&include, &exclude, None, &agent_types);
+            let gate =
+                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let sender = MockSender::new("mock", Arc::clone(&sent));
+            let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
 
-        let outcome = pipeline
-            .handle_detection(&test_detection(), 7, None, None)
-            .await;
+            let outcome = pipeline
+                .handle_detection(&test_detection(), 7, None, None)
+                .await;
 
-        assert!(matches!(outcome.decision, NotifyDecision::Filtered));
-        assert!(outcome.deliveries.is_empty());
-        assert!(sent.lock().unwrap().is_empty());
+            assert!(matches!(outcome.decision, NotifyDecision::Filtered));
+            assert!(outcome.deliveries.is_empty());
+            assert!(sent.lock().unwrap().is_empty());
+        });
     }
 
-    #[tokio::test]
-    async fn pipeline_deduplicates_repeated_events() {
-        let filter = EventFilter::allow_all();
-        let gate = NotificationGate::from_config(
-            filter,
-            Duration::from_secs(300),
-            Duration::from_secs(60),
-        );
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let sender = MockSender::new("mock", Arc::clone(&sent));
-        let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
+    #[test]
+    fn pipeline_deduplicates_repeated_events() {
+        run_async_test(async {
+            let filter = EventFilter::allow_all();
+            let gate = NotificationGate::from_config(
+                filter,
+                Duration::from_secs(300),
+                Duration::from_secs(60),
+            );
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let sender = MockSender::new("mock", Arc::clone(&sent));
+            let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
 
-        let _ = pipeline
-            .handle_detection(&test_detection(), 7, None, None)
-            .await;
-        let outcome = pipeline
-            .handle_detection(&test_detection(), 7, None, None)
-            .await;
+            let _ = pipeline
+                .handle_detection(&test_detection(), 7, None, None)
+                .await;
+            let outcome = pipeline
+                .handle_detection(&test_detection(), 7, None, None)
+                .await;
 
-        assert!(matches!(
-            outcome.decision,
-            NotifyDecision::Deduplicated { .. }
-        ));
-        assert_eq!(sent.lock().unwrap().len(), 1);
+            assert!(matches!(
+                outcome.decision,
+                NotifyDecision::Deduplicated { .. }
+            ));
+            assert_eq!(sent.lock().unwrap().len(), 1);
+        });
     }
 
     // ========================================================================
@@ -633,67 +651,73 @@ mod tests {
     // Rate limiting (RateLimitedSender)
     // ========================================================================
 
-    #[tokio::test]
-    async fn rate_limited_sender_allows_first_send() {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let inner = MockSender::new("inner", Arc::clone(&sent));
-        let limited = RateLimitedSender::new(inner, Duration::from_secs(60));
+    #[test]
+    fn rate_limited_sender_allows_first_send() {
+        run_async_test(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let inner = MockSender::new("inner", Arc::clone(&sent));
+            let limited = RateLimitedSender::new(inner, Duration::from_secs(60));
 
-        let payload =
-            NotificationPayload::from_detection(&test_detection(), 1, &test_rendered(), 0);
-        let delivery = limited.send(&payload).await;
+            let payload =
+                NotificationPayload::from_detection(&test_detection(), 1, &test_rendered(), 0);
+            let delivery = limited.send(&payload).await;
 
-        assert!(delivery.success);
-        assert!(!delivery.rate_limited);
-        assert_eq!(sent.lock().unwrap().len(), 1);
+            assert!(delivery.success);
+            assert!(!delivery.rate_limited);
+            assert_eq!(sent.lock().unwrap().len(), 1);
+        });
     }
 
-    #[tokio::test]
-    async fn rate_limited_sender_blocks_rapid_second_send() {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let inner = MockSender::new("inner", Arc::clone(&sent));
-        let limited = RateLimitedSender::new(inner, Duration::from_secs(60));
+    #[test]
+    fn rate_limited_sender_blocks_rapid_second_send() {
+        run_async_test(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let inner = MockSender::new("inner", Arc::clone(&sent));
+            let limited = RateLimitedSender::new(inner, Duration::from_secs(60));
 
-        let payload =
-            NotificationPayload::from_detection(&test_detection(), 1, &test_rendered(), 0);
+            let payload =
+                NotificationPayload::from_detection(&test_detection(), 1, &test_rendered(), 0);
 
-        // First send succeeds
-        let d1 = limited.send(&payload).await;
-        assert!(d1.success);
+            // First send succeeds
+            let d1 = limited.send(&payload).await;
+            assert!(d1.success);
 
-        // Immediate second send is rate limited
-        let d2 = limited.send(&payload).await;
-        assert!(!d2.success);
-        assert!(d2.rate_limited);
-        assert_eq!(
-            d2.error.as_deref(),
-            Some("rate_limited"),
-            "should report rate_limited error"
-        );
+            // Immediate second send is rate limited
+            let d2 = limited.send(&payload).await;
+            assert!(!d2.success);
+            assert!(d2.rate_limited);
+            assert_eq!(
+                d2.error.as_deref(),
+                Some("rate_limited"),
+                "should report rate_limited error"
+            );
 
-        // Only 1 delivery reached the inner sender
-        assert_eq!(sent.lock().unwrap().len(), 1);
+            // Only 1 delivery reached the inner sender
+            assert_eq!(sent.lock().unwrap().len(), 1);
+        });
     }
 
-    #[tokio::test]
-    async fn rate_limited_sender_allows_after_interval() {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let inner = MockSender::new("inner", Arc::clone(&sent));
-        let limited = RateLimitedSender::new(inner, Duration::from_millis(10));
+    #[test]
+    fn rate_limited_sender_allows_after_interval() {
+        run_async_test(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let inner = MockSender::new("inner", Arc::clone(&sent));
+            let limited = RateLimitedSender::new(inner, Duration::from_millis(10));
 
-        let payload =
-            NotificationPayload::from_detection(&test_detection(), 1, &test_rendered(), 0);
+            let payload =
+                NotificationPayload::from_detection(&test_detection(), 1, &test_rendered(), 0);
 
-        let d1 = limited.send(&payload).await;
-        assert!(d1.success);
+            let d1 = limited.send(&payload).await;
+            assert!(d1.success);
 
-        // Wait for rate limit to expire
-        std::thread::sleep(Duration::from_millis(15));
+            // Wait for rate limit to expire
+            std::thread::sleep(Duration::from_millis(15));
 
-        let d2 = limited.send(&payload).await;
-        assert!(d2.success, "should allow send after interval");
-        assert!(!d2.rate_limited);
-        assert_eq!(sent.lock().unwrap().len(), 2);
+            let d2 = limited.send(&payload).await;
+            assert!(d2.success, "should allow send after interval");
+            assert!(!d2.rate_limited);
+            assert_eq!(sent.lock().unwrap().len(), 2);
+        });
     }
 
     #[test]
@@ -716,31 +740,33 @@ mod tests {
     // Pipeline: multi-sender fan-out
     // ========================================================================
 
-    #[tokio::test]
-    async fn pipeline_fans_out_to_multiple_senders() {
-        let filter = EventFilter::allow_all();
-        let gate =
-            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+    #[test]
+    fn pipeline_fans_out_to_multiple_senders() {
+        run_async_test(async {
+            let filter = EventFilter::allow_all();
+            let gate =
+                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
 
-        let sent_a = Arc::new(Mutex::new(Vec::new()));
-        let sent_b = Arc::new(Mutex::new(Vec::new()));
-        let sender_a = MockSender::new("a", Arc::clone(&sent_a));
-        let sender_b = MockSender::new("b", Arc::clone(&sent_b));
-        let mut pipeline =
-            NotificationPipeline::new(gate, vec![Box::new(sender_a), Box::new(sender_b)]);
+            let sent_a = Arc::new(Mutex::new(Vec::new()));
+            let sent_b = Arc::new(Mutex::new(Vec::new()));
+            let sender_a = MockSender::new("a", Arc::clone(&sent_a));
+            let sender_b = MockSender::new("b", Arc::clone(&sent_b));
+            let mut pipeline =
+                NotificationPipeline::new(gate, vec![Box::new(sender_a), Box::new(sender_b)]);
 
-        let outcome = pipeline
-            .handle_detection(&test_detection(), 1, None, None)
-            .await;
+            let outcome = pipeline
+                .handle_detection(&test_detection(), 1, None, None)
+                .await;
 
-        assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
-        assert_eq!(
-            outcome.deliveries.len(),
-            2,
-            "should deliver to both senders"
-        );
-        assert_eq!(sent_a.lock().unwrap().len(), 1);
-        assert_eq!(sent_b.lock().unwrap().len(), 1);
+            assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
+            assert_eq!(
+                outcome.deliveries.len(),
+                2,
+                "should deliver to both senders"
+            );
+            assert_eq!(sent_a.lock().unwrap().len(), 1);
+            assert_eq!(sent_b.lock().unwrap().len(), 1);
+        });
     }
 
     #[test]
@@ -757,81 +783,85 @@ mod tests {
         assert_eq!(pipeline.sender_count(), 2);
     }
 
-    #[tokio::test]
-    async fn pipeline_empty_senders_still_returns_outcome() {
-        let filter = EventFilter::allow_all();
-        let gate =
-            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
-        let mut pipeline = NotificationPipeline::new(gate, vec![]);
+    #[test]
+    fn pipeline_empty_senders_still_returns_outcome() {
+        run_async_test(async {
+            let filter = EventFilter::allow_all();
+            let gate =
+                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let mut pipeline = NotificationPipeline::new(gate, vec![]);
 
-        let outcome = pipeline
-            .handle_detection(&test_detection(), 1, None, None)
-            .await;
+            let outcome = pipeline
+                .handle_detection(&test_detection(), 1, None, None)
+                .await;
 
-        assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
-        assert!(
-            outcome.deliveries.is_empty(),
-            "no senders means no deliveries"
-        );
+            assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
+            assert!(
+                outcome.deliveries.is_empty(),
+                "no senders means no deliveries"
+            );
+        });
     }
 
     // ========================================================================
     // Pipeline: mute store integration
     // ========================================================================
 
-    #[tokio::test]
-    async fn pipeline_with_mute_store_blocks_muted_events() {
-        use crate::events::event_identity_key;
-        use crate::storage::{EventMuteRecord, StorageHandle};
+    #[test]
+    fn pipeline_with_mute_store_blocks_muted_events() {
+        run_async_test(async {
+            use crate::events::event_identity_key;
+            use crate::storage::{EventMuteRecord, StorageHandle};
 
-        let db_path =
-            std::env::temp_dir().join(format!("wa_notif_test_mute_{}.db", std::process::id()));
-        let db_str = db_path.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{db_str}-wal"));
-        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+            let db_path =
+                std::env::temp_dir().join(format!("wa_notif_test_mute_{}.db", std::process::id()));
+            let db_str = db_path.to_string_lossy().to_string();
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_str}-shm"));
 
-        let storage = StorageHandle::new(&db_str).await.expect("open test db");
+            let storage = StorageHandle::new(&db_str).await.expect("open test db");
 
-        // Mute the event
-        let detection = test_detection();
-        let identity_key = event_identity_key(&detection, 7, None);
-        let now_ms = crate::storage::now_ms();
-        storage
-            .add_event_mute(EventMuteRecord {
-                identity_key,
-                scope: "workspace".to_string(),
-                created_at: now_ms,
-                expires_at: None,
-                created_by: Some("test".to_string()),
-                reason: Some("too noisy".to_string()),
-            })
-            .await
-            .unwrap();
+            // Mute the event
+            let detection = test_detection();
+            let identity_key = event_identity_key(&detection, 7, None);
+            let now_ms = crate::storage::now_ms();
+            storage
+                .add_event_mute(EventMuteRecord {
+                    identity_key,
+                    scope: "workspace".to_string(),
+                    created_at: now_ms,
+                    expires_at: None,
+                    created_by: Some("test".to_string()),
+                    reason: Some("too noisy".to_string()),
+                })
+                .await
+                .unwrap();
 
-        let filter = EventFilter::allow_all();
-        let gate =
-            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let sender = MockSender::new("mock", Arc::clone(&sent));
-        let storage_arc = Arc::new(crate::runtime_compat::RwLock::new(storage));
-        let mut pipeline =
-            NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
+            let filter = EventFilter::allow_all();
+            let gate =
+                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let sender = MockSender::new("mock", Arc::clone(&sent));
+            let storage_arc = Arc::new(crate::runtime_compat::RwLock::new(storage));
+            let mut pipeline =
+                NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
 
-        let outcome = pipeline.handle_detection(&detection, 7, None, None).await;
+            let outcome = pipeline.handle_detection(&detection, 7, None, None).await;
 
-        assert!(
-            matches!(outcome.decision, NotifyDecision::Filtered),
-            "muted event should be filtered"
-        );
-        assert!(
-            sent.lock().unwrap().is_empty(),
-            "muted event should not be sent"
-        );
+            assert!(
+                matches!(outcome.decision, NotifyDecision::Filtered),
+                "muted event should be filtered"
+            );
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "muted event should not be sent"
+            );
 
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{db_str}-wal"));
-        let _ = std::fs::remove_file(format!("{db_str}-shm"));
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_str}-shm"));
+        });
     }
 
     // ========================================================================
@@ -859,67 +889,73 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn pipeline_handles_sender_failure_gracefully() {
-        let filter = EventFilter::allow_all();
-        let gate =
-            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
-        let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(FailingSender)]);
+    #[test]
+    fn pipeline_handles_sender_failure_gracefully() {
+        run_async_test(async {
+            let filter = EventFilter::allow_all();
+            let gate =
+                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(FailingSender)]);
 
-        let outcome = pipeline
-            .handle_detection(&test_detection(), 1, None, None)
-            .await;
+            let outcome = pipeline
+                .handle_detection(&test_detection(), 1, None, None)
+                .await;
 
-        assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
-        assert_eq!(outcome.deliveries.len(), 1);
-        assert!(!outcome.deliveries[0].success);
-        assert_eq!(
-            outcome.deliveries[0].error.as_deref(),
-            Some("connection refused")
-        );
+            assert!(matches!(outcome.decision, NotifyDecision::Send { .. }));
+            assert_eq!(outcome.deliveries.len(), 1);
+            assert!(!outcome.deliveries[0].success);
+            assert_eq!(
+                outcome.deliveries[0].error.as_deref(),
+                Some("connection refused")
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn pipeline_partial_failure_still_delivers_to_healthy_senders() {
-        let filter = EventFilter::allow_all();
-        let gate =
-            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let good_sender = MockSender::new("good", Arc::clone(&sent));
-        let mut pipeline =
-            NotificationPipeline::new(gate, vec![Box::new(FailingSender), Box::new(good_sender)]);
+    #[test]
+    fn pipeline_partial_failure_still_delivers_to_healthy_senders() {
+        run_async_test(async {
+            let filter = EventFilter::allow_all();
+            let gate =
+                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let good_sender = MockSender::new("good", Arc::clone(&sent));
+            let mut pipeline =
+                NotificationPipeline::new(gate, vec![Box::new(FailingSender), Box::new(good_sender)]);
 
-        let outcome = pipeline
-            .handle_detection(&test_detection(), 1, None, None)
-            .await;
+            let outcome = pipeline
+                .handle_detection(&test_detection(), 1, None, None)
+                .await;
 
-        assert_eq!(outcome.deliveries.len(), 2);
-        // First delivery fails
-        assert!(!outcome.deliveries[0].success);
-        // Second delivery succeeds
-        assert!(outcome.deliveries[1].success);
-        // Good sender received the payload
-        assert_eq!(sent.lock().unwrap().len(), 1);
+            assert_eq!(outcome.deliveries.len(), 2);
+            // First delivery fails
+            assert!(!outcome.deliveries[0].success);
+            // Second delivery succeeds
+            assert!(outcome.deliveries[1].success);
+            // Good sender received the payload
+            assert_eq!(sent.lock().unwrap().len(), 1);
+        });
     }
 
     // ========================================================================
     // Failure sender doesn't leak secrets
     // ========================================================================
 
-    #[tokio::test]
-    async fn failed_delivery_error_does_not_contain_payload() {
-        let filter = EventFilter::allow_all();
-        let gate =
-            NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
-        let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(FailingSender)]);
+    #[test]
+    fn failed_delivery_error_does_not_contain_payload() {
+        run_async_test(async {
+            let filter = EventFilter::allow_all();
+            let gate =
+                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(FailingSender)]);
 
-        let outcome = pipeline
-            .handle_detection(&test_detection(), 1, None, None)
-            .await;
+            let outcome = pipeline
+                .handle_detection(&test_detection(), 1, None, None)
+                .await;
 
-        // Error message should not contain the event payload or secrets
-        let err = outcome.deliveries[0].error.as_deref().unwrap_or("");
-        assert!(!err.contains("sk-abc"), "error should not leak secrets");
+            // Error message should not contain the event payload or secrets
+            let err = outcome.deliveries[0].error.as_deref().unwrap_or("");
+            assert!(!err.contains("sk-abc"), "error should not leak secrets");
+        });
     }
 
     // ========================================================================

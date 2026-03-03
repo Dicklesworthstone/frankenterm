@@ -426,6 +426,18 @@ mod tests {
     use crate::session_topology::{PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot};
     use crate::wezterm::{MockWezterm, WeztermInterface};
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build restore_layout test runtime");
+        runtime.block_on(future);
+    }
+
     fn make_restorer(mock: Arc<MockWezterm>) -> LayoutRestorer {
         LayoutRestorer::new(mock, RestoreConfig::default())
     }
@@ -481,186 +493,252 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn restore_single_pane() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let snapshot = single_tab_snapshot(leaf(42, Some("/home/user")));
+    #[test]
+    fn restore_single_pane() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let snapshot = single_tab_snapshot(leaf(42, Some("/home/user")));
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        assert_eq!(result.panes_created, 1);
-        assert_eq!(result.windows_created, 1);
-        assert_eq!(result.tabs_created, 1);
-        assert!(result.failed_panes.is_empty());
-        assert!(result.pane_id_map.contains_key(&42));
+            assert_eq!(result.panes_created, 1);
+            assert_eq!(result.windows_created, 1);
+            assert_eq!(result.tabs_created, 1);
+            assert!(result.failed_panes.is_empty());
+            assert!(result.pane_id_map.contains_key(&42));
+        });
     }
 
-    #[tokio::test]
-    async fn restore_horizontal_split() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let tree = hsplit(vec![(0.5, leaf(1, None)), (0.5, leaf(2, None))]);
-        let snapshot = single_tab_snapshot(tree);
+    #[test]
+    fn restore_horizontal_split() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let tree = hsplit(vec![(0.5, leaf(1, None)), (0.5, leaf(2, None))]);
+            let snapshot = single_tab_snapshot(tree);
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        assert_eq!(result.panes_created, 2);
-        assert!(result.pane_id_map.contains_key(&1));
-        assert!(result.pane_id_map.contains_key(&2));
-        assert_ne!(result.pane_id_map[&1], result.pane_id_map[&2]);
+            assert_eq!(result.panes_created, 2);
+            assert!(result.pane_id_map.contains_key(&1));
+            assert!(result.pane_id_map.contains_key(&2));
+            assert_ne!(result.pane_id_map[&1], result.pane_id_map[&2]);
+        });
     }
 
-    #[tokio::test]
-    async fn restore_vertical_split() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let tree = vsplit(vec![(0.5, leaf(10, None)), (0.5, leaf(11, None))]);
-        let snapshot = single_tab_snapshot(tree);
+    #[test]
+    fn restore_vertical_split() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let tree = vsplit(vec![(0.5, leaf(10, None)), (0.5, leaf(11, None))]);
+            let snapshot = single_tab_snapshot(tree);
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        assert_eq!(result.panes_created, 2);
-        assert!(result.pane_id_map.contains_key(&10));
-        assert!(result.pane_id_map.contains_key(&11));
+            assert_eq!(result.panes_created, 2);
+            assert!(result.pane_id_map.contains_key(&10));
+            assert!(result.pane_id_map.contains_key(&11));
+        });
     }
 
-    #[tokio::test]
-    async fn restore_three_pane_l_shape() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let tree = vsplit(vec![
-            (0.5, leaf(1, None)),
-            (
-                0.5,
-                hsplit(vec![(0.5, leaf(2, None)), (0.5, leaf(3, None))]),
-            ),
-        ]);
-        let snapshot = single_tab_snapshot(tree);
+    #[test]
+    fn restore_three_pane_l_shape() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let tree = vsplit(vec![
+                (0.5, leaf(1, None)),
+                (
+                    0.5,
+                    hsplit(vec![(0.5, leaf(2, None)), (0.5, leaf(3, None))]),
+                ),
+            ]);
+            let snapshot = single_tab_snapshot(tree);
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        assert_eq!(result.panes_created, 3);
-        for id in [1, 2, 3] {
-            assert!(result.pane_id_map.contains_key(&id));
-        }
+            assert_eq!(result.panes_created, 3);
+            for id in [1, 2, 3] {
+                assert!(result.pane_id_map.contains_key(&id));
+            }
+        });
     }
 
-    #[tokio::test]
-    async fn restore_four_pane_grid() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let tree = hsplit(vec![
-            (
-                0.5,
-                vsplit(vec![(0.5, leaf(1, None)), (0.5, leaf(2, None))]),
-            ),
-            (
-                0.5,
-                vsplit(vec![(0.5, leaf(3, None)), (0.5, leaf(4, None))]),
-            ),
-        ]);
-        let snapshot = single_tab_snapshot(tree);
+    #[test]
+    fn restore_four_pane_grid() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let tree = hsplit(vec![
+                (
+                    0.5,
+                    vsplit(vec![(0.5, leaf(1, None)), (0.5, leaf(2, None))]),
+                ),
+                (
+                    0.5,
+                    vsplit(vec![(0.5, leaf(3, None)), (0.5, leaf(4, None))]),
+                ),
+            ]);
+            let snapshot = single_tab_snapshot(tree);
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        assert_eq!(result.panes_created, 4);
-        for id in 1..=4 {
-            assert!(result.pane_id_map.contains_key(&id));
-        }
-        let new_ids: std::collections::HashSet<_> = result.pane_id_map.values().collect();
-        assert_eq!(new_ids.len(), 4);
+            assert_eq!(result.panes_created, 4);
+            for id in 1..=4 {
+                assert!(result.pane_id_map.contains_key(&id));
+            }
+            let new_ids: std::collections::HashSet<_> = result.pane_id_map.values().collect();
+            assert_eq!(new_ids.len(), 4);
+        });
     }
 
-    #[tokio::test]
-    async fn restore_deeply_nested_splits() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let tree = hsplit(vec![
-            (0.5, leaf(1, None)),
-            (
-                0.5,
-                vsplit(vec![
-                    (0.5, leaf(2, None)),
-                    (
-                        0.5,
-                        hsplit(vec![
-                            (0.5, leaf(3, None)),
-                            (
-                                0.5,
-                                vsplit(vec![
-                                    (0.5, leaf(4, None)),
-                                    (
-                                        0.5,
-                                        hsplit(vec![(0.5, leaf(5, None)), (0.5, leaf(6, None))]),
-                                    ),
-                                ]),
-                            ),
-                        ]),
-                    ),
-                ]),
-            ),
-        ]);
-        let snapshot = single_tab_snapshot(tree);
+    #[test]
+    fn restore_deeply_nested_splits() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let tree = hsplit(vec![
+                (0.5, leaf(1, None)),
+                (
+                    0.5,
+                    vsplit(vec![
+                        (0.5, leaf(2, None)),
+                        (
+                            0.5,
+                            hsplit(vec![
+                                (0.5, leaf(3, None)),
+                                (
+                                    0.5,
+                                    vsplit(vec![
+                                        (0.5, leaf(4, None)),
+                                        (
+                                            0.5,
+                                            hsplit(vec![
+                                                (0.5, leaf(5, None)),
+                                                (0.5, leaf(6, None)),
+                                            ]),
+                                        ),
+                                    ]),
+                                ),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]);
+            let snapshot = single_tab_snapshot(tree);
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        assert_eq!(result.panes_created, 6);
-        for id in 1..=6 {
-            assert!(result.pane_id_map.contains_key(&id));
-        }
+            assert_eq!(result.panes_created, 6);
+            for id in 1..=6 {
+                assert!(result.pane_id_map.contains_key(&id));
+            }
+        });
     }
 
-    #[tokio::test]
-    async fn restore_multiple_tabs() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let snapshot = TopologySnapshot {
-            schema_version: 1,
-            captured_at: 1000,
-            workspace_id: None,
-            windows: vec![WindowSnapshot {
-                window_id: 0,
-                title: None,
-                position: None,
-                size: None,
-                tabs: vec![
-                    TabSnapshot {
-                        tab_id: 0,
+    #[test]
+    fn restore_multiple_tabs() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let snapshot = TopologySnapshot {
+                schema_version: 1,
+                captured_at: 1000,
+                workspace_id: None,
+                windows: vec![WindowSnapshot {
+                    window_id: 0,
+                    title: None,
+                    position: None,
+                    size: None,
+                    tabs: vec![
+                        TabSnapshot {
+                            tab_id: 0,
+                            title: None,
+                            pane_tree: leaf(1, None),
+                            active_pane_id: None,
+                        },
+                        TabSnapshot {
+                            tab_id: 1,
+                            title: None,
+                            pane_tree: vsplit(vec![
+                                (0.5, leaf(2, None)),
+                                (0.5, leaf(3, None)),
+                            ]),
+                            active_pane_id: Some(3),
+                        },
+                    ],
+                    active_tab_index: Some(1),
+                }],
+            };
+
+            let result = restorer.restore(&snapshot).await.unwrap();
+
+            assert_eq!(result.tabs_created, 2);
+            assert_eq!(result.panes_created, 3);
+            for id in 1..=3 {
+                assert!(result.pane_id_map.contains_key(&id));
+            }
+        });
+    }
+
+    #[test]
+    fn restore_multiple_windows() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let snapshot = TopologySnapshot {
+                schema_version: 1,
+                captured_at: 1000,
+                workspace_id: None,
+                windows: vec![
+                    WindowSnapshot {
+                        window_id: 0,
                         title: None,
-                        pane_tree: leaf(1, None),
-                        active_pane_id: None,
+                        position: None,
+                        size: None,
+                        tabs: vec![TabSnapshot {
+                            tab_id: 0,
+                            title: None,
+                            pane_tree: leaf(1, None),
+                            active_pane_id: None,
+                        }],
+                        active_tab_index: None,
                     },
-                    TabSnapshot {
-                        tab_id: 1,
+                    WindowSnapshot {
+                        window_id: 1,
                         title: None,
-                        pane_tree: vsplit(vec![(0.5, leaf(2, None)), (0.5, leaf(3, None))]),
-                        active_pane_id: Some(3),
+                        position: None,
+                        size: None,
+                        tabs: vec![TabSnapshot {
+                            tab_id: 1,
+                            title: None,
+                            pane_tree: leaf(2, None),
+                            active_pane_id: None,
+                        }],
+                        active_tab_index: None,
                     },
                 ],
-                active_tab_index: Some(1),
-            }],
-        };
+            };
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        assert_eq!(result.tabs_created, 2);
-        assert_eq!(result.panes_created, 3);
-        for id in 1..=3 {
-            assert!(result.pane_id_map.contains_key(&id));
-        }
+            assert_eq!(result.windows_created, 2);
+            assert_eq!(result.panes_created, 2);
+        });
     }
 
-    #[tokio::test]
-    async fn restore_multiple_windows() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let snapshot = TopologySnapshot {
-            schema_version: 1,
-            captured_at: 1000,
-            workspace_id: None,
-            windows: vec![
-                WindowSnapshot {
+    #[test]
+    fn restore_activates_correct_pane() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let snapshot = TopologySnapshot {
+                schema_version: 1,
+                captured_at: 1000,
+                workspace_id: None,
+                windows: vec![WindowSnapshot {
                     window_id: 0,
                     title: None,
                     position: None,
@@ -668,60 +746,21 @@ mod tests {
                     tabs: vec![TabSnapshot {
                         tab_id: 0,
                         title: None,
-                        pane_tree: leaf(1, None),
-                        active_pane_id: None,
+                        pane_tree: vsplit(vec![
+                            (0.5, leaf(1, None)),
+                            (0.5, active_leaf(2)),
+                        ]),
+                        active_pane_id: Some(2),
                     }],
                     active_tab_index: None,
-                },
-                WindowSnapshot {
-                    window_id: 1,
-                    title: None,
-                    position: None,
-                    size: None,
-                    tabs: vec![TabSnapshot {
-                        tab_id: 1,
-                        title: None,
-                        pane_tree: leaf(2, None),
-                        active_pane_id: None,
-                    }],
-                    active_tab_index: None,
-                },
-            ],
-        };
-
-        let result = restorer.restore(&snapshot).await.unwrap();
-
-        assert_eq!(result.windows_created, 2);
-        assert_eq!(result.panes_created, 2);
-    }
-
-    #[tokio::test]
-    async fn restore_activates_correct_pane() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let snapshot = TopologySnapshot {
-            schema_version: 1,
-            captured_at: 1000,
-            workspace_id: None,
-            windows: vec![WindowSnapshot {
-                window_id: 0,
-                title: None,
-                position: None,
-                size: None,
-                tabs: vec![TabSnapshot {
-                    tab_id: 0,
-                    title: None,
-                    pane_tree: vsplit(vec![(0.5, leaf(1, None)), (0.5, active_leaf(2))]),
-                    active_pane_id: Some(2),
                 }],
-                active_tab_index: None,
-            }],
-        };
+            };
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        assert_eq!(result.panes_created, 2);
-        assert!(result.pane_id_map.contains_key(&2));
+            assert_eq!(result.panes_created, 2);
+            assert!(result.pane_id_map.contains_key(&2));
+        });
     }
 
     #[test]
@@ -772,22 +811,24 @@ mod tests {
         assert_eq!(count_panes(&snapshot), 3);
     }
 
-    #[tokio::test]
-    async fn restore_empty_snapshot() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let snapshot = TopologySnapshot {
-            schema_version: 1,
-            captured_at: 1000,
-            workspace_id: None,
-            windows: vec![],
-        };
+    #[test]
+    fn restore_empty_snapshot() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let snapshot = TopologySnapshot {
+                schema_version: 1,
+                captured_at: 1000,
+                workspace_id: None,
+                windows: vec![],
+            };
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        assert_eq!(result.windows_created, 0);
-        assert_eq!(result.tabs_created, 0);
-        assert_eq!(result.panes_created, 0);
+            assert_eq!(result.windows_created, 0);
+            assert_eq!(result.tabs_created, 0);
+            assert_eq!(result.panes_created, 0);
+        });
     }
 
     #[test]
@@ -824,84 +865,92 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3]);
     }
 
-    #[tokio::test]
-    async fn restore_three_way_split() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let tree = vsplit(vec![
-            (0.33, leaf(1, None)),
-            (0.33, leaf(2, None)),
-            (0.34, leaf(3, None)),
-        ]);
-        let snapshot = single_tab_snapshot(tree);
+    #[test]
+    fn restore_three_way_split() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let tree = vsplit(vec![
+                (0.33, leaf(1, None)),
+                (0.33, leaf(2, None)),
+                (0.34, leaf(3, None)),
+            ]);
+            let snapshot = single_tab_snapshot(tree);
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        assert_eq!(result.panes_created, 3);
-        let new_ids: std::collections::HashSet<_> = result.pane_id_map.values().collect();
-        assert_eq!(new_ids.len(), 3);
+            assert_eq!(result.panes_created, 3);
+            let new_ids: std::collections::HashSet<_> = result.pane_id_map.values().collect();
+            assert_eq!(new_ids.len(), 3);
+        });
     }
 
-    #[tokio::test]
-    async fn pane_id_map_completeness() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let tree = hsplit(vec![
-            (0.25, leaf(100, None)),
-            (0.25, leaf(200, None)),
-            (0.25, leaf(300, None)),
-            (0.25, leaf(400, None)),
-        ]);
-        let snapshot = single_tab_snapshot(tree);
+    #[test]
+    fn pane_id_map_completeness() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let tree = hsplit(vec![
+                (0.25, leaf(100, None)),
+                (0.25, leaf(200, None)),
+                (0.25, leaf(300, None)),
+                (0.25, leaf(400, None)),
+            ]);
+            let snapshot = single_tab_snapshot(tree);
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        let all_leaves = collect_leaf_ids(&snapshot.windows[0].tabs[0].pane_tree);
-        for id in &all_leaves {
-            assert!(
-                result.pane_id_map.contains_key(id),
-                "pane {id} missing from pane_id_map"
-            );
-        }
-        assert_eq!(result.pane_id_map.len(), all_leaves.len());
+            let all_leaves = collect_leaf_ids(&snapshot.windows[0].tabs[0].pane_tree);
+            for id in &all_leaves {
+                assert!(
+                    result.pane_id_map.contains_key(id),
+                    "pane {id} missing from pane_id_map"
+                );
+            }
+            assert_eq!(result.pane_id_map.len(), all_leaves.len());
+        });
     }
 
-    #[tokio::test]
-    async fn restore_sets_cwd_from_file_uri() {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = make_restorer(mock.clone());
-        let tree = leaf(1, Some("file:///home/agent/project"));
-        let snapshot = single_tab_snapshot(tree);
+    #[test]
+    fn restore_sets_cwd_from_file_uri() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let tree = leaf(1, Some("file:///home/agent/project"));
+            let snapshot = single_tab_snapshot(tree);
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        assert_eq!(result.panes_created, 1);
-        let new_id = result.pane_id_map[&1];
-        let text: String = WeztermInterface::get_text(&*mock, new_id, false)
-            .await
-            .unwrap();
-        assert!(text.contains("/home/agent/project"), "cwd should be set");
+            assert_eq!(result.panes_created, 1);
+            let new_id = result.pane_id_map[&1];
+            let text: String = WeztermInterface::get_text(&*mock, new_id, false)
+                .await
+                .unwrap();
+            assert!(text.contains("/home/agent/project"), "cwd should be set");
+        });
     }
 
-    #[tokio::test]
-    async fn config_skip_cwd_restore() {
-        let mock = Arc::new(MockWezterm::new());
-        let config = RestoreConfig {
-            restore_working_dirs: false,
-            ..Default::default()
-        };
-        let restorer = LayoutRestorer::new(mock.clone(), config);
-        let tree = leaf(1, Some("/home/user"));
-        let snapshot = single_tab_snapshot(tree);
+    #[test]
+    fn config_skip_cwd_restore() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let config = RestoreConfig {
+                restore_working_dirs: false,
+                ..Default::default()
+            };
+            let restorer = LayoutRestorer::new(mock.clone(), config);
+            let tree = leaf(1, Some("/home/user"));
+            let snapshot = single_tab_snapshot(tree);
 
-        let result = restorer.restore(&snapshot).await.unwrap();
+            let result = restorer.restore(&snapshot).await.unwrap();
 
-        assert_eq!(result.panes_created, 1);
-        let new_id = result.pane_id_map[&1];
-        let text: String = WeztermInterface::get_text(&*mock, new_id, false)
-            .await
-            .unwrap();
-        assert!(!text.contains("cd "), "cwd should not be set");
+            assert_eq!(result.panes_created, 1);
+            let new_id = result.pane_id_map[&1];
+            let text: String = WeztermInterface::get_text(&*mock, new_id, false)
+                .await
+                .unwrap();
+            assert!(!text.contains("cd "), "cwd should not be set");
+        });
     }
 
     #[test]
