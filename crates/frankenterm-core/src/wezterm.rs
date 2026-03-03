@@ -1943,6 +1943,31 @@ mod tests {
     #[cfg(not(feature = "asupersync-runtime"))]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build wezterm test runtime");
+        runtime.block_on(future);
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    fn run_async_test_paused<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("failed to build wezterm paused test runtime");
+        runtime.block_on(future);
+    }
+
     #[test]
     fn pane_info_deserializes_minimal() {
         let json = r#"{
@@ -2117,45 +2142,49 @@ mod tests {
         assert_eq!(client.retry_delay_ms, 10);
     }
 
-    #[tokio::test]
-    async fn retry_with_retries_transient_errors() {
-        let client = WeztermClient::new().with_retries(3).with_retry_delay_ms(0);
-        let attempts = Cell::new(0);
+    #[test]
+    fn retry_with_retries_transient_errors() {
+        run_async_test(async {
+            let client = WeztermClient::new().with_retries(3).with_retry_delay_ms(0);
+            let attempts = Cell::new(0);
 
-        let result = client
-            .retry_with(|| {
-                attempts.set(attempts.get() + 1);
-                async {
-                    if attempts.get() < 2 {
-                        Err(WeztermError::NotRunning.into())
-                    } else {
-                        Ok("ok".to_string())
+            let result = client
+                .retry_with(|| {
+                    attempts.set(attempts.get() + 1);
+                    async {
+                        if attempts.get() < 2 {
+                            Err(WeztermError::NotRunning.into())
+                        } else {
+                            Ok("ok".to_string())
+                        }
                     }
-                }
-            })
-            .await;
+                })
+                .await;
 
-        assert_eq!(attempts.get(), 2);
-        assert_eq!(result.unwrap(), "ok");
+            assert_eq!(attempts.get(), 2);
+            assert_eq!(result.unwrap(), "ok");
+        });
     }
 
-    #[tokio::test]
-    async fn retry_with_stops_on_non_retryable_error() {
-        let client = WeztermClient::new().with_retries(3).with_retry_delay_ms(0);
-        let attempts = Cell::new(0);
+    #[test]
+    fn retry_with_stops_on_non_retryable_error() {
+        run_async_test(async {
+            let client = WeztermClient::new().with_retries(3).with_retry_delay_ms(0);
+            let attempts = Cell::new(0);
 
-        let result = client
-            .retry_with(|| {
-                attempts.set(attempts.get() + 1);
-                async { Err(WeztermError::PaneNotFound(42).into()) }
-            })
-            .await;
+            let result = client
+                .retry_with(|| {
+                    attempts.set(attempts.get() + 1);
+                    async { Err(WeztermError::PaneNotFound(42).into()) }
+                })
+                .await;
 
-        assert_eq!(attempts.get(), 1);
-        assert!(matches!(
-            result,
-            Err(crate::Error::Wezterm(WeztermError::PaneNotFound(42)))
-        ));
+            assert_eq!(attempts.get(), 1);
+            assert!(matches!(
+                result,
+                Err(crate::Error::Wezterm(WeztermError::PaneNotFound(42)))
+            ));
+        });
     }
 
     #[test]
@@ -2240,95 +2269,99 @@ mod tests {
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]
-    #[tokio::test(start_paused = true)]
-    async fn waiter_matches_substring() {
-        let source = TestTextSource::new(vec!["booting...", "ready: prompt"]);
-        let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
-            tail_lines: 50,
-            escapes: false,
-            poll_initial: Duration::from_secs(1),
-            poll_max: Duration::from_secs(1),
-            max_polls: 10,
-        });
+    #[test]
+    fn waiter_matches_substring() {
+        run_async_test_paused(async {
+            let source = TestTextSource::new(vec!["booting...", "ready: prompt"]);
+            let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
+                tail_lines: 50,
+                escapes: false,
+                poll_initial: Duration::from_secs(1),
+                poll_max: Duration::from_secs(1),
+                max_polls: 10,
+            });
 
-        let matcher = WaitMatcher::substring("ready");
-        let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(5)));
+            let matcher = WaitMatcher::substring("ready");
+            let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(5)));
 
-        for _ in 0..3 {
-            crate::runtime_compat::select! {
-                result = &mut fut => {
-                    let result = result.expect("wait_for");
-                    match result {
-                        WaitResult::Matched { polls, .. } => {
-                            assert!(polls >= 2, "expected at least two polls");
+            for _ in 0..3 {
+                crate::runtime_compat::select! {
+                    result = &mut fut => {
+                        let result = result.expect("wait_for");
+                        match result {
+                            WaitResult::Matched { polls, .. } => {
+                                assert!(polls >= 2, "expected at least two polls");
+                            }
+                            WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
                         }
-                        WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
+                        return;
                     }
-                    return;
+                    () = crate::runtime_compat::time::advance(Duration::from_secs(1)) => {}
                 }
-                () = crate::runtime_compat::time::advance(Duration::from_secs(1)) => {}
+                crate::runtime_compat::task::yield_now().await;
             }
-            crate::runtime_compat::task::yield_now().await;
-        }
 
-        let result = fut.await.expect("wait_for");
-        match result {
-            WaitResult::Matched { polls, .. } => {
-                assert!(polls >= 2, "expected at least two polls");
+            let result = fut.await.expect("wait_for");
+            match result {
+                WaitResult::Matched { polls, .. } => {
+                    assert!(polls >= 2, "expected at least two polls");
+                }
+                WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
             }
-            WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
-        }
+        });
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]
-    #[tokio::test(start_paused = true)]
-    async fn waiter_times_out() {
-        let source = TestTextSource::new(vec!["still waiting"]);
-        let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
-            tail_lines: 10,
-            escapes: false,
-            poll_initial: Duration::from_secs(1),
-            poll_max: Duration::from_secs(1),
-            max_polls: 100,
-        });
+    #[test]
+    fn waiter_times_out() {
+        run_async_test_paused(async {
+            let source = TestTextSource::new(vec!["still waiting"]);
+            let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
+                tail_lines: 10,
+                escapes: false,
+                poll_initial: Duration::from_secs(1),
+                poll_max: Duration::from_secs(1),
+                max_polls: 100,
+            });
 
-        let matcher = WaitMatcher::substring("never");
-        let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(2)));
+            let matcher = WaitMatcher::substring("never");
+            let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(2)));
 
-        for _ in 0..4 {
-            crate::runtime_compat::select! {
-                result = &mut fut => {
-                    let result = result.expect("wait_for");
-                    match result {
-                        WaitResult::TimedOut {
-                            polls,
-                            last_tail_hash,
-                            ..
-                        } => {
-                            assert!(polls >= 1);
-                            assert!(last_tail_hash.is_some());
+            for _ in 0..4 {
+                crate::runtime_compat::select! {
+                    result = &mut fut => {
+                        let result = result.expect("wait_for");
+                        match result {
+                            WaitResult::TimedOut {
+                                polls,
+                                last_tail_hash,
+                                ..
+                            } => {
+                                assert!(polls >= 1);
+                                assert!(last_tail_hash.is_some());
+                            }
+                            WaitResult::Matched { .. } => panic!("unexpected match"),
                         }
-                        WaitResult::Matched { .. } => panic!("unexpected match"),
+                        return;
                     }
-                    return;
+                    () = crate::runtime_compat::time::advance(Duration::from_secs(1)) => {}
                 }
-                () = crate::runtime_compat::time::advance(Duration::from_secs(1)) => {}
+                crate::runtime_compat::task::yield_now().await;
             }
-            crate::runtime_compat::task::yield_now().await;
-        }
 
-        let result = fut.await.expect("wait_for");
-        match result {
-            WaitResult::TimedOut {
-                polls,
-                last_tail_hash,
-                ..
-            } => {
-                assert!(polls >= 1);
-                assert!(last_tail_hash.is_some());
+            let result = fut.await.expect("wait_for");
+            match result {
+                WaitResult::TimedOut {
+                    polls,
+                    last_tail_hash,
+                    ..
+                } => {
+                    assert!(polls >= 1);
+                    assert!(last_tail_hash.is_some());
+                }
+                WaitResult::Matched { .. } => panic!("unexpected match"),
             }
-            WaitResult::Matched { .. } => panic!("unexpected match"),
-        }
+        });
     }
 
     #[test]
@@ -2881,46 +2914,58 @@ mod tests {
     // mock_wezterm_handle / mock_wezterm_handle_failing
     // =====================================================================
 
-    #[tokio::test]
-    async fn mock_handle_returns_empty_panes() {
-        let handle = mock_wezterm_handle();
-        let panes = handle.list_panes().await.unwrap();
-        assert!(panes.is_empty());
+    #[test]
+    fn mock_handle_returns_empty_panes() {
+        run_async_test(async {
+            let handle = mock_wezterm_handle();
+            let panes = handle.list_panes().await.unwrap();
+            assert!(panes.is_empty());
+        });
     }
 
-    #[tokio::test]
-    async fn mock_handle_failing_list_errors() {
-        let handle = mock_wezterm_handle_failing();
-        let result = handle.list_panes().await;
-        assert!(result.is_err());
+    #[test]
+    fn mock_handle_failing_list_errors() {
+        run_async_test(async {
+            let handle = mock_wezterm_handle_failing();
+            let result = handle.list_panes().await;
+            assert!(result.is_err());
+        });
     }
 
-    #[tokio::test]
-    async fn mock_handle_failing_get_text_errors() {
-        let handle = mock_wezterm_handle_failing();
-        let result = handle.get_text(0, false).await;
-        assert!(result.is_err());
+    #[test]
+    fn mock_handle_failing_get_text_errors() {
+        run_async_test(async {
+            let handle = mock_wezterm_handle_failing();
+            let result = handle.get_text(0, false).await;
+            assert!(result.is_err());
+        });
     }
 
-    #[tokio::test]
-    async fn mock_handle_failing_send_text_errors() {
-        let handle = mock_wezterm_handle_failing();
-        let result = handle.send_text(0, "test").await;
-        assert!(result.is_err());
+    #[test]
+    fn mock_handle_failing_send_text_errors() {
+        run_async_test(async {
+            let handle = mock_wezterm_handle_failing();
+            let result = handle.send_text(0, "test").await;
+            assert!(result.is_err());
+        });
     }
 
-    #[tokio::test]
-    async fn mock_handle_failing_spawn_errors() {
-        let handle = mock_wezterm_handle_failing();
-        let result = handle.spawn(None, None).await;
-        assert!(result.is_err());
+    #[test]
+    fn mock_handle_failing_spawn_errors() {
+        run_async_test(async {
+            let handle = mock_wezterm_handle_failing();
+            let result = handle.spawn(None, None).await;
+            assert!(result.is_err());
+        });
     }
 
-    #[tokio::test]
-    async fn mock_handle_failing_circuit_status_default() {
-        let handle = mock_wezterm_handle_failing();
-        let status = handle.circuit_status();
-        assert_eq!(status.state, CircuitStateKind::Closed);
+    #[test]
+    fn mock_handle_failing_circuit_status_default() {
+        run_async_test(async {
+            let handle = mock_wezterm_handle_failing();
+            let status = handle.circuit_status();
+            assert_eq!(status.state, CircuitStateKind::Closed);
+        });
     }
 
     // =====================================================================
@@ -2963,16 +3008,18 @@ mod tests {
     // WeztermHandleSource
     // =====================================================================
 
-    #[tokio::test]
-    async fn wezterm_handle_source_delegates_get_text() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
-        mock.inject_output(0, "source test").await.unwrap();
+    #[test]
+    fn wezterm_handle_source_delegates_get_text() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.inject_output(0, "source test").await.unwrap();
 
-        let handle: WeztermHandle = Arc::new(mock);
-        let source = WeztermHandleSource::new(handle);
-        let text = source.get_text(0, false).await.unwrap();
-        assert_eq!(text, "source test");
+            let handle: WeztermHandle = Arc::new(mock);
+            let source = WeztermHandleSource::new(handle);
+            let text = source.get_text(0, false).await.unwrap();
+            assert_eq!(text, "source test");
+        });
     }
 
     // =====================================================================
@@ -2980,40 +3027,42 @@ mod tests {
     // =====================================================================
 
     #[cfg(not(feature = "asupersync-runtime"))]
-    #[tokio::test(start_paused = true)]
-    async fn waiter_stops_at_max_polls() {
-        let source = TestTextSource::new(vec!["no match"]);
-        let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
-            tail_lines: 50,
-            escapes: false,
-            poll_initial: Duration::from_millis(1),
-            poll_max: Duration::from_millis(1),
-            max_polls: 3,
-        });
+    #[test]
+    fn waiter_stops_at_max_polls() {
+        run_async_test_paused(async {
+            let source = TestTextSource::new(vec!["no match"]);
+            let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
+                tail_lines: 50,
+                escapes: false,
+                poll_initial: Duration::from_millis(1),
+                poll_max: Duration::from_millis(1),
+                max_polls: 3,
+            });
 
-        let matcher = WaitMatcher::substring("never-found");
-        let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(60)));
+            let matcher = WaitMatcher::substring("never-found");
+            let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(60)));
 
-        // Advance time enough for polling
-        for _ in 0..10 {
-            crate::runtime_compat::select! {
-                result = &mut fut => {
-                    let result = result.unwrap();
-                    match result {
-                        WaitResult::TimedOut { polls, .. } => {
-                            assert!(polls <= 3);
+            // Advance time enough for polling
+            for _ in 0..10 {
+                crate::runtime_compat::select! {
+                    result = &mut fut => {
+                        let result = result.unwrap();
+                        match result {
+                            WaitResult::TimedOut { polls, .. } => {
+                                assert!(polls <= 3);
+                            }
+                            WaitResult::Matched { .. } => panic!("unexpected match"),
                         }
-                        WaitResult::Matched { .. } => panic!("unexpected match"),
+                        return;
                     }
-                    return;
+                    () = crate::runtime_compat::time::advance(Duration::from_millis(5)) => {}
                 }
-                () = crate::runtime_compat::time::advance(Duration::from_millis(5)) => {}
+                crate::runtime_compat::task::yield_now().await;
             }
-            crate::runtime_compat::task::yield_now().await;
-        }
 
-        let result = fut.await.unwrap();
-        assert!(matches!(result, WaitResult::TimedOut { .. }));
+            let result = fut.await.unwrap();
+            assert!(matches!(result, WaitResult::TimedOut { .. }));
+        });
     }
 
     // Batch: DarkBadger wa-1u90p.7.1
@@ -4113,224 +4162,272 @@ pub fn mock_wezterm_handle_failing() -> WeztermHandle {
 mod mock_tests {
     use super::*;
 
-    #[tokio::test]
-    async fn mock_add_and_list_panes() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
-        mock.add_default_pane(1).await;
-
-        let panes = mock.list_panes().await.unwrap();
-        assert_eq!(panes.len(), 2);
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build wezterm test runtime");
+        runtime.block_on(future);
     }
 
-    #[tokio::test]
-    async fn mock_get_text_returns_content() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
-        mock.inject_output(0, "hello world\n").await.unwrap();
+    #[test]
+    fn mock_add_and_list_panes() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.add_default_pane(1).await;
 
-        let text = mock.get_text(0, false).await.unwrap();
-        assert_eq!(text, "hello world\n");
+            let panes = mock.list_panes().await.unwrap();
+            assert_eq!(panes.len(), 2);
+        });
     }
 
-    #[tokio::test]
-    async fn mock_send_text_echoes() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
-        mock.send_text(0, "ls -la\n").await.unwrap();
+    #[test]
+    fn mock_get_text_returns_content() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.inject_output(0, "hello world\n").await.unwrap();
 
-        let text = mock.get_text(0, false).await.unwrap();
-        assert_eq!(text, "ls -la\n");
+            let text = mock.get_text(0, false).await.unwrap();
+            assert_eq!(text, "hello world\n");
+        });
     }
 
-    #[tokio::test]
-    async fn mock_inject_events() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
+    #[test]
+    fn mock_send_text_echoes() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.send_text(0, "ls -la\n").await.unwrap();
 
-        mock.inject(0, MockEvent::AppendOutput("line 1\n".to_string()))
-            .await
-            .unwrap();
-        mock.inject(0, MockEvent::SetTitle("New Title".to_string()))
-            .await
-            .unwrap();
-        mock.inject(0, MockEvent::Resize(120, 40)).await.unwrap();
-
-        let state = mock.pane_state(0).await.unwrap();
-        assert_eq!(state.content, "line 1\n");
-        assert_eq!(state.title, "New Title");
-        assert_eq!(state.cols, 120);
-        assert_eq!(state.rows, 40);
+            let text = mock.get_text(0, false).await.unwrap();
+            assert_eq!(text, "ls -la\n");
+        });
     }
 
-    #[tokio::test]
-    async fn mock_spawn_creates_pane() {
-        let mock = MockWezterm::new();
-        let id = mock.spawn(Some("/tmp"), None).await.unwrap();
-        assert_eq!(mock.pane_count().await, 1);
+    #[test]
+    fn mock_inject_events() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
 
-        let pane = mock.get_pane(id).await.unwrap();
-        assert_eq!(pane.cwd.as_deref(), Some("/tmp"));
+            mock.inject(0, MockEvent::AppendOutput("line 1\n".to_string()))
+                .await
+                .unwrap();
+            mock.inject(0, MockEvent::SetTitle("New Title".to_string()))
+                .await
+                .unwrap();
+            mock.inject(0, MockEvent::Resize(120, 40)).await.unwrap();
+
+            let state = mock.pane_state(0).await.unwrap();
+            assert_eq!(state.content, "line 1\n");
+            assert_eq!(state.title, "New Title");
+            assert_eq!(state.cols, 120);
+            assert_eq!(state.rows, 40);
+        });
     }
 
-    #[tokio::test]
-    async fn mock_kill_pane_removes() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
-        assert_eq!(mock.pane_count().await, 1);
+    #[test]
+    fn mock_spawn_creates_pane() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            let id = mock.spawn(Some("/tmp"), None).await.unwrap();
+            assert_eq!(mock.pane_count().await, 1);
 
-        mock.kill_pane(0).await.unwrap();
-        assert_eq!(mock.pane_count().await, 0);
+            let pane = mock.get_pane(id).await.unwrap();
+            assert_eq!(pane.cwd.as_deref(), Some("/tmp"));
+        });
     }
 
-    #[tokio::test]
-    async fn mock_activate_pane() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
-        mock.add_default_pane(1).await;
+    #[test]
+    fn mock_kill_pane_removes() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            assert_eq!(mock.pane_count().await, 1);
 
-        mock.activate_pane(1).await.unwrap();
-
-        let p0 = mock.pane_state(0).await.unwrap();
-        let p1 = mock.pane_state(1).await.unwrap();
-        assert!(!p0.is_active);
-        assert!(p1.is_active);
+            mock.kill_pane(0).await.unwrap();
+            assert_eq!(mock.pane_count().await, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn mock_zoom_pane() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
+    #[test]
+    fn mock_activate_pane() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.add_default_pane(1).await;
 
-        mock.zoom_pane(0, true).await.unwrap();
-        let state = mock.pane_state(0).await.unwrap();
-        assert!(state.is_zoomed);
+            mock.activate_pane(1).await.unwrap();
 
-        mock.zoom_pane(0, false).await.unwrap();
-        let state = mock.pane_state(0).await.unwrap();
-        assert!(!state.is_zoomed);
+            let p0 = mock.pane_state(0).await.unwrap();
+            let p1 = mock.pane_state(1).await.unwrap();
+            assert!(!p0.is_active);
+            assert!(p1.is_active);
+        });
     }
 
-    #[tokio::test]
-    async fn mock_clear_screen() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
-        mock.inject_output(0, "some text").await.unwrap();
-        mock.inject(0, MockEvent::ClearScreen).await.unwrap();
+    #[test]
+    fn mock_zoom_pane() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
 
-        let text = mock.get_text(0, false).await.unwrap();
-        assert!(text.is_empty());
+            mock.zoom_pane(0, true).await.unwrap();
+            let state = mock.pane_state(0).await.unwrap();
+            assert!(state.is_zoomed);
+
+            mock.zoom_pane(0, false).await.unwrap();
+            let state = mock.pane_state(0).await.unwrap();
+            assert!(!state.is_zoomed);
+        });
     }
 
-    #[tokio::test]
-    async fn mock_pane_not_found() {
-        let mock = MockWezterm::new();
-        assert!(mock.get_text(99, false).await.is_err());
-        assert!(mock.send_text(99, "x").await.is_err());
-        assert!(mock.inject_output(99, "x").await.is_err());
+    #[test]
+    fn mock_clear_screen() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.inject_output(0, "some text").await.unwrap();
+            mock.inject(0, MockEvent::ClearScreen).await.unwrap();
+
+            let text = mock.get_text(0, false).await.unwrap();
+            assert!(text.is_empty());
+        });
     }
 
-    #[tokio::test]
-    async fn mock_split_pane_creates_new() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
-
-        let new_id = mock
-            .split_pane(0, SplitDirection::Right, None, None)
-            .await
-            .unwrap();
-        assert_eq!(mock.pane_count().await, 2);
-        assert_ne!(new_id, 0);
+    #[test]
+    fn mock_pane_not_found() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            assert!(mock.get_text(99, false).await.is_err());
+            assert!(mock.send_text(99, "x").await.is_err());
+            assert!(mock.inject_output(99, "x").await.is_err());
+        });
     }
 
-    #[tokio::test]
-    async fn mock_as_wezterm_handle() {
-        // Verify MockWezterm works as a WeztermHandle (Arc<dyn WeztermInterface>)
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
-        mock.inject_output(0, "test").await.unwrap();
+    #[test]
+    fn mock_split_pane_creates_new() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
 
-        let handle: WeztermHandle = std::sync::Arc::new(mock);
-        let text = handle.get_text(0, false).await.unwrap();
-        assert_eq!(text, "test");
+            let new_id = mock
+                .split_pane(0, SplitDirection::Right, None, None)
+                .await
+                .unwrap();
+            assert_eq!(mock.pane_count().await, 2);
+            assert_ne!(new_id, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn mock_pane_content_isolation() {
-        // Content in one pane doesn't leak to another
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
-        mock.add_default_pane(1).await;
+    #[test]
+    fn mock_as_wezterm_handle() {
+        run_async_test(async {
+            // Verify MockWezterm works as a WeztermHandle (Arc<dyn WeztermInterface>)
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.inject_output(0, "test").await.unwrap();
 
-        mock.inject_output(0, "pane-zero-only").await.unwrap();
-        mock.inject_output(1, "pane-one-only").await.unwrap();
-
-        let t0 = mock.get_text(0, false).await.unwrap();
-        let t1 = mock.get_text(1, false).await.unwrap();
-        assert!(t0.contains("pane-zero-only"));
-        assert!(!t0.contains("pane-one-only"));
-        assert!(t1.contains("pane-one-only"));
-        assert!(!t1.contains("pane-zero-only"));
+            let handle: WeztermHandle = std::sync::Arc::new(mock);
+            let text = handle.get_text(0, false).await.unwrap();
+            assert_eq!(text, "test");
+        });
     }
 
-    #[tokio::test]
-    async fn mock_pane_size_via_state() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
+    #[test]
+    fn mock_pane_content_isolation() {
+        run_async_test(async {
+            // Content in one pane doesn't leak to another
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.add_default_pane(1).await;
 
-        let state = mock.pane_state(0).await.unwrap();
-        assert_eq!(state.cols, 80);
-        assert_eq!(state.rows, 24);
+            mock.inject_output(0, "pane-zero-only").await.unwrap();
+            mock.inject_output(1, "pane-one-only").await.unwrap();
 
-        // After resize
-        mock.inject(0, MockEvent::Resize(200, 50)).await.unwrap();
-        let state = mock.pane_state(0).await.unwrap();
-        assert_eq!(state.cols, 200);
-        assert_eq!(state.rows, 50);
+            let t0 = mock.get_text(0, false).await.unwrap();
+            let t1 = mock.get_text(1, false).await.unwrap();
+            assert!(t0.contains("pane-zero-only"));
+            assert!(!t0.contains("pane-one-only"));
+            assert!(t1.contains("pane-one-only"));
+            assert!(!t1.contains("pane-zero-only"));
+        });
     }
 
-    #[tokio::test]
-    async fn mock_multiple_appends_accumulate() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
+    #[test]
+    fn mock_pane_size_via_state() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
 
-        mock.inject_output(0, "a").await.unwrap();
-        mock.inject_output(0, "b").await.unwrap();
-        mock.inject_output(0, "c").await.unwrap();
+            let state = mock.pane_state(0).await.unwrap();
+            assert_eq!(state.cols, 80);
+            assert_eq!(state.rows, 24);
 
-        let text = mock.get_text(0, false).await.unwrap();
-        assert_eq!(text, "abc");
+            // After resize
+            mock.inject(0, MockEvent::Resize(200, 50)).await.unwrap();
+            let state = mock.pane_state(0).await.unwrap();
+            assert_eq!(state.cols, 200);
+            assert_eq!(state.rows, 50);
+        });
     }
 
-    #[tokio::test]
-    async fn mock_spawn_multiple_gets_unique_ids() {
-        let mock = MockWezterm::new();
-        let id1 = mock.spawn(None, None).await.unwrap();
-        let id2 = mock.spawn(None, None).await.unwrap();
-        let id3 = mock.spawn(None, None).await.unwrap();
+    #[test]
+    fn mock_multiple_appends_accumulate() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
 
-        assert_ne!(id1, id2);
-        assert_ne!(id2, id3);
-        assert_eq!(mock.pane_count().await, 3);
+            mock.inject_output(0, "a").await.unwrap();
+            mock.inject_output(0, "b").await.unwrap();
+            mock.inject_output(0, "c").await.unwrap();
+
+            let text = mock.get_text(0, false).await.unwrap();
+            assert_eq!(text, "abc");
+        });
     }
 
-    #[tokio::test]
-    async fn mock_kill_nonexistent_pane_is_noop() {
-        let mock = MockWezterm::new();
-        // kill_pane on nonexistent pane succeeds silently (HashMap::remove returns None)
-        assert!(mock.kill_pane(99).await.is_ok());
+    #[test]
+    fn mock_spawn_multiple_gets_unique_ids() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            let id1 = mock.spawn(None, None).await.unwrap();
+            let id2 = mock.spawn(None, None).await.unwrap();
+            let id3 = mock.spawn(None, None).await.unwrap();
+
+            assert_ne!(id1, id2);
+            assert_ne!(id2, id3);
+            assert_eq!(mock.pane_count().await, 3);
+        });
     }
 
-    #[tokio::test]
-    async fn mock_split_ignores_parent_creates_new() {
-        let mock = MockWezterm::new();
-        // split_pane delegates to spawn, ignoring parent pane ID
-        let new_id = mock
-            .split_pane(99, SplitDirection::Right, None, None)
-            .await
-            .unwrap();
-        assert_eq!(mock.pane_count().await, 1);
-        assert_eq!(new_id, 0);
+    #[test]
+    fn mock_kill_nonexistent_pane_is_noop() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            // kill_pane on nonexistent pane succeeds silently (HashMap::remove returns None)
+            assert!(mock.kill_pane(99).await.is_ok());
+        });
+    }
+
+    #[test]
+    fn mock_split_ignores_parent_creates_new() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            // split_pane delegates to spawn, ignoring parent pane ID
+            let new_id = mock
+                .split_pane(99, SplitDirection::Right, None, None)
+                .await
+                .unwrap();
+            assert_eq!(mock.pane_count().await, 1);
+            assert_eq!(new_id, 0);
+        });
     }
 }
 
@@ -4469,55 +4566,73 @@ mod unified_tests {
         assert_eq!(unified.selection().reason, "test");
     }
 
-    #[tokio::test]
-    async fn unified_client_get_text_delegates() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
-        mock.inject_output(0, "hello from unified").await.unwrap();
-
-        let handle: WeztermHandle = Arc::new(mock);
-        let sel = BackendSelection {
-            kind: BackendKind::Cli,
-            reason: "test".to_string(),
-            compatibility: None,
-        };
-        let unified = UnifiedClient::from_handle(handle, sel);
-        let text = unified.get_text(0, false).await.unwrap();
-        assert_eq!(text, "hello from unified");
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build wezterm test runtime");
+        runtime.block_on(future);
     }
 
-    #[tokio::test]
-    async fn unified_client_send_text_delegates() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
+    #[test]
+    fn unified_client_get_text_delegates() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.inject_output(0, "hello from unified").await.unwrap();
 
-        let handle: WeztermHandle = Arc::new(mock);
-        let sel = BackendSelection {
-            kind: BackendKind::Cli,
-            reason: "test".to_string(),
-            compatibility: None,
-        };
-        let unified = UnifiedClient::from_handle(handle, sel);
-        unified.send_text(0, "cmd\n").await.unwrap();
-        let text = unified.get_text(0, false).await.unwrap();
-        assert_eq!(text, "cmd\n");
+            let handle: WeztermHandle = Arc::new(mock);
+            let sel = BackendSelection {
+                kind: BackendKind::Cli,
+                reason: "test".to_string(),
+                compatibility: None,
+            };
+            let unified = UnifiedClient::from_handle(handle, sel);
+            let text = unified.get_text(0, false).await.unwrap();
+            assert_eq!(text, "hello from unified");
+        });
     }
 
-    #[tokio::test]
-    async fn unified_client_list_panes_delegates() {
-        let mock = MockWezterm::new();
-        mock.add_default_pane(0).await;
-        mock.add_default_pane(1).await;
+    #[test]
+    fn unified_client_send_text_delegates() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
 
-        let handle: WeztermHandle = Arc::new(mock);
-        let sel = BackendSelection {
-            kind: BackendKind::Vendored,
-            reason: "test".to_string(),
-            compatibility: None,
-        };
-        let unified = UnifiedClient::from_handle(handle, sel);
-        let panes = unified.list_panes().await.unwrap();
-        assert_eq!(panes.len(), 2);
+            let handle: WeztermHandle = Arc::new(mock);
+            let sel = BackendSelection {
+                kind: BackendKind::Cli,
+                reason: "test".to_string(),
+                compatibility: None,
+            };
+            let unified = UnifiedClient::from_handle(handle, sel);
+            unified.send_text(0, "cmd\n").await.unwrap();
+            let text = unified.get_text(0, false).await.unwrap();
+            assert_eq!(text, "cmd\n");
+        });
+    }
+
+    #[test]
+    fn unified_client_list_panes_delegates() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.add_default_pane(0).await;
+            mock.add_default_pane(1).await;
+
+            let handle: WeztermHandle = Arc::new(mock);
+            let sel = BackendSelection {
+                kind: BackendKind::Vendored,
+                reason: "test".to_string(),
+                compatibility: None,
+            };
+            let unified = UnifiedClient::from_handle(handle, sel);
+            let panes = unified.list_panes().await.unwrap();
+            assert_eq!(panes.len(), 2);
+        });
     }
 
     #[test]

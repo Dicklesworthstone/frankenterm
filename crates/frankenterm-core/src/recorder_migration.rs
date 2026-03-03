@@ -721,6 +721,22 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // -----------------------------------------------------------------------
+    // Async test helper
+    // -----------------------------------------------------------------------
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build recorder_migration test runtime");
+        runtime.block_on(future);
+    }
+
+    // -----------------------------------------------------------------------
     // Test helpers: mock reader + mock storage
     // -----------------------------------------------------------------------
 
@@ -967,57 +983,63 @@ mod tests {
     // M0 tests
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_m0_captures_manifest_with_correct_counts() {
-        let records = vec![
-            make_cursor_record(1, 0),
-            make_cursor_record(1, 1),
-            make_cursor_record(2, 2),
-            make_cursor_record(1, 3),
-            make_cursor_record(3, 4),
-        ];
-        let reader = TestEventReader::new(records);
-        let storage = MockMigrationStorage::healthy();
-        let engine = MigrationEngine::new(MigrationConfig::default());
+    #[test]
+    fn test_m0_captures_manifest_with_correct_counts() {
+        run_async_test(async {
+            let records = vec![
+                make_cursor_record(1, 0),
+                make_cursor_record(1, 1),
+                make_cursor_record(2, 2),
+                make_cursor_record(1, 3),
+                make_cursor_record(3, 4),
+            ];
+            let reader = TestEventReader::new(records);
+            let storage = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = engine.m0_preflight(&storage, &reader).await.unwrap();
+            let manifest = engine.m0_preflight(&storage, &reader).await.unwrap();
 
-        assert_eq!(manifest.event_count, 5);
-        assert_eq!(manifest.first_ordinal, 0);
-        assert_eq!(manifest.last_ordinal, 4);
-        assert_eq!(manifest.per_pane_counts.get(&1), Some(&3));
-        assert_eq!(manifest.per_pane_counts.get(&2), Some(&1));
-        assert_eq!(manifest.per_pane_counts.get(&3), Some(&1));
-        assert!(manifest.last_offset.is_some());
+            assert_eq!(manifest.event_count, 5);
+            assert_eq!(manifest.first_ordinal, 0);
+            assert_eq!(manifest.last_ordinal, 4);
+            assert_eq!(manifest.per_pane_counts.get(&1), Some(&3));
+            assert_eq!(manifest.per_pane_counts.get(&2), Some(&1));
+            assert_eq!(manifest.per_pane_counts.get(&3), Some(&1));
+            assert!(manifest.last_offset.is_some());
+        });
     }
 
-    #[tokio::test]
-    async fn test_m0_rejects_degraded_source() {
-        let reader = TestEventReader::new(vec![]);
-        let storage = MockMigrationStorage::degraded();
-        let engine = MigrationEngine::new(MigrationConfig::default());
+    #[test]
+    fn test_m0_rejects_degraded_source() {
+        run_async_test(async {
+            let reader = TestEventReader::new(vec![]);
+            let storage = MockMigrationStorage::degraded();
+            let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let result = engine.m0_preflight(&storage, &reader).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("degraded"),
-            "error should mention degraded: {msg}"
-        );
+            let result = engine.m0_preflight(&storage, &reader).await;
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("degraded"),
+                "error should mention degraded: {msg}"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn test_m0_empty_source_produces_zero_counts() {
-        let reader = TestEventReader::new(vec![]);
-        let storage = MockMigrationStorage::healthy();
-        let engine = MigrationEngine::new(MigrationConfig::default());
+    #[test]
+    fn test_m0_empty_source_produces_zero_counts() {
+        run_async_test(async {
+            let reader = TestEventReader::new(vec![]);
+            let storage = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = engine.m0_preflight(&storage, &reader).await.unwrap();
-        assert_eq!(manifest.event_count, 0);
-        assert_eq!(manifest.first_ordinal, 0);
-        assert_eq!(manifest.last_ordinal, 0);
-        assert!(manifest.per_pane_counts.is_empty());
+            let manifest = engine.m0_preflight(&storage, &reader).await.unwrap();
+            assert_eq!(manifest.event_count, 0);
+            assert_eq!(manifest.first_ordinal, 0);
+            assert_eq!(manifest.last_ordinal, 0);
+            assert!(manifest.per_pane_counts.is_empty());
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -1098,120 +1120,130 @@ mod tests {
     // M2 tests
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_m2_imports_preserving_ordinals() {
-        let records = vec![
-            make_cursor_record(1, 0),
-            make_cursor_record(1, 1),
-            make_cursor_record(2, 2),
-        ];
-        let engine = MigrationEngine::new(MigrationConfig {
-            import_batch_size: 2,
-            ..Default::default()
+    #[test]
+    fn test_m2_imports_preserving_ordinals() {
+        run_async_test(async {
+            let records = vec![
+                make_cursor_record(1, 0),
+                make_cursor_record(1, 1),
+                make_cursor_record(2, 2),
+            ];
+            let engine = MigrationEngine::new(MigrationConfig {
+                import_batch_size: 2,
+                ..Default::default()
+            });
+            let mut manifest = MigrationManifest::default();
+
+            // Compute export digest first
+            let reader = TestEventReader::new(records.clone());
+            let exported = engine.m1_export(&reader, &mut manifest).unwrap();
+
+            let target = MockMigrationStorage::healthy();
+            engine
+                .m2_import(&target, &exported, &mut manifest)
+                .await
+                .unwrap();
+
+            assert_eq!(target.total_events_appended(), 3);
+            assert_eq!(manifest.import_count, 3);
+            assert_eq!(manifest.import_digest, manifest.export_digest);
         });
-        let mut manifest = MigrationManifest::default();
-
-        // Compute export digest first
-        let reader = TestEventReader::new(records.clone());
-        let exported = engine.m1_export(&reader, &mut manifest).unwrap();
-
-        let target = MockMigrationStorage::healthy();
-        engine
-            .m2_import(&target, &exported, &mut manifest)
-            .await
-            .unwrap();
-
-        assert_eq!(target.total_events_appended(), 3);
-        assert_eq!(manifest.import_count, 3);
-        assert_eq!(manifest.import_digest, manifest.export_digest);
     }
 
-    #[tokio::test]
-    async fn test_m2_digest_match_passes() {
-        let records = vec![make_cursor_record(1, 0), make_cursor_record(1, 1)];
-        let engine = MigrationEngine::new(MigrationConfig::default());
-        let mut manifest = MigrationManifest::default();
+    #[test]
+    fn test_m2_digest_match_passes() {
+        run_async_test(async {
+            let records = vec![make_cursor_record(1, 0), make_cursor_record(1, 1)];
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let mut manifest = MigrationManifest::default();
 
-        let reader = TestEventReader::new(records);
-        let exported = engine.m1_export(&reader, &mut manifest).unwrap();
+            let reader = TestEventReader::new(records);
+            let exported = engine.m1_export(&reader, &mut manifest).unwrap();
 
-        let target = MockMigrationStorage::healthy();
-        let result = engine.m2_import(&target, &exported, &mut manifest).await;
-        assert!(result.is_ok());
+            let target = MockMigrationStorage::healthy();
+            let result = engine.m2_import(&target, &exported, &mut manifest).await;
+            assert!(result.is_ok());
+        });
     }
 
-    #[tokio::test]
-    async fn test_m2_digest_mismatch_aborts() {
-        let records = vec![make_cursor_record(1, 0), make_cursor_record(1, 1)];
-        let engine = MigrationEngine::new(MigrationConfig::default());
-        let mut manifest = MigrationManifest::default();
+    #[test]
+    fn test_m2_digest_mismatch_aborts() {
+        run_async_test(async {
+            let records = vec![make_cursor_record(1, 0), make_cursor_record(1, 1)];
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let mut manifest = MigrationManifest::default();
 
-        let reader = TestEventReader::new(records);
-        let exported = engine.m1_export(&reader, &mut manifest).unwrap();
+            let reader = TestEventReader::new(records);
+            let exported = engine.m1_export(&reader, &mut manifest).unwrap();
 
-        // Tamper with the digest
-        manifest.export_digest = 0xDEADBEEF;
+            // Tamper with the digest
+            manifest.export_digest = 0xDEADBEEF;
 
-        let target = MockMigrationStorage::healthy();
-        let result = engine.m2_import(&target, &exported, &mut manifest).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("digest mismatch"), "error: {msg}");
+            let target = MockMigrationStorage::healthy();
+            let result = engine.m2_import(&target, &exported, &mut manifest).await;
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("digest mismatch"), "error: {msg}");
+        });
     }
 
-    #[tokio::test]
-    async fn test_m2_target_write_failure_propagates() {
-        let records = vec![make_cursor_record(1, 0)];
-        let engine = MigrationEngine::new(MigrationConfig::default());
-        let mut manifest = MigrationManifest::default();
+    #[test]
+    fn test_m2_target_write_failure_propagates() {
+        run_async_test(async {
+            let records = vec![make_cursor_record(1, 0)];
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let mut manifest = MigrationManifest::default();
 
-        let reader = TestEventReader::new(records);
-        let exported = engine.m1_export(&reader, &mut manifest).unwrap();
+            let reader = TestEventReader::new(records);
+            let exported = engine.m1_export(&reader, &mut manifest).unwrap();
 
-        let target = MockMigrationStorage::healthy();
-        target.fail_append.store(true, Ordering::Relaxed);
+            let target = MockMigrationStorage::healthy();
+            target.fail_append.store(true, Ordering::Relaxed);
 
-        let result = engine.m2_import(&target, &exported, &mut manifest).await;
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("target write error"), "error: {msg}");
+            let result = engine.m2_import(&target, &exported, &mut manifest).await;
+            assert!(result.is_err());
+            let msg = format!("{}", result.unwrap_err());
+            assert!(msg.contains("target write error"), "error: {msg}");
+        });
     }
 
     // -----------------------------------------------------------------------
     // End-to-end M0→M2 pipeline
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_m0_m2_pipeline_end_to_end() {
-        let records = vec![
-            make_cursor_record(1, 0),
-            make_cursor_record(1, 1),
-            make_cursor_record(2, 2),
-            make_cursor_record(3, 3),
-            make_cursor_record(1, 4),
-        ];
-        let reader = TestEventReader::new(records);
-        let source = MockMigrationStorage::healthy();
-        let target = MockMigrationStorage::healthy();
-        let engine = MigrationEngine::new(MigrationConfig {
-            export_batch_size: 2,
-            import_batch_size: 3,
-            consumer_id: "test-migration".to_string(),
+    #[test]
+    fn test_m0_m2_pipeline_end_to_end() {
+        run_async_test(async {
+            let records = vec![
+                make_cursor_record(1, 0),
+                make_cursor_record(1, 1),
+                make_cursor_record(2, 2),
+                make_cursor_record(3, 3),
+                make_cursor_record(1, 4),
+            ];
+            let reader = TestEventReader::new(records);
+            let source = MockMigrationStorage::healthy();
+            let target = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig {
+                export_batch_size: 2,
+                import_batch_size: 3,
+                consumer_id: "test-migration".to_string(),
+            });
+
+            let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+
+            assert_eq!(manifest.event_count, 5);
+            assert_eq!(manifest.first_ordinal, 0);
+            assert_eq!(manifest.last_ordinal, 4);
+            assert_eq!(manifest.export_count, 5);
+            assert_eq!(manifest.import_count, 5);
+            assert_eq!(manifest.import_digest, manifest.export_digest);
+            assert_eq!(target.total_events_appended(), 5);
+            assert_eq!(manifest.per_pane_counts.get(&1), Some(&3));
+            assert_eq!(manifest.per_pane_counts.get(&2), Some(&1));
+            assert_eq!(manifest.per_pane_counts.get(&3), Some(&1));
         });
-
-        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-
-        assert_eq!(manifest.event_count, 5);
-        assert_eq!(manifest.first_ordinal, 0);
-        assert_eq!(manifest.last_ordinal, 4);
-        assert_eq!(manifest.export_count, 5);
-        assert_eq!(manifest.import_count, 5);
-        assert_eq!(manifest.import_digest, manifest.export_digest);
-        assert_eq!(target.total_events_appended(), 5);
-        assert_eq!(manifest.per_pane_counts.get(&1), Some(&3));
-        assert_eq!(manifest.per_pane_counts.get(&2), Some(&1));
-        assert_eq!(manifest.per_pane_counts.get(&3), Some(&1));
     }
 
     // -----------------------------------------------------------------------
@@ -1357,80 +1389,86 @@ mod tests {
     // Small batch size pipeline
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_m0_m2_with_batch_size_one() {
-        let records = vec![
-            make_cursor_record(1, 0),
-            make_cursor_record(2, 1),
-            make_cursor_record(3, 2),
-        ];
-        let reader = TestEventReader::new(records);
-        let source = MockMigrationStorage::healthy();
-        let target = MockMigrationStorage::healthy();
-        let engine = MigrationEngine::new(MigrationConfig {
-            export_batch_size: 1,
-            import_batch_size: 1,
-            ..Default::default()
+    #[test]
+    fn test_m0_m2_with_batch_size_one() {
+        run_async_test(async {
+            let records = vec![
+                make_cursor_record(1, 0),
+                make_cursor_record(2, 1),
+                make_cursor_record(3, 2),
+            ];
+            let reader = TestEventReader::new(records);
+            let source = MockMigrationStorage::healthy();
+            let target = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig {
+                export_batch_size: 1,
+                import_batch_size: 1,
+                ..Default::default()
+            });
+
+            let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+
+            assert_eq!(manifest.event_count, 3);
+            assert_eq!(manifest.export_count, 3);
+            assert_eq!(manifest.import_count, 3);
+            assert_eq!(manifest.import_digest, manifest.export_digest);
+            // batch_size=1 means 3 separate append calls
+            assert_eq!(target.appended.lock().unwrap().len(), 3);
         });
-
-        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-
-        assert_eq!(manifest.event_count, 3);
-        assert_eq!(manifest.export_count, 3);
-        assert_eq!(manifest.import_count, 3);
-        assert_eq!(manifest.import_digest, manifest.export_digest);
-        // batch_size=1 means 3 separate append calls
-        assert_eq!(target.appended.lock().unwrap().len(), 3);
     }
 
-    #[tokio::test]
-    async fn test_m0_m2_pipeline_empty_source() {
-        let reader = TestEventReader::new(vec![]);
-        let source = MockMigrationStorage::healthy();
-        let target = MockMigrationStorage::healthy();
-        let engine = MigrationEngine::new(MigrationConfig::default());
+    #[test]
+    fn test_m0_m2_pipeline_empty_source() {
+        run_async_test(async {
+            let reader = TestEventReader::new(vec![]);
+            let source = MockMigrationStorage::healthy();
+            let target = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+            let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
-        assert_eq!(manifest.event_count, 0);
-        assert_eq!(manifest.export_count, 0);
-        assert_eq!(manifest.import_count, 0);
-        assert_eq!(manifest.import_digest, manifest.export_digest);
-        assert_eq!(target.total_events_appended(), 0);
+            assert_eq!(manifest.event_count, 0);
+            assert_eq!(manifest.export_count, 0);
+            assert_eq!(manifest.import_count, 0);
+            assert_eq!(manifest.import_digest, manifest.export_digest);
+            assert_eq!(target.total_events_appended(), 0);
+        });
     }
 
     // -----------------------------------------------------------------------
     // Batch ID idempotency test
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_m2_batch_ids_contain_ordinal_range() {
-        let records = vec![
-            make_cursor_record(1, 10),
-            make_cursor_record(1, 11),
-            make_cursor_record(1, 12),
-        ];
-        let engine = MigrationEngine::new(MigrationConfig {
-            import_batch_size: 2,
-            consumer_id: "test-mig".to_string(),
-            ..Default::default()
+    #[test]
+    fn test_m2_batch_ids_contain_ordinal_range() {
+        run_async_test(async {
+            let records = vec![
+                make_cursor_record(1, 10),
+                make_cursor_record(1, 11),
+                make_cursor_record(1, 12),
+            ];
+            let engine = MigrationEngine::new(MigrationConfig {
+                import_batch_size: 2,
+                consumer_id: "test-mig".to_string(),
+                ..Default::default()
+            });
+            let mut manifest = MigrationManifest::default();
+            let reader = TestEventReader::new(records);
+            let exported = engine.m1_export(&reader, &mut manifest).unwrap();
+
+            let target = MockMigrationStorage::healthy();
+            engine
+                .m2_import(&target, &exported, &mut manifest)
+                .await
+                .unwrap();
+
+            let appended = target.appended.lock().unwrap();
+            // batch_size=2: [10,11] then [12]
+            assert_eq!(appended.len(), 2);
+            assert!(appended[0].batch_id.contains("10"));
+            assert!(appended[0].batch_id.contains("11"));
+            assert!(appended[1].batch_id.contains("12"));
         });
-        let mut manifest = MigrationManifest::default();
-        let reader = TestEventReader::new(records);
-        let exported = engine.m1_export(&reader, &mut manifest).unwrap();
-
-        let target = MockMigrationStorage::healthy();
-        engine
-            .m2_import(&target, &exported, &mut manifest)
-            .await
-            .unwrap();
-
-        let appended = target.appended.lock().unwrap();
-        // batch_size=2: [10,11] then [12]
-        assert_eq!(appended.len(), 2);
-        assert!(appended[0].batch_id.contains("10"));
-        assert!(appended[0].batch_id.contains("11"));
-        assert!(appended[1].batch_id.contains("12"));
     }
 
     // -----------------------------------------------------------------------
@@ -1473,23 +1511,25 @@ mod tests {
         assert!(msg.contains("queue full"), "msg: {msg}");
     }
 
-    #[tokio::test]
-    async fn test_m2_count_mismatch_detected() {
-        let records = vec![make_cursor_record(1, 0), make_cursor_record(1, 1)];
-        let engine = MigrationEngine::new(MigrationConfig::default());
-        let mut manifest = MigrationManifest::default();
+    #[test]
+    fn test_m2_count_mismatch_detected() {
+        run_async_test(async {
+            let records = vec![make_cursor_record(1, 0), make_cursor_record(1, 1)];
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let mut manifest = MigrationManifest::default();
 
-        let reader = TestEventReader::new(records);
-        let exported = engine.m1_export(&reader, &mut manifest).unwrap();
+            let reader = TestEventReader::new(records);
+            let exported = engine.m1_export(&reader, &mut manifest).unwrap();
 
-        // Tamper with export_count so count verification fails
-        manifest.export_count = 999;
+            // Tamper with export_count so count verification fails
+            manifest.export_count = 999;
 
-        let target = MockMigrationStorage::healthy();
-        let result = engine.m2_import(&target, &exported, &mut manifest).await;
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("count mismatch"), "msg: {msg}");
+            let target = MockMigrationStorage::healthy();
+            let result = engine.m2_import(&target, &exported, &mut manifest).await;
+            assert!(result.is_err());
+            let msg = format!("{}", result.unwrap_err());
+            assert!(msg.contains("count mismatch"), "msg: {msg}");
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -1627,185 +1667,199 @@ mod tests {
     // M3 tests
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_m3_migrates_all_consumer_checkpoints() {
-        let consumers = vec![
-            make_consumer_lag("indexer", 5),
-            make_consumer_lag("auditor", 10),
-        ];
-        let mut checkpoints = HashMap::new();
-        checkpoints.insert("indexer".to_string(), make_checkpoint("indexer", 3));
-        checkpoints.insert("auditor".to_string(), make_checkpoint("auditor", 2));
+    #[test]
+    fn test_m3_migrates_all_consumer_checkpoints() {
+        run_async_test(async {
+            let consumers = vec![
+                make_consumer_lag("indexer", 5),
+                make_consumer_lag("auditor", 10),
+            ];
+            let mut checkpoints = HashMap::new();
+            checkpoints.insert("indexer".to_string(), make_checkpoint("indexer", 3));
+            checkpoints.insert("auditor".to_string(), make_checkpoint("auditor", 2));
 
-        let source = MockCheckpointStorage::new(consumers, checkpoints);
-        let target = MockCheckpointStorage::empty_target();
-        let engine = MigrationEngine::new(MigrationConfig::default());
+            let source = MockCheckpointStorage::new(consumers, checkpoints);
+            let target = MockCheckpointStorage::empty_target();
+            let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = MigrationManifest {
-            first_ordinal: 0,
-            last_ordinal: 10,
-            ..Default::default()
-        };
+            let manifest = MigrationManifest {
+                first_ordinal: 0,
+                last_ordinal: 10,
+                ..Default::default()
+            };
 
-        let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
-            .await
-            .unwrap();
+            let result = engine
+                .m3_checkpoint_sync(&source, &target, &manifest)
+                .await
+                .unwrap();
 
-        assert_eq!(result.consumers_found, 2);
-        assert_eq!(result.checkpoints_migrated, 2);
-        assert_eq!(result.checkpoints_reset, 0);
-        assert_eq!(target.committed.lock().unwrap().len(), 2);
+            assert_eq!(result.consumers_found, 2);
+            assert_eq!(result.checkpoints_migrated, 2);
+            assert_eq!(result.checkpoints_reset, 0);
+            assert_eq!(target.committed.lock().unwrap().len(), 2);
+        });
     }
 
-    #[tokio::test]
-    async fn test_m3_preserves_checkpoint_monotonicity() {
-        let consumers = vec![make_consumer_lag("idx", 0)];
-        let mut checkpoints = HashMap::new();
-        checkpoints.insert("idx".to_string(), make_checkpoint("idx", 5));
+    #[test]
+    fn test_m3_preserves_checkpoint_monotonicity() {
+        run_async_test(async {
+            let consumers = vec![make_consumer_lag("idx", 0)];
+            let mut checkpoints = HashMap::new();
+            checkpoints.insert("idx".to_string(), make_checkpoint("idx", 5));
 
-        let source = MockCheckpointStorage::new(consumers, checkpoints);
-        let target = MockCheckpointStorage::empty_target();
-        let engine = MigrationEngine::new(MigrationConfig::default());
+            let source = MockCheckpointStorage::new(consumers, checkpoints);
+            let target = MockCheckpointStorage::empty_target();
+            let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = MigrationManifest {
-            first_ordinal: 0,
-            last_ordinal: 10,
-            ..Default::default()
-        };
+            let manifest = MigrationManifest {
+                first_ordinal: 0,
+                last_ordinal: 10,
+                ..Default::default()
+            };
 
-        let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
-            .await
-            .unwrap();
-        assert_eq!(result.checkpoints_migrated, 1);
+            let result = engine
+                .m3_checkpoint_sync(&source, &target, &manifest)
+                .await
+                .unwrap();
+            assert_eq!(result.checkpoints_migrated, 1);
 
-        let committed = target.committed.lock().unwrap();
-        assert_eq!(committed[0].upto_offset.ordinal, 5);
+            let committed = target.committed.lock().unwrap();
+            assert_eq!(committed[0].upto_offset.ordinal, 5);
+        });
     }
 
-    #[tokio::test]
-    async fn test_m3_rejects_checkpoint_referencing_missing_ordinal() {
-        // Checkpoint at ordinal 20, but manifest only goes to 10 → reset
-        let consumers = vec![make_consumer_lag("stale", 0)];
-        let mut checkpoints = HashMap::new();
-        checkpoints.insert("stale".to_string(), make_checkpoint("stale", 20));
+    #[test]
+    fn test_m3_rejects_checkpoint_referencing_missing_ordinal() {
+        run_async_test(async {
+            // Checkpoint at ordinal 20, but manifest only goes to 10 -> reset
+            let consumers = vec![make_consumer_lag("stale", 0)];
+            let mut checkpoints = HashMap::new();
+            checkpoints.insert("stale".to_string(), make_checkpoint("stale", 20));
 
-        let source = MockCheckpointStorage::new(consumers, checkpoints);
-        let target = MockCheckpointStorage::empty_target();
-        let engine = MigrationEngine::new(MigrationConfig::default());
+            let source = MockCheckpointStorage::new(consumers, checkpoints);
+            let target = MockCheckpointStorage::empty_target();
+            let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = MigrationManifest {
-            first_ordinal: 0,
-            last_ordinal: 10,
-            ..Default::default()
-        };
+            let manifest = MigrationManifest {
+                first_ordinal: 0,
+                last_ordinal: 10,
+                ..Default::default()
+            };
 
-        let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
-            .await
-            .unwrap();
-        assert_eq!(result.checkpoints_reset, 1);
-        assert_eq!(result.reset_consumers, vec!["stale"]);
+            let result = engine
+                .m3_checkpoint_sync(&source, &target, &manifest)
+                .await
+                .unwrap();
+            assert_eq!(result.checkpoints_reset, 1);
+            assert_eq!(result.reset_consumers, vec!["stale"]);
 
-        let committed = target.committed.lock().unwrap();
-        // Reset to first_ordinal
-        assert_eq!(committed[0].upto_offset.ordinal, 0);
+            let committed = target.committed.lock().unwrap();
+            // Reset to first_ordinal
+            assert_eq!(committed[0].upto_offset.ordinal, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn test_m3_handles_zero_consumers() {
-        let source = MockCheckpointStorage::new(vec![], HashMap::new());
-        let target = MockCheckpointStorage::empty_target();
-        let engine = MigrationEngine::new(MigrationConfig::default());
+    #[test]
+    fn test_m3_handles_zero_consumers() {
+        run_async_test(async {
+            let source = MockCheckpointStorage::new(vec![], HashMap::new());
+            let target = MockCheckpointStorage::empty_target();
+            let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = MigrationManifest::default();
+            let manifest = MigrationManifest::default();
 
-        let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
-            .await
-            .unwrap();
-        assert_eq!(result.consumers_found, 0);
-        assert_eq!(result.checkpoints_migrated, 0);
-        assert_eq!(result.checkpoints_reset, 0);
+            let result = engine
+                .m3_checkpoint_sync(&source, &target, &manifest)
+                .await
+                .unwrap();
+            assert_eq!(result.consumers_found, 0);
+            assert_eq!(result.checkpoints_migrated, 0);
+            assert_eq!(result.checkpoints_reset, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn test_m3_handles_consumer_at_head_offset() {
-        // Checkpoint at exactly last_ordinal — should pass without reset
-        let consumers = vec![make_consumer_lag("head", 0)];
-        let mut checkpoints = HashMap::new();
-        checkpoints.insert("head".to_string(), make_checkpoint("head", 10));
+    #[test]
+    fn test_m3_handles_consumer_at_head_offset() {
+        run_async_test(async {
+            // Checkpoint at exactly last_ordinal -- should pass without reset
+            let consumers = vec![make_consumer_lag("head", 0)];
+            let mut checkpoints = HashMap::new();
+            checkpoints.insert("head".to_string(), make_checkpoint("head", 10));
 
-        let source = MockCheckpointStorage::new(consumers, checkpoints);
-        let target = MockCheckpointStorage::empty_target();
-        let engine = MigrationEngine::new(MigrationConfig::default());
+            let source = MockCheckpointStorage::new(consumers, checkpoints);
+            let target = MockCheckpointStorage::empty_target();
+            let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = MigrationManifest {
-            first_ordinal: 0,
-            last_ordinal: 10,
-            ..Default::default()
-        };
+            let manifest = MigrationManifest {
+                first_ordinal: 0,
+                last_ordinal: 10,
+                ..Default::default()
+            };
 
-        let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
-            .await
-            .unwrap();
-        assert_eq!(result.checkpoints_migrated, 1);
-        assert_eq!(result.checkpoints_reset, 0);
+            let result = engine
+                .m3_checkpoint_sync(&source, &target, &manifest)
+                .await
+                .unwrap();
+            assert_eq!(result.checkpoints_migrated, 1);
+            assert_eq!(result.checkpoints_reset, 0);
 
-        let committed = target.committed.lock().unwrap();
-        assert_eq!(committed[0].upto_offset.ordinal, 10);
+            let committed = target.committed.lock().unwrap();
+            assert_eq!(committed[0].upto_offset.ordinal, 10);
+        });
     }
 
-    #[tokio::test]
-    async fn test_m3_mixed_valid_and_stale_consumers() {
-        let consumers = vec![make_consumer_lag("good", 2), make_consumer_lag("stale", 0)];
-        let mut checkpoints = HashMap::new();
-        checkpoints.insert("good".to_string(), make_checkpoint("good", 5));
-        checkpoints.insert("stale".to_string(), make_checkpoint("stale", 100));
+    #[test]
+    fn test_m3_mixed_valid_and_stale_consumers() {
+        run_async_test(async {
+            let consumers = vec![make_consumer_lag("good", 2), make_consumer_lag("stale", 0)];
+            let mut checkpoints = HashMap::new();
+            checkpoints.insert("good".to_string(), make_checkpoint("good", 5));
+            checkpoints.insert("stale".to_string(), make_checkpoint("stale", 100));
 
-        let source = MockCheckpointStorage::new(consumers, checkpoints);
-        let target = MockCheckpointStorage::empty_target();
-        let engine = MigrationEngine::new(MigrationConfig::default());
+            let source = MockCheckpointStorage::new(consumers, checkpoints);
+            let target = MockCheckpointStorage::empty_target();
+            let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = MigrationManifest {
-            first_ordinal: 0,
-            last_ordinal: 10,
-            ..Default::default()
-        };
+            let manifest = MigrationManifest {
+                first_ordinal: 0,
+                last_ordinal: 10,
+                ..Default::default()
+            };
 
-        let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
-            .await
-            .unwrap();
-        assert_eq!(result.consumers_found, 2);
-        assert_eq!(result.checkpoints_migrated, 2);
-        assert_eq!(result.checkpoints_reset, 1);
-        assert_eq!(result.reset_consumers, vec!["stale"]);
+            let result = engine
+                .m3_checkpoint_sync(&source, &target, &manifest)
+                .await
+                .unwrap();
+            assert_eq!(result.consumers_found, 2);
+            assert_eq!(result.checkpoints_migrated, 2);
+            assert_eq!(result.checkpoints_reset, 1);
+            assert_eq!(result.reset_consumers, vec!["stale"]);
+        });
     }
 
-    #[tokio::test]
-    async fn test_m3_target_rejects_out_of_order() {
-        let consumers = vec![make_consumer_lag("rej", 0)];
-        let mut checkpoints = HashMap::new();
-        checkpoints.insert("rej".to_string(), make_checkpoint("rej", 5));
+    #[test]
+    fn test_m3_target_rejects_out_of_order() {
+        run_async_test(async {
+            let consumers = vec![make_consumer_lag("rej", 0)];
+            let mut checkpoints = HashMap::new();
+            checkpoints.insert("rej".to_string(), make_checkpoint("rej", 5));
 
-        let source = MockCheckpointStorage::new(consumers, checkpoints);
-        let target = MockCheckpointStorage::empty_target();
-        target.reject_commit.store(true, Ordering::Relaxed);
-        let engine = MigrationEngine::new(MigrationConfig::default());
+            let source = MockCheckpointStorage::new(consumers, checkpoints);
+            let target = MockCheckpointStorage::empty_target();
+            target.reject_commit.store(true, Ordering::Relaxed);
+            let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = MigrationManifest {
-            first_ordinal: 0,
-            last_ordinal: 10,
-            ..Default::default()
-        };
+            let manifest = MigrationManifest {
+                first_ordinal: 0,
+                last_ordinal: 10,
+                ..Default::default()
+            };
 
-        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await;
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("rejected"), "msg: {msg}");
+            let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await;
+            assert!(result.is_err());
+            let msg = format!("{}", result.unwrap_err());
+            assert!(msg.contains("rejected"), "msg: {msg}");
+        });
     }
 
     #[test]
@@ -1821,28 +1875,30 @@ mod tests {
         assert_eq!(result, restored);
     }
 
-    #[tokio::test]
-    async fn test_m3_consumer_without_checkpoint_skipped() {
-        // Consumer appears in lag_metrics but has no checkpoint stored
-        let consumers = vec![make_consumer_lag("ghost", 0)];
-        let source = MockCheckpointStorage::new(consumers, HashMap::new());
-        let target = MockCheckpointStorage::empty_target();
-        let engine = MigrationEngine::new(MigrationConfig::default());
+    #[test]
+    fn test_m3_consumer_without_checkpoint_skipped() {
+        run_async_test(async {
+            // Consumer appears in lag_metrics but has no checkpoint stored
+            let consumers = vec![make_consumer_lag("ghost", 0)];
+            let source = MockCheckpointStorage::new(consumers, HashMap::new());
+            let target = MockCheckpointStorage::empty_target();
+            let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = MigrationManifest {
-            first_ordinal: 0,
-            last_ordinal: 10,
-            ..Default::default()
-        };
+            let manifest = MigrationManifest {
+                first_ordinal: 0,
+                last_ordinal: 10,
+                ..Default::default()
+            };
 
-        let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
-            .await
-            .unwrap();
-        assert_eq!(result.consumers_found, 1);
-        assert_eq!(result.checkpoints_migrated, 0);
-        assert_eq!(result.checkpoints_reset, 0);
-        assert!(target.committed.lock().unwrap().is_empty());
+            let result = engine
+                .m3_checkpoint_sync(&source, &target, &manifest)
+                .await
+                .unwrap();
+            assert_eq!(result.consumers_found, 1);
+            assert_eq!(result.checkpoints_migrated, 0);
+            assert_eq!(result.checkpoints_reset, 0);
+            assert!(target.committed.lock().unwrap().is_empty());
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -1871,102 +1927,112 @@ mod tests {
     // M5 tests
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_m5_emits_lifecycle_marker() {
-        let target = MockMigrationStorage::healthy();
-        let engine = MigrationEngine::new(MigrationConfig::default());
-        let manifest = MigrationManifest {
-            event_count: 100,
-            first_ordinal: 0,
-            last_ordinal: 99,
-            export_digest: 0xCAFE,
-            ..Default::default()
-        };
+    #[test]
+    fn test_m5_emits_lifecycle_marker() {
+        run_async_test(async {
+            let target = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let manifest = MigrationManifest {
+                event_count: 100,
+                first_ordinal: 0,
+                last_ordinal: 99,
+                export_digest: 0xCAFE,
+                ..Default::default()
+            };
 
-        let result = engine
-            .m5_cutover(&target, &manifest, 1708000000, None)
-            .await
-            .unwrap();
+            let result = engine
+                .m5_cutover(&target, &manifest, 1708000000, None)
+                .await
+                .unwrap();
 
-        assert_eq!(result.activated_backend, RecorderBackendKind::FrankenSqlite);
-        assert_eq!(result.migration_epoch_ms, 1708000000);
-        assert!(result.target_healthy);
-        assert!(result.source_retained_path.is_none());
+            assert_eq!(result.activated_backend, RecorderBackendKind::FrankenSqlite);
+            assert_eq!(result.migration_epoch_ms, 1708000000);
+            assert!(result.target_healthy);
+            assert!(result.source_retained_path.is_none());
 
-        // Verify one batch was appended (the marker event)
-        let appended = target.appended.lock().unwrap();
-        assert_eq!(appended.len(), 1);
-        assert_eq!(appended[0].events.len(), 1);
+            // Verify one batch was appended (the marker event)
+            let appended = target.appended.lock().unwrap();
+            assert_eq!(appended.len(), 1);
+            assert_eq!(appended[0].events.len(), 1);
 
-        let marker = &appended[0].events[0];
-        assert!(marker.event_id.contains("cutover"));
-        assert_eq!(marker.sequence, 100); // last_ordinal + 1
+            let marker = &appended[0].events[0];
+            assert!(marker.event_id.contains("cutover"));
+            assert_eq!(marker.sequence, 100); // last_ordinal + 1
+        });
     }
 
-    #[tokio::test]
-    async fn test_m5_switches_backend_selector() {
-        let target = MockMigrationStorage::healthy();
-        let engine = MigrationEngine::new(MigrationConfig::default());
-        let manifest = MigrationManifest::default();
+    #[test]
+    fn test_m5_switches_backend_selector() {
+        run_async_test(async {
+            let target = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let manifest = MigrationManifest::default();
 
-        let result = engine
-            .m5_cutover(&target, &manifest, 1000, None)
-            .await
-            .unwrap();
+            let result = engine
+                .m5_cutover(&target, &manifest, 1000, None)
+                .await
+                .unwrap();
 
-        // Activation result always indicates FrankenSqlite
-        assert_eq!(result.activated_backend, RecorderBackendKind::FrankenSqlite);
+            // Activation result always indicates FrankenSqlite
+            assert_eq!(result.activated_backend, RecorderBackendKind::FrankenSqlite);
+        });
     }
 
-    #[tokio::test]
-    async fn test_m5_preserves_source_files() {
-        let target = MockMigrationStorage::healthy();
-        let engine = MigrationEngine::new(MigrationConfig::default());
-        let manifest = MigrationManifest::default();
+    #[test]
+    fn test_m5_preserves_source_files() {
+        run_async_test(async {
+            let target = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let manifest = MigrationManifest::default();
 
-        let result = engine
-            .m5_cutover(
-                &target,
-                &manifest,
-                1000,
-                Some("/data/events.log".to_string()),
-            )
-            .await
-            .unwrap();
+            let result = engine
+                .m5_cutover(
+                    &target,
+                    &manifest,
+                    1000,
+                    Some("/data/events.log".to_string()),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(
-            result.source_retained_path,
-            Some("/data/events.log".to_string())
-        );
+            assert_eq!(
+                result.source_retained_path,
+                Some("/data/events.log".to_string())
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn test_m5_verifies_target_health_post_activation() {
-        // Use a degraded target
-        let target = MockMigrationStorage::degraded();
-        let engine = MigrationEngine::new(MigrationConfig::default());
-        let manifest = MigrationManifest::default();
+    #[test]
+    fn test_m5_verifies_target_health_post_activation() {
+        run_async_test(async {
+            // Use a degraded target
+            let target = MockMigrationStorage::degraded();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let manifest = MigrationManifest::default();
 
-        let result = engine
-            .m5_cutover(&target, &manifest, 1000, None)
-            .await
-            .unwrap();
+            let result = engine
+                .m5_cutover(&target, &manifest, 1000, None)
+                .await
+                .unwrap();
 
-        // Degraded target reports unhealthy
-        assert!(!result.target_healthy);
+            // Degraded target reports unhealthy
+            assert!(!result.target_healthy);
+        });
     }
 
-    #[tokio::test]
-    async fn test_m5_write_failure_propagates() {
-        let target = MockMigrationStorage::healthy();
-        target.fail_append.store(true, Ordering::Relaxed);
-        let engine = MigrationEngine::new(MigrationConfig::default());
-        let manifest = MigrationManifest::default();
+    #[test]
+    fn test_m5_write_failure_propagates() {
+        run_async_test(async {
+            let target = MockMigrationStorage::healthy();
+            target.fail_append.store(true, Ordering::Relaxed);
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let manifest = MigrationManifest::default();
 
-        let result = engine.m5_cutover(&target, &manifest, 1000, None).await;
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("target write error"), "msg: {msg}");
+            let result = engine.m5_cutover(&target, &manifest, 1000, None).await;
+            assert!(result.is_err());
+            let msg = format!("{}", result.unwrap_err());
+            assert!(msg.contains("target write error"), "msg: {msg}");
+        });
     }
 
     #[test]
@@ -1982,18 +2048,20 @@ mod tests {
         assert_eq!(result, restored);
     }
 
-    #[tokio::test]
-    async fn test_m5_marker_batch_uses_fsync_durability() {
-        let target = MockMigrationStorage::healthy();
-        let engine = MigrationEngine::new(MigrationConfig::default());
-        let manifest = MigrationManifest::default();
+    #[test]
+    fn test_m5_marker_batch_uses_fsync_durability() {
+        run_async_test(async {
+            let target = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let manifest = MigrationManifest::default();
 
-        engine
-            .m5_cutover(&target, &manifest, 1000, None)
-            .await
-            .unwrap();
+            engine
+                .m5_cutover(&target, &manifest, 1000, None)
+                .await
+                .unwrap();
 
-        let appended = target.appended.lock().unwrap();
-        assert_eq!(appended[0].required_durability, DurabilityLevel::Fsync,);
+            let appended = target.appended.lock().unwrap();
+            assert_eq!(appended[0].required_durability, DurabilityLevel::Fsync,);
+        });
     }
 }
