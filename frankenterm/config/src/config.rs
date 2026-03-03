@@ -1031,6 +1031,33 @@ impl Config {
         Self::load_with_overrides(&frankenterm_dynamic::Value::default())
     }
 
+    fn defaults_with_overrides(overrides: &frankenterm_dynamic::Value) -> LoadedConfig {
+        let (config, warnings) =
+            frankenterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
+                let cfg = Config::from_dynamic(
+                    overrides,
+                    frankenterm_dynamic::FromDynamicOptions {
+                        unknown_fields: frankenterm_dynamic::UnknownFieldAction::Warn,
+                        deprecated_fields: frankenterm_dynamic::UnknownFieldAction::Warn,
+                    },
+                )
+                .context("Error converting override config to Config struct")?;
+
+                cfg.check_consistency()
+                    .context("check_consistency on override config")?;
+                let _ = cfg.key_bindings();
+
+                Ok(cfg.compute_extra_defaults(None))
+            });
+
+        LoadedConfig {
+            config,
+            file_name: None,
+            lua: None,
+            warnings,
+        }
+    }
+
     /// It is relatively expensive to parse all the ssh config files,
     /// so we defer producing the default list until someone explicitly
     /// asks for it
@@ -1118,12 +1145,7 @@ impl Config {
         if let Some(loaded) = crate::toml_config::try_load_toml_config(overrides) {
             return loaded;
         }
-        LoadedConfig {
-            config: Ok(Self::default_config()),
-            file_name: None,
-            lua: None,
-            warnings: vec![],
-        }
+        Self::defaults_with_overrides(overrides)
     }
 
     #[cfg(feature = "lua")]
@@ -1146,12 +1168,7 @@ impl Config {
             log::info!(
                 "No frankenterm.toml found; Lua config disabled (set FRANKENTERM_LUA_CONFIG=1 to enable)"
             );
-            return LoadedConfig {
-                config: Ok(Self::default().compute_extra_defaults(None)),
-                file_name: None,
-                lua: None,
-                warnings: vec![],
-            };
+            return Self::defaults_with_overrides(overrides);
         }
 
         // Note that the directories crate has methods for locating project
