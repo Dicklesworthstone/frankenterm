@@ -946,7 +946,7 @@ fn e2e_fleet_provision_command_fail_rollback_recover() {
         reason: "recover from mass disconnect".to_string(),
     }) {
         RemoteResponse::RollbackComplete {
-            restored, removed, ..
+            restored, removed: _, ..
         } => {
             assert!(restored >= 3, "3 orphaned panes should be restored");
         }
@@ -1012,7 +1012,8 @@ fn e2e_federated_fleet_status_aggregation() {
             assert_eq!(status.node_id, "harness-node");
             assert_eq!(status.pane_count, 2);
             assert_eq!(status.peer_count, 2);
-            assert!(status.uptime_ms >= 0);
+            // uptime_ms is u64, just verify the field is accessible
+            let _ = status.uptime_ms;
         }
         other => panic!("expected Status, got {other:?}"),
     }
