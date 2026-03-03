@@ -22,7 +22,7 @@
 // for restart safety.
 // =============================================================================
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -1162,7 +1162,7 @@ mod tests {
         q.enqueue(item("a", 0, &[])).unwrap();
         q.enqueue(item("b", 0, &["a"])).unwrap();
 
-        assert!(q.would_create_cycle(&"a", &["b".into()]));
+        assert!(q.would_create_cycle(&"a".into(), &["b".into()]));
     }
 
     #[test]
@@ -1172,7 +1172,7 @@ mod tests {
         q.enqueue(item("b", 0, &["a"])).unwrap();
         q.enqueue(item("c", 0, &["b"])).unwrap();
 
-        assert!(q.would_create_cycle(&"a", &["c".into()]));
+        assert!(q.would_create_cycle(&"a".into(), &["c".into()]));
     }
 
     #[test]
@@ -1182,8 +1182,8 @@ mod tests {
         q.enqueue(item("b", 0, &["a"])).unwrap();
         q.enqueue(item("c", 0, &["a"])).unwrap();
 
-        assert!(!q.would_create_cycle(&"b", &["a".into()])); // b→a already exists, no new cycle
-        assert!(!q.would_create_cycle(&"c", &["a".into()])); // c→a already exists
+        assert!(!q.would_create_cycle(&"b".into(), &["a".into()])); // b→a already exists, no new cycle
+        assert!(!q.would_create_cycle(&"c".into(), &["a".into()])); // c→a already exists
     }
 
     // =========================================================================

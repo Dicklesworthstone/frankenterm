@@ -15,6 +15,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 mkdir -p "${LOG_DIR}"
 
+SKIP_LIB_TESTS="${FT_SKIP_LIB_TESTS:-0}"
+CARGO_TARGET_DIR_OVERRIDE="${FT_CARGO_TARGET_DIR:-target-lilaccreek-ft3681t51-e2e}"
+
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="ft_3681t_5_1_connector_host_runtime"
 CORRELATION_ID="ft-3681t.5.1-${RUN_ID}"
@@ -76,28 +79,66 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ "${SKIP_LIB_TESTS}" != "1" ]]; then
+  emit_log \
+    "running" \
+    "rch_exec_cargo_test_lib" \
+    "none" \
+    "none" \
+    "$(basename "${STDOUT_FILE}")" \
+    "rch exec -- env CARGO_TARGET_DIR=${CARGO_TARGET_DIR_OVERRIDE} cargo test -p frankenterm-core --lib connector_host_runtime_ -- --nocapture"
+
+  set +e
+  rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR_OVERRIDE}" cargo test -p frankenterm-core --lib connector_host_runtime_ -- --nocapture \
+    >"${STDOUT_FILE}" 2>"${STDERR_FILE}"
+  rc=$?
+  set -e
+
+  if [[ ${rc} -ne 0 ]]; then
+    emit_log \
+      "failed" \
+      "rch_exec_cargo_test_lib" \
+      "cargo_test_failed" \
+      "non_zero_exit" \
+      "$(basename "${STDERR_FILE}")" \
+      "rch-offloaded connector host runtime tests failed with exit ${rc}"
+    echo "ft-3681t.5.1 validation failed; inspect ${STDERR_FILE}" >&2
+    exit "${rc}"
+  fi
+else
+  : >"${STDOUT_FILE}"
+  : >"${STDERR_FILE}"
+  emit_log \
+    "skipped" \
+    "rch_exec_cargo_test_lib" \
+    "lib_tests_skipped_by_env" \
+    "none" \
+    "$(basename "${STDOUT_FILE}")" \
+    "FT_SKIP_LIB_TESTS=1; skipping lib test phase by explicit operator choice"
+fi
+
 emit_log \
   "running" \
-  "rch_exec_cargo_test" \
+  "rch_exec_cargo_test_integration" \
   "none" \
   "none" \
   "$(basename "${STDOUT_FILE}")" \
-  "rch exec -- env CARGO_TARGET_DIR=target-lilaccreek-ft3681t51-e2e cargo test -p frankenterm-core --lib connector_host_runtime_ -- --nocapture"
+  "rch exec -- env CARGO_TARGET_DIR=${CARGO_TARGET_DIR_OVERRIDE} cargo test -p frankenterm-core --test connector_host_runtime_integration -- --nocapture"
 
 set +e
-rch exec -- env CARGO_TARGET_DIR=target-lilaccreek-ft3681t51-e2e cargo test -p frankenterm-core --lib connector_host_runtime_ -- --nocapture \
-  >"${STDOUT_FILE}" 2>"${STDERR_FILE}"
+rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR_OVERRIDE}" cargo test -p frankenterm-core --test connector_host_runtime_integration -- --nocapture \
+  >>"${STDOUT_FILE}" 2>>"${STDERR_FILE}"
 rc=$?
 set -e
 
 if [[ ${rc} -ne 0 ]]; then
   emit_log \
     "failed" \
-    "rch_exec_cargo_test" \
+    "rch_exec_cargo_test_integration" \
     "cargo_test_failed" \
     "non_zero_exit" \
     "$(basename "${STDERR_FILE}")" \
-    "rch-offloaded connector host runtime tests failed with exit ${rc}"
+    "rch-offloaded connector host runtime integration tests failed with exit ${rc}"
   echo "ft-3681t.5.1 validation failed; inspect ${STDERR_FILE}" >&2
   exit "${rc}"
 fi
