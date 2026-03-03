@@ -16,8 +16,8 @@ use super::query::{
     EventView, HealthStatus, HistoryEntryView, PaneBookmarkView, PaneView, RulesetProfileState,
     SavedSearchView, SearchResultView, TriageItemView, WorkflowProgressView,
 };
+use super::view_adapters::{DashboardModel, adapt_dashboard};
 use crate::circuit_breaker::CircuitStateKind;
-use super::view_adapters::{adapt_dashboard, DashboardModel};
 
 /// Available views in the TUI
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -352,6 +352,75 @@ pub fn filtered_history_indices(state: &ViewState) -> Vec<usize> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportClass {
+    Compact,
+    Regular,
+    Wide,
+}
+
+#[must_use]
+fn viewport_class(area: Rect) -> ViewportClass {
+    if area.width >= 132 && area.height >= 36 {
+        ViewportClass::Wide
+    } else if area.width < 96 || area.height < 28 {
+        ViewportClass::Compact
+    } else {
+        ViewportClass::Regular
+    }
+}
+
+#[must_use]
+fn home_layout_constraints(has_dashboard: bool, viewport: ViewportClass) -> Vec<Constraint> {
+    match (has_dashboard, viewport) {
+        (true, ViewportClass::Wide) => vec![
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(9), // Health status detail
+            Constraint::Length(7), // Metrics snapshot
+            Constraint::Min(10),   // Dashboard panels
+            Constraint::Length(4), // Quick help
+            Constraint::Length(3), // Footer
+        ],
+        (true, ViewportClass::Regular) => vec![
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(8), // Health status detail
+            Constraint::Length(6), // Metrics snapshot
+            Constraint::Min(7),    // Dashboard panels
+            Constraint::Length(3), // Quick help
+            Constraint::Length(3), // Footer
+        ],
+        (true, ViewportClass::Compact) => vec![
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(6), // Health status detail
+            Constraint::Length(5), // Metrics snapshot
+            Constraint::Min(4),    // Dashboard panels
+            Constraint::Length(3), // Quick help
+            Constraint::Length(2), // Footer
+        ],
+        (false, ViewportClass::Wide) => vec![
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(9), // Health status detail
+            Constraint::Length(7), // Metrics snapshot
+            Constraint::Min(3),    // Quick help
+            Constraint::Length(3), // Footer
+        ],
+        (false, ViewportClass::Regular) => vec![
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(8), // Health status detail
+            Constraint::Length(6), // Metrics snapshot
+            Constraint::Min(3),    // Quick help
+            Constraint::Length(3), // Footer
+        ],
+        (false, ViewportClass::Compact) => vec![
+            Constraint::Length(3), // Title + aggregate health
+            Constraint::Length(6), // Health status detail
+            Constraint::Length(5), // Metrics snapshot
+            Constraint::Min(3),    // Quick help
+            Constraint::Length(2), // Footer
+        ],
+    }
+}
+
 /// Render the navigation tabs at the top
 pub fn render_tabs(current_view: View, area: Rect, buf: &mut Buffer) {
     let titles: Vec<Line> = View::all()
@@ -399,44 +468,35 @@ fn aggregate_health_indicator(health: &HealthStatus) -> (&'static str, Style) {
 /// Render the home/dashboard view
 pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let has_dashboard = state.dashboard.is_some();
-    let chunks = if has_dashboard {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),  // Title + aggregate health
-                Constraint::Length(9),  // Health status detail
-                Constraint::Length(7),  // Metrics snapshot
-                Constraint::Min(10),   // Dashboard panels
-                Constraint::Length(3),  // Quick help
-                Constraint::Length(3),  // Footer
-            ])
-            .split(area)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // Title + aggregate health
-                Constraint::Length(9), // Health status detail
-                Constraint::Length(7), // Metrics snapshot
-                Constraint::Min(3),    // Quick help
-                Constraint::Length(3), // Footer
-            ])
-            .split(area)
-    };
+    let viewport = viewport_class(area);
+    let compact = matches!(viewport, ViewportClass::Compact);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(home_layout_constraints(has_dashboard, viewport))
+        .split(area);
 
     // Title + aggregate status
     let (aggregate_label, aggregate_style) = state.health.as_ref().map_or_else(
         || ("LOADING", Style::default().fg(Color::Yellow)),
         |h| aggregate_health_indicator(h),
     );
+    let viewport_label = match viewport {
+        ViewportClass::Compact => "COMPACT",
+        ViewportClass::Regular => "STANDARD",
+        ViewportClass::Wide => "DESKTOP",
+    };
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
-            "WezTerm Automata  ",
+            "FrankenTerm Control Center  ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(aggregate_label, aggregate_style),
+        Span::styled(
+            format!("  [{viewport_label}]"),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]))
     .block(Block::default().borders(Borders::NONE));
     title.render(chunks[0], buf);
@@ -465,17 +525,23 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             } else {
                 Span::styled("ERROR", Style::default().fg(Color::Red))
             };
-            let circuit_status = match health.wezterm_circuit.state {
-                CircuitStateKind::Closed => {
-                    Span::styled("CLOSED", Style::default().fg(Color::Green))
-                }
-                CircuitStateKind::HalfOpen => {
-                    Span::styled("HALF-OPEN", Style::default().fg(Color::Yellow))
-                }
+            let (circuit_full, circuit_compact, circuit_style) = match health.wezterm_circuit.state
+            {
+                CircuitStateKind::Closed => (
+                    "CLOSED".to_string(),
+                    "CLOSED".to_string(),
+                    Style::default().fg(Color::Green),
+                ),
+                CircuitStateKind::HalfOpen => (
+                    "HALF-OPEN".to_string(),
+                    "HALF".to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
                 CircuitStateKind::Open => {
                     let remaining = health.wezterm_circuit.cooldown_remaining_ms.unwrap_or(0);
-                    Span::styled(
+                    (
                         format!("OPEN ({remaining} ms cooldown)"),
+                        "OPEN".to_string(),
                         Style::default().fg(Color::Red),
                     )
                 }
@@ -497,22 +563,51 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                     }
                 },
             );
-
-            vec![
-                Line::from(vec![Span::raw("  Watcher:       "), watcher_status]),
-                Line::from(vec![Span::raw("  Database:      "), db_status]),
-                Line::from(vec![Span::raw("  WezTerm CLI:   "), wezterm_status]),
-                Line::from(vec![Span::raw("  Circuit:       "), circuit_status]),
-                Line::from(vec![Span::raw("  Capture lag:   "), capture_lag]),
-                Line::from(vec![
-                    Span::raw("  Failures:      "),
-                    Span::raw(format!(
-                        "{}/{}",
-                        health.wezterm_circuit.consecutive_failures,
-                        health.wezterm_circuit.failure_threshold
-                    )),
-                ]),
-            ]
+            if compact {
+                vec![
+                    Line::from(vec![
+                        Span::raw("  Watcher "),
+                        watcher_status,
+                        Span::raw("  DB "),
+                        db_status,
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  WezTerm "),
+                        wezterm_status,
+                        Span::raw("  Circuit "),
+                        Span::styled(circuit_compact, circuit_style.clone()),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  Capture "),
+                        capture_lag,
+                        Span::raw("  Failures "),
+                        Span::raw(format!(
+                            "{}/{}",
+                            health.wezterm_circuit.consecutive_failures,
+                            health.wezterm_circuit.failure_threshold
+                        )),
+                    ]),
+                ]
+            } else {
+                vec![
+                    Line::from(vec![Span::raw("  Watcher:       "), watcher_status]),
+                    Line::from(vec![Span::raw("  Database:      "), db_status]),
+                    Line::from(vec![Span::raw("  WezTerm CLI:   "), wezterm_status]),
+                    Line::from(vec![
+                        Span::raw("  Circuit:       "),
+                        Span::styled(circuit_full, circuit_style),
+                    ]),
+                    Line::from(vec![Span::raw("  Capture lag:   "), capture_lag]),
+                    Line::from(vec![
+                        Span::raw("  Failures:      "),
+                        Span::raw(format!(
+                            "{}/{}",
+                            health.wezterm_circuit.consecutive_failures,
+                            health.wezterm_circuit.failure_threshold
+                        )),
+                    ]),
+                ]
+            }
         },
     );
 
@@ -556,25 +651,41 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             } else {
                 Style::default().fg(Color::Green)
             };
-
-            vec![
-                Line::from(vec![
-                    Span::raw("  Panes:         "),
-                    Span::styled(health.pane_count.to_string(), pane_count_style),
-                ]),
-                Line::from(vec![
-                    Span::raw("  Events:        "),
-                    Span::styled(health.event_count.to_string(), event_count_style),
-                ]),
-                Line::from(vec![
-                    Span::raw("  Unhandled:     "),
-                    Span::styled(unhandled.to_string(), unhandled_style),
-                ]),
-                Line::from(vec![
-                    Span::raw("  Triage items:  "),
-                    Span::styled(triage_count.to_string(), triage_style),
-                ]),
-            ]
+            if compact {
+                vec![
+                    Line::from(vec![
+                        Span::raw("  Panes "),
+                        Span::styled(health.pane_count.to_string(), pane_count_style),
+                        Span::raw("  Events "),
+                        Span::styled(health.event_count.to_string(), event_count_style),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  Unhandled "),
+                        Span::styled(unhandled.to_string(), unhandled_style),
+                        Span::raw("  Triage "),
+                        Span::styled(triage_count.to_string(), triage_style),
+                    ]),
+                ]
+            } else {
+                vec![
+                    Line::from(vec![
+                        Span::raw("  Panes:         "),
+                        Span::styled(health.pane_count.to_string(), pane_count_style),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  Events:        "),
+                        Span::styled(health.event_count.to_string(), event_count_style),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  Unhandled:     "),
+                        Span::styled(unhandled.to_string(), unhandled_style),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  Triage items:  "),
+                        Span::styled(triage_count.to_string(), triage_style),
+                    ]),
+                ]
+            }
         },
     );
     let metrics_block =
@@ -589,26 +700,56 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 
     // Quick help — index shifts when dashboard is present
     let help_idx = if has_dashboard { 4 } else { 3 };
-    let instructions = Paragraph::new(vec![
-        Line::from(Span::styled(
-            "Navigation:",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from("  Tab / Shift+Tab: Switch views   q: Quit   r: Refresh   ?: Help"),
-    ])
-    .block(Block::default().title("Quick Help").borders(Borders::ALL));
+    let help_lines = match viewport {
+        ViewportClass::Wide => vec![
+            Line::from(Span::styled(
+                "Desktop workflow:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from("  Tab/Shift+Tab switch views | j/k move | Enter act | / search"),
+            Line::from("  r refresh | u mark handled | p cycle profile | q quit"),
+        ],
+        ViewportClass::Regular => vec![
+            Line::from(Span::styled(
+                "Navigation:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from("  Tab views | j/k move | Enter action | ? help | q quit"),
+        ],
+        ViewportClass::Compact => vec![
+            Line::from(Span::styled(
+                "Compact controls:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from("  Tab views | j/k move | Enter | ? help | q quit"),
+        ],
+    };
+    let instructions = Paragraph::new(help_lines)
+        .block(Block::default().title("Quick Help").borders(Borders::ALL));
     instructions.render(chunks[help_idx], buf);
 
     // Footer with error if any
     let footer_idx = if has_dashboard { 5 } else { 4 };
-    if let Some(ref error) = state.error_message {
-        let error_widget = Paragraph::new(Span::styled(
-            error.as_str(),
+    let footer_inner_width = usize::from(chunks[footer_idx].width.saturating_sub(2)).max(1);
+    let (footer_msg, footer_style) = if let Some(ref error) = state.error_message {
+        (
+            truncate_str(error, footer_inner_width),
             Style::default().fg(Color::Red),
-        ))
+        )
+    } else if compact {
+        (
+            "No active errors | Press r to refresh".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        (
+            "Ready | Home shows fleet health, cost, and throttling state".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    let footer_widget = Paragraph::new(Span::styled(footer_msg, footer_style))
         .block(Block::default().borders(Borders::TOP));
-        error_widget.render(chunks[footer_idx], buf);
-    }
+    footer_widget.render(chunks[footer_idx], buf);
 }
 
 /// Render the unified dashboard panels (cost, rate limits, backpressure, quota).
@@ -627,18 +768,16 @@ fn render_dashboard_panels(model: &DashboardModel, area: Rect, buf: &mut Buffer)
     let inner = outer.inner(area);
     outer.render(area, buf);
 
-    if inner.height < 2 || inner.width < 20 {
+    if inner.height < 6 || inner.width < 28 {
         // Terminal too small — show summary line only.
-        let summary =
-            Paragraph::new(Span::raw(&model.summary_line)).block(Block::default().borders(Borders::NONE));
+        let summary = Paragraph::new(Span::raw(&model.summary_line))
+            .block(Block::default().borders(Borders::NONE));
         summary.render(inner, buf);
         return;
     }
 
-    // 2x2 grid layout when wide enough, else vertical stack.
-    let use_grid = inner.width >= 60;
-
-    if use_grid {
+    // Desktop mode: roomy symmetric grid.
+    if inner.width >= 110 && inner.height >= 12 {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -656,13 +795,33 @@ fn render_dashboard_panels(model: &DashboardModel, area: Rect, buf: &mut Buffer)
         render_rate_limit_panel(model, top_cols[1], buf);
         render_backpressure_panel(model, bot_cols[0], buf);
         render_quota_panel(model, bot_cols[1], buf);
+    // Tablet/narrow-desktop mode: weighted split keeps dense panels readable.
+    } else if inner.width >= 78 && inner.height >= 10 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+            .split(inner);
+        let top_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(rows[0]);
+        let bot_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(rows[1]);
+
+        render_cost_panel(model, top_cols[0], buf);
+        render_rate_limit_panel(model, top_cols[1], buf);
+        render_backpressure_panel(model, bot_cols[0], buf);
+        render_quota_panel(model, bot_cols[1], buf);
+    // Compact mode: single-column stack avoids cramped two-column text.
     } else {
         let panels = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(30),
-                Constraint::Percentage(25),
-                Constraint::Percentage(25),
+                Constraint::Percentage(32),
+                Constraint::Percentage(24),
+                Constraint::Percentage(24),
                 Constraint::Percentage(20),
             ])
             .split(inner);
@@ -683,21 +842,25 @@ fn render_cost_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     // Header
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{:<12} {:>10} {:>12} {:>6}", "Provider", "Cost", "Tokens", "Budget"),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "{:<12} {:>10} {:>12} {:>6}",
+            "Provider", "Cost", "Tokens", "Budget"
         ),
-    ]));
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]));
 
     // Cost rows
     for row in &model.cost_rows {
         let budget_style: Style = row.budget_style.into();
         lines.push(Line::from(vec![
             Span::raw(format!("{:<12} ", row.agent_type)),
-            Span::styled(format!("{:>10} ", row.cost_label), Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("{:>10} ", row.cost_label),
+                Style::default().fg(Color::Green),
+            ),
             Span::raw(format!("{:>12} ", row.tokens_label)),
             Span::styled(format!("{:>6}", row.budget_label), budget_style),
         ]));
@@ -705,14 +868,20 @@ fn render_cost_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
 
     // Totals
     lines.push(Line::from(vec![
-        Span::styled("Total:       ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Total:       ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!("{:>10} ", model.total_cost_label),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("{:>12}", model.total_tokens_label), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{:>12}", model.total_tokens_label),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
     ]));
 
     // Alerts (if any)
@@ -816,10 +985,23 @@ fn render_quota_panel(model: &DashboardModel, area: Rect, buf: &mut Buffer) {
 
 /// Render the panes list view
 pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
-        .split(area);
+    let stacked_mode = area.width < 96 || area.height < 18;
+    let ultra_compact = area.width < 68;
+    let chunks = if stacked_mode {
+        let detail_height = if area.height >= 22 { 10 } else { 8 };
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(area.height.saturating_sub(detail_height)),
+                Constraint::Length(detail_height),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(area)
+    };
 
     let mut bookmarks_by_pane: HashMap<u64, Vec<&PaneBookmarkView>> = HashMap::new();
     for bookmark in &state.pane_bookmarks {
@@ -839,17 +1021,23 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 
     let list_block = Block::default()
         .title(format!(
-            "Panes ({}/{})",
+            "Panes ({}/{}){}",
             filtered_indices.len(),
-            state.panes.len()
+            state.panes.len(),
+            if stacked_mode { " [compact]" } else { "" }
         ))
         .borders(Borders::ALL);
     let list_inner = list_block.inner(chunks[0]);
     list_block.render(chunks[0], buf);
 
+    let list_header_height = if ultra_compact || list_inner.height < 6 {
+        2
+    } else {
+        3
+    };
     let list_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([Constraint::Length(list_header_height), Constraint::Min(1)])
         .split(list_inner);
 
     let active_profile_name = state
@@ -875,21 +1063,43 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .as_ref()
         .map_or(0, |s| s.profiles.len());
 
-    let filter_summary = format!(
-        "filter='{}' unhandled={} bookmarked={} agent={} domain={} profile={} active={} ({})",
-        state.panes_filter_query,
-        state.panes_unhandled_only,
-        state.panes_bookmarked_only,
-        state.panes_agent_filter.as_deref().unwrap_or("all"),
-        state.panes_domain_filter.as_deref().unwrap_or("all"),
-        selected_profile_name,
-        active_profile_name,
-        profile_count
-    );
+    let filter_summary = if stacked_mode {
+        format!(
+            "q='{}' uh={} bm={} ag={} dom={} prof={}/{} ({})",
+            state.panes_filter_query,
+            state.panes_unhandled_only,
+            state.panes_bookmarked_only,
+            state.panes_agent_filter.as_deref().unwrap_or("all"),
+            state.panes_domain_filter.as_deref().unwrap_or("all"),
+            selected_profile_name,
+            active_profile_name,
+            profile_count
+        )
+    } else {
+        format!(
+            "filter='{}' unhandled={} bookmarked={} agent={} domain={} profile={} active={} ({})",
+            state.panes_filter_query,
+            state.panes_unhandled_only,
+            state.panes_bookmarked_only,
+            state.panes_agent_filter.as_deref().unwrap_or("all"),
+            state.panes_domain_filter.as_deref().unwrap_or("all"),
+            selected_profile_name,
+            active_profile_name,
+            profile_count
+        )
+    };
+    let header_width = usize::from(list_chunks[0].width.saturating_sub(1)).max(1);
+    let columns = if ultra_compact {
+        "id ag st u title"
+    } else if stacked_mode {
+        "id bm ag state u title"
+    } else {
+        "id  bm      agent    state          unhandled  title"
+    };
     Paragraph::new(vec![
-        Line::from("id  bm      agent    state          unhandled  title"),
+        Line::from(truncate_str(columns, header_width)),
         Line::from(Span::styled(
-            filter_summary,
+            truncate_str(&filter_summary, header_width),
             Style::default().fg(Color::Gray),
         )),
     ])
@@ -903,6 +1113,7 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .render(list_chunks[1], buf);
     } else {
         let mut lines: Vec<Line> = Vec::with_capacity(filtered_indices.len());
+        let row_width = usize::from(list_chunks[1].width.saturating_sub(1)).max(1);
         for (pos, pane_index) in filtered_indices.iter().enumerate() {
             let pane = &state.panes[*pane_index];
             let bookmark_summary = bookmarks_by_pane.get(&pane.pane_id).map_or_else(
@@ -927,7 +1138,26 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 Style::default()
             };
             let agent = pane.agent_type.as_deref().unwrap_or("unknown");
-            lines.push(Line::styled(
+            let raw_line = if ultra_compact {
+                format!(
+                    "{:>3} {:6} {:4} {:>2} {}",
+                    pane.pane_id,
+                    truncate_str(agent, 6),
+                    truncate_str(&pane.pane_state, 4),
+                    pane.unhandled_event_count,
+                    truncate_str(&pane.title, 18)
+                )
+            } else if stacked_mode {
+                format!(
+                    "{:>3} {:4} {:6} {:8} {:>2} {}",
+                    pane.pane_id,
+                    bookmark_summary,
+                    truncate_str(agent, 6),
+                    truncate_str(&pane.pane_state, 8),
+                    pane.unhandled_event_count,
+                    truncate_str(&pane.title, 20)
+                )
+            } else {
                 format!(
                     "{:>3} {:6} {:8} {:12} {:>9}  {}",
                     pane.pane_id,
@@ -936,14 +1166,20 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                     truncate_str(&pane.pane_state, 12),
                     pane.unhandled_event_count,
                     truncate_str(&pane.title, 24)
-                ),
-                style,
-            ));
+                )
+            };
+            lines.push(Line::styled(truncate_str(&raw_line, row_width), style));
         }
         Paragraph::new(lines).render(list_chunks[1], buf);
     }
 
-    let detail_block = Block::default().title("Pane Details").borders(Borders::ALL);
+    let detail_block = Block::default()
+        .title(if stacked_mode {
+            "Selected Pane"
+        } else {
+            "Pane Details"
+        })
+        .borders(Borders::ALL);
     let detail_inner = detail_block.inner(chunks[1]);
     detail_block.render(chunks[1], buf);
 
@@ -960,7 +1196,7 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         } else if pane.unhandled_event_count > 0 {
             format!("Run: ft workflow list --pane {}", pane.pane_id)
         } else {
-            format!("Inspect: wa get-text {} --tail 120", pane.pane_id)
+            format!("Inspect: ft robot get-text {} --tail 120", pane.pane_id)
         };
         let bookmark_summary = if pane_bookmarks.is_empty() {
             "none".to_string()
@@ -977,36 +1213,109 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let details = vec![
-            Line::from(format!("Pane ID: {}", pane.pane_id)),
-            Line::from(format!("Title: {}", pane.title)),
-            Line::from(format!("Domain: {}", pane.domain)),
-            Line::from(format!(
-                "Agent: {}",
-                pane.agent_type.as_deref().unwrap_or("unknown")
-            )),
-            Line::from(format!("State: {}", pane.pane_state)),
-            Line::from(format!("CWD: {}", pane.cwd.as_deref().unwrap_or("unknown"))),
-            Line::from(format!("Last Activity: {}", last_activity)),
-            Line::from(format!("Unhandled Events: {}", pane.unhandled_event_count)),
-            Line::from(format!(
-                "Bookmarks: {}",
-                truncate_str(&bookmark_summary, 80)
-            )),
-            Line::from(format!("Ruleset Active: {}", active_profile_name)),
-            Line::from(format!("Ruleset Selected: {}", selected_profile_name)),
-            Line::from(""),
-            Line::from(Span::styled(
+        let detail_width = usize::from(detail_inner.width.saturating_sub(1)).max(1);
+        let compact_details = stacked_mode || detail_inner.height < 10 || detail_inner.width < 34;
+        let mut details: Vec<Line> = Vec::new();
+
+        if compact_details {
+            details.push(Line::from(truncate_str(
+                &format!("#{} {}", pane.pane_id, pane.title),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!(
+                    "State {} | Agent {}",
+                    pane.pane_state,
+                    pane.agent_type.as_deref().unwrap_or("unknown")
+                ),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!(
+                    "Domain {} | Unhandled {}",
+                    pane.domain, pane.unhandled_event_count
+                ),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Bookmarks {}", truncate_str(&bookmark_summary, 30)),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Ruleset {selected_profile_name}/{active_profile_name}"),
+                detail_width,
+            )));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
                 "Next best action:",
                 Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(next_action),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Keys: p=cycle profile, Enter=apply selected profile, b=bookmarked only",
+            )));
+            details.push(Line::from(truncate_str(&next_action, detail_width)));
+            details.push(Line::from(""));
+            details.push(Line::from(truncate_str(
+                "Keys: j/k nav | p profile | Enter apply | b bookmarked",
+                detail_width,
+            )));
+        } else {
+            details.push(Line::from(truncate_str(
+                &format!("Pane ID: {}", pane.pane_id),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Title: {}", pane.title),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Domain: {}", pane.domain),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Agent: {}", pane.agent_type.as_deref().unwrap_or("unknown")),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("State: {}", pane.pane_state),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("CWD: {}", pane.cwd.as_deref().unwrap_or("unknown")),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Last Activity: {}", last_activity),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Unhandled Events: {}", pane.unhandled_event_count),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Bookmarks: {}", truncate_str(&bookmark_summary, 80)),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Ruleset Active: {}", active_profile_name),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Ruleset Selected: {}", selected_profile_name),
+                detail_width,
+            )));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Next best action:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            details.push(Line::from(truncate_str(&next_action, detail_width)));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                truncate_str(
+                    "Keys: p=cycle profile, Enter=apply selected profile, b=bookmarked only",
+                    detail_width,
+                ),
                 Style::default().fg(Color::Gray),
-            )),
-        ];
+            )));
+        }
         Paragraph::new(details).render(detail_inner, buf);
     } else {
         Paragraph::new(Span::styled(
@@ -2016,12 +2325,16 @@ pub fn render_timeline_placeholder(area: Rect, buf: &mut Buffer) {
 
 /// Truncate a string to max length, adding ellipsis if needed
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if max_len == 0 {
+        String::new()
+    } else if s.chars().count() <= max_len {
         s.to_string()
     } else if max_len > 3 {
-        format!("{}...", &s[..max_len - 3])
+        let mut truncated: String = s.chars().take(max_len - 3).collect();
+        truncated.push_str("...");
+        truncated
     } else {
-        s[..max_len].to_string()
+        s.chars().take(max_len).collect()
     }
 }
 
@@ -2055,6 +2368,39 @@ mod tests {
         assert_eq!(truncate_str("hello", 10), "hello");
         assert_eq!(truncate_str("hello world", 8), "hello...");
         assert_eq!(truncate_str("ab", 2), "ab");
+    }
+
+    #[test]
+    fn truncate_zero_len_is_safe() {
+        assert_eq!(truncate_str("hello", 0), "");
+    }
+
+    #[test]
+    fn viewport_class_breakpoints_are_stable() {
+        assert_eq!(
+            viewport_class(Rect::new(0, 0, 150, 40)),
+            ViewportClass::Wide
+        );
+        assert_eq!(
+            viewport_class(Rect::new(0, 0, 100, 30)),
+            ViewportClass::Regular
+        );
+        assert_eq!(
+            viewport_class(Rect::new(0, 0, 80, 30)),
+            ViewportClass::Compact
+        );
+    }
+
+    #[test]
+    fn home_layout_constraints_match_dashboard_mode() {
+        assert_eq!(
+            home_layout_constraints(true, ViewportClass::Compact).len(),
+            6
+        );
+        assert_eq!(
+            home_layout_constraints(false, ViewportClass::Regular).len(),
+            5
+        );
     }
 
     #[test]
