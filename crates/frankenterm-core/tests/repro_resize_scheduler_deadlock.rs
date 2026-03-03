@@ -17,7 +17,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known deadlock reproduction; enable when fixing superseded completion semantics"]
     fn test_deadlock_when_completing_superseded_work() {
         let config = ResizeSchedulerConfig::default();
         let mut scheduler = ResizeScheduler::new(config);
