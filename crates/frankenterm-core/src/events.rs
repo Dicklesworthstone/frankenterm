@@ -15,10 +15,11 @@
 //! use frankenterm_core::events::{EventBus, Event};
 //!
 //! fn main() {
-//!     let runtime = frankenterm_core::runtime_compat::Builder::new_current_thread()
+//!     let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
 //!         .enable_all()
 //!         .build()
 //!         .expect("build runtime");
+//!     use frankenterm_core::runtime_compat::CompatRuntime;
 //!     runtime.block_on(async {
 //!         let bus = EventBus::new(1000);
 //!         let mut subscriber = bus.subscribe();
