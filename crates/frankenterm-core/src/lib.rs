@@ -189,6 +189,8 @@ pub mod logging;
 pub mod lru_cache;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(any(feature = "mcp", feature = "mcp-client"))]
+mod mcp_framework;
 #[cfg(feature = "mcp-client")]
 pub mod mcp_client;
 #[cfg(feature = "mcp")]
@@ -345,6 +347,7 @@ pub mod suffix_array;
 pub mod suggestions;
 pub mod survival;
 pub mod swarm_work_queue;
+pub mod swarm_scheduler;
 pub mod tailer;
 #[cfg(feature = "recorder-lexical")]
 pub mod tantivy_ingest;

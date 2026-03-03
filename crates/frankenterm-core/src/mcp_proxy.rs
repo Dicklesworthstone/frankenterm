@@ -5,22 +5,13 @@
 //! - local tools keep existing names (`wa.*`),
 //! - remote tools are mounted under `<proxy_prefix>/<server>/<tool>`.
 
-mod mcp_proxy_framework {
-    pub use fastmcp::{
-        Content as FrameworkContent, McpContext as FrameworkMcpContext,
-        McpError as FrameworkMcpError, McpResult as FrameworkMcpResult, Server as FrameworkServer,
-        ServerBuilder as FrameworkServerBuilder, Tool as FrameworkTool,
-        ToolHandler as FrameworkToolHandler,
-    };
-}
-
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[allow(unused_imports)]
-use mcp_proxy_framework::{
+use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
     FrameworkMcpResult as McpResult, FrameworkServer as Server, FrameworkServerBuilder,
     FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,

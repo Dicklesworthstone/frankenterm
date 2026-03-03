@@ -9,17 +9,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-mod mcp_resources_framework {
-    pub use fastmcp::{
-        Content as FrameworkContent, McpContext as FrameworkMcpContext,
-        McpError as FrameworkMcpError, McpResult as FrameworkMcpResult,
-        Resource as FrameworkResource, ResourceContent as FrameworkResourceContent,
-        ResourceHandler as FrameworkResourceHandler, ResourceTemplate as FrameworkResourceTemplate,
-        ToolHandler as FrameworkToolHandler,
-    };
-}
-
-use mcp_resources_framework::{
+use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
     FrameworkMcpResult as McpResult, FrameworkResource as Resource,
     FrameworkResourceContent as ResourceContent, FrameworkResourceHandler as ResourceHandler,

@@ -25,17 +25,7 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-mod web_framework {
-    pub use fastapi::ResponseBody;
-    pub use fastapi::core::{
-        BoxFuture, ControlFlow, Cx, Handler, Middleware, StartupOutcome,
-    };
-    pub use fastapi::http::QueryString;
-    pub use fastapi::prelude::{App, Method, Request, RequestContext, Response, StatusCode};
-    pub use fastapi::{ServerConfig, ServerError, TcpServer};
-}
-
-use web_framework::{
+use crate::web_framework::{
     App, BoxFuture, ControlFlow, Cx, Handler, Method, Middleware, QueryString, Request,
     RequestContext, Response, ResponseBody, ServerConfig, ServerError, StartupOutcome, StatusCode,
     TcpServer,

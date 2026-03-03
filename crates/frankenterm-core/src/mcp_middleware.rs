@@ -1,17 +1,9 @@
 //! Middleware wrappers for MCP tool handling.
 
-mod mcp_middleware_framework {
-    pub use fastmcp::{
-        Content as FrameworkContent, McpContext as FrameworkMcpContext,
-        McpError as FrameworkMcpError, McpResult as FrameworkMcpResult, Tool as FrameworkTool,
-        ToolHandler as FrameworkToolHandler,
-    };
-}
-
 use super::{
     MCP_ERR_INVALID_ARGS, McpEnvelope, elapsed_ms, envelope_to_content, record_mcp_audit_sync,
 };
-use mcp_middleware_framework::{
+use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
     FrameworkMcpResult as McpResult, FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
 };

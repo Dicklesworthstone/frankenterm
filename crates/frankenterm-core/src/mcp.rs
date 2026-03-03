@@ -11,19 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-mod mcp_framework {
-    pub use fastmcp::{
-        Content as FrameworkContent, McpContext as FrameworkMcpContext,
-        McpError as FrameworkMcpError, McpResult as FrameworkMcpResult,
-        Resource as FrameworkResource, ResourceContent as FrameworkResourceContent,
-        ResourceHandler as FrameworkResourceHandler, ResourceTemplate as FrameworkResourceTemplate,
-        Server as FrameworkServer, StdioTransport as FrameworkStdioTransport,
-        Tool as FrameworkTool, ToolHandler as FrameworkToolHandler,
-    };
-}
-
 #[allow(unused_imports)]
-use mcp_framework::{
+use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
     FrameworkMcpResult as McpResult, FrameworkResource as Resource,
     FrameworkResourceContent as ResourceContent, FrameworkResourceHandler as ResourceHandler,

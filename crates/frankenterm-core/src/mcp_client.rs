@@ -5,19 +5,8 @@
 //! - deterministic server selection,
 //! - outbound tool invocation with mapped errors.
 
-mod mcp_client_framework {
-    pub use fastmcp::mcp_config::{
-        ConfigLoader as FrameworkConfigLoader, ServerConfig as FrameworkServerConfig,
-    };
-    pub use fastmcp::{
-        Client as FrameworkClient, ClientBuilder as FrameworkClientBuilder,
-        Content as FrameworkContent, McpError as FrameworkMcpError,
-        McpErrorCode as FrameworkMcpErrorCode, Tool as FrameworkTool,
-    };
-}
-
 use crate::config::{Config, McpClientConfig};
-use mcp_client_framework::{
+use crate::mcp_framework::{
     FrameworkClient, FrameworkClientBuilder, FrameworkConfigLoader, FrameworkContent,
     FrameworkMcpError, FrameworkMcpErrorCode, FrameworkServerConfig, FrameworkTool,
 };

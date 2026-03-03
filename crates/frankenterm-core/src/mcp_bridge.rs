@@ -3,10 +3,6 @@
 //! This stays as a thin extraction-only layer to reduce `mcp.rs` size while
 //! preserving behavior and registration order.
 
-mod mcp_bridge_framework {
-    pub use fastmcp::{Server as FrameworkServer, StdioTransport as FrameworkStdioTransport};
-}
-
 use super::{
     AuditedToolHandler, Config, FormatAwareToolHandler, Result,
     WaAccountsByServiceTemplateResource, WaAccountsRefreshTool, WaAccountsResource, WaAccountsTool,
@@ -19,7 +15,9 @@ use super::{
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
     WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowsResource,
 };
-use mcp_bridge_framework::{FrameworkServer as Server, FrameworkStdioTransport as StdioTransport};
+use crate::mcp_framework::{
+    FrameworkServer as Server, FrameworkStdioTransport as StdioTransport,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 
