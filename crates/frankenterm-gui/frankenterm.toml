@@ -135,6 +135,7 @@ agent_show_backpressure = true
 #   Cmd+Shift+K  Kill all stuck agents
 #   Cmd+Shift+O  Pause all agent input
 #   Cmd+Shift+E  Focus next error/stuck pane
+#   Cmd+Shift+D  Toggle dashboard panel
 
 # --- SSH Domains ---
 

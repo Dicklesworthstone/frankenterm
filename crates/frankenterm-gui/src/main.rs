@@ -39,6 +39,7 @@ use frankenterm_mux_server_impl::update_mux_domains;
 use wezterm_toast_notification::*;
 
 mod colorease;
+mod dashboard;
 mod native_bridge;
 mod commands;
 mod customglyph;
@@ -410,45 +411,11 @@ async fn connect_to_auto_connect_domains() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn trigger_gui_startup(
-    lua: Option<Rc<mlua::Lua>>,
-    spawn: Option<SpawnCommand>,
-) -> anyhow::Result<()> {
-    if let Some(lua) = lua {
-        let args = lua.pack_multi(spawn)?;
-        config::lua::emit_event(&lua, ("gui-startup".to_string(), args)).await?;
-    }
-    Ok(())
-}
+// Lua scripting deferred to ft-1memj.8
+async fn trigger_and_log_gui_startup(_spawn_command: Option<SpawnCommand>) {}
 
-async fn trigger_and_log_gui_startup(spawn_command: Option<SpawnCommand>) {
-    if let Err(err) =
-        config::with_lua_config_on_main_thread(move |lua| trigger_gui_startup(lua, spawn_command))
-            .await
-    {
-        let message = format!("while processing gui-startup event: {:#}", err);
-        log::error!("{}", message);
-        persistent_toast_notification("Error", &message);
-    }
-}
-
-async fn trigger_gui_attached(lua: Option<Rc<mlua::Lua>>, domain: MuxDomain) -> anyhow::Result<()> {
-    if let Some(lua) = lua {
-        let args = lua.pack_multi(domain)?;
-        config::lua::emit_event(&lua, ("gui-attached".to_string(), args)).await?;
-    }
-    Ok(())
-}
-
-async fn trigger_and_log_gui_attached(domain: MuxDomain) {
-    if let Err(err) =
-        config::with_lua_config_on_main_thread(move |lua| trigger_gui_attached(lua, domain)).await
-    {
-        let message = format!("while processing gui-attached event: {:#}", err);
-        log::error!("{}", message);
-        persistent_toast_notification("Error", &message);
-    }
-}
+// Lua scripting deferred to ft-1memj.8
+async fn trigger_and_log_gui_attached(_domain: MuxDomain) {}
 
 fn cell_pixel_dims(config: &ConfigHandle, dpi: f64) -> anyhow::Result<(usize, usize)> {
     let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi as usize)?);

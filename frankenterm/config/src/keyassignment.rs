@@ -650,6 +650,8 @@ pub enum KeyAssignment {
     FocusErrorPanes,
     /// Cycle agent auto-layout policy (by_status → by_activity → by_domain → manual).
     CycleAgentAutoLayout,
+    /// Toggle the integrated agent swarm dashboard panel (Cmd+Shift+D).
+    ToggleDashboard,
     SplitPane(SplitPane),
     PaneSelect(PaneSelectArguments),
     CharSelect(CharSelectArguments),

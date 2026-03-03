@@ -2060,6 +2060,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window", "Agents"],
             icon: Some("md_grid_view"),
         },
+        ToggleDashboard => CommandDef {
+            brief: "Toggle Dashboard".into(),
+            doc: "Show or hide the integrated agent swarm dashboard panel".into(),
+            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "d".into())],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["View"],
+            icon: Some("md_dashboard"),
+        },
         SplitPane(split) => {
             let direction = split.direction;
             CommandDef {
@@ -2190,6 +2198,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         PauseAllAgents,
         FocusErrorPanes,
         CycleAgentAutoLayout,
+        ToggleDashboard,
         ActivateTab(0),
         ActivateTab(1),
         ActivateTab(2),
