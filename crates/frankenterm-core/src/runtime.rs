@@ -3329,6 +3329,11 @@ mod tests {
     /// Like `run_async_test`, but runs the runtime on a dedicated thread so that
     /// TLS destructors don't collide with other tests running in parallel.
     /// Use for tests that spawn background tasks via `task::spawn`.
+    ///
+    /// The runtime is explicitly dropped inside `catch_unwind` to absorb
+    /// asupersync's RuntimeHandle TLS destructor panics (which occur when
+    /// spawned tasks' `Sleep` futures are dropped after TLS is destroyed).
+    /// Test assertion panics are captured separately and re-raised.
     fn run_async_test_isolated<F>(f: impl FnOnce() -> F + Send + 'static)
     where
         F: std::future::Future<Output = ()>,
@@ -3339,7 +3344,23 @@ mod tests {
                 let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
                     .build()
                     .expect("failed to build runtime for runtime tests");
-                runtime.block_on(f());
+
+                // Run the test body, catching any assertion panics.
+                let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.block_on(f());
+                }));
+
+                // Drop runtime inside catch_unwind to absorb TLS destructor
+                // panics from asupersync Sleep/Cx cleanup.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(runtime);
+                }));
+                crate::runtime_compat::clear_runtime_handle();
+
+                // Re-raise test assertion panics after cleanup.
+                if let Err(payload) = test_result {
+                    std::panic::resume_unwind(payload);
+                }
             })
             .expect("failed to spawn isolated test thread")
             .join();
