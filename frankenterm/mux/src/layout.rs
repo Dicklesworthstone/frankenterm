@@ -1063,4 +1063,32 @@ mod tests {
         assert_eq!(original.name, "grid-4");
         assert_eq!(cloned.name, "modified");
     }
+
+    /// Validates that preset function names match the session handler's
+    /// name-to-preset resolution (sessionhandler.rs SetLayoutCycle handler).
+    #[test]
+    fn preset_names_match_session_handler_expectations() {
+        // The session handler resolves layout names to presets using these exact strings.
+        let expected_names = ["grid-4", "main-side", "stacked", "main-bottom"];
+        let presets = [grid_4(), main_side(), stacked(), main_bottom()];
+
+        for (expected, preset) in expected_names.iter().zip(presets.iter()) {
+            assert_eq!(
+                preset.name, *expected,
+                "Preset name '{}' does not match expected '{}'",
+                preset.name, expected
+            );
+        }
+
+        // Also verify default_cycle contains exactly these presets in order
+        let cycle = default_cycle();
+        let cycle_names: Vec<&str> = cycle.layouts().iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(cycle_names, expected_names);
+    }
+
+    #[test]
+    fn default_cycle_has_four_layouts() {
+        let cycle = default_cycle();
+        assert_eq!(cycle.len(), 4);
+    }
 }
