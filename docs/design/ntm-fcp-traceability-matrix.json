@@ -192,8 +192,8 @@
       "capability_id": "ntm.swarm.launcher_weighted",
       "capability_name": "Native weighted swarm launcher and live rebalance",
       "source_domain": "ntm",
-      "status": "gap",
-      "gap_severity": "high",
+      "status": "partial",
+      "gap_severity": "medium",
       "mapped_bead_ids": [
         "ft-3681t.3.1",
         "ft-3681t.3.2"
@@ -228,20 +228,24 @@
       "capability_id": "fcp.host_runtime_native",
       "capability_name": "Connector host runtime and protocol embedding",
       "source_domain": "fcp",
-      "status": "gap",
-      "gap_severity": "high",
+      "status": "partial",
+      "gap_severity": "medium",
       "mapped_bead_ids": [
         "ft-3681t.5.1",
         "ft-3681t.5.2",
         "ft-3681t.5.3"
       ],
       "surfaces": [
-        "future connector lifecycle/runtime APIs"
+        "connector host lifecycle/runtime APIs",
+        "connector health and liveness snapshots",
+        "connector protocol operation envelopes"
       ],
       "implementation_anchors": [
-        "docs/design/ntm-fcp-convergence-architecture.md"
+        "docs/design/ntm-fcp-convergence-architecture.md",
+        "crates/frankenterm-core/src/connector_host_runtime.rs",
+        "tests/e2e/test_ft_3681t_5_1_connector_host_runtime.sh"
       ],
-      "evidence_notes": "No first-class connector fabric module is merged yet; design contracts exist."
+      "evidence_notes": "Deterministic connector host runtime core is now merged (lifecycle/protocol envelope/budget guardrails). Registry verification, sandbox zones, and bridge adapters remain in downstream ft-3681t.5.x beads."
     },
     {
       "capability_id": "fcp.connector_bridge_inbound_outbound",
