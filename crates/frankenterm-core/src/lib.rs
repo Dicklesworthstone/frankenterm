@@ -167,6 +167,7 @@ pub mod extensions;
 pub mod fd_budget;
 pub mod fenwick_tree;
 pub mod fibonacci_heap;
+pub mod fleet_launcher;
 pub mod gc;
 pub mod graph_scoring;
 pub mod headless_mux_server;
@@ -200,6 +201,8 @@ pub mod merkle_tree;
 pub mod metrics;
 #[cfg(feature = "subprocess-bridge")]
 pub mod mission_events;
+#[cfg(feature = "subprocess-bridge")]
+pub mod mission_agent_mail;
 #[cfg(feature = "subprocess-bridge")]
 pub mod mission_loop;
 pub mod network_observer;
@@ -341,6 +344,7 @@ pub mod subprocess_bridge;
 pub mod suffix_array;
 pub mod suggestions;
 pub mod survival;
+pub mod swarm_work_queue;
 pub mod tailer;
 #[cfg(feature = "recorder-lexical")]
 pub mod tantivy_ingest;
