@@ -208,6 +208,13 @@ step_gate_tests() {
   run_tests "frankenterm-term" "tests::gate"
 }
 
+# ======================================================================
+# Step 10: Session handler PDU dispatch tests (sessionhandler.rs)
+# ======================================================================
+step_session_handler_tests() {
+  run_tests "frankenterm-mux-server-impl" "sessionhandler::tests"
+}
+
 # --- Run all steps ---
 log "=== FrankenTerm Mux Layouts E2E Suite ==="
 log "Project root: $PROJECT_ROOT"
@@ -223,6 +230,7 @@ run_step "Stack cycling (forward/backward)" step_cycle_stack_tests     || true
 run_step "Codec PDU roundtrip (10 PDUs)"   step_codec_pdu_roundtrip    || true
 run_step "Resize reflow scorecard"         step_scorecard_tests        || true
 run_step "Readability gate thresholds"     step_gate_tests             || true
+run_step "Session handler PDU dispatch"   step_session_handler_tests  || true
 
 # --- Summary ---
 log ""

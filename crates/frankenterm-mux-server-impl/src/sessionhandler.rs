@@ -1232,3 +1232,277 @@ async fn move_pane(
         window_id,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Creates a PduSender that captures all sent PDUs into a shared Vec.
+    fn capturing_sender() -> (PduSender, Arc<Mutex<Vec<DecodedPdu>>>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let sender = PduSender::new(move |pdu| {
+            captured_clone.lock().unwrap().push(pdu);
+            Ok(())
+        });
+        (sender, captured)
+    }
+
+    /// Extract the single response PDU from the captured list.
+    fn take_response(captured: &Arc<Mutex<Vec<DecodedPdu>>>) -> DecodedPdu {
+        let mut v = captured.lock().unwrap();
+        assert_eq!(v.len(), 1, "expected exactly one response PDU");
+        v.remove(0)
+    }
+
+    #[test]
+    fn session_handler_new_has_empty_state() {
+        let (sender, _captured) = capturing_sender();
+        let handler = SessionHandler::new(sender);
+        assert!(handler.client_id.is_none());
+        assert!(handler.proxy_client_id.is_none());
+        assert!(handler.per_pane.is_empty());
+    }
+
+    #[test]
+    fn per_pane_creates_and_caches_entry() {
+        let (sender, _captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        let pp1 = handler.per_pane(42);
+        let pp2 = handler.per_pane(42);
+        // Same Arc returned for same pane_id
+        assert!(Arc::ptr_eq(&pp1, &pp2));
+
+        let pp3 = handler.per_pane(99);
+        // Different pane_id gets a different entry
+        assert!(!Arc::ptr_eq(&pp1, &pp3));
+    }
+
+    #[test]
+    fn per_pane_default_has_zero_seqno_and_empty_title() {
+        let (sender, _captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+        let pp = handler.per_pane(1);
+        let guard = pp.lock().unwrap();
+        assert_eq!(guard.seqno, 0);
+        assert_eq!(guard.title, "");
+        assert!(!guard.mouse_grabbed);
+        assert!(!guard.sent_initial_palette);
+        assert!(guard.notifications.is_empty());
+        assert!(guard.working_dir.is_none());
+    }
+
+    #[test]
+    fn ping_pdu_returns_pong() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 42,
+            pdu: Pdu::Ping(Ping {}),
+        });
+
+        let resp = take_response(&captured);
+        assert_eq!(resp.serial, 42);
+        assert_eq!(resp.pdu, Pdu::Pong(Pong {}));
+    }
+
+    #[test]
+    fn select_stack_pane_stub_returns_unit_response() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 100,
+            pdu: Pdu::SelectStackPane(SelectStackPane {
+                tab_id: 5,
+                slot_index: 0,
+                pane_index: 2,
+            }),
+        });
+
+        let resp = take_response(&captured);
+        assert_eq!(resp.serial, 100);
+        assert_eq!(resp.pdu, Pdu::UnitResponse(UnitResponse {}));
+    }
+
+    #[test]
+    fn update_pane_constraints_stub_returns_unit_response() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 101,
+            pdu: Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+                pane_id: 7,
+                min_width: Some(20),
+                max_width: Some(200),
+                min_height: None,
+                max_height: Some(50),
+            }),
+        });
+
+        let resp = take_response(&captured);
+        assert_eq!(resp.serial, 101);
+        assert_eq!(resp.pdu, Pdu::UnitResponse(UnitResponse {}));
+    }
+
+    #[test]
+    fn invalid_pdu_returns_error_response() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 200,
+            pdu: Pdu::Invalid { ident: 255 },
+        });
+
+        let resp = take_response(&captured);
+        assert_eq!(resp.serial, 200);
+        match resp.pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                assert!(
+                    reason.contains("invalid PDU"),
+                    "error should mention invalid PDU, got: {reason}"
+                );
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_pdu_treated_as_unexpected_request() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        // Sending a Pong (which is a response) as a request should get rejected
+        handler.process_one(DecodedPdu {
+            serial: 300,
+            pdu: Pdu::Pong(Pong {}),
+        });
+
+        let resp = take_response(&captured);
+        assert_eq!(resp.serial, 300);
+        match resp.pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                assert!(
+                    reason.contains("expected a request"),
+                    "error should mention expected request, got: {reason}"
+                );
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unit_response_treated_as_unexpected_request() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 301,
+            pdu: Pdu::UnitResponse(UnitResponse {}),
+        });
+
+        let resp = take_response(&captured);
+        match resp.pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                assert!(reason.contains("expected a request"));
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pdu_sender_propagates_errors() {
+        let sender = PduSender::new(|_| anyhow::bail!("send failed"));
+        let result = sender.send(DecodedPdu {
+            serial: 0,
+            pdu: Pdu::Pong(Pong {}),
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serial_preserved_across_different_pdus() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        // Send multiple synchronous PDUs with distinct serials
+        for serial in [1, 100, 999, u64::MAX] {
+            handler.process_one(DecodedPdu {
+                serial,
+                pdu: Pdu::Ping(Ping {}),
+            });
+        }
+
+        let pdus = captured.lock().unwrap();
+        let serials: Vec<u64> = pdus.iter().map(|p| p.serial).collect();
+        assert_eq!(serials, vec![1, 100, 999, u64::MAX]);
+    }
+
+    #[test]
+    fn update_pane_constraints_all_none_returns_unit() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 50,
+            pdu: Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+                pane_id: 1,
+                min_width: None,
+                max_width: None,
+                min_height: None,
+                max_height: None,
+            }),
+        });
+
+        let resp = take_response(&captured);
+        assert_eq!(resp.pdu, Pdu::UnitResponse(UnitResponse {}));
+    }
+
+    #[test]
+    fn error_response_pdu_treated_as_unexpected() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 400,
+            pdu: Pdu::ErrorResponse(ErrorResponse {
+                reason: "test error".to_string(),
+            }),
+        });
+
+        let resp = take_response(&captured);
+        match resp.pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                assert!(reason.contains("expected a request"));
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_panes_response_treated_as_unexpected() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 401,
+            pdu: Pdu::ListPanesResponse(ListPanesResponse {
+                tabs: vec![],
+                tab_titles: vec![],
+                window_titles: HashMap::new(),
+            }),
+        });
+
+        let resp = take_response(&captured);
+        match resp.pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                assert!(reason.contains("expected a request"));
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+}
