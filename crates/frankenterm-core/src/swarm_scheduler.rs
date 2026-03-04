@@ -993,6 +993,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_dep_item(id: &str, priority: u32, deps: Vec<&str>) -> WorkItem {
         WorkItem {
             id: id.to_string(),
@@ -1773,7 +1774,7 @@ mod tests {
     #[test]
     fn single_agent_no_rebalance() {
         let scheduler = SwarmScheduler::new(test_config());
-        let mut queue = make_queue();
+        let queue = make_queue();
 
         // Can't rebalance with only one agent
         let result = scheduler.check_rebalance(&queue, 3);

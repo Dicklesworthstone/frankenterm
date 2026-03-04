@@ -831,7 +831,7 @@ mod tests {
         assert!(diff.is_empty());
 
         // Add a pane to current
-        let mut reg2 = make_registry(&[1, 2, 3]);
+        let reg2 = make_registry(&[1, 2, 3]);
         let diff2 = mgr.diff_from_current(id, &reg2).unwrap();
         assert_eq!(diff2.added.len(), 1);
     }
@@ -852,7 +852,7 @@ mod tests {
 
         let record = mgr.rollback(cp_id, &mut reg_modified, "test rollback").unwrap();
         assert_eq!(record.target_checkpoint_id, cp_id);
-        assert!(record.removed_entity_count > 0 || record.restored_entity_count >= 0);
+        assert!(record.removed_entity_count > 0 || record.restored_entity_count == 0);
     }
 
     #[test]
