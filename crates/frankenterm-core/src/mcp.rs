@@ -1516,8 +1516,8 @@ mod tests {
 
     #[test]
     fn check_refresh_cooldown_past_cooldown() {
-        // Refreshed 120 seconds ago, cooldown is 60 seconds
-        assert!(check_refresh_cooldown(0, 120_000, 60_000).is_none());
+        // Refreshed 110 seconds ago, cooldown is 60 seconds.
+        assert!(check_refresh_cooldown(10_000, 120_000, 60_000).is_none());
     }
 
     #[test]
