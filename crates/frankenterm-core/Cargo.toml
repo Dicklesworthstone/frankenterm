@@ -22,6 +22,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 futures.workspace = true
+frankenterm-alloc.workspace = true
 
 # Pattern matching
 aho-corasick.workspace = true

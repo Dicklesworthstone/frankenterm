@@ -3218,6 +3218,7 @@ dependencies = [
  "fr-store",
  "franken-agent-detection",
  "frankensearch",
+ "frankenterm-alloc",
  "frankenterm-term",
  "fs2",
  "ftui",

@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::hash::Hash;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use frankenterm_alloc::{PaneArena, PaneArenaRegistry};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -313,6 +314,8 @@ pub struct PaneEntry {
 
     /// Optional operator-set priority override for capture scheduling.
     pub priority_override: Option<PanePriorityOverride>,
+    /// Logical allocator arena reservation for this pane.
+    pub pane_arena: PaneArena,
 }
 
 impl PaneEntry {
@@ -325,6 +328,7 @@ impl PaneEntry {
         info: PaneInfo,
         fingerprint: PaneFingerprint,
         observation: ObservationDecision,
+        pane_arena: PaneArena,
     ) -> Self {
         let now = epoch_ms();
         let domain = info.inferred_domain();
@@ -342,6 +346,7 @@ impl PaneEntry {
             is_alt_screen: false,
             last_status_at: None,
             priority_override: None,
+            pane_arena,
         }
     }
 
@@ -351,6 +356,7 @@ impl PaneEntry {
         info: PaneInfo,
         fingerprint: PaneFingerprint,
         observation: ObservationDecision,
+        pane_arena: PaneArena,
         pane_uuid: String,
     ) -> Self {
         let now = epoch_ms();
@@ -366,6 +372,7 @@ impl PaneEntry {
             is_alt_screen: false,
             last_status_at: None,
             priority_override: None,
+            pane_arena,
         }
     }
 
@@ -703,6 +710,8 @@ pub struct PaneRegistry {
     trauma_guard_config: TraumaGuardConfig,
     /// Pane filter configuration (cached)
     filter_config: PaneFilterConfig,
+    /// Logical per-pane allocator arena reservations.
+    pane_arenas: PaneArenaRegistry,
     /// Operational telemetry counters
     telemetry: IngestTelemetry,
 }
@@ -724,6 +733,7 @@ impl PaneRegistry {
             trauma_states: HashMap::new(),
             trauma_guard_config: TraumaGuardConfig::default(),
             filter_config: PaneFilterConfig::default(),
+            pane_arenas: PaneArenaRegistry::new(),
             telemetry: IngestTelemetry::new(),
         }
     }
@@ -747,6 +757,7 @@ impl PaneRegistry {
             trauma_states: HashMap::new(),
             trauma_guard_config,
             filter_config,
+            pane_arenas: PaneArenaRegistry::new(),
             telemetry: IngestTelemetry::new(),
         }
     }
@@ -895,8 +906,9 @@ impl PaneRegistry {
 
                 let fingerprint = PaneFingerprint::without_content(&pane);
                 let observation = self.decide_observation(&pane);
+                let pane_arena = self.pane_arenas.reserve(pane_id).arena();
 
-                let entry = PaneEntry::new(pane, fingerprint, observation);
+                let entry = PaneEntry::new(pane, fingerprint, observation, pane_arena);
                 self.uuid_index.insert(entry.pane_uuid.clone(), pane_id);
                 self.entries.insert(pane_id, entry);
                 self.trauma_states.insert(
@@ -934,6 +946,7 @@ impl PaneRegistry {
             self.entries.remove(pane_id);
             self.cursors.remove(pane_id);
             self.trauma_states.remove(pane_id);
+            self.pane_arenas.release(*pane_id);
         }
 
         self.telemetry.record_discovery_tick(&diff);
@@ -971,6 +984,24 @@ impl PaneRegistry {
     #[must_use]
     pub fn pane_ids(&self) -> Vec<u64> {
         self.entries.keys().copied().collect()
+    }
+
+    /// Lookup the logical allocator arena for a pane.
+    #[must_use]
+    pub fn pane_arena(&self, pane_id: u64) -> Option<PaneArena> {
+        self.pane_arenas.get(pane_id)
+    }
+
+    /// Number of active logical pane-arena reservations.
+    #[must_use]
+    pub fn pane_arena_count(&self) -> usize {
+        self.pane_arenas.count()
+    }
+
+    /// Snapshot of active pane-arena reservations sorted by pane id.
+    #[must_use]
+    pub fn pane_arenas_snapshot(&self) -> Vec<PaneArena> {
+        self.pane_arenas.snapshot()
     }
 
     /// Get only observed pane IDs (for tailing)
@@ -2984,7 +3015,8 @@ mod tests {
     fn pane_entry_creation_and_update() {
         let pane = make_pane(1, "bash", Some("/home"));
         let fp = PaneFingerprint::without_content(&pane);
-        let entry = PaneEntry::new(pane, fp, ObservationDecision::Observed);
+        let pane_arena = PaneArenaRegistry::new().reserve(1).arena();
+        let entry = PaneEntry::new(pane, fp, ObservationDecision::Observed, pane_arena);
 
         assert_eq!(entry.info.pane_id, 1);
         assert!(entry.should_observe());
@@ -3294,7 +3326,8 @@ mod tests {
     fn pane_entry_to_pane_record_observed() {
         let pane = make_pane(1, "bash", Some("/home/user"));
         let fp = PaneFingerprint::without_content(&pane);
-        let entry = PaneEntry::new(pane, fp, ObservationDecision::Observed);
+        let pane_arena = PaneArenaRegistry::new().reserve(1).arena();
+        let entry = PaneEntry::new(pane, fp, ObservationDecision::Observed, pane_arena);
 
         let record = entry.to_pane_record();
 
@@ -3311,12 +3344,14 @@ mod tests {
     fn pane_entry_to_pane_record_ignored() {
         let pane = make_pane(2, "vim", Some("/tmp"));
         let fp = PaneFingerprint::without_content(&pane);
+        let pane_arena = PaneArenaRegistry::new().reserve(2).arena();
         let entry = PaneEntry::new(
             pane,
             fp,
             ObservationDecision::Ignored {
                 reason: "exclude-vim".to_string(),
             },
+            pane_arena,
         );
 
         let record = entry.to_pane_record();
@@ -3364,6 +3399,30 @@ mod tests {
         assert!(!ignored[0].observed);
         assert_eq!(ignored[0].pane_id, 2);
         assert_eq!(ignored[0].ignore_reason, Some("skip-vim".to_string()));
+    }
+
+    #[test]
+    fn discovery_tick_tracks_pane_arena_lifecycle() {
+        let mut registry = PaneRegistry::new();
+        registry.discovery_tick(vec![
+            make_pane(1, "bash", Some("/home")),
+            make_pane(2, "vim", Some("/tmp")),
+        ]);
+
+        assert_eq!(registry.pane_arena_count(), 2);
+        let first = registry.pane_arena(1).expect("pane 1 arena should exist");
+        let second = registry.pane_arena(2).expect("pane 2 arena should exist");
+        assert_eq!(first.pane_id(), 1);
+        assert_eq!(second.pane_id(), 2);
+        assert_ne!(first.arena_id(), second.arena_id());
+
+        registry.discovery_tick(vec![make_pane(1, "bash", Some("/home"))]);
+
+        assert_eq!(registry.pane_arena_count(), 1);
+        assert!(registry.pane_arena(2).is_none());
+        let snapshot = registry.pane_arenas_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].pane_id(), 1);
     }
 
     // =========================================================================

@@ -14,6 +14,7 @@ use crate::runtime_compat::RwLock;
 use crate::runtime_compat::mpsc;
 #[cfg(unix)]
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixListener, UnixStream};
+use frankenterm_alloc::{allocator_backend, jemalloc_enabled, read_allocator_stats};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -50,6 +51,31 @@ fn elapsed_ms(start: Instant) -> u64 {
 
 fn now_ms_i64() -> i64 {
     i64::try_from(now_ms()).unwrap_or(i64::MAX)
+}
+
+fn allocator_status_payload() -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "backend": allocator_backend().as_str(),
+        "jemalloc_enabled": jemalloc_enabled(),
+        "stats": serde_json::Value::Null,
+    });
+
+    match read_allocator_stats() {
+        Ok(stats) => {
+            payload["stats"] = serde_json::json!({
+                "allocated": stats.allocated,
+                "active": stats.active,
+                "resident": stats.resident,
+                "mapped": stats.mapped,
+                "retained": stats.retained,
+            });
+        }
+        Err(err) => {
+            payload["stats_error"] = serde_json::Value::String(err.to_string());
+        }
+    }
+
+    payload
 }
 
 async fn mpsc_recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
@@ -1022,6 +1048,34 @@ async fn handle_request_with_context(
                 build_search_status_payload(ctx.search_config.as_ref());
             payload["search_index"] = search_index;
             payload["search_health"] = search_health;
+            payload["allocator"] = allocator_status_payload();
+            if let Some(registry_lock) = ctx.registry.as_ref() {
+                let (active_count, panes) = {
+                    let registry = registry_lock.read().await;
+                    let snapshot = registry.pane_arenas_snapshot();
+                    let active_count = snapshot.len();
+                    let panes: Vec<_> = snapshot
+                        .into_iter()
+                        .map(|arena| {
+                            serde_json::json!({
+                                "pane_id": arena.pane_id(),
+                                "arena_id": arena.arena_id().raw(),
+                            })
+                        })
+                        .collect();
+                    (active_count, panes)
+                };
+                payload["pane_arenas"] = serde_json::json!({
+                    "active_count": active_count,
+                    "panes": panes,
+                });
+            } else {
+                payload["pane_arenas"] = serde_json::json!({
+                    "active_count": 0,
+                    "panes": [],
+                    "source": "unavailable",
+                });
+            }
             IpcResponse::ok_with_data(payload)
         }
         IpcRequest::PaneState { pane_id } => handle_pane_state(pane_id, ctx).await,
@@ -1996,6 +2050,75 @@ mod tests {
                 search_health.get("indexing_error_count"),
                 Some(&serde_json::json!(0))
             );
+            let allocator = data
+                .get("allocator")
+                .and_then(serde_json::Value::as_object)
+                .expect("allocator should be present in status payload");
+            assert!(matches!(
+                allocator.get("backend").and_then(serde_json::Value::as_str),
+                Some("system" | "jemalloc")
+            ));
+            assert!(allocator.get("stats").is_some());
+            let pane_arenas = data
+                .get("pane_arenas")
+                .and_then(serde_json::Value::as_object)
+                .expect("pane_arenas should be present in status payload");
+            assert_eq!(pane_arenas.get("active_count"), Some(&serde_json::json!(0)));
+            assert_eq!(
+                pane_arenas.get("source"),
+                Some(&serde_json::json!("unavailable"))
+            );
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
+        });
+    }
+
+    #[test]
+    fn ipc_status_with_registry_reports_pane_arenas() {
+        run_async_test(async {
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
+
+            let server = IpcServer::bind(&socket_path).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+            {
+                let mut registry = registry.write().await;
+                registry.discovery_tick(vec![make_pane_info(7), make_pane_info(9)]);
+            }
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+            let server_bus = event_bus.clone();
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server
+                    .run_with_registry(server_bus, registry, shutdown_rx)
+                    .await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+
+            let client = IpcClient::new(&socket_path);
+            let response = client.status().await.unwrap();
+
+            assert!(response.ok);
+            let data = response.data.expect("status payload should be present");
+            let pane_arenas = data
+                .get("pane_arenas")
+                .and_then(serde_json::Value::as_object)
+                .expect("pane_arenas should be present");
+            assert_eq!(pane_arenas.get("active_count"), Some(&serde_json::json!(2)));
+            let panes = pane_arenas
+                .get("panes")
+                .and_then(serde_json::Value::as_array)
+                .expect("pane_arenas.panes should be an array");
+            assert_eq!(panes.len(), 2);
+            let pane_ids: Vec<_> = panes
+                .iter()
+                .filter_map(|value| value.get("pane_id").and_then(serde_json::Value::as_u64))
+                .collect();
+            assert_eq!(pane_ids, vec![7, 9]);
+            assert!(panes.iter().all(|pane| pane.get("arena_id").is_some()));
 
             send_shutdown(&shutdown_tx).await;
             let _ = server_handle.await;
