@@ -3276,6 +3276,7 @@ fn snapshot_trigger_from_detection(
     if matches!(
         event_type,
         "session.tool_use"
+            | "session.compaction"
             | "session.compaction_complete"
             | "session.summary"
             | "session.end"
@@ -4883,6 +4884,15 @@ mod tests {
     #[test]
     fn snapshot_trigger_session_compaction_complete_is_work_completed() {
         let detection = test_detection("session.compaction_complete", Severity::Info);
+        assert_eq!(
+            snapshot_trigger_from_detection(&detection),
+            Some(crate::snapshot_engine::SnapshotTrigger::WorkCompleted)
+        );
+    }
+
+    #[test]
+    fn snapshot_trigger_session_compaction_is_work_completed() {
+        let detection = test_detection("session.compaction", Severity::Info);
         assert_eq!(
             snapshot_trigger_from_detection(&detection),
             Some(crate::snapshot_engine::SnapshotTrigger::WorkCompleted)

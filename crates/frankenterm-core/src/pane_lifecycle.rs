@@ -386,6 +386,10 @@ impl PaneLifecycleEngine {
         let state = self.ensure_pane_state(pane_id, root_pid, age);
         state.last_health = health;
         state.age = age;
+        if health != PaneHealth::PossiblyStuck {
+            // A recovered pane should warn again if it later becomes possibly stuck.
+            state.warned = false;
+        }
 
         // Store sample in ring buffer.
         if state.samples.len() >= trend_window {
@@ -801,6 +805,20 @@ mod tests {
         // Second check: review (already warned)
         let (_, action2) = engine.health_check(1, 1000, Duration::from_secs(9 * 3600), 0.3, None);
         assert!(matches!(action2, LifecycleAction::Review { .. }));
+    }
+
+    #[test]
+    fn possibly_stuck_warning_resets_after_recovery() {
+        let mut engine = PaneLifecycleEngine::with_defaults();
+
+        let (_, first) = engine.health_check(1, 1000, Duration::from_secs(8 * 3600), 0.5, None);
+        assert!(matches!(first, LifecycleAction::Warn { .. }));
+
+        let (_, recovered) = engine.health_check(1, 1000, Duration::from_secs(3600), 20.0, None);
+        assert!(matches!(recovered, LifecycleAction::None));
+
+        let (_, second) = engine.health_check(1, 1000, Duration::from_secs(10 * 3600), 0.4, None);
+        assert!(matches!(second, LifecycleAction::Warn { .. }));
     }
 
     // ========================================================================

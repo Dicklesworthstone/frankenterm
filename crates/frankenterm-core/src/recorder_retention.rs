@@ -496,41 +496,45 @@ impl RetentionManager {
     ) -> RetentionSweepResult {
         let mut result = RetentionSweepResult::default();
 
-        // Collect transitions first to avoid borrow issues
-        let transitions: Vec<(usize, SegmentPhase)> = self
-            .segments
-            .iter()
-            .enumerate()
-            .filter_map(|(i, seg)| {
-                seg.eligible_transition(&self.config, now_ms)
-                    .map(|target| (i, target))
-            })
-            .collect();
+        for idx in 0..self.segments.len() {
+            loop {
+                let target = {
+                    let seg = &self.segments[idx];
+                    seg.eligible_transition(&self.config, now_ms)
+                };
+                let Some(target) = target else { break };
+                let seg_id = self.segments[idx].segment_id.clone();
 
-        for (idx, target) in transitions {
-            let seg = &mut self.segments[idx];
-            let seg_id = seg.segment_id.clone();
-
-            if target == SegmentPhase::Purged {
-                // Check checkpoint holds
-                if let Some(holders) = checkpoint_holders.get(&seg_id) {
-                    if !holders.is_empty() {
-                        for h in holders {
-                            result.held.push((seg_id.clone(), h.clone()));
+                if target == SegmentPhase::Purged {
+                    // Check checkpoint holds.
+                    if let Some(holders) = checkpoint_holders.get(&seg_id) {
+                        if !holders.is_empty() {
+                            for h in holders {
+                                result.held.push((seg_id.clone(), h.clone()));
+                            }
+                            result.purge_candidates.push(seg_id);
+                            break;
                         }
-                        result.purge_candidates.push(seg_id);
-                        continue;
                     }
                 }
-                // Safe to purge
-                if seg.transition(target, now_ms).is_ok() {
-                    result.purged.push(seg_id);
+
+                let transitioned = {
+                    let seg = &mut self.segments[idx];
+                    seg.transition(target, now_ms).is_ok()
+                };
+                if !transitioned {
+                    break;
                 }
-            } else if seg.transition(target, now_ms).is_ok() {
+
                 match target {
                     SegmentPhase::Sealed => result.sealed.push(seg_id),
                     SegmentPhase::Archived => result.archived.push(seg_id),
-                    _ => {}
+                    SegmentPhase::Purged => result.purged.push(seg_id),
+                    SegmentPhase::Active => {}
+                }
+
+                if target == SegmentPhase::Purged {
+                    break;
                 }
             }
         }
@@ -1193,6 +1197,28 @@ mod tests {
         assert!(result.purged.is_empty());
         assert_eq!(result.held.len(), 1);
         assert_eq!(result.held[0], ("s1".to_string(), "indexer".to_string()));
+    }
+
+    #[test]
+    fn manager_sweep_t3_converges_in_single_pass() {
+        let mut mgr = RetentionManager::new(RetentionConfig {
+            t3_max_hours: 24,
+            ..Default::default()
+        })
+        .unwrap();
+
+        mgr.add_segment(make_segment(
+            "t3",
+            SensitivityTier::T3Restricted,
+            SegmentPhase::Active,
+            0,
+        ));
+
+        let result = mgr.sweep(ms(24) + ms_days(1), &HashMap::new());
+        assert_eq!(result.sealed, vec!["t3".to_string()]);
+        assert_eq!(result.archived, vec!["t3".to_string()]);
+        assert_eq!(result.purged, vec!["t3".to_string()]);
+        assert_eq!(mgr.get_segment("t3").unwrap().phase, SegmentPhase::Purged);
     }
 
     #[test]

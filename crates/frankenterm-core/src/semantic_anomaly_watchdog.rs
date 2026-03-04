@@ -89,9 +89,7 @@ impl Default for WatchdogConfig {
 
 fn sanitize_watchdog_config(mut config: WatchdogConfig) -> WatchdogConfig {
     if config.queue_capacity == 0 {
-        tracing::warn!(
-            "semantic watchdog queue_capacity=0 is invalid; clamping to 1"
-        );
+        tracing::warn!("semantic watchdog queue_capacity=0 is invalid; clamping to 1");
         config.queue_capacity = 1;
     }
     if config.batch_size == 0 {
@@ -355,7 +353,7 @@ impl SemanticAnomalyWatchdog {
         let ml_running = Arc::clone(&running);
         let batch_timeout = Duration::from_millis(config.batch_timeout_ms);
 
-        let thread_handle = std::thread::Builder::new()
+        let thread_handle = match std::thread::Builder::new()
             .name("ft-semantic-ml".to_string())
             .spawn(move || {
                 ml_thread_loop(
@@ -367,11 +365,20 @@ impl SemanticAnomalyWatchdog {
                     embed_fn,
                     event_bus,
                 );
-            })
-            .expect("failed to spawn ML thread");
+            }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "failed to spawn semantic watchdog ML thread; watchdog disabled"
+                );
+                running.store(false, Ordering::Release);
+                None
+            }
+        };
 
         Self {
-            thread_handle: Some(thread_handle),
+            thread_handle,
             handle,
         }
     }
