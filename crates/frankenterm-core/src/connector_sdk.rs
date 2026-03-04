@@ -2033,6 +2033,7 @@ mod tests {
         let payload = test_payload();
         let manifest = ManifestBuilder::new("sim-connector")
             .version("1.0.0")
+            .publisher_signature("test-sig")
             .build_with_digest(&payload)
             .unwrap();
 
@@ -2052,6 +2053,7 @@ mod tests {
         let payload = test_payload();
         let manifest = ManifestBuilder::new("lifecycle")
             .version("1.0.0")
+            .publisher_signature("test-sig")
             .build_with_digest(&payload)
             .unwrap();
 
@@ -2093,6 +2095,7 @@ mod tests {
         let payload = test_payload();
         let manifest = ManifestBuilder::new("logged")
             .version("1.0.0")
+            .publisher_signature("test-sig")
             .build_with_digest(&payload)
             .unwrap();
 
@@ -2122,6 +2125,7 @@ mod tests {
         let payload = test_payload();
         let manifest = ManifestBuilder::new("tel")
             .version("1.0.0")
+            .publisher_signature("test-sig")
             .build_with_digest(&payload)
             .unwrap();
 
