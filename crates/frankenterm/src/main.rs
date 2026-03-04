@@ -8149,7 +8149,7 @@ fn build_robot_quick_start() -> RobotQuickStartData {
             "Use 'now' timestamp in responses to track freshness",
             "Pane IDs are stable within a backend session (current bridge: WezTerm) but may change across restarts",
             "Use --format toon for compact output when piping robot results between agents",
-            "NTM-compat aliases are supported: status->state, read->get-text, inject->send, await->wait-for",
+            "NTM-compat aliases are supported: status|panes->state, read|tail->get-text, inject|write->send, await|watch->wait-for, find|grep->search, event-log|eventlog->events",
         ],
         error_handling: QuickStartErrorHandling {
             common_codes: vec![
@@ -42345,6 +42345,28 @@ log_level = "debug"
     }
 
     #[test]
+    fn cli_robot_state_alias_panes_parses() {
+        let cli = Cli::try_parse_from(["ft", "robot", "panes", "--include-text", "--tail", "7"])
+            .expect("robot panes alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::State {
+                    include_text,
+                    tail,
+                    escapes,
+                }) => {
+                    assert!(include_text);
+                    assert_eq!(tail, 7);
+                    assert!(!escapes);
+                }
+                _ => panic!("expected RobotCommands::State"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
     fn cli_robot_agents_list_parses() {
         let cli = Cli::try_parse_from(["ft", "robot", "agents", "list"])
             .expect("robot agents list should parse");
@@ -42464,6 +42486,32 @@ log_level = "debug"
     }
 
     #[test]
+    fn cli_robot_get_text_alias_tail_parses() {
+        let cli = Cli::try_parse_from(["ft", "robot", "tail", "9", "--tail", "8", "--escapes"])
+            .expect("robot tail alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::GetText {
+                    pane_id,
+                    panes,
+                    all,
+                    tail,
+                    escapes,
+                }) => {
+                    assert_eq!(pane_id, Some(9));
+                    assert_eq!(panes, None);
+                    assert!(!all);
+                    assert_eq!(tail, 8);
+                    assert!(escapes);
+                }
+                _ => panic!("expected RobotCommands::GetText"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
     fn cli_robot_send_alias_inject_parses() {
         let cli = Cli::try_parse_from(["ft", "robot", "inject", "2", "echo hi", "--dry-run"])
             .expect("robot inject alias should parse");
@@ -42484,6 +42532,45 @@ log_level = "debug"
                     assert_eq!(wait_for, None);
                     assert_eq!(timeout_secs, 30);
                     assert!(!wait_for_regex);
+                }
+                _ => panic!("expected RobotCommands::Send"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_send_alias_write_parses() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "write",
+            "2",
+            "echo hi",
+            "--wait-for",
+            "done",
+            "--timeout-secs",
+            "45",
+            "--wait-for-regex",
+        ])
+        .expect("robot write alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Send {
+                    pane_id,
+                    text,
+                    dry_run,
+                    wait_for,
+                    timeout_secs,
+                    wait_for_regex,
+                }) => {
+                    assert_eq!(pane_id, 2);
+                    assert_eq!(text, "echo hi");
+                    assert!(!dry_run);
+                    assert_eq!(wait_for.as_deref(), Some("done"));
+                    assert_eq!(timeout_secs, 45);
+                    assert!(wait_for_regex);
                 }
                 _ => panic!("expected RobotCommands::Send"),
             },
@@ -42527,6 +42614,54 @@ log_level = "debug"
     }
 
     #[test]
+    fn cli_robot_wait_for_alias_watch_parses() {
+        let cli = Cli::try_parse_from(["ft", "robot", "watch", "4", "ready>", "--tail", "99"])
+            .expect("robot watch alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::WaitFor {
+                    pane_id,
+                    pattern,
+                    timeout_secs,
+                    tail,
+                    regex,
+                }) => {
+                    assert_eq!(pane_id, 4);
+                    assert_eq!(pattern, "ready>");
+                    assert_eq!(timeout_secs, 30);
+                    assert_eq!(tail, 99);
+                    assert!(!regex);
+                }
+                _ => panic!("expected RobotCommands::WaitFor"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_search_alias_grep_parses() {
+        let cli = Cli::try_parse_from([
+            "ft", "robot", "grep", "error", "--limit", "3", "--mode", "hybrid",
+        ])
+        .expect("robot grep alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Search {
+                    query, limit, mode, ..
+                }) => {
+                    assert_eq!(query, "error");
+                    assert_eq!(limit, 3);
+                    assert_eq!(mode, SearchModeArg::Hybrid);
+                }
+                _ => panic!("expected RobotCommands::Search"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
     fn cli_robot_events_alias_event_log_parses() {
         let cli = Cli::try_parse_from(["ft", "robot", "event-log", "--limit", "5"])
             .expect("robot event-log alias should parse");
@@ -42557,6 +42692,22 @@ log_level = "debug"
                     assert!(!would_handle);
                     assert!(!dry_run);
                     assert!(command.is_none());
+                }
+                _ => panic!("expected RobotCommands::Events"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_events_alias_eventlog_parses() {
+        let cli = Cli::try_parse_from(["ft", "robot", "eventlog", "--limit", "6"])
+            .expect("robot eventlog alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Events { limit, .. }) => {
+                    assert_eq!(limit, 6);
                 }
                 _ => panic!("expected RobotCommands::Events"),
             },
