@@ -12,11 +12,11 @@ use crate::overlay::selector::{matcher_pattern, matcher_score};
 use crate::termwindow::TermWindowNotif;
 use config::configuration;
 use config::keyassignment::{KeyAssignment, SpawnCommand, SpawnTabDomain};
+use mux::Mux;
 use mux::domain::{DomainId, DomainState};
 use mux::pane::PaneId;
 use mux::termwiztermtab::TermWizTerminal;
 use mux::window::WindowId;
-use mux::Mux;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use termwiz::cell::{AttributeChange, CellAttributes};
@@ -41,6 +41,14 @@ pub struct LauncherTabEntry {
     pub pane_count: Option<usize>,
 }
 
+#[derive(Clone, Debug)]
+pub struct LauncherWorkspaceEntry {
+    pub name: String,
+    pub window_count: usize,
+    pub pane_count: usize,
+    pub is_active: bool,
+}
+
 #[derive(Debug)]
 pub struct LauncherDomainEntry {
     pub domain_id: DomainId,
@@ -57,7 +65,7 @@ pub struct LauncherArgs {
     domain_id_of_current_tab: DomainId,
     title: String,
     active_workspace: String,
-    workspaces: Vec<String>,
+    workspaces: Vec<LauncherWorkspaceEntry>,
     help_text: String,
     fuzzy_help_text: String,
     alphabet: String,
@@ -79,11 +87,46 @@ impl LauncherArgs {
 
         let active_workspace = mux.active_workspace();
 
-        let workspaces = if flags.contains(LauncherFlags::WORKSPACES) {
+        let mut workspaces = if flags.contains(LauncherFlags::WORKSPACES) {
             mux.iter_workspaces()
+                .into_iter()
+                .map(|workspace| {
+                    let window_ids = mux.iter_windows_in_workspace(&workspace);
+                    let mut pane_count = 0usize;
+                    for window_id in &window_ids {
+                        if let Some(window) = mux.get_window(*window_id) {
+                            for tab in window.iter() {
+                                pane_count += tab.count_panes().unwrap_or(0);
+                            }
+                        }
+                    }
+
+                    LauncherWorkspaceEntry {
+                        is_active: workspace == active_workspace,
+                        name: workspace,
+                        window_count: window_ids.len(),
+                        pane_count,
+                    }
+                })
+                .collect()
         } else {
             vec![]
         };
+        if flags.contains(LauncherFlags::WORKSPACES)
+            && !workspaces.iter().any(|ws| ws.name == active_workspace)
+        {
+            workspaces.push(LauncherWorkspaceEntry {
+                name: active_workspace.clone(),
+                window_count: 0,
+                pane_count: 0,
+                is_active: true,
+            });
+        }
+        workspaces.sort_by(|a, b| {
+            b.is_active
+                .cmp(&a.is_active)
+                .then_with(|| a.name.cmp(&b.name))
+        });
 
         let tabs = if flags.contains(LauncherFlags::TABS) {
             // Ideally we'd resolve the tabs on the fly once we've started the
@@ -170,6 +213,14 @@ impl LauncherArgs {
 }
 
 const ROW_OVERHEAD: usize = 3;
+
+fn count_label(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
 
 struct LauncherState {
     active_idx: usize,
@@ -272,19 +323,31 @@ impl LauncherState {
 
         if args.flags.contains(LauncherFlags::WORKSPACES) {
             for ws in &args.workspaces {
-                if *ws != args.active_workspace {
-                    self.entries.push(Entry {
-                        label: format!("Switch to workspace: `{}`", ws),
-                        action: KeyAssignment::SwitchToWorkspace {
-                            name: Some(ws.clone()),
-                            spawn: None,
-                        },
-                    });
+                let session_shape = format!(
+                    "{}, {}",
+                    count_label(ws.window_count, "window", "windows"),
+                    count_label(ws.pane_count, "pane", "panes")
+                );
+                let label = if ws.is_active {
+                    format!("Current session: `{}` ({session_shape})", ws.name)
+                } else {
+                    format!("Switch to session: `{}` ({session_shape})", ws.name)
+                };
+
+                if ws.is_active {
+                    self.active_idx = self.entries.len();
                 }
+                self.entries.push(Entry {
+                    label,
+                    action: KeyAssignment::SwitchToWorkspace {
+                        name: Some(ws.name.clone()),
+                        spawn: None,
+                    },
+                });
             }
             self.entries.push(Entry {
                 label: format!(
-                    "Create new Workspace (current is `{}`)",
+                    "Create new session (current is `{}`)",
                     args.active_workspace
                 ),
                 action: KeyAssignment::SwitchToWorkspace {

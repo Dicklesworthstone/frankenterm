@@ -2393,7 +2393,7 @@ impl TermWindow {
     }
 
     fn show_launcher(&mut self) {
-        let title = "Launcher".to_string();
+        let title = "Session Manager".to_string();
         let args = LauncherActionArgs {
             title: Some(title),
             flags: LauncherFlags::LAUNCH_MENU_ITEMS
@@ -2401,7 +2401,9 @@ impl TermWindow {
                 | LauncherFlags::DOMAINS
                 | LauncherFlags::KEY_ASSIGNMENTS
                 | LauncherFlags::COMMANDS,
-            help_text: None,
+            help_text: Some(
+                "Session manager: Enter=run/switch  Esc=cancel  /=filter".to_string(),
+            ),
             fuzzy_help_text: None,
             alphabet: None,
         };

@@ -106,7 +106,8 @@ frankenterm-gui show-keys --lua
 
 Default session-manager entry point:
 
-- `Cmd+S` opens the launcher (workspace/domain/session switch surface).
+- `Cmd+S` opens the session manager launcher (workspace/domain/session switch surface).
+- Session rows include active/current marker plus window and pane counts.
 
 Global launch options:
 
