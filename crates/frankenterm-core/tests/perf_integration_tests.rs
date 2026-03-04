@@ -26,6 +26,7 @@ fn run_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,
 {
+    use frankenterm_core::runtime_compat::CompatRuntime;
     let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
         .enable_all()
         .build()
