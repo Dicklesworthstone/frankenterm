@@ -109,9 +109,12 @@ pub(super) fn parse_i64(qs: &QueryString<'_>, key: &str) -> Option<i64> {
     qs.get(key).and_then(|v| v.parse::<i64>().ok())
 }
 
-/// Parse a boolean query parameter (`"1"`, `"true"`, or `"yes"`).
+/// Parse a boolean query parameter (case-insensitive "1", "true", or "yes").
 pub(super) fn parse_bool(qs: &QueryString<'_>, key: &str) -> bool {
-    matches!(qs.get(key), Some("1" | "true" | "yes"))
+    qs.get(key).is_some_and(|v| {
+        let lower = v.to_ascii_lowercase();
+        matches!(lower.as_str(), "1" | "true" | "yes")
+    })
 }
 
 // =============================================================================
