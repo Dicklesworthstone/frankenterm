@@ -109,6 +109,7 @@ pub mod command_transport;
 pub mod connector_host_runtime;
 pub mod connector_inbound_bridge;
 pub mod connector_mesh;
+pub mod connector_outbound_bridge;
 pub mod connector_registry;
 pub mod connector_sdk;
 pub mod compact_bitset;
