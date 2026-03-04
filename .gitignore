@@ -124,6 +124,11 @@ storage.sqlite3.bak
 # macOS app bundles (build output)
 *.app/
 
+# Scratch/throwaway files (agent experiments, one-off debugging)
+*.orig
+*.patch
+*.bak
+
 # Agent tool MCP config backups (timestamped .bak files)
 .claude/*.bak
 .cline.mcp.json.*
