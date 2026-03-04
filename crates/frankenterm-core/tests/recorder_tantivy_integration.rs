@@ -29,6 +29,18 @@ use frankenterm_core::tantivy_ingest::{
     map_event_to_document,
 };
 
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use frankenterm_core::runtime_compat::CompatRuntime;
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
 // ===========================================================================
 // Test helpers
 // ===========================================================================
@@ -305,8 +317,9 @@ impl ChaosScenarioReport {
 // Test: Full pipeline cold start with invariant checking
 // ===========================================================================
 
-#[tokio::test]
-async fn full_pipeline_cold_start_with_invariant_check() {
+#[test]
+fn full_pipeline_cold_start_with_invariant_check() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -353,14 +366,16 @@ async fn full_pipeline_cold_start_with_invariant_check() {
         "invariant violations: {:?}",
         report.violations
     );
+    });
 }
 
 // ===========================================================================
 // Test: Multi-run checkpoint resume — no reprocessing
 // ===========================================================================
 
-#[tokio::test]
-async fn multi_run_checkpoint_resume_no_reprocessing() {
+#[test]
+fn multi_run_checkpoint_resume_no_reprocessing() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -439,14 +454,16 @@ async fn multi_run_checkpoint_resume_no_reprocessing() {
         indexed_ids_run1.len() + indexed_ids_run2.len() + indexed_ids_run3.len(),
         12
     );
+    });
 }
 
 // ===========================================================================
 // Test: Append new events between indexer runs
 // ===========================================================================
 
-#[tokio::test]
-async fn append_between_indexer_runs() {
+#[test]
+fn append_between_indexer_runs() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -498,14 +515,16 @@ async fn append_between_indexer_runs() {
     let lag = compute_indexer_lag(&storage, consumer).await.unwrap();
     assert_eq!(lag.records_behind, 0);
     assert!(lag.caught_up);
+    });
 }
 
 // ===========================================================================
 // Test: Dedup delete-before-add ordering
 // ===========================================================================
 
-#[tokio::test]
-async fn dedup_delete_before_add_ordering() {
+#[test]
+fn dedup_delete_before_add_ordering() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -550,14 +569,16 @@ async fn dedup_delete_before_add_ordering() {
             }
         }
     }
+    });
 }
 
 // ===========================================================================
 // Test: Dedup disabled — no delete calls
 // ===========================================================================
 
-#[tokio::test]
-async fn dedup_disabled_no_deletes() {
+#[test]
+fn dedup_disabled_no_deletes() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -577,14 +598,16 @@ async fn dedup_disabled_no_deletes() {
         "expected no deletes when dedup disabled"
     );
     assert_eq!(indexer.writer().docs.len(), 1);
+    });
 }
 
 // ===========================================================================
 // Test: Mixed event types through full pipeline
 // ===========================================================================
 
-#[tokio::test]
-async fn mixed_event_types_full_pipeline() {
+#[test]
+fn mixed_event_types_full_pipeline() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -624,14 +647,16 @@ async fn mixed_event_types_full_pipeline() {
     // Verify multi-pane preservation
     assert_eq!(docs[0].pane_id, 1);
     assert_eq!(docs[4].pane_id, 2);
+    });
 }
 
 // ===========================================================================
 // Test: Schema version filtering
 // ===========================================================================
 
-#[tokio::test]
-async fn schema_version_filtering_skips_unknown() {
+#[test]
+fn schema_version_filtering_skips_unknown() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -663,14 +688,16 @@ async fn schema_version_filtering_skips_unknown() {
 
     // Checkpoint should advance past all 3 (including skipped)
     assert_eq!(result.final_ordinal, Some(2));
+    });
 }
 
 // ===========================================================================
 // Test: Lag monitoring accuracy across indexer runs
 // ===========================================================================
 
-#[tokio::test]
-async fn lag_monitoring_accuracy_across_runs() {
+#[test]
+fn lag_monitoring_accuracy_across_runs() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -720,14 +747,16 @@ async fn lag_monitoring_accuracy_across_runs() {
     let lag3 = compute_indexer_lag(&storage, consumer).await.unwrap();
     assert_eq!(lag3.records_behind, 0);
     assert!(lag3.caught_up);
+    });
 }
 
 // ===========================================================================
 // Test: Multi-consumer independent checkpoints
 // ===========================================================================
 
-#[tokio::test]
-async fn multi_consumer_independent_checkpoints() {
+#[test]
+fn multi_consumer_independent_checkpoints() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -777,14 +806,16 @@ async fn multi_consumer_independent_checkpoints() {
 
     assert_eq!(cp_a.upto_offset.ordinal, 2);
     assert_eq!(cp_b.upto_offset.ordinal, 7);
+    });
 }
 
 // ===========================================================================
 // Test: Idempotent batch_id replay
 // ===========================================================================
 
-#[tokio::test]
-async fn idempotent_batch_replay_no_duplicates() {
+#[test]
+fn idempotent_batch_replay_no_duplicates() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -806,14 +837,16 @@ async fn idempotent_batch_replay_no_duplicates() {
     // Should only see 2 events (not 4)
     assert_eq!(result.events_indexed, 2);
     assert!(result.caught_up);
+    });
 }
 
 // ===========================================================================
 // Test: Writer rejection skips event but advances checkpoint
 // ===========================================================================
 
-#[tokio::test]
-async fn writer_rejection_skips_but_advances() {
+#[test]
+fn writer_rejection_skips_but_advances() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -844,14 +877,16 @@ async fn writer_rejection_skips_but_advances() {
     let r2 = ix2.run(&storage).await.unwrap();
     assert_eq!(r2.events_indexed, 0);
     assert!(r2.caught_up);
+    });
 }
 
 // ===========================================================================
 // Test: Commit failure prevents checkpoint advance
 // ===========================================================================
 
-#[tokio::test]
-async fn commit_failure_prevents_checkpoint_advance() {
+#[test]
+fn commit_failure_prevents_checkpoint_advance() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -879,14 +914,16 @@ async fn commit_failure_prevents_checkpoint_advance() {
     let r2 = ix2.run(&storage).await.unwrap();
     assert_eq!(r2.events_indexed, 1);
     assert!(r2.caught_up);
+    });
 }
 
 // ===========================================================================
 // Test: Torn-tail recovery — reader agrees with storage
 // ===========================================================================
 
-#[tokio::test]
-async fn torn_tail_recovery_reader_matches_storage() {
+#[test]
+fn torn_tail_recovery_reader_matches_storage() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
@@ -928,6 +965,7 @@ async fn torn_tail_recovery_reader_matches_storage() {
     let health2 = storage2.health().await;
     // After torn-tail truncation on reopen, storage should have same head
     assert!(health2.latest_offset.is_some());
+    });
 }
 
 async fn run_process_kill_resume_scenario() -> ChaosScenarioReport {
@@ -1211,8 +1249,9 @@ async fn run_torn_tail_corruption_scenario() -> ChaosScenarioReport {
 // Test: Chaos/failure matrix for recorder storage + indexing recovery
 // ===========================================================================
 
-#[tokio::test]
-async fn chaos_failure_matrix_detects_faults_and_recovers_without_silent_loss() {
+#[test]
+fn chaos_failure_matrix_detects_faults_and_recovers_without_silent_loss() {
+    run_async_test(async {
     let reports = vec![
         run_process_kill_resume_scenario().await,
         run_commit_failure_recovery_scenario().await,
@@ -1247,14 +1286,16 @@ async fn chaos_failure_matrix_detects_faults_and_recovers_without_silent_loss() 
             "reports": reports.iter().map(|r| r.as_artifact()).collect::<Vec<_>>(),
         }),
     );
+    });
 }
 
 // ===========================================================================
 // Test: Indexed documents preserve merge key ordering from source events
 // ===========================================================================
 
-#[tokio::test]
-async fn indexed_docs_preserve_merge_key_data() {
+#[test]
+fn indexed_docs_preserve_merge_key_data() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1279,14 +1320,16 @@ async fn indexed_docs_preserve_merge_key_data() {
         assert_eq!(doc.occurred_at_ms, src.occurred_at_ms as i64);
         assert_eq!(doc.event_id, src.event_id);
     }
+    });
 }
 
 // ===========================================================================
 // Test: Log offset monotonicity in indexed documents
 // ===========================================================================
 
-#[tokio::test]
-async fn log_offset_monotonically_increasing() {
+#[test]
+fn log_offset_monotonically_increasing() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1314,14 +1357,16 @@ async fn log_offset_monotonically_increasing() {
             w[0]
         );
     }
+    });
 }
 
 // ===========================================================================
 // Test: Redaction levels preserved in documents
 // ===========================================================================
 
-#[tokio::test]
-async fn redaction_levels_applied_in_pipeline() {
+#[test]
+fn redaction_levels_applied_in_pipeline() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1364,14 +1409,16 @@ async fn redaction_levels_applied_in_pipeline() {
     // No redaction: original text preserved
     assert_eq!(docs[2].redaction, Some("none".to_string()));
     assert_eq!(docs[2].text, "public data");
+    });
 }
 
 // ===========================================================================
 // Test: Large-scale multi-pane end-to-end with invariant checking
 // ===========================================================================
 
-#[tokio::test]
-async fn large_scale_multi_pane_end_to_end() {
+#[test]
+fn large_scale_multi_pane_end_to_end() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1453,14 +1500,16 @@ async fn large_scale_multi_pane_end_to_end() {
             doc.event_id
         );
     }
+    });
 }
 
 // ===========================================================================
 // Test: Storage flush modes with indexer
 // ===========================================================================
 
-#[tokio::test]
-async fn storage_flush_modes_with_indexer() {
+#[test]
+fn storage_flush_modes_with_indexer() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1481,6 +1530,7 @@ async fn storage_flush_modes_with_indexer() {
     let result = indexer.run(&storage).await.unwrap();
     assert_eq!(result.events_indexed, 1);
     assert!(result.caught_up);
+    });
 }
 
 // ===========================================================================
@@ -1533,8 +1583,9 @@ fn document_mapper_all_event_types() {
 // Test: Reader and storage agree on record count
 // ===========================================================================
 
-#[tokio::test]
-async fn reader_and_storage_agree_on_record_count() {
+#[test]
+fn reader_and_storage_agree_on_record_count() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1562,14 +1613,16 @@ async fn reader_and_storage_agree_on_record_count() {
     for (i, record) in all_records.iter().enumerate() {
         assert_eq!(record.offset.ordinal, i as u64);
     }
+    });
 }
 
 // ===========================================================================
 // Test: Deterministic IDs remain unique after storage roundtrip
 // ===========================================================================
 
-#[tokio::test]
-async fn deterministic_ids_unique_after_roundtrip() {
+#[test]
+fn deterministic_ids_unique_after_roundtrip() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1604,14 +1657,16 @@ async fn deterministic_ids_unique_after_roundtrip() {
     for (i, record) in records.iter().enumerate() {
         assert_eq!(record.event.event_id, events[i].event_id);
     }
+    });
 }
 
 // ===========================================================================
 // Test: Batch size boundary behavior
 // ===========================================================================
 
-#[tokio::test]
-async fn batch_boundary_exact_fit() {
+#[test]
+fn batch_boundary_exact_fit() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1639,14 +1694,16 @@ async fn batch_boundary_exact_fit() {
     assert!(result.caught_up);
     // Should take at most 2 batch reads (one full, one empty)
     assert!(result.batches_committed >= 1);
+    });
 }
 
 // ===========================================================================
 // Test: Causality preservation through storage → index pipeline
 // ===========================================================================
 
-#[tokio::test]
-async fn causality_preserved_through_pipeline() {
+#[test]
+fn causality_preserved_through_pipeline() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1672,14 +1729,16 @@ async fn causality_preserved_through_pipeline() {
     assert_eq!(doc.root_event_id, Some("root-001".to_string()));
     assert_eq!(doc.workflow_id, Some("wf-test".to_string()));
     assert_eq!(doc.correlation_id, Some("corr-test".to_string()));
+    });
 }
 
 // ===========================================================================
 // Test: Empty batches between populated batches
 // ===========================================================================
 
-#[tokio::test]
-async fn empty_run_between_populated_runs() {
+#[test]
+fn empty_run_between_populated_runs() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1709,14 +1768,16 @@ async fn empty_run_between_populated_runs() {
     assert_eq!(r3.events_indexed, 1);
     assert!(r3.caught_up);
     assert_eq!(ix3.writer().docs[0].event_id, "e1");
+    });
 }
 
 // ===========================================================================
 // Test: Serde roundtrip of indexed documents
 // ===========================================================================
 
-#[tokio::test]
-async fn indexed_document_serde_roundtrip() {
+#[test]
+fn indexed_document_serde_roundtrip() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let scfg = storage_config(dir.path());
     let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -1742,4 +1803,5 @@ async fn indexed_document_serde_roundtrip() {
         let roundtripped: IndexDocumentFields = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(doc, &roundtripped);
     }
+    });
 }

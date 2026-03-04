@@ -15,6 +15,18 @@ use frankenterm_core::recording::{
 use std::time::Instant;
 use tempfile::tempdir;
 
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use frankenterm_core::runtime_compat::CompatRuntime;
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -94,8 +106,9 @@ fn coefficient_of_variation(values: &[u64]) -> f64 {
 // Append throughput tests
 // ===========================================================================
 
-#[tokio::test]
-async fn test_append_single_batch_latency() {
+#[test]
+fn test_append_single_batch_latency() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -118,10 +131,12 @@ async fn test_append_single_batch_latency() {
         elapsed_us < 50_000,
         "single append took {elapsed_us}us, expected < 50ms"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_append_batch_128_latency() {
+#[test]
+fn test_append_batch_128_latency() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -137,10 +152,12 @@ async fn test_append_batch_128_latency() {
         elapsed_us < 50_000,
         "128-event batch took {elapsed_us}us, expected < 50ms"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_append_throughput_events_per_sec() {
+#[test]
+fn test_append_throughput_events_per_sec() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -165,14 +182,16 @@ async fn test_append_throughput_events_per_sec() {
         events_per_sec > 500.0,
         "throughput {events_per_sec:.0} events/sec, expected > 500"
     );
+    });
 }
 
 // ===========================================================================
 // Flush latency tests
 // ===========================================================================
 
-#[tokio::test]
-async fn test_flush_buffered_latency() {
+#[test]
+fn test_flush_buffered_latency() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
     storage
@@ -189,10 +208,12 @@ async fn test_flush_buffered_latency() {
         elapsed_us < 50_000,
         "buffered flush took {elapsed_us}us, expected < 50ms"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_flush_durable_latency() {
+#[test]
+fn test_flush_durable_latency() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
     storage
@@ -209,6 +230,7 @@ async fn test_flush_durable_latency() {
         elapsed_us < 100_000,
         "durable flush took {elapsed_us}us, expected < 100ms"
     );
+    });
 }
 
 // ===========================================================================
@@ -293,8 +315,9 @@ impl RecorderEventReader for PerfMemoryReader {
 // Cursor iteration tests
 // ===========================================================================
 
-#[tokio::test]
-async fn test_cursor_iteration_1k_events() {
+#[test]
+fn test_cursor_iteration_1k_events() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -357,14 +380,16 @@ async fn test_cursor_iteration_1k_events() {
         elapsed_us < 100_000,
         "1K cursor iteration took {elapsed_us}us, expected < 100ms"
     );
+    });
 }
 
 // ===========================================================================
 // SLO gate tests
 // ===========================================================================
 
-#[tokio::test]
-async fn test_slo_append_p50_under_1ms() {
+#[test]
+fn test_slo_append_p50_under_1ms() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -383,10 +408,12 @@ async fn test_slo_append_p50_under_1ms() {
 
     // p50 should be under 1ms (1000us) — allow 5ms test headroom
     assert!(p50 < 5_000, "append p50 = {p50}us, expected < 5ms");
+    });
 }
 
-#[tokio::test]
-async fn test_slo_append_p99_under_10ms() {
+#[test]
+fn test_slo_append_p99_under_10ms() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -405,10 +432,12 @@ async fn test_slo_append_p99_under_10ms() {
 
     // p99 should be under 10ms — allow 50ms test headroom for CI
     assert!(p99 < 50_000, "append p99 = {p99}us, expected < 50ms");
+    });
 }
 
-#[tokio::test]
-async fn test_slo_flush_durable_p50_under_5ms() {
+#[test]
+fn test_slo_flush_durable_p50_under_5ms() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -429,25 +458,29 @@ async fn test_slo_flush_durable_p50_under_5ms() {
 
     // Durable flush p50 < 5ms — allow 50ms headroom
     assert!(p50 < 50_000, "flush durable p50 = {p50}us, expected < 50ms");
+    });
 }
 
 // ===========================================================================
 // Backend kind verification
 // ===========================================================================
 
-#[tokio::test]
-async fn test_backend_kind_is_append_log() {
+#[test]
+fn test_backend_kind_is_append_log() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
     assert_eq!(storage.backend_kind(), RecorderBackendKind::AppendLog);
+    });
 }
 
 // ===========================================================================
 // Health under load
 // ===========================================================================
 
-#[tokio::test]
-async fn test_health_stays_green_under_sustained_append() {
+#[test]
+fn test_health_stays_green_under_sustained_append() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -462,14 +495,16 @@ async fn test_health_stays_green_under_sustained_append() {
     assert!(!health.degraded, "storage degraded after 1000 events");
     assert!(health.latest_offset.is_some());
     assert_eq!(health.latest_offset.unwrap().ordinal, 999);
+    });
 }
 
 // ===========================================================================
 // Soak tests (sustained ingest)
 // ===========================================================================
 
-#[tokio::test]
-async fn test_soak_sustained_ingest_no_degradation() {
+#[test]
+fn test_soak_sustained_ingest_no_degradation() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -506,10 +541,12 @@ async fn test_soak_sustained_ingest_no_degradation() {
         max_batch_us < 500_000,
         "worst batch {max_batch_us}us, expected < 500ms"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_soak_no_latency_drift() {
+#[test]
+fn test_soak_no_latency_drift() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -543,14 +580,16 @@ async fn test_soak_no_latency_drift() {
         ratio < 5.0,
         "latency drift ratio {ratio:.2}x (first={first}us, last={last}us), expected < 5x"
     );
+    });
 }
 
 // ===========================================================================
 // Flake detection tests
 // ===========================================================================
 
-#[tokio::test]
-async fn test_flake_append_variance_under_threshold() {
+#[test]
+fn test_flake_append_variance_under_threshold() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -580,10 +619,12 @@ async fn test_flake_append_variance_under_threshold() {
         cv < 2.0,
         "append CV = {cv:.3}, expected < 2.0 (latencies: {latencies:?})"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_flake_flush_variance_under_threshold() {
+#[test]
+fn test_flake_flush_variance_under_threshold() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -601,14 +642,16 @@ async fn test_flake_flush_variance_under_threshold() {
 
     let cv = coefficient_of_variation(&latencies);
     assert!(cv < 2.0, "flush CV = {cv:.3}, expected < 2.0");
+    });
 }
 
 // ===========================================================================
 // Multi-pane concurrent-ish append
 // ===========================================================================
 
-#[tokio::test]
-async fn test_multi_pane_append_no_contention_degradation() {
+#[test]
+fn test_multi_pane_append_no_contention_degradation() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -637,14 +680,16 @@ async fn test_multi_pane_append_no_contention_degradation() {
 
     let health = storage.health().await;
     assert!(!health.degraded);
+    });
 }
 
 // ===========================================================================
 // Checkpoint latency
 // ===========================================================================
 
-#[tokio::test]
-async fn test_checkpoint_roundtrip_latency() {
+#[test]
+fn test_checkpoint_roundtrip_latency() {
+    run_async_test(async {
     use frankenterm_core::recorder_storage::{CheckpointConsumerId, RecorderCheckpoint};
 
     let dir = tempdir().unwrap();
@@ -682,14 +727,16 @@ async fn test_checkpoint_roundtrip_latency() {
     // Checkpoint SLO: p95 < 100ms
     assert!(commit_us < 100_000, "checkpoint commit took {commit_us}us");
     assert!(read_us < 100_000, "checkpoint read took {read_us}us");
+    });
 }
 
 // ===========================================================================
 // Idempotency performance
 // ===========================================================================
 
-#[tokio::test]
-async fn test_idempotent_replay_no_performance_penalty() {
+#[test]
+fn test_idempotent_replay_no_performance_penalty() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -706,6 +753,7 @@ async fn test_idempotent_replay_no_performance_penalty() {
         elapsed_us < 50_000,
         "idempotent replay took {elapsed_us}us, expected < 50ms"
     );
+    });
 }
 
 // ===========================================================================
@@ -745,8 +793,9 @@ fn test_coefficient_of_variation_varied() {
 // Large batch edge case
 // ===========================================================================
 
-#[tokio::test]
-async fn test_max_batch_256_events_within_slo() {
+#[test]
+fn test_max_batch_256_events_within_slo() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -762,14 +811,16 @@ async fn test_max_batch_256_events_within_slo() {
         elapsed_us < 100_000,
         "256-event batch took {elapsed_us}us, expected < 100ms"
     );
+    });
 }
 
 // ===========================================================================
 // Sequential flush consistency
 // ===========================================================================
 
-#[tokio::test]
-async fn test_sequential_flush_no_stacking() {
+#[test]
+fn test_sequential_flush_no_stacking() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -791,14 +842,16 @@ async fn test_sequential_flush_no_stacking() {
         elapsed_us < 50_000,
         "noop flush took {elapsed_us}us, expected < 50ms"
     );
+    });
 }
 
 // ===========================================================================
 // Lag metrics performance
 // ===========================================================================
 
-#[tokio::test]
-async fn test_lag_metrics_latency() {
+#[test]
+fn test_lag_metrics_latency() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
     storage
@@ -815,14 +868,16 @@ async fn test_lag_metrics_latency() {
         elapsed_us < 50_000,
         "lag_metrics took {elapsed_us}us, expected < 50ms"
     );
+    });
 }
 
 // ===========================================================================
 // Additional SLO and edge case tests
 // ===========================================================================
 
-#[tokio::test]
-async fn test_health_latency_under_1ms() {
+#[test]
+fn test_health_latency_under_1ms() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
     storage
@@ -839,10 +894,12 @@ async fn test_health_latency_under_1ms() {
         elapsed_us < 10_000,
         "health() took {elapsed_us}us, expected < 10ms"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_append_monotonic_ordinals_under_load() {
+#[test]
+fn test_append_monotonic_ordinals_under_load() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -859,10 +916,12 @@ async fn test_append_monotonic_ordinals_under_load() {
         last_ordinal = resp.last_offset.ordinal + 1;
     }
     assert_eq!(last_ordinal, 500);
+    });
 }
 
-#[tokio::test]
-async fn test_empty_batch_rejection_fast() {
+#[test]
+fn test_empty_batch_rejection_fast() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -882,10 +941,12 @@ async fn test_empty_batch_rejection_fast() {
         elapsed_us < 10_000,
         "empty batch rejection took {elapsed_us}us, expected < 10ms"
     );
+    });
 }
 
-#[tokio::test]
-async fn test_soak_window_p99_stability() {
+#[test]
+fn test_soak_window_p99_stability() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -912,10 +973,12 @@ async fn test_soak_window_p99_stability() {
     for (i, p99) in window_p99s.iter().enumerate() {
         assert!(*p99 < 100_000, "window {i} p99 = {p99}us, expected < 100ms");
     }
+    });
 }
 
-#[tokio::test]
-async fn test_cursor_partial_range_performance() {
+#[test]
+fn test_cursor_partial_range_performance() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
@@ -977,4 +1040,5 @@ async fn test_cursor_partial_range_performance() {
         elapsed_us < 50_000,
         "partial cursor took {elapsed_us}us, expected < 50ms"
     );
+    });
 }

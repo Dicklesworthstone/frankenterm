@@ -19,6 +19,22 @@ use frankenterm_core::recording::{
 use tempfile::tempdir;
 
 // ---------------------------------------------------------------------------
+// Async test helper
+// ---------------------------------------------------------------------------
+
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use frankenterm_core::runtime_compat::CompatRuntime;
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -72,176 +88,188 @@ fn append_req(batch_id: &str, events: Vec<RecorderEvent>) -> AppendRequest {
 // RecorderStorage trait contract tests (AppendLog backend)
 // ===========================================================================
 
-#[tokio::test]
-async fn test_append_idempotency_append_log() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+#[test]
+fn test_append_idempotency_append_log() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
-    let first = storage
-        .append_batch(append_req(
-            "same-batch",
-            vec![sample_event("e1", 1, 0, "one")],
-        ))
-        .await
-        .unwrap();
-    assert_eq!(first.accepted_count, 1);
+        let first = storage
+            .append_batch(append_req(
+                "same-batch",
+                vec![sample_event("e1", 1, 0, "one")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.accepted_count, 1);
 
-    let second = storage
-        .append_batch(append_req(
-            "same-batch",
-            vec![sample_event("e2", 1, 1, "two")],
-        ))
-        .await
-        .unwrap();
-    // Idempotent: same batch_id → same result, no duplicate
-    assert_eq!(second.accepted_count, 1);
-    assert_eq!(second.first_offset, first.first_offset);
+        let second = storage
+            .append_batch(append_req(
+                "same-batch",
+                vec![sample_event("e2", 1, 1, "two")],
+            ))
+            .await
+            .unwrap();
+        // Idempotent: same batch_id → same result, no duplicate
+        assert_eq!(second.accepted_count, 1);
+        assert_eq!(second.first_offset, first.first_offset);
+    });
 }
 
-#[tokio::test]
-async fn test_ordinal_monotonicity_append_log() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+#[test]
+fn test_ordinal_monotonicity_append_log() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
-    let r1 = storage
-        .append_batch(append_req("b1", vec![sample_event("e1", 1, 0, "first")]))
-        .await
-        .unwrap();
+        let r1 = storage
+            .append_batch(append_req("b1", vec![sample_event("e1", 1, 0, "first")]))
+            .await
+            .unwrap();
 
-    let r2 = storage
-        .append_batch(append_req("b2", vec![sample_event("e2", 1, 1, "second")]))
-        .await
-        .unwrap();
+        let r2 = storage
+            .append_batch(append_req("b2", vec![sample_event("e2", 1, 1, "second")]))
+            .await
+            .unwrap();
 
-    assert!(
-        r2.first_offset.ordinal > r1.last_offset.ordinal,
-        "ordinals must be monotonically increasing: {} vs {}",
-        r2.first_offset.ordinal,
-        r1.last_offset.ordinal
-    );
+        assert!(
+            r2.first_offset.ordinal > r1.last_offset.ordinal,
+            "ordinals must be monotonically increasing: {} vs {}",
+            r2.first_offset.ordinal,
+            r1.last_offset.ordinal
+        );
+    });
 }
 
-#[tokio::test]
-async fn test_checkpoint_roundtrip_append_log() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let consumer = CheckpointConsumerId("test-consumer".to_string());
+#[test]
+fn test_checkpoint_roundtrip_append_log() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let consumer = CheckpointConsumerId("test-consumer".to_string());
 
-    // Initially no checkpoint
-    let initial = storage.read_checkpoint(&consumer).await.unwrap();
-    assert!(initial.is_none());
+        // Initially no checkpoint
+        let initial = storage.read_checkpoint(&consumer).await.unwrap();
+        assert!(initial.is_none());
 
-    // Commit a checkpoint
-    let cp = RecorderCheckpoint {
-        consumer: consumer.clone(),
-        upto_offset: RecorderOffset {
-            segment_id: 0,
-            byte_offset: 100,
-            ordinal: 5,
-        },
-        schema_version: "ft.recorder.event.v1".to_string(),
-        committed_at_ms: 1000,
-    };
-    let outcome = storage.commit_checkpoint(cp.clone()).await.unwrap();
-    assert_eq!(outcome, CheckpointCommitOutcome::Advanced);
+        // Commit a checkpoint
+        let cp = RecorderCheckpoint {
+            consumer: consumer.clone(),
+            upto_offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: 100,
+                ordinal: 5,
+            },
+            schema_version: "ft.recorder.event.v1".to_string(),
+            committed_at_ms: 1000,
+        };
+        let outcome = storage.commit_checkpoint(cp.clone()).await.unwrap();
+        assert_eq!(outcome, CheckpointCommitOutcome::Advanced);
 
-    // Read it back
-    let read = storage.read_checkpoint(&consumer).await.unwrap();
-    assert!(read.is_some());
-    let read = read.unwrap();
-    assert_eq!(read.upto_offset.ordinal, 5);
-    assert_eq!(read.consumer, consumer);
+        // Read it back
+        let read = storage.read_checkpoint(&consumer).await.unwrap();
+        assert!(read.is_some());
+        let read = read.unwrap();
+        assert_eq!(read.upto_offset.ordinal, 5);
+        assert_eq!(read.consumer, consumer);
+    });
 }
 
-#[tokio::test]
-async fn test_checkpoint_regression_append_log() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let consumer = CheckpointConsumerId("regress-test".to_string());
+#[test]
+fn test_checkpoint_regression_append_log() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let consumer = CheckpointConsumerId("regress-test".to_string());
 
-    // Advance to ordinal 10
-    let cp1 = RecorderCheckpoint {
-        consumer: consumer.clone(),
-        upto_offset: RecorderOffset {
-            segment_id: 0,
-            byte_offset: 0,
-            ordinal: 10,
-        },
-        schema_version: "ft.recorder.event.v1".to_string(),
-        committed_at_ms: 1000,
-    };
-    storage.commit_checkpoint(cp1).await.unwrap();
-
-    // Try to go backwards to ordinal 5
-    let cp2 = RecorderCheckpoint {
-        consumer: consumer.clone(),
-        upto_offset: RecorderOffset {
-            segment_id: 0,
-            byte_offset: 0,
-            ordinal: 5,
-        },
-        schema_version: "ft.recorder.event.v1".to_string(),
-        committed_at_ms: 2000,
-    };
-    // AppendLog backend returns CheckpointRegression error for backwards ordinals
-    let result = storage.commit_checkpoint(cp2).await;
-    assert!(result.is_err(), "checkpoint regression must be rejected");
-    assert!(matches!(
-        result.unwrap_err(),
-        RecorderStorageError::CheckpointRegression { .. }
-    ));
-}
-
-#[tokio::test]
-async fn test_health_queue_depth_append_log() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-
-    let health = storage.health().await;
-    assert_eq!(health.backend, RecorderBackendKind::AppendLog);
-    assert!(!health.degraded);
-    assert_eq!(health.queue_depth, 0);
-    assert!(health.queue_capacity > 0);
-}
-
-#[tokio::test]
-async fn test_lag_metrics_append_log() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-
-    // Append events and commit a checkpoint behind head
-    storage
-        .append_batch(append_req(
-            "b1",
-            vec![
-                sample_event("e1", 1, 0, "a"),
-                sample_event("e2", 1, 1, "b"),
-                sample_event("e3", 1, 2, "c"),
-            ],
-        ))
-        .await
-        .unwrap();
-
-    let consumer = CheckpointConsumerId("lag-test".to_string());
-    storage
-        .commit_checkpoint(RecorderCheckpoint {
+        // Advance to ordinal 10
+        let cp1 = RecorderCheckpoint {
             consumer: consumer.clone(),
             upto_offset: RecorderOffset {
                 segment_id: 0,
                 byte_offset: 0,
-                ordinal: 0,
+                ordinal: 10,
             },
-            schema_version: "v1".to_string(),
+            schema_version: "ft.recorder.event.v1".to_string(),
             committed_at_ms: 1000,
-        })
-        .await
-        .unwrap();
+        };
+        storage.commit_checkpoint(cp1).await.unwrap();
 
-    let lag = storage.lag_metrics().await.unwrap();
-    assert!(lag.latest_offset.is_some());
-    assert!(!lag.consumers.is_empty());
-    let consumer_lag = &lag.consumers[0];
-    assert!(consumer_lag.offsets_behind > 0);
+        // Try to go backwards to ordinal 5
+        let cp2 = RecorderCheckpoint {
+            consumer: consumer.clone(),
+            upto_offset: RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 5,
+            },
+            schema_version: "ft.recorder.event.v1".to_string(),
+            committed_at_ms: 2000,
+        };
+        // AppendLog backend returns CheckpointRegression error for backwards ordinals
+        let result = storage.commit_checkpoint(cp2).await;
+        assert!(result.is_err(), "checkpoint regression must be rejected");
+        assert!(matches!(
+            result.unwrap_err(),
+            RecorderStorageError::CheckpointRegression { .. }
+        ));
+    });
+}
+
+#[test]
+fn test_health_queue_depth_append_log() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        let health = storage.health().await;
+        assert_eq!(health.backend, RecorderBackendKind::AppendLog);
+        assert!(!health.degraded);
+        assert_eq!(health.queue_depth, 0);
+        assert!(health.queue_capacity > 0);
+    });
+}
+
+#[test]
+fn test_lag_metrics_append_log() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+
+        // Append events and commit a checkpoint behind head
+        storage
+            .append_batch(append_req(
+                "b1",
+                vec![
+                    sample_event("e1", 1, 0, "a"),
+                    sample_event("e2", 1, 1, "b"),
+                    sample_event("e3", 1, 2, "c"),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let consumer = CheckpointConsumerId("lag-test".to_string());
+        storage
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: consumer.clone(),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 0,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 1000,
+            })
+            .await
+            .unwrap();
+
+        let lag = storage.lag_metrics().await.unwrap();
+        assert!(lag.latest_offset.is_some());
+        assert!(!lag.consumers.is_empty());
+        let consumer_lag = &lag.consumers[0];
+        assert!(consumer_lag.offsets_behind > 0);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -304,38 +332,42 @@ fn test_error_class_checkpoint_regression_is_terminal() {
 // Flush contract tests
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn test_flush_buffered_append_log() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+#[test]
+fn test_flush_buffered_append_log() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
-    storage
-        .append_batch(append_req(
-            "flush-test",
-            vec![sample_event("e1", 1, 0, "text")],
-        ))
-        .await
-        .unwrap();
+        storage
+            .append_batch(append_req(
+                "flush-test",
+                vec![sample_event("e1", 1, 0, "text")],
+            ))
+            .await
+            .unwrap();
 
-    let stats = storage.flush(FlushMode::Buffered).await.unwrap();
-    assert_eq!(stats.backend, RecorderBackendKind::AppendLog);
+        let stats = storage.flush(FlushMode::Buffered).await.unwrap();
+        assert_eq!(stats.backend, RecorderBackendKind::AppendLog);
+    });
 }
 
-#[tokio::test]
-async fn test_flush_durable_append_log() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+#[test]
+fn test_flush_durable_append_log() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
-    storage
-        .append_batch(append_req(
-            "flush-durable",
-            vec![sample_event("e1", 1, 0, "text")],
-        ))
-        .await
-        .unwrap();
+        storage
+            .append_batch(append_req(
+                "flush-durable",
+                vec![sample_event("e1", 1, 0, "text")],
+            ))
+            .await
+            .unwrap();
 
-    let stats = storage.flush(FlushMode::Durable).await.unwrap();
-    assert_eq!(stats.backend, RecorderBackendKind::AppendLog);
+        let stats = storage.flush(FlushMode::Durable).await.unwrap();
+        assert_eq!(stats.backend, RecorderBackendKind::AppendLog);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -433,91 +465,146 @@ fn test_manifest_digest_deterministic() {
 // Multi-batch append ordering
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn test_multi_batch_preserves_order() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+#[test]
+fn test_multi_batch_preserves_order() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
-    for i in 0..3u64 {
-        storage
-            .append_batch(append_req(
-                &format!("batch-{i}"),
-                vec![sample_event(&format!("e{i}"), 1, i, &format!("text-{i}"))],
-            ))
-            .await
-            .unwrap();
-    }
+        for i in 0..3u64 {
+            storage
+                .append_batch(append_req(
+                    &format!("batch-{i}"),
+                    vec![sample_event(&format!("e{i}"), 1, i, &format!("text-{i}"))],
+                ))
+                .await
+                .unwrap();
+        }
 
-    let health = storage.health().await;
-    let offset = health.latest_offset.unwrap();
-    assert_eq!(offset.ordinal, 2); // 0-indexed, 3 events
+        let health = storage.health().await;
+        let offset = health.latest_offset.unwrap();
+        assert_eq!(offset.ordinal, 2); // 0-indexed, 3 events
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Empty batch
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn test_empty_batch_append_log() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+#[test]
+fn test_empty_batch_append_log() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
-    let result = storage.append_batch(append_req("empty", vec![])).await;
+        let result = storage.append_batch(append_req("empty", vec![])).await;
 
-    // Empty batch should either succeed with 0 count or be rejected
-    match result {
-        Ok(r) => assert_eq!(r.accepted_count, 0),
-        Err(e) => assert!(matches!(e, RecorderStorageError::InvalidRequest { .. })),
-    }
+        // Empty batch should either succeed with 0 count or be rejected
+        match result {
+            Ok(r) => assert_eq!(r.accepted_count, 0),
+            Err(e) => assert!(matches!(e, RecorderStorageError::InvalidRequest { .. })),
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Max batch size enforcement
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn test_max_batch_events_enforced() {
-    let dir = tempdir().unwrap();
-    let mut cfg = test_config(dir.path());
-    cfg.max_batch_events = 2;
-    let storage = AppendLogRecorderStorage::open(cfg).unwrap();
+#[test]
+fn test_max_batch_events_enforced() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.max_batch_events = 2;
+        let storage = AppendLogRecorderStorage::open(cfg).unwrap();
 
-    // Try to append 3 events with max_batch_events=2
-    let events: Vec<_> = (0..3)
-        .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
-        .collect();
-    let result = storage.append_batch(append_req("big", events)).await;
+        // Try to append 3 events with max_batch_events=2
+        let events: Vec<_> = (0..3)
+            .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+            .collect();
+        let result = storage.append_batch(append_req("big", events)).await;
 
-    // Should be rejected
-    assert!(result.is_err());
+        // Should be rejected
+        assert!(result.is_err());
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Backend kind contract
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn test_backend_kind_is_append_log() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    assert_eq!(storage.backend_kind(), RecorderBackendKind::AppendLog);
+#[test]
+fn test_backend_kind_is_append_log() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        assert_eq!(storage.backend_kind(), RecorderBackendKind::AppendLog);
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Multiple consumers checkpoint
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn test_multiple_consumers_independent_checkpoints() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+#[test]
+fn test_multiple_consumers_independent_checkpoints() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
 
-    let c1 = CheckpointConsumerId("consumer-a".to_string());
-    let c2 = CheckpointConsumerId("consumer-b".to_string());
+        let c1 = CheckpointConsumerId("consumer-a".to_string());
+        let c2 = CheckpointConsumerId("consumer-b".to_string());
 
-    storage
-        .commit_checkpoint(RecorderCheckpoint {
-            consumer: c1.clone(),
+        storage
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: c1.clone(),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 5,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 1000,
+            })
+            .await
+            .unwrap();
+
+        storage
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: c2.clone(),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 10,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 2000,
+            })
+            .await
+            .unwrap();
+
+        let cp1 = storage.read_checkpoint(&c1).await.unwrap().unwrap();
+        let cp2 = storage.read_checkpoint(&c2).await.unwrap().unwrap();
+
+        assert_eq!(cp1.upto_offset.ordinal, 5);
+        assert_eq!(cp2.upto_offset.ordinal, 10);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint advance (noop if already advanced)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_checkpoint_noop_already_advanced() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let consumer = CheckpointConsumerId("noop-test".to_string());
+
+        let cp = RecorderCheckpoint {
+            consumer: consumer.clone(),
             upto_offset: RecorderOffset {
                 segment_id: 0,
                 byte_offset: 0,
@@ -525,69 +612,28 @@ async fn test_multiple_consumers_independent_checkpoints() {
             },
             schema_version: "v1".to_string(),
             committed_at_ms: 1000,
-        })
-        .await
-        .unwrap();
+        };
+        storage.commit_checkpoint(cp.clone()).await.unwrap();
 
-    storage
-        .commit_checkpoint(RecorderCheckpoint {
-            consumer: c2.clone(),
-            upto_offset: RecorderOffset {
-                segment_id: 0,
-                byte_offset: 0,
-                ordinal: 10,
-            },
-            schema_version: "v1".to_string(),
-            committed_at_ms: 2000,
-        })
-        .await
-        .unwrap();
-
-    let cp1 = storage.read_checkpoint(&c1).await.unwrap().unwrap();
-    let cp2 = storage.read_checkpoint(&c2).await.unwrap().unwrap();
-
-    assert_eq!(cp1.upto_offset.ordinal, 5);
-    assert_eq!(cp2.upto_offset.ordinal, 10);
-}
-
-// ---------------------------------------------------------------------------
-// Checkpoint advance (noop if already advanced)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_checkpoint_noop_already_advanced() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let consumer = CheckpointConsumerId("noop-test".to_string());
-
-    let cp = RecorderCheckpoint {
-        consumer: consumer.clone(),
-        upto_offset: RecorderOffset {
-            segment_id: 0,
-            byte_offset: 0,
-            ordinal: 5,
-        },
-        schema_version: "v1".to_string(),
-        committed_at_ms: 1000,
-    };
-    storage.commit_checkpoint(cp.clone()).await.unwrap();
-
-    // Same ordinal = noop
-    let outcome = storage.commit_checkpoint(cp).await.unwrap();
-    assert_eq!(outcome, CheckpointCommitOutcome::NoopAlreadyAdvanced);
+        // Same ordinal = noop
+        let outcome = storage.commit_checkpoint(cp).await.unwrap();
+        assert_eq!(outcome, CheckpointCommitOutcome::NoopAlreadyAdvanced);
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Health with degraded source detection
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn test_health_not_degraded_initially() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let health = storage.health().await;
-    assert!(!health.degraded);
-    assert!(health.last_error.is_none());
+#[test]
+fn test_health_not_degraded_initially() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let health = storage.health().await;
+        assert!(!health.degraded);
+        assert!(health.last_error.is_none());
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -738,11 +784,13 @@ fn test_error_class_serde_all_variants() {
 // Append data path contract
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn test_append_log_data_path_present() {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    assert!(storage.append_log_data_path().is_some());
+#[test]
+fn test_append_log_data_path_present() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        assert!(storage.append_log_data_path().is_some());
+    });
 }
 
 // ---------------------------------------------------------------------------

@@ -21,6 +21,18 @@ use frankenterm_core::session_topology::{PaneNode, TopologySnapshot};
 use frankenterm_core::snapshot_engine::{SnapshotEngine, SnapshotError, SnapshotTrigger};
 use frankenterm_core::wezterm::{PaneInfo, PaneSize};
 
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use frankenterm_core::runtime_compat::CompatRuntime;
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
 // =============================================================================
 // Test helpers
 // =============================================================================
@@ -114,449 +126,477 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
 // Full pipeline: capture → persist → query → cleanup
 // =============================================================================
 
-#[tokio::test]
-async fn full_pipeline_capture_persist_query_cleanup() {
-    let (_tmp, db_path) = setup_test_db();
-    let config = SnapshotConfig {
-        retention_count: 3,
-        retention_days: 365,
-        ..SnapshotConfig::default()
-    };
-    let engine = SnapshotEngine::new(db_path.clone(), config);
+#[test]
+fn full_pipeline_capture_persist_query_cleanup() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let config = SnapshotConfig {
+            retention_count: 3,
+            retention_days: 365,
+            ..SnapshotConfig::default()
+        };
+        let engine = SnapshotEngine::new(db_path.clone(), config);
 
-    // Capture initial state (3 panes across 2 tabs)
-    let panes = vec![
-        make_pane(0, 0, 0, 24, 80),
-        make_pane(1, 0, 0, 24, 80),
-        make_pane(2, 1, 0, 30, 120),
-    ];
-    let r1 = engine
-        .capture(&panes, SnapshotTrigger::Startup)
-        .await
-        .unwrap();
-    assert_eq!(r1.pane_count, 3);
-    assert!(r1.total_bytes > 0);
-
-    // Verify DB state
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let session_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(session_count, 1);
-
-    let checkpoint_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(checkpoint_count, 1);
-
-    let pane_state_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(pane_state_count, 3);
-
-    // Verify checkpoint type is startup
-    let cp_type: String = conn
-        .query_row(
-            "SELECT checkpoint_type FROM session_checkpoints WHERE id = ?1",
-            [r1.checkpoint_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(cp_type, "startup");
-
-    // Capture changed state (new pane added)
-    let panes2 = vec![
-        make_pane(0, 0, 0, 24, 80),
-        make_pane(1, 0, 0, 24, 80),
-        make_pane(2, 1, 0, 30, 120),
-        make_pane(3, 1, 0, 30, 120), // new pane
-    ];
-    let r2 = engine
-        .capture(&panes2, SnapshotTrigger::Periodic)
-        .await
-        .unwrap();
-    assert_eq!(r2.pane_count, 4);
-    assert_eq!(r1.session_id, r2.session_id); // same session
-
-    // Now we have 2 checkpoints, 7 pane states total
-    drop(conn);
-
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let total_pane_states: i64 = conn
-        .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(total_pane_states, 7); // 3 + 4
-}
-
-#[tokio::test]
-async fn cleanup_removes_old_preserves_recent() {
-    let (_tmp, db_path) = setup_test_db();
-    let config = SnapshotConfig {
-        retention_count: 2,
-        retention_days: 365,
-        ..SnapshotConfig::default()
-    };
-    let engine = SnapshotEngine::new(db_path.clone(), config);
-
-    // Create 5 snapshots with different pane data
-    for i in 0..5u64 {
-        let panes = vec![make_pane(i, 0, 0, 24 + i as u32, 80)];
-        engine
-            .capture(&panes, SnapshotTrigger::Manual)
+        // Capture initial state (3 panes across 2 tabs)
+        let panes = vec![
+            make_pane(0, 0, 0, 24, 80),
+            make_pane(1, 0, 0, 24, 80),
+            make_pane(2, 1, 0, 30, 120),
+        ];
+        let r1 = engine
+            .capture(&panes, SnapshotTrigger::Startup)
             .await
             .unwrap();
-    }
+        assert_eq!(r1.pane_count, 3);
+        assert!(r1.total_bytes > 0);
 
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let before: i64 = conn
-        .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(before, 5);
+        // Verify DB state
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let session_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(session_count, 1);
 
-    drop(conn);
+        let checkpoint_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(checkpoint_count, 1);
 
-    // Cleanup: keep 2
-    let deleted = engine.cleanup().await.unwrap();
-    assert_eq!(deleted, 3);
+        let pane_state_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pane_state_count, 3);
 
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let after: i64 = conn
-        .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(after, 2);
+        // Verify checkpoint type is startup
+        let cp_type: String = conn
+            .query_row(
+                "SELECT checkpoint_type FROM session_checkpoints WHERE id = ?1",
+                [r1.checkpoint_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cp_type, "startup");
 
-    // Verify pane states were cascade-deleted too
-    let remaining_pane_states: i64 = conn
-        .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(remaining_pane_states, 2); // 1 pane per remaining checkpoint
+        // Capture changed state (new pane added)
+        let panes2 = vec![
+            make_pane(0, 0, 0, 24, 80),
+            make_pane(1, 0, 0, 24, 80),
+            make_pane(2, 1, 0, 30, 120),
+            make_pane(3, 1, 0, 30, 120), // new pane
+        ];
+        let r2 = engine
+            .capture(&panes2, SnapshotTrigger::Periodic)
+            .await
+            .unwrap();
+        assert_eq!(r2.pane_count, 4);
+        assert_eq!(r1.session_id, r2.session_id); // same session
+
+        // Now we have 2 checkpoints, 7 pane states total
+        drop(conn);
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let total_pane_states: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total_pane_states, 7); // 3 + 4
+    });
 }
 
-#[tokio::test]
-async fn shutdown_marks_session_clean() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn cleanup_removes_old_preserves_recent() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let config = SnapshotConfig {
+            retention_count: 2,
+            retention_days: 365,
+            ..SnapshotConfig::default()
+        };
+        let engine = SnapshotEngine::new(db_path.clone(), config);
 
-    let panes = vec![make_pane_simple(0)];
-    let r = engine
-        .capture(&panes, SnapshotTrigger::Startup)
-        .await
-        .unwrap();
+        // Create 5 snapshots with different pane data
+        for i in 0..5u64 {
+            let panes = vec![make_pane(i, 0, 0, 24 + i as u32, 80)];
+            engine
+                .capture(&panes, SnapshotTrigger::Manual)
+                .await
+                .unwrap();
+        }
 
-    // Verify not yet clean
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let clean: i64 = conn
-        .query_row(
-            "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
-            [&r.session_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(clean, 0);
-    drop(conn);
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(before, 5);
 
-    // Mark shutdown
-    engine.mark_shutdown().await.unwrap();
+        drop(conn);
 
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let clean: i64 = conn
-        .query_row(
-            "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
-            [&r.session_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(clean, 1);
+        // Cleanup: keep 2
+        let deleted = engine.cleanup().await.unwrap();
+        assert_eq!(deleted, 3);
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, 2);
+
+        // Verify pane states were cascade-deleted too
+        let remaining_pane_states: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining_pane_states, 2); // 1 pane per remaining checkpoint
+    });
+}
+
+#[test]
+fn shutdown_marks_session_clean() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+
+        let panes = vec![make_pane_simple(0)];
+        let r = engine
+            .capture(&panes, SnapshotTrigger::Startup)
+            .await
+            .unwrap();
+
+        // Verify not yet clean
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let clean: i64 = conn
+            .query_row(
+                "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+                [&r.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(clean, 0);
+        drop(conn);
+
+        // Mark shutdown
+        engine.mark_shutdown().await.unwrap();
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let clean: i64 = conn
+            .query_row(
+                "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+                [&r.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(clean, 1);
+    });
 }
 
 // =============================================================================
 // Deduplication
 // =============================================================================
 
-#[tokio::test]
-async fn dedup_periodic_skips_identical_state() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-    let panes = vec![make_pane_simple(0), make_pane_simple(1)];
+#[test]
+fn dedup_periodic_skips_identical_state() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let panes = vec![make_pane_simple(0), make_pane_simple(1)];
 
-    // First capture OK
-    let r1 = engine.capture(&panes, SnapshotTrigger::Periodic).await;
-    assert!(r1.is_ok());
+        // First capture OK
+        let r1 = engine.capture(&panes, SnapshotTrigger::Periodic).await;
+        assert!(r1.is_ok());
 
-    // Same panes, periodic → skip
-    let r2 = engine.capture(&panes, SnapshotTrigger::Periodic).await;
-    assert!(matches!(r2, Err(SnapshotError::NoChanges)));
+        // Same panes, periodic → skip
+        let r2 = engine.capture(&panes, SnapshotTrigger::Periodic).await;
+        assert!(matches!(r2, Err(SnapshotError::NoChanges)));
 
-    // Verify only 1 checkpoint exists
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(count, 1);
+        // Verify only 1 checkpoint exists
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    });
 }
 
-#[tokio::test]
-async fn dedup_manual_does_not_skip() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-    let panes = vec![make_pane_simple(0)];
+#[test]
+fn dedup_manual_does_not_skip() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let panes = vec![make_pane_simple(0)];
 
-    engine
-        .capture(&panes, SnapshotTrigger::Manual)
-        .await
-        .unwrap();
-    engine
-        .capture(&panes, SnapshotTrigger::Manual)
-        .await
-        .unwrap();
+        engine
+            .capture(&panes, SnapshotTrigger::Manual)
+            .await
+            .unwrap();
+        engine
+            .capture(&panes, SnapshotTrigger::Manual)
+            .await
+            .unwrap();
 
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(count, 2);
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+    });
 }
 
-#[tokio::test]
-async fn dedup_periodic_captures_after_change() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn dedup_periodic_captures_after_change() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    let panes1 = vec![make_pane_simple(0)];
-    engine
-        .capture(&panes1, SnapshotTrigger::Periodic)
-        .await
-        .unwrap();
+        let panes1 = vec![make_pane_simple(0)];
+        engine
+            .capture(&panes1, SnapshotTrigger::Periodic)
+            .await
+            .unwrap();
 
-    // Add a pane → different hash → should capture
-    let panes2 = vec![make_pane_simple(0), make_pane_simple(1)];
-    let r2 = engine.capture(&panes2, SnapshotTrigger::Periodic).await;
-    assert!(r2.is_ok());
-    assert_eq!(r2.unwrap().pane_count, 2);
+        // Add a pane → different hash → should capture
+        let panes2 = vec![make_pane_simple(0), make_pane_simple(1)];
+        let r2 = engine.capture(&panes2, SnapshotTrigger::Periodic).await;
+        assert!(r2.is_ok());
+        assert_eq!(r2.unwrap().pane_count, 2);
+    });
 }
 
 // =============================================================================
 // Error handling
 // =============================================================================
 
-#[tokio::test]
-async fn capture_empty_panes_returns_error() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn capture_empty_panes_returns_error() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    let result = engine.capture(&[], SnapshotTrigger::Manual).await;
-    assert!(matches!(result, Err(SnapshotError::NoPanes)));
+        let result = engine.capture(&[], SnapshotTrigger::Manual).await;
+        assert!(matches!(result, Err(SnapshotError::NoPanes)));
+    });
 }
 
 // =============================================================================
 // Topology integration
 // =============================================================================
 
-#[tokio::test]
-async fn multi_tab_topology_persisted() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn multi_tab_topology_persisted() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    // 2 tabs, 3 panes total
-    let panes = vec![
-        make_pane(0, 0, 0, 24, 80),  // tab 0, left pane
-        make_pane(1, 0, 0, 24, 80),  // tab 0, right pane (vsplit)
-        make_pane(2, 1, 0, 30, 120), // tab 1, single pane
-    ];
+        // 2 tabs, 3 panes total
+        let panes = vec![
+            make_pane(0, 0, 0, 24, 80),  // tab 0, left pane
+            make_pane(1, 0, 0, 24, 80),  // tab 0, right pane (vsplit)
+            make_pane(2, 1, 0, 30, 120), // tab 1, single pane
+        ];
 
-    let result = engine
-        .capture(&panes, SnapshotTrigger::Startup)
-        .await
-        .unwrap();
+        let result = engine
+            .capture(&panes, SnapshotTrigger::Startup)
+            .await
+            .unwrap();
 
-    // Verify topology is stored in mux_sessions
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let topology_json: String = conn
-        .query_row(
-            "SELECT topology_json FROM mux_sessions WHERE session_id = ?1",
-            [&result.session_id],
-            |row| row.get(0),
-        )
-        .unwrap();
+        // Verify topology is stored in mux_sessions
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let topology_json: String = conn
+            .query_row(
+                "SELECT topology_json FROM mux_sessions WHERE session_id = ?1",
+                [&result.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
 
-    let topology: TopologySnapshot = serde_json::from_str(&topology_json).unwrap();
-    assert_eq!(topology.pane_count(), 3);
-    assert_eq!(topology.windows.len(), 1);
-    assert_eq!(topology.windows[0].tabs.len(), 2);
+        let topology: TopologySnapshot = serde_json::from_str(&topology_json).unwrap();
+        assert_eq!(topology.pane_count(), 3);
+        assert_eq!(topology.windows.len(), 1);
+        assert_eq!(topology.windows[0].tabs.len(), 2);
+    });
 }
 
-#[tokio::test]
-async fn multi_window_topology_persisted() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn multi_window_topology_persisted() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    // 2 windows, 1 pane each
-    let panes = vec![
-        make_pane(0, 0, 0, 24, 80),  // window 0
-        make_pane(1, 1, 1, 30, 120), // window 1
-    ];
+        // 2 windows, 1 pane each
+        let panes = vec![
+            make_pane(0, 0, 0, 24, 80),  // window 0
+            make_pane(1, 1, 1, 30, 120), // window 1
+        ];
 
-    let result = engine
-        .capture(&panes, SnapshotTrigger::Startup)
-        .await
-        .unwrap();
+        let result = engine
+            .capture(&panes, SnapshotTrigger::Startup)
+            .await
+            .unwrap();
 
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let topology_json: String = conn
-        .query_row(
-            "SELECT topology_json FROM mux_sessions WHERE session_id = ?1",
-            [&result.session_id],
-            |row| row.get(0),
-        )
-        .unwrap();
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let topology_json: String = conn
+            .query_row(
+                "SELECT topology_json FROM mux_sessions WHERE session_id = ?1",
+                [&result.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
 
-    let topology: TopologySnapshot = serde_json::from_str(&topology_json).unwrap();
-    assert_eq!(topology.windows.len(), 2);
+        let topology: TopologySnapshot = serde_json::from_str(&topology_json).unwrap();
+        assert_eq!(topology.windows.len(), 2);
+    });
 }
 
 // =============================================================================
 // Per-pane state integration
 // =============================================================================
 
-#[tokio::test]
-async fn pane_state_cwd_and_title_persisted() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn pane_state_cwd_and_title_persisted() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    let mut pane = make_pane_simple(42);
-    pane.cwd = Some("file:///home/alice/code".to_string());
-    pane.title = Some("vim main.rs".to_string());
+        let mut pane = make_pane_simple(42);
+        pane.cwd = Some("file:///home/alice/code".to_string());
+        pane.title = Some("vim main.rs".to_string());
 
-    let result = engine
-        .capture(&[pane], SnapshotTrigger::Manual)
-        .await
-        .unwrap();
+        let result = engine
+            .capture(&[pane], SnapshotTrigger::Manual)
+            .await
+            .unwrap();
 
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let (cwd, _command): (Option<String>, Option<String>) = conn
-        .query_row(
-            "SELECT cwd, command FROM mux_pane_state WHERE checkpoint_id = ?1",
-            [result.checkpoint_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let (cwd, _command): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT cwd, command FROM mux_pane_state WHERE checkpoint_id = ?1",
+                [result.checkpoint_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
 
-    assert!(cwd.is_some());
+        assert!(cwd.is_some());
+    });
 }
 
-#[tokio::test]
-async fn pane_state_terminal_json_valid() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-    let panes = vec![make_pane(0, 0, 0, 30, 120)];
+#[test]
+fn pane_state_terminal_json_valid() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let panes = vec![make_pane(0, 0, 0, 30, 120)];
 
-    let result = engine
-        .capture(&panes, SnapshotTrigger::Manual)
-        .await
-        .unwrap();
+        let result = engine
+            .capture(&panes, SnapshotTrigger::Manual)
+            .await
+            .unwrap();
 
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let terminal_json: String = conn
-        .query_row(
-            "SELECT terminal_state_json FROM mux_pane_state WHERE checkpoint_id = ?1",
-            [result.checkpoint_id],
-            |row| row.get(0),
-        )
-        .unwrap();
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let terminal_json: String = conn
+            .query_row(
+                "SELECT terminal_state_json FROM mux_pane_state WHERE checkpoint_id = ?1",
+                [result.checkpoint_id],
+                |row| row.get(0),
+            )
+            .unwrap();
 
-    // terminal_state_json stores just the TerminalState portion
-    let terminal: TerminalState = serde_json::from_str(&terminal_json).unwrap();
-    assert_eq!(terminal.rows, 30);
-    assert_eq!(terminal.cols, 120);
+        // terminal_state_json stores just the TerminalState portion
+        let terminal: TerminalState = serde_json::from_str(&terminal_json).unwrap();
+        assert_eq!(terminal.rows, 30);
+        assert_eq!(terminal.cols, 120);
+    });
 }
 
-#[tokio::test]
-async fn agent_metadata_from_title_persisted() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn agent_metadata_from_title_persisted() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    let mut pane = make_pane_simple(1);
-    pane.title = Some("claude-code".to_string());
+        let mut pane = make_pane_simple(1);
+        pane.title = Some("claude-code".to_string());
 
-    let result = engine
-        .capture(&[pane], SnapshotTrigger::Manual)
-        .await
-        .unwrap();
+        let result = engine
+            .capture(&[pane], SnapshotTrigger::Manual)
+            .await
+            .unwrap();
 
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let agent_json: Option<String> = conn
-        .query_row(
-            "SELECT agent_metadata_json FROM mux_pane_state WHERE checkpoint_id = ?1 AND pane_id = 1",
-            [result.checkpoint_id],
-            |row| row.get(0),
-        )
-        .unwrap();
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let agent_json: Option<String> = conn
+            .query_row(
+                "SELECT agent_metadata_json FROM mux_pane_state WHERE checkpoint_id = ?1 AND pane_id = 1",
+                [result.checkpoint_id],
+                |row| row.get(0),
+            )
+            .unwrap();
 
-    let agent_json = agent_json.expect("agent_metadata_json should be present");
-    let meta: AgentMetadata = serde_json::from_str(&agent_json).unwrap();
-    assert_eq!(meta.agent_type, "claude_code");
+        let agent_json = agent_json.expect("agent_metadata_json should be present");
+        let meta: AgentMetadata = serde_json::from_str(&agent_json).unwrap();
+        assert_eq!(meta.agent_type, "claude_code");
+    });
 }
 
 // =============================================================================
 // Session continuity
 // =============================================================================
 
-#[tokio::test]
-async fn session_id_stable_across_captures() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn session_id_stable_across_captures() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    let panes1 = vec![make_pane_simple(0)];
-    let panes2 = vec![make_pane_simple(0), make_pane_simple(1)];
-    let panes3 = vec![
-        make_pane_simple(0),
-        make_pane_simple(1),
-        make_pane_simple(2),
-    ];
+        let panes1 = vec![make_pane_simple(0)];
+        let panes2 = vec![make_pane_simple(0), make_pane_simple(1)];
+        let panes3 = vec![
+            make_pane_simple(0),
+            make_pane_simple(1),
+            make_pane_simple(2),
+        ];
 
-    let r1 = engine
-        .capture(&panes1, SnapshotTrigger::Startup)
-        .await
-        .unwrap();
-    let r2 = engine
-        .capture(&panes2, SnapshotTrigger::Periodic)
-        .await
-        .unwrap();
-    let r3 = engine
-        .capture(&panes3, SnapshotTrigger::Manual)
-        .await
-        .unwrap();
+        let r1 = engine
+            .capture(&panes1, SnapshotTrigger::Startup)
+            .await
+            .unwrap();
+        let r2 = engine
+            .capture(&panes2, SnapshotTrigger::Periodic)
+            .await
+            .unwrap();
+        let r3 = engine
+            .capture(&panes3, SnapshotTrigger::Manual)
+            .await
+            .unwrap();
 
-    assert_eq!(r1.session_id, r2.session_id);
-    assert_eq!(r2.session_id, r3.session_id);
+        assert_eq!(r1.session_id, r2.session_id);
+        assert_eq!(r2.session_id, r3.session_id);
 
-    // But all have different checkpoint IDs
-    assert_ne!(r1.checkpoint_id, r2.checkpoint_id);
-    assert_ne!(r2.checkpoint_id, r3.checkpoint_id);
+        // But all have different checkpoint IDs
+        assert_ne!(r1.checkpoint_id, r2.checkpoint_id);
+        assert_ne!(r2.checkpoint_id, r3.checkpoint_id);
+    });
 }
 
-#[tokio::test]
-async fn session_id_format_valid() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn session_id_format_valid() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    let result = engine
-        .capture(&[make_pane_simple(0)], SnapshotTrigger::Startup)
-        .await
-        .unwrap();
+        let result = engine
+            .capture(&[make_pane_simple(0)], SnapshotTrigger::Startup)
+            .await
+            .unwrap();
 
-    assert!(result.session_id.starts_with("sess-"));
-    assert!(result.session_id.len() > 20);
+        assert!(result.session_id.starts_with("sess-"));
+        assert!(result.session_id.len() > 20);
+    });
 }
 
 // =============================================================================
@@ -874,84 +914,88 @@ fn pane_state_env_redacts_secrets() {
 // Schema / foreign key integrity
 // =============================================================================
 
-#[tokio::test]
-async fn foreign_key_cascade_on_session_delete() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn foreign_key_cascade_on_session_delete() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    let panes = vec![make_pane_simple(0), make_pane_simple(1)];
-    let result = engine
-        .capture(&panes, SnapshotTrigger::Manual)
-        .await
+        let panes = vec![make_pane_simple(0), make_pane_simple(1)];
+        let result = engine
+            .capture(&panes, SnapshotTrigger::Manual)
+            .await
+            .unwrap();
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+
+        // Verify data exists
+        let cp_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(cp_count > 0);
+
+        let ps_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
+            .unwrap();
+        assert!(ps_count > 0);
+
+        // Delete the session → should cascade to checkpoints and pane states
+        conn.execute(
+            "DELETE FROM mux_sessions WHERE session_id = ?1",
+            [&result.session_id],
+        )
         .unwrap();
 
-    let conn = Connection::open(db_path.as_str()).unwrap();
+        let cp_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(cp_after, 0);
 
-    // Verify data exists
-    let cp_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert!(cp_count > 0);
-
-    let ps_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
-        .unwrap();
-    assert!(ps_count > 0);
-
-    // Delete the session → should cascade to checkpoints and pane states
-    conn.execute(
-        "DELETE FROM mux_sessions WHERE session_id = ?1",
-        [&result.session_id],
-    )
-    .unwrap();
-
-    let cp_after: i64 = conn
-        .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(cp_after, 0);
-
-    let ps_after: i64 = conn
-        .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(ps_after, 0);
+        let ps_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ps_after, 0);
+    });
 }
 
-#[tokio::test]
-async fn foreign_key_cascade_on_checkpoint_delete() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn foreign_key_cascade_on_checkpoint_delete() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    let panes = vec![
-        make_pane_simple(0),
-        make_pane_simple(1),
-        make_pane_simple(2),
-    ];
-    let result = engine
-        .capture(&panes, SnapshotTrigger::Manual)
-        .await
+        let panes = vec![
+            make_pane_simple(0),
+            make_pane_simple(1),
+            make_pane_simple(2),
+        ];
+        let result = engine
+            .capture(&panes, SnapshotTrigger::Manual)
+            .await
+            .unwrap();
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let ps_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ps_before, 3);
+
+        // Delete the checkpoint → pane states should cascade
+        conn.execute(
+            "DELETE FROM session_checkpoints WHERE id = ?1",
+            [result.checkpoint_id],
+        )
         .unwrap();
 
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let ps_before: i64 = conn
-        .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(ps_before, 3);
-
-    // Delete the checkpoint → pane states should cascade
-    conn.execute(
-        "DELETE FROM session_checkpoints WHERE id = ?1",
-        [result.checkpoint_id],
-    )
-    .unwrap();
-
-    let ps_after: i64 = conn
-        .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(ps_after, 0);
+        let ps_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ps_after, 0);
+    });
 }
 
 // =============================================================================
@@ -1037,66 +1081,70 @@ fn agent_correlator_multiple_panes() {
 // Snapshot trigger types
 // =============================================================================
 
-#[tokio::test]
-async fn all_trigger_types_stored_correctly() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn all_trigger_types_stored_correctly() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    let triggers = [
-        (SnapshotTrigger::Startup, "startup"),
-        (SnapshotTrigger::Manual, "event"),
-        (SnapshotTrigger::Event, "event"),
-    ];
+        let triggers = [
+            (SnapshotTrigger::Startup, "startup"),
+            (SnapshotTrigger::Manual, "event"),
+            (SnapshotTrigger::Event, "event"),
+        ];
 
-    for (i, (trigger, expected_type)) in triggers.iter().enumerate() {
-        let panes = vec![make_pane(i as u64, 0, 0, 24 + i as u32, 80)];
-        let result = engine.capture(&panes, *trigger).await.unwrap();
+        for (i, (trigger, expected_type)) in triggers.iter().enumerate() {
+            let panes = vec![make_pane(i as u64, 0, 0, 24 + i as u32, 80)];
+            let result = engine.capture(&panes, *trigger).await.unwrap();
 
-        let conn = Connection::open(db_path.as_str()).unwrap();
-        let cp_type: String = conn
-            .query_row(
-                "SELECT checkpoint_type FROM session_checkpoints WHERE id = ?1",
-                [result.checkpoint_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            cp_type, *expected_type,
-            "trigger {:?} should store as '{}'",
-            trigger, expected_type
-        );
-    }
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let cp_type: String = conn
+                .query_row(
+                    "SELECT checkpoint_type FROM session_checkpoints WHERE id = ?1",
+                    [result.checkpoint_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                cp_type, *expected_type,
+                "trigger {:?} should store as '{}'",
+                trigger, expected_type
+            );
+        }
+    });
 }
 
 // =============================================================================
 // Large pane count
 // =============================================================================
 
-#[tokio::test]
-async fn capture_50_panes() {
-    let (_tmp, db_path) = setup_test_db();
-    let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+#[test]
+fn capture_50_panes() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
 
-    let panes: Vec<PaneInfo> = (0..50)
-        .map(|i| make_pane(i, i / 5, i / 25, 24, 80))
-        .collect();
+        let panes: Vec<PaneInfo> = (0..50)
+            .map(|i| make_pane(i, i / 5, i / 25, 24, 80))
+            .collect();
 
-    let result = engine
-        .capture(&panes, SnapshotTrigger::Manual)
-        .await
-        .unwrap();
-    assert_eq!(result.pane_count, 50);
-    assert!(result.total_bytes > 0);
+        let result = engine
+            .capture(&panes, SnapshotTrigger::Manual)
+            .await
+            .unwrap();
+        assert_eq!(result.pane_count, 50);
+        assert!(result.total_bytes > 0);
 
-    let conn = Connection::open(db_path.as_str()).unwrap();
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = ?1",
-            [result.checkpoint_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 50);
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = ?1",
+                [result.checkpoint_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 50);
+    });
 }
 
 // =============================================================================

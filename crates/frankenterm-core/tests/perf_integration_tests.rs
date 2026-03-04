@@ -22,175 +22,198 @@ use frankenterm_core::retry::{
 use frankenterm_core::runtime_compat::sleep;
 use frankenterm_core::watchdog::{Component, HealthStatus, HeartbeatRegistry, WatchdogConfig};
 
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
 // =============================================================================
 // 1. Connection pool integration
 // =============================================================================
 
-#[tokio::test]
-async fn pool_lifecycle() {
-    let pool: Pool<String> = Pool::new(PoolConfig {
-        max_size: 4,
-        idle_timeout: Duration::from_secs(60),
-        acquire_timeout: Duration::from_secs(1),
+#[test]
+fn pool_lifecycle() {
+    run_async_test(async {
+        let pool: Pool<String> = Pool::new(PoolConfig {
+            max_size: 4,
+            idle_timeout: Duration::from_secs(60),
+            acquire_timeout: Duration::from_secs(1),
+        });
+
+        // Seed the pool with connections
+        for i in 0..4 {
+            pool.put(format!("conn-{i}")).await;
+        }
+
+        // Acquire all 4
+        let mut guards = Vec::new();
+        for _ in 0..4 {
+            guards.push(pool.acquire().await.unwrap());
+        }
+        assert_eq!(pool.stats().await.active_count, 4);
+
+        // Return them
+        drop(guards);
+
+        // Re-acquire should succeed
+        let _g = pool.acquire().await.unwrap();
+        let stats = pool.stats().await;
+        assert!(stats.total_acquired >= 5);
     });
-
-    // Seed the pool with connections
-    for i in 0..4 {
-        pool.put(format!("conn-{i}")).await;
-    }
-
-    // Acquire all 4
-    let mut guards = Vec::new();
-    for _ in 0..4 {
-        guards.push(pool.acquire().await.unwrap());
-    }
-    assert_eq!(pool.stats().await.active_count, 4);
-
-    // Return them
-    drop(guards);
-
-    // Re-acquire should succeed
-    let _g = pool.acquire().await.unwrap();
-    let stats = pool.stats().await;
-    assert!(stats.total_acquired >= 5);
 }
 
-#[tokio::test]
-async fn pool_under_load() {
-    let pool = Arc::new(Pool::<u32>::new(PoolConfig {
-        max_size: 8,
-        idle_timeout: Duration::from_secs(60),
-        acquire_timeout: Duration::from_secs(5),
-    }));
-
-    // Seed pool
-    for i in 0..8 {
-        pool.put(i).await;
-    }
-
-    let completed = Arc::new(AtomicU32::new(0));
-
-    // Launch 50 concurrent tasks each acquiring, holding briefly, then releasing
-    let mut handles = Vec::new();
-    for _ in 0..50 {
-        let pool = pool.clone();
-        let completed = completed.clone();
-        handles.push(frankenterm_core::runtime_compat::task::spawn(async move {
-            let guard = pool.acquire().await.unwrap();
-            // Simulate work
-            sleep(Duration::from_millis(5)).await;
-            drop(guard);
-            completed.fetch_add(1, Ordering::SeqCst);
+#[test]
+fn pool_under_load() {
+    run_async_test(async {
+        let pool = Arc::new(Pool::<u32>::new(PoolConfig {
+            max_size: 8,
+            idle_timeout: Duration::from_secs(60),
+            acquire_timeout: Duration::from_secs(5),
         }));
-    }
 
-    for h in handles {
-        h.await.unwrap();
-    }
+        // Seed pool
+        for i in 0..8 {
+            pool.put(i).await;
+        }
 
-    assert_eq!(completed.load(Ordering::SeqCst), 50);
-    let stats = pool.stats().await;
-    assert!(
-        stats.total_acquired >= 50,
-        "expected at least 50 acquires, got {}",
-        stats.total_acquired
-    );
-    assert_eq!(stats.total_timeouts, 0);
-}
+        let completed = Arc::new(AtomicU32::new(0));
 
-#[tokio::test]
-async fn pool_exhaustion_waits() {
-    let pool = Arc::new(Pool::<u32>::new(PoolConfig {
-        max_size: 1,
-        idle_timeout: Duration::from_secs(60),
-        acquire_timeout: Duration::from_secs(2),
-    }));
-    pool.put(1).await;
+        // Launch 50 concurrent tasks each acquiring, holding briefly, then releasing
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let pool = pool.clone();
+            let completed = completed.clone();
+            handles.push(frankenterm_core::runtime_compat::task::spawn(async move {
+                let guard = pool.acquire().await.unwrap();
+                // Simulate work
+                sleep(Duration::from_millis(5)).await;
+                drop(guard);
+                completed.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
 
-    // Hold the only connection
-    let guard = pool.acquire().await.unwrap();
+        for h in handles {
+            h.await.unwrap();
+        }
 
-    // Spawn a task that tries to acquire — it should wait
-    let pool2 = pool.clone();
-    let waiter = frankenterm_core::runtime_compat::task::spawn(async move {
-        let start = Instant::now();
-        let _g = pool2.acquire().await.unwrap();
-        start.elapsed()
+        assert_eq!(completed.load(Ordering::SeqCst), 50);
+        let stats = pool.stats().await;
+        assert!(
+            stats.total_acquired >= 50,
+            "expected at least 50 acquires, got {}",
+            stats.total_acquired
+        );
+        assert_eq!(stats.total_timeouts, 0);
     });
-
-    // Release after 200ms
-    sleep(Duration::from_millis(200)).await;
-    drop(guard);
-
-    let wait_time = waiter.await.unwrap();
-    assert!(
-        wait_time >= Duration::from_millis(100),
-        "waiter should have waited, but waited only {:?}",
-        wait_time
-    );
 }
 
-#[tokio::test]
-async fn pool_acquire_timeout() {
-    let pool = Pool::<u32>::new(PoolConfig {
-        max_size: 1,
-        idle_timeout: Duration::from_secs(60),
-        acquire_timeout: Duration::from_millis(100),
+#[test]
+fn pool_exhaustion_waits() {
+    run_async_test(async {
+        let pool = Arc::new(Pool::<u32>::new(PoolConfig {
+            max_size: 1,
+            idle_timeout: Duration::from_secs(60),
+            acquire_timeout: Duration::from_secs(2),
+        }));
+        pool.put(1).await;
+
+        // Hold the only connection
+        let guard = pool.acquire().await.unwrap();
+
+        // Spawn a task that tries to acquire — it should wait
+        let pool2 = pool.clone();
+        let waiter = frankenterm_core::runtime_compat::task::spawn(async move {
+            let start = Instant::now();
+            let _g = pool2.acquire().await.unwrap();
+            start.elapsed()
+        });
+
+        // Release after 200ms
+        sleep(Duration::from_millis(200)).await;
+        drop(guard);
+
+        let wait_time = waiter.await.unwrap();
+        assert!(
+            wait_time >= Duration::from_millis(100),
+            "waiter should have waited, but waited only {:?}",
+            wait_time
+        );
     });
-    pool.put(1).await;
-
-    // Hold the only connection
-    let _guard = pool.acquire().await.unwrap();
-
-    // Try to acquire — should timeout
-    let result = pool.acquire().await;
-    assert_eq!(result.unwrap_err(), PoolError::AcquireTimeout);
-
-    let stats = pool.stats().await;
-    assert_eq!(stats.total_timeouts, 1);
 }
 
-#[tokio::test]
-async fn pool_evict_idle() {
-    let pool = Pool::<u32>::new(PoolConfig {
-        max_size: 4,
-        idle_timeout: Duration::from_millis(50), // very short
-        acquire_timeout: Duration::from_secs(1),
+#[test]
+fn pool_acquire_timeout() {
+    run_async_test(async {
+        let pool = Pool::<u32>::new(PoolConfig {
+            max_size: 1,
+            idle_timeout: Duration::from_secs(60),
+            acquire_timeout: Duration::from_millis(100),
+        });
+        pool.put(1).await;
+
+        // Hold the only connection
+        let _guard = pool.acquire().await.unwrap();
+
+        // Try to acquire — should timeout
+        let result = pool.acquire().await;
+        assert_eq!(result.unwrap_err(), PoolError::AcquireTimeout);
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.total_timeouts, 1);
     });
-
-    for i in 0..4 {
-        pool.put(i).await;
-    }
-
-    // Wait for connections to become stale
-    sleep(Duration::from_millis(100)).await;
-
-    let evicted = pool.evict_idle().await;
-    assert_eq!(evicted, 4);
-
-    let stats = pool.stats().await;
-    assert_eq!(stats.idle_count, 0);
-    assert_eq!(stats.total_evicted, 4);
 }
 
-#[tokio::test]
-async fn pool_metrics_accuracy() {
-    let pool = Pool::<u32>::new(PoolConfig::default());
+#[test]
+fn pool_evict_idle() {
+    run_async_test(async {
+        let pool = Pool::<u32>::new(PoolConfig {
+            max_size: 4,
+            idle_timeout: Duration::from_millis(50), // very short
+            acquire_timeout: Duration::from_secs(1),
+        });
 
-    // Seed
-    pool.put(1).await;
-    pool.put(2).await;
+        for i in 0..4 {
+            pool.put(i).await;
+        }
 
-    let s1 = pool.stats().await;
-    assert_eq!(s1.idle_count, 2);
-    assert_eq!(s1.active_count, 0);
+        // Wait for connections to become stale
+        sleep(Duration::from_millis(100)).await;
 
-    // Acquire one
-    let _g = pool.acquire().await.unwrap();
-    let s2 = pool.stats().await;
-    assert_eq!(s2.idle_count, 1);
-    assert_eq!(s2.active_count, 1);
-    assert_eq!(s2.total_acquired, 1);
+        let evicted = pool.evict_idle().await;
+        assert_eq!(evicted, 4);
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.idle_count, 0);
+        assert_eq!(stats.total_evicted, 4);
+    });
+}
+
+#[test]
+fn pool_metrics_accuracy() {
+    run_async_test(async {
+        let pool = Pool::<u32>::new(PoolConfig::default());
+
+        // Seed
+        pool.put(1).await;
+        pool.put(2).await;
+
+        let s1 = pool.stats().await;
+        assert_eq!(s1.idle_count, 2);
+        assert_eq!(s1.active_count, 0);
+
+        // Acquire one
+        let _g = pool.acquire().await.unwrap();
+        let s2 = pool.stats().await;
+        assert_eq!(s2.idle_count, 1);
+        assert_eq!(s2.active_count, 1);
+        assert_eq!(s2.total_acquired, 1);
+    });
 }
 
 // =============================================================================
@@ -288,194 +311,206 @@ fn circuit_breaker_status_reports_failures() {
 // 3. Retry integration
 // =============================================================================
 
-#[tokio::test]
-async fn retry_succeeds_on_first_attempt() {
-    let policy = RetryPolicy {
-        max_attempts: Some(3),
-        initial_delay: Duration::from_millis(10),
-        ..RetryPolicy::default()
-    };
+#[test]
+fn retry_succeeds_on_first_attempt() {
+    run_async_test(async {
+        let policy = RetryPolicy {
+            max_attempts: Some(3),
+            initial_delay: Duration::from_millis(10),
+            ..RetryPolicy::default()
+        };
 
-    let attempt_count = Arc::new(AtomicU32::new(0));
-    let ac = attempt_count.clone();
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let ac = attempt_count.clone();
 
-    let result = with_retry(&policy, || {
-        let ac = ac.clone();
-        async move {
-            ac.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, frankenterm_core::Error>(42)
-        }
-    })
-    .await;
+        let result = with_retry(&policy, || {
+            let ac = ac.clone();
+            async move {
+                ac.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, frankenterm_core::Error>(42)
+            }
+        })
+        .await;
 
-    assert_eq!(result.unwrap(), 42);
-    assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
+    });
 }
 
-#[tokio::test]
-async fn retry_succeeds_after_transient_failures() {
-    let policy = RetryPolicy {
-        max_attempts: Some(5),
-        initial_delay: Duration::from_millis(5),
-        backoff_factor: 1.0, // no backoff for test speed
-        jitter_percent: 0.0,
-        ..RetryPolicy::default()
-    };
+#[test]
+fn retry_succeeds_after_transient_failures() {
+    run_async_test(async {
+        let policy = RetryPolicy {
+            max_attempts: Some(5),
+            initial_delay: Duration::from_millis(5),
+            backoff_factor: 1.0, // no backoff for test speed
+            jitter_percent: 0.0,
+            ..RetryPolicy::default()
+        };
 
-    let attempt_count = Arc::new(AtomicU32::new(0));
-    let ac = attempt_count.clone();
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let ac = attempt_count.clone();
 
-    let result = with_retry(&policy, || {
-        let ac = ac.clone();
-        async move {
-            let n = ac.fetch_add(1, Ordering::SeqCst);
-            if n < 2 {
+        let result = with_retry(&policy, || {
+            let ac = ac.clone();
+            async move {
+                let n = ac.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(frankenterm_core::Error::Wezterm(
+                        frankenterm_core::error::WeztermError::Timeout(5),
+                    ))
+                } else {
+                    Ok(99)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 3); // 2 failures + 1 success
+    });
+}
+
+#[test]
+fn retry_exhausted_returns_error() {
+    run_async_test(async {
+        let policy = RetryPolicy {
+            max_attempts: Some(3),
+            initial_delay: Duration::from_millis(5),
+            backoff_factor: 1.0,
+            jitter_percent: 0.0,
+            ..RetryPolicy::default()
+        };
+
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let ac = attempt_count.clone();
+
+        let result: frankenterm_core::Result<i32> = with_retry(&policy, || {
+            let ac = ac.clone();
+            async move {
+                ac.fetch_add(1, Ordering::SeqCst);
                 Err(frankenterm_core::Error::Wezterm(
                     frankenterm_core::error::WeztermError::Timeout(5),
                 ))
-            } else {
-                Ok(99)
             }
-        }
-    })
-    .await;
+        })
+        .await;
 
-    assert_eq!(result.unwrap(), 99);
-    assert_eq!(attempt_count.load(Ordering::SeqCst), 3); // 2 failures + 1 success
+        assert!(result.is_err());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
+    });
 }
 
-#[tokio::test]
-async fn retry_exhausted_returns_error() {
-    let policy = RetryPolicy {
-        max_attempts: Some(3),
-        initial_delay: Duration::from_millis(5),
-        backoff_factor: 1.0,
-        jitter_percent: 0.0,
-        ..RetryPolicy::default()
-    };
+#[test]
+fn retry_outcome_tracks_attempt_count() {
+    run_async_test(async {
+        let policy = RetryPolicy {
+            max_attempts: Some(4),
+            initial_delay: Duration::from_millis(5),
+            backoff_factor: 1.0,
+            jitter_percent: 0.0,
+            ..RetryPolicy::default()
+        };
 
-    let attempt_count = Arc::new(AtomicU32::new(0));
-    let ac = attempt_count.clone();
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let ac = attempt_count.clone();
 
-    let result: frankenterm_core::Result<i32> = with_retry(&policy, || {
-        let ac = ac.clone();
-        async move {
-            ac.fetch_add(1, Ordering::SeqCst);
-            Err(frankenterm_core::Error::Wezterm(
-                frankenterm_core::error::WeztermError::Timeout(5),
-            ))
-        }
-    })
-    .await;
+        let outcome = with_retry_outcome(&policy, || {
+            let ac = ac.clone();
+            async move {
+                let n = ac.fetch_add(1, Ordering::SeqCst);
+                if n < 1 {
+                    Err(frankenterm_core::Error::Wezterm(
+                        frankenterm_core::error::WeztermError::Timeout(5),
+                    ))
+                } else {
+                    Ok::<_, frankenterm_core::Error>("done")
+                }
+            }
+        })
+        .await;
 
-    assert!(result.is_err());
-    assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.attempts, 2);
+        assert!(outcome.elapsed > Duration::ZERO);
+    });
 }
 
-#[tokio::test]
-async fn retry_outcome_tracks_attempt_count() {
-    let policy = RetryPolicy {
-        max_attempts: Some(4),
-        initial_delay: Duration::from_millis(5),
-        backoff_factor: 1.0,
-        jitter_percent: 0.0,
-        ..RetryPolicy::default()
-    };
+#[test]
+fn retry_with_circuit_breaker_skips_when_open() {
+    run_async_test(async {
+        let policy = RetryPolicy {
+            max_attempts: Some(5),
+            initial_delay: Duration::from_millis(5),
+            backoff_factor: 1.0,
+            jitter_percent: 0.0,
+            ..RetryPolicy::default()
+        };
 
-    let attempt_count = Arc::new(AtomicU32::new(0));
-    let ac = attempt_count.clone();
+        let mut cb = CircuitBreaker::new(CircuitBreakerConfig::new(
+            2,
+            1,
+            Duration::from_secs(60), // long cooldown
+        ));
 
-    let outcome = with_retry_outcome(&policy, || {
-        let ac = ac.clone();
-        async move {
-            let n = ac.fetch_add(1, Ordering::SeqCst);
-            if n < 1 {
+        // Open the circuit manually
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.status().state, CircuitStateKind::Open);
+
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let ac = attempt_count.clone();
+
+        let result: frankenterm_core::Result<i32> = with_retry_and_circuit(&policy, &mut cb, || {
+            let ac = ac.clone();
+            async move {
+                ac.fetch_add(1, Ordering::SeqCst);
+                Ok(42)
+            }
+        })
+        .await;
+
+        // Should fail without executing the operation
+        assert!(result.is_err());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn retry_exponential_backoff_timing() {
+    run_async_test(async {
+        let policy = RetryPolicy {
+            max_attempts: Some(4),
+            initial_delay: Duration::from_millis(50),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            jitter_percent: 0.0, // no jitter for timing accuracy
+        };
+
+        let start = Instant::now();
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let ac = attempt_count.clone();
+
+        let _: frankenterm_core::Result<i32> = with_retry(&policy, || {
+            let ac = ac.clone();
+            async move {
+                ac.fetch_add(1, Ordering::SeqCst);
                 Err(frankenterm_core::Error::Wezterm(
                     frankenterm_core::error::WeztermError::Timeout(5),
                 ))
-            } else {
-                Ok::<_, frankenterm_core::Error>("done")
             }
-        }
-    })
-    .await;
+        })
+        .await;
 
-    assert!(outcome.result.is_ok());
-    assert_eq!(outcome.attempts, 2);
-    assert!(outcome.elapsed > Duration::ZERO);
-}
-
-#[tokio::test]
-async fn retry_with_circuit_breaker_skips_when_open() {
-    let policy = RetryPolicy {
-        max_attempts: Some(5),
-        initial_delay: Duration::from_millis(5),
-        backoff_factor: 1.0,
-        jitter_percent: 0.0,
-        ..RetryPolicy::default()
-    };
-
-    let mut cb = CircuitBreaker::new(CircuitBreakerConfig::new(
-        2,
-        1,
-        Duration::from_secs(60), // long cooldown
-    ));
-
-    // Open the circuit manually
-    cb.record_failure();
-    cb.record_failure();
-    assert_eq!(cb.status().state, CircuitStateKind::Open);
-
-    let attempt_count = Arc::new(AtomicU32::new(0));
-    let ac = attempt_count.clone();
-
-    let result: frankenterm_core::Result<i32> = with_retry_and_circuit(&policy, &mut cb, || {
-        let ac = ac.clone();
-        async move {
-            ac.fetch_add(1, Ordering::SeqCst);
-            Ok(42)
-        }
-    })
-    .await;
-
-    // Should fail without executing the operation
-    assert!(result.is_err());
-    assert_eq!(attempt_count.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn retry_exponential_backoff_timing() {
-    let policy = RetryPolicy {
-        max_attempts: Some(4),
-        initial_delay: Duration::from_millis(50),
-        max_delay: Duration::from_secs(10),
-        backoff_factor: 2.0,
-        jitter_percent: 0.0, // no jitter for timing accuracy
-    };
-
-    let start = Instant::now();
-    let attempt_count = Arc::new(AtomicU32::new(0));
-    let ac = attempt_count.clone();
-
-    let _: frankenterm_core::Result<i32> = with_retry(&policy, || {
-        let ac = ac.clone();
-        async move {
-            ac.fetch_add(1, Ordering::SeqCst);
-            Err(frankenterm_core::Error::Wezterm(
-                frankenterm_core::error::WeztermError::Timeout(5),
-            ))
-        }
-    })
-    .await;
-
-    let elapsed = start.elapsed();
-    // 3 delays: 50ms + 100ms + 200ms = 350ms minimum
-    assert!(
-        elapsed >= Duration::from_millis(300),
-        "expected at least 300ms backoff, got {:?}",
-        elapsed
-    );
-    assert_eq!(attempt_count.load(Ordering::SeqCst), 4);
+        let elapsed = start.elapsed();
+        // 3 delays: 50ms + 100ms + 200ms = 350ms minimum
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "expected at least 300ms backoff, got {:?}",
+            elapsed
+        );
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 4);
+    });
 }
 
 // =============================================================================
@@ -746,192 +781,202 @@ fn backpressure_zero_capacity_no_panic() {
 // 6. Cross-component integration
 // =============================================================================
 
-#[tokio::test]
-async fn pool_and_retry_integration() {
-    let pool = Arc::new(Pool::<u32>::new(PoolConfig {
-        max_size: 2,
-        idle_timeout: Duration::from_secs(60),
-        acquire_timeout: Duration::from_millis(500),
-    }));
+#[test]
+fn pool_and_retry_integration() {
+    run_async_test(async {
+        let pool = Arc::new(Pool::<u32>::new(PoolConfig {
+            max_size: 2,
+            idle_timeout: Duration::from_secs(60),
+            acquire_timeout: Duration::from_millis(500),
+        }));
 
-    // Seed pool
-    pool.put(1).await;
-    pool.put(2).await;
+        // Seed pool
+        pool.put(1).await;
+        pool.put(2).await;
 
-    let policy = RetryPolicy {
-        max_attempts: Some(3),
-        initial_delay: Duration::from_millis(10),
-        backoff_factor: 1.0,
-        jitter_percent: 0.0,
-        ..RetryPolicy::default()
-    };
+        let policy = RetryPolicy {
+            max_attempts: Some(3),
+            initial_delay: Duration::from_millis(10),
+            backoff_factor: 1.0,
+            jitter_percent: 0.0,
+            ..RetryPolicy::default()
+        };
 
-    let pool_clone = pool.clone();
-    let attempt_count = Arc::new(AtomicU32::new(0));
-    let ac = attempt_count.clone();
+        let pool_clone = pool.clone();
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let ac = attempt_count.clone();
 
-    // Use retry to acquire from pool and do work
-    let result = with_retry(&policy, || {
-        let pool = pool_clone.clone();
-        let ac = ac.clone();
-        async move {
-            let guard = pool
-                .acquire()
-                .await
-                .map_err(|e| frankenterm_core::Error::Runtime(e.to_string()))?;
-            ac.fetch_add(1, Ordering::SeqCst);
-            drop(guard);
-            Ok::<_, frankenterm_core::Error>(true)
-        }
-    })
-    .await;
-
-    assert!(result.unwrap());
-    assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn circuit_breaker_and_pool_integration() {
-    let pool = Arc::new(Pool::<u32>::new(PoolConfig {
-        max_size: 2,
-        idle_timeout: Duration::from_secs(60),
-        acquire_timeout: Duration::from_millis(200),
-    }));
-
-    pool.put(1).await;
-
-    let cb = Arc::new(Mutex::new(CircuitBreaker::new(CircuitBreakerConfig::new(
-        2,
-        1,
-        Duration::from_secs(60),
-    ))));
-
-    // Successful acquire records success
-    {
-        let guard = pool.acquire().await.unwrap();
-        cb.lock().unwrap().record_success();
-        drop(guard);
-    }
-
-    assert_eq!(cb.lock().unwrap().status().state, CircuitStateKind::Closed);
-
-    // Simulate failures
-    cb.lock().unwrap().record_failure();
-    cb.lock().unwrap().record_failure();
-
-    // Circuit is now open — operations should be rejected
-    assert!(!cb.lock().unwrap().allow());
-}
-
-#[tokio::test]
-async fn watchdog_and_backpressure_coherence() {
-    // Verify that when backpressure is at Black, the watchdog can still
-    // function (no deadlocks, no panics)
-    let registry = HeartbeatRegistry::new();
-    let bp_config = BackpressureConfig::default();
-    let bp_manager = BackpressureManager::new(bp_config);
-
-    // Record heartbeats under extreme load
-    registry.record_discovery();
-    registry.record_capture();
-    registry.record_persistence();
-    registry.record_maintenance();
-
-    // Classify at near-saturation
-    let depths = QueueDepths {
-        capture_depth: 999,
-        capture_capacity: 1000,
-        write_depth: 499,
-        write_capacity: 500,
-    };
-
-    let tier = bp_manager.classify(&depths);
-    assert_eq!(tier, BackpressureTier::Black);
-
-    // Watchdog should still work
-    let wd_config = WatchdogConfig::default();
-    let report = registry.check_health(&wd_config);
-    // Should not panic, health status is valid
-    assert!(matches!(
-        report.overall,
-        HealthStatus::Healthy | HealthStatus::Degraded | HealthStatus::Critical
-    ));
-}
-
-#[tokio::test]
-async fn concurrent_pool_acquire_and_evict() {
-    let pool = Arc::new(Pool::<u32>::new(PoolConfig {
-        max_size: 4,
-        idle_timeout: Duration::from_millis(20),
-        acquire_timeout: Duration::from_secs(2),
-    }));
-
-    // Seed
-    for i in 0..4 {
-        pool.put(i).await;
-    }
-
-    let pool1 = pool.clone();
-    let pool2 = pool.clone();
-
-    // Concurrent: one task acquires/releases, another evicts
-    let acquire_task = frankenterm_core::runtime_compat::task::spawn(async move {
-        for _ in 0..20 {
-            if let Ok(guard) = pool1.acquire().await {
-                sleep(Duration::from_millis(5)).await;
+        // Use retry to acquire from pool and do work
+        let result = with_retry(&policy, || {
+            let pool = pool_clone.clone();
+            let ac = ac.clone();
+            async move {
+                let guard = pool
+                    .acquire()
+                    .await
+                    .map_err(|e| frankenterm_core::Error::Runtime(e.to_string()))?;
+                ac.fetch_add(1, Ordering::SeqCst);
                 drop(guard);
+                Ok::<_, frankenterm_core::Error>(true)
             }
-        }
-    });
+        })
+        .await;
 
-    let evict_task = frankenterm_core::runtime_compat::task::spawn(async move {
-        for _ in 0..10 {
-            pool2.evict_idle().await;
-            sleep(Duration::from_millis(10)).await;
-        }
+        assert!(result.unwrap());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
     });
+}
 
-    // Both should complete without deadlock
-    let (r1, r2) = frankenterm_core::runtime_compat::join!(acquire_task, evict_task);
-    r1.unwrap();
-    r2.unwrap();
+#[test]
+fn circuit_breaker_and_pool_integration() {
+    run_async_test(async {
+        let pool = Arc::new(Pool::<u32>::new(PoolConfig {
+            max_size: 2,
+            idle_timeout: Duration::from_secs(60),
+            acquire_timeout: Duration::from_millis(200),
+        }));
+
+        pool.put(1).await;
+
+        let cb = Arc::new(Mutex::new(CircuitBreaker::new(CircuitBreakerConfig::new(
+            2,
+            1,
+            Duration::from_secs(60),
+        ))));
+
+        // Successful acquire records success
+        {
+            let guard = pool.acquire().await.unwrap();
+            cb.lock().unwrap().record_success();
+            drop(guard);
+        }
+
+        assert_eq!(cb.lock().unwrap().status().state, CircuitStateKind::Closed);
+
+        // Simulate failures
+        cb.lock().unwrap().record_failure();
+        cb.lock().unwrap().record_failure();
+
+        // Circuit is now open — operations should be rejected
+        assert!(!cb.lock().unwrap().allow());
+    });
+}
+
+#[test]
+fn watchdog_and_backpressure_coherence() {
+    run_async_test(async {
+        // Verify that when backpressure is at Black, the watchdog can still
+        // function (no deadlocks, no panics)
+        let registry = HeartbeatRegistry::new();
+        let bp_config = BackpressureConfig::default();
+        let bp_manager = BackpressureManager::new(bp_config);
+
+        // Record heartbeats under extreme load
+        registry.record_discovery();
+        registry.record_capture();
+        registry.record_persistence();
+        registry.record_maintenance();
+
+        // Classify at near-saturation
+        let depths = QueueDepths {
+            capture_depth: 999,
+            capture_capacity: 1000,
+            write_depth: 499,
+            write_capacity: 500,
+        };
+
+        let tier = bp_manager.classify(&depths);
+        assert_eq!(tier, BackpressureTier::Black);
+
+        // Watchdog should still work
+        let wd_config = WatchdogConfig::default();
+        let report = registry.check_health(&wd_config);
+        // Should not panic, health status is valid
+        assert!(matches!(
+            report.overall,
+            HealthStatus::Healthy | HealthStatus::Degraded | HealthStatus::Critical
+        ));
+    });
+}
+
+#[test]
+fn concurrent_pool_acquire_and_evict() {
+    run_async_test(async {
+        let pool = Arc::new(Pool::<u32>::new(PoolConfig {
+            max_size: 4,
+            idle_timeout: Duration::from_millis(20),
+            acquire_timeout: Duration::from_secs(2),
+        }));
+
+        // Seed
+        for i in 0..4 {
+            pool.put(i).await;
+        }
+
+        let pool1 = pool.clone();
+        let pool2 = pool.clone();
+
+        // Concurrent: one task acquires/releases, another evicts
+        let acquire_task = frankenterm_core::runtime_compat::task::spawn(async move {
+            for _ in 0..20 {
+                if let Ok(guard) = pool1.acquire().await {
+                    sleep(Duration::from_millis(5)).await;
+                    drop(guard);
+                }
+            }
+        });
+
+        let evict_task = frankenterm_core::runtime_compat::task::spawn(async move {
+            for _ in 0..10 {
+                pool2.evict_idle().await;
+                sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        // Both should complete without deadlock
+        let (r1, r2) = frankenterm_core::runtime_compat::join!(acquire_task, evict_task);
+        r1.unwrap();
+        r2.unwrap();
+    });
 }
 
 // =============================================================================
 // 7. Stress tests
 // =============================================================================
 
-#[tokio::test]
-async fn pool_stress_100_concurrent() {
-    let pool = Arc::new(Pool::<u32>::new(PoolConfig {
-        max_size: 4,
-        idle_timeout: Duration::from_secs(60),
-        acquire_timeout: Duration::from_secs(10),
-    }));
-
-    for i in 0..4 {
-        pool.put(i).await;
-    }
-
-    let completed = Arc::new(AtomicU32::new(0));
-    let mut handles = Vec::new();
-
-    for _ in 0..100 {
-        let pool = pool.clone();
-        let completed = completed.clone();
-        handles.push(frankenterm_core::runtime_compat::task::spawn(async move {
-            let guard = pool.acquire().await.unwrap();
-            sleep(Duration::from_millis(1)).await;
-            drop(guard);
-            completed.fetch_add(1, Ordering::SeqCst);
+#[test]
+fn pool_stress_100_concurrent() {
+    run_async_test(async {
+        let pool = Arc::new(Pool::<u32>::new(PoolConfig {
+            max_size: 4,
+            idle_timeout: Duration::from_secs(60),
+            acquire_timeout: Duration::from_secs(10),
         }));
-    }
 
-    for h in handles {
-        h.await.unwrap();
-    }
+        for i in 0..4 {
+            pool.put(i).await;
+        }
 
-    assert_eq!(completed.load(Ordering::SeqCst), 100);
+        let completed = Arc::new(AtomicU32::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..100 {
+            let pool = pool.clone();
+            let completed = completed.clone();
+            handles.push(frankenterm_core::runtime_compat::task::spawn(async move {
+                let guard = pool.acquire().await.unwrap();
+                sleep(Duration::from_millis(1)).await;
+                drop(guard);
+                completed.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(completed.load(Ordering::SeqCst), 100);
+    });
 }
 
 #[test]

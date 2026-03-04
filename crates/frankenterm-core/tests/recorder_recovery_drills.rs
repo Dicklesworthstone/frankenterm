@@ -28,6 +28,18 @@ use frankenterm_core::tantivy_reindex::{
     ReindexableWriter,
 };
 
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use frankenterm_core::runtime_compat::CompatRuntime;
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
 fn emit_recovery_artifact(label: &str, value: serde_json::Value) {
     eprintln!("[ARTIFACT][recorder-recovery-drill] {label}={value}");
 }
@@ -213,8 +225,9 @@ impl IndexLookup for DrillLookup {
     }
 }
 
-#[tokio::test]
-async fn recovery_drill_writer_crash_resume_replays_without_loss() {
+#[test]
+fn recovery_drill_writer_crash_resume_replays_without_loss() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(storage_config(dir.path())).unwrap();
     append_events(&storage, "writer-crash", 12).await;
@@ -256,10 +269,12 @@ async fn recovery_drill_writer_crash_resume_replays_without_loss() {
             "recovery_ms": recovery_ms,
         }),
     );
+    });
 }
 
-#[tokio::test]
-async fn recovery_drill_checkpoint_divergence_detected_then_resumed() {
+#[test]
+fn recovery_drill_checkpoint_divergence_detected_then_resumed() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(storage_config(dir.path())).unwrap();
     append_events(&storage, "checkpoint-divergence", 9).await;
@@ -315,10 +330,12 @@ async fn recovery_drill_checkpoint_divergence_detected_then_resumed() {
             "recovery_ms": recovery_ms,
         }),
     );
+    });
 }
 
-#[tokio::test]
-async fn recovery_drill_reindex_resume_integrity_consistent() {
+#[test]
+fn recovery_drill_reindex_resume_integrity_consistent() {
+    run_async_test(async {
     let dir = tempdir().unwrap();
     let storage = AppendLogRecorderStorage::open(storage_config(dir.path())).unwrap();
     append_events(&storage, "reindex-drill", 16).await;
@@ -377,4 +394,5 @@ async fn recovery_drill_reindex_resume_integrity_consistent() {
             "events_scanned": integrity.log_events_scanned,
         }),
     );
+    });
 }

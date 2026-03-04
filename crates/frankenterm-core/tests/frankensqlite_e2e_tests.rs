@@ -27,6 +27,17 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::tempdir;
 
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
@@ -309,442 +320,484 @@ impl RecorderStorage for MockTargetStorage {
 // E2E scenarios
 // ===========================================================================
 
-#[tokio::test]
-async fn test_e2e_full_migration_happy_path() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 100).await;
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig {
-        export_batch_size: 25,
-        import_batch_size: 30,
-        consumer_id: "e2e-test".to_string(),
+#[test]
+fn test_e2e_full_migration_happy_path() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 100).await;
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig {
+            export_batch_size: 25,
+            import_batch_size: 30,
+            consumer_id: "e2e-test".to_string(),
+        });
+
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+
+        assert_eq!(manifest.event_count, 100);
+        assert_eq!(manifest.export_count, 100);
+        assert_eq!(manifest.import_count, 100);
+        assert_eq!(manifest.import_digest, manifest.export_digest);
+        assert_eq!(target.total_events(), 100);
     });
-
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-
-    assert_eq!(manifest.event_count, 100);
-    assert_eq!(manifest.export_count, 100);
-    assert_eq!(manifest.import_count, 100);
-    assert_eq!(manifest.import_digest, manifest.export_digest);
-    assert_eq!(target.total_events(), 100);
 }
 
-#[tokio::test]
-async fn test_e2e_m5_cutover_completes() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 10).await;
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_e2e_m5_cutover_completes() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 10).await;
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
-    let cutover = engine
-        .m5_cutover(
-            &target,
-            &manifest,
-            1708000000,
-            Some(dir.path().to_string_lossy().to_string()),
-        )
-        .await
-        .unwrap();
+        let cutover = engine
+            .m5_cutover(
+                &target,
+                &manifest,
+                1708000000,
+                Some(dir.path().to_string_lossy().to_string()),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(
-        cutover.activated_backend,
-        RecorderBackendKind::FrankenSqlite
-    );
-    assert!(cutover.target_healthy);
-    assert!(cutover.source_retained_path.is_some());
-}
-
-#[tokio::test]
-async fn test_e2e_m2_digest_mismatch_triggers_immediate_rollback() {
-    let input = MigrationRollbackClassifierInput {
-        stage: MigrationStage::Import,
-        import_digest_mismatch: true,
-        ..Default::default()
-    };
-
-    let decision = classify_migration_rollback_trigger(&input);
-    assert!(decision.should_rollback);
-    assert_eq!(
-        decision.rollback_class,
-        Some(MigrationRollbackClass::Immediate)
-    );
-}
-
-#[tokio::test]
-async fn test_e2e_m5_health_failure_triggers_postcutover_rollback() {
-    // projection_lag_breach requires sustained_slo_windows consecutive breaches
-    let input = MigrationRollbackClassifierInput {
-        stage: MigrationStage::Activate,
-        projection_lag_breach: true,
-        consecutive_slo_breach_windows: 3,
-        ..Default::default()
-    };
-
-    let decision = classify_migration_rollback_trigger(&input);
-    assert!(decision.should_rollback);
-    assert_eq!(
-        decision.rollback_class,
-        Some(MigrationRollbackClass::PostCutover)
-    );
-}
-
-#[tokio::test]
-async fn test_e2e_corruption_triggers_immediate_rollback() {
-    // corrupt_import is an immediate-tier trigger (not emergency)
-    let input = MigrationRollbackClassifierInput {
-        stage: MigrationStage::Import,
-        corrupt_import: true,
-        ..Default::default()
-    };
-
-    let decision = classify_migration_rollback_trigger(&input);
-    assert!(decision.should_rollback);
-    assert_eq!(
-        decision.rollback_class,
-        Some(MigrationRollbackClass::Immediate)
-    );
-}
-
-#[tokio::test]
-async fn test_e2e_rollback_preserves_source_data() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let _records = populate_source(&source, 20).await;
-
-    let health = source.health().await;
-    assert!(!health.degraded);
-    assert!(health.latest_offset.is_some());
-    assert_eq!(health.latest_offset.unwrap().ordinal, 19);
-}
-
-#[tokio::test]
-async fn test_e2e_immediate_rollback_playbook() {
-    let dir = tempdir().unwrap();
-
-    let context = MigrationRollbackPlaybookContext {
-        rollback_class: MigrationRollbackClass::Immediate,
-        from_stage: MigrationStage::Import,
-        pre_migration_checkpoints: BTreeMap::new(),
-        forensic_capture: None,
-        forensics_output_dir: dir.path().to_path_buf(),
-    };
-
-    let mut state = MigrationRollbackExecutionState::default();
-    let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
-
-    assert_eq!(report.tier, MigrationRollbackClass::Immediate);
-    assert!(!report.migration_active);
-    assert_eq!(report.backend_selector, RecorderBackendKind::AppendLog);
-    assert!(report.target_cleared);
-}
-
-#[tokio::test]
-async fn test_e2e_postcutover_rollback_playbook() {
-    let dir = tempdir().unwrap();
-
-    let context = MigrationRollbackPlaybookContext {
-        rollback_class: MigrationRollbackClass::PostCutover,
-        from_stage: MigrationStage::Activate,
-        pre_migration_checkpoints: BTreeMap::new(),
-        forensic_capture: None,
-        forensics_output_dir: dir.path().to_path_buf(),
-    };
-
-    let mut state = MigrationRollbackExecutionState::default();
-    let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
-
-    assert_eq!(report.tier, MigrationRollbackClass::PostCutover);
-    assert_eq!(report.backend_selector, RecorderBackendKind::AppendLog);
-    assert!(report.projection_rebuild_triggered);
-}
-
-#[tokio::test]
-async fn test_e2e_target_write_failure_at_m2() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 10).await;
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    target.fail_append.store(true, Ordering::Relaxed);
-    let engine = MigrationEngine::new(MigrationConfig::default());
-
-    let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
-    let exported = engine.m1_export(&reader, &mut manifest).unwrap();
-
-    let result = engine.m2_import(&target, &exported, &mut manifest).await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn test_e2e_m5_degraded_target_reports_unhealthy() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 5).await;
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig::default());
-
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-
-    target.degraded_post_cutover.store(true, Ordering::Relaxed);
-
-    let cutover = engine
-        .m5_cutover(&target, &manifest, 1000, None)
-        .await
-        .unwrap();
-
-    assert!(!cutover.target_healthy);
-}
-
-#[tokio::test]
-async fn test_e2e_checkpoint_monotonicity_across_cutover() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 20).await;
-
-    let consumer = CheckpointConsumerId("e2e-consumer".to_string());
-    source
-        .commit_checkpoint(RecorderCheckpoint {
-            consumer: consumer.clone(),
-            upto_offset: RecorderOffset {
-                segment_id: 0,
-                byte_offset: 0,
-                ordinal: 10,
-            },
-            schema_version: "v1".to_string(),
-            committed_at_ms: 1000,
-        })
-        .await
-        .unwrap();
-
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig::default());
-
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-
-    let sync_result = engine
-        .m3_checkpoint_sync(&source, &target, &manifest)
-        .await
-        .unwrap();
-
-    assert_eq!(sync_result.consumers_found, 1);
-    assert_eq!(sync_result.checkpoints_migrated, 1);
-
-    let target_cp = target.read_checkpoint(&consumer).await.unwrap().unwrap();
-    assert_eq!(target_cp.upto_offset.ordinal, 10);
-}
-
-#[tokio::test]
-async fn test_e2e_manifest_captures_per_pane_distribution() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 30).await;
-
-    let reader = MemoryReader { records };
-    let engine = MigrationEngine::new(MigrationConfig::default());
-    let manifest = engine.m0_preflight(&source, &reader).await.unwrap();
-
-    assert_eq!(manifest.per_pane_counts.len(), 3);
-    assert_eq!(manifest.per_pane_counts.get(&1), Some(&10));
-    assert_eq!(manifest.per_pane_counts.get(&2), Some(&10));
-    assert_eq!(manifest.per_pane_counts.get(&3), Some(&10));
-}
-
-#[tokio::test]
-async fn test_e2e_empty_source_migration() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 0).await;
-
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig::default());
-
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-
-    assert_eq!(manifest.event_count, 0);
-    assert_eq!(manifest.export_count, 0);
-    assert_eq!(manifest.import_count, 0);
-    assert_eq!(target.total_events(), 0);
-}
-
-#[tokio::test]
-async fn test_e2e_large_dataset_200_events() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 200).await;
-
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig {
-        export_batch_size: 50,
-        import_batch_size: 75,
-        ..Default::default()
+        assert_eq!(
+            cutover.activated_backend,
+            RecorderBackendKind::FrankenSqlite
+        );
+        assert!(cutover.target_healthy);
+        assert!(cutover.source_retained_path.is_some());
     });
-
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-
-    assert_eq!(manifest.event_count, 200);
-    assert_eq!(manifest.export_count, 200);
-    assert_eq!(manifest.import_count, 200);
-    assert_eq!(manifest.import_digest, manifest.export_digest);
-    assert_eq!(target.total_events(), 200);
 }
 
-#[tokio::test]
-async fn test_e2e_no_rollback_when_all_healthy() {
-    let input = MigrationRollbackClassifierInput {
-        stage: MigrationStage::Activate,
-        ..Default::default()
-    };
+#[test]
+fn test_e2e_m2_digest_mismatch_triggers_immediate_rollback() {
+    run_async_test(async {
+        let input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::Import,
+            import_digest_mismatch: true,
+            ..Default::default()
+        };
 
-    let decision = classify_migration_rollback_trigger(&input);
-    assert!(!decision.should_rollback);
-    assert!(decision.rollback_class.is_none());
+        let decision = classify_migration_rollback_trigger(&input);
+        assert!(decision.should_rollback);
+        assert_eq!(
+            decision.rollback_class,
+            Some(MigrationRollbackClass::Immediate)
+        );
+    });
 }
 
-#[tokio::test]
-async fn test_e2e_cardinality_mismatch_is_immediate() {
-    let input = MigrationRollbackClassifierInput {
-        stage: MigrationStage::Import,
-        event_cardinality_mismatch: true,
-        ..Default::default()
-    };
+#[test]
+fn test_e2e_m5_health_failure_triggers_postcutover_rollback() {
+    run_async_test(async {
+        // projection_lag_breach requires sustained_slo_windows consecutive breaches
+        let input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::Activate,
+            projection_lag_breach: true,
+            consecutive_slo_breach_windows: 3,
+            ..Default::default()
+        };
 
-    let decision = classify_migration_rollback_trigger(&input);
-    assert!(decision.should_rollback);
-    assert_eq!(
-        decision.rollback_class,
-        Some(MigrationRollbackClass::Immediate)
-    );
+        let decision = classify_migration_rollback_trigger(&input);
+        assert!(decision.should_rollback);
+        assert_eq!(
+            decision.rollback_class,
+            Some(MigrationRollbackClass::PostCutover)
+        );
+    });
 }
 
-#[tokio::test]
-async fn test_e2e_checkpoint_regression_is_immediate() {
-    let input = MigrationRollbackClassifierInput {
-        stage: MigrationStage::CheckpointSync,
-        checkpoint_regression: true,
-        ..Default::default()
-    };
+#[test]
+fn test_e2e_corruption_triggers_immediate_rollback() {
+    run_async_test(async {
+        // corrupt_import is an immediate-tier trigger (not emergency)
+        let input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::Import,
+            corrupt_import: true,
+            ..Default::default()
+        };
 
-    let decision = classify_migration_rollback_trigger(&input);
-    assert!(decision.should_rollback);
-    assert_eq!(
-        decision.rollback_class,
-        Some(MigrationRollbackClass::Immediate)
-    );
+        let decision = classify_migration_rollback_trigger(&input);
+        assert!(decision.should_rollback);
+        assert_eq!(
+            decision.rollback_class,
+            Some(MigrationRollbackClass::Immediate)
+        );
+    });
 }
 
-#[tokio::test]
-async fn test_e2e_data_loss_is_data_integrity_emergency() {
-    let input = MigrationRollbackClassifierInput {
-        stage: MigrationStage::Activate,
-        confirmed_canonical_data_loss: true,
-        ..Default::default()
-    };
+#[test]
+fn test_e2e_rollback_preserves_source_data() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let _records = populate_source(&source, 20).await;
 
-    let decision = classify_migration_rollback_trigger(&input);
-    assert!(decision.should_rollback);
-    assert_eq!(
-        decision.rollback_class,
-        Some(MigrationRollbackClass::DataIntegrityEmergency)
-    );
+        let health = source.health().await;
+        assert!(!health.degraded);
+        assert!(health.latest_offset.is_some());
+        assert_eq!(health.latest_offset.unwrap().ordinal, 19);
+    });
 }
 
-#[tokio::test]
-async fn test_e2e_full_pipeline_with_m3_and_m5() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 50).await;
+#[test]
+fn test_e2e_immediate_rollback_playbook() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
 
-    source
-        .commit_checkpoint(RecorderCheckpoint {
-            consumer: CheckpointConsumerId("indexer".to_string()),
-            upto_offset: RecorderOffset {
-                segment_id: 0,
-                byte_offset: 0,
-                ordinal: 25,
-            },
-            schema_version: "v1".to_string(),
-            committed_at_ms: 1000,
-        })
-        .await
-        .unwrap();
+        let context = MigrationRollbackPlaybookContext {
+            rollback_class: MigrationRollbackClass::Immediate,
+            from_stage: MigrationStage::Import,
+            pre_migration_checkpoints: BTreeMap::new(),
+            forensic_capture: None,
+            forensics_output_dir: dir.path().to_path_buf(),
+        };
 
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig::default());
+        let mut state = MigrationRollbackExecutionState::default();
+        let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
 
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-    assert_eq!(manifest.export_count, 50);
-
-    let sync = engine
-        .m3_checkpoint_sync(&source, &target, &manifest)
-        .await
-        .unwrap();
-    assert_eq!(sync.checkpoints_migrated, 1);
-
-    let cutover = engine
-        .m5_cutover(
-            &target,
-            &manifest,
-            1708000000,
-            source
-                .append_log_data_path()
-                .map(|p| p.to_string_lossy().to_string()),
-        )
-        .await
-        .unwrap();
-    assert!(cutover.target_healthy);
-    assert_eq!(
-        cutover.activated_backend,
-        RecorderBackendKind::FrankenSqlite
-    );
+        assert_eq!(report.tier, MigrationRollbackClass::Immediate);
+        assert!(!report.migration_active);
+        assert_eq!(report.backend_selector, RecorderBackendKind::AppendLog);
+        assert!(report.target_cleared);
+    });
 }
 
-#[tokio::test]
-async fn test_e2e_source_health_still_good_after_export() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 30).await;
+#[test]
+fn test_e2e_postcutover_rollback_playbook() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
 
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig::default());
+        let context = MigrationRollbackPlaybookContext {
+            rollback_class: MigrationRollbackClass::PostCutover,
+            from_stage: MigrationStage::Activate,
+            pre_migration_checkpoints: BTreeMap::new(),
+            forensic_capture: None,
+            forensics_output_dir: dir.path().to_path_buf(),
+        };
 
-    let _manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+        let mut state = MigrationRollbackExecutionState::default();
+        let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
 
-    let health = source.health().await;
-    assert!(!health.degraded);
+        assert_eq!(report.tier, MigrationRollbackClass::PostCutover);
+        assert_eq!(report.backend_selector, RecorderBackendKind::AppendLog);
+        assert!(report.projection_rebuild_triggered);
+    });
 }
 
-#[tokio::test]
-async fn test_e2e_manifest_digest_matches_re_export() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 25).await;
+#[test]
+fn test_e2e_target_write_failure_at_m2() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 10).await;
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        target.fail_append.store(true, Ordering::Relaxed);
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let reader = MemoryReader {
-        records: records.clone(),
-    };
-    let engine = MigrationEngine::new(MigrationConfig::default());
+        let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
+        let exported = engine.m1_export(&reader, &mut manifest).unwrap();
 
-    let mut m1 = MigrationManifest::default();
-    engine.m1_export(&reader, &mut m1).unwrap();
+        let result = engine.m2_import(&target, &exported, &mut manifest).await;
+        assert!(result.is_err());
+    });
+}
 
-    let reader2 = MemoryReader { records };
-    let mut m2 = MigrationManifest::default();
-    engine.m1_export(&reader2, &mut m2).unwrap();
+#[test]
+fn test_e2e_m5_degraded_target_reports_unhealthy() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 5).await;
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    assert_eq!(m1.export_digest, m2.export_digest);
-    assert_eq!(m1.export_count, m2.export_count);
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+
+        target.degraded_post_cutover.store(true, Ordering::Relaxed);
+
+        let cutover = engine
+            .m5_cutover(&target, &manifest, 1000, None)
+            .await
+            .unwrap();
+
+        assert!(!cutover.target_healthy);
+    });
+}
+
+#[test]
+fn test_e2e_checkpoint_monotonicity_across_cutover() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 20).await;
+
+        let consumer = CheckpointConsumerId("e2e-consumer".to_string());
+        source
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: consumer.clone(),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 10,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 1000,
+            })
+            .await
+            .unwrap();
+
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+
+        let sync_result = engine
+            .m3_checkpoint_sync(&source, &target, &manifest)
+            .await
+            .unwrap();
+
+        assert_eq!(sync_result.consumers_found, 1);
+        assert_eq!(sync_result.checkpoints_migrated, 1);
+
+        let target_cp = target.read_checkpoint(&consumer).await.unwrap().unwrap();
+        assert_eq!(target_cp.upto_offset.ordinal, 10);
+    });
+}
+
+#[test]
+fn test_e2e_manifest_captures_per_pane_distribution() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 30).await;
+
+        let reader = MemoryReader { records };
+        let engine = MigrationEngine::new(MigrationConfig::default());
+        let manifest = engine.m0_preflight(&source, &reader).await.unwrap();
+
+        assert_eq!(manifest.per_pane_counts.len(), 3);
+        assert_eq!(manifest.per_pane_counts.get(&1), Some(&10));
+        assert_eq!(manifest.per_pane_counts.get(&2), Some(&10));
+        assert_eq!(manifest.per_pane_counts.get(&3), Some(&10));
+    });
+}
+
+#[test]
+fn test_e2e_empty_source_migration() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 0).await;
+
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+
+        assert_eq!(manifest.event_count, 0);
+        assert_eq!(manifest.export_count, 0);
+        assert_eq!(manifest.import_count, 0);
+        assert_eq!(target.total_events(), 0);
+    });
+}
+
+#[test]
+fn test_e2e_large_dataset_200_events() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 200).await;
+
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig {
+            export_batch_size: 50,
+            import_batch_size: 75,
+            ..Default::default()
+        });
+
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+
+        assert_eq!(manifest.event_count, 200);
+        assert_eq!(manifest.export_count, 200);
+        assert_eq!(manifest.import_count, 200);
+        assert_eq!(manifest.import_digest, manifest.export_digest);
+        assert_eq!(target.total_events(), 200);
+    });
+}
+
+#[test]
+fn test_e2e_no_rollback_when_all_healthy() {
+    run_async_test(async {
+        let input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::Activate,
+            ..Default::default()
+        };
+
+        let decision = classify_migration_rollback_trigger(&input);
+        assert!(!decision.should_rollback);
+        assert!(decision.rollback_class.is_none());
+    });
+}
+
+#[test]
+fn test_e2e_cardinality_mismatch_is_immediate() {
+    run_async_test(async {
+        let input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::Import,
+            event_cardinality_mismatch: true,
+            ..Default::default()
+        };
+
+        let decision = classify_migration_rollback_trigger(&input);
+        assert!(decision.should_rollback);
+        assert_eq!(
+            decision.rollback_class,
+            Some(MigrationRollbackClass::Immediate)
+        );
+    });
+}
+
+#[test]
+fn test_e2e_checkpoint_regression_is_immediate() {
+    run_async_test(async {
+        let input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::CheckpointSync,
+            checkpoint_regression: true,
+            ..Default::default()
+        };
+
+        let decision = classify_migration_rollback_trigger(&input);
+        assert!(decision.should_rollback);
+        assert_eq!(
+            decision.rollback_class,
+            Some(MigrationRollbackClass::Immediate)
+        );
+    });
+}
+
+#[test]
+fn test_e2e_data_loss_is_data_integrity_emergency() {
+    run_async_test(async {
+        let input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::Activate,
+            confirmed_canonical_data_loss: true,
+            ..Default::default()
+        };
+
+        let decision = classify_migration_rollback_trigger(&input);
+        assert!(decision.should_rollback);
+        assert_eq!(
+            decision.rollback_class,
+            Some(MigrationRollbackClass::DataIntegrityEmergency)
+        );
+    });
+}
+
+#[test]
+fn test_e2e_full_pipeline_with_m3_and_m5() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 50).await;
+
+        source
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: CheckpointConsumerId("indexer".to_string()),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 25,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 1000,
+            })
+            .await
+            .unwrap();
+
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+        assert_eq!(manifest.export_count, 50);
+
+        let sync = engine
+            .m3_checkpoint_sync(&source, &target, &manifest)
+            .await
+            .unwrap();
+        assert_eq!(sync.checkpoints_migrated, 1);
+
+        let cutover = engine
+            .m5_cutover(
+                &target,
+                &manifest,
+                1708000000,
+                source
+                    .append_log_data_path()
+                    .map(|p| p.to_string_lossy().to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(cutover.target_healthy);
+        assert_eq!(
+            cutover.activated_backend,
+            RecorderBackendKind::FrankenSqlite
+        );
+    });
+}
+
+#[test]
+fn test_e2e_source_health_still_good_after_export() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 30).await;
+
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let _manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+
+        let health = source.health().await;
+        assert!(!health.degraded);
+    });
+}
+
+#[test]
+fn test_e2e_manifest_digest_matches_re_export() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 25).await;
+
+        let reader = MemoryReader {
+            records: records.clone(),
+        };
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let mut m1 = MigrationManifest::default();
+        engine.m1_export(&reader, &mut m1).unwrap();
+
+        let reader2 = MemoryReader { records };
+        let mut m2 = MigrationManifest::default();
+        engine.m1_export(&reader2, &mut m2).unwrap();
+
+        assert_eq!(m1.export_digest, m2.export_digest);
+        assert_eq!(m1.export_count, m2.export_count);
+    });
 }
 
 #[test]
@@ -763,149 +816,163 @@ fn test_e2e_rollback_class_as_str() {
     );
 }
 
-#[tokio::test]
-async fn test_e2e_single_event_migration() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 1).await;
+#[test]
+fn test_e2e_single_event_migration() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 1).await;
 
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig::default());
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
-    assert_eq!(manifest.event_count, 1);
-    assert_eq!(manifest.first_ordinal, 0);
-    assert_eq!(manifest.last_ordinal, 0);
-    assert_eq!(target.total_events(), 1);
+        assert_eq!(manifest.event_count, 1);
+        assert_eq!(manifest.first_ordinal, 0);
+        assert_eq!(manifest.last_ordinal, 0);
+        assert_eq!(target.total_events(), 1);
+    });
 }
 
-#[tokio::test]
-async fn test_e2e_suspected_corruption_triggers_emergency() {
-    let input = MigrationRollbackClassifierInput {
-        stage: MigrationStage::Import,
-        suspected_canonical_corruption: true,
-        ..Default::default()
-    };
-
-    let decision = classify_migration_rollback_trigger(&input);
-    assert!(decision.should_rollback);
-    assert_eq!(
-        decision.rollback_class,
-        Some(MigrationRollbackClass::DataIntegrityEmergency)
-    );
-}
-
-#[tokio::test]
-async fn test_e2e_repeated_write_failures_trigger_postcutover() {
-    let input = MigrationRollbackClassifierInput {
-        stage: MigrationStage::Soak,
-        high_severity_write_failures: 5,
-        config: MigrationRollbackClassifierConfig {
-            repeated_write_failure_threshold: 3,
+#[test]
+fn test_e2e_suspected_corruption_triggers_emergency() {
+    run_async_test(async {
+        let input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::Import,
+            suspected_canonical_corruption: true,
             ..Default::default()
-        },
-        ..Default::default()
-    };
+        };
 
-    let decision = classify_migration_rollback_trigger(&input);
-    assert!(decision.should_rollback);
-}
-
-#[tokio::test]
-async fn test_e2e_export_batch_size_respected() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 40).await;
-    let reader = MemoryReader { records };
-    let engine = MigrationEngine::new(MigrationConfig {
-        export_batch_size: 10,
-        ..Default::default()
+        let decision = classify_migration_rollback_trigger(&input);
+        assert!(decision.should_rollback);
+        assert_eq!(
+            decision.rollback_class,
+            Some(MigrationRollbackClass::DataIntegrityEmergency)
+        );
     });
-
-    let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
-    let exported = engine.m1_export(&reader, &mut manifest).unwrap();
-    assert_eq!(exported.len(), 40);
-    assert_eq!(manifest.export_count, 40);
 }
 
-#[tokio::test]
-async fn test_e2e_import_batch_size_splits_correctly() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 15).await;
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig {
-        import_batch_size: 5,
-        ..Default::default()
+#[test]
+fn test_e2e_repeated_write_failures_trigger_postcutover() {
+    run_async_test(async {
+        let input = MigrationRollbackClassifierInput {
+            stage: MigrationStage::Soak,
+            high_severity_write_failures: 5,
+            config: MigrationRollbackClassifierConfig {
+                repeated_write_failure_threshold: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let decision = classify_migration_rollback_trigger(&input);
+        assert!(decision.should_rollback);
     });
-
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-
-    assert_eq!(manifest.import_count, 15);
-    // With batch size 5, 15 events → 3 batches
-    assert!(target.appended.lock().unwrap().len() >= 3);
 }
 
-#[tokio::test]
-async fn test_e2e_manifest_serde_roundtrip() {
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let records = populate_source(&source, 10).await;
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_e2e_export_batch_size_respected() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 40).await;
+        let reader = MemoryReader { records };
+        let engine = MigrationEngine::new(MigrationConfig {
+            export_batch_size: 10,
+            ..Default::default()
+        });
 
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-
-    let json = serde_json::to_string(&manifest).unwrap();
-    let roundtripped: MigrationManifest = serde_json::from_str(&json).unwrap();
-
-    assert_eq!(roundtripped.event_count, manifest.event_count);
-    assert_eq!(roundtripped.export_digest, manifest.export_digest);
-    assert_eq!(roundtripped.import_digest, manifest.import_digest);
-    assert_eq!(roundtripped.per_pane_counts, manifest.per_pane_counts);
+        let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
+        let exported = engine.m1_export(&reader, &mut manifest).unwrap();
+        assert_eq!(exported.len(), 40);
+        assert_eq!(manifest.export_count, 40);
+    });
 }
 
-#[tokio::test]
-async fn test_e2e_data_integrity_freeze_blocks_writes() {
-    let dir = tempdir().unwrap();
-    let forensic_capture = MigrationForensicCaptureContext {
-        source_state: MigrationForensicBackendState {
-            health: true,
-            head_offset: None,
-            last_checkpoint: None,
-        },
-        target_state: MigrationForensicBackendState {
-            health: false,
-            head_offset: None,
-            last_checkpoint: None,
-        },
-        migration_checkpoint: MigrationForensicMigrationCheckpoint {
-            last_completed_stage: MigrationStage::Import,
-            manifest: "{}".to_string(),
-        },
-        corruption_detail: MigrationForensicCorruptionDetail {
-            location: "target-import".to_string(),
-            affected_ordinals: vec![0, 1, 2],
-            detail: "e2e test corruption".to_string(),
-        },
-    };
+#[test]
+fn test_e2e_import_batch_size_splits_correctly() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 15).await;
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig {
+            import_batch_size: 5,
+            ..Default::default()
+        });
 
-    let context = MigrationRollbackPlaybookContext {
-        rollback_class: MigrationRollbackClass::DataIntegrityEmergency,
-        from_stage: MigrationStage::Import,
-        pre_migration_checkpoints: BTreeMap::new(),
-        forensic_capture: Some(forensic_capture),
-        forensics_output_dir: dir.path().to_path_buf(),
-    };
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
 
-    let mut state = MigrationRollbackExecutionState::default();
-    let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
+        assert_eq!(manifest.import_count, 15);
+        // With batch size 5, 15 events → 3 batches
+        assert!(target.appended.lock().unwrap().len() >= 3);
+    });
+}
 
-    assert_eq!(report.tier, MigrationRollbackClass::DataIntegrityEmergency);
-    assert!(state.recorder_writes_blocked());
-    assert!(!report.migration_active);
+#[test]
+fn test_e2e_manifest_serde_roundtrip() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let records = populate_source(&source, 10).await;
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        let roundtripped: MigrationManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(roundtripped.event_count, manifest.event_count);
+        assert_eq!(roundtripped.export_digest, manifest.export_digest);
+        assert_eq!(roundtripped.import_digest, manifest.import_digest);
+        assert_eq!(roundtripped.per_pane_counts, manifest.per_pane_counts);
+    });
+}
+
+#[test]
+fn test_e2e_data_integrity_freeze_blocks_writes() {
+    run_async_test(async {
+        let dir = tempdir().unwrap();
+        let forensic_capture = MigrationForensicCaptureContext {
+            source_state: MigrationForensicBackendState {
+                health: true,
+                head_offset: None,
+                last_checkpoint: None,
+            },
+            target_state: MigrationForensicBackendState {
+                health: false,
+                head_offset: None,
+                last_checkpoint: None,
+            },
+            migration_checkpoint: MigrationForensicMigrationCheckpoint {
+                last_completed_stage: MigrationStage::Import,
+                manifest: "{}".to_string(),
+            },
+            corruption_detail: MigrationForensicCorruptionDetail {
+                location: "target-import".to_string(),
+                affected_ordinals: vec![0, 1, 2],
+                detail: "e2e test corruption".to_string(),
+            },
+        };
+
+        let context = MigrationRollbackPlaybookContext {
+            rollback_class: MigrationRollbackClass::DataIntegrityEmergency,
+            from_stage: MigrationStage::Import,
+            pre_migration_checkpoints: BTreeMap::new(),
+            forensic_capture: Some(forensic_capture),
+            forensics_output_dir: dir.path().to_path_buf(),
+        };
+
+        let mut state = MigrationRollbackExecutionState::default();
+        let report = execute_migration_rollback_playbook(&mut state, &context).unwrap();
+
+        assert_eq!(report.tier, MigrationRollbackClass::DataIntegrityEmergency);
+        assert!(state.recorder_writes_blocked());
+        assert!(!report.migration_active);
+    });
 }

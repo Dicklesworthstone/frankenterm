@@ -34,6 +34,22 @@ use frankenterm_core::storage_telemetry::{
 };
 
 // =============================================================================
+// Async test helper
+// =============================================================================
+
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use frankenterm_core::runtime_compat::CompatRuntime;
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
+// =============================================================================
 // Test helpers
 // =============================================================================
 
@@ -149,86 +165,92 @@ fn workflow_actor() -> ActorIdentity {
 // =============================================================================
 
 /// Append events and verify telemetry records the operation.
-#[tokio::test]
-async fn storage_append_records_telemetry_metrics() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(storage_config(dir.path())).unwrap();
-    let telemetry = Arc::new(StorageTelemetry::with_defaults());
+#[test]
+fn storage_append_records_telemetry_metrics() {
+    run_async_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(storage_config(dir.path())).unwrap();
+        let telemetry = Arc::new(StorageTelemetry::with_defaults());
 
-    let events: Vec<RecorderEvent> = (0..5)
-        .map(|i| sample_event(&format!("evt-{}", i), 1, i, "hello"))
-        .collect();
+        let events: Vec<RecorderEvent> = (0..5)
+            .map(|i| sample_event(&format!("evt-{}", i), 1, i, "hello"))
+            .collect();
 
-    let req = AppendRequest {
-        batch_id: "batch-1".to_string(),
-        events,
-        required_durability: DurabilityLevel::Appended,
-        producer_ts_ms: 1_700_000_000_000,
-    };
+        let req = AppendRequest {
+            batch_id: "batch-1".to_string(),
+            events,
+            required_durability: DurabilityLevel::Appended,
+            producer_ts_ms: 1_700_000_000_000,
+        };
 
-    let start = Instant::now();
-    let result = storage.append_batch(req).await;
-    let elapsed_us = start.elapsed().as_micros() as f64;
+        let start = Instant::now();
+        let result = storage.append_batch(req).await;
+        let elapsed_us = start.elapsed().as_micros() as f64;
 
-    assert!(result.is_ok());
-    let resp = result.unwrap();
+        assert!(result.is_ok());
+        let resp = result.unwrap();
 
-    // Record in telemetry.
-    telemetry.record_append(elapsed_us, resp.accepted_count, 500, false);
+        // Record in telemetry.
+        telemetry.record_append(elapsed_us, resp.accepted_count, 500, false);
 
-    let snapshot = telemetry.snapshot();
-    assert_eq!(snapshot.total_events_appended, 5);
-    assert_eq!(snapshot.total_batches, 1);
-    assert!(snapshot.append_rate_ewma > 0.0);
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.total_events_appended, 5);
+        assert_eq!(snapshot.total_batches, 1);
+        assert!(snapshot.append_rate_ewma > 0.0);
+    });
 }
 
 /// Flush and verify telemetry snapshot captures flush stats.
-#[tokio::test]
-async fn storage_flush_updates_telemetry() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(storage_config(dir.path())).unwrap();
-    let telemetry = Arc::new(StorageTelemetry::with_defaults());
+#[test]
+fn storage_flush_updates_telemetry() {
+    run_async_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(storage_config(dir.path())).unwrap();
+        let telemetry = Arc::new(StorageTelemetry::with_defaults());
 
-    // Append first.
-    let events = vec![sample_event("evt-0", 1, 0, "data")];
-    let req = AppendRequest {
-        batch_id: "batch-flush".to_string(),
-        events,
-        required_durability: DurabilityLevel::Appended,
-        producer_ts_ms: 1_700_000_000_000,
-    };
-    let start = Instant::now();
-    let resp = storage.append_batch(req).await.unwrap();
-    telemetry.record_append(
-        start.elapsed().as_micros() as f64,
-        resp.accepted_count,
-        100,
-        false,
-    );
+        // Append first.
+        let events = vec![sample_event("evt-0", 1, 0, "data")];
+        let req = AppendRequest {
+            batch_id: "batch-flush".to_string(),
+            events,
+            required_durability: DurabilityLevel::Appended,
+            producer_ts_ms: 1_700_000_000_000,
+        };
+        let start = Instant::now();
+        let resp = storage.append_batch(req).await.unwrap();
+        telemetry.record_append(
+            start.elapsed().as_micros() as f64,
+            resp.accepted_count,
+            100,
+            false,
+        );
 
-    // Flush.
-    let flush_start = Instant::now();
-    let flush_result = storage.flush(FlushMode::Buffered).await;
-    assert!(flush_result.is_ok());
-    telemetry.record_flush(flush_start.elapsed().as_micros() as f64);
+        // Flush.
+        let flush_start = Instant::now();
+        let flush_result = storage.flush(FlushMode::Buffered).await;
+        assert!(flush_result.is_ok());
+        telemetry.record_flush(flush_start.elapsed().as_micros() as f64);
 
-    let snapshot = telemetry.snapshot();
-    assert_eq!(snapshot.total_flushes, 1);
-    assert_eq!(snapshot.total_batches, 1);
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.total_flushes, 1);
+        assert_eq!(snapshot.total_batches, 1);
+    });
 }
 
 /// Health status propagates to telemetry tier classification.
-#[tokio::test]
-async fn storage_health_propagates_to_telemetry_tier() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(storage_config(dir.path())).unwrap();
-    let telemetry = Arc::new(StorageTelemetry::with_defaults());
+#[test]
+fn storage_health_propagates_to_telemetry_tier() {
+    run_async_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(storage_config(dir.path())).unwrap();
+        let telemetry = Arc::new(StorageTelemetry::with_defaults());
 
-    let health = storage.health().await;
-    telemetry.update_health(health);
+        let health = storage.health().await;
+        telemetry.update_health(health);
 
-    // Fresh storage should be healthy (Green).
-    assert_eq!(telemetry.current_tier(), StorageHealthTier::Green);
+        // Fresh storage should be healthy (Green).
+        assert_eq!(telemetry.current_tier(), StorageHealthTier::Green);
+    });
 }
 
 /// Error recording tracks class distribution.
@@ -643,79 +665,81 @@ fn remediation_covers_all_error_classes() {
 // =============================================================================
 
 /// Full pipeline: append events, record telemetry, manage retention, audit everything.
-#[tokio::test]
-async fn full_pipeline_append_telemetry_retention_audit() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(storage_config(dir.path())).unwrap();
-    let telemetry = Arc::new(StorageTelemetry::with_defaults());
-    let audit_log = AuditLog::new(AuditLogConfig::default());
-    let mut retention_mgr = RetentionManager::with_defaults();
+#[test]
+fn full_pipeline_append_telemetry_retention_audit() {
+    run_async_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(storage_config(dir.path())).unwrap();
+        let telemetry = Arc::new(StorageTelemetry::with_defaults());
+        let audit_log = AuditLog::new(AuditLogConfig::default());
+        let mut retention_mgr = RetentionManager::with_defaults();
 
-    let base_ms = 1_700_000_000_000u64;
+        let base_ms = 1_700_000_000_000u64;
 
-    // Step 1: Append events to storage.
-    let events: Vec<RecorderEvent> = (0..10)
-        .map(|i| sample_event(&format!("pipe-{}", i), 1, i, &format!("data-{}", i)))
-        .collect();
+        // Step 1: Append events to storage.
+        let events: Vec<RecorderEvent> = (0..10)
+            .map(|i| sample_event(&format!("pipe-{}", i), 1, i, &format!("data-{}", i)))
+            .collect();
 
-    let req = AppendRequest {
-        batch_id: "pipeline-batch-1".to_string(),
-        events,
-        required_durability: DurabilityLevel::Appended,
-        producer_ts_ms: base_ms,
-    };
+        let req = AppendRequest {
+            batch_id: "pipeline-batch-1".to_string(),
+            events,
+            required_durability: DurabilityLevel::Appended,
+            producer_ts_ms: base_ms,
+        };
 
-    let start = Instant::now();
-    let resp = storage.append_batch(req).await.unwrap();
-    let elapsed_us = start.elapsed().as_micros() as f64;
+        let start = Instant::now();
+        let resp = storage.append_batch(req).await.unwrap();
+        let elapsed_us = start.elapsed().as_micros() as f64;
 
-    // Step 2: Record in telemetry.
-    telemetry.record_append(elapsed_us, resp.accepted_count, 5000, false);
+        // Step 2: Record in telemetry.
+        telemetry.record_append(elapsed_us, resp.accepted_count, 5000, false);
 
-    // Step 3: Create retention segment from appended data.
-    let seg = make_segment(
-        "seg_pipeline_001",
-        SensitivityTier::T1Standard,
-        SegmentPhase::Active,
-        base_ms,
-        5000,
-        10,
-        resp.first_offset.ordinal,
-    );
-    retention_mgr.add_segment(seg);
+        // Step 3: Create retention segment from appended data.
+        let seg = make_segment(
+            "seg_pipeline_001",
+            SensitivityTier::T1Standard,
+            SegmentPhase::Active,
+            base_ms,
+            5000,
+            10,
+            resp.first_offset.ordinal,
+        );
+        retention_mgr.add_segment(seg);
 
-    // Step 4: Audit the query.
-    let decision = check_authorization(ActorKind::Human, AccessTier::A2FullQuery);
-    audit_log.append(
-        AuditEventBuilder::new(AuditEventType::RecorderQuery, human_actor(), base_ms)
-            .with_decision(decision)
-            .with_pane_ids(vec![1])
-            .with_result_count(10),
-    );
+        // Step 4: Audit the query.
+        let decision = check_authorization(ActorKind::Human, AccessTier::A2FullQuery);
+        audit_log.append(
+            AuditEventBuilder::new(AuditEventType::RecorderQuery, human_actor(), base_ms)
+                .with_decision(decision)
+                .with_pane_ids(vec![1])
+                .with_result_count(10),
+        );
 
-    // Step 5: Flush storage.
-    let flush_start = Instant::now();
-    storage.flush(FlushMode::Buffered).await.unwrap();
-    telemetry.record_flush(flush_start.elapsed().as_micros() as f64);
+        // Step 5: Flush storage.
+        let flush_start = Instant::now();
+        storage.flush(FlushMode::Buffered).await.unwrap();
+        telemetry.record_flush(flush_start.elapsed().as_micros() as f64);
 
-    // Step 6: Verify telemetry snapshot.
-    let health = storage.health().await;
-    telemetry.update_health(health);
-    let snapshot = telemetry.snapshot();
+        // Step 6: Verify telemetry snapshot.
+        let health = storage.health().await;
+        telemetry.update_health(health);
+        let snapshot = telemetry.snapshot();
 
-    assert_eq!(snapshot.total_events_appended, 10);
-    assert_eq!(snapshot.total_batches, 1);
-    assert_eq!(snapshot.total_flushes, 1);
-    assert_eq!(snapshot.health_tier, StorageHealthTier::Green);
+        assert_eq!(snapshot.total_events_appended, 10);
+        assert_eq!(snapshot.total_batches, 1);
+        assert_eq!(snapshot.total_flushes, 1);
+        assert_eq!(snapshot.health_tier, StorageHealthTier::Green);
 
-    // Step 7: Retention stats.
-    let ret_stats = retention_mgr.stats();
-    assert_eq!(ret_stats.active_count, 1);
-    assert_eq!(retention_mgr.total_events(), 10);
+        // Step 7: Retention stats.
+        let ret_stats = retention_mgr.stats();
+        assert_eq!(ret_stats.active_count, 1);
+        assert_eq!(retention_mgr.total_events(), 10);
 
-    // Step 8: Audit chain is intact.
-    let verification = AuditLog::verify_chain(&audit_log.entries(), GENESIS_HASH);
-    assert!(verification.chain_intact);
+        // Step 8: Audit chain is intact.
+        let verification = AuditLog::verify_chain(&audit_log.entries(), GENESIS_HASH);
+        assert!(verification.chain_intact);
+    });
 }
 
 // =============================================================================

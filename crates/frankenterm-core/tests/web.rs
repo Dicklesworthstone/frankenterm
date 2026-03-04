@@ -15,6 +15,18 @@ mod web_tests {
 
     use frankenterm_core::web::{WebServerConfig, start_web_server};
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use frankenterm_core::runtime_compat::CompatRuntime;
+        let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime");
+        runtime.block_on(future);
+    }
+
     /// Extract the HTTP response body from a raw HTTP response string.
     fn extract_body(raw: &str) -> &str {
         raw.split("\r\n\r\n").nth(1).unwrap_or("")
@@ -149,22 +161,23 @@ mod web_tests {
         Ok((storage, tempdir))
     }
 
-    #[tokio::test]
-    async fn web_health_ephemeral_port() -> Result<(), Box<dyn std::error::Error>> {
-        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
-        let addr = server.bound_addr();
+    #[test]
+    fn web_health_ephemeral_port() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let addr = server.bound_addr();
 
-        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+            assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
 
-        let response = fetch_health(addr).await;
-        let shutdown = server.shutdown().await;
+            let response = fetch_health(addr).await;
+            let shutdown = server.shutdown().await;
 
-        let response = response?;
-        shutdown?;
+            let response = response.unwrap();
+            shutdown.unwrap();
 
-        assert!(response.contains("200"));
-        assert!(response.contains("\"ok\":true"));
-        Ok(())
+            assert!(response.contains("200"));
+            assert!(response.contains("\"ok\":true"));
+        });
     }
 
     // =========================================================================
@@ -182,343 +195,355 @@ mod web_tests {
         );
     }
 
-    #[tokio::test]
-    async fn public_bind_rejected_without_opt_in() {
-        let config = WebServerConfig::new(0).with_host("0.0.0.0");
-        let result = start_web_server(config).await;
-        assert!(result.is_err(), "public bind should be rejected by default");
-        let err_msg = result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("refusing to bind") || err_msg.contains("dangerous"),
-            "error should mention public bind safety: {err_msg}"
-        );
+    #[test]
+    fn public_bind_rejected_without_opt_in() {
+        run_async_test(async {
+            let config = WebServerConfig::new(0).with_host("0.0.0.0");
+            let result = start_web_server(config).await;
+            assert!(result.is_err(), "public bind should be rejected by default");
+            let err_msg = result.err().unwrap().to_string();
+            assert!(
+                err_msg.contains("refusing to bind") || err_msg.contains("dangerous"),
+                "error should mention public bind safety: {err_msg}"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn public_bind_allowed_with_explicit_opt_in() {
-        // We use port 0 so this doesn't actually need a specific interface
-        let config = WebServerConfig::new(0)
-            .with_host("0.0.0.0")
-            .with_dangerous_public_bind();
-        let result = start_web_server(config).await;
-        assert!(result.is_ok(), "public bind should succeed with opt-in");
-        if let Ok(server) = result {
-            let _ = server.shutdown().await;
-        }
+    #[test]
+    fn public_bind_allowed_with_explicit_opt_in() {
+        run_async_test(async {
+            // We use port 0 so this doesn't actually need a specific interface
+            let config = WebServerConfig::new(0)
+                .with_host("0.0.0.0")
+                .with_dangerous_public_bind();
+            let result = start_web_server(config).await;
+            assert!(result.is_ok(), "public bind should succeed with opt-in");
+            if let Ok(server) = result {
+                let _ = server.shutdown().await;
+            }
+        });
     }
 
-    #[tokio::test]
-    async fn panes_returns_503_without_storage() -> Result<(), Box<dyn std::error::Error>> {
-        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
-        let addr = server.bound_addr();
+    #[test]
+    fn panes_returns_503_without_storage() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let addr = server.bound_addr();
 
-        let req = b"GET /panes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        let response = fetch_raw(addr, req).await;
-        let shutdown = server.shutdown().await;
+            let req = b"GET /panes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let response = fetch_raw(addr, req).await;
+            let shutdown = server.shutdown().await;
 
-        let response = response?;
-        shutdown?;
+            let response = response.unwrap();
+            shutdown.unwrap();
 
-        assert!(
-            response.contains("503"),
-            "should return 503 without storage: {response}"
-        );
-        assert!(
-            response.contains("no_storage"),
-            "should include error code: {response}"
-        );
-        Ok(())
+            assert!(
+                response.contains("503"),
+                "should return 503 without storage: {response}"
+            );
+            assert!(
+                response.contains("no_storage"),
+                "should include error code: {response}"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn search_requires_query_param() -> Result<(), Box<dyn std::error::Error>> {
-        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
-        let addr = server.bound_addr();
+    #[test]
+    fn search_requires_query_param() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let addr = server.bound_addr();
 
-        // Request /search without ?q= parameter
-        let req = b"GET /search HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        let response = fetch_raw(addr, req).await;
-        let shutdown = server.shutdown().await;
+            // Request /search without ?q= parameter
+            let req = b"GET /search HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let response = fetch_raw(addr, req).await;
+            let shutdown = server.shutdown().await;
 
-        let response = response?;
-        shutdown?;
+            let response = response.unwrap();
+            shutdown.unwrap();
 
-        // Without storage, 503 takes precedence over the missing-query 400.
-        assert!(
-            response.contains("503") || response.contains("400"),
-            "should reject missing q: {response}"
-        );
-        Ok(())
+            // Without storage, 503 takes precedence over the missing-query 400.
+            assert!(
+                response.contains("503") || response.contains("400"),
+                "should reject missing q: {response}"
+            );
+        });
     }
 
     // =========================================================================
     // Schema / contract tests (wa-nu4.3.6.4)
     // =========================================================================
 
-    #[tokio::test]
-    async fn health_schema_parseable() -> Result<(), Box<dyn std::error::Error>> {
-        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
-        let addr = server.bound_addr();
+    #[test]
+    fn health_schema_parseable() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let addr = server.bound_addr();
 
-        let response = fetch_health(addr).await;
-        let shutdown = server.shutdown().await;
-        let response = response?;
-        shutdown?;
+            let response = fetch_health(addr).await;
+            let shutdown = server.shutdown().await;
+            let response = response.unwrap();
+            shutdown.unwrap();
 
-        let body = extract_body(&response);
-        let json: serde_json::Value = serde_json::from_str(body)
-            .unwrap_or_else(|e| panic!("health response not valid JSON: {e}\nbody: {body}"));
+            let body = extract_body(&response);
+            let json: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("health response not valid JSON: {e}\nbody: {body}"));
 
-        assert_eq!(json["ok"], true, "health.ok should be true");
-        assert!(
-            json["version"].is_string(),
-            "health.version should be a string"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn events_returns_503_without_storage() -> Result<(), Box<dyn std::error::Error>> {
-        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
-        let addr = server.bound_addr();
-
-        let req = b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        let response = fetch_raw(addr, req).await;
-        let shutdown = server.shutdown().await;
-        let response = response?;
-        shutdown?;
-
-        assert_eq!(extract_status(&response), 503);
-
-        // Response body should be valid JSON with the error envelope
-        let body = extract_body(&response);
-        let json: serde_json::Value = serde_json::from_str(body)
-            .unwrap_or_else(|e| panic!("events 503 not valid JSON: {e}\nbody: {body}"));
-        assert_eq!(json["ok"], false, "error response ok should be false");
-        assert!(json["error_code"].is_string(), "should include error_code");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn panes_503_has_json_envelope() -> Result<(), Box<dyn std::error::Error>> {
-        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
-        let addr = server.bound_addr();
-
-        let req = b"GET /panes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        let response = fetch_raw(addr, req).await;
-        let shutdown = server.shutdown().await;
-        let response = response?;
-        shutdown?;
-
-        let body = extract_body(&response);
-        let json: serde_json::Value = serde_json::from_str(body)
-            .unwrap_or_else(|e| panic!("panes 503 not valid JSON: {e}\nbody: {body}"));
-        assert_eq!(json["ok"], false);
-        assert_eq!(json["error_code"], "no_storage");
-        assert!(
-            json["version"].is_string(),
-            "envelope should include version"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn unknown_route_returns_404() -> Result<(), Box<dyn std::error::Error>> {
-        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
-        let addr = server.bound_addr();
-
-        let req = b"GET /not-a-route HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        let response = fetch_raw(addr, req).await;
-        let shutdown = server.shutdown().await;
-        let response = response?;
-        shutdown?;
-
-        assert_eq!(
-            extract_status(&response),
-            404,
-            "unknown route should 404: {response}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn post_method_not_allowed() -> Result<(), Box<dyn std::error::Error>> {
-        let server = start_web_server(WebServerConfig::default().with_port(0)).await?;
-        let addr = server.bound_addr();
-
-        let req = b"POST /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let response = fetch_raw(addr, req).await;
-        let shutdown = server.shutdown().await;
-        let response = response?;
-        shutdown?;
-
-        let status = extract_status(&response);
-        assert!(
-            status == 404 || status == 405,
-            "POST should be rejected (404 or 405), got {status}: {response}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stream_fetch_prefix_times_out_on_stalled_body()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-
-        let server_task = task::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let mut req_buf = [0_u8; 512];
-            let _ = timeout(Duration::from_millis(250), read(&mut stream, &mut req_buf)).await;
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
-                )
-                .await?;
-            sleep(Duration::from_secs(1)).await;
-            Ok::<(), std::io::Error>(())
+            assert_eq!(json["ok"], true, "health.ok should be true");
+            assert!(
+                json["version"].is_string(),
+                "health.version should be a string"
+            );
         });
-
-        let req = b"GET /stream/events?channel=detections&max_hz=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        let start = Instant::now();
-        let response = fetch_stream_prefix(addr, req, Duration::from_millis(120), 256).await?;
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < Duration::from_millis(700),
-            "fetch should return after read timeout, elapsed={elapsed:?}"
-        );
-        assert!(
-            response.contains("HTTP/1.1 200 OK"),
-            "expected partial HTTP response headers: {response}"
-        );
-
-        let _ = timeout(Duration::from_secs(2), server_task).await;
-
-        Ok(())
     }
 
-    #[tokio::test]
-    async fn stream_deltas_emits_schema_and_redacts_content()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (storage, _tmp) = create_test_storage_with_pane(7).await?;
-        let event_bus = Arc::new(EventBus::new(64));
-        let server = start_web_server(
-            WebServerConfig::default()
-                .with_port(0)
-                .with_storage(storage.clone())
-                .with_event_bus(Arc::clone(&event_bus)),
-        )
-        .await?;
-        let addr = server.bound_addr();
+    #[test]
+    fn events_returns_503_without_storage() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let addr = server.bound_addr();
 
-        let req = b"GET /stream/deltas?pane_id=7&max_hz=200 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        let fetch_task = task::spawn(async move {
-            fetch_stream_prefix(addr, req, Duration::from_secs(3), 512).await
+            let req = b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let response = fetch_raw(addr, req).await;
+            let shutdown = server.shutdown().await;
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            assert_eq!(extract_status(&response), 503);
+
+            // Response body should be valid JSON with the error envelope
+            let body = extract_body(&response);
+            let json: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("events 503 not valid JSON: {e}\nbody: {body}"));
+            assert_eq!(json["ok"], false, "error response ok should be false");
+            assert!(json["error_code"].is_string(), "should include error_code");
         });
-
-        sleep(Duration::from_millis(80)).await;
-        let secret = "auth token sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let seg = storage.append_segment(7, secret, None).await?;
-        let _ = event_bus.publish(Event::SegmentCaptured {
-            pane_id: 7,
-            seq: seg.seq,
-            content_len: seg.content_len,
-        });
-
-        let response = fetch_task.await??;
-        server.shutdown().await?;
-
-        assert!(
-            response.contains("text/event-stream"),
-            "SSE content-type header expected: {response}"
-        );
-
-        let delta_data = response
-            .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
-            .find(|line| line.contains("\"kind\":\"delta\""))
-            .ok_or("missing delta frame in SSE response")?;
-        let frame: serde_json::Value = serde_json::from_str(delta_data)?;
-
-        assert_eq!(frame["schema"], "ft.stream.v1");
-        assert_eq!(frame["stream"], "deltas");
-        assert_eq!(frame["kind"], "delta");
-        assert_eq!(frame["data"]["pane_id"], 7);
-
-        let redacted = frame["data"]["content"]
-            .as_str()
-            .ok_or("delta content should be a string")?;
-        assert!(redacted.contains("[REDACTED]"), "content must be redacted");
-        assert!(
-            !redacted.contains("sk-aaaaaaaa"),
-            "raw secret should not appear"
-        );
-        Ok(())
     }
 
-    #[tokio::test]
-    async fn stream_events_reports_lag_and_releases_subscriber()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let event_bus = Arc::new(EventBus::new(2));
-        let server = start_web_server(
-            WebServerConfig::default()
-                .with_port(0)
-                .with_event_bus(Arc::clone(&event_bus)),
-        )
-        .await?;
-        let addr = server.bound_addr();
+    #[test]
+    fn panes_503_has_json_envelope() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let addr = server.bound_addr();
 
-        let req = b"GET /stream/events?channel=detections&max_hz=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        let fetch_task = task::spawn(async move {
-            fetch_stream_prefix(addr, req, Duration::from_secs(4), 640).await
+            let req = b"GET /panes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let response = fetch_raw(addr, req).await;
+            let shutdown = server.shutdown().await;
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            let body = extract_body(&response);
+            let json: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("panes 503 not valid JSON: {e}\nbody: {body}"));
+            assert_eq!(json["ok"], false);
+            assert_eq!(json["error_code"], "no_storage");
+            assert!(
+                json["version"].is_string(),
+                "envelope should include version"
+            );
         });
+    }
 
-        sleep(Duration::from_millis(80)).await;
-        for i in 0..64_u64 {
-            let detection = Detection {
-                rule_id: format!("core.test:{i}"),
-                agent_type: AgentType::Codex,
-                event_type: "usage_reached".to_string(),
-                severity: Severity::Warning,
-                confidence: 1.0,
-                extracted: serde_json::json!({
-                    "token": "sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "index": i
-                }),
-                matched_text: format!(
-                    "usage reached with secret sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb #{i}"
-                ),
-                span: (0, 0),
-            };
-            let _ = event_bus.publish(Event::PatternDetected {
-                pane_id: 11,
-                pane_uuid: None,
-                detection,
-                event_id: None,
+    #[test]
+    fn unknown_route_returns_404() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"GET /not-a-route HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let response = fetch_raw(addr, req).await;
+            let shutdown = server.shutdown().await;
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            assert_eq!(
+                extract_status(&response),
+                404,
+                "unknown route should 404: {response}"
+            );
+        });
+    }
+
+    #[test]
+    fn post_method_not_allowed() {
+        run_async_test(async {
+            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"POST /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let response = fetch_raw(addr, req).await;
+            let shutdown = server.shutdown().await;
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            let status = extract_status(&response);
+            assert!(
+                status == 404 || status == 405,
+                "POST should be rejected (404 or 405), got {status}: {response}"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_fetch_prefix_times_out_on_stalled_body() {
+        run_async_test(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server_task = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                let mut req_buf = [0_u8; 512];
+                let _ = timeout(Duration::from_millis(250), read(&mut stream, &mut req_buf)).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
+                    )
+                    .await?;
+                sleep(Duration::from_secs(1)).await;
+                Ok::<(), std::io::Error>(())
             });
-        }
 
-        let response = fetch_task.await??;
-        server.shutdown().await?;
+            let req = b"GET /stream/events?channel=detections&max_hz=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let start = Instant::now();
+            let response = fetch_stream_prefix(addr, req, Duration::from_millis(120), 256).await.unwrap();
+            let elapsed = start.elapsed();
 
-        assert!(
-            response.contains("event: lag") || response.contains("\"kind\":\"lag\""),
-            "expected lag event in stream output: {response}"
-        );
+            assert!(
+                elapsed < Duration::from_millis(700),
+                "fetch should return after read timeout, elapsed={elapsed:?}"
+            );
+            assert!(
+                response.contains("HTTP/1.1 200 OK"),
+                "expected partial HTTP response headers: {response}"
+            );
 
-        for _ in 0..20 {
-            if event_bus.subscriber_count() == 0 {
-                return Ok(());
+            let _ = timeout(Duration::from_secs(2), server_task).await;
+        });
+    }
+
+    #[test]
+    fn stream_deltas_emits_schema_and_redacts_content() {
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(64));
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_storage(storage.clone())
+                    .with_event_bus(Arc::clone(&event_bus)),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"GET /stream/deltas?pane_id=7&max_hz=200 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let fetch_task = task::spawn(async move {
+                fetch_stream_prefix(addr, req, Duration::from_secs(3), 512).await
+            });
+
+            sleep(Duration::from_millis(80)).await;
+            let secret = "auth token sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let seg = storage.append_segment(7, secret, None).await.unwrap();
+            let _ = event_bus.publish(Event::SegmentCaptured {
+                pane_id: 7,
+                seq: seg.seq,
+                content_len: seg.content_len,
+            });
+
+            let response = fetch_task.await.unwrap().unwrap();
+            server.shutdown().await.unwrap();
+
+            assert!(
+                response.contains("text/event-stream"),
+                "SSE content-type header expected: {response}"
+            );
+
+            let delta_data = response
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .find(|line| line.contains("\"kind\":\"delta\""))
+                .expect("missing delta frame in SSE response");
+            let frame: serde_json::Value = serde_json::from_str(delta_data).unwrap();
+
+            assert_eq!(frame["schema"], "ft.stream.v1");
+            assert_eq!(frame["stream"], "deltas");
+            assert_eq!(frame["kind"], "delta");
+            assert_eq!(frame["data"]["pane_id"], 7);
+
+            let redacted = frame["data"]["content"]
+                .as_str()
+                .expect("delta content should be a string");
+            assert!(redacted.contains("[REDACTED]"), "content must be redacted");
+            assert!(
+                !redacted.contains("sk-aaaaaaaa"),
+                "raw secret should not appear"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_events_reports_lag_and_releases_subscriber() {
+        run_async_test(async {
+            let event_bus = Arc::new(EventBus::new(2));
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_event_bus(Arc::clone(&event_bus)),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"GET /stream/events?channel=detections&max_hz=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let fetch_task = task::spawn(async move {
+                fetch_stream_prefix(addr, req, Duration::from_secs(4), 640).await
+            });
+
+            sleep(Duration::from_millis(80)).await;
+            for i in 0..64_u64 {
+                let detection = Detection {
+                    rule_id: format!("core.test:{i}"),
+                    agent_type: AgentType::Codex,
+                    event_type: "usage_reached".to_string(),
+                    severity: Severity::Warning,
+                    confidence: 1.0,
+                    extracted: serde_json::json!({
+                        "token": "sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "index": i
+                    }),
+                    matched_text: format!(
+                        "usage reached with secret sk-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb #{i}"
+                    ),
+                    span: (0, 0),
+                };
+                let _ = event_bus.publish(Event::PatternDetected {
+                    pane_id: 11,
+                    pane_uuid: None,
+                    detection,
+                    event_id: None,
+                });
             }
-            sleep(Duration::from_millis(25)).await;
-        }
 
-        assert_eq!(
-            event_bus.subscriber_count(),
-            0,
-            "subscriber should be released after disconnect"
-        );
-        Ok(())
+            let response = fetch_task.await.unwrap().unwrap();
+            server.shutdown().await.unwrap();
+
+            assert!(
+                response.contains("event: lag") || response.contains("\"kind\":\"lag\""),
+                "expected lag event in stream output: {response}"
+            );
+
+            for _ in 0..20 {
+                if event_bus.subscriber_count() == 0 {
+                    return;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+
+            assert_eq!(
+                event_bus.subscriber_count(),
+                0,
+                "subscriber should be released after disconnect"
+            );
+        });
     }
 }

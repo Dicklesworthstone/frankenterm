@@ -27,6 +27,18 @@ const PERF_HANDSHAKE_P95_BUDGET_MS: u128 = 400;
 const PERF_VERIFY_P95_BUDGET_US: u128 = 250;
 const PERF_VERIFY_THROUGHPUT_BUDGET_MSGS_PER_SEC: f64 = 2_000.0;
 
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use frankenterm_core::runtime_compat::CompatRuntime;
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
 fn temp_pem(contents: &str) -> tempfile::NamedTempFile {
     let mut file = tempfile::NamedTempFile::new().expect("temp file");
     std::io::Write::write_all(file.as_file_mut(), contents.as_bytes()).expect("write pem");
@@ -124,8 +136,9 @@ async fn tls_handshake_rejected(
     client_result.is_err() || server_result.is_err()
 }
 
-#[tokio::test]
-async fn distributed_security_e2e_tls_required_happy_path_with_artifacts() {
+#[test]
+fn distributed_security_e2e_tls_required_happy_path_with_artifacts() {
+    run_async_test(async {
     let ca_cert = temp_pem(OLD_CA_CERT);
     let server_cert = temp_pem(OLD_SERVER_CERT);
     let server_key = temp_pem(OLD_SERVER_KEY);
@@ -214,10 +227,12 @@ async fn distributed_security_e2e_tls_required_happy_path_with_artifacts() {
             "size_bytes": file_size
         }),
     );
+    });
 }
 
-#[tokio::test]
-async fn distributed_security_e2e_tls_failures_and_plaintext_rejection() {
+#[test]
+fn distributed_security_e2e_tls_failures_and_plaintext_rejection() {
+    run_async_test(async {
     let trusted_ca = temp_pem(OLD_CA_CERT);
     let untrusted_ca = temp_pem(ROTATED_CA_CERT);
     let server_cert = temp_pem(OLD_SERVER_CERT);
@@ -287,10 +302,12 @@ async fn distributed_security_e2e_tls_failures_and_plaintext_rejection() {
             "stable_error_code": DistributedSecurityError::AuthFailed.code()
         }),
     );
+    });
 }
 
-#[tokio::test]
-async fn distributed_security_e2e_auth_replay_and_rotation() {
+#[test]
+fn distributed_security_e2e_auth_replay_and_rotation() {
+    run_async_test(async {
     let mut token_file = tempfile::NamedTempFile::new().expect("token file");
     std::io::Write::write_all(token_file.as_file_mut(), b"agent-a:token-v1")
         .expect("write token v1");
@@ -424,10 +441,12 @@ async fn distributed_security_e2e_auth_replay_and_rotation() {
             "new_cert_accepted_after_rotation": true
         }),
     );
+    });
 }
 
-#[tokio::test]
-async fn distributed_security_perf_budgets_within_initial_thresholds() {
+#[test]
+fn distributed_security_perf_budgets_within_initial_thresholds() {
+    run_async_test(async {
     let ca_cert = temp_pem(OLD_CA_CERT);
     let server_cert = temp_pem(OLD_SERVER_CERT);
     let server_key = temp_pem(OLD_SERVER_KEY);
@@ -518,4 +537,5 @@ async fn distributed_security_perf_budgets_within_initial_thresholds() {
             }
         }),
     );
+    });
 }

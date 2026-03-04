@@ -20,6 +20,22 @@ use frankenterm_core::recording::{
 };
 
 // ═══════════════════════════════════════════════════════════════════════
+// Async test helper
+// ═══════════════════════════════════════════════════════════════════════
+
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use frankenterm_core::runtime_compat::CompatRuntime;
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Fixture format and helpers
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -765,83 +781,93 @@ fn test_fixture_control_json_roundtrip() {
 
 // ── End-to-end: load fixture into AppendLog storage ───────────────────
 
-#[tokio::test]
-async fn test_fixture_ingest_into_storage() {
-    write_standard_fixtures();
-    let fixture = load_fixture_from_disk("fixture_normal_100_events.json").unwrap();
+#[test]
+fn test_fixture_ingest_into_storage() {
+    run_async_test(async {
+        write_standard_fixtures();
+        let fixture = load_fixture_from_disk("fixture_normal_100_events.json").unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let offsets = populate_from_fixture(&storage, &fixture.events).await;
-    assert_eq!(offsets.len(), 100);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let offsets = populate_from_fixture(&storage, &fixture.events).await;
+        assert_eq!(offsets.len(), 100);
 
-    let health = storage.health().await;
-    assert_eq!(health.backend, RecorderBackendKind::AppendLog);
-    assert!(!health.degraded);
+        let health = storage.health().await;
+        assert_eq!(health.backend, RecorderBackendKind::AppendLog);
+        assert!(!health.degraded);
+    });
 }
 
-#[tokio::test]
-async fn test_fixture_ingest_preserves_event_count() {
-    let fixture = build_fixture("inline-test", generate_normal_100(), vec![]);
-    let dir = tempfile::tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let offsets = populate_from_fixture(&storage, &fixture.events).await;
-    assert_eq!(offsets.len(), fixture.expected_event_count);
+#[test]
+fn test_fixture_ingest_preserves_event_count() {
+    run_async_test(async {
+        let fixture = build_fixture("inline-test", generate_normal_100(), vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let offsets = populate_from_fixture(&storage, &fixture.events).await;
+        assert_eq!(offsets.len(), fixture.expected_event_count);
+    });
 }
 
-#[tokio::test]
-async fn test_fixture_ingest_large_10k_completes() {
-    write_standard_fixtures();
-    let fixture = load_fixture_from_disk("fixture_large_10k_events.json").unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let offsets = populate_from_fixture(&storage, &fixture.events).await;
-    assert_eq!(offsets.len(), 10_000);
+#[test]
+fn test_fixture_ingest_large_10k_completes() {
+    run_async_test(async {
+        write_standard_fixtures();
+        let fixture = load_fixture_from_disk("fixture_large_10k_events.json").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let offsets = populate_from_fixture(&storage, &fixture.events).await;
+        assert_eq!(offsets.len(), 10_000);
+    });
 }
 
 // ── Fixture replay corpus: load → ingest → verify ─────────────────────
 
-#[tokio::test]
-async fn test_fixture_replay_corpus_offsets_monotonic() {
-    let events = generate_normal_100();
-    let fixture = build_fixture("replay-test", events, vec![]);
+#[test]
+fn test_fixture_replay_corpus_offsets_monotonic() {
+    run_async_test(async {
+        let events = generate_normal_100();
+        let fixture = build_fixture("replay-test", events, vec![]);
 
-    let dir = tempfile::tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
-    let offsets = populate_from_fixture(&source, &fixture.events).await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let offsets = populate_from_fixture(&source, &fixture.events).await;
 
-    // Offsets should be strictly monotonically increasing
-    for window in offsets.windows(2) {
-        assert!(
-            window[0].ordinal < window[1].ordinal,
-            "ordinals not monotonic: {} >= {}",
-            window[0].ordinal,
-            window[1].ordinal,
-        );
-    }
+        // Offsets should be strictly monotonically increasing
+        for window in offsets.windows(2) {
+            assert!(
+                window[0].ordinal < window[1].ordinal,
+                "ordinals not monotonic: {} >= {}",
+                window[0].ordinal,
+                window[1].ordinal,
+            );
+        }
+    });
 }
 
-#[tokio::test]
-async fn test_fixture_replay_corpus_idempotent_batch() {
-    let events = generate_normal_100();
+#[test]
+fn test_fixture_replay_corpus_idempotent_batch() {
+    run_async_test(async {
+        let events = generate_normal_100();
 
-    let dir = tempfile::tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(test_append_config(dir.path())).unwrap();
 
-    // First ingest
-    let _offsets = populate_from_fixture(&storage, &events).await;
+        // First ingest
+        let _offsets = populate_from_fixture(&storage, &events).await;
 
-    // Replay same batch_id — idempotent
-    let resp = storage
-        .append_batch(AppendRequest {
-            batch_id: "fixture-batch-0".to_string(),
-            events: events[..50].to_vec(),
-            required_durability: DurabilityLevel::Appended,
-            producer_ts_ms: 1,
-        })
-        .await
-        .unwrap();
-    assert_eq!(resp.accepted_count, 50);
+        // Replay same batch_id — idempotent
+        let resp = storage
+            .append_batch(AppendRequest {
+                batch_id: "fixture-batch-0".to_string(),
+                events: events[..50].to_vec(),
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.accepted_count, 50);
+    });
 }
 
 // ── Edge cases ────────────────────────────────────────────────────────

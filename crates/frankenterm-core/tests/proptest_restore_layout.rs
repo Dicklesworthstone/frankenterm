@@ -36,6 +36,21 @@ use frankenterm_core::session_topology::{PaneNode, TabSnapshot, TopologySnapshot
 use proptest::prelude::*;
 
 // =========================================================================
+// Async test helper
+// =========================================================================
+
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
+// =========================================================================
 // Strategies
 // =========================================================================
 
@@ -837,9 +852,9 @@ fn config_roundtrip_all_false() {
 }
 
 // =========================================================================
-// Async unit tests (Properties 22-25) using MockWezterm + tokio
+// Async unit tests (Properties 22-25) using MockWezterm + run_async_test
 //
-// These use #[tokio::test] since proptest does not support async.
+// These use run_async_test since proptest does not support async.
 // =========================================================================
 
 use frankenterm_core::restore_layout::LayoutRestorer;
@@ -847,142 +862,151 @@ use frankenterm_core::wezterm::MockWezterm;
 use std::sync::Arc;
 
 /// Property 22: LayoutRestorer restore on single leaf creates exactly 1 pane
-#[tokio::test]
-async fn restore_single_leaf_creates_one_pane() {
-    let mock = Arc::new(MockWezterm::new());
-    let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
-    let snapshot = single_tab_snapshot(leaf(42));
+#[test]
+fn restore_single_leaf_creates_one_pane() {
+    run_async_test(async {
+        let mock = Arc::new(MockWezterm::new());
+        let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
+        let snapshot = single_tab_snapshot(leaf(42));
 
-    let result = restorer.restore(&snapshot).await.unwrap();
+        let result = restorer.restore(&snapshot).await.unwrap();
 
-    assert_eq!(
-        result.panes_created, 1,
-        "single leaf should create exactly 1 pane"
-    );
-    assert_eq!(result.windows_created, 1);
-    assert_eq!(result.tabs_created, 1);
-    assert!(result.failed_panes.is_empty());
-    assert!(
-        result.pane_id_map.contains_key(&42),
-        "pane_id_map should contain the original leaf pane id"
-    );
+        assert_eq!(
+            result.panes_created, 1,
+            "single leaf should create exactly 1 pane"
+        );
+        assert_eq!(result.windows_created, 1);
+        assert_eq!(result.tabs_created, 1);
+        assert!(result.failed_panes.is_empty());
+        assert!(
+            result.pane_id_map.contains_key(&42),
+            "pane_id_map should contain the original leaf pane id"
+        );
+    });
 }
 
 /// Property 23: LayoutRestorer restore on empty topology creates 0 panes
-#[tokio::test]
-async fn restore_empty_topology_creates_zero_panes() {
-    let mock = Arc::new(MockWezterm::new());
-    let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
-    let snapshot = TopologySnapshot {
-        schema_version: 1,
-        captured_at: 1000,
-        workspace_id: None,
-        windows: vec![],
-    };
+#[test]
+fn restore_empty_topology_creates_zero_panes() {
+    run_async_test(async {
+        let mock = Arc::new(MockWezterm::new());
+        let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
+        let snapshot = TopologySnapshot {
+            schema_version: 1,
+            captured_at: 1000,
+            workspace_id: None,
+            windows: vec![],
+        };
 
-    let result = restorer.restore(&snapshot).await.unwrap();
+        let result = restorer.restore(&snapshot).await.unwrap();
 
-    assert_eq!(
-        result.panes_created, 0,
-        "empty topology should create 0 panes"
-    );
-    assert_eq!(result.windows_created, 0);
-    assert_eq!(result.tabs_created, 0);
-    assert!(result.pane_id_map.is_empty());
-    assert!(result.failed_panes.is_empty());
+        assert_eq!(
+            result.panes_created, 0,
+            "empty topology should create 0 panes"
+        );
+        assert_eq!(result.windows_created, 0);
+        assert_eq!(result.tabs_created, 0);
+        assert!(result.pane_id_map.is_empty());
+        assert!(result.failed_panes.is_empty());
+    });
 }
 
 /// Property 24: LayoutRestorer restore preserves pane_id_map size matching count_panes
-#[tokio::test]
-async fn restore_pane_id_map_size_matches_count_panes() {
-    // Test with several different topologies
-    let topologies = vec![
-        // Single leaf
-        single_tab_snapshot(leaf(1)),
-        // HSplit with 2 leaves
-        single_tab_snapshot(PaneNode::HSplit {
-            children: vec![(0.5, leaf(10)), (0.5, leaf(11))],
-        }),
-        // VSplit with 3 leaves
-        single_tab_snapshot(PaneNode::VSplit {
-            children: vec![(0.33, leaf(20)), (0.33, leaf(21)), (0.34, leaf(22))],
-        }),
-        // Nested: VSplit of (leaf, HSplit(leaf, leaf))
-        single_tab_snapshot(PaneNode::VSplit {
-            children: vec![
-                (0.5, leaf(30)),
-                (
-                    0.5,
-                    PaneNode::HSplit {
-                        children: vec![(0.5, leaf(31)), (0.5, leaf(32))],
-                    },
-                ),
-            ],
-        }),
-    ];
+#[test]
+fn restore_pane_id_map_size_matches_count_panes() {
+    run_async_test(async {
+        // Test with several different topologies
+        let topologies = vec![
+            // Single leaf
+            single_tab_snapshot(leaf(1)),
+            // HSplit with 2 leaves
+            single_tab_snapshot(PaneNode::HSplit {
+                children: vec![(0.5, leaf(10)), (0.5, leaf(11))],
+            }),
+            // VSplit with 3 leaves
+            single_tab_snapshot(PaneNode::VSplit {
+                children: vec![(0.33, leaf(20)), (0.33, leaf(21)), (0.34, leaf(22))],
+            }),
+            // Nested: VSplit of (leaf, HSplit(leaf, leaf))
+            single_tab_snapshot(PaneNode::VSplit {
+                children: vec![
+                    (0.5, leaf(30)),
+                    (
+                        0.5,
+                        PaneNode::HSplit {
+                            children: vec![(0.5, leaf(31)), (0.5, leaf(32))],
+                        },
+                    ),
+                ],
+            }),
+        ];
 
-    for snapshot in &topologies {
-        let mock = Arc::new(MockWezterm::new());
-        let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
-        let expected_panes = count_panes(snapshot);
+        for snapshot in &topologies {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
+            let expected_panes = count_panes(snapshot);
 
-        let result = restorer.restore(snapshot).await.unwrap();
+            let result = restorer.restore(snapshot).await.unwrap();
 
-        assert_eq!(
-            result.pane_id_map.len(),
-            expected_panes,
-            "pane_id_map size ({}) should equal count_panes ({}) for topology",
-            result.pane_id_map.len(),
-            expected_panes,
-        );
-    }
+            assert_eq!(
+                result.pane_id_map.len(),
+                expected_panes,
+                "pane_id_map size ({}) should equal count_panes ({}) for topology",
+                result.pane_id_map.len(),
+                expected_panes,
+            );
+        }
+    });
 }
 
 /// Property 25: LayoutRestorer restore with splits creates correct pane count
-#[tokio::test]
-async fn restore_with_splits_creates_correct_pane_count() {
-    // 2x2 grid: HSplit of (VSplit(leaf, leaf), VSplit(leaf, leaf))
-    let tree = PaneNode::HSplit {
-        children: vec![
-            (
-                0.5,
-                PaneNode::VSplit {
-                    children: vec![(0.5, leaf(1)), (0.5, leaf(2))],
-                },
-            ),
-            (
-                0.5,
-                PaneNode::VSplit {
-                    children: vec![(0.5, leaf(3)), (0.5, leaf(4))],
-                },
-            ),
-        ],
-    };
-    let snapshot = single_tab_snapshot(tree);
+#[test]
+fn restore_with_splits_creates_correct_pane_count() {
+    run_async_test(async {
+        // 2x2 grid: HSplit of (VSplit(leaf, leaf), VSplit(leaf, leaf))
+        let tree = PaneNode::HSplit {
+            children: vec![
+                (
+                    0.5,
+                    PaneNode::VSplit {
+                        children: vec![(0.5, leaf(1)), (0.5, leaf(2))],
+                    },
+                ),
+                (
+                    0.5,
+                    PaneNode::VSplit {
+                        children: vec![(0.5, leaf(3)), (0.5, leaf(4))],
+                    },
+                ),
+            ],
+        };
+        let snapshot = single_tab_snapshot(tree);
 
-    let mock = Arc::new(MockWezterm::new());
-    let restorer = LayoutRestorer::new(mock.clone(), RestoreConfig::default());
-    let result = restorer.restore(&snapshot).await.unwrap();
+        let mock = Arc::new(MockWezterm::new());
+        let restorer = LayoutRestorer::new(mock.clone(), RestoreConfig::default());
+        let result = restorer.restore(&snapshot).await.unwrap();
 
-    assert_eq!(
-        result.panes_created, 4,
-        "2x2 grid should create exactly 4 panes"
-    );
-    // All old pane IDs should be in the map
-    for id in 1..=4_u64 {
-        assert!(
-            result.pane_id_map.contains_key(&id),
-            "pane {} should be in pane_id_map",
-            id,
+        assert_eq!(
+            result.panes_created, 4,
+            "2x2 grid should create exactly 4 panes"
         );
-    }
-    // All new pane IDs should be distinct
-    let new_ids: std::collections::HashSet<u64> = result.pane_id_map.values().copied().collect();
-    assert_eq!(new_ids.len(), 4, "all 4 new pane IDs should be distinct");
-    // MockWezterm should have exactly 4 panes
-    let mock_count = mock.pane_count().await;
-    assert_eq!(
-        mock_count, 4,
-        "MockWezterm should have 4 panes after restore"
-    );
+        // All old pane IDs should be in the map
+        for id in 1..=4_u64 {
+            assert!(
+                result.pane_id_map.contains_key(&id),
+                "pane {} should be in pane_id_map",
+                id,
+            );
+        }
+        // All new pane IDs should be distinct
+        let new_ids: std::collections::HashSet<u64> =
+            result.pane_id_map.values().copied().collect();
+        assert_eq!(new_ids.len(), 4, "all 4 new pane IDs should be distinct");
+        // MockWezterm should have exactly 4 panes
+        let mock_count = mock.pane_count().await;
+        assert_eq!(
+            mock_count, 4,
+            "MockWezterm should have 4 panes after restore"
+        );
+    });
 }

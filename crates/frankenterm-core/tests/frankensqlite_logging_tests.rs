@@ -28,6 +28,22 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 
 // ---------------------------------------------------------------------------
+// Async test helper
+// ---------------------------------------------------------------------------
+
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use frankenterm_core::runtime_compat::CompatRuntime;
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
+// ---------------------------------------------------------------------------
 // LogCapture — tracing layer that captures structured fields
 // ---------------------------------------------------------------------------
 
@@ -407,202 +423,220 @@ fn has_field(events: &[CapturedEvent], field_name: &str) -> bool {
 // Migration logging tests
 // ===========================================================================
 
-#[tokio::test]
-async fn test_m0_preflight_logs_migration_stage() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 20).await;
-    let reader = MemoryReader { records };
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_m0_preflight_logs_migration_stage() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 20).await;
+        let reader = MemoryReader { records };
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    engine.m0_preflight(&source, &reader).await.unwrap();
+        engine.m0_preflight(&source, &reader).await.unwrap();
 
-    let events = captured.lock().unwrap();
-    let stage_events = events_with_field_value(&events, "migration_stage", "M0");
-    assert!(
-        !stage_events.is_empty(),
-        "M0 preflight should log migration_stage=M0"
-    );
+        let events = captured.lock().unwrap();
+        let stage_events = events_with_field_value(&events, "migration_stage", "M0");
+        assert!(
+            !stage_events.is_empty(),
+            "M0 preflight should log migration_stage=M0"
+        );
+    });
 }
 
-#[tokio::test]
-async fn test_m0_preflight_logs_event_count() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 15).await;
-    let reader = MemoryReader { records };
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_m0_preflight_logs_event_count() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 15).await;
+        let reader = MemoryReader { records };
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    engine.m0_preflight(&source, &reader).await.unwrap();
+        engine.m0_preflight(&source, &reader).await.unwrap();
 
-    let events = captured.lock().unwrap();
-    assert!(
-        has_field(&events, "event_count"),
-        "M0 should log event_count field"
-    );
+        let events = captured.lock().unwrap();
+        assert!(
+            has_field(&events, "event_count"),
+            "M0 should log event_count field"
+        );
+    });
 }
 
-#[tokio::test]
-async fn test_m1_export_logs_migration_stage_m1() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 10).await;
-    let reader = MemoryReader { records };
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_m1_export_logs_migration_stage_m1() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 10).await;
+        let reader = MemoryReader { records };
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
-    engine.m1_export(&reader, &mut manifest).unwrap();
+        let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
+        engine.m1_export(&reader, &mut manifest).unwrap();
 
-    let events = captured.lock().unwrap();
-    let m1_events = events_with_field_value(&events, "migration_stage", "M1");
-    assert!(
-        !m1_events.is_empty(),
-        "M1 export should log migration_stage=M1"
-    );
+        let events = captured.lock().unwrap();
+        let m1_events = events_with_field_value(&events, "migration_stage", "M1");
+        assert!(
+            !m1_events.is_empty(),
+            "M1 export should log migration_stage=M1"
+        );
+    });
 }
 
-#[tokio::test]
-async fn test_m1_export_logs_digest() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 10).await;
-    let reader = MemoryReader { records };
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_m1_export_logs_digest() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 10).await;
+        let reader = MemoryReader { records };
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
-    engine.m1_export(&reader, &mut manifest).unwrap();
+        let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
+        engine.m1_export(&reader, &mut manifest).unwrap();
 
-    let events = captured.lock().unwrap();
-    assert!(
-        has_field(&events, "digest"),
-        "M1 export should log digest field"
-    );
+        let events = captured.lock().unwrap();
+        assert!(
+            has_field(&events, "digest"),
+            "M1 export should log digest field"
+        );
+    });
 }
 
-#[tokio::test]
-async fn test_m1_export_logs_events_exported() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 10).await;
-    let reader = MemoryReader { records };
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_m1_export_logs_events_exported() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 10).await;
+        let reader = MemoryReader { records };
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
-    engine.m1_export(&reader, &mut manifest).unwrap();
+        let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
+        engine.m1_export(&reader, &mut manifest).unwrap();
 
-    let events = captured.lock().unwrap();
-    assert!(
-        has_field(&events, "events_exported"),
-        "M1 export should log events_exported field"
-    );
+        let events = captured.lock().unwrap();
+        assert!(
+            has_field(&events, "events_exported"),
+            "M1 export should log events_exported field"
+        );
+    });
 }
 
-#[tokio::test]
-async fn test_m2_import_logs_migration_stage_m2() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 10).await;
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_m2_import_logs_migration_stage_m2() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 10).await;
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
-    let exported = engine.m1_export(&reader, &mut manifest).unwrap();
-    engine
-        .m2_import(&target, &exported, &mut manifest)
-        .await
-        .unwrap();
+        let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
+        let exported = engine.m1_export(&reader, &mut manifest).unwrap();
+        engine
+            .m2_import(&target, &exported, &mut manifest)
+            .await
+            .unwrap();
 
-    let events = captured.lock().unwrap();
-    let m2_events = events_with_field_value(&events, "migration_stage", "M2");
-    assert!(
-        !m2_events.is_empty(),
-        "M2 import should log migration_stage=M2"
-    );
+        let events = captured.lock().unwrap();
+        let m2_events = events_with_field_value(&events, "migration_stage", "M2");
+        assert!(
+            !m2_events.is_empty(),
+            "M2 import should log migration_stage=M2"
+        );
+    });
 }
 
-#[tokio::test]
-async fn test_m2_import_error_logs_error_fields() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 10).await;
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    target.fail_append.store(true, Ordering::Relaxed);
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_m2_import_error_logs_error_fields() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 10).await;
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        target.fail_append.store(true, Ordering::Relaxed);
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
-    let exported = engine.m1_export(&reader, &mut manifest).unwrap();
-    let _ = engine.m2_import(&target, &exported, &mut manifest).await;
+        let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
+        let exported = engine.m1_export(&reader, &mut manifest).unwrap();
+        let _ = engine.m2_import(&target, &exported, &mut manifest).await;
 
-    // The M1 export still runs and logs its stage — verify that
-    let events = captured.lock().unwrap();
-    let m1_events = events_with_field_value(&events, "migration_stage", "M1");
-    assert!(
-        !m1_events.is_empty(),
-        "M1 stage should still be logged before M2 failure"
-    );
-    // M2 write failure propagates without logging — verify no M2 success log
-    let m2_events = events_with_field_value(&events, "migration_stage", "M2");
-    assert!(
-        m2_events.is_empty(),
-        "M2 stage should NOT be logged on write failure"
-    );
+        // The M1 export still runs and logs its stage — verify that
+        let events = captured.lock().unwrap();
+        let m1_events = events_with_field_value(&events, "migration_stage", "M1");
+        assert!(
+            !m1_events.is_empty(),
+            "M1 stage should still be logged before M2 failure"
+        );
+        // M2 write failure propagates without logging — verify no M2 success log
+        let m2_events = events_with_field_value(&events, "migration_stage", "M2");
+        assert!(
+            m2_events.is_empty(),
+            "M2 stage should NOT be logged on write failure"
+        );
+    });
 }
 
-#[tokio::test]
-async fn test_m3_checkpoint_sync_logs_stage() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 10).await;
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_m3_checkpoint_sync_logs_stage() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 10).await;
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-    engine
-        .m3_checkpoint_sync(&source, &target, &manifest)
-        .await
-        .unwrap();
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+        engine
+            .m3_checkpoint_sync(&source, &target, &manifest)
+            .await
+            .unwrap();
 
-    let events = captured.lock().unwrap();
-    let m3_events = events_with_field_value(&events, "migration_stage", "M3");
-    assert!(
-        !m3_events.is_empty(),
-        "M3 checkpoint sync should log migration_stage=M3"
-    );
+        let events = captured.lock().unwrap();
+        let m3_events = events_with_field_value(&events, "migration_stage", "M3");
+        assert!(
+            !m3_events.is_empty(),
+            "M3 checkpoint sync should log migration_stage=M3"
+        );
+    });
 }
 
-#[tokio::test]
-async fn test_m5_cutover_logs_stage() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 10).await;
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_m5_cutover_logs_stage() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 10).await;
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-    engine
-        .m5_cutover(&target, &manifest, 1708000000, None)
-        .await
-        .unwrap();
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+        engine
+            .m5_cutover(&target, &manifest, 1708000000, None)
+            .await
+            .unwrap();
 
-    let events = captured.lock().unwrap();
-    let m5_events = events_with_field_value(&events, "migration_stage", "M5");
-    assert!(
-        !m5_events.is_empty(),
-        "M5 cutover should log migration_stage=M5"
-    );
+        let events = captured.lock().unwrap();
+        let m5_events = events_with_field_value(&events, "migration_stage", "M5");
+        assert!(
+            !m5_events.is_empty(),
+            "M5 cutover should log migration_stage=M5"
+        );
+    });
 }
 
 // ===========================================================================
@@ -855,100 +889,108 @@ fn test_rollback_classifier_logs_slo_fields_when_present() {
     );
 }
 
-#[tokio::test]
-async fn test_full_pipeline_emits_all_stage_logs() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 20).await;
-    let reader = MemoryReader { records };
-    let target = MockTargetStorage::healthy();
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_full_pipeline_emits_all_stage_logs() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 20).await;
+        let reader = MemoryReader { records };
+        let target = MockTargetStorage::healthy();
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
-    engine
-        .m3_checkpoint_sync(&source, &target, &manifest)
-        .await
-        .unwrap();
-    engine
-        .m5_cutover(&target, &manifest, 1708000000, None)
-        .await
-        .unwrap();
+        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+        engine
+            .m3_checkpoint_sync(&source, &target, &manifest)
+            .await
+            .unwrap();
+        engine
+            .m5_cutover(&target, &manifest, 1708000000, None)
+            .await
+            .unwrap();
 
-    let events = captured.lock().unwrap();
-    let stages: Vec<String> = events
-        .iter()
-        .filter_map(|e| e.fields.get("migration_stage").cloned())
-        .collect();
+        let events = captured.lock().unwrap();
+        let stages: Vec<String> = events
+            .iter()
+            .filter_map(|e| e.fields.get("migration_stage").cloned())
+            .collect();
 
-    assert!(stages.contains(&"M0".to_string()), "missing M0 stage log");
-    assert!(stages.contains(&"M1".to_string()), "missing M1 stage log");
-    assert!(stages.contains(&"M2".to_string()), "missing M2 stage log");
-    assert!(stages.contains(&"M3".to_string()), "missing M3 stage log");
-    assert!(stages.contains(&"M5".to_string()), "missing M5 stage log");
+        assert!(stages.contains(&"M0".to_string()), "missing M0 stage log");
+        assert!(stages.contains(&"M1".to_string()), "missing M1 stage log");
+        assert!(stages.contains(&"M2".to_string()), "missing M2 stage log");
+        assert!(stages.contains(&"M3".to_string()), "missing M3 stage log");
+        assert!(stages.contains(&"M5".to_string()), "missing M5 stage log");
+    });
 }
 
 // ===========================================================================
 // Numeric field correctness
 // ===========================================================================
 
-#[tokio::test]
-async fn test_m0_logs_correct_event_count() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 25).await;
-    let reader = MemoryReader { records };
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_m0_logs_correct_event_count() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 25).await;
+        let reader = MemoryReader { records };
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    engine.m0_preflight(&source, &reader).await.unwrap();
+        engine.m0_preflight(&source, &reader).await.unwrap();
 
-    let events = captured.lock().unwrap();
-    let count_events = events_with_field(&events, "event_count");
-    assert!(!count_events.is_empty());
-    let logged_count = &count_events[0].fields["event_count"];
-    assert_eq!(logged_count, "25", "event_count should be 25");
+        let events = captured.lock().unwrap();
+        let count_events = events_with_field(&events, "event_count");
+        assert!(!count_events.is_empty());
+        let logged_count = &count_events[0].fields["event_count"];
+        assert_eq!(logged_count, "25", "event_count should be 25");
+    });
 }
 
-#[tokio::test]
-async fn test_m1_logs_correct_export_count() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 12).await;
-    let reader = MemoryReader { records };
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_m1_logs_correct_export_count() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 12).await;
+        let reader = MemoryReader { records };
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
-    engine.m1_export(&reader, &mut manifest).unwrap();
+        let mut manifest = engine.m0_preflight(&source, &reader).await.unwrap();
+        engine.m1_export(&reader, &mut manifest).unwrap();
 
-    let events = captured.lock().unwrap();
-    let export_events = events_with_field(&events, "events_exported");
-    assert!(!export_events.is_empty());
-    let logged = &export_events[0].fields["events_exported"];
-    assert_eq!(logged, "12", "events_exported should be 12");
+        let events = captured.lock().unwrap();
+        let export_events = events_with_field(&events, "events_exported");
+        assert!(!export_events.is_empty());
+        let logged = &export_events[0].fields["events_exported"];
+        assert_eq!(logged, "12", "events_exported should be 12");
+    });
 }
 
 // ===========================================================================
 // Additional logging probes
 // ===========================================================================
 
-#[tokio::test]
-async fn test_m0_logs_last_ordinal() {
-    let (_guard, captured) = install_capture();
-    let dir = tempdir().unwrap();
-    let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
-    let records = populate_source(&source, 10).await;
-    let reader = MemoryReader { records };
-    let engine = MigrationEngine::new(MigrationConfig::default());
+#[test]
+fn test_m0_logs_last_ordinal() {
+    run_async_test(async {
+        let (_guard, captured) = install_capture();
+        let dir = tempdir().unwrap();
+        let source = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+        let records = populate_source(&source, 10).await;
+        let reader = MemoryReader { records };
+        let engine = MigrationEngine::new(MigrationConfig::default());
 
-    engine.m0_preflight(&source, &reader).await.unwrap();
+        engine.m0_preflight(&source, &reader).await.unwrap();
 
-    let events = captured.lock().unwrap();
-    assert!(
-        has_field(&events, "last_ordinal"),
-        "M0 should log last_ordinal field"
-    );
+        let events = captured.lock().unwrap();
+        assert!(
+            has_field(&events, "last_ordinal"),
+            "M0 should log last_ordinal field"
+        );
+    });
 }
 
 #[test]

@@ -23,6 +23,18 @@ use frankenterm_core::session_pane_state::{
 use frankenterm_core::session_topology::{PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot};
 use frankenterm_core::wezterm::{MockWezterm, WeztermInterface};
 
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use frankenterm_core::runtime_compat::CompatRuntime;
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
 // =============================================================================
 // Proptest strategies: Atomic generators
 // =============================================================================
@@ -815,8 +827,9 @@ proptest! {
 // =============================================================================
 
 /// Empty topology snapshot restores with zero panes.
-#[tokio::test]
-async fn empty_topology_restores_empty() {
+#[test]
+fn empty_topology_restores_empty() {
+    run_async_test(async {
     let topo = TopologySnapshot {
         schema_version: 1,
         captured_at: 1_700_000_000,
@@ -832,11 +845,13 @@ async fn empty_topology_restores_empty() {
     assert_eq!(result.windows_created, 0);
     assert_eq!(result.tabs_created, 0);
     assert_eq!(result.panes_created, 0);
+    });
 }
 
 /// Single-pane topology restores correctly.
-#[tokio::test]
-async fn single_pane_topology_restores() {
+#[test]
+fn single_pane_topology_restores() {
+    run_async_test(async {
     let topo = TopologySnapshot {
         schema_version: 1,
         captured_at: 1_700_000_000,
@@ -872,11 +887,13 @@ async fn single_pane_topology_restores() {
     assert_eq!(result.windows_created, 1);
     assert_eq!(result.tabs_created, 1);
     assert_eq!(result.panes_created, 1);
+    });
 }
 
 /// Maximum complexity topology: many windows, tabs, and deep splits.
-#[tokio::test]
-async fn max_complexity_topology_restores() {
+#[test]
+fn max_complexity_topology_restores() {
+    run_async_test(async {
     // Build a deep split tree: 5 levels, ~31 panes
     fn deep_tree(depth: u32, next_id: &mut u64) -> PaneNode {
         if depth == 0 {
@@ -931,6 +948,7 @@ async fn max_complexity_topology_restores() {
 
     assert_eq!(result.pane_id_map.len(), expected_panes);
     assert_eq!(result.panes_created, expected_panes);
+    });
 }
 
 // =============================================================================

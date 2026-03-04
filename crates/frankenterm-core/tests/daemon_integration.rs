@@ -21,6 +21,18 @@ use frankenterm_core::patterns::{DetectionContext, PatternEngine};
 use frankenterm_core::storage::{PaneRecord, StorageHandle, StoredEvent};
 use tempfile::TempDir;
 
+fn run_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use frankenterm_core::runtime_compat::CompatRuntime;
+    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(future);
+}
+
 /// Create a temp database path.
 fn temp_db() -> (TempDir, String) {
     let dir = TempDir::new().expect("create temp dir");
@@ -124,8 +136,9 @@ fn detection_to_stored_event(
 /// Test: Segments are persisted correctly.
 ///
 /// Verifies the basic ingest → persist flow without pattern detection.
-#[tokio::test]
-async fn segments_are_persisted() {
+#[test]
+fn segments_are_persisted() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -155,13 +168,15 @@ async fn segments_are_persisted() {
     assert_eq!(segments[0].content, "hello world\n");
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: Multiple segments maintain seq monotonicity.
 ///
 /// Verifies that sequence numbers increment correctly across multiple persists.
-#[tokio::test]
-async fn seq_monotonicity_across_persists() {
+#[test]
+fn seq_monotonicity_across_persists() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -191,13 +206,15 @@ async fn seq_monotonicity_across_persists() {
     assert_eq!(seqs, vec![4, 3, 2, 1, 0]);
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: Gaps are recorded when segment kind is Gap.
 ///
 /// Verifies that Gap segments create gap records in storage.
-#[tokio::test]
-async fn gaps_are_recorded_for_gap_segments() {
+#[test]
+fn gaps_are_recorded_for_gap_segments() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -227,13 +244,15 @@ async fn gaps_are_recorded_for_gap_segments() {
     assert_eq!(gap.reason, "overlap_not_found");
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: Pattern detection triggers events.
 ///
 /// Verifies the full pipeline: content → pattern engine → event persistence.
-#[tokio::test]
-async fn pattern_detection_triggers_events() {
+#[test]
+fn pattern_detection_triggers_events() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -280,13 +299,15 @@ async fn pattern_detection_triggers_events() {
     assert!(event.rule_id.contains("codex.usage"));
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: No-match content exercises quick-reject path.
 ///
 /// Verifies that content not matching any pattern produces no events.
-#[tokio::test]
-async fn no_match_content_produces_no_events() {
+#[test]
+fn no_match_content_produces_no_events() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -321,13 +342,15 @@ async fn no_match_content_produces_no_events() {
     assert!(events.is_empty(), "No events should exist");
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: Explicit GAP required fixture.
 ///
 /// Verifies that a deliberate discontinuity creates a GAP record.
-#[tokio::test]
-async fn explicit_gap_discontinuity_is_recorded() {
+#[test]
+fn explicit_gap_discontinuity_is_recorded() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -360,13 +383,15 @@ async fn explicit_gap_discontinuity_is_recorded() {
     assert_eq!(r1.gap.unwrap().reason, "test_discontinuity");
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: OSC 133 prompt markers in content.
 ///
 /// Verifies that content with shell integration markers is handled correctly.
-#[tokio::test]
-async fn osc_133_prompt_markers_handled() {
+#[test]
+fn osc_133_prompt_markers_handled() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -401,13 +426,15 @@ async fn osc_133_prompt_markers_handled() {
     assert!(segments[0].content.contains("\x1b]133;A"));
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: Multiple panes are isolated.
 ///
 /// Verifies that segments from different panes don't interfere.
-#[tokio::test]
-async fn multiple_panes_isolation() {
+#[test]
+fn multiple_panes_isolation() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -449,13 +476,15 @@ async fn multiple_panes_isolation() {
     assert!(segments2[0].content.contains("pane2"));
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: Claude Code compaction pattern triggers detection.
 ///
 /// Verifies that Claude Code specific patterns work.
-#[tokio::test]
-async fn claude_code_compaction_detection() {
+#[test]
+fn claude_code_compaction_detection() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -499,13 +528,15 @@ async fn claude_code_compaction_detection() {
     assert!(events.iter().any(|e| e.rule_id.contains("compaction")));
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: Alt-screen content creates gap.
 ///
 /// Verifies that alt-screen transitions are handled as gaps.
-#[tokio::test]
-async fn alt_screen_content_as_gap() {
+#[test]
+fn alt_screen_content_as_gap() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -538,13 +569,15 @@ async fn alt_screen_content_as_gap() {
     assert_eq!(r1.gap.unwrap().reason, "alt_screen_entered");
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: Full pipeline with mixed content.
 ///
 /// End-to-end test simulating realistic daemon operation.
-#[tokio::test]
-async fn full_pipeline_mixed_content() {
+#[test]
+fn full_pipeline_mixed_content() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -620,13 +653,15 @@ async fn full_pipeline_mixed_content() {
     assert_eq!(events.len() as u64, total_events);
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: Sequence discontinuity creates additional gap.
 ///
 /// Verifies that when cursor seq doesn't match storage seq, a discontinuity gap is recorded.
-#[tokio::test]
-async fn sequence_discontinuity_gap() {
+#[test]
+fn sequence_discontinuity_gap() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -664,13 +699,15 @@ async fn sequence_discontinuity_gap() {
     );
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: Large content batch.
 ///
 /// Verifies the pipeline handles larger volumes correctly.
-#[tokio::test]
-async fn large_content_batch() {
+#[test]
+fn large_content_batch() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -702,13 +739,15 @@ async fn large_content_batch() {
     }
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
 
 /// Test: Events reference correct segments.
 ///
 /// Verifies that events have correct segment_id foreign keys.
-#[tokio::test]
-async fn events_reference_segments() {
+#[test]
+fn events_reference_segments() {
+    run_async_test(async {
     let (_dir, db_path) = temp_db();
     let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -751,4 +790,5 @@ async fn events_reference_segments() {
     }
 
     storage.shutdown().await.expect("shutdown");
+    });
 }
