@@ -40,7 +40,7 @@ mod common;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use asupersync::lab::explorer::{ExplorerConfig, ScheduleExplorer};
+use asupersync::lab::explorer::ScheduleExplorer;
 use asupersync::{Budget, LabRuntime};
 
 use frankenterm_core::chaos::{
@@ -66,6 +66,7 @@ struct SharedWorkloadState {
     /// Tracks which tasks completed (bit mask).
     completed_mask: AtomicU64,
     /// Tracks cancellations observed.
+    #[allow(dead_code)]
     cancellations: AtomicU64,
 }
 
@@ -93,6 +94,7 @@ impl SharedWorkloadState {
     }
 
     /// Record a cancellation.
+    #[allow(dead_code)]
     fn record_cancellation(&self) {
         self.cancellations.fetch_add(1, Ordering::SeqCst);
     }
@@ -340,6 +342,7 @@ fn event_dispatch_workload(
 
 /// Result of running one cell in the fault matrix.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct MatrixCellResult {
     scenario_name: String,
     workload_name: String,

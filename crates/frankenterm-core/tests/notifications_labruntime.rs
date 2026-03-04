@@ -16,7 +16,7 @@ mod common;
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::events::{EventFilter, NotificationGate, NotifyDecision};
 use frankenterm_core::notifications::{
-    NotificationDelivery, NotificationFuture, NotificationOutcome, NotificationPayload,
+    NotificationDelivery, NotificationFuture, NotificationPayload,
     NotificationPipeline, NotificationSender, RateLimitedSender,
 };
 use frankenterm_core::patterns::{AgentType, Detection, Severity};

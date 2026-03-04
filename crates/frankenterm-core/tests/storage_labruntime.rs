@@ -27,7 +27,7 @@ mod common;
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::storage::{
     AgentSessionRecord, Correlation, CorrelationRef, CorrelationType, EventQuery, Gap,
-    IndexingHealthReport, MetricQuery, MetricType, PaneIndexingStats, PaneInfo, PaneRecord,
+    MetricQuery, MetricType, PaneInfo, PaneRecord,
     SearchOptions, Segment, SemanticBudgetConfig, StorageConfig, StorageHandle, StoredEvent,
     Timeline, TimelineEvent, TimelineQuery, UsageMetricRecord, WorkflowRecord,
     WorkflowStepLogRecord, now_ms,

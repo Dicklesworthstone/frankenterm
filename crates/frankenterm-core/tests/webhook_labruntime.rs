@@ -16,7 +16,7 @@ use frankenterm_core::event_templates::{RenderedEvent, Suggestion};
 use frankenterm_core::events::{EventFilter, NotificationGate, NotifyDecision};
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::webhook::{
-    DeliveryResult, WebhookDispatcher, WebhookEndpointConfig, WebhookPayload, WebhookTemplate,
+    DeliveryResult, WebhookDispatcher, WebhookEndpointConfig, WebhookTemplate,
     WebhookTransport,
 };
 

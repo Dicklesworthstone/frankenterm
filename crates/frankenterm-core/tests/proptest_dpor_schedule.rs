@@ -10,7 +10,7 @@
 mod common;
 
 use asupersync::lab::explorer::{ExplorerConfig, ScheduleExplorer};
-use asupersync::{Budget, LabRuntime};
+use asupersync::Budget;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use std::sync::Arc;

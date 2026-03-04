@@ -68,6 +68,7 @@ fn test_config(path: &Path) -> AppendLogStorageConfig {
     }
 }
 
+#[allow(dead_code)]
 fn recorder_test_config(path: &Path) -> RecorderStorageConfig {
     RecorderStorageConfig {
         backend: RecorderBackendKind::AppendLog,

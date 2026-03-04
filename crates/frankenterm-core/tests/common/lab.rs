@@ -8,6 +8,8 @@
 //! All helpers emit structured tracing logs with seed, test name, and
 //! outcome information for debugging.
 
+#![allow(dead_code)]
+
 use asupersync::lab::chaos::ChaosConfig;
 use asupersync::lab::explorer::{ExplorationReport, ExplorerConfig, ScheduleExplorer};
 use asupersync::{LabConfig, LabRuntime, Time};

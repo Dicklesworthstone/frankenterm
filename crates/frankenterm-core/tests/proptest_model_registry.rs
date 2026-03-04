@@ -47,6 +47,7 @@ fn arb_model_info() -> impl Strategy<Value = ModelInfo> {
         )
 }
 
+#[allow(dead_code)]
 fn arb_model_info_with_name(name: String) -> impl Strategy<Value = ModelInfo> {
     (
         "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}",

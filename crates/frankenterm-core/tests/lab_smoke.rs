@@ -8,9 +8,9 @@
 
 mod common;
 
-use asupersync::{Budget, CancelKind, Cx, LabConfig, LabRuntime};
+use asupersync::Budget;
 use common::fixtures::{
-    self, MockMuxClient, MockPool, RuntimeFixture, TestPaneData, healthy_cx, timeout_cx,
+    MockMuxClient, MockPool, RuntimeFixture, TestPaneData, healthy_cx, timeout_cx,
     user_cancelled_cx,
 };
 use common::lab::{

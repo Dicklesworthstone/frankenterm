@@ -3,6 +3,8 @@
 //! Provides mock types, test data generators, and simulation helpers
 //! used across LabRuntime integration tests.
 
+#![allow(dead_code)]
+
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::sync::Mutex;
 use asupersync::{Budget, CancelKind, Cx};

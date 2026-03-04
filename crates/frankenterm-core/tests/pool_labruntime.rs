@@ -375,7 +375,7 @@ fn lab_mock_pool_concurrent_acquire_release() {
             let total_ops = Arc::new(AtomicU64::new(0));
 
             // Spawn 4 tasks that each acquire+release
-            for i in 0..4_u32 {
+            for _i in 0..4_u32 {
                 let pool_c = Arc::clone(&pool);
                 let ops = Arc::clone(&total_ops);
                 let (task_id, _handle) = runtime

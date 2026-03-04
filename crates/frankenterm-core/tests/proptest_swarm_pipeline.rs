@@ -142,6 +142,7 @@ fn arb_circuit_state() -> impl Strategy<Value = CircuitState> {
     ]
 }
 
+#[allow(dead_code)]
 fn arb_circuit_breaker_config() -> impl Strategy<Value = CircuitBreakerConfig> {
     (1u32..20, 1_000u64..120_000, 1u32..10).prop_map(
         |(failure_threshold, reset_timeout_ms, success_threshold)| CircuitBreakerConfig {
@@ -453,8 +454,8 @@ proptest! {
     fn backoff_always_capped(strategy in arb_backoff_strategy()) {
         for attempt in 0..20 {
             let d = strategy.delay_for_attempt(attempt);
-            // Delay should always be non-negative (Duration is unsigned)
-            assert!(d.as_millis() >= 0);
+            // Delay should be finite (not overflow)
+            let _ = d.as_millis();
             // And should be finite (not overflow)
             assert!(d.as_secs() < 86_400);
         }

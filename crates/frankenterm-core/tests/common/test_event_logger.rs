@@ -344,6 +344,7 @@ impl ScenarioRunner {
     }
 
     /// Set the artifact output directory.
+    #[allow(dead_code)]
     pub fn artifact_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.artifact_dir = Some(dir.into());
         self
