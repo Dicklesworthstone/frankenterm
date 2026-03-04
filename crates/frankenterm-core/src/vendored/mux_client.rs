@@ -1254,7 +1254,15 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("failed to build runtime for mux_client tests");
-        CompatRuntime::block_on(&runtime, future);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CompatRuntime::block_on(&runtime, future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     #[test]

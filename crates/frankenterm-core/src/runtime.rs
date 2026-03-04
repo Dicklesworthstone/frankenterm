@@ -3392,6 +3392,7 @@ mod tests {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     drop(runtime);
                 }));
+                #[cfg(feature = "asupersync-runtime")]
                 crate::runtime_compat::clear_runtime_handle();
 
                 // Re-raise test assertion panics after cleanup.

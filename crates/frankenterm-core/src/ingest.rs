@@ -2485,7 +2485,15 @@ mod tests {
             .enable_all()
             .build()
             .expect("build current-thread runtime");
-        crate::runtime_compat::CompatRuntime::block_on(&runtime, future);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::CompatRuntime::block_on(&runtime, future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     #[test]

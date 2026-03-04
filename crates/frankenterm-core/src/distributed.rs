@@ -1101,6 +1101,7 @@ pub fn evaluate_readiness(config: &DistributedConfig) -> ReadinessReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "distributed")]
     use crate::runtime_compat::CompatRuntime;
 
     #[test]
@@ -1188,7 +1189,16 @@ mod tests {
             .enable_all()
             .build()
             .expect("create runtime");
-        runtime.block_on(future);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // Absorb TLS destructor panics from asupersync during runtime drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     #[cfg(feature = "distributed")]

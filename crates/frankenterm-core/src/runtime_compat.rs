@@ -1093,7 +1093,14 @@ impl CompatRuntime for Runtime {
         let handle = self.inner.handle();
         ASUPERSYNC_HANDLE.with(|cell| cell.replace(Some(handle)));
         let result = self.inner.block_on(future);
-        ASUPERSYNC_HANDLE.with(|cell| cell.replace(None));
+        // NOTE: We intentionally do NOT clear the handle here. The handle
+        // holds an Arc to shared runtime state, keeping it alive is safe.
+        // Eagerly clearing caused "thread local panicked on drop" aborts
+        // when the Runtime's Drop ran after the handle was cleared, because
+        // the inner runtime's shutdown could access thread-locals that were
+        // already being destroyed during thread exit. Leaving the handle
+        // lets it naturally drain when the thread exits or when the next
+        // block_on call replaces it.
         result
     }
 

@@ -635,7 +635,16 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("failed to build runtime for wait tests");
-        runtime.block_on(future);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // Absorb TLS destructor panics from asupersync during runtime drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     #[test]

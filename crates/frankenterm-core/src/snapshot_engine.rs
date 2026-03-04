@@ -1219,7 +1219,16 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("snapshot test runtime should build");
-        runtime.block_on(future);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // Absorb TLS destructor panics from asupersync during runtime drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     fn make_test_pane(id: u64, rows: u32, cols: u32) -> PaneInfo {

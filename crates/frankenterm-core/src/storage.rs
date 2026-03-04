@@ -20468,7 +20468,16 @@ mod storage_handle_tests {
             .enable_all()
             .build()
             .expect("failed to build storage test runtime");
-        runtime.block_on(future);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // Absorb TLS destructor panics from asupersync during runtime drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -22204,7 +22213,16 @@ mod queue_depth_tests {
             .enable_all()
             .build()
             .expect("failed to build storage test runtime");
-        runtime.block_on(future);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // Absorb TLS destructor panics from asupersync during runtime drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     static QD_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -22451,7 +22469,16 @@ mod backpressure_integration_tests {
             .enable_all()
             .build()
             .expect("failed to build storage test runtime");
-        runtime.block_on(future);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // Absorb TLS destructor panics from asupersync during runtime drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     static BP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -25558,7 +25585,16 @@ mod timeline_integration_tests {
             .enable_all()
             .build()
             .expect("failed to build storage test runtime");
-        runtime.block_on(future);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        // Absorb TLS destructor panics from asupersync during runtime drop.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     fn make_pane(pane_id: u64, now: i64) -> PaneRecord {
