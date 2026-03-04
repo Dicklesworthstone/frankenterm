@@ -103,7 +103,15 @@ pub use views::{View, ViewState};
 mod ftui_stub;
 
 #[cfg(all(feature = "ftui", not(feature = "rollout")))]
-pub use ftui_stub::{App, AppConfig, View, ViewState, WaModel, WaMsg, run_tui};
+pub use ftui_stub::{App, AppConfig, View, ViewState, run_tui};
+
+// Export ftui-native model/message and alias types in both rollout and
+// non-rollout builds so benchmarks and tests can target the ftui surface
+// without depending on rollout-dispatched aliases.
+#[cfg(feature = "ftui")]
+pub use ftui_stub::{
+    AppConfig as FtuiAppConfig, View as FtuiView, ViewState as FtuiViewState, WaModel, WaMsg,
+};
 
 // Rollout dispatch: runtime backend selection via FT_TUI_BACKEND env var.
 // Compiles both backends and delegates at runtime based on operator preference.
