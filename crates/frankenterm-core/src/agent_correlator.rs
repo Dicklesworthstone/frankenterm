@@ -416,19 +416,56 @@ fn metadata_agent_type_for_provider(provider: &AgentProvider) -> String {
 
 /// Infer agent state from a detection rule_id.
 fn infer_state_from_rule(rule_id: &str) -> &'static str {
-    // Extract the suffix after the last ':'
-    let suffix = rule_id.rsplit(':').next().unwrap_or(rule_id);
-
-    match suffix {
-        "banner" | "session.start" => "starting",
-        "tool_use" | "compaction" => "working",
-        "rate_limited" | "usage_reached" | "usage.reached" | "quota_exceeded" => "rate_limited",
-        "approval_needed" | "approval_required" => "waiting_approval",
-        "cost_summary" | "session.end" | "token_usage" => "idle",
-        "auth.api_key_error" | "auth.login_required" | "auth.device_code_prompt" => "auth_error",
-        _ if suffix.starts_with("usage.warning") => "active",
-        _ => "active",
+    // Rule IDs historically used `provider:event` and now primarily use
+    // `provider.event` names. Match on terminal suffixes so both shapes map
+    // to the same state semantics.
+    let normalized = rule_id.trim();
+    if normalized.is_empty() {
+        return "active";
     }
+
+    if normalized.ends_with("banner") || normalized.ends_with("session.start") {
+        return "starting";
+    }
+
+    if normalized.ends_with("compaction.complete")
+        || normalized.ends_with("compaction_complete")
+        || normalized.ends_with("cost_summary")
+        || normalized.ends_with("session.summary")
+        || normalized.ends_with("session.end")
+        || normalized.ends_with("token_usage")
+    {
+        return "idle";
+    }
+
+    if normalized.ends_with("tool_use") || normalized.ends_with("compaction") {
+        return "working";
+    }
+
+    if normalized.ends_with("rate_limited")
+        || normalized.ends_with("usage_reached")
+        || normalized.ends_with("usage.reached")
+        || normalized.ends_with("quota_exceeded")
+    {
+        return "rate_limited";
+    }
+
+    if normalized.ends_with("approval_needed") || normalized.ends_with("approval_required") {
+        return "waiting_approval";
+    }
+
+    if normalized.ends_with("auth.api_key_error")
+        || normalized.ends_with("auth.login_required")
+        || normalized.ends_with("auth.device_code_prompt")
+    {
+        return "auth_error";
+    }
+
+    if normalized.contains("usage.warning") {
+        return "active";
+    }
+
+    "active"
 }
 
 /// Extract a session ID from detection extracted data (JSON).
@@ -1107,8 +1144,24 @@ mod tests {
 
     #[test]
     fn infer_state_multiple_colons_uses_last() {
-        // rsplit(':').next() gets the part after the last colon
+        // Legacy colon-delimited IDs must still be recognized.
         assert_eq!(infer_state_from_rule("a:b:c:banner"), "starting");
+    }
+
+    #[test]
+    fn infer_state_dot_delimited_rule_ids() {
+        assert_eq!(infer_state_from_rule("codex.usage_reached"), "rate_limited");
+        assert_eq!(
+            infer_state_from_rule("claude_code.approval_needed"),
+            "waiting_approval"
+        );
+        assert_eq!(
+            infer_state_from_rule("claude_code.compaction.complete"),
+            "idle"
+        );
+        assert_eq!(infer_state_from_rule("claude_code.session.end"), "idle");
+        assert_eq!(infer_state_from_rule("gemini.session.summary"), "idle");
+        assert_eq!(infer_state_from_rule("codex.session.token_usage"), "idle");
     }
 
     // ====================================================================
