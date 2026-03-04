@@ -6009,6 +6009,7 @@ async fn authorize_read_or_search_policy(
     .with_policy_rules(config.safety.rules.clone());
 
     let mut input = frankenterm_core::policy::PolicyInput::new(action, actor)
+        .with_surface(frankenterm_core::policy::PolicySurface::Mux)
         .with_text_summary(redact_for_output(summary));
     let mut domain = None;
 
@@ -6578,6 +6579,7 @@ fn build_send_dry_run_report(
 
     let summary = engine.redact_secrets(text);
     let mut input = PolicyInput::new(ActionKind::SendText, actor_kind)
+        .with_surface(frankenterm_core::policy::PolicySurface::Mux)
         .with_pane(pane_id)
         .with_domain(domain.clone())
         .with_capabilities(capabilities.clone())
@@ -13036,6 +13038,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 let summary = engine.redact_secrets(&text);
                                 let input =
                                     PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                                        .with_surface(frankenterm_core::policy::PolicySurface::Mux)
                                         .with_pane(pane_id)
                                         .with_domain(domain.clone())
                                         .with_capabilities(capabilities)
@@ -14647,7 +14650,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 let response = RobotResponse::<RobotEventsData>::error_with_code(
                                     ROBOT_ERR_INVALID_ARGS,
                                     "Invalid --cursor: must be non-negative".to_string(),
-                                    Some("Use the last `next_cursor` value from a prior response.".to_string()),
+                                    Some(
+                                        "Use the last `next_cursor` value from a prior response."
+                                            .to_string(),
+                                    ),
                                     elapsed_ms(start),
                                 );
                                 print_robot_response(&response, format, stats)?;
@@ -14674,18 +14680,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             // Query events
                             let events_result = if cursor_mode {
                                 storage
-                                    .get_events_stream(frankenterm_core::storage::EventStreamQuery {
-                                        after_id: cursor,
-                                        limit: Some(effective_limit),
-                                        pane_id: pane,
-                                        rule_id: rule_id.clone(),
-                                        event_type: event_type.clone(),
-                                        triage_state: triage_state.clone(),
-                                        label: label.clone(),
-                                        unhandled_only: unhandled,
-                                        since,
-                                        until: None,
-                                    })
+                                    .get_events_stream(
+                                        frankenterm_core::storage::EventStreamQuery {
+                                            after_id: cursor,
+                                            limit: Some(effective_limit),
+                                            pane_id: pane,
+                                            rule_id: rule_id.clone(),
+                                            event_type: event_type.clone(),
+                                            triage_state: triage_state.clone(),
+                                            label: label.clone(),
+                                            unhandled_only: unhandled,
+                                            since,
+                                            until: None,
+                                        },
+                                    )
                                     .await
                             } else {
                                 storage
@@ -19335,6 +19343,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     frankenterm_core::policy::ActionKind::SendText,
                     frankenterm_core::policy::ActorKind::Human,
                 )
+                .with_surface(frankenterm_core::policy::PolicySurface::Mux)
                 .with_pane(pane_id)
                 .with_domain(domain.clone())
                 .with_capabilities(capabilities)
@@ -21599,6 +21608,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     frankenterm_core::policy::ActionKind::SendText,
                     frankenterm_core::policy::ActorKind::Human,
                 )
+                .with_surface(frankenterm_core::policy::PolicySurface::Mux)
                 .with_pane(pane_id)
                 .with_domain(domain.clone())
                 .with_capabilities(capabilities)
@@ -21853,6 +21863,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         frankenterm_core::policy::ActionKind::WorkflowRun,
                         frankenterm_core::policy::ActorKind::Human,
                     )
+                    .with_surface(frankenterm_core::policy::PolicySurface::Workflow)
                     .with_pane(pane_id)
                     .with_workflow(&name);
 
@@ -22142,6 +22153,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         frankenterm_core::policy::ActionKind::SendText,
                         frankenterm_core::policy::ActorKind::Human,
                     )
+                    .with_surface(frankenterm_core::policy::PolicySurface::Mux)
                     .with_pane(pane_id)
                     .with_domain(domain.clone())
                     .with_capabilities(capabilities)
@@ -22398,6 +22410,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         frankenterm_core::policy::ActionKind::WorkflowRun,
                         frankenterm_core::policy::ActorKind::Human,
                     )
+                    .with_surface(frankenterm_core::policy::PolicySurface::Workflow)
                     .with_pane(pane_id)
                     .with_workflow(&workflow_name);
 
@@ -42838,6 +42851,13 @@ log_level = "debug"
             decision.is_allowed(),
             "default robot search should be allowed"
         );
+        let context = decision
+            .context()
+            .expect("read/search decisions should include decision context");
+        assert_eq!(
+            context.surface,
+            frankenterm_core::policy::PolicySurface::Mux
+        );
     }
 
     #[tokio::test]
@@ -42873,6 +42893,13 @@ log_level = "debug"
         .await;
         assert!(decision.is_denied(), "rule should deny robot search");
         assert_eq!(decision.reason(), Some("robot search blocked for test"));
+        let context = decision
+            .context()
+            .expect("read/search decisions should include decision context");
+        assert_eq!(
+            context.surface,
+            frankenterm_core::policy::PolicySurface::Mux
+        );
     }
 
     #[test]

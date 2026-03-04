@@ -2819,6 +2819,13 @@ impl WaAccountsRefreshTool {
     }
 }
 
+fn accounts_refresh_policy_input(summary: &str) -> PolicyInput {
+    PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
+        .with_surface(PolicySurface::Mcp)
+        .with_text_summary(summary.to_string())
+        .with_command_text(summary.to_string())
+}
+
 impl ToolHandler for WaAccountsRefreshTool {
     fn definition(&self) -> Tool {
         Tool {
@@ -2889,9 +2896,7 @@ impl ToolHandler for WaAccountsRefreshTool {
 
                 let mut engine = build_policy_engine(&config, false);
                 let summary = format!("caut refresh {service}");
-                let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
-                    .with_text_summary(summary.clone())
-                    .with_command_text(summary.clone());
+                let input = accounts_refresh_policy_input(&summary);
                 let decision = engine.authorize(&input);
                 if decision.is_denied() {
                     let reason = policy_reason(&decision)
@@ -4142,6 +4147,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn accounts_refresh_policy_input_uses_mcp_surface() {
+        let summary = "caut refresh openai";
+        let input = accounts_refresh_policy_input(summary);
+
+        assert_eq!(input.action, ActionKind::ExecCommand);
+        assert_eq!(input.actor, ActorKind::Mcp);
+        assert_eq!(input.surface, PolicySurface::Mcp);
+        assert_eq!(input.text_summary.as_deref(), Some(summary));
+        assert_eq!(input.command_text.as_deref(), Some(summary));
+    }
+
     // ========================================================================
     // All Tool Names Use wa. Prefix
     // ========================================================================
@@ -4202,11 +4219,7 @@ mod tests {
     #[test]
     fn all_tools_have_version() {
         for def in all_definitions() {
-            assert!(
-                def.version.is_some(),
-                "Tool {} missing version",
-                def.name
-            );
+            assert!(def.version.is_some(), "Tool {} missing version", def.name);
         }
     }
 
@@ -4277,12 +4290,7 @@ mod tests {
 
     #[test]
     fn tx_tool_names_stable() {
-        let expected = [
-            "wa.tx_plan",
-            "wa.tx_show",
-            "wa.tx_run",
-            "wa.tx_rollback",
-        ];
+        let expected = ["wa.tx_plan", "wa.tx_show", "wa.tx_run", "wa.tx_rollback"];
         let names: Vec<String> = all_definitions().iter().map(|d| d.name.clone()).collect();
         for expected_name in &expected {
             assert!(
@@ -4308,11 +4316,7 @@ mod tests {
 
     #[test]
     fn annotation_tool_names_stable() {
-        let expected = [
-            "wa.events_annotate",
-            "wa.events_triage",
-            "wa.events_label",
-        ];
+        let expected = ["wa.events_annotate", "wa.events_triage", "wa.events_label"];
         let names: Vec<String> = all_definitions().iter().map(|d| d.name.clone()).collect();
         for expected_name in &expected {
             assert!(
@@ -4331,8 +4335,14 @@ mod tests {
     fn state_tool_schema_has_domain_and_pane_id() {
         let def = WaStateTool::new(PaneFilterConfig::default()).definition();
         let props = def.input_schema.get("properties").unwrap();
-        assert!(props.get("domain").is_some(), "wa.state missing 'domain' param");
-        assert!(props.get("pane_id").is_some(), "wa.state missing 'pane_id' param");
+        assert!(
+            props.get("domain").is_some(),
+            "wa.state missing 'domain' param"
+        );
+        assert!(
+            props.get("pane_id").is_some(),
+            "wa.state missing 'pane_id' param"
+        );
     }
 
     #[test]

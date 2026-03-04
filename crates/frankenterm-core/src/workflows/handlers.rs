@@ -20,6 +20,31 @@ use super::*;
 /// detection trigger and upserts an `AgentSessionRecord`.
 pub struct HandleSessionEnd;
 
+fn parse_i64_field(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::String(raw) => parse_number(raw.trim()),
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|v| i64::try_from(v).ok())),
+        _ => None,
+    }
+}
+
+fn parse_cost_usd_field(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::String(raw) => {
+            let normalized = raw.trim().replace(',', "");
+            if normalized.is_empty() {
+                None
+            } else {
+                normalized.parse::<f64>().ok()
+            }
+        }
+        serde_json::Value::Number(number) => number.as_f64(),
+        _ => None,
+    }
+}
+
 impl HandleSessionEnd {
     #[must_use]
     pub fn new() -> Self {
@@ -61,32 +86,14 @@ impl HandleSessionEnd {
                 .map(ToString::to_string);
 
             // Token fields (Codex session.summary)
-            record.total_tokens = ext
-                .get("total")
-                .and_then(|v| v.as_str())
-                .and_then(parse_number);
-            record.input_tokens = ext
-                .get("input")
-                .and_then(|v| v.as_str())
-                .and_then(parse_number);
-            record.output_tokens = ext
-                .get("output")
-                .and_then(|v| v.as_str())
-                .and_then(parse_number);
-            record.cached_tokens = ext
-                .get("cached")
-                .and_then(|v| v.as_str())
-                .and_then(parse_number);
-            record.reasoning_tokens = ext
-                .get("reasoning")
-                .and_then(|v| v.as_str())
-                .and_then(parse_number);
+            record.total_tokens = ext.get("total").and_then(parse_i64_field);
+            record.input_tokens = ext.get("input").and_then(parse_i64_field);
+            record.output_tokens = ext.get("output").and_then(parse_i64_field);
+            record.cached_tokens = ext.get("cached").and_then(parse_i64_field);
+            record.reasoning_tokens = ext.get("reasoning").and_then(parse_i64_field);
 
             // Cost field (Claude Code session.cost_summary)
-            record.estimated_cost_usd = ext
-                .get("cost")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok());
+            record.estimated_cost_usd = ext.get("cost").and_then(parse_cost_usd_field);
 
             // Model name (if present in extracted)
             record.model_name = ext
@@ -3198,6 +3205,52 @@ mod tests {
         assert_eq!(record.total_tokens, Some(1000));
         assert!(record.input_tokens.is_none());
         assert!(record.estimated_cost_usd.is_none()); // "not_a_number" fails parse
+    }
+
+    #[test]
+    fn record_from_detection_accepts_numeric_json_fields() {
+        let detection = serde_json::json!({
+            "agent_type": "codex",
+            "event_type": "session.summary",
+            "extracted": {
+                "total": 10_000,
+                "input": 5_000,
+                "output": 3_000,
+                "cached": 1_500,
+                "reasoning": 500,
+                "cost": 0.42
+            }
+        });
+
+        let record = HandleSessionEnd::record_from_detection(7, &detection);
+        assert_eq!(record.total_tokens, Some(10_000));
+        assert_eq!(record.input_tokens, Some(5_000));
+        assert_eq!(record.output_tokens, Some(3_000));
+        assert_eq!(record.cached_tokens, Some(1_500));
+        assert_eq!(record.reasoning_tokens, Some(500));
+        assert!(
+            record
+                .estimated_cost_usd
+                .is_some_and(|v| (v - 0.42).abs() < f64::EPSILON)
+        );
+    }
+
+    #[test]
+    fn record_from_detection_parses_cost_with_thousands_separator() {
+        let detection = serde_json::json!({
+            "agent_type": "claude_code",
+            "event_type": "session.summary",
+            "extracted": {
+                "cost": "1,234.56"
+            }
+        });
+
+        let record = HandleSessionEnd::record_from_detection(8, &detection);
+        assert!(
+            record
+                .estimated_cost_usd
+                .is_some_and(|v| (v - 1234.56).abs() < f64::EPSILON)
+        );
     }
 
     // ========================================================================
