@@ -20475,6 +20475,10 @@ mod storage_handle_tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(runtime);
         }));
+        // Clear handle from TLS so it doesn't panic during thread exit.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
@@ -22220,6 +22224,10 @@ mod queue_depth_tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(runtime);
         }));
+        // Clear handle from TLS so it doesn't panic during thread exit.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
@@ -22475,6 +22483,10 @@ mod backpressure_integration_tests {
         // Absorb TLS destructor panics from asupersync during runtime drop.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(runtime);
+        }));
+        // Clear handle from TLS so it doesn't panic during thread exit.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -25591,6 +25603,10 @@ mod timeline_integration_tests {
         // Absorb TLS destructor panics from asupersync during runtime drop.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(runtime);
+        }));
+        // Clear handle from TLS so it doesn't panic during thread exit.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
