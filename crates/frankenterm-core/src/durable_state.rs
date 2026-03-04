@@ -123,8 +123,16 @@ impl DurableStateManager {
     /// Create with custom retention limit.
     pub fn with_max_checkpoints(max: usize) -> Self {
         Self {
-            max_checkpoints: max,
+            max_checkpoints: normalize_max_checkpoints(max),
             ..Self::new()
+        }
+    }
+
+    fn enforce_retention_limit(&mut self) {
+        let limit = normalize_max_checkpoints(self.max_checkpoints);
+        if self.checkpoints.len() > limit {
+            let drain_count = self.checkpoints.len() - limit;
+            self.checkpoints.drain(..drain_count);
         }
     }
 
@@ -159,14 +167,9 @@ impl DurableStateManager {
         };
 
         self.checkpoints.push(checkpoint);
+        self.enforce_retention_limit();
 
-        // Enforce retention limit
-        if self.checkpoints.len() > self.max_checkpoints {
-            let drain_count = self.checkpoints.len() - self.max_checkpoints;
-            self.checkpoints.drain(..drain_count);
-        }
-
-        self.checkpoints.last().unwrap()
+        self.checkpoints.last().expect("checkpoint must exist")
     }
 
     /// Create an auto-checkpoint if the interval has elapsed.
@@ -335,6 +338,7 @@ impl DurableStateManager {
         };
 
         self.rollback_history.push(record.clone());
+        self.enforce_retention_limit();
         Ok(record)
     }
 
@@ -601,6 +605,10 @@ fn epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn normalize_max_checkpoints(max: usize) -> usize {
+    max.max(1)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -693,6 +701,19 @@ mod tests {
         // Oldest checkpoints should have been evicted
         let summaries = mgr.list_checkpoints();
         assert_eq!(summaries[0].label, "cp-2");
+    }
+
+    #[test]
+    fn checkpoint_retention_limit_zero_clamps_to_one() {
+        let reg = make_registry(&[1]);
+        let mut mgr = DurableStateManager::with_max_checkpoints(0);
+
+        for i in 0..3 {
+            mgr.checkpoint(&reg, format!("cp-{i}"), CheckpointTrigger::Manual, HashMap::new());
+        }
+
+        assert_eq!(mgr.checkpoint_count(), 1);
+        assert_eq!(mgr.latest_checkpoint().unwrap().label, "cp-2");
     }
 
     #[test]
@@ -904,6 +925,22 @@ mod tests {
                 assert!(s.rolled_back, "checkpoint {} should be rolled_back", s.id);
             }
         }
+    }
+
+    #[test]
+    fn rollback_respects_retention_limit() {
+        let reg = make_registry(&[1]);
+        let mut mgr = DurableStateManager::with_max_checkpoints(3);
+
+        let cp1 = mgr.checkpoint(&reg, "cp1", CheckpointTrigger::Manual, HashMap::new()).id;
+        mgr.checkpoint(&reg, "cp2", CheckpointTrigger::Manual, HashMap::new());
+        mgr.checkpoint(&reg, "cp3", CheckpointTrigger::Manual, HashMap::new());
+
+        let mut reg_current = make_registry(&[1, 2]);
+        mgr.rollback(cp1, &mut reg_current, "rollback with retention").unwrap();
+
+        assert_eq!(mgr.checkpoint_count(), 3);
+        assert!(mgr.rollback_history().len() == 1);
     }
 
     // -------------------------------------------------------------------------

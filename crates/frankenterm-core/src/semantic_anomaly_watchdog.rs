@@ -87,6 +87,28 @@ impl Default for WatchdogConfig {
     }
 }
 
+fn sanitize_watchdog_config(mut config: WatchdogConfig) -> WatchdogConfig {
+    if config.queue_capacity == 0 {
+        tracing::warn!(
+            "semantic watchdog queue_capacity=0 is invalid; clamping to 1"
+        );
+        config.queue_capacity = 1;
+    }
+    if config.batch_size == 0 {
+        tracing::warn!("semantic watchdog batch_size=0 is invalid; clamping to 1");
+        config.batch_size = 1;
+    }
+    if config.max_segment_bytes < config.min_segment_bytes {
+        tracing::warn!(
+            min_segment_bytes = config.min_segment_bytes,
+            max_segment_bytes = config.max_segment_bytes,
+            "semantic watchdog max_segment_bytes < min_segment_bytes; clamping max to min"
+        );
+        config.max_segment_bytes = config.min_segment_bytes;
+    }
+    config
+}
+
 // =============================================================================
 // Metrics
 // =============================================================================
@@ -316,6 +338,7 @@ impl SemanticAnomalyWatchdog {
     where
         F: Fn(&[u8]) -> Vec<f32> + Send + 'static,
     {
+        let config = sanitize_watchdog_config(config);
         let queue = Arc::new(ArrayQueue::new(config.queue_capacity));
         let metrics = Arc::new(WatchdogMetrics::new());
         let running = Arc::new(AtomicBool::new(true));
@@ -617,6 +640,20 @@ mod tests {
         assert_eq!(restored.batch_timeout_ms, config.batch_timeout_ms);
     }
 
+    #[test]
+    fn sanitize_watchdog_config_clamps_invalid_values() {
+        let mut config = test_config();
+        config.queue_capacity = 0;
+        config.batch_size = 0;
+        config.min_segment_bytes = 128;
+        config.max_segment_bytes = 8;
+
+        let sanitized = sanitize_watchdog_config(config);
+        assert_eq!(sanitized.queue_capacity, 1);
+        assert_eq!(sanitized.batch_size, 1);
+        assert_eq!(sanitized.max_segment_bytes, 128);
+    }
+
     // =========================================================================
     // Metrics tests
     // =========================================================================
@@ -778,6 +815,24 @@ mod tests {
         assert!(watchdog.is_running());
         let snap = watchdog.metrics();
         assert_eq!(snap.segments_submitted, 0);
+        watchdog.shutdown();
+    }
+
+    #[test]
+    fn watchdog_start_clamps_zero_queue_and_batch_config() {
+        let mut config = test_config();
+        config.queue_capacity = 0;
+        config.batch_size = 0;
+
+        let watchdog = SemanticAnomalyWatchdog::start(config, mock_embed, None);
+        let handle = watchdog.handle();
+        assert_eq!(handle.queue_capacity(), 1);
+
+        assert!(handle.observe_segment(1, b"valid segment payload"));
+        std::thread::sleep(Duration::from_millis(30));
+
+        let snap = watchdog.metrics();
+        assert_eq!(snap.segments_submitted, 1);
         watchdog.shutdown();
     }
 

@@ -235,25 +235,57 @@ impl IpcRequest {
 }
 
 fn rpc_required_scope(args: &[String]) -> IpcScope {
-    let Some(cmd) = args.first().map(String::as_str) else {
+    let Some(cmd) = args.first().map(|value| value.trim().to_ascii_lowercase()) else {
         return IpcScope::Write;
     };
+    let subcmd = args.get(1).map(|value| value.trim().to_ascii_lowercase());
 
-    match cmd {
+    match cmd.as_str() {
         "send" | "approve" => IpcScope::Write,
-        "workflow" => match args.get(1).map(String::as_str) {
+        "help"
+        | "quickstart"
+        | "quick-start"
+        | "state"
+        | "get-text"
+        | "gettext"
+        | "wait-for"
+        | "waitfor"
+        | "search"
+        | "search-explain"
+        | "searchexplain"
+        | "cass"
+        | "why"
+        | "rules"
+        | "agents"
+        | "health" => IpcScope::Read,
+        "events" => match subcmd.as_deref() {
+            Some("annotate" | "triage" | "label") => IpcScope::Write,
+            _ => IpcScope::Read,
+        },
+        "workflow" => match subcmd.as_deref() {
             Some("run" | "abort") => IpcScope::Write,
-            _ => IpcScope::Read,
+            Some("status" | "list") => IpcScope::Read,
+            _ => IpcScope::Write,
         },
-        "accounts" => match args.get(1).map(String::as_str) {
+        "accounts" => match subcmd.as_deref() {
             Some("refresh") => IpcScope::Write,
-            _ => IpcScope::Read,
+            Some("list") => IpcScope::Read,
+            _ => IpcScope::Write,
         },
-        "reservations" => match args.get(1).map(String::as_str) {
+        "reservations" => match subcmd.as_deref() {
             Some("reserve" | "release") => IpcScope::Write,
-            _ => IpcScope::Read,
+            Some("list") => IpcScope::Read,
+            _ => IpcScope::Write,
         },
-        _ => IpcScope::Read,
+        "mission" => match subcmd.as_deref() {
+            Some("status" | "state" | "explain") => IpcScope::Read,
+            _ => IpcScope::Write,
+        },
+        "tx" => match subcmd.as_deref() {
+            Some("show" | "plan") => IpcScope::Read,
+            _ => IpcScope::Write,
+        },
+        _ => IpcScope::Write,
     }
 }
 
@@ -1499,6 +1531,10 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(runtime);
         }));
+        // Clear handle from TLS so it doesn't panic during thread exit.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
@@ -2172,7 +2208,7 @@ mod tests {
     #[test]
     fn rpc_required_scope_workflow_no_subcommand_is_read() {
         let args = vec!["workflow".to_string()];
-        assert_eq!(rpc_required_scope(&args), IpcScope::Read);
+        assert_eq!(rpc_required_scope(&args), IpcScope::Write);
     }
 
     #[test]
@@ -2185,6 +2221,12 @@ mod tests {
     fn rpc_required_scope_accounts_list_is_read() {
         let args = vec!["accounts".to_string(), "list".to_string()];
         assert_eq!(rpc_required_scope(&args), IpcScope::Read);
+    }
+
+    #[test]
+    fn rpc_required_scope_events_annotate_is_write() {
+        let args = vec!["events".to_string(), "annotate".to_string()];
+        assert_eq!(rpc_required_scope(&args), IpcScope::Write);
     }
 
     #[test]
@@ -2206,7 +2248,13 @@ mod tests {
     }
 
     #[test]
-    fn rpc_required_scope_unknown_command_is_read() {
+    fn rpc_required_scope_unknown_command_is_write() {
+        let args = vec!["not-a-real-command".to_string()];
+        assert_eq!(rpc_required_scope(&args), IpcScope::Write);
+    }
+
+    #[test]
+    fn rpc_required_scope_known_read_command_remains_read() {
         let args = vec!["events".to_string()];
         assert_eq!(rpc_required_scope(&args), IpcScope::Read);
     }
@@ -2262,6 +2310,14 @@ mod tests {
 
         let req = IpcRequest::Rpc {
             args: vec!["send".to_string(), "1".to_string()],
+        };
+        assert_eq!(req.required_scope(), IpcScope::Write);
+    }
+
+    #[test]
+    fn ipc_request_required_scope_rpc_unknown_defaults_to_write() {
+        let req = IpcRequest::Rpc {
+            args: vec!["unknown-op".to_string()],
         };
         assert_eq!(req.required_scope(), IpcScope::Write);
     }
