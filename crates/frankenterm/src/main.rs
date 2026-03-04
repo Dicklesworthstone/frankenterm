@@ -2464,6 +2464,14 @@ enum RobotCommands {
         #[arg(long)]
         since: Option<i64>,
 
+        /// Cursor checkpoint: only return events with id greater than this value
+        #[arg(long)]
+        cursor: Option<i64>,
+
+        /// Bounded replay window for cursor/event retrieval (defaults to --limit)
+        #[arg(long)]
+        replay_limit: Option<usize>,
+
         /// Preview which workflows would handle these events (no execution)
         #[arg(long)]
         would_handle: bool,
@@ -5290,6 +5298,14 @@ struct RobotEventsData {
     events: Vec<RobotEventItem>,
     total_count: usize,
     limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    order: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pane_filter: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14244,6 +14260,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             label,
                             unhandled,
                             since,
+                            cursor,
+                            replay_limit,
                             would_handle,
                             dry_run,
                             command,
@@ -14625,20 +14643,66 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
 
                             // Build event query
-                            let query = frankenterm_core::storage::EventQuery {
-                                limit: Some(limit),
-                                pane_id: pane,
-                                rule_id: rule_id.clone(),
-                                event_type: event_type.clone(),
-                                triage_state: triage_state.clone(),
-                                label: label.clone(),
-                                unhandled_only: unhandled,
-                                since,
-                                until: None,
+                            if cursor.is_some_and(|value| value < 0) {
+                                let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    "Invalid --cursor: must be non-negative".to_string(),
+                                    Some("Use the last `next_cursor` value from a prior response.".to_string()),
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+                            if replay_limit.is_some_and(|value| value == 0) {
+                                let response = RobotResponse::<RobotEventsData>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    "Invalid --replay-limit: must be >= 1".to_string(),
+                                    None,
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
+                            }
+                            let effective_limit = replay_limit.unwrap_or(limit);
+                            let cursor_mode = cursor.is_some();
+                            let order = if cursor_mode {
+                                Some("id_asc".to_string())
+                            } else {
+                                None
                             };
 
                             // Query events
-                            match storage.get_events(query).await {
+                            let events_result = if cursor_mode {
+                                storage
+                                    .get_events_stream(frankenterm_core::storage::EventStreamQuery {
+                                        after_id: cursor,
+                                        limit: Some(effective_limit),
+                                        pane_id: pane,
+                                        rule_id: rule_id.clone(),
+                                        event_type: event_type.clone(),
+                                        triage_state: triage_state.clone(),
+                                        label: label.clone(),
+                                        unhandled_only: unhandled,
+                                        since,
+                                        until: None,
+                                    })
+                                    .await
+                            } else {
+                                storage
+                                    .get_events(frankenterm_core::storage::EventQuery {
+                                        limit: Some(effective_limit),
+                                        pane_id: pane,
+                                        rule_id: rule_id.clone(),
+                                        event_type: event_type.clone(),
+                                        triage_state: triage_state.clone(),
+                                        label: label.clone(),
+                                        unhandled_only: unhandled,
+                                        since,
+                                        until: None,
+                                    })
+                                    .await
+                            };
+                            match events_result {
                                 Ok(events) => {
                                     let include_preview = would_handle || dry_run;
                                     let rule_index = if include_preview {
@@ -14715,7 +14779,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let data = RobotEventsData {
                                         events: items,
                                         total_count,
-                                        limit,
+                                        limit: effective_limit,
+                                        cursor,
+                                        next_cursor: if cursor_mode {
+                                            events.last().map(|event| event.id)
+                                        } else {
+                                            None
+                                        },
+                                        replay_limit,
+                                        order,
                                         pane_filter: pane,
                                         rule_id_filter: rule_id,
                                         event_type_filter: event_type,
@@ -42677,6 +42749,8 @@ log_level = "debug"
                     label,
                     unhandled,
                     since,
+                    cursor,
+                    replay_limit,
                     would_handle,
                     dry_run,
                     command,
@@ -42689,6 +42763,8 @@ log_level = "debug"
                     assert_eq!(label, None);
                     assert!(!unhandled);
                     assert_eq!(since, None);
+                    assert_eq!(cursor, None);
+                    assert_eq!(replay_limit, None);
                     assert!(!would_handle);
                     assert!(!dry_run);
                     assert!(command.is_none());
@@ -42708,6 +42784,35 @@ log_level = "debug"
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Events { limit, .. }) => {
                     assert_eq!(limit, 6);
+                }
+                _ => panic!("expected RobotCommands::Events"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_events_cursor_and_replay_limit_parse() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "events",
+            "--cursor",
+            "42",
+            "--replay-limit",
+            "7",
+        ])
+        .expect("robot events cursor/replay args should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Events {
+                    cursor,
+                    replay_limit,
+                    ..
+                }) => {
+                    assert_eq!(cursor, Some(42));
+                    assert_eq!(replay_limit, Some(7));
                 }
                 _ => panic!("expected RobotCommands::Events"),
             },
