@@ -223,34 +223,19 @@ mod tests {
 
     #[test]
     fn parse_format_json() {
-        assert_eq!(
-            parse_mcp_output_format("json"),
-            Some(McpOutputFormat::Json)
-        );
+        assert_eq!(parse_mcp_output_format("json"), Some(McpOutputFormat::Json));
     }
 
     #[test]
     fn parse_format_toon() {
-        assert_eq!(
-            parse_mcp_output_format("toon"),
-            Some(McpOutputFormat::Toon)
-        );
+        assert_eq!(parse_mcp_output_format("toon"), Some(McpOutputFormat::Toon));
     }
 
     #[test]
     fn parse_format_case_insensitive() {
-        assert_eq!(
-            parse_mcp_output_format("JSON"),
-            Some(McpOutputFormat::Json)
-        );
-        assert_eq!(
-            parse_mcp_output_format("Toon"),
-            Some(McpOutputFormat::Toon)
-        );
-        assert_eq!(
-            parse_mcp_output_format("TOON"),
-            Some(McpOutputFormat::Toon)
-        );
+        assert_eq!(parse_mcp_output_format("JSON"), Some(McpOutputFormat::Json));
+        assert_eq!(parse_mcp_output_format("Toon"), Some(McpOutputFormat::Toon));
+        assert_eq!(parse_mcp_output_format("TOON"), Some(McpOutputFormat::Toon));
     }
 
     #[test]

@@ -253,12 +253,13 @@ fn check_refresh_cooldown(
     now_ms_val: i64,
     cooldown_ms: i64,
 ) -> Option<(i64, i64)> {
-    if most_recent_refresh_ms <= 0 {
+    if most_recent_refresh_ms <= 0 || cooldown_ms <= 0 {
         return None;
     }
-    let elapsed = now_ms_val - most_recent_refresh_ms;
+    let elapsed = (now_ms_val - most_recent_refresh_ms).max(0);
     if elapsed < cooldown_ms {
-        Some((elapsed / 1000, (cooldown_ms - elapsed) / 1000))
+        let remaining = (cooldown_ms - elapsed).max(0);
+        Some((elapsed / 1000, remaining / 1000))
     } else {
         None
     }
@@ -1523,6 +1524,19 @@ mod tests {
     fn check_refresh_cooldown_exactly_at_boundary() {
         // Exactly at cooldown boundary
         assert!(check_refresh_cooldown(40_000, 100_000, 60_000).is_none());
+    }
+
+    #[test]
+    fn check_refresh_cooldown_future_timestamp_clamps_to_zero_elapsed() {
+        // System clock moved backward or persisted refresh timestamp is in the future.
+        let result = check_refresh_cooldown(120_000, 100_000, 60_000);
+        assert_eq!(result, Some((0, 60)));
+    }
+
+    #[test]
+    fn check_refresh_cooldown_non_positive_window_is_disabled() {
+        assert!(check_refresh_cooldown(100_000, 101_000, 0).is_none());
+        assert!(check_refresh_cooldown(100_000, 101_000, -1).is_none());
     }
 
     // ── resolve_alt_screen_state tests ───────────────────────────────────

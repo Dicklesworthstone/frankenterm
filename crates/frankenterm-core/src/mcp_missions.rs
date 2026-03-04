@@ -581,7 +581,11 @@ mod tests {
     fn kill_switch_safe_mode_variants() {
         for variant in &["safe_mode", "safe-mode", "safemode"] {
             let level = mcp_parse_mission_kill_switch(Some(variant)).unwrap();
-            assert_eq!(level, MissionKillSwitchLevel::SafeMode, "failed for {variant}");
+            assert_eq!(
+                level,
+                MissionKillSwitchLevel::SafeMode,
+                "failed for {variant}"
+            );
         }
     }
 
@@ -589,7 +593,11 @@ mod tests {
     fn kill_switch_hard_stop_variants() {
         for variant in &["hard_stop", "hard-stop", "hardstop"] {
             let level = mcp_parse_mission_kill_switch(Some(variant)).unwrap();
-            assert_eq!(level, MissionKillSwitchLevel::HardStop, "failed for {variant}");
+            assert_eq!(
+                level,
+                MissionKillSwitchLevel::HardStop,
+                "failed for {variant}"
+            );
         }
     }
 
@@ -657,7 +665,10 @@ mod tests {
     #[test]
     fn tx_transition_from_planned_has_entries() {
         let transitions = mcp_tx_transition_info(MissionTxState::Planned);
-        assert!(!transitions.is_empty(), "Planned state should have transitions");
+        assert!(
+            !transitions.is_empty(),
+            "Planned state should have transitions"
+        );
     }
 
     #[test]
@@ -679,7 +690,10 @@ mod tests {
     #[test]
     fn lifecycle_transitions_from_planning_has_entries() {
         let transitions = mcp_mission_lifecycle_transitions(MissionLifecycleState::Planning);
-        assert!(!transitions.is_empty(), "Planning state should have transitions");
+        assert!(
+            !transitions.is_empty(),
+            "Planning state should have transitions"
+        );
     }
 
     #[test]
@@ -827,7 +841,14 @@ mod tests {
     #[test]
     fn assignments_limit_truncates() {
         let assignments: Vec<Assignment> = (0..10)
-            .map(|i| make_assignment(&format!("a{i}"), &format!("agent-{i}"), ApprovalState::NotRequired, None))
+            .map(|i| {
+                make_assignment(
+                    &format!("a{i}"),
+                    &format!("agent-{i}"),
+                    ApprovalState::NotRequired,
+                    None,
+                )
+            })
             .collect();
         let mission = make_mission_with_assignments(assignments);
         let mut filters = empty_filters();
@@ -840,21 +861,42 @@ mod tests {
     #[test]
     fn assignments_counters_track_all_states() {
         let a1 = make_assignment(
-            "a1", "ag1", ApprovalState::NotRequired,
-            Some(Outcome::Success { reason_code: "ok".to_string(), completed_at_ms: 1 }),
+            "a1",
+            "ag1",
+            ApprovalState::NotRequired,
+            Some(Outcome::Success {
+                reason_code: "ok".to_string(),
+                completed_at_ms: 1,
+            }),
         );
         let a2 = make_assignment(
-            "a2", "ag2", ApprovalState::NotRequired,
-            Some(Outcome::Failed { reason_code: "err".to_string(), error_code: "E1".to_string(), completed_at_ms: 2 }),
+            "a2",
+            "ag2",
+            ApprovalState::NotRequired,
+            Some(Outcome::Failed {
+                reason_code: "err".to_string(),
+                error_code: "E1".to_string(),
+                completed_at_ms: 2,
+            }),
         );
         let a3 = make_assignment(
-            "a3", "ag3",
-            ApprovalState::Denied { denied_by: "op".to_string(), denied_at_ms: 3, reason_code: "no".to_string() },
+            "a3",
+            "ag3",
+            ApprovalState::Denied {
+                denied_by: "op".to_string(),
+                denied_at_ms: 3,
+                reason_code: "no".to_string(),
+            },
             None,
         );
         let a4 = make_assignment(
-            "a4", "ag4", ApprovalState::NotRequired,
-            Some(Outcome::Cancelled { reason_code: "abort".to_string(), completed_at_ms: 4 }),
+            "a4",
+            "ag4",
+            ApprovalState::NotRequired,
+            Some(Outcome::Cancelled {
+                reason_code: "abort".to_string(),
+                completed_at_ms: 4,
+            }),
         );
         let mission = make_mission_with_assignments(vec![a1, a2, a3, a4]);
         let (_, counters, _) = mcp_build_mission_assignments(&mission, &empty_filters());
@@ -1041,20 +1083,15 @@ mod tests {
     #[test]
     fn resolve_tx_file_path_explicit() {
         // When explicit path is given, it is used directly
-        let result = mcp_resolve_mission_tx_file_path(
-            &Config::default(),
-            Some("/tmp/my-tx.json"),
-        );
+        let result = mcp_resolve_mission_tx_file_path(&Config::default(), Some("/tmp/my-tx.json"));
         // With explicit path, Config doesn't matter
         assert_eq!(result.unwrap(), PathBuf::from("/tmp/my-tx.json"));
     }
 
     #[test]
     fn resolve_mission_file_path_explicit() {
-        let result = mcp_resolve_mission_file_path(
-            &Config::default(),
-            Some("/tmp/my-mission.json"),
-        );
+        let result =
+            mcp_resolve_mission_file_path(&Config::default(), Some("/tmp/my-mission.json"));
         assert_eq!(result.unwrap(), PathBuf::from("/tmp/my-mission.json"));
     }
 }

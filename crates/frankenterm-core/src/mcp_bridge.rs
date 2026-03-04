@@ -15,9 +15,7 @@ use super::{
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
     WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowsResource,
 };
-use crate::mcp_framework::{
-    FrameworkServer as Server, FrameworkStdioTransport as StdioTransport,
-};
+use crate::mcp_framework::{FrameworkServer as Server, FrameworkStdioTransport as StdioTransport};
 use std::path::PathBuf;
 use std::sync::Arc;
 

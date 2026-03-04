@@ -681,7 +681,9 @@ mod tests {
 
     #[test]
     fn rules_by_agent_template_has_template() {
-        let template = WaRulesByAgentTemplateResource.template().expect("should have template");
+        let template = WaRulesByAgentTemplateResource
+            .template()
+            .expect("should have template");
         assert_eq!(template.uri_template, "wa://rules/{agent_type}");
     }
 
@@ -716,17 +718,31 @@ mod tests {
     fn all_resource_uris_are_unique() {
         let db = db_path();
         let uris = [
-            WaPanesResource::new(PaneFilterConfig::default()).definition().uri,
+            WaPanesResource::new(PaneFilterConfig::default())
+                .definition()
+                .uri,
             WaEventsResource::new(Arc::clone(&db)).definition().uri,
-            WaEventsTemplateResource::new(Arc::clone(&db)).definition().uri,
-            WaEventsUnhandledTemplateResource::new(Arc::clone(&db)).definition().uri,
+            WaEventsTemplateResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
+            WaEventsUnhandledTemplateResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
             WaAccountsResource::new(Arc::clone(&db)).definition().uri,
-            WaAccountsByServiceTemplateResource::new(Arc::clone(&db)).definition().uri,
+            WaAccountsByServiceTemplateResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
             WaRulesResource.definition().uri,
             WaRulesByAgentTemplateResource.definition().uri,
-            WaWorkflowsResource::new(Arc::new(Config::default())).definition().uri,
-            WaReservationsResource::new(Arc::clone(&db)).definition().uri,
-            WaReservationsByPaneTemplateResource::new(Arc::clone(&db)).definition().uri,
+            WaWorkflowsResource::new(Arc::new(Config::default()))
+                .definition()
+                .uri,
+            WaReservationsResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
+            WaReservationsByPaneTemplateResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
         ];
         let mut seen = std::collections::HashSet::new();
         for uri in &uris {
@@ -742,11 +758,17 @@ mod tests {
     fn all_resource_uris_use_wa_scheme() {
         let db = db_path();
         let uris = [
-            WaPanesResource::new(PaneFilterConfig::default()).definition().uri,
+            WaPanesResource::new(PaneFilterConfig::default())
+                .definition()
+                .uri,
             WaEventsResource::new(Arc::clone(&db)).definition().uri,
             WaRulesResource.definition().uri,
-            WaWorkflowsResource::new(Arc::new(Config::default())).definition().uri,
-            WaReservationsResource::new(Arc::clone(&db)).definition().uri,
+            WaWorkflowsResource::new(Arc::new(Config::default()))
+                .definition()
+                .uri,
+            WaReservationsResource::new(Arc::clone(&db))
+                .definition()
+                .uri,
         ];
         for uri in &uris {
             assert!(uri.starts_with("wa://"), "URI {uri} missing wa:// scheme");

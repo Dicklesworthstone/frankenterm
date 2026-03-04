@@ -934,9 +934,15 @@ mod tests {
     fn now_ms_returns_reasonable_epoch() {
         let ms = now_ms();
         // Should be after 2024-01-01 (1704067200000ms)
-        assert!(ms > 1_704_067_200_000, "now_ms returned suspiciously low value: {ms}");
+        assert!(
+            ms > 1_704_067_200_000,
+            "now_ms returned suspiciously low value: {ms}"
+        );
         // Should be before 2030-01-01 (1893456000000ms)
-        assert!(ms < 1_893_456_000_000, "now_ms returned suspiciously high value: {ms}");
+        assert!(
+            ms < 1_893_456_000_000,
+            "now_ms returned suspiciously high value: {ms}"
+        );
     }
 
     #[test]
@@ -984,7 +990,8 @@ mod tests {
 
     #[test]
     fn envelope_error_fields() {
-        let envelope = McpEnvelope::<()>::error("FT-MCP-0001", "bad input", Some("fix it".to_string()), 10);
+        let envelope =
+            McpEnvelope::<()>::error("FT-MCP-0001", "bad input", Some("fix it".to_string()), 10);
         assert!(!envelope.ok);
         assert!(envelope.data.is_none());
         assert_eq!(envelope.error.as_deref(), Some("bad input"));
