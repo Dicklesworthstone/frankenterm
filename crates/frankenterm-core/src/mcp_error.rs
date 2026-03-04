@@ -52,6 +52,7 @@ impl McpToolError {
         }
     }
 
+    #[allow(dead_code)] // symmetric with from_caut_error; cass handlers inline the logic today
     pub(crate) fn from_cass_error(err: CassError) -> Self {
         let (code, hint) = map_cass_error(&err);
         Self {
