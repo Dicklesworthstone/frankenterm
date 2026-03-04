@@ -47,23 +47,26 @@ The machine-readable source of truth is `SURFACE_CONTRACT_V1` in that module.
   - `crates/frankenterm-core/src/tailer.rs` (tests)
 - Replaced external call-sites of transitional MPSC/watch helper shims in runtime hot paths with explicit backend-aware local semantics:
   - `crates/frankenterm-core/src/runtime.rs`
+- Replaced external call-sites of transitional MPSC/watch helper shims in vendored subscription paths with explicit backend-aware local semantics:
+  - `crates/frankenterm-core/src/vendored/mux_client.rs`
 - Added contract guardrail e2e script:
   - `tests/e2e/test_ft_e34d9_10_2_3_runtime_compat_contraction.sh`
-  - now enforces zero `mpsc_recv_option` / `mpsc_send` / `watch_has_changed` / `watch_borrow_and_update_clone` call-sites outside `runtime_compat.rs`.
+  - now enforces zero `mpsc_recv_option` / `mpsc_send` / `watch_has_changed` / `watch_borrow_and_update_clone` / `watch_changed` call-sites outside `runtime_compat.rs`.
 
 ## Validation Artifacts
 
 - Command:
   - `tests/e2e/test_ft_e34d9_10_2_3_runtime_compat_contraction.sh`
 - Latest run:
-  - `tests/e2e/logs/ft_e34d9_10_2_3_20260304_022100.jsonl`
+  - `tests/e2e/logs/ft_e34d9_10_2_3_20260304_064346.jsonl`
 - Outcome:
   - Preflight failed fast because `rch workers probe --all` reported zero reachable workers.
   - Harness emitted `reason_code=rch_health_probe_mismatch` (`RCH-E101`) after `rch check` passed but probe showed no reachable workers.
   - Offload-only policy correctly prevented cargo-test execution when no remote worker was reachable.
+  - Contract guardrails now run before remote-worker preflight, so helper/allowlist regression checks still execute and emit artifacts even when remote offload is unavailable.
 - Slice-level static checks (non-compile, no local cargo fallback):
-  - `rg -n "\b(mpsc_recv_option|mpsc_send|watch_has_changed|watch_borrow_and_update_clone)\b" crates/frankenterm-core/src --glob '!runtime_compat.rs'` -> no matches
-  - `rustfmt --edition 2024 --check crates/frankenterm-core/src/runtime.rs crates/frankenterm-core/src/runtime_compat.rs` -> pass
+  - `rg -n "\b(runtime_compat::)?(mpsc_recv_option|mpsc_send|watch_has_changed|watch_borrow_and_update_clone|watch_changed)\b" crates/frankenterm-core/src --glob '!runtime_compat.rs'` -> no matches
+  - `rustfmt --edition 2024 --check crates/frankenterm-core/src/vendored/mux_client.rs` -> pass
   - `bash -n tests/e2e/test_ft_e34d9_10_2_3_runtime_compat_contraction.sh` -> pass
 - Notes:
   - `CARGO_TARGET_DIR` is run-unique (`...-<RUN_ID>`) to avoid cross-run artifact lock contention.

@@ -60,6 +60,14 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
         name: "mux_client_ops/subscription_setup/tokio_baseline",
         budget: "tokio poller setup+cancel baseline remains responsive",
     },
+    bench_common::BenchBudget {
+        name: "mux_client_ops/render_changes_poll",
+        budget: "direct client render-change polling stays low-latency across pane ids",
+    },
+    bench_common::BenchBudget {
+        name: "mux_client_ops/render_changes_poll/tokio_baseline",
+        budget: "tokio-equivalent render-change polling baseline stays bounded",
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -619,11 +627,69 @@ fn bench_subscription_setup(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_render_changes_poll(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("mux_client_ops/render_changes_poll");
+    let socket = socket_path("render-changes");
+    let _server = rt.block_on(spawn_mock_mux_server(
+        socket.clone(),
+        MockServerConfig {
+            list_window_titles: 1,
+            list_title_len: 16,
+        },
+    ));
+    let direct_client = Arc::new(Mutex::new(rt.block_on(connect_client(&socket))));
+    let tokio_baseline = Arc::new(Mutex::new(rt.block_on(connect_tokio_baseline(&socket))));
+
+    group.throughput(Throughput::Elements(1));
+    for &pane_id in &[1_u64, 42, 4096] {
+        group.bench_with_input(
+            BenchmarkId::new("direct_client_get_pane_render_changes", pane_id),
+            &pane_id,
+            |b, &pane_id| {
+                let direct_client = Arc::clone(&direct_client);
+                b.to_async(&rt).iter(|| {
+                    let direct_client = Arc::clone(&direct_client);
+                    async move {
+                        let mut client = direct_client.lock().await;
+                        let response = client
+                            .get_pane_render_changes(pane_id)
+                            .await
+                            .expect("get_pane_render_changes");
+                        black_box((response.pane_id, response.seqno));
+                    }
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("tokio_baseline_get_pane_render_changes", pane_id),
+            &pane_id,
+            |b, &pane_id| {
+                let tokio_baseline = Arc::clone(&tokio_baseline);
+                b.to_async(&rt).iter(|| {
+                    let tokio_baseline = Arc::clone(&tokio_baseline);
+                    async move {
+                        let mut client = tokio_baseline.lock().await;
+                        let response = client
+                            .get_pane_render_changes(pane_id)
+                            .await
+                            .expect("tokio baseline get_pane_render_changes");
+                        black_box((response.pane_id, response.seqno));
+                    }
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_suite(c: &mut Criterion) {
     bench_pdu_encode_write(c);
     bench_pdu_read_decode(c);
     bench_pdu_roundtrip(c);
     bench_subscription_setup(c);
+    bench_render_changes_poll(c);
     bench_common::emit_bench_artifacts("mux_client_ops", BUDGETS);
 }
 

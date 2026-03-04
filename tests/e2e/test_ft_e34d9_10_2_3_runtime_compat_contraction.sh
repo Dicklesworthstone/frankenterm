@@ -128,11 +128,48 @@ validate_spawn_blocking_allowlist() {
 
 validate_runtime_compat_helper_callsites() {
   local output_file="$1"
-  rg -n "\\b(mpsc_recv_option|mpsc_send|watch_has_changed|watch_borrow_and_update_clone)\\b" \
+  rg -n "\\b(mpsc_recv_option|mpsc_send|watch_has_changed|watch_borrow_and_update_clone|watch_changed)\\b" \
     crates/frankenterm-core/src \
     --glob '!runtime_compat.rs' \
     > "${output_file}" || true
   [[ ! -s "${output_file}" ]]
+}
+
+run_static_contract_checks() {
+  local allowlist_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_allowlist_nominal.log"
+  if validate_spawn_blocking_allowlist "nominal" "${allowlist_log}"; then
+    emit_log "validation" "compat_surface.allowlist.nominal" "allowed=search_bridge_only" "passed" "allowlist_enforced" "none" "$(basename "${allowlist_log}")"
+  else
+    emit_log "validation" "compat_surface.allowlist.nominal" "allowed=search_bridge_only" "failed" "unexpected_spawn_blocking_callsite" "SURFACE-E200" "$(basename "${allowlist_log}")"
+    cat "${allowlist_log}" >&2
+    exit 1
+  fi
+
+  local failure_injection_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_allowlist_failure_injection.log"
+  if validate_spawn_blocking_allowlist "failure_injection" "${failure_injection_log}"; then
+    emit_log "validation" "compat_surface.allowlist.failure_injection" "allowed=none" "passed" "detector_triggered_expected_failure" "none" "$(basename "${failure_injection_log}")"
+  else
+    emit_log "validation" "compat_surface.allowlist.failure_injection" "allowed=none" "failed" "detector_missed_expected_failure" "SURFACE-E201" "$(basename "${failure_injection_log}")"
+    exit 1
+  fi
+
+  local recovery_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_allowlist_recovery.log"
+  if validate_spawn_blocking_allowlist "nominal" "${recovery_log}"; then
+    emit_log "validation" "compat_surface.allowlist.recovery" "allowed=search_bridge_only" "passed" "recovery_check_passed" "none" "$(basename "${recovery_log}")"
+  else
+    emit_log "validation" "compat_surface.allowlist.recovery" "allowed=search_bridge_only" "failed" "recovery_check_failed" "SURFACE-E202" "$(basename "${recovery_log}")"
+    cat "${recovery_log}" >&2
+    exit 1
+  fi
+
+  local helper_guard_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_runtime_compat_helpers.log"
+  if validate_runtime_compat_helper_callsites "${helper_guard_log}"; then
+    emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_compat_helper_callsites_outside_runtime_compat_rs" "passed" "runtime_compat_helper_replacement_enforced" "none" "$(basename "${helper_guard_log}")"
+  else
+    emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_compat_helper_callsites_outside_runtime_compat_rs" "failed" "unexpected_runtime_compat_helper_callsite" "SURFACE-E203" "$(basename "${helper_guard_log}")"
+    cat "${helper_guard_log}" >&2
+    exit 1
+  fi
 }
 
 cd "${ROOT_DIR}"
@@ -145,6 +182,7 @@ require_cmd cargo
 
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
 emit_log "preflight" "target_dir" "cargo_target_dir=${CARGO_TARGET_DIR}" "configured" "none" "none" "$(basename "${LOG_FILE}")"
+run_static_contract_checks
 
 probe_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_probe.json"
 status_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_status.json"
@@ -190,41 +228,6 @@ else
   fi
   echo "workers probe found no reachable remote workers; refusing local fallback" >&2
   exit 2
-fi
-
-allowlist_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_allowlist_nominal.log"
-if validate_spawn_blocking_allowlist "nominal" "${allowlist_log}"; then
-  emit_log "validation" "compat_surface.allowlist.nominal" "allowed=search_bridge_only" "passed" "allowlist_enforced" "none" "$(basename "${allowlist_log}")"
-else
-  emit_log "validation" "compat_surface.allowlist.nominal" "allowed=search_bridge_only" "failed" "unexpected_spawn_blocking_callsite" "SURFACE-E200" "$(basename "${allowlist_log}")"
-  cat "${allowlist_log}" >&2
-  exit 1
-fi
-
-failure_injection_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_allowlist_failure_injection.log"
-if validate_spawn_blocking_allowlist "failure_injection" "${failure_injection_log}"; then
-  emit_log "validation" "compat_surface.allowlist.failure_injection" "allowed=none" "passed" "detector_triggered_expected_failure" "none" "$(basename "${failure_injection_log}")"
-else
-  emit_log "validation" "compat_surface.allowlist.failure_injection" "allowed=none" "failed" "detector_missed_expected_failure" "SURFACE-E201" "$(basename "${failure_injection_log}")"
-  exit 1
-fi
-
-recovery_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_allowlist_recovery.log"
-if validate_spawn_blocking_allowlist "nominal" "${recovery_log}"; then
-  emit_log "validation" "compat_surface.allowlist.recovery" "allowed=search_bridge_only" "passed" "recovery_check_passed" "none" "$(basename "${recovery_log}")"
-else
-  emit_log "validation" "compat_surface.allowlist.recovery" "allowed=search_bridge_only" "failed" "recovery_check_failed" "SURFACE-E202" "$(basename "${recovery_log}")"
-  cat "${recovery_log}" >&2
-  exit 1
-fi
-
-helper_guard_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_runtime_compat_helpers.log"
-if validate_runtime_compat_helper_callsites "${helper_guard_log}"; then
-  emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_compat_helper_callsites_outside_runtime_compat_rs" "passed" "runtime_compat_helper_replacement_enforced" "none" "$(basename "${helper_guard_log}")"
-else
-  emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_compat_helper_callsites_outside_runtime_compat_rs" "failed" "unexpected_runtime_compat_helper_callsite" "SURFACE-E203" "$(basename "${helper_guard_log}")"
-  cat "${helper_guard_log}" >&2
-  exit 1
 fi
 
 run_rch_test_step \
