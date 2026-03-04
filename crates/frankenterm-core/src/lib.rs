@@ -106,6 +106,7 @@ pub mod cleanup;
 pub mod code_scanner;
 pub mod command_guard;
 pub mod command_transport;
+pub mod connector_event_model;
 pub mod connector_host_runtime;
 pub mod connector_inbound_bridge;
 pub mod connector_mesh;
