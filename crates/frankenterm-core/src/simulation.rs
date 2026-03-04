@@ -1381,6 +1381,19 @@ mod tests {
     use crate::wezterm::WeztermInterface;
     use std::collections::BTreeSet;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build simulation test runtime");
+        runtime.block_on(future);
+    }
+
+
     const BASIC_SCENARIO: &str = r#"
 name: basic_test
 description: "A simple test scenario"
@@ -1665,8 +1678,8 @@ events:
         }
     }
 
-    #[tokio::test]
-    async fn setup_creates_panes() {
+    #[test]
+    fn setup_creates_panes() { run_async_test(async {
         let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
         let mock = MockWezterm::new();
         scenario.setup(&mock).await.unwrap();
@@ -1675,10 +1688,10 @@ events:
         let state = mock.pane_state(0).await.unwrap();
         assert_eq!(state.title, "Main");
         assert_eq!(state.content, "$ ");
-    }
+    }); }
 
-    #[tokio::test]
-    async fn execute_all_injects_events() {
+    #[test]
+    fn execute_all_injects_events() { run_async_test(async {
         let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
         let mock = MockWezterm::new();
         scenario.setup(&mock).await.unwrap();
@@ -1689,10 +1702,10 @@ events:
         let text = mock.get_text(0, false).await.unwrap();
         assert!(text.contains("hello world"));
         assert!(text.contains("done"));
-    }
+    }); }
 
-    #[tokio::test]
-    async fn execute_all_with_resize_timeline_records_stage_probes() {
+    #[test]
+    fn execute_all_with_resize_timeline_records_stage_probes() { run_async_test(async {
         let yaml = r#"
 name: resize_probe_case
 duration: "10s"
@@ -1766,10 +1779,10 @@ events:
                 "queue depth should be non-increasing for dequeued event"
             );
         }
-    }
+    }); }
 
-    #[tokio::test]
-    async fn resize_timeline_summary_and_flame_samples_cover_all_stages() {
+    #[test]
+    fn resize_timeline_summary_and_flame_samples_cover_all_stages() { run_async_test(async {
         let yaml = r#"
 name: resize_probe_summary
 duration: "6s"
@@ -1820,10 +1833,10 @@ events:
         for stage in ResizeTimelineStage::ALL {
             assert!(stage_suffixes.contains(stage.as_str()));
         }
-    }
+    }); }
 
-    #[tokio::test]
-    async fn set_font_size_render_prep_uses_staged_atlas_and_shader_warmup_policy() {
+    #[test]
+    fn set_font_size_render_prep_uses_staged_atlas_and_shader_warmup_policy() { run_async_test(async {
         let yaml = r#"
 name: font_pipeline_policy
 duration: "8s"
@@ -1879,10 +1892,10 @@ events:
         assert_eq!(third.atlas_cache_policy, FontAtlasCachePolicy::FullRebuild);
         assert!(third.shader_warmup);
         assert!(third.deferred_glyphs > 0);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn execute_until_partial() {
+    #[test]
+    fn execute_until_partial() { run_async_test(async {
         let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
         let mock = MockWezterm::new();
         scenario.setup(&mock).await.unwrap();
@@ -1897,10 +1910,10 @@ events:
         let text = mock.get_text(0, false).await.unwrap();
         assert!(text.contains("hello world"));
         assert!(!text.contains("done"));
-    }
+    }); }
 
-    #[tokio::test]
-    async fn scenario_with_clear() {
+    #[test]
+    fn scenario_with_clear() { run_async_test(async {
         let yaml = r#"
 name: clear_test
 duration: "5s"
@@ -1924,10 +1937,10 @@ events:
         let text = mock.get_text(0, false).await.unwrap();
         assert!(!text.contains("old content"));
         assert!(text.contains("new content"));
-    }
+    }); }
 
-    #[tokio::test]
-    async fn scenario_with_resize_and_title() {
+    #[test]
+    fn scenario_with_resize_and_title() { run_async_test(async {
         let yaml = r#"
 name: resize_title
 duration: "5s"
@@ -1952,7 +1965,7 @@ events:
         assert_eq!(state.cols, 120);
         assert_eq!(state.rows, 40);
         assert_eq!(state.title, "Updated Title");
-    }
+    }); }
 
     #[test]
     fn parse_duration_values() {
@@ -2076,8 +2089,8 @@ events:
         assert!(Scenario::from_yaml(yaml).is_err());
     }
 
-    #[tokio::test]
-    async fn multi_pane_execution() {
+    #[test]
+    fn multi_pane_execution() { run_async_test(async {
         let yaml = r#"
 name: multi_exec
 duration: "5s"
@@ -2112,10 +2125,10 @@ events:
         assert!(t0.contains("more-a"));
         assert!(t1.contains("output-b"));
         assert!(!t1.contains("output-a"));
-    }
+    }); }
 
-    #[tokio::test]
-    async fn marker_event_injects_marker_text() {
+    #[test]
+    fn marker_event_injects_marker_text() { run_async_test(async {
         let yaml = r#"
 name: marker_test
 duration: "5s"
@@ -2134,10 +2147,10 @@ events:
 
         let text = mock.get_text(0, false).await.unwrap();
         assert!(text.contains("[MARKER:checkpoint_1]"));
-    }
+    }); }
 
-    #[tokio::test]
-    async fn contains_expectation_passes() {
+    #[test]
+    fn contains_expectation_passes() { run_async_test(async {
         let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
         let mock = MockWezterm::new();
         scenario.setup(&mock).await.unwrap();
@@ -2152,7 +2165,7 @@ events:
             }
             _ => panic!("Expected Contains expectation"),
         }
-    }
+    }); }
 
     #[test]
     fn comments_are_ignored() {
@@ -2237,8 +2250,8 @@ events:
         assert!(parse_duration("s").is_err());
     }
 
-    #[tokio::test]
-    async fn execute_until_zero_runs_nothing() {
+    #[test]
+    fn execute_until_zero_runs_nothing() { run_async_test(async {
         let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
         let mock = MockWezterm::new();
         scenario.setup(&mock).await.unwrap();
@@ -2251,7 +2264,7 @@ events:
 
         let text = mock.get_text(0, false).await.unwrap();
         assert_eq!(text, "$ ");
-    }
+    }); }
 
     #[test]
     fn scenario_round_trip_yaml() {
@@ -2263,8 +2276,8 @@ events:
         assert!(serialized.contains("hello world"));
     }
 
-    #[tokio::test]
-    async fn scenario_load_from_temp_file() {
+    #[test]
+    fn scenario_load_from_temp_file() { run_async_test(async {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.yaml");
@@ -2275,7 +2288,7 @@ events:
         let scenario = Scenario::load(&path).unwrap();
         assert_eq!(scenario.name, "basic_test");
         assert_eq!(scenario.events.len(), 2);
-    }
+    }); }
 
     #[test]
     fn scenario_load_nonexistent_file() {
@@ -2313,8 +2326,8 @@ events: []
     // TutorialSandbox tests
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn sandbox_creates_default_panes() {
+    #[test]
+    fn sandbox_creates_default_panes() { run_async_test(async {
         let sandbox = TutorialSandbox::new().await;
         assert_eq!(sandbox.mock().pane_count().await, 3);
 
@@ -2324,33 +2337,33 @@ events: []
         assert_eq!(p1.title, "Codex Agent");
         let p2 = sandbox.mock().pane_state(2).await.unwrap();
         assert_eq!(p2.title, "Claude Code");
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_initial_content() {
+    #[test]
+    fn sandbox_initial_content() { run_async_test(async {
         let sandbox = TutorialSandbox::new().await;
 
         let t0 = sandbox.mock().get_text(0, false).await.unwrap();
         assert_eq!(t0, "$ ");
         let t1 = sandbox.mock().get_text(1, false).await.unwrap();
         assert!(t1.contains("codex>"));
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_format_output_with_indicator() {
+    #[test]
+    fn sandbox_format_output_with_indicator() { run_async_test(async {
         let sandbox = TutorialSandbox::new().await;
         assert_eq!(sandbox.format_output("hello"), "[SANDBOX] hello");
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_format_output_without_indicator() {
+    #[test]
+    fn sandbox_format_output_without_indicator() { run_async_test(async {
         let mut sandbox = TutorialSandbox::new().await;
         sandbox.set_show_indicator(false);
         assert_eq!(sandbox.format_output("hello"), "hello");
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_command_logging() {
+    #[test]
+    fn sandbox_command_logging() { run_async_test(async {
         let mut sandbox = TutorialSandbox::new().await;
         assert!(sandbox.command_log().is_empty());
 
@@ -2365,10 +2378,10 @@ events: []
         );
         assert_eq!(sandbox.command_log()[1].command, "ft list");
         assert!(sandbox.command_log()[1].exercise_id.is_none());
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_trigger_events() {
+    #[test]
+    fn sandbox_trigger_events() { run_async_test(async {
         let sandbox = TutorialSandbox::new().await;
         let count = sandbox.trigger_exercise_events().await.unwrap();
         assert_eq!(count, 2);
@@ -2377,10 +2390,10 @@ events: []
         assert!(t1.contains("Usage Warning"));
         let t2 = sandbox.mock().get_text(2, false).await.unwrap();
         assert!(t2.contains("Context Compaction"));
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_check_expectations_after_events() {
+    #[test]
+    fn sandbox_check_expectations_after_events() { run_async_test(async {
         let sandbox = TutorialSandbox::new().await;
         sandbox.trigger_exercise_events().await.unwrap();
 
@@ -2388,20 +2401,20 @@ events: []
         assert_eq!(pass, 2);
         assert_eq!(fail, 0);
         assert_eq!(skip, 0);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_check_expectations_before_events() {
+    #[test]
+    fn sandbox_check_expectations_before_events() { run_async_test(async {
         let sandbox = TutorialSandbox::new().await;
         // Don't trigger events — expectations should fail
         let (pass, fail, skip) = sandbox.check_all_expectations().await;
         assert_eq!(pass, 0);
         assert_eq!(fail, 2);
         assert_eq!(skip, 0);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_with_custom_scenario() {
+    #[test]
+    fn sandbox_with_custom_scenario() { run_async_test(async {
         let yaml = r#"
 name: custom_sandbox
 duration: "5s"
@@ -2417,29 +2430,29 @@ events: []
         assert_eq!(sandbox.mock().pane_count().await, 1);
         let text = sandbox.mock().get_text(0, false).await.unwrap();
         assert_eq!(text, "custom> ");
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_empty_has_no_panes() {
+    #[test]
+    fn sandbox_empty_has_no_panes() { run_async_test(async {
         let sandbox = TutorialSandbox::empty();
         assert_eq!(sandbox.mock().pane_count().await, 0);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_empty_trigger_events_returns_zero() {
+    #[test]
+    fn sandbox_empty_trigger_events_returns_zero() { run_async_test(async {
         let sandbox = TutorialSandbox::empty();
         let count = sandbox.trigger_exercise_events().await.unwrap();
         assert_eq!(count, 0);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_empty_check_expectations() {
+    #[test]
+    fn sandbox_empty_check_expectations() { run_async_test(async {
         let sandbox = TutorialSandbox::empty();
         let (pass, fail, skip) = sandbox.check_all_expectations().await;
         assert_eq!(pass, 0);
         assert_eq!(fail, 0);
         assert_eq!(skip, 0);
-    }
+    }); }
 
     // -----------------------------------------------------------------------
     // NEW TESTS: parse_duration edge cases
@@ -3644,8 +3657,8 @@ events: []
     // NEW TESTS: Async execution edge cases
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn execute_until_exact_boundary() {
+    #[test]
+    fn execute_until_exact_boundary() { run_async_test(async {
         let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
         let mock = MockWezterm::new();
         scenario.setup(&mock).await.unwrap();
@@ -3656,10 +3669,10 @@ events: []
             .await
             .unwrap();
         assert_eq!(count, 1);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn execute_until_just_before_first_event() {
+    #[test]
+    fn execute_until_just_before_first_event() { run_async_test(async {
         let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
         let mock = MockWezterm::new();
         scenario.setup(&mock).await.unwrap();
@@ -3669,10 +3682,10 @@ events: []
             .await
             .unwrap();
         assert_eq!(count, 0);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn execute_until_far_future() {
+    #[test]
+    fn execute_until_far_future() { run_async_test(async {
         let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
         let mock = MockWezterm::new();
         scenario.setup(&mock).await.unwrap();
@@ -3683,10 +3696,10 @@ events: []
             .await
             .unwrap();
         assert_eq!(count, 2);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn setup_pane_0_is_active() {
+    #[test]
+    fn setup_pane_0_is_active() { run_async_test(async {
         let yaml = r#"
 name: active_test
 duration: "1s"
@@ -3703,10 +3716,10 @@ events: []
         assert!(p0.is_active);
         let p5 = mock.pane_state(5).await.unwrap();
         assert!(!p5.is_active);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn setup_panes_not_zoomed() {
+    #[test]
+    fn setup_panes_not_zoomed() { run_async_test(async {
         let yaml = r#"
 name: zoom_test
 duration: "1s"
@@ -3720,14 +3733,14 @@ events: []
 
         let p0 = mock.pane_state(0).await.unwrap();
         assert!(!p0.is_zoomed);
-    }
+    }); }
 
     // -----------------------------------------------------------------------
     // NEW TESTS: resize timeline with partial execution
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn execute_until_with_resize_timeline_partial() {
+    #[test]
+    fn execute_until_with_resize_timeline_partial() { run_async_test(async {
         let yaml = r#"
 name: partial_resize
 duration: "10s"
@@ -3756,10 +3769,10 @@ events:
         assert_eq!(timeline.executed_resize_events, 1);
         assert_eq!(timeline.events.len(), 1);
         assert_eq!(timeline.events[0].action, EventAction::Resize);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn execute_until_with_resize_timeline_no_resize_events() {
+    #[test]
+    fn execute_until_with_resize_timeline_no_resize_events() { run_async_test(async {
         let yaml = r#"
 name: no_resize
 duration: "5s"
@@ -3785,10 +3798,10 @@ events:
         assert_eq!(count, 2);
         assert_eq!(timeline.executed_resize_events, 0);
         assert!(timeline.events.is_empty());
-    }
+    }); }
 
-    #[tokio::test]
-    async fn resize_timeline_captured_at_is_recent() {
+    #[test]
+    fn resize_timeline_captured_at_is_recent() { run_async_test(async {
         let yaml = r#"
 name: ts_check
 duration: "1s"
@@ -3806,14 +3819,14 @@ events: []
             .unwrap();
         // Should be a recent epoch ms
         assert!(timeline.captured_at_ms > 1_577_836_800_000);
-    }
+    }); }
 
     // -----------------------------------------------------------------------
     // NEW TESTS: TutorialSandbox extended
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn sandbox_check_event_expectation_returns_false() {
+    #[test]
+    fn sandbox_check_event_expectation_returns_false() { run_async_test(async {
         let sandbox = TutorialSandbox::new().await;
         // Event expectations always return false (need runtime)
         let result = sandbox
@@ -3823,10 +3836,10 @@ events: []
             })
             .await;
         assert!(!result);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_check_workflow_expectation_returns_false() {
+    #[test]
+    fn sandbox_check_workflow_expectation_returns_false() { run_async_test(async {
         let sandbox = TutorialSandbox::new().await;
         let result = sandbox
             .check_expectation(&ExpectationKind::Workflow {
@@ -3835,10 +3848,10 @@ events: []
             })
             .await;
         assert!(!result);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_check_contains_nonexistent_pane() {
+    #[test]
+    fn sandbox_check_contains_nonexistent_pane() { run_async_test(async {
         let sandbox = TutorialSandbox::new().await;
         let result = sandbox
             .check_expectation(&ExpectationKind::Contains {
@@ -3847,10 +3860,10 @@ events: []
             })
             .await;
         assert!(!result);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_check_contains_missing_text() {
+    #[test]
+    fn sandbox_check_contains_missing_text() { run_async_test(async {
         let sandbox = TutorialSandbox::new().await;
         let result = sandbox
             .check_expectation(&ExpectationKind::Contains {
@@ -3859,10 +3872,10 @@ events: []
             })
             .await;
         assert!(!result);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_check_contains_present_text() {
+    #[test]
+    fn sandbox_check_contains_present_text() { run_async_test(async {
         let sandbox = TutorialSandbox::new().await;
         // Pane 0 has initial content "$ "
         let result = sandbox
@@ -3872,20 +3885,20 @@ events: []
             })
             .await;
         assert!(result);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_indicator_toggle() {
+    #[test]
+    fn sandbox_indicator_toggle() { run_async_test(async {
         let mut sandbox = TutorialSandbox::new().await;
         assert_eq!(sandbox.format_output("x"), "[SANDBOX] x");
         sandbox.set_show_indicator(false);
         assert_eq!(sandbox.format_output("x"), "x");
         sandbox.set_show_indicator(true);
         assert_eq!(sandbox.format_output("x"), "[SANDBOX] x");
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_command_log_timestamps_are_monotonic() {
+    #[test]
+    fn sandbox_command_log_timestamps_are_monotonic() { run_async_test(async {
         let mut sandbox = TutorialSandbox::new().await;
         sandbox.log_command("cmd1", None);
         sandbox.log_command("cmd2", None);
@@ -3896,16 +3909,16 @@ events: []
         // Timestamps should be non-decreasing
         assert!(log[0].timestamp_ms <= log[1].timestamp_ms);
         assert!(log[1].timestamp_ms <= log[2].timestamp_ms);
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_format_output_empty_text() {
+    #[test]
+    fn sandbox_format_output_empty_text() { run_async_test(async {
         let sandbox = TutorialSandbox::new().await;
         assert_eq!(sandbox.format_output(""), "[SANDBOX] ");
-    }
+    }); }
 
-    #[tokio::test]
-    async fn sandbox_with_expectations_mixed_types() {
+    #[test]
+    fn sandbox_with_expectations_mixed_types() { run_async_test(async {
         let yaml = r#"
 name: mixed_exp
 duration: "5s"
@@ -3929,7 +3942,7 @@ expectations:
         assert_eq!(pass, 1); // contains passes
         assert_eq!(fail, 0);
         assert_eq!(skip, 2); // event and workflow are skipped
-    }
+    }); }
 
     // -----------------------------------------------------------------------
     // NEW TESTS: SandboxCommand serialization
