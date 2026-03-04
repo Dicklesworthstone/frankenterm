@@ -644,13 +644,10 @@ impl ConnectorRegistryClient {
             })?;
 
         let expected = entry.manifest.sha256_digest.clone();
+        let manifest_clone = entry.manifest.clone();
         if let Err(e) = verify_digest(package_id, payload, &expected) {
             self.telemetry.digest_failures += 1;
-            self.record_verification(
-                &self.packages[package_id].manifest.clone(),
-                VerificationOutcome::DigestFailed,
-                now_ms,
-            );
+            self.record_verification(&manifest_clone, VerificationOutcome::DigestFailed, now_ms);
             return Err(e);
         }
 
