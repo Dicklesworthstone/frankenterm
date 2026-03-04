@@ -221,6 +221,7 @@ impl<C: Send + 'static> Pool<C> {
     }
 
     /// Inner implementation for acquire without cx.
+    #[cfg(not(feature = "asupersync-runtime"))]
     async fn acquire_inner(&self) -> Result<PoolAcquireResult<C>, PoolError> {
         let acquire_result = crate::runtime_compat::timeout(
             self.config.acquire_timeout,
@@ -375,6 +376,18 @@ pub struct PoolAcquireGuard {
 mod tests {
     use super::*;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build pool test runtime");
+        runtime.block_on(future);
+    }
+
     fn test_config(max_size: usize) -> PoolConfig {
         PoolConfig {
             max_size,
@@ -383,191 +396,219 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn pool_acquire_returns_none_when_empty() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        let result = pool.acquire().await.expect("should acquire");
-        assert!(result.conn.is_none());
-        assert!(!result.has_connection());
+    #[test]
+    fn pool_acquire_returns_none_when_empty() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            let result = pool.acquire().await.expect("should acquire");
+            assert!(result.conn.is_none());
+            assert!(!result.has_connection());
+        });
     }
 
     #[cfg(feature = "asupersync-runtime")]
-    #[tokio::test]
-    async fn pool_acquire_with_cx_returns_none_when_empty() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        let cx = crate::cx::for_testing();
-        let result = pool.acquire_with_cx(&cx).await.expect("should acquire");
-        assert!(result.conn.is_none());
-        assert!(!result.has_connection());
+    #[test]
+    fn pool_acquire_with_cx_returns_none_when_empty() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            let cx = crate::cx::for_testing();
+            let result = pool.acquire_with_cx(&cx).await.expect("should acquire");
+            assert!(result.conn.is_none());
+            assert!(!result.has_connection());
+        });
     }
 
-    #[tokio::test]
-    async fn pool_put_and_acquire_returns_idle_connection() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        pool.put("conn-1".to_string()).await;
-        // Release the implicit semaphore hold — put doesn't hold a permit
-        let result = pool.acquire().await.expect("should acquire");
-        assert_eq!(result.conn.as_deref(), Some("conn-1"));
+    #[test]
+    fn pool_put_and_acquire_returns_idle_connection() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            pool.put("conn-1".to_string()).await;
+            // Release the implicit semaphore hold — put doesn't hold a permit
+            let result = pool.acquire().await.expect("should acquire");
+            assert_eq!(result.conn.as_deref(), Some("conn-1"));
+        });
     }
 
-    #[tokio::test]
-    async fn pool_fifo_ordering() {
-        let pool: Pool<String> = Pool::new(test_config(4));
-        pool.put("first".to_string()).await;
-        pool.put("second".to_string()).await;
+    #[test]
+    fn pool_fifo_ordering() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(4));
+            pool.put("first".to_string()).await;
+            pool.put("second".to_string()).await;
 
-        let r1 = pool.acquire().await.expect("acquire 1");
-        assert_eq!(r1.conn.as_deref(), Some("first"));
-        let r2 = pool.acquire().await.expect("acquire 2");
-        assert_eq!(r2.conn.as_deref(), Some("second"));
+            let r1 = pool.acquire().await.expect("acquire 1");
+            assert_eq!(r1.conn.as_deref(), Some("first"));
+            let r2 = pool.acquire().await.expect("acquire 2");
+            assert_eq!(r2.conn.as_deref(), Some("second"));
+        });
     }
 
-    #[tokio::test]
-    async fn pool_respects_max_size() {
-        let pool: Pool<String> = Pool::new(test_config(1));
+    #[test]
+    fn pool_respects_max_size() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(1));
 
-        // Acquire the only slot
-        let _held = pool.acquire().await.expect("acquire 1");
-
-        // Second acquire should timeout
-        let err = pool.acquire().await.expect_err("should timeout");
-        assert_eq!(err, PoolError::AcquireTimeout);
-    }
-
-    #[tokio::test]
-    async fn pool_releases_slot_on_drop() {
-        let pool: Pool<String> = Pool::new(test_config(1));
-
-        {
+            // Acquire the only slot
             let _held = pool.acquire().await.expect("acquire 1");
-            // _held dropped here
-        }
 
-        // Should succeed now
-        let result = pool.acquire().await.expect("acquire after drop");
-        assert!(result.conn.is_none());
+            // Second acquire should timeout
+            let err = pool.acquire().await.expect_err("should timeout");
+            assert_eq!(err, PoolError::AcquireTimeout);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_idle_timeout_eviction() {
-        let config = PoolConfig {
-            max_size: 2,
-            idle_timeout: Duration::from_millis(10),
-            acquire_timeout: Duration::from_millis(100),
-        };
-        let pool: Pool<String> = Pool::new(config);
-        pool.put("stale".to_string()).await;
+    #[test]
+    fn pool_releases_slot_on_drop() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(1));
 
-        // Wait for it to expire
-        crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+            {
+                let _held = pool.acquire().await.expect("acquire 1");
+                // _held dropped here
+            }
 
-        let result = pool.acquire().await.expect("acquire");
-        assert!(
-            result.conn.is_none(),
-            "stale connection should have been evicted"
-        );
+            // Should succeed now
+            let result = pool.acquire().await.expect("acquire after drop");
+            assert!(result.conn.is_none());
+        });
     }
 
-    #[tokio::test]
-    async fn pool_clear_drains_all() {
-        let pool: Pool<String> = Pool::new(test_config(4));
-        pool.put("a".to_string()).await;
-        pool.put("b".to_string()).await;
-        pool.put("c".to_string()).await;
+    #[test]
+    fn pool_idle_timeout_eviction() {
+        run_async_test(async {
+            let config = PoolConfig {
+                max_size: 2,
+                idle_timeout: Duration::from_millis(10),
+                acquire_timeout: Duration::from_millis(100),
+            };
+            let pool: Pool<String> = Pool::new(config);
+            pool.put("stale".to_string()).await;
 
-        pool.clear().await;
+            // Wait for it to expire
+            crate::runtime_compat::sleep(Duration::from_millis(20)).await;
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 0);
-        assert_eq!(stats.total_evicted, 3);
+            let result = pool.acquire().await.expect("acquire");
+            assert!(
+                result.conn.is_none(),
+                "stale connection should have been evicted"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn pool_stats_are_accurate() {
-        let pool: Pool<String> = Pool::new(test_config(2));
+    #[test]
+    fn pool_clear_drains_all() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(4));
+            pool.put("a".to_string()).await;
+            pool.put("b".to_string()).await;
+            pool.put("c".to_string()).await;
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.max_size, 2);
-        assert_eq!(stats.idle_count, 0);
-        assert_eq!(stats.active_count, 0);
-        assert_eq!(stats.total_acquired, 0);
+            pool.clear().await;
 
-        pool.put("conn".to_string()).await;
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 1);
-        assert_eq!(stats.total_returned, 1);
-
-        let _held = pool.acquire().await.expect("acquire");
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 0);
-        assert_eq!(stats.active_count, 1);
-        assert_eq!(stats.total_acquired, 1);
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 0);
+            assert_eq!(stats.total_evicted, 3);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_try_acquire_when_full_batch2() {
-        let pool: Pool<String> = Pool::new(test_config(1));
-        let _held = pool.acquire().await.expect("acquire");
+    #[test]
+    fn pool_stats_are_accurate() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
 
-        let err = pool.try_acquire().await.expect_err("should fail");
-        assert_eq!(err, PoolError::AcquireTimeout);
+            let stats = pool.stats().await;
+            assert_eq!(stats.max_size, 2);
+            assert_eq!(stats.idle_count, 0);
+            assert_eq!(stats.active_count, 0);
+            assert_eq!(stats.total_acquired, 0);
+
+            pool.put("conn".to_string()).await;
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 1);
+            assert_eq!(stats.total_returned, 1);
+
+            let _held = pool.acquire().await.expect("acquire");
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 0);
+            assert_eq!(stats.active_count, 1);
+            assert_eq!(stats.total_acquired, 1);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_try_acquire_returns_idle() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        pool.put("idle-conn".to_string()).await;
+    #[test]
+    fn pool_try_acquire_when_full_batch2() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(1));
+            let _held = pool.acquire().await.expect("acquire");
 
-        let result = pool.try_acquire().await.expect("should succeed");
-        assert_eq!(result.conn.as_deref(), Some("idle-conn"));
+            let err = pool.try_acquire().await.expect_err("should fail");
+            assert_eq!(err, PoolError::AcquireTimeout);
+        });
+    }
+
+    #[test]
+    fn pool_try_acquire_returns_idle() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            pool.put("idle-conn".to_string()).await;
+
+            let result = pool.try_acquire().await.expect("should succeed");
+            assert_eq!(result.conn.as_deref(), Some("idle-conn"));
+        });
     }
 
     #[cfg(feature = "asupersync-runtime")]
-    #[tokio::test]
-    async fn pool_try_acquire_with_cx_returns_idle() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        pool.put("idle-conn".to_string()).await;
-        let cx = crate::cx::for_testing();
+    #[test]
+    fn pool_try_acquire_with_cx_returns_idle() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            pool.put("idle-conn".to_string()).await;
+            let cx = crate::cx::for_testing();
 
-        let result = pool.try_acquire_with_cx(&cx).await.expect("should succeed");
-        assert_eq!(result.conn.as_deref(), Some("idle-conn"));
+            let result = pool.try_acquire_with_cx(&cx).await.expect("should succeed");
+            assert_eq!(result.conn.as_deref(), Some("idle-conn"));
+        });
     }
 
-    #[tokio::test]
-    async fn pool_concurrent_acquire_respects_limit() {
-        let pool = Arc::new(Pool::<u64>::new(test_config(2)));
-        let pool2 = pool.clone();
-        let pool3 = pool.clone();
+    #[test]
+    fn pool_concurrent_acquire_respects_limit() {
+        run_async_test(async {
+            let pool = Arc::new(Pool::<u64>::new(test_config(2)));
+            let pool2 = pool.clone();
+            let pool3 = pool.clone();
 
-        let h1 = crate::runtime_compat::task::spawn(async move {
-            let _r = pool2.acquire().await.expect("acquire 1");
-            crate::runtime_compat::sleep(Duration::from_millis(50)).await;
+            let h1 = crate::runtime_compat::task::spawn(async move {
+                let _r = pool2.acquire().await.expect("acquire 1");
+                crate::runtime_compat::sleep(Duration::from_millis(50)).await;
+            });
+
+            let h2 = crate::runtime_compat::task::spawn(async move {
+                let _r = pool3.acquire().await.expect("acquire 2");
+                crate::runtime_compat::sleep(Duration::from_millis(50)).await;
+            });
+
+            // Both should succeed with pool size 2
+            h1.await.expect("h1");
+            h2.await.expect("h2");
         });
-
-        let h2 = crate::runtime_compat::task::spawn(async move {
-            let _r = pool3.acquire().await.expect("acquire 2");
-            crate::runtime_compat::sleep(Duration::from_millis(50)).await;
-        });
-
-        // Both should succeed with pool size 2
-        h1.await.expect("h1");
-        h2.await.expect("h2");
     }
 
-    #[tokio::test]
-    async fn pool_evict_idle_returns_count() {
-        let config = PoolConfig {
-            max_size: 4,
-            idle_timeout: Duration::from_millis(10),
-            acquire_timeout: Duration::from_millis(100),
-        };
-        let pool: Pool<String> = Pool::new(config);
-        pool.put("a".to_string()).await;
-        pool.put("b".to_string()).await;
+    #[test]
+    fn pool_evict_idle_returns_count() {
+        run_async_test(async {
+            let config = PoolConfig {
+                max_size: 4,
+                idle_timeout: Duration::from_millis(10),
+                acquire_timeout: Duration::from_millis(100),
+            };
+            let pool: Pool<String> = Pool::new(config);
+            pool.put("a".to_string()).await;
+            pool.put("b".to_string()).await;
 
-        crate::runtime_compat::sleep(Duration::from_millis(20)).await;
-        let evicted = pool.evict_idle().await;
-        assert_eq!(evicted, 2);
+            crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+            let evicted = pool.evict_idle().await;
+            assert_eq!(evicted, 2);
+        });
     }
 
     #[test]
@@ -616,35 +657,39 @@ mod tests {
         assert_eq!(PoolError::Closed.to_string(), "connection pool is closed");
     }
 
-    #[tokio::test]
-    async fn pool_into_parts_transfers_permit() {
-        let pool: Pool<String> = Pool::new(test_config(1));
-        pool.put("conn".to_string()).await;
+    #[test]
+    fn pool_into_parts_transfers_permit() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(1));
+            pool.put("conn".to_string()).await;
 
-        let result = pool.acquire().await.expect("acquire");
-        let (conn, _guard) = result.into_parts();
-        assert_eq!(conn.as_deref(), Some("conn"));
+            let result = pool.acquire().await.expect("acquire");
+            let (conn, _guard) = result.into_parts();
+            assert_eq!(conn.as_deref(), Some("conn"));
 
-        // Slot is still held by guard
-        let stats = pool.stats().await;
-        assert_eq!(stats.active_count, 1);
+            // Slot is still held by guard
+            let stats = pool.stats().await;
+            assert_eq!(stats.active_count, 1);
 
-        // Drop guard
-        drop(_guard);
-        let stats = pool.stats().await;
-        assert_eq!(stats.active_count, 0);
+            // Drop guard
+            drop(_guard);
+            let stats = pool.stats().await;
+            assert_eq!(stats.active_count, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_put_excess_connections_dropped() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        pool.put("a".to_string()).await;
-        pool.put("b".to_string()).await;
-        pool.put("c".to_string()).await; // Exceeds max_size, should be dropped
+    #[test]
+    fn pool_put_excess_connections_dropped() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            pool.put("a".to_string()).await;
+            pool.put("b".to_string()).await;
+            pool.put("c".to_string()).await; // Exceeds max_size, should be dropped
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 2);
-        assert_eq!(stats.total_returned, 2);
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 2);
+            assert_eq!(stats.total_returned, 2);
+        });
     }
 
     // ── Batch: RubyBeaver wa-1u90p.7.1 ──────────────────────────────────
@@ -766,224 +811,256 @@ mod tests {
         assert_eq!(back.total_timeouts, 1);
     }
 
-    #[tokio::test]
-    async fn pool_stats_timeout_counter() {
-        let pool: Pool<String> = Pool::new(test_config(1));
-        let _held = pool.acquire().await.expect("acquire slot");
+    #[test]
+    fn pool_stats_timeout_counter() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(1));
+            let _held = pool.acquire().await.expect("acquire slot");
 
-        // This should timeout and increment the counter
-        let _ = pool.acquire().await;
+            // This should timeout and increment the counter
+            let _ = pool.acquire().await;
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.total_timeouts, 1);
+            let stats = pool.stats().await;
+            assert_eq!(stats.total_timeouts, 1);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_stats_initial_all_zero() {
-        let pool: Pool<String> = Pool::new(test_config(4));
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 0);
-        assert_eq!(stats.active_count, 0);
-        assert_eq!(stats.total_acquired, 0);
-        assert_eq!(stats.total_returned, 0);
-        assert_eq!(stats.total_evicted, 0);
-        assert_eq!(stats.total_timeouts, 0);
+    #[test]
+    fn pool_stats_initial_all_zero() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(4));
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 0);
+            assert_eq!(stats.active_count, 0);
+            assert_eq!(stats.total_acquired, 0);
+            assert_eq!(stats.total_returned, 0);
+            assert_eq!(stats.total_evicted, 0);
+            assert_eq!(stats.total_timeouts, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_clear_on_empty_is_noop() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        pool.clear().await;
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 0);
-        assert_eq!(stats.total_evicted, 0);
+    #[test]
+    fn pool_clear_on_empty_is_noop() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            pool.clear().await;
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 0);
+            assert_eq!(stats.total_evicted, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_put_after_clear_works() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        pool.put("a".to_string()).await;
-        pool.clear().await;
-        pool.put("b".to_string()).await;
+    #[test]
+    fn pool_put_after_clear_works() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            pool.put("a".to_string()).await;
+            pool.clear().await;
+            pool.put("b".to_string()).await;
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 1);
-        let result = pool.acquire().await.expect("acquire");
-        assert_eq!(result.conn.as_deref(), Some("b"));
-    }
-
-    #[tokio::test]
-    async fn pool_evict_idle_returns_zero_when_fresh() {
-        let pool: Pool<String> = Pool::new(test_config(4));
-        pool.put("fresh".to_string()).await;
-        let evicted = pool.evict_idle().await;
-        assert_eq!(evicted, 0);
-    }
-
-    #[tokio::test]
-    async fn pool_evict_idle_on_empty_returns_zero() {
-        let pool: Pool<String> = Pool::new(test_config(4));
-        let evicted = pool.evict_idle().await;
-        assert_eq!(evicted, 0);
-    }
-
-    #[tokio::test]
-    async fn pool_evict_partial_only_stale() {
-        // put() calls evict_expired internally, so we must ensure
-        // old is still within timeout at the time of put("new").
-        // Constraints: first_sleep < timeout, first_sleep + second_sleep > timeout,
-        // second_sleep < timeout.
-        let config = PoolConfig {
-            max_size: 4,
-            idle_timeout: Duration::from_millis(500),
-            acquire_timeout: Duration::from_millis(500),
-        };
-        let pool: Pool<String> = Pool::new(config);
-        pool.put("old".to_string()).await;
-        // old age: ~300ms (< 500ms timeout), survives put("new") evict
-        crate::runtime_compat::sleep(Duration::from_millis(300)).await;
-        pool.put("new".to_string()).await;
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 2);
-        // old age: ~700ms (> 500ms, stale), new age: ~400ms (< 500ms, fresh)
-        crate::runtime_compat::sleep(Duration::from_millis(400)).await;
-
-        let evicted = pool.evict_idle().await;
-        assert_eq!(evicted, 1);
-
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 1);
-    }
-
-    #[tokio::test]
-    async fn pool_into_parts_with_none_connection() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        let result = pool.acquire().await.expect("acquire empty slot");
-        assert!(!result.has_connection());
-
-        let (conn, guard) = result.into_parts();
-        assert!(conn.is_none());
-
-        let stats = pool.stats().await;
-        assert_eq!(stats.active_count, 1);
-        drop(guard);
-        let stats = pool.stats().await;
-        assert_eq!(stats.active_count, 0);
-    }
-
-    #[tokio::test]
-    async fn pool_try_acquire_no_idle_returns_none_conn() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        let result = pool.try_acquire().await.expect("slot available");
-        assert!(result.conn.is_none());
-    }
-
-    #[tokio::test]
-    async fn pool_acquire_result_debug_batch2() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        pool.put("test-conn".to_string()).await;
-        let result = pool.acquire().await.expect("acquire");
-        let dbg = format!("{result:?}");
-        assert!(dbg.contains("PoolAcquireResult"));
-        assert!(dbg.contains("test-conn"));
-        assert!(dbg.contains("has_permit"));
-    }
-
-    #[tokio::test]
-    async fn pool_acquire_release_cycle() {
-        let pool: Pool<u32> = Pool::new(test_config(2));
-        for i in 0..10u32 {
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 1);
             let result = pool.acquire().await.expect("acquire");
-            drop(result);
-            pool.put(i).await;
-        }
-        let stats = pool.stats().await;
-        assert_eq!(stats.total_acquired, 10);
-        assert_eq!(stats.total_returned, 10);
+            assert_eq!(result.conn.as_deref(), Some("b"));
+        });
     }
 
-    #[tokio::test]
-    async fn pool_stats_active_returns_to_zero() {
-        let pool: Pool<String> = Pool::new(test_config(3));
-        let r1 = pool.acquire().await.unwrap();
-        let r2 = pool.acquire().await.unwrap();
-        let r3 = pool.acquire().await.unwrap();
-
-        let stats = pool.stats().await;
-        assert_eq!(stats.active_count, 3);
-
-        drop(r1);
-        drop(r2);
-        drop(r3);
-
-        let stats = pool.stats().await;
-        assert_eq!(stats.active_count, 0);
+    #[test]
+    fn pool_evict_idle_returns_zero_when_fresh() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(4));
+            pool.put("fresh".to_string()).await;
+            let evicted = pool.evict_idle().await;
+            assert_eq!(evicted, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_fifo_after_put_back() {
-        let pool: Pool<String> = Pool::new(test_config(4));
-        pool.put("first".to_string()).await;
-        pool.put("second".to_string()).await;
-
-        // Acquire first, put it back, acquire again
-        let r1 = pool.acquire().await.unwrap();
-        assert_eq!(r1.conn.as_deref(), Some("first"));
-        drop(r1);
-        pool.put("first-recycled".to_string()).await;
-
-        let r2 = pool.acquire().await.unwrap();
-        assert_eq!(r2.conn.as_deref(), Some("second"));
-        let r3 = pool.acquire().await.unwrap();
-        assert_eq!(r3.conn.as_deref(), Some("first-recycled"));
+    #[test]
+    fn pool_evict_idle_on_empty_returns_zero() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(4));
+            let evicted = pool.evict_idle().await;
+            assert_eq!(evicted, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_multiple_concurrent_three_slots() {
-        let pool = Arc::new(Pool::<u64>::new(test_config(3)));
-        let mut handles = Vec::new();
+    #[test]
+    fn pool_evict_partial_only_stale() {
+        run_async_test(async {
+            // put() calls evict_expired internally, so we must ensure
+            // old is still within timeout at the time of put("new").
+            // Constraints: first_sleep < timeout, first_sleep + second_sleep > timeout,
+            // second_sleep < timeout.
+            let config = PoolConfig {
+                max_size: 4,
+                idle_timeout: Duration::from_millis(500),
+                acquire_timeout: Duration::from_millis(500),
+            };
+            let pool: Pool<String> = Pool::new(config);
+            pool.put("old".to_string()).await;
+            // old age: ~300ms (< 500ms timeout), survives put("new") evict
+            crate::runtime_compat::sleep(Duration::from_millis(300)).await;
+            pool.put("new".to_string()).await;
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 2);
+            // old age: ~700ms (> 500ms, stale), new age: ~400ms (< 500ms, fresh)
+            crate::runtime_compat::sleep(Duration::from_millis(400)).await;
 
-        for i in 0..3u64 {
-            let p = pool.clone();
-            handles.push(crate::runtime_compat::task::spawn(async move {
-                let r = p.acquire().await.expect("acquire");
-                crate::runtime_compat::sleep(Duration::from_millis(10)).await;
-                drop(r);
-                p.put(i).await;
-            }));
-        }
+            let evicted = pool.evict_idle().await;
+            assert_eq!(evicted, 1);
 
-        for h in handles {
-            h.await.expect("task");
-        }
-
-        let stats = pool.stats().await;
-        assert_eq!(stats.total_acquired, 3);
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 1);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_stats_evicted_increments_on_clear() {
-        let pool: Pool<String> = Pool::new(test_config(4));
-        pool.put("a".to_string()).await;
-        pool.put("b".to_string()).await;
-        pool.clear().await;
+    #[test]
+    fn pool_into_parts_with_none_connection() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            let result = pool.acquire().await.expect("acquire empty slot");
+            assert!(!result.has_connection());
 
-        pool.put("c".to_string()).await;
-        pool.clear().await;
+            let (conn, guard) = result.into_parts();
+            assert!(conn.is_none());
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.total_evicted, 3); // 2 + 1
+            let stats = pool.stats().await;
+            assert_eq!(stats.active_count, 1);
+            drop(guard);
+            let stats = pool.stats().await;
+            assert_eq!(stats.active_count, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_with_large_max_size() {
-        let pool: Pool<u32> = Pool::new(test_config(100));
-        for i in 0..50u32 {
-            pool.put(i).await;
-        }
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 50);
-        assert_eq!(stats.total_returned, 50);
+    #[test]
+    fn pool_try_acquire_no_idle_returns_none_conn() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            let result = pool.try_acquire().await.expect("slot available");
+            assert!(result.conn.is_none());
+        });
+    }
+
+    #[test]
+    fn pool_acquire_result_debug_batch2() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            pool.put("test-conn".to_string()).await;
+            let result = pool.acquire().await.expect("acquire");
+            let dbg = format!("{result:?}");
+            assert!(dbg.contains("PoolAcquireResult"));
+            assert!(dbg.contains("test-conn"));
+            assert!(dbg.contains("has_permit"));
+        });
+    }
+
+    #[test]
+    fn pool_acquire_release_cycle() {
+        run_async_test(async {
+            let pool: Pool<u32> = Pool::new(test_config(2));
+            for i in 0..10u32 {
+                let result = pool.acquire().await.expect("acquire");
+                drop(result);
+                pool.put(i).await;
+            }
+            let stats = pool.stats().await;
+            assert_eq!(stats.total_acquired, 10);
+            assert_eq!(stats.total_returned, 10);
+        });
+    }
+
+    #[test]
+    fn pool_stats_active_returns_to_zero() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(3));
+            let r1 = pool.acquire().await.unwrap();
+            let r2 = pool.acquire().await.unwrap();
+            let r3 = pool.acquire().await.unwrap();
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.active_count, 3);
+
+            drop(r1);
+            drop(r2);
+            drop(r3);
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.active_count, 0);
+        });
+    }
+
+    #[test]
+    fn pool_fifo_after_put_back() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(4));
+            pool.put("first".to_string()).await;
+            pool.put("second".to_string()).await;
+
+            // Acquire first, put it back, acquire again
+            let r1 = pool.acquire().await.unwrap();
+            assert_eq!(r1.conn.as_deref(), Some("first"));
+            drop(r1);
+            pool.put("first-recycled".to_string()).await;
+
+            let r2 = pool.acquire().await.unwrap();
+            assert_eq!(r2.conn.as_deref(), Some("second"));
+            let r3 = pool.acquire().await.unwrap();
+            assert_eq!(r3.conn.as_deref(), Some("first-recycled"));
+        });
+    }
+
+    #[test]
+    fn pool_multiple_concurrent_three_slots() {
+        run_async_test(async {
+            let pool = Arc::new(Pool::<u64>::new(test_config(3)));
+            let mut handles = Vec::new();
+
+            for i in 0..3u64 {
+                let p = pool.clone();
+                handles.push(crate::runtime_compat::task::spawn(async move {
+                    let r = p.acquire().await.expect("acquire");
+                    crate::runtime_compat::sleep(Duration::from_millis(10)).await;
+                    drop(r);
+                    p.put(i).await;
+                }));
+            }
+
+            for h in handles {
+                h.await.expect("task");
+            }
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.total_acquired, 3);
+        });
+    }
+
+    #[test]
+    fn pool_stats_evicted_increments_on_clear() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(4));
+            pool.put("a".to_string()).await;
+            pool.put("b".to_string()).await;
+            pool.clear().await;
+
+            pool.put("c".to_string()).await;
+            pool.clear().await;
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.total_evicted, 3); // 2 + 1
+        });
+    }
+
+    #[test]
+    fn pool_with_large_max_size() {
+        run_async_test(async {
+            let pool: Pool<u32> = Pool::new(test_config(100));
+            for i in 0..50u32 {
+                pool.put(i).await;
+            }
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 50);
+            assert_eq!(stats.total_returned, 50);
+        });
     }
 
     // ── Batch: DarkBadger wa-1u90p.7.1 ──────────────────────────────────
@@ -1042,76 +1119,86 @@ mod tests {
         assert_eq!(obj.len(), 7);
     }
 
-    #[tokio::test]
-    async fn pool_multiple_timeouts_accumulate() {
-        let pool: Pool<String> = Pool::new(test_config(1));
-        let _held = pool.acquire().await.expect("acquire slot");
+    #[test]
+    fn pool_multiple_timeouts_accumulate() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(1));
+            let _held = pool.acquire().await.expect("acquire slot");
 
-        for _ in 0..3 {
-            let _ = pool.acquire().await;
-        }
+            for _ in 0..3 {
+                let _ = pool.acquire().await;
+            }
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.total_timeouts, 3);
+            let stats = pool.stats().await;
+            assert_eq!(stats.total_timeouts, 3);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_put_and_clear_and_stats_consistent() {
-        let pool: Pool<String> = Pool::new(test_config(4));
-        pool.put("a".to_string()).await;
-        pool.put("b".to_string()).await;
-        pool.put("c".to_string()).await;
+    #[test]
+    fn pool_put_and_clear_and_stats_consistent() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(4));
+            pool.put("a".to_string()).await;
+            pool.put("b".to_string()).await;
+            pool.put("c".to_string()).await;
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 3);
-        assert_eq!(stats.total_returned, 3);
-        assert_eq!(stats.total_evicted, 0);
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 3);
+            assert_eq!(stats.total_returned, 3);
+            assert_eq!(stats.total_evicted, 0);
 
-        pool.clear().await;
+            pool.clear().await;
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 0);
-        assert_eq!(stats.total_returned, 3);
-        assert_eq!(stats.total_evicted, 3);
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 0);
+            assert_eq!(stats.total_returned, 3);
+            assert_eq!(stats.total_evicted, 3);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_acquire_counts_only_acquire_not_put() {
-        let pool: Pool<String> = Pool::new(test_config(4));
-        pool.put("a".to_string()).await;
-        pool.put("b".to_string()).await;
+    #[test]
+    fn pool_acquire_counts_only_acquire_not_put() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(4));
+            pool.put("a".to_string()).await;
+            pool.put("b".to_string()).await;
 
-        let stats = pool.stats().await;
-        assert_eq!(
-            stats.total_acquired, 0,
-            "put should not increment total_acquired"
-        );
+            let stats = pool.stats().await;
+            assert_eq!(
+                stats.total_acquired, 0,
+                "put should not increment total_acquired"
+            );
 
-        let _r = pool.acquire().await.unwrap();
-        let stats = pool.stats().await;
-        assert_eq!(stats.total_acquired, 1);
+            let _r = pool.acquire().await.unwrap();
+            let stats = pool.stats().await;
+            assert_eq!(stats.total_acquired, 1);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_try_acquire_increments_acquired() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        let _r = pool.try_acquire().await.unwrap();
-        let stats = pool.stats().await;
-        assert_eq!(stats.total_acquired, 1);
+    #[test]
+    fn pool_try_acquire_increments_acquired() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            let _r = pool.try_acquire().await.unwrap();
+            let stats = pool.stats().await;
+            assert_eq!(stats.total_acquired, 1);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_has_connection_method() {
-        let pool: Pool<String> = Pool::new(test_config(4));
-        pool.put("conn".to_string()).await;
+    #[test]
+    fn pool_has_connection_method() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(4));
+            pool.put("conn".to_string()).await;
 
-        let with_conn = pool.acquire().await.unwrap();
-        assert!(with_conn.has_connection());
-        drop(with_conn);
+            let with_conn = pool.acquire().await.unwrap();
+            assert!(with_conn.has_connection());
+            drop(with_conn);
 
-        // Now pool is empty (connection was taken, not returned)
-        let without_conn = pool.acquire().await.unwrap();
-        assert!(!without_conn.has_connection());
+            // Now pool is empty (connection was taken, not returned)
+            let without_conn = pool.acquire().await.unwrap();
+            assert!(!without_conn.has_connection());
+        });
     }
 
     // ── Batch 2: DarkBadger wa-1u90p.7.1 ─────────────────────────────────
@@ -1228,203 +1315,231 @@ mod tests {
         assert_eq!(stats.total_acquired, cloned.total_acquired);
     }
 
-    #[tokio::test]
-    async fn pool_into_parts_decompose() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        pool.put("hello".to_string()).await;
+    #[test]
+    fn pool_into_parts_decompose() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            pool.put("hello".to_string()).await;
 
-        let result = pool.acquire().await.unwrap();
-        assert!(result.has_connection());
+            let result = pool.acquire().await.unwrap();
+            assert!(result.has_connection());
 
-        let (conn, _guard) = result.into_parts();
-        assert_eq!(conn, Some("hello".to_string()));
+            let (conn, _guard) = result.into_parts();
+            assert_eq!(conn, Some("hello".to_string()));
 
-        // Guard holds the permit — pool slot is still occupied
-        let stats = pool.stats().await;
-        assert_eq!(stats.active_count, 1);
+            // Guard holds the permit — pool slot is still occupied
+            let stats = pool.stats().await;
+            assert_eq!(stats.active_count, 1);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_into_parts_releases_on_guard_drop() {
-        let pool: Pool<String> = Pool::new(test_config(1));
-        let result = pool.acquire().await.unwrap();
-        let (conn, guard) = result.into_parts();
-        assert!(conn.is_none()); // no idle connection
+    #[test]
+    fn pool_into_parts_releases_on_guard_drop() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(1));
+            let result = pool.acquire().await.unwrap();
+            let (conn, guard) = result.into_parts();
+            assert!(conn.is_none()); // no idle connection
 
-        // Pool is at capacity (1 slot held by guard)
-        let stats = pool.stats().await;
-        assert_eq!(stats.active_count, 1);
+            // Pool is at capacity (1 slot held by guard)
+            let stats = pool.stats().await;
+            assert_eq!(stats.active_count, 1);
 
-        // Dropping guard releases the slot
-        drop(guard);
-        let stats = pool.stats().await;
-        assert_eq!(stats.active_count, 0);
+            // Dropping guard releases the slot
+            drop(guard);
+            let stats = pool.stats().await;
+            assert_eq!(stats.active_count, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_into_parts_no_connection() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        let result = pool.acquire().await.unwrap();
-        let (conn, _guard) = result.into_parts();
-        assert!(conn.is_none());
+    #[test]
+    fn pool_into_parts_no_connection() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            let result = pool.acquire().await.unwrap();
+            let (conn, _guard) = result.into_parts();
+            assert!(conn.is_none());
+        });
     }
 
-    #[tokio::test]
-    async fn pool_acquire_result_debug_v2() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        pool.put("debug-test".to_string()).await;
+    #[test]
+    fn pool_acquire_result_debug_v2() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            pool.put("debug-test".to_string()).await;
 
-        let result = pool.acquire().await.unwrap();
-        let debug = format!("{result:?}");
-        assert!(debug.contains("PoolAcquireResult"));
-        assert!(debug.contains("debug-test"));
-        assert!(debug.contains("has_permit"));
+            let result = pool.acquire().await.unwrap();
+            let debug = format!("{result:?}");
+            assert!(debug.contains("PoolAcquireResult"));
+            assert!(debug.contains("debug-test"));
+            assert!(debug.contains("has_permit"));
+        });
     }
 
-    #[tokio::test]
-    async fn pool_try_acquire_when_full_v2() {
-        let pool: Pool<String> = Pool::new(test_config(1));
-        let _held = pool.acquire().await.unwrap();
+    #[test]
+    fn pool_try_acquire_when_full_v2() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(1));
+            let _held = pool.acquire().await.unwrap();
 
-        let err = pool.try_acquire().await.unwrap_err();
-        assert_eq!(err, PoolError::AcquireTimeout);
+            let err = pool.try_acquire().await.unwrap_err();
+            assert_eq!(err, PoolError::AcquireTimeout);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_try_acquire_returns_idle_conn() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        pool.put("idle".to_string()).await;
+    #[test]
+    fn pool_try_acquire_returns_idle_conn() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            pool.put("idle".to_string()).await;
 
-        let result = pool.try_acquire().await.unwrap();
-        assert!(result.has_connection());
-        assert_eq!(result.conn.as_deref(), Some("idle"));
+            let result = pool.try_acquire().await.unwrap();
+            assert!(result.has_connection());
+            assert_eq!(result.conn.as_deref(), Some("idle"));
+        });
     }
 
-    #[tokio::test]
-    async fn pool_try_acquire_returns_none_when_no_idle() {
-        let pool: Pool<String> = Pool::new(test_config(2));
-        let result = pool.try_acquire().await.unwrap();
-        assert!(!result.has_connection());
-        assert!(result.conn.is_none());
+    #[test]
+    fn pool_try_acquire_returns_none_when_no_idle() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(2));
+            let result = pool.try_acquire().await.unwrap();
+            assert!(!result.has_connection());
+            assert!(result.conn.is_none());
+        });
     }
 
-    #[tokio::test]
-    async fn pool_evict_idle_returns_zero_when_none_expired() {
-        let pool: Pool<String> = Pool::new(test_config(4));
-        pool.put("a".to_string()).await;
-        pool.put("b".to_string()).await;
+    #[test]
+    fn pool_evict_idle_returns_zero_when_none_expired() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(4));
+            pool.put("a".to_string()).await;
+            pool.put("b".to_string()).await;
 
-        let evicted = pool.evict_idle().await;
-        assert_eq!(evicted, 0);
+            let evicted = pool.evict_idle().await;
+            assert_eq!(evicted, 0);
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 2);
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 2);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_evict_idle_evicts_expired_entries() {
-        let config = PoolConfig {
-            max_size: 4,
-            idle_timeout: Duration::ZERO, // everything expires immediately
-            acquire_timeout: Duration::from_millis(100),
-        };
-        let pool: Pool<String> = Pool::new(config);
-        pool.put("a".to_string()).await;
-        pool.put("b".to_string()).await;
+    #[test]
+    fn pool_evict_idle_evicts_expired_entries() {
+        run_async_test(async {
+            let config = PoolConfig {
+                max_size: 4,
+                idle_timeout: Duration::ZERO, // everything expires immediately
+                acquire_timeout: Duration::from_millis(100),
+            };
+            let pool: Pool<String> = Pool::new(config);
+            pool.put("a".to_string()).await;
+            pool.put("b".to_string()).await;
 
-        // Wait a tiny bit so the entries are past idle_timeout=0
-        crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            // Wait a tiny bit so the entries are past idle_timeout=0
+            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
 
-        let evicted = pool.evict_idle().await;
-        // put() eagerly evicts expired entries, so "a" may already be gone
-        // With ZERO timeout, at least some entries are evicted
-        assert!(evicted >= 1);
+            let evicted = pool.evict_idle().await;
+            // put() eagerly evicts expired entries, so "a" may already be gone
+            // With ZERO timeout, at least some entries are evicted
+            assert!(evicted >= 1);
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 0);
-        assert!(stats.total_evicted >= 2);
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 0);
+            assert!(stats.total_evicted >= 2);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_put_at_max_capacity_drops_connection() {
-        // Pool with max_size=2, fill it to capacity, then put one more
-        let pool: Pool<String> = Pool::new(test_config(2));
-        pool.put("a".to_string()).await;
-        pool.put("b".to_string()).await;
+    #[test]
+    fn pool_put_at_max_capacity_drops_connection() {
+        run_async_test(async {
+            // Pool with max_size=2, fill it to capacity, then put one more
+            let pool: Pool<String> = Pool::new(test_config(2));
+            pool.put("a".to_string()).await;
+            pool.put("b".to_string()).await;
 
-        // This should be silently dropped since idle queue is at max_size
-        pool.put("c".to_string()).await;
+            // This should be silently dropped since idle queue is at max_size
+            pool.put("c".to_string()).await;
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 2); // still 2, not 3
-        // Only 2 were counted as returned
-        assert_eq!(stats.total_returned, 2);
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 2); // still 2, not 3
+            // Only 2 were counted as returned
+            assert_eq!(stats.total_returned, 2);
 
-        // Verify which connections are in the pool (FIFO)
-        let r1 = pool.acquire().await.unwrap();
-        assert_eq!(r1.conn.as_deref(), Some("a"));
-        let r2 = pool.acquire().await.unwrap();
-        assert_eq!(r2.conn.as_deref(), Some("b"));
+            // Verify which connections are in the pool (FIFO)
+            let r1 = pool.acquire().await.unwrap();
+            assert_eq!(r1.conn.as_deref(), Some("a"));
+            let r2 = pool.acquire().await.unwrap();
+            assert_eq!(r2.conn.as_deref(), Some("b"));
+        });
     }
 
-    #[tokio::test]
-    async fn pool_clear_then_refill() {
-        let pool: Pool<String> = Pool::new(test_config(3));
-        pool.put("a".to_string()).await;
-        pool.put("b".to_string()).await;
-        pool.clear().await;
+    #[test]
+    fn pool_clear_then_refill() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(3));
+            pool.put("a".to_string()).await;
+            pool.put("b".to_string()).await;
+            pool.clear().await;
 
-        // Refill after clear
-        pool.put("c".to_string()).await;
-        let stats = pool.stats().await;
-        assert_eq!(stats.idle_count, 1);
-        assert_eq!(stats.total_evicted, 2);
-        assert_eq!(stats.total_returned, 3); // a + b + c
+            // Refill after clear
+            pool.put("c".to_string()).await;
+            let stats = pool.stats().await;
+            assert_eq!(stats.idle_count, 1);
+            assert_eq!(stats.total_evicted, 2);
+            assert_eq!(stats.total_returned, 3); // a + b + c
 
-        let r = pool.acquire().await.unwrap();
-        assert_eq!(r.conn.as_deref(), Some("c"));
+            let r = pool.acquire().await.unwrap();
+            assert_eq!(r.conn.as_deref(), Some("c"));
+        });
     }
 
-    #[tokio::test]
-    async fn pool_stats_max_size_reflects_config() {
-        let pool: Pool<u32> = Pool::new(test_config(7));
-        let stats = pool.stats().await;
-        assert_eq!(stats.max_size, 7);
+    #[test]
+    fn pool_stats_max_size_reflects_config() {
+        run_async_test(async {
+            let pool: Pool<u32> = Pool::new(test_config(7));
+            let stats = pool.stats().await;
+            assert_eq!(stats.max_size, 7);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_stats_active_count_with_multiple_acquires() {
-        let pool: Pool<String> = Pool::new(test_config(5));
-        let r1 = pool.acquire().await.unwrap();
-        let r2 = pool.acquire().await.unwrap();
-        let r3 = pool.acquire().await.unwrap();
+    #[test]
+    fn pool_stats_active_count_with_multiple_acquires() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(5));
+            let r1 = pool.acquire().await.unwrap();
+            let r2 = pool.acquire().await.unwrap();
+            let r3 = pool.acquire().await.unwrap();
 
-        let stats = pool.stats().await;
-        assert_eq!(stats.active_count, 3);
+            let stats = pool.stats().await;
+            assert_eq!(stats.active_count, 3);
 
-        drop(r2);
-        let stats = pool.stats().await;
-        assert_eq!(stats.active_count, 2);
+            drop(r2);
+            let stats = pool.stats().await;
+            assert_eq!(stats.active_count, 2);
 
-        drop(r1);
-        drop(r3);
-        let stats = pool.stats().await;
-        assert_eq!(stats.active_count, 0);
+            drop(r1);
+            drop(r3);
+            let stats = pool.stats().await;
+            assert_eq!(stats.active_count, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn pool_acquire_after_timeout_still_works() {
-        let pool: Pool<String> = Pool::new(test_config(1));
-        let held = pool.acquire().await.unwrap();
+    #[test]
+    fn pool_acquire_after_timeout_still_works() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(1));
+            let held = pool.acquire().await.unwrap();
 
-        // This should timeout
-        let err = pool.acquire().await.unwrap_err();
-        assert_eq!(err, PoolError::AcquireTimeout);
+            // This should timeout
+            let err = pool.acquire().await.unwrap_err();
+            assert_eq!(err, PoolError::AcquireTimeout);
 
-        // Release and try again
-        drop(held);
-        let result = pool.acquire().await;
-        assert!(result.is_ok());
+            // Release and try again
+            drop(held);
+            let result = pool.acquire().await;
+            assert!(result.is_ok());
+        });
     }
 
     #[test]
@@ -1435,14 +1550,16 @@ mod tests {
         assert!(!err2.to_string().is_empty());
     }
 
-    #[tokio::test]
-    async fn pool_stats_total_timeouts_increments() {
-        let pool: Pool<String> = Pool::new(test_config(1));
-        let _held = pool.acquire().await.unwrap();
+    #[test]
+    fn pool_stats_total_timeouts_increments() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(1));
+            let _held = pool.acquire().await.unwrap();
 
-        // This should timeout and increment timeout counter
-        let _err = pool.acquire().await.unwrap_err();
-        let stats = pool.stats().await;
-        assert_eq!(stats.total_timeouts, 1);
+            // This should timeout and increment timeout counter
+            let _err = pool.acquire().await.unwrap_err();
+            let stats = pool.stats().await;
+            assert_eq!(stats.total_timeouts, 1);
+        });
     }
 }

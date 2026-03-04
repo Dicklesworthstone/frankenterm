@@ -76,6 +76,17 @@ mod tests {
     use crate::patterns::{AgentType, Detection, PatternEngine, Severity};
     use crate::runtime_compat::CompatRuntime;
 
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build workflows test runtime");
+        runtime.block_on(future);
+    }
+
     // ========================================================================
     // StepResult Tests
     // ========================================================================
@@ -378,8 +389,9 @@ mod tests {
         assert!(!workflow.handles(&make_test_detection("production.event")));
     }
 
-    #[tokio::test]
-    async fn stub_workflow_executes_steps_correctly() {
+    #[test]
+    fn stub_workflow_executes_steps_correctly() {
+        run_async_test(async {
         let workflow = StubWorkflow::new();
 
         // Create a minimal context for testing
@@ -390,6 +402,7 @@ mod tests {
         // but we can verify the workflow's step logic independently
         let steps = workflow.steps();
         assert_eq!(steps.len(), 3);
+        });
     }
 
     #[test]
@@ -781,8 +794,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn pattern_wait_succeeds_on_immediate_match() {
+    #[test]
+    fn pattern_wait_succeeds_on_immediate_match() {
+        run_async_test(async {
         let source = MockPaneSource::new(vec![
             "Conversation compacted 100,000 tokens to 25,000 tokens".to_string(),
         ]);
@@ -806,10 +820,12 @@ mod tests {
         let result = result.unwrap();
         assert!(result.is_satisfied());
         assert_eq!(source.calls(), 1);
+        });
     }
 
-    #[tokio::test]
-    async fn pattern_wait_times_out_on_no_match() {
+    #[test]
+    fn pattern_wait_times_out_on_no_match() {
+        run_async_test(async {
         let source = MockPaneSource::new(vec!["no matching pattern here".to_string()]);
         let engine = PatternEngine::new();
 
@@ -830,10 +846,12 @@ mod tests {
         assert!(result.is_ok());
         let result = result.unwrap();
         assert!(result.is_timed_out());
+        });
     }
 
-    #[tokio::test]
-    async fn pattern_wait_succeeds_after_multiple_polls() {
+    #[test]
+    fn pattern_wait_succeeds_after_multiple_polls() {
+        run_async_test(async {
         let source = MockPaneSource::new(vec![
             "no match yet".to_string(),
             "still no match".to_string(),
@@ -859,10 +877,12 @@ mod tests {
         let result = result.unwrap();
         assert!(result.is_satisfied());
         assert!(source.calls() >= 3);
+        });
     }
 
-    #[tokio::test]
-    async fn text_match_wait_succeeds_on_substring() {
+    #[test]
+    fn text_match_wait_succeeds_on_substring() {
+        run_async_test(async {
         let source = MockPaneSource::new(vec!["booting".to_string(), "ready> prompt".to_string()]);
         let engine = PatternEngine::new();
 
@@ -884,10 +904,12 @@ mod tests {
         let result = result.unwrap();
         assert!(result.is_satisfied());
         assert!(source.calls() >= 2);
+        });
     }
 
-    #[tokio::test]
-    async fn text_match_wait_succeeds_on_regex() {
+    #[test]
+    fn text_match_wait_succeeds_on_regex() {
+        run_async_test(async {
         let source = MockPaneSource::new(vec![
             "waiting".to_string(),
             "completed in 123ms".to_string(),
@@ -912,10 +934,12 @@ mod tests {
         let result = result.unwrap();
         assert!(result.is_satisfied());
         assert!(source.calls() >= 2);
+        });
     }
 
-    #[tokio::test]
-    async fn pane_idle_succeeds_with_osc133_prompt_active() {
+    #[test]
+    fn pane_idle_succeeds_with_osc133_prompt_active() {
+        run_async_test(async {
         use crate::ingest::{Osc133State, ShellState};
 
         let source = MockPaneSource::new(vec!["some text".to_string()]);
@@ -945,10 +969,12 @@ mod tests {
         if let WaitConditionResult::Satisfied { context, .. } = result {
             assert!(context.unwrap().contains("osc133"));
         }
+        });
     }
 
-    #[tokio::test]
-    async fn pane_idle_times_out_with_osc133_command_running() {
+    #[test]
+    fn pane_idle_times_out_with_osc133_command_running() {
+        run_async_test(async {
         use crate::ingest::{Osc133State, ShellState};
 
         let source = MockPaneSource::new(vec!["running command...".to_string()]);
@@ -974,6 +1000,7 @@ mod tests {
         assert!(result.is_ok());
         let result = result.unwrap();
         assert!(result.is_timed_out());
+        });
     }
 
     // ========================================================================
@@ -1109,8 +1136,9 @@ steps:
         assert!(msg.contains("timeout_ms too large"));
     }
 
-    #[tokio::test]
-    async fn descriptor_send_ctrl_requires_injector() {
+    #[test]
+    fn descriptor_send_ctrl_requires_injector() {
+        run_async_test(async {
         let yaml = r#"
 workflow_schema_version: 1
 name: "ctrl_only"
@@ -1138,10 +1166,12 @@ steps:
             }
             other => panic!("Expected abort, got: {other:?}"),
         }
+        });
     }
 
-    #[tokio::test]
-    async fn descriptor_workflow_logs_policy_summary_on_send_text() {
+    #[test]
+    fn descriptor_workflow_logs_policy_summary_on_send_text() {
+        run_async_test(async {
         let yaml = r#"
 workflow_schema_version: 1
 name: "send_text_policy"
@@ -1212,10 +1242,12 @@ steps:
             summary_json.get("decision").and_then(|v| v.as_str()),
             Some("allow")
         );
+        });
     }
 
-    #[tokio::test]
-    async fn workflow_runner_emits_step_and_policy_decision_capture_events() {
+    #[test]
+    fn workflow_runner_emits_step_and_policy_decision_capture_events() {
+        run_async_test(async {
         let yaml = r#"
 workflow_schema_version: 1
 name: "decision_capture_flow"
@@ -1305,6 +1337,7 @@ steps:
             }),
             "expected policy_evaluation decision provenance event"
         );
+        });
     }
 
     // --- Custom workflow extensions (wa-fno.2) ---
@@ -1457,8 +1490,9 @@ steps:
         assert_eq!(steps[1].name, "record");
     }
 
-    #[tokio::test]
-    async fn descriptor_notify_step_returns_continue() {
+    #[test]
+    fn descriptor_notify_step_returns_continue() {
+        run_async_test(async {
         let yaml = r#"
 workflow_schema_version: 1
 name: "notify_exec"
@@ -1478,10 +1512,12 @@ steps:
         let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-notify");
         let result = workflow.execute_step(&mut ctx, 0).await;
         assert!(result.is_continue());
+        });
     }
 
-    #[tokio::test]
-    async fn descriptor_log_step_returns_continue() {
+    #[test]
+    fn descriptor_log_step_returns_continue() {
+        run_async_test(async {
         let yaml = r#"
 workflow_schema_version: 1
 name: "log_exec"
@@ -1497,10 +1533,12 @@ steps:
         let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-log");
         let result = workflow.execute_step(&mut ctx, 0).await;
         assert!(result.is_continue());
+        });
     }
 
-    #[tokio::test]
-    async fn descriptor_abort_step_returns_abort() {
+    #[test]
+    fn descriptor_abort_step_returns_abort() {
+        run_async_test(async {
         let yaml = r#"
 workflow_schema_version: 1
 name: "abort_exec"
@@ -1523,10 +1561,12 @@ steps:
             StepResult::Abort { reason } => assert_eq!(reason, "cannot proceed"),
             other => panic!("Expected Abort, got: {other:?}"),
         }
+        });
     }
 
-    #[tokio::test]
-    async fn descriptor_conditional_then_branch() {
+    #[test]
+    fn descriptor_conditional_then_branch() {
+        run_async_test(async {
         let yaml = r#"
 workflow_schema_version: 1
 name: "cond_then"
@@ -1558,10 +1598,12 @@ steps:
         // test_text contains "error" so then_steps should run (notify returns Continue)
         let result = workflow.execute_step(&mut ctx, 0).await;
         assert!(result.is_continue());
+        });
     }
 
-    #[tokio::test]
-    async fn descriptor_conditional_else_branch() {
+    #[test]
+    fn descriptor_conditional_else_branch() {
+        run_async_test(async {
         let yaml = r#"
 workflow_schema_version: 1
 name: "cond_else"
@@ -1606,10 +1648,12 @@ steps:
             }
         };
         assert!(result.is_continue());
+        });
     }
 
-    #[tokio::test]
-    async fn descriptor_conditional_then_with_abort() {
+    #[test]
+    fn descriptor_conditional_then_with_abort() {
+        run_async_test(async {
         let yaml = r#"
 workflow_schema_version: 1
 name: "cond_abort"
@@ -1652,10 +1696,12 @@ steps:
             StepResult::Abort { reason } => assert_eq!(reason, "fatal error"),
             other => panic!("Expected Abort, got: {other:?}"),
         }
+        });
     }
 
-    #[tokio::test]
-    async fn descriptor_loop_repeats_steps() {
+    #[test]
+    fn descriptor_loop_repeats_steps() {
+        run_async_test(async {
         let yaml = r#"
 workflow_schema_version: 1
 name: "loop_test"
@@ -1680,10 +1726,12 @@ steps:
         // All body steps are log (Continue), so loop completes with Continue
         let result = workflow.execute_step(&mut ctx, 0).await;
         assert!(result.is_continue());
+        });
     }
 
-    #[tokio::test]
-    async fn descriptor_loop_aborts_on_abort_step() {
+    #[test]
+    fn descriptor_loop_aborts_on_abort_step() {
+        run_async_test(async {
         let yaml = r#"
 workflow_schema_version: 1
 name: "loop_abort"
@@ -1711,6 +1759,7 @@ steps:
             StepResult::Abort { reason } => assert_eq!(reason, "stop early"),
             other => panic!("Expected Abort, got: {other:?}"),
         }
+        });
     }
 
     #[test]
@@ -1962,8 +2011,9 @@ steps:
         assert_eq!(loaded[0].0.name, "yml_ext");
     }
 
-    #[tokio::test]
-    async fn pane_idle_uses_heuristics_when_no_osc133() {
+    #[test]
+    fn pane_idle_uses_heuristics_when_no_osc133() {
+        run_async_test(async {
         let source = MockPaneSource::new(vec!["user@host:~$ ".to_string()]);
         let engine = PatternEngine::new();
 
@@ -1987,10 +2037,12 @@ steps:
         if let WaitConditionResult::Satisfied { context, .. } = result {
             assert!(context.unwrap().contains("heuristic"));
         }
+        });
     }
 
-    #[tokio::test]
-    async fn pane_idle_respects_threshold_duration() {
+    #[test]
+    fn pane_idle_respects_threshold_duration() {
+        run_async_test(async {
         use crate::ingest::{Osc133State, ShellState};
 
         let source = MockPaneSource::new(vec!["some text".to_string()]);
@@ -2021,10 +2073,12 @@ steps:
         assert!(result.is_satisfied());
         // Should have waited at least the threshold duration
         assert!(elapsed >= Duration::from_millis(50));
+        });
     }
 
-    #[tokio::test]
-    async fn stable_tail_succeeds_after_stability_window() {
+    #[test]
+    fn stable_tail_succeeds_after_stability_window() {
+        run_async_test(async {
         let source = MockPaneSource::new(vec![
             "compaction in progress".to_string(),
             "compaction in progress".to_string(),
@@ -2049,10 +2103,12 @@ steps:
         assert!(result.is_ok());
         let result = result.unwrap();
         assert!(result.is_satisfied());
+        });
     }
 
-    #[tokio::test]
-    async fn stable_tail_times_out_when_changing() {
+    #[test]
+    fn stable_tail_times_out_when_changing() {
+        run_async_test(async {
         let source = MockPaneSource::new(vec![
             "line 1".to_string(),
             "line 2".to_string(),
@@ -2078,10 +2134,12 @@ steps:
         assert!(result.is_ok());
         let result = result.unwrap();
         assert!(result.is_timed_out());
+        });
     }
 
-    #[tokio::test]
-    async fn external_wait_returns_unsupported() {
+    #[test]
+    fn external_wait_returns_unsupported() {
+        run_async_test(async {
         let source = MockPaneSource::new(vec!["text".to_string()]);
         let engine = PatternEngine::new();
 
@@ -2099,10 +2157,12 @@ steps:
             }
             _ => panic!("Expected Unsupported"),
         }
+        });
     }
 
-    #[tokio::test]
-    async fn wait_respects_max_polls() {
+    #[test]
+    fn wait_respects_max_polls() {
+        run_async_test(async {
         let source = MockPaneSource::new(vec!["no match".to_string()]);
         let engine = PatternEngine::new();
 
@@ -2126,6 +2186,7 @@ steps:
         if let WaitConditionResult::TimedOut { polls, .. } = result {
             assert!(polls <= 3);
         }
+        });
     }
 
     // ========================================================================
@@ -4316,8 +4377,9 @@ steps:
     }
 
     /// Test that InjectionResult::Denied is returned when policy denies.
-    #[tokio::test]
-    async fn policy_gated_injector_returns_denied_for_running_command() {
+    #[test]
+    fn policy_gated_injector_returns_denied_for_running_command() {
+        run_async_test(async {
         use crate::policy::{
             ActorKind, InjectionResult, PaneCapabilities, PolicyEngine, PolicyGatedInjector,
         };
@@ -4356,6 +4418,7 @@ steps:
                 decision.rule_id()
             );
         }
+        });
     }
 
     /// Test that WorkflowContext has injector access after with_injector is called.
@@ -4967,8 +5030,9 @@ steps:
 
     /// Test: Workflow execution step 0 (check_guards) with PromptActive state
     /// Expected: Step returns Continue (not Abort)
-    #[tokio::test]
-    async fn handle_compaction_execute_step0_prompt_active_continues() {
+    #[test]
+    fn handle_compaction_execute_step0_prompt_active_continues() {
+        run_async_test(async {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir
             .path()
@@ -5005,12 +5069,14 @@ steps:
         }
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: Workflow execution step 0 (check_guards) with AltScreen state
     /// Expected: Step returns Abort with actionable reason
-    #[tokio::test]
-    async fn handle_compaction_execute_step0_alt_screen_aborts() {
+    #[test]
+    fn handle_compaction_execute_step0_alt_screen_aborts() {
+        run_async_test(async {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir
             .path()
@@ -5054,12 +5120,14 @@ steps:
         }
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: Workflow execution step 1 (stabilize) returns Continue after stabilization
     /// Expected: Step returns Continue (no wait-for result)
-    #[tokio::test]
-    async fn handle_compaction_execute_step1_returns_continue() {
+    #[test]
+    fn handle_compaction_execute_step1_returns_continue() {
+        run_async_test(async {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir
             .path()
@@ -5093,12 +5161,14 @@ steps:
         }
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: Workflow execution step 2 (send_prompt) without injector
     /// Expected: Step returns Abort (no injector configured)
-    #[tokio::test]
-    async fn handle_compaction_execute_step2_no_injector_aborts() {
+    #[test]
+    fn handle_compaction_execute_step2_no_injector_aborts() {
+        run_async_test(async {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir
             .path()
@@ -5137,12 +5207,14 @@ steps:
         }
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: Unexpected step index returns Abort
     /// Expected: Step indices >= step_count return Abort
-    #[tokio::test]
-    async fn handle_compaction_execute_invalid_step_aborts() {
+    #[test]
+    fn handle_compaction_execute_invalid_step_aborts() {
+        run_async_test(async {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir
             .path()
@@ -5178,6 +5250,7 @@ steps:
         }
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     // ========================================================================
@@ -5499,8 +5572,9 @@ steps:
     // ------------------------------------------------------------------------
 
     /// Test: Lock is released when workflow completes successfully (Done)
-    #[tokio::test]
-    async fn lock_released_on_workflow_completion() {
+    #[test]
+    fn lock_released_on_workflow_completion() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -5545,11 +5619,13 @@ steps:
         );
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: Lock is released when workflow aborts
-    #[tokio::test]
-    async fn lock_released_on_workflow_abort() {
+    #[test]
+    fn lock_released_on_workflow_abort() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -5597,11 +5673,13 @@ steps:
         );
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: Per-pane lock prevents concurrent workflow execution
-    #[tokio::test]
-    async fn per_pane_lock_prevents_concurrent_workflows() {
+    #[test]
+    fn per_pane_lock_prevents_concurrent_workflows() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -5660,6 +5738,7 @@ steps:
         );
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     // ------------------------------------------------------------------------
@@ -5667,8 +5746,9 @@ steps:
     // ------------------------------------------------------------------------
 
     /// Test: Step logs are written correctly during workflow execution
-    #[tokio::test]
-    async fn step_logs_written_correctly() {
+    #[test]
+    fn step_logs_written_correctly() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -5721,11 +5801,13 @@ steps:
         assert_eq!(step_logs[3].result_type, "done");
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: SendText step logs capture audit_action_id and join into action_history
-    #[tokio::test]
-    async fn send_text_step_logs_audit_action_id() {
+    #[test]
+    fn send_text_step_logs_audit_action_id() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -5796,11 +5878,13 @@ steps:
         assert_eq!(entry.step_name.as_deref(), Some("send"));
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: workflow completion updates undo metadata and records workflow actions.
-    #[tokio::test]
-    async fn workflow_completion_updates_undo_metadata() {
+    #[test]
+    fn workflow_completion_updates_undo_metadata() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -5875,11 +5959,13 @@ steps:
         );
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: workflow abort updates undo metadata and records abort action.
-    #[tokio::test]
-    async fn workflow_abort_updates_undo_metadata() {
+    #[test]
+    fn workflow_abort_updates_undo_metadata() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -5959,11 +6045,13 @@ steps:
         );
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: idempotent steps are skipped on retry to avoid double-apply.
-    #[tokio::test]
-    async fn idempotent_step_skip_prevents_double_send() {
+    #[test]
+    fn idempotent_step_skip_prevents_double_send() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -6047,11 +6135,13 @@ steps:
         );
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: Step logs record abort correctly
-    #[tokio::test]
-    async fn step_logs_record_abort() {
+    #[test]
+    fn step_logs_record_abort() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -6092,6 +6182,7 @@ steps:
         assert_eq!(step_logs[2].result_type, "abort");
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     // ------------------------------------------------------------------------
@@ -6099,8 +6190,9 @@ steps:
     // ------------------------------------------------------------------------
 
     /// Test: WorkflowEngine.resume computes correct next step from logs
-    #[tokio::test]
-    async fn engine_resume_finds_correct_step() {
+    #[test]
+    fn engine_resume_finds_correct_step() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -6168,11 +6260,13 @@ steps:
         assert_eq!(next_step, 2, "Next step should be 2 (after steps 0, 1)");
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: find_incomplete_workflows returns workflows with running/waiting status
-    #[tokio::test]
-    async fn find_incomplete_workflows_returns_running_and_waiting() {
+    #[test]
+    fn find_incomplete_workflows_returns_running_and_waiting() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -6241,11 +6335,13 @@ steps:
         assert!(!incomplete_ids.contains(exec3.id.as_str()));
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: resume_incomplete resumes workflows from last completed step
-    #[tokio::test]
-    async fn resume_incomplete_resumes_from_last_step() {
+    #[test]
+    fn resume_incomplete_resumes_from_last_step() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -6328,11 +6424,13 @@ steps:
         assert_eq!(step_logs[3].result_type, "done");
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     /// Test: Aborted workflows are not resumed
-    #[tokio::test]
-    async fn aborted_workflows_not_resumed() {
+    #[test]
+    fn aborted_workflows_not_resumed() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir
             .path()
@@ -6379,6 +6477,7 @@ steps:
         );
 
         storage.shutdown().await.unwrap();
+        });
     }
 
     // ====================================================================
@@ -6435,8 +6534,9 @@ steps:
         }
     }
 
-    #[tokio::test]
-    async fn codex_exit_sends_one_ctrl_c_when_summary_present() {
+    #[test]
+    fn codex_exit_sends_one_ctrl_c_when_summary_present() {
+        run_async_test(async {
         let source = TestTextSource::new(vec![
             "Token usage: total=10 input=5 (+ 0 cached) output=5\nTo resume, run: codex resume 123e4567-e89b-12d3-a456-426614174000",
         ]);
@@ -6463,10 +6563,12 @@ steps:
         assert_eq!(result.ctrl_c_count, 1);
         assert!(result.summary.matched);
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
     }
 
-    #[tokio::test]
-    async fn codex_exit_sends_second_ctrl_c_when_grace_times_out() {
+    #[test]
+    fn codex_exit_sends_second_ctrl_c_when_grace_times_out() {
+        run_async_test(async {
         let source = TestTextSource::new(vec![
             "still running...",
             "Token usage: total=10 input=5 (+ 0 cached) output=5\nTo resume, run: codex resume 123e4567-e89b-12d3-a456-426614174000",
@@ -6494,10 +6596,12 @@ steps:
         assert_eq!(result.ctrl_c_count, 2);
         assert!(result.summary.matched);
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+        });
     }
 
-    #[tokio::test]
-    async fn codex_exit_errors_when_summary_never_appears() {
+    #[test]
+    fn codex_exit_errors_when_summary_never_appears() {
+        run_async_test(async {
         let source = TestTextSource::new(vec!["no summary", "still no summary"]);
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter_clone = Arc::clone(&counter);
@@ -6520,10 +6624,12 @@ steps:
             .expect_err("expected failure");
         assert!(err.contains("Session summary not found"));
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+        });
     }
 
-    #[tokio::test]
-    async fn codex_exit_aborts_on_policy_denial() {
+    #[test]
+    fn codex_exit_aborts_on_policy_denial() {
+        run_async_test(async {
         let source = TestTextSource::new(vec![
             "Token usage: total=1 input=1 (+ 0 cached) output=0 codex resume 123e4567-e89b-12d3-a456-426614174000",
         ]);
@@ -6554,6 +6660,7 @@ steps:
             .expect_err("expected denial");
         assert!(err.contains("denied"));
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
     }
 
     // ========================================================================
@@ -7068,8 +7175,9 @@ Try again at 3:00 PM UTC.
         assert!(wf.requires_pane());
     }
 
-    #[tokio::test]
-    async fn handle_session_end_persist_roundtrip() {
+    #[test]
+    fn handle_session_end_persist_roundtrip() {
+        run_async_test(async {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::SeqCst);
@@ -7124,10 +7232,12 @@ Try again at 3:00 PM UTC.
         assert_eq!(session.output_tokens, Some(2000));
         assert!(session.ended_at.is_some());
         assert_eq!(session.end_reason.as_deref(), Some("completed"));
+        });
     }
 
-    #[tokio::test]
-    async fn persist_caut_refresh_accounts_records_metrics() {
+    #[test]
+    fn persist_caut_refresh_accounts_records_metrics() {
+        run_async_test(async {
         use std::collections::HashMap;
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
@@ -7200,6 +7310,7 @@ Try again at 3:00 PM UTC.
 
         storage.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_file(&db_path);
+        });
     }
 
     // ========================================================================
@@ -7247,8 +7358,9 @@ Try again at 3:00 PM UTC.
         assert!(!wf.handles(&non_matching));
     }
 
-    #[tokio::test]
-    async fn handle_process_triage_lifecycle_step0_aborts_on_alt_screen() {
+    #[test]
+    fn handle_process_triage_lifecycle_step0_aborts_on_alt_screen() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir.path().join("triage_lifecycle_alt_screen.db");
         let storage = Arc::new(
@@ -7269,10 +7381,12 @@ Try again at 3:00 PM UTC.
             }
             other => panic!("expected abort, got {other:?}"),
         }
+        });
     }
 
-    #[tokio::test]
-    async fn handle_process_triage_lifecycle_step2_aborts_on_protected_destructive_action() {
+    #[test]
+    fn handle_process_triage_lifecycle_step2_aborts_on_protected_destructive_action() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir.path().join("triage_lifecycle_protected_abort.db");
         let storage = Arc::new(
@@ -7316,10 +7430,12 @@ Try again at 3:00 PM UTC.
             }
             other => panic!("expected abort, got {other:?}"),
         }
+        });
     }
 
-    #[tokio::test]
-    async fn handle_process_triage_lifecycle_session_step_emits_all_artifacts() {
+    #[test]
+    fn handle_process_triage_lifecycle_session_step_emits_all_artifacts() {
+        run_async_test(async {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let db_path = temp_dir.path().join("triage_lifecycle_session.db");
         let storage = Arc::new(
@@ -7376,6 +7492,7 @@ Try again at 3:00 PM UTC.
             }
             other => panic!("expected done, got {other:?}"),
         }
+        });
     }
 
     // ========================================================================
@@ -7568,8 +7685,9 @@ Try again at 3:00 PM UTC.
         assert!(prompt.contains("Cass workspace filter: /repo"));
     }
 
-    #[tokio::test]
-    async fn handle_auth_required_audit_roundtrip() {
+    #[test]
+    fn handle_auth_required_audit_roundtrip() {
+        run_async_test(async {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::SeqCst);
@@ -7629,10 +7747,12 @@ Try again at 3:00 PM UTC.
         assert!(!results.is_empty());
         assert_eq!(results[0].action_kind, "auth_required");
         assert_eq!(results[0].pane_id, Some(88));
+        });
     }
 
-    #[tokio::test]
-    async fn handle_auth_required_cooldown_blocks_repeat() {
+    #[test]
+    fn handle_auth_required_cooldown_blocks_repeat() {
+        run_async_test(async {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR2: AtomicU64 = AtomicU64::new(0);
         let n = CTR2.fetch_add(1, Ordering::SeqCst);
@@ -7696,6 +7816,7 @@ Try again at 3:00 PM UTC.
             !results.is_empty(),
             "Should find recent auth event within cooldown window"
         );
+        });
     }
 
     // ========================================================================
@@ -8270,8 +8391,9 @@ Try again at 3:00 PM UTC.
         });
     }
 
-    #[tokio::test]
-    async fn regression_session_end_full_execution() {
+    #[test]
+    fn regression_session_end_full_execution() {
+        run_async_test(async {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::SeqCst);
@@ -8350,10 +8472,12 @@ Try again at 3:00 PM UTC.
                 .any(|m| m.metric_type == crate::storage::MetricType::SessionDuration),
             "Expected session duration metric"
         );
+        });
     }
 
-    #[tokio::test]
-    async fn regression_auth_required_full_execution() {
+    #[test]
+    fn regression_auth_required_full_execution() {
+        run_async_test(async {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::SeqCst);
@@ -8423,10 +8547,12 @@ Try again at 3:00 PM UTC.
         );
         assert_eq!(audits[0].action_kind, "auth_required");
         assert_eq!(audits[0].pane_id, Some(pane_id));
+        });
     }
 
-    #[tokio::test]
-    async fn regression_auth_cooldown_skips_repeat() {
+    #[test]
+    fn regression_auth_cooldown_skips_repeat() {
+        run_async_test(async {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::SeqCst);
@@ -8480,10 +8606,12 @@ Try again at 3:00 PM UTC.
         );
         assert_eq!(logs2[0].step_name, "check_cooldown");
         assert_eq!(logs2[0].result_type, "done");
+        });
     }
 
-    #[tokio::test]
-    async fn regression_session_end_null_trigger_produces_sparse_record() {
+    #[test]
+    fn regression_session_end_null_trigger_produces_sparse_record() {
+        run_async_test(async {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::SeqCst);
@@ -8527,6 +8655,7 @@ Try again at 3:00 PM UTC.
             2,
             "Should have 2 step logs even with sparse data"
         );
+        });
     }
 
     #[test]
