@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use frankenterm_core::connector_host_runtime::ConnectorCapability;
 use frankenterm_core::connector_registry::{
     compute_digest, verify_digest, ConnectorManifest, ConnectorRegistryClient,
-    ConnectorRegistryConfig, PackageEntry, PackageStatus, RegistryTelemetrySnapshot,
-    TransparencyCheckResult, TrustLevel, TrustPolicy, VerificationOutcome, VerificationRecord,
+    ConnectorRegistryConfig, PackageStatus, RegistryTelemetrySnapshot,
+    TrustLevel, TrustPolicy, VerificationOutcome, VerificationRecord,
 };
 
 // ---------------------------------------------------------------------------
