@@ -13,6 +13,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Maximum allowed message payload size in bytes (1 MiB).
 pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
+/// Maximum sender identity length in bytes.
+pub const MAX_SENDER_ID_LEN: usize = 128;
 /// Default idle window before a sender is considered stale.
 pub const DEFAULT_AGENT_STALE_AFTER_MS: i64 = 5 * 60 * 1000;
 
@@ -139,6 +141,7 @@ impl WireEnvelope {
                 got: envelope.version,
             });
         }
+        validate_sender_identity(&envelope.sender)?;
         Ok(envelope)
     }
 }
@@ -156,6 +159,11 @@ pub enum WireProtocolError {
     MessageTooLarge { size: usize, max: usize },
     #[error("protocol version mismatch: expected {expected}, got {got}")]
     VersionMismatch { expected: u32, got: u32 },
+    #[error("invalid sender identity '{sender}': {reason}")]
+    InvalidSender {
+        sender: String,
+        reason: &'static str,
+    },
     #[error("aggregator capacity exceeded: max tracked agents {max}, rejected sender '{sender}'")]
     TooManyAgents { max: usize, sender: String },
 }
@@ -438,6 +446,11 @@ impl Aggregator {
         &mut self,
         envelope: WireEnvelope,
     ) -> Result<IngestResult, WireProtocolError> {
+        if let Err(err) = validate_sender_identity(&envelope.sender) {
+            self.total_rejected = self.total_rejected.saturating_add(1);
+            return Err(err);
+        }
+
         let is_new = !self.agents.contains_key(&envelope.sender);
         if is_new && self.agents.len() >= self.max_agents {
             self.prune_stale_agents(envelope.sent_at_ms);
@@ -530,6 +543,31 @@ fn epoch_ms_now() -> i64 {
             .as_millis(),
     )
     .unwrap_or(i64::MAX)
+}
+
+fn validate_sender_identity(sender: &str) -> Result<(), WireProtocolError> {
+    if sender.trim().is_empty() {
+        return Err(WireProtocolError::InvalidSender {
+            sender: sender.to_string(),
+            reason: "sender must not be empty",
+        });
+    }
+    if sender.len() > MAX_SENDER_ID_LEN {
+        return Err(WireProtocolError::InvalidSender {
+            sender: sender.to_string(),
+            reason: "sender exceeds max length",
+        });
+    }
+    if sender
+        .bytes()
+        .any(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
+    {
+        return Err(WireProtocolError::InvalidSender {
+            sender: sender.to_string(),
+            reason: "sender contains invalid characters",
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +769,24 @@ mod tests {
     fn empty_bytes_rejected() {
         let err = WireEnvelope::from_json(b"").unwrap_err();
         assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn rejects_empty_sender_identity() {
+        let mut envelope = WireEnvelope::new(1, "agent", WirePayload::Gap(sample_gap()));
+        envelope.sender = "   ".to_string();
+        let bytes = envelope.to_json().unwrap();
+        let err = WireEnvelope::from_json(&bytes).unwrap_err();
+        assert!(matches!(err, WireProtocolError::InvalidSender { .. }));
+    }
+
+    #[test]
+    fn rejects_sender_identity_with_separator_characters() {
+        let mut envelope = WireEnvelope::new(1, "agent", WirePayload::Gap(sample_gap()));
+        envelope.sender = "agent:beta".to_string();
+        let bytes = envelope.to_json().unwrap();
+        let err = WireEnvelope::from_json(&bytes).unwrap_err();
+        assert!(matches!(err, WireProtocolError::InvalidSender { .. }));
     }
 
     // --- Golden fixture: a known-good serialized message ---
@@ -1203,6 +1259,19 @@ mod tests {
             0,
             "rejected inputs must not inflate accepted counters"
         );
+    }
+
+    #[test]
+    fn aggregator_rejects_invalid_sender_identity_and_tracks_rejections() {
+        let mut agg = Aggregator::new(10);
+        let envelope = WireEnvelope::new(1, "agent:invalid", WirePayload::Gap(sample_gap()));
+        let err = agg
+            .ingest_envelope(envelope)
+            .expect_err("invalid sender identity should be rejected");
+        assert!(matches!(err, WireProtocolError::InvalidSender { .. }));
+        assert_eq!(agg.total_rejected(), 1);
+        assert_eq!(agg.total_accepted(), 0);
+        assert_eq!(agg.agent_count(), 0);
     }
 
     #[test]
