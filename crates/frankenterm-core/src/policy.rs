@@ -6137,6 +6137,86 @@ mod tests {
     }
 
     #[test]
+    fn policy_rules_match_exec_command_surface_case_insensitive() {
+        let rules = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "rule.mcp.exec".to_string(),
+                description: None,
+                priority: 10,
+                match_on: PolicyRuleMatch {
+                    actions: vec!["exec_command".to_string()],
+                    actors: vec!["mcp".to_string()],
+                    surfaces: vec!["MCP".to_string()],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::Deny,
+                message: Some("mcp exec blocked".to_string()),
+            }],
+        };
+
+        let mut engine = PolicyEngine::permissive().with_policy_rules(rules);
+        let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
+            .with_command_text("caut refresh openai");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("config.rule.rule.mcp.exec"));
+        let context = decision
+            .context()
+            .expect("decision context should be present");
+        assert_eq!(context.surface, PolicySurface::Mcp);
+    }
+
+    #[test]
+    fn explicit_surface_override_takes_precedence_over_actor_default() {
+        let rules = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![
+                PolicyRule {
+                    id: "rule.surface.mcp".to_string(),
+                    description: None,
+                    priority: 10,
+                    match_on: PolicyRuleMatch {
+                        actions: vec!["read_output".to_string()],
+                        actors: vec!["mcp".to_string()],
+                        surfaces: vec!["mcp".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Deny,
+                    message: Some("mcp surface blocked".to_string()),
+                },
+                PolicyRule {
+                    id: "rule.surface.mux".to_string(),
+                    description: None,
+                    priority: 10,
+                    match_on: PolicyRuleMatch {
+                        actions: vec!["read_output".to_string()],
+                        actors: vec!["mcp".to_string()],
+                        surfaces: vec!["mux".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Allow,
+                    message: Some("mux override allowed".to_string()),
+                },
+            ],
+        };
+
+        let mut engine = PolicyEngine::permissive().with_policy_rules(rules);
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Mcp)
+            .with_surface(PolicySurface::Mux)
+            .with_pane(3);
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+        assert_eq!(decision.rule_id(), Some("config.rule.rule.surface.mux"));
+        let context = decision
+            .context()
+            .expect("decision context should be present");
+        assert_eq!(context.surface, PolicySurface::Mux);
+    }
+
+    #[test]
     fn glob_match_patterns() {
         // Test the glob matching helper
         assert!(glob_match("*", "anything"));
