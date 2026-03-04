@@ -14732,6 +14732,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         None
                                     };
                                     let total_count = events.len();
+                                    let next_cursor = if cursor_mode {
+                                        events.last().map(|event| event.id)
+                                    } else {
+                                        None
+                                    };
                                     let mut items: Vec<RobotEventItem> =
                                         Vec::with_capacity(events.len());
                                     for e in events {
@@ -14781,11 +14786,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         total_count,
                                         limit: effective_limit,
                                         cursor,
-                                        next_cursor: if cursor_mode {
-                                            events.last().map(|event| event.id)
-                                        } else {
-                                            None
-                                        },
+                                        next_cursor,
                                         replay_limit,
                                         order,
                                         pane_filter: pane,

@@ -15,7 +15,7 @@ pub(super) fn build_app(storage: Option<StorageHandle>, event_bus: Option<Arc<Ev
 
     App::builder()
         .middleware(BodySizeGuard)
-        .middleware(RequestSpanLogger::default())
+        .middleware(RequestSpanLogger)
         .middleware(StateInjector { state })
         .route(
             "/health",

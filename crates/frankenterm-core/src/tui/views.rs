@@ -575,7 +575,7 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                         Span::raw("  WezTerm "),
                         wezterm_status,
                         Span::raw("  Circuit "),
-                        Span::styled(circuit_compact, circuit_style.clone()),
+                        Span::styled(circuit_compact, circuit_style),
                     ]),
                     Line::from(vec![
                         Span::raw("  Capture "),

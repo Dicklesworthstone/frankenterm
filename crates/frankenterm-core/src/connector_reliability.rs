@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use crate::connector_outbound_bridge::{ConnectorAction, ConnectorActionKind};
+use crate::connector_outbound_bridge::ConnectorAction;
 use crate::retry::RetryPolicy;
 
 // =============================================================================
@@ -808,6 +808,7 @@ impl ReliabilityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector_outbound_bridge::ConnectorActionKind;
 
     fn sample_action(connector: &str, kind: ConnectorActionKind) -> ConnectorAction {
         ConnectorAction {

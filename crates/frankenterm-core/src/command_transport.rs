@@ -770,8 +770,8 @@ impl CommandDeduplicator {
 mod tests {
     use super::*;
     use crate::session_topology::{
-        AgentLifecycleState, LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry,
-        LifecycleState, MuxPaneLifecycleState, SessionLifecycleState, WindowLifecycleState,
+        LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
+        MuxPaneLifecycleState, SessionLifecycleState, WindowLifecycleState,
     };
 
     fn test_context(ts: u64) -> CommandContext {

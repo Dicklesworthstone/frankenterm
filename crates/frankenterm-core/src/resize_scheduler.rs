@@ -1984,7 +1984,6 @@ mod tests {
         ResizeLifecycleStage, ResizeScheduler, ResizeSchedulerConfig, ResizeSchedulerDebugSnapshot,
         ResizeWorkClass, SubmitOutcome,
     };
-    use crate::resize_invariants::ResizeViolationKind;
 
     fn intent(
         pane_id: u64,
