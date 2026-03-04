@@ -51,20 +51,23 @@ impl SimpleTempDir {
 
     fn del_ref(&self, content_id: ContentId) {
         let mut refs = self.refs.lock().unwrap();
-        match refs.get_mut(&content_id) {
-            Some(count) if *count == 1 => {
+        match refs.get(&content_id).copied() {
+            Some(1) => {
+                refs.remove(&content_id);
+                drop(refs);
                 if let Ok(path) = self.path_for_content(content_id) {
                     if let Err(err) = std::fs::remove_file(&path) {
                         eprintln!("Failed to remove {}: {err:#}", path.display());
                     }
                 }
-                *count = 0;
             }
-            Some(count) => {
-                *count -= 1;
+            Some(count) if count > 1 => {
+                if let Some(entry) = refs.get_mut(&content_id) {
+                    *entry = count - 1;
+                }
             }
-            None => {
-                // Shouldn't really happen...
+            _ => {
+                // Duplicate drops can happen during teardown races; treat as no-op.
             }
         }
     }
@@ -277,6 +280,35 @@ mod tests {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut reader, &mut buf).unwrap();
         assert_eq!(buf, b"reader data");
+    }
+
+    #[test]
+    fn advise_lease_dropped_removes_terminal_ref_entry() {
+        let store = SimpleTempDir::new().unwrap();
+        let content_id = ContentId::for_bytes(b"terminal ref");
+        let lease_id = LeaseId::new();
+        store.store(content_id, b"terminal ref", lease_id).unwrap();
+
+        store.advise_lease_dropped(lease_id, content_id).unwrap();
+        assert!(
+            !store.refs.lock().unwrap().contains_key(&content_id),
+            "terminal ref entry should be removed instead of kept at 0"
+        );
+    }
+
+    #[test]
+    fn duplicate_advise_lease_dropped_is_noop() {
+        let store = SimpleTempDir::new().unwrap();
+        let content_id = ContentId::for_bytes(b"duplicate drop");
+        let lease_id = LeaseId::new();
+        store
+            .store(content_id, b"duplicate drop", lease_id)
+            .unwrap();
+
+        store.advise_lease_dropped(lease_id, content_id).unwrap();
+        // Second drop for the same content should not underflow refcount.
+        store.advise_lease_dropped(lease_id, content_id).unwrap();
+        assert!(!store.refs.lock().unwrap().contains_key(&content_id));
     }
 
     #[test]
