@@ -37,7 +37,9 @@ use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
 use crate::events::{Event, EventBus, UserVarPayload, event_identity_key};
 use crate::gc::{CacheGcSettings, compact_u64_map, should_vacuum};
-use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
+use crate::ingest::{
+    PaneCursor, PaneRegistry, bounded_segment_for_persistence, persist_captured_segment,
+};
 #[cfg(feature = "native-wezterm")]
 use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
@@ -2339,14 +2341,15 @@ impl ObservationRuntime {
                     }
                 }
                 let pane_id = event.segment.pane_id;
-                let content = event.segment.content.clone();
-                let captured_at = event.segment.captured_at;
-                let captured_seq = event.segment.seq;
+                let bounded_segment = bounded_segment_for_persistence(&event.segment);
+                let content = bounded_segment.content.clone();
+                let captured_at = bounded_segment.captured_at;
+                let captured_seq = bounded_segment.seq;
 
                 // Persist the segment
                 let (storage_guard, lock_held_since) =
                     lock_storage_with_profile(&storage, &metrics).await;
-                match persist_captured_segment(&storage_guard, &event.segment).await {
+                match persist_captured_segment(&storage_guard, &bounded_segment).await {
                     Ok(persisted) => {
                         // Check for sequence discontinuity and resync cursor if needed
                         if persisted.segment.seq != captured_seq {

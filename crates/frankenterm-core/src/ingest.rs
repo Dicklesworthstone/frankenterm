@@ -1329,6 +1329,17 @@ fn enforce_segment_size_for_persistence(
     )
 }
 
+/// Return the capture payload bounded to the default persistence size limit.
+///
+/// This is used by callers that need deterministic downstream behavior (for
+/// example, bounded regex detection work) to match persistence semantics.
+#[must_use]
+pub(crate) fn bounded_segment_for_persistence(captured: &CapturedSegment) -> CapturedSegment {
+    let (bounded, _) =
+        enforce_segment_size_for_persistence(captured, DEFAULT_MAX_PERSIST_SEGMENT_BYTES);
+    bounded
+}
+
 /// Persist a captured segment and optional gap into storage.
 ///
 /// The pane must already exist in storage (use `upsert_pane` elsewhere).
@@ -2491,6 +2502,10 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(runtime);
         }));
+        // Clear handle from TLS so it doesn't panic during thread exit.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
@@ -2867,6 +2882,36 @@ mod tests {
             handle.shutdown().await.unwrap();
             cleanup_db(&db_path);
         });
+    }
+
+    #[test]
+    fn bounded_segment_for_persistence_uses_default_limit() {
+        let oversized = CapturedSegment {
+            pane_id: 9,
+            seq: 1,
+            content: format!(
+                "prefix-{}",
+                "x".repeat(DEFAULT_MAX_PERSIST_SEGMENT_BYTES + 17)
+            ),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 123,
+        };
+
+        let bounded = bounded_segment_for_persistence(&oversized);
+        assert_eq!(bounded.pane_id, oversized.pane_id);
+        assert_eq!(bounded.seq, oversized.seq);
+        assert_eq!(bounded.captured_at, oversized.captured_at);
+        assert_eq!(bounded.content.len(), DEFAULT_MAX_PERSIST_SEGMENT_BYTES);
+
+        match bounded.kind {
+            CapturedSegmentKind::Gap { reason } => {
+                assert!(reason.contains("segment_truncated:original_bytes="));
+                assert!(reason.contains("max_bytes=65536"));
+            }
+            CapturedSegmentKind::Delta => {
+                panic!("bounded segment should promote oversized delta to gap")
+            }
+        }
     }
 
     // Helper to create a test PaneInfo
