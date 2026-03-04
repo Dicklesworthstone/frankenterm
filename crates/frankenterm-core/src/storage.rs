@@ -7600,6 +7600,23 @@ impl StorageHandle {
         .await
     }
 
+    /// Query events using an ID cursor for deterministic replay/resume.
+    ///
+    /// Results are ordered by ascending event ID so callers can checkpoint using
+    /// the last seen `id` and resume with `after_id`.
+    pub async fn get_events_stream(&self, query: EventStreamQuery) -> Result<Vec<StoredEvent>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_events_stream(&conn, &query)
+        })
+        .await
+    }
+
     /// Get a unified timeline of events across panes.
     ///
     /// Returns events enriched with pane info and correlations,
@@ -9141,6 +9158,31 @@ pub struct ActionHistoryQuery {
 #[derive(Debug, Clone, Default)]
 pub struct EventQuery {
     /// Maximum number of results (default: 20)
+    pub limit: Option<usize>,
+    /// Filter by pane ID
+    pub pane_id: Option<u64>,
+    /// Filter by rule ID (exact match)
+    pub rule_id: Option<String>,
+    /// Filter by event type (e.g., "compaction_warning")
+    pub event_type: Option<String>,
+    /// Filter by triage state (exact match)
+    pub triage_state: Option<String>,
+    /// Filter by label (exact match)
+    pub label: Option<String>,
+    /// Only return unhandled events
+    pub unhandled_only: bool,
+    /// Filter by time range start (epoch ms)
+    pub since: Option<i64>,
+    /// Filter by time range end (epoch ms)
+    pub until: Option<i64>,
+}
+
+/// Query options for cursor-based event streaming/replay.
+#[derive(Debug, Clone, Default)]
+pub struct EventStreamQuery {
+    /// Resume after this event ID (exclusive)
+    pub after_id: Option<i64>,
+    /// Maximum number of results (default: 100)
     pub limit: Option<usize>,
     /// Filter by pane ID
     pub pane_id: Option<u64>,
@@ -14071,6 +14113,102 @@ fn query_events(conn: &Connection, query: &EventQuery) -> Result<Vec<StoredEvent
             })
         })
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+
+    Ok(results)
+}
+
+/// Query events in deterministic ID order with cursor-based resume.
+fn query_events_stream(conn: &Connection, query: &EventStreamQuery) -> Result<Vec<StoredEvent>> {
+    let mut sql = String::from(
+        "SELECT id, pane_id, rule_id, agent_type, event_type, severity, confidence,
+         extracted, matched_text, segment_id, detected_at, dedupe_key, handled_at,
+         handled_by_workflow_id, handled_status
+         FROM events WHERE 1=1",
+    );
+    let mut params: Vec<SqlValue> = Vec::new();
+
+    if let Some(after_id) = query.after_id {
+        sql.push_str(" AND id > ?");
+        params.push(SqlValue::Integer(after_id));
+    }
+    if query.unhandled_only {
+        sql.push_str(" AND handled_at IS NULL");
+    }
+    if let Some(pane_id) = query.pane_id {
+        let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+        sql.push_str(" AND pane_id = ?");
+        params.push(SqlValue::Integer(pane_id_i64));
+    }
+    if let Some(rule_id) = &query.rule_id {
+        sql.push_str(" AND rule_id = ?");
+        params.push(SqlValue::Text(rule_id.clone()));
+    }
+    if let Some(event_type) = &query.event_type {
+        sql.push_str(" AND event_type = ?");
+        params.push(SqlValue::Text(event_type.clone()));
+    }
+    if let Some(triage_state) = &query.triage_state {
+        sql.push_str(" AND triage_state = ?");
+        params.push(SqlValue::Text(triage_state.clone()));
+    }
+    if let Some(label) = &query.label {
+        sql.push_str(" AND id IN (SELECT event_id FROM event_labels WHERE label = ?)");
+        params.push(SqlValue::Text(label.clone()));
+    }
+    if let Some(since) = query.since {
+        sql.push_str(" AND detected_at >= ?");
+        params.push(SqlValue::Integer(since));
+    }
+    if let Some(until) = query.until {
+        sql.push_str(" AND detected_at <= ?");
+        params.push(SqlValue::Integer(until));
+    }
+
+    sql.push_str(" ORDER BY id ASC LIMIT ?");
+    let limit_i64 = usize_to_i64(query.limit.unwrap_or(100), "limit")?;
+    params.push(SqlValue::Integer(limit_i64));
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| StorageError::Database(format!("Failed to prepare stream query: {e}")))?;
+
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            let extracted_str: Option<String> = row.get(7)?;
+            let extracted = extracted_str
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok());
+
+            Ok(StoredEvent {
+                id: row.get(0)?,
+                pane_id: {
+                    let val: i64 = row.get(1)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        val as u64
+                    }
+                },
+                rule_id: row.get(2)?,
+                agent_type: row.get(3)?,
+                event_type: row.get(4)?,
+                severity: row.get(5)?,
+                confidence: row.get(6)?,
+                extracted,
+                matched_text: row.get(8)?,
+                segment_id: row.get(9)?,
+                detected_at: row.get(10)?,
+                dedupe_key: row.get(11)?,
+                handled_at: row.get(12)?,
+                handled_by_workflow_id: row.get(13)?,
+                handled_status: row.get(14)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Stream query failed: {e}")))?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -21398,6 +21536,70 @@ mod storage_handle_tests {
                 .unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].id, event_id);
+
+            handle.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&db_path);
+        });
+    }
+
+    #[test]
+    fn storage_handle_event_stream_cursor_resume() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+            handle.upsert_pane(test_pane(7)).await.unwrap();
+            let base = now_ms();
+            let mut ids = Vec::new();
+            for i in 0..3 {
+                let id = handle
+                    .record_event(StoredEvent {
+                        id: 0,
+                        pane_id: 7,
+                        rule_id: format!("test.rule.{i}"),
+                        agent_type: "codex".to_string(),
+                        event_type: "stream".to_string(),
+                        severity: "info".to_string(),
+                        confidence: 0.9,
+                        extracted: None,
+                        matched_text: Some(format!("m{i}")),
+                        segment_id: None,
+                        detected_at: base + i,
+                        dedupe_key: None,
+                        handled_at: None,
+                        handled_by_workflow_id: None,
+                        handled_status: None,
+                    })
+                    .await
+                    .unwrap();
+                ids.push(id);
+            }
+
+            let page1 = handle
+                .get_events_stream(EventStreamQuery {
+                    after_id: None,
+                    limit: Some(2),
+                    pane_id: Some(7),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(page1.len(), 2);
+            assert_eq!(page1[0].id, ids[0]);
+            assert_eq!(page1[1].id, ids[1]);
+
+            let cursor = page1.last().map(|event| event.id).unwrap();
+            let page2 = handle
+                .get_events_stream(EventStreamQuery {
+                    after_id: Some(cursor),
+                    limit: Some(10),
+                    pane_id: Some(7),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(page2.len(), 1);
+            assert_eq!(page2[0].id, ids[2]);
 
             handle.shutdown().await.unwrap();
             let _ = std::fs::remove_file(&db_path);
