@@ -181,6 +181,7 @@ fn arb_decision_context() -> impl Strategy<Value = DecisionContext> {
                     timestamp_ms,
                     action,
                     actor,
+                    surface: PolicySurface::Unknown,
                     pane_id,
                     domain,
                     capabilities,

@@ -1807,6 +1807,10 @@ pub struct PolicyRuleMatch {
     #[serde(default)]
     pub actors: Vec<String>,
 
+    /// Match high-level policy surface (e.g., "robot", "connector", "swarm")
+    #[serde(default)]
+    pub surfaces: Vec<String>,
+
     /// Match pane by ID (exact match)
     #[serde(default)]
     pub pane_ids: Vec<u64>,
@@ -1845,6 +1849,9 @@ impl PolicyRuleMatch {
         if !self.actors.is_empty() {
             score += 1;
         }
+        if !self.surfaces.is_empty() {
+            score += 1;
+        }
         if !self.pane_ids.is_empty() {
             score += 2; // ID match is very specific
         }
@@ -1871,6 +1878,7 @@ impl PolicyRuleMatch {
     pub fn is_catch_all(&self) -> bool {
         self.actions.is_empty()
             && self.actors.is_empty()
+            && self.surfaces.is_empty()
             && self.pane_ids.is_empty()
             && self.pane_titles.is_empty()
             && self.pane_cwds.is_empty()
@@ -6210,6 +6218,7 @@ retention_tiers = []
         let multi = PolicyRuleMatch {
             actions: vec!["send_text".to_string()],   // +1
             actors: vec!["robot".to_string()],        // +1
+            surfaces: vec!["connector".to_string()],  // +1
             pane_ids: vec![1],                        // +2
             pane_titles: vec!["bash".to_string()],    // +1
             pane_cwds: vec!["/tmp".to_string()],      // +1
@@ -6217,7 +6226,7 @@ retention_tiers = []
             command_patterns: vec!["ls".to_string()], // +2
             agent_types: vec!["codex".to_string()],   // +1
         };
-        assert_eq!(multi.specificity(), 10);
+        assert_eq!(multi.specificity(), 11);
         assert!(!multi.is_catch_all());
     }
 

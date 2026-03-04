@@ -191,6 +191,64 @@ impl ActorKind {
 }
 
 // ============================================================================
+// Policy Surface
+// ============================================================================
+
+/// High-level subsystem surface where a policy action originates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySurface {
+    /// Surface could not be determined.
+    #[default]
+    Unknown,
+    /// Native mux/session control plane.
+    Mux,
+    /// Swarm orchestration runtime.
+    Swarm,
+    /// Robot mode command/API surface.
+    Robot,
+    /// Connector fabric execution surface.
+    Connector,
+    /// Workflow automation runtime.
+    Workflow,
+    /// MCP tool-serving surface.
+    Mcp,
+    /// Local IPC surface.
+    Ipc,
+}
+
+impl PolicySurface {
+    /// Returns a stable string identifier for this policy surface.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Mux => "mux",
+            Self::Swarm => "swarm",
+            Self::Robot => "robot",
+            Self::Connector => "connector",
+            Self::Workflow => "workflow",
+            Self::Mcp => "mcp",
+            Self::Ipc => "ipc",
+        }
+    }
+
+    /// Best-effort default surface for an actor when no explicit surface is provided.
+    ///
+    /// Human actions intentionally remain `Unknown` until call-sites annotate the
+    /// concrete subsystem (mux/swarm/ipc/etc.) to avoid over-asserting context.
+    #[must_use]
+    pub const fn default_for_actor(actor: ActorKind) -> Self {
+        match actor {
+            ActorKind::Human => Self::Unknown,
+            ActorKind::Robot => Self::Robot,
+            ActorKind::Mcp => Self::Mcp,
+            ActorKind::Workflow => Self::Workflow,
+        }
+    }
+}
+
+// ============================================================================
 // Pane Capabilities (stub - full impl in wa-4vx.8.8)
 // ============================================================================
 
@@ -335,6 +393,9 @@ pub struct DecisionContext {
     pub action: ActionKind,
     /// Actor requesting the action
     pub actor: ActorKind,
+    /// High-level subsystem surface for this decision
+    #[serde(default)]
+    pub surface: PolicySurface,
     /// Target pane ID (if applicable)
     pub pane_id: Option<u64>,
     /// Target domain (if applicable)
@@ -366,6 +427,7 @@ impl DecisionContext {
             timestamp_ms: 0,
             action: ActionKind::ReadOutput,
             actor: ActorKind::Human,
+            surface: PolicySurface::Unknown,
             pane_id: None,
             domain: None,
             capabilities: PaneCapabilities::default(),
@@ -906,6 +968,9 @@ pub struct PolicyInput {
     pub action: ActionKind,
     /// Who is requesting the action
     pub actor: ActorKind,
+    /// High-level subsystem surface where this request originates
+    #[serde(default)]
+    pub surface: PolicySurface,
     /// Target pane ID (if applicable)
     pub pane_id: Option<u64>,
     /// Target pane domain (if applicable)
@@ -942,6 +1007,7 @@ impl PolicyInput {
         Self {
             action,
             actor,
+            surface: PolicySurface::default_for_actor(actor),
             pane_id: None,
             domain: None,
             capabilities: PaneCapabilities::default(),
@@ -966,6 +1032,13 @@ impl PolicyInput {
     #[must_use]
     pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
         self.domain = Some(domain.into());
+        self
+    }
+
+    /// Set request surface
+    #[must_use]
+    pub fn with_surface(mut self, surface: PolicySurface) -> Self {
+        self.surface = surface;
         self
     }
 
@@ -1040,6 +1113,7 @@ impl DecisionContext {
             timestamp_ms: now_ms(),
             action: input.action,
             actor: input.actor,
+            surface: input.surface,
             pane_id: input.pane_id,
             domain: input.domain.clone(),
             capabilities: input.capabilities.clone(),
@@ -1072,6 +1146,7 @@ impl DecisionContext {
             input.capabilities.has_recent_gap.to_string(),
         );
         ctx.add_evidence("is_reserved", input.capabilities.is_reserved.to_string());
+        ctx.add_evidence("surface", input.surface.as_str());
         if let Some(reserved_by) = &input.capabilities.reserved_by {
             ctx.add_evidence("reserved_by", reserved_by.clone());
         }
@@ -2251,6 +2326,16 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
         return false;
     }
 
+    // Check policy surface
+    if !match_on.surfaces.is_empty()
+        && !match_on
+            .surfaces
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(input.surface.as_str()))
+    {
+        return false;
+    }
+
     // Check pane ID
     if !match_on.pane_ids.is_empty() {
         match input.pane_id {
@@ -3142,6 +3227,7 @@ impl PolicyEngine {
         };
 
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_surface(PolicySurface::Mux)
             .with_pane(pane_id)
             .with_capabilities(capabilities);
 
@@ -3757,6 +3843,7 @@ where
 
         // Build policy input
         let mut input = PolicyInput::new(action, actor)
+            .with_surface(PolicySurface::Mux)
             .with_pane(pane_id)
             .with_capabilities(capabilities.clone())
             .with_text_summary(&summary);
@@ -4341,6 +4428,33 @@ mod tests {
     }
 
     #[test]
+    fn injector_policy_context_marks_mux_surface() {
+        run_async_test(async {
+            let mut injector = PolicyGatedInjector::new(
+                PolicyEngine::strict(),
+                crate::wezterm::default_wezterm_handle(),
+            );
+
+            let mut caps = PaneCapabilities::prompt();
+            caps.alt_screen = Some(true);
+
+            let result = injector
+                .send_text(1, "echo hi", ActorKind::Robot, &caps, None)
+                .await;
+
+            match result {
+                InjectionResult::Denied { decision, .. } => {
+                    let context = decision
+                        .context()
+                        .expect("injector deny decision should include context");
+                    assert_eq!(context.surface, PolicySurface::Mux);
+                }
+                other => panic!("expected denied result, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
     fn e2e_trauma_guard_deny_injects_synthetic_feedback() {
         run_async_test(async {
             let injector = PolicyGatedInjector::permissive(crate::wezterm::MockWezterm::new());
@@ -4657,6 +4771,17 @@ mod tests {
         let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn check_send_compatibility_path_uses_mux_surface() {
+        let mut engine = PolicyEngine::strict();
+        #[allow(deprecated)]
+        let decision = engine.check_send(7, false);
+        let context = decision
+            .context()
+            .expect("compatibility path should capture decision context");
+        assert_eq!(context.surface, PolicySurface::Mux);
     }
 
     #[test]
@@ -5932,11 +6057,12 @@ mod tests {
         let multi_criteria = PolicyRuleMatch {
             actions: vec!["send_text".to_string()],
             actors: vec!["robot".to_string()],
+            surfaces: vec!["connector".to_string()],
             pane_ids: vec![42],
             command_patterns: vec!["rm.*".to_string()],
             ..Default::default()
         };
-        assert_eq!(multi_criteria.specificity(), 6); // 1 + 1 + 2 + 2
+        assert_eq!(multi_criteria.specificity(), 7); // 1 + 1 + 1 + 2 + 2
     }
 
     #[test]
@@ -5944,6 +6070,57 @@ mod tests {
         assert_eq!(PolicyRuleDecision::Deny.priority(), 0);
         assert_eq!(PolicyRuleDecision::RequireApproval.priority(), 1);
         assert_eq!(PolicyRuleDecision::Allow.priority(), 2);
+    }
+
+    #[test]
+    fn policy_rules_match_on_surface() {
+        let rules = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![
+                PolicyRule {
+                    id: "rule.robot.surface".to_string(),
+                    description: None,
+                    priority: 100,
+                    match_on: PolicyRuleMatch {
+                        actions: vec!["read_output".to_string()],
+                        actors: vec!["robot".to_string()],
+                        surfaces: vec!["robot".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Allow,
+                    message: Some("robot surface allowed".to_string()),
+                },
+                PolicyRule {
+                    id: "rule.connector.surface".to_string(),
+                    description: None,
+                    priority: 10,
+                    match_on: PolicyRuleMatch {
+                        actions: vec!["read_output".to_string()],
+                        actors: vec!["robot".to_string()],
+                        surfaces: vec!["connector".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Deny,
+                    message: Some("connector surface blocked".to_string()),
+                },
+            ],
+        };
+
+        let mut engine = PolicyEngine::permissive().with_policy_rules(rules);
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_surface(PolicySurface::Connector)
+            .with_pane(7);
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(
+            decision.rule_id(),
+            Some("config.rule.rule.connector.surface")
+        );
+        let context = decision
+            .context()
+            .expect("decision context should be present");
+        assert_eq!(context.surface, PolicySurface::Connector);
     }
 
     #[test]
@@ -6729,6 +6906,7 @@ mod tests {
 
         // Verify empty defaults
         assert_eq!(ctx.timestamp_ms, 0);
+        assert_eq!(ctx.surface, PolicySurface::Unknown);
         assert!(ctx.rules_evaluated.is_empty());
         assert!(ctx.determining_rule.is_none());
         assert!(ctx.evidence.is_empty());
@@ -6894,6 +7072,79 @@ mod tests {
         assert!(!ActorKind::Robot.is_trusted());
         assert!(!ActorKind::Mcp.is_trusted());
         assert!(!ActorKind::Workflow.is_trusted());
+    }
+
+    // --- PolicySurface ---
+
+    #[test]
+    fn policy_surface_debug_clone_copy_eq_hash_default() {
+        use std::collections::HashSet;
+        let a = PolicySurface::Robot;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_eq!(PolicySurface::default(), PolicySurface::Unknown);
+        let mut set = HashSet::new();
+        set.insert(PolicySurface::Unknown);
+        set.insert(PolicySurface::Robot);
+        set.insert(PolicySurface::Connector);
+        set.insert(PolicySurface::Ipc);
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn policy_surface_serde_and_as_str() {
+        let variants = [
+            (PolicySurface::Unknown, "\"unknown\""),
+            (PolicySurface::Mux, "\"mux\""),
+            (PolicySurface::Swarm, "\"swarm\""),
+            (PolicySurface::Robot, "\"robot\""),
+            (PolicySurface::Connector, "\"connector\""),
+            (PolicySurface::Workflow, "\"workflow\""),
+            (PolicySurface::Mcp, "\"mcp\""),
+            (PolicySurface::Ipc, "\"ipc\""),
+        ];
+        for (v, expected) in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            assert_eq!(json, expected);
+            assert_eq!(v.as_str(), expected.trim_matches('"'));
+            let parsed: PolicySurface = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, v);
+        }
+    }
+
+    #[test]
+    fn policy_surface_default_for_actor_mapping() {
+        assert_eq!(
+            PolicySurface::default_for_actor(ActorKind::Human),
+            PolicySurface::Unknown
+        );
+        assert_eq!(
+            PolicySurface::default_for_actor(ActorKind::Robot),
+            PolicySurface::Robot
+        );
+        assert_eq!(
+            PolicySurface::default_for_actor(ActorKind::Mcp),
+            PolicySurface::Mcp
+        );
+        assert_eq!(
+            PolicySurface::default_for_actor(ActorKind::Workflow),
+            PolicySurface::Workflow
+        );
+    }
+
+    #[test]
+    fn policy_input_new_defaults_surface_from_actor() {
+        let robot = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
+        assert_eq!(robot.surface, PolicySurface::Robot);
+
+        let mcp = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Mcp);
+        assert_eq!(mcp.surface, PolicySurface::Mcp);
+
+        let workflow = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Workflow);
+        assert_eq!(workflow.surface, PolicySurface::Workflow);
+
+        let human = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Human);
+        assert_eq!(human.surface, PolicySurface::Unknown);
     }
 
     // --- RiskCategory ---

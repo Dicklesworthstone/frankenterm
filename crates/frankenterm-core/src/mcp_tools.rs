@@ -2,6 +2,7 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::policy::PolicySurface;
 
 // wa.rules_list tool
 pub(super) struct WaRulesListTool;
@@ -648,6 +649,7 @@ impl ToolHandler for WaGetTextTool {
                 let mut engine = build_policy_engine(&config, false);
                 let summary = format!("wa.get_text pane_id={}", params.pane_id);
                 let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Mcp)
+                    .with_surface(PolicySurface::Mux)
                     .with_pane(params.pane_id)
                     .with_domain(domain)
                     .with_capabilities(capabilities)
@@ -1006,6 +1008,7 @@ impl ToolHandler for WaSearchTool {
                 let mut engine = build_policy_engine(&config, false);
                 let summary = engine.redact_secrets(&query_for_storage);
                 let mut input = PolicyInput::new(ActionKind::SearchOutput, ActorKind::Mcp)
+                    .with_surface(PolicySurface::Mux)
                     .with_text_summary(summary.clone());
 
                 if let Some(pane_id) = search_options.pane_id {
@@ -1434,6 +1437,7 @@ impl ToolHandler for WaSendTool {
             let summary = engine.redact_secrets(&params.text);
 
             let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Mcp)
+                .with_surface(PolicySurface::Mux)
                 .with_pane(params.pane_id)
                 .with_domain(domain)
                 .with_capabilities(capabilities.clone())
@@ -1666,6 +1670,7 @@ impl ToolHandler for WaWorkflowRunTool {
                 let summary = format!("workflow run {}", params.name);
 
                 let mut input = PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Mcp)
+                    .with_surface(PolicySurface::Workflow)
                     .with_pane(params.pane_id)
                     .with_domain(domain)
                     .with_capabilities(capabilities.clone())
@@ -2507,6 +2512,7 @@ impl ToolHandler for WaReserveTool {
 
                 let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
                 let mut input = PolicyInput::new(ActionKind::ReservePane, ActorKind::Mcp)
+                    .with_surface(PolicySurface::Swarm)
                     .with_pane(params.pane_id)
                     .with_capabilities(PaneCapabilities::unknown())
                     .with_text_summary(format!("reserve pane {}", params.pane_id));
@@ -2647,6 +2653,7 @@ impl ToolHandler for WaReleaseTool {
 
                 let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
                 let mut input = PolicyInput::new(ActionKind::ReleasePane, ActorKind::Mcp)
+                    .with_surface(PolicySurface::Swarm)
                     .with_capabilities(PaneCapabilities::unknown())
                     .with_text_summary(format!("release reservation {}", params.reservation_id));
                 if let Some(pane_id) = pane_id {
