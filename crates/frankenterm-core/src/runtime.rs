@@ -44,9 +44,9 @@ use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 use crate::runtime_compat::{
-    Mutex, MutexGuard, RwLock, mpsc, mpsc_recv_option, sleep,
+    Mutex, MutexGuard, RwLock, mpsc, sleep,
     task::{self, JoinHandle},
-    timeout, watch, watch_borrow_and_update_clone, watch_has_changed,
+    timeout, watch,
 };
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
@@ -57,6 +57,43 @@ use crate::watchdog::HeartbeatRegistry;
 use crate::wezterm::{
     PaneInfo, WeztermHandle, WeztermHandleSource, WeztermInterface, wezterm_handle_with_timeout,
 };
+
+fn config_update_pending(rx: &watch::Receiver<HotReloadableConfig>) -> bool {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        rx.has_changed()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        rx.has_changed().unwrap_or(false)
+    }
+}
+
+fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        rx.borrow_and_clone()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        rx.borrow_and_update().clone()
+    }
+}
+
+async fn recv_event<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_testing();
+        rx.recv(&cx).await.ok()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        rx.recv().await
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Native event output coalescing (wa-x4rq)
@@ -1300,8 +1337,8 @@ impl ObservationRuntime {
                 }
 
                 // Check for config updates
-                if watch_has_changed(&config_rx) {
-                    let new_config = watch_borrow_and_update_clone(&mut config_rx);
+                if config_update_pending(&config_rx) {
+                    let new_config = config_take_update(&mut config_rx);
                     if new_config.retention_days != retention_days {
                         info!(
                             old = retention_days,
@@ -1661,8 +1698,8 @@ impl ObservationRuntime {
                 }
 
                 // Check for config updates (non-blocking)
-                if watch_has_changed(&config_rx) {
-                    let new_config = watch_borrow_and_update_clone(&mut config_rx);
+                if config_update_pending(&config_rx) {
+                    let new_config = config_take_update(&mut config_rx);
                     let new_interval = Duration::from_millis(new_config.poll_interval_ms);
                     if new_interval != current_interval {
                         info!(
@@ -1928,8 +1965,8 @@ impl ObservationRuntime {
                     heartbeats.record_capture();
 
                     // Check for config updates
-                    if watch_has_changed(&config_rx) {
-                        let new_config = watch_borrow_and_update_clone(&mut config_rx);
+                    if config_update_pending(&config_rx) {
+                        let new_config = config_take_update(&mut config_rx);
                         let new_tailer_config = TailerConfig {
                             min_interval: Duration::from_millis(new_config.min_poll_interval_ms),
                             max_interval: Duration::from_millis(new_config.poll_interval_ms),
@@ -2102,7 +2139,7 @@ impl ObservationRuntime {
                 }
 
                 let flush_wait = next_flush.saturating_duration_since(now);
-                match timeout(flush_wait, mpsc_recv_option(&mut event_rx)).await {
+                match timeout(flush_wait, recv_event(&mut event_rx)).await {
                     Ok(maybe_event) => {
                         let Some(event) = maybe_event else {
                             break;
@@ -2217,7 +2254,7 @@ impl ObservationRuntime {
             loop {
                 match timeout(
                     Duration::from_millis(25),
-                    mpsc_recv_option(&mut capture_ingress_rx),
+                    recv_event(&mut capture_ingress_rx),
                 )
                 .await
                 {
@@ -2279,8 +2316,8 @@ impl ObservationRuntime {
                     // Continue to drain but don't block forever
                 }
 
-                if watch_has_changed(&config_rx) {
-                    let new_config = watch_borrow_and_update_clone(&mut config_rx);
+                if config_update_pending(&config_rx) {
+                    let new_config = config_take_update(&mut config_rx);
                     if new_config.patterns != current_patterns {
                         match PatternEngine::from_config_with_root(
                             &new_config.patterns,

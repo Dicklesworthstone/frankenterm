@@ -126,9 +126,12 @@ validate_spawn_blocking_allowlist() {
   [[ -s "${output_file}" ]]
 }
 
-validate_mpsc_helper_callsites() {
+validate_runtime_compat_helper_callsites() {
   local output_file="$1"
-  rg -n "runtime_compat::mpsc_(recv_option|send)" crates/frankenterm-core/src > "${output_file}" || true
+  rg -n "\\b(mpsc_recv_option|mpsc_send|watch_has_changed|watch_borrow_and_update_clone)\\b" \
+    crates/frankenterm-core/src \
+    --glob '!runtime_compat.rs' \
+    > "${output_file}" || true
   [[ ! -s "${output_file}" ]]
 }
 
@@ -215,12 +218,12 @@ else
   exit 1
 fi
 
-mpsc_helper_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_mpsc_helpers.log"
-if validate_mpsc_helper_callsites "${mpsc_helper_log}"; then
-  emit_log "validation" "compat_surface.mpsc_helpers.nominal" "expected=zero_runtime_compat_mpsc_helper_callsites" "passed" "mpsc_helper_replacement_enforced" "none" "$(basename "${mpsc_helper_log}")"
+helper_guard_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_runtime_compat_helpers.log"
+if validate_runtime_compat_helper_callsites "${helper_guard_log}"; then
+  emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_compat_helper_callsites_outside_runtime_compat_rs" "passed" "runtime_compat_helper_replacement_enforced" "none" "$(basename "${helper_guard_log}")"
 else
-  emit_log "validation" "compat_surface.mpsc_helpers.nominal" "expected=zero_runtime_compat_mpsc_helper_callsites" "failed" "unexpected_runtime_compat_mpsc_helper_callsite" "SURFACE-E203" "$(basename "${mpsc_helper_log}")"
-  cat "${mpsc_helper_log}" >&2
+  emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_compat_helper_callsites_outside_runtime_compat_rs" "failed" "unexpected_runtime_compat_helper_callsite" "SURFACE-E203" "$(basename "${helper_guard_log}")"
+  cat "${helper_guard_log}" >&2
   exit 1
 fi
 

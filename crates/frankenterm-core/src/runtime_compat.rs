@@ -104,6 +104,24 @@ pub const SURFACE_CONTRACT_V1: &[SurfaceContractEntry] = &[
         replacement: Some("cx-aware channel send path (reserve/commit where required)"),
     },
     SurfaceContractEntry {
+        api: "watch_has_changed",
+        disposition: SurfaceDisposition::Replace,
+        rationale: "Boolean-normalized change checks hide backend-specific closure semantics.",
+        replacement: Some("watch::Receiver::has_changed with explicit closure/error handling"),
+    },
+    SurfaceContractEntry {
+        api: "watch_borrow_and_update_clone",
+        disposition: SurfaceDisposition::Replace,
+        rationale: "Clone-and-mark helper hides backend differences in watch-consume semantics.",
+        replacement: Some("watch receiver borrow/consume path with explicit backend behavior"),
+    },
+    SurfaceContractEntry {
+        api: "watch_changed",
+        disposition: SurfaceDisposition::Replace,
+        rationale: "Implicit test-cx helper hides cancellation and wake-up ownership semantics.",
+        replacement: Some("watch::Receiver::changed with explicit cx/lifecycle context"),
+    },
+    SurfaceContractEntry {
         api: "process::Command",
         disposition: SurfaceDisposition::Retire,
         rationale: "Tokio process shim remains temporary and should be replaced by asupersync-native process layer.",

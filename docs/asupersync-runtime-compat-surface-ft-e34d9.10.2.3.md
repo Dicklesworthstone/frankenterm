@@ -22,6 +22,12 @@ The machine-readable source of truth is `SURFACE_CONTRACT_V1` in that module.
   - replacement: explicit receive semantics with cx/cancellation awareness
 - `mpsc_send`
   - replacement: explicit cx-aware channel send path
+- `watch_has_changed`
+  - replacement: explicit `watch::Receiver::has_changed` handling per backend semantics
+- `watch_borrow_and_update_clone`
+  - replacement: explicit borrow/consume logic per backend semantics
+- `watch_changed`
+  - replacement: explicit `watch::Receiver::changed` with caller-owned cx/lifecycle handling
 
 ## Retire
 
@@ -39,9 +45,11 @@ The machine-readable source of truth is `SURFACE_CONTRACT_V1` in that module.
   - `crates/frankenterm-core/src/ipc.rs`
   - `crates/frankenterm-core/src/native_events.rs` (tests)
   - `crates/frankenterm-core/src/tailer.rs` (tests)
+- Replaced external call-sites of transitional MPSC/watch helper shims in runtime hot paths with explicit backend-aware local semantics:
+  - `crates/frankenterm-core/src/runtime.rs`
 - Added contract guardrail e2e script:
   - `tests/e2e/test_ft_e34d9_10_2_3_runtime_compat_contraction.sh`
-  - now enforces zero `runtime_compat::mpsc_recv_option` / `runtime_compat::mpsc_send` call-sites in `crates/frankenterm-core/src`.
+  - now enforces zero `mpsc_recv_option` / `mpsc_send` / `watch_has_changed` / `watch_borrow_and_update_clone` call-sites outside `runtime_compat.rs`.
 
 ## Validation Artifacts
 
