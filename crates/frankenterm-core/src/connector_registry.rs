@@ -30,10 +30,7 @@ pub enum ConnectorRegistryError {
     },
 
     #[error("signature verification failed for {package_id}: {reason}")]
-    SignatureInvalid {
-        package_id: String,
-        reason: String,
-    },
+    SignatureInvalid { package_id: String, reason: String },
 
     #[error("manifest parse error: {reason}")]
     ManifestInvalid { reason: String },
@@ -42,10 +39,7 @@ pub enum ConnectorRegistryError {
     TrustPolicyDenied { reason: String },
 
     #[error("transparency log check failed for {package_id}: {reason}")]
-    TransparencyCheckFailed {
-        package_id: String,
-        reason: String,
-    },
+    TransparencyCheckFailed { package_id: String, reason: String },
 
     #[error("capability not permitted: {capability}")]
     CapabilityNotPermitted { capability: String },
@@ -68,7 +62,7 @@ pub enum ConnectorRegistryError {
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// A connector package manifest describing metadata, capabilities, and provenance.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectorManifest {
     /// Schema version for forward compatibility.
     pub schema_version: u32,
@@ -160,9 +154,22 @@ impl TrustLevel {
         }
     }
 
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Trusted => 3,
+            Self::Conditional => 2,
+            Self::Untrusted => 1,
+            Self::Blocked => 0,
+        }
+    }
+
     /// Whether this trust level allows installation.
     pub const fn allows_install(self) -> bool {
         matches!(self, Self::Trusted | Self::Conditional)
+    }
+
+    pub const fn meets_minimum(self, minimum: Self) -> bool {
+        self.rank() >= minimum.rank()
     }
 }
 
@@ -252,18 +259,14 @@ impl TrustPolicy {
     }
 
     /// Full policy gate: trust + capabilities + optional transparency.
-    pub fn gate(
-        &self,
-        manifest: &ConnectorManifest,
-    ) -> Result<TrustLevel, ConnectorRegistryError> {
+    pub fn gate(&self, manifest: &ConnectorManifest) -> Result<TrustLevel, ConnectorRegistryError> {
         let level = self.evaluate(manifest);
 
-        if !level.allows_install() {
+        if !level.meets_minimum(self.min_install_level) || !level.allows_install() {
             return Err(ConnectorRegistryError::TrustPolicyDenied {
                 reason: format!(
                     "trust level '{}' does not meet minimum '{}'",
-                    level,
-                    self.min_install_level,
+                    level, self.min_install_level,
                 ),
             });
         }
@@ -347,7 +350,8 @@ pub fn verify_digest(
     hasher.update(payload);
     let digest = hasher.finalize();
     let actual = hex_encode(&digest);
-    if actual != expected_hex {
+    let expected_normalized = expected_hex.to_ascii_lowercase();
+    if actual != expected_normalized {
         return Err(ConnectorRegistryError::DigestMismatch {
             package_id: package_id.to_string(),
             expected: expected_hex.to_string(),
@@ -607,10 +611,32 @@ impl ConnectorRegistryClient {
             }
         }
 
-        // 5. Evict retired entries if at capacity
-        self.evict_if_needed();
+        // 5. Prevent silent active-version replacement.
+        if let Some(existing) = self.packages.get(&manifest.package_id) {
+            if existing.status == PackageStatus::Active
+                && existing.manifest.version != manifest.version
+            {
+                return Err(ConnectorRegistryError::VersionConflict {
+                    installed: existing.manifest.version.clone(),
+                    requested: manifest.version.clone(),
+                });
+            }
+        }
 
-        // 6. Record successful verification
+        // 6. Evict retired entries if at capacity
+        self.evict_if_needed();
+        if self.packages.len() >= self.config.max_packages
+            && !self.packages.contains_key(&manifest.package_id)
+        {
+            return Err(ConnectorRegistryError::RegistryUnavailable {
+                reason: format!(
+                    "registry at capacity (max_packages={}) and no retired packages available for eviction",
+                    self.config.max_packages
+                ),
+            });
+        }
+
+        // 7. Record successful verification
         self.record_verification(&manifest, VerificationOutcome::Passed, now_ms);
         self.telemetry.packages_verified += 1;
         self.telemetry.packages_registered += 1;
@@ -636,12 +662,11 @@ impl ConnectorRegistryClient {
         payload: &[u8],
         now_ms: u64,
     ) -> Result<(), ConnectorRegistryError> {
-        let entry = self
-            .packages
-            .get(package_id)
-            .ok_or_else(|| ConnectorRegistryError::PackageNotFound {
+        let entry = self.packages.get(package_id).ok_or_else(|| {
+            ConnectorRegistryError::PackageNotFound {
                 package_id: package_id.to_string(),
-            })?;
+            }
+        })?;
 
         let expected = entry.manifest.sha256_digest.clone();
         let manifest_clone = entry.manifest.clone();
@@ -656,11 +681,7 @@ impl ConnectorRegistryClient {
         entry.last_verified_at_ms = now_ms;
         entry.verification_count += 1;
         let manifest = entry.manifest.clone();
-        self.record_verification(
-            &manifest,
-            VerificationOutcome::Passed,
-            now_ms,
-        );
+        self.record_verification(&manifest, VerificationOutcome::Passed, now_ms);
         Ok(())
     }
 
@@ -679,31 +700,23 @@ impl ConnectorRegistryClient {
     }
 
     /// Disable a package.
-    pub fn disable_package(
-        &mut self,
-        package_id: &str,
-    ) -> Result<(), ConnectorRegistryError> {
-        let entry = self
-            .packages
-            .get_mut(package_id)
-            .ok_or_else(|| ConnectorRegistryError::PackageNotFound {
+    pub fn disable_package(&mut self, package_id: &str) -> Result<(), ConnectorRegistryError> {
+        let entry = self.packages.get_mut(package_id).ok_or_else(|| {
+            ConnectorRegistryError::PackageNotFound {
                 package_id: package_id.to_string(),
-            })?;
+            }
+        })?;
         entry.status = PackageStatus::Disabled;
         Ok(())
     }
 
     /// Retire a package (soft-remove).
-    pub fn retire_package(
-        &mut self,
-        package_id: &str,
-    ) -> Result<(), ConnectorRegistryError> {
-        let entry = self
-            .packages
-            .get_mut(package_id)
-            .ok_or_else(|| ConnectorRegistryError::PackageNotFound {
+    pub fn retire_package(&mut self, package_id: &str) -> Result<(), ConnectorRegistryError> {
+        let entry = self.packages.get_mut(package_id).ok_or_else(|| {
+            ConnectorRegistryError::PackageNotFound {
                 package_id: package_id.to_string(),
-            })?;
+            }
+        })?;
         entry.status = PackageStatus::Retired;
         Ok(())
     }
@@ -820,7 +833,10 @@ mod tests {
         let mut m = test_manifest("foo", b"hello");
         m.package_id = String::new();
         let err = m.validate().unwrap_err();
-        assert!(matches!(err, ConnectorRegistryError::ManifestInvalid { .. }));
+        assert!(matches!(
+            err,
+            ConnectorRegistryError::ManifestInvalid { .. }
+        ));
     }
 
     #[test]
@@ -828,7 +844,10 @@ mod tests {
         let mut m = test_manifest("foo", b"hello");
         m.version = String::new();
         let err = m.validate().unwrap_err();
-        assert!(matches!(err, ConnectorRegistryError::ManifestInvalid { .. }));
+        assert!(matches!(
+            err,
+            ConnectorRegistryError::ManifestInvalid { .. }
+        ));
     }
 
     #[test]
@@ -836,7 +855,10 @@ mod tests {
         let mut m = test_manifest("foo", b"hello");
         m.sha256_digest = "abc".to_string();
         let err = m.validate().unwrap_err();
-        assert!(matches!(err, ConnectorRegistryError::ManifestInvalid { .. }));
+        assert!(matches!(
+            err,
+            ConnectorRegistryError::ManifestInvalid { .. }
+        ));
     }
 
     #[test]
@@ -844,7 +866,10 @@ mod tests {
         let mut m = test_manifest("foo", b"hello");
         m.sha256_digest = "g".repeat(64);
         let err = m.validate().unwrap_err();
-        assert!(matches!(err, ConnectorRegistryError::ManifestInvalid { .. }));
+        assert!(matches!(
+            err,
+            ConnectorRegistryError::ManifestInvalid { .. }
+        ));
     }
 
     #[test]
@@ -852,7 +877,10 @@ mod tests {
         let mut m = test_manifest("foo", b"hello");
         m.schema_version = 0;
         let err = m.validate().unwrap_err();
-        assert!(matches!(err, ConnectorRegistryError::ManifestInvalid { .. }));
+        assert!(matches!(
+            err,
+            ConnectorRegistryError::ManifestInvalid { .. }
+        ));
     }
 
     #[test]
@@ -860,7 +888,10 @@ mod tests {
         let mut m = test_manifest("foo", b"hello");
         m.schema_version = MANIFEST_SCHEMA_VERSION + 1;
         let err = m.validate().unwrap_err();
-        assert!(matches!(err, ConnectorRegistryError::ManifestInvalid { .. }));
+        assert!(matches!(
+            err,
+            ConnectorRegistryError::ManifestInvalid { .. }
+        ));
     }
 
     #[test]
@@ -883,14 +914,18 @@ mod tests {
     }
 
     #[test]
+    fn digest_verify_accepts_uppercase_expected() {
+        let data = b"hello world";
+        let expected_upper = compute_digest(data).to_ascii_uppercase();
+        assert!(verify_digest("test", data, &expected_upper).is_ok());
+    }
+
+    #[test]
     fn digest_verify_mismatch() {
         let data = b"hello world";
         let bad = "0".repeat(64);
         let err = verify_digest("test", data, &bad).unwrap_err();
-        assert!(matches!(
-            err,
-            ConnectorRegistryError::DigestMismatch { .. }
-        ));
+        assert!(matches!(err, ConnectorRegistryError::DigestMismatch { .. }));
     }
 
     #[test]
@@ -985,6 +1020,18 @@ mod tests {
     }
 
     #[test]
+    fn trust_policy_gate_enforces_min_install_level() {
+        let mut policy = TrustPolicy::default();
+        policy.min_install_level = TrustLevel::Trusted;
+        let m = test_manifest("pkg", b"x"); // signed unknown publisher => Conditional
+        let err = policy.gate(&m).unwrap_err();
+        assert!(matches!(
+            err,
+            ConnectorRegistryError::TrustPolicyDenied { .. }
+        ));
+    }
+
+    #[test]
     fn trust_policy_requires_transparency() {
         let mut policy = TrustPolicy::default();
         policy.require_transparency_proof = true;
@@ -1040,15 +1087,49 @@ mod tests {
     }
 
     #[test]
+    fn register_package_active_version_conflict() {
+        let mut client = default_client();
+        let data_v1 = b"connector payload v1";
+        let data_v2 = b"connector payload v2";
+
+        let m1 = test_manifest("my-connector", data_v1);
+        client.register_package(m1, data_v1, 1000).unwrap();
+
+        let mut m2 = test_manifest("my-connector", data_v2);
+        m2.version = "2.0.0".to_string();
+        let err = client.register_package(m2, data_v2, 1001).unwrap_err();
+        assert!(matches!(
+            err,
+            ConnectorRegistryError::VersionConflict { .. }
+        ));
+        let installed = client.get_package("my-connector").unwrap();
+        assert_eq!(installed.manifest.version, "1.0.0");
+    }
+
+    #[test]
+    fn register_package_after_disable_allows_new_version() {
+        let mut client = default_client();
+        let data_v1 = b"connector payload v1";
+        let data_v2 = b"connector payload v2";
+
+        let m1 = test_manifest("my-connector", data_v1);
+        client.register_package(m1, data_v1, 1000).unwrap();
+        client.disable_package("my-connector").unwrap();
+
+        let mut m2 = test_manifest("my-connector", data_v2);
+        m2.version = "2.0.0".to_string();
+        let entry = client.register_package(m2, data_v2, 1001).unwrap();
+        assert_eq!(entry.manifest.version, "2.0.0");
+        assert_eq!(entry.status, PackageStatus::Active);
+    }
+
+    #[test]
     fn register_package_bad_digest() {
         let mut client = default_client();
         let data = b"connector payload";
         let m = test_manifest("my-connector", data);
         let err = client.register_package(m, b"wrong data", 1000).unwrap_err();
-        assert!(matches!(
-            err,
-            ConnectorRegistryError::DigestMismatch { .. }
-        ));
+        assert!(matches!(err, ConnectorRegistryError::DigestMismatch { .. }));
         assert_eq!(client.telemetry().digest_failures, 1);
     }
 
@@ -1069,7 +1150,10 @@ mod tests {
     #[test]
     fn register_package_blocked() {
         let mut config = default_config();
-        config.trust_policy.blocked_packages.push("evil".to_string());
+        config
+            .trust_policy
+            .blocked_packages
+            .push("evil".to_string());
         let mut client = ConnectorRegistryClient::new(config);
         let data = b"payload";
         let m = test_manifest("evil", data);
@@ -1183,11 +1267,10 @@ mod tests {
         let m = test_manifest("pkg", data);
         client.register_package(m, data, 1000).unwrap();
 
-        let err = client.reverify_package("pkg", b"tampered", 2000).unwrap_err();
-        assert!(matches!(
-            err,
-            ConnectorRegistryError::DigestMismatch { .. }
-        ));
+        let err = client
+            .reverify_package("pkg", b"tampered", 2000)
+            .unwrap_err();
+        assert!(matches!(err, ConnectorRegistryError::DigestMismatch { .. }));
     }
 
     #[test]
@@ -1233,6 +1316,36 @@ mod tests {
         assert!(client.get_package("a").is_none());
         assert!(client.get_package("b").is_some());
         assert!(client.get_package("c").is_some());
+    }
+
+    #[test]
+    fn register_fails_when_capacity_reached_without_retired_entries() {
+        let mut config = default_config();
+        config.max_packages = 2;
+        let mut client = ConnectorRegistryClient::new(config);
+
+        let d1 = b"d1";
+        let d2 = b"d2";
+        let d3 = b"d3";
+
+        client
+            .register_package(test_manifest("a", d1), d1, 1000)
+            .unwrap();
+        client
+            .register_package(test_manifest("b", d2), d2, 1001)
+            .unwrap();
+
+        let err = client
+            .register_package(test_manifest("c", d3), d3, 1002)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConnectorRegistryError::RegistryUnavailable { .. }
+        ));
+        assert_eq!(client.package_count(), 2);
+        assert!(client.get_package("a").is_some());
+        assert!(client.get_package("b").is_some());
+        assert!(client.get_package("c").is_none());
     }
 
     #[test]
@@ -1380,7 +1493,9 @@ mod tests {
         for i in 0..100 {
             let data = format!("payload-{i}");
             let m = test_manifest(&format!("pkg-{i}"), data.as_bytes());
-            client.register_package(m, data.as_bytes(), 1000 + i as u64).unwrap();
+            client
+                .register_package(m, data.as_bytes(), 1000 + i as u64)
+                .unwrap();
         }
         assert_eq!(client.package_count(), 100);
         assert_eq!(client.active_packages().len(), 100);

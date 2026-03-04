@@ -174,10 +174,7 @@ impl DurableStateManager {
 
     /// Create an auto-checkpoint if the interval has elapsed.
     /// Returns `Some` if a checkpoint was created.
-    pub fn maybe_auto_checkpoint(
-        &mut self,
-        registry: &LifecycleRegistry,
-    ) -> Option<CheckpointId> {
+    pub fn maybe_auto_checkpoint(&mut self, registry: &LifecycleRegistry) -> Option<CheckpointId> {
         if self.auto_checkpoint_interval_ms == 0 {
             return None;
         }
@@ -254,23 +251,9 @@ impl DurableStateManager {
             return Err(DurableStateError::AlreadyRolledBack { id: target_id });
         }
 
-        // Save current state as a pre-rollback checkpoint
+        // Snapshot current state so we can both compute diffs and persist
+        // a pre-rollback checkpoint only after rollback validation succeeds.
         let current_snapshot = registry.snapshot();
-        let from_checkpoint_id = self.next_id;
-        self.next_id += 1;
-
-        let pre_rollback = Checkpoint {
-            id: from_checkpoint_id,
-            label: format!("pre-rollback-to-{target_id}"),
-            created_at: epoch_ms(),
-            entities: current_snapshot.clone(),
-            metadata: HashMap::new(),
-            trigger: CheckpointTrigger::PreOperation {
-                operation: format!("rollback-to-{target_id}"),
-            },
-            rolled_back: false,
-        };
-        self.checkpoints.push(pre_rollback);
 
         // Compute what needs to change
         let target_entities = &self.checkpoints[target_idx].entities;
@@ -287,39 +270,48 @@ impl DurableStateManager {
         let mut restored_count = 0usize;
         let mut removed_count = 0usize;
 
-        // Restore entities from checkpoint
+        // Count restored entities (missing or state-changed relative to target).
         for (key, record) in &target_keys {
-            if let Some(current) = current_keys.get(key) {
-                // Entity exists — check if state differs
-                if current.state != record.state {
-                    // Re-register with checkpoint state
-                    registry.register_entity(
-                        record.identity.clone(),
-                        record.state.clone(),
-                        record.updated_at_ms,
-                    ).ok();
-                    restored_count += 1;
-                }
-            } else {
-                // Entity doesn't exist in current — restore it
-                registry.register_entity(
-                    record.identity.clone(),
-                    record.state.clone(),
-                    record.updated_at_ms,
-                ).ok();
-                restored_count += 1;
+            match current_keys.get(key) {
+                Some(current) if current.state == record.state => {}
+                _ => restored_count += 1,
             }
         }
 
-        // Count entities that exist now but didn't at checkpoint time
+        // Count entities that exist now but didn't at checkpoint time.
         for key in current_keys.keys() {
             if !target_keys.contains_key(key) {
                 removed_count += 1;
-                // Note: We don't actually remove entities from the registry here
-                // because LifecycleRegistry doesn't have a remove method.
-                // The caller should handle removal if needed.
             }
         }
+
+        // Rebuild the registry exactly from the target checkpoint snapshot.
+        let mut rebuilt_registry = LifecycleRegistry::new();
+        for record in target_entities {
+            rebuilt_registry
+                .register_entity(record.identity.clone(), record.state, record.updated_at_ms)
+                .map_err(|err| DurableStateError::InvalidCheckpointRecord {
+                    id: target_id,
+                    reason: err.to_string(),
+                })?;
+        }
+
+        // Rollback validation succeeded; persist a pre-rollback checkpoint
+        // and only then commit the restored registry.
+        let from_checkpoint_id = self.next_id;
+        self.next_id += 1;
+        self.checkpoints.push(Checkpoint {
+            id: from_checkpoint_id,
+            label: format!("pre-rollback-to-{target_id}"),
+            created_at: epoch_ms(),
+            entities: current_snapshot.clone(),
+            metadata: HashMap::new(),
+            trigger: CheckpointTrigger::PreOperation {
+                operation: format!("rollback-to-{target_id}"),
+            },
+            rolled_back: false,
+        });
+        *registry = rebuilt_registry;
 
         // Mark rolled-back checkpoints
         for cp in &mut self.checkpoints {
@@ -384,14 +376,14 @@ impl DurableStateManager {
                 None => added.push(EntityChange {
                     identity: to_record.identity.clone(),
                     from_state: None,
-                    to_state: Some(to_record.state.clone()),
+                    to_state: Some(to_record.state),
                 }),
                 Some(from_record) => {
                     if from_record.state != to_record.state {
                         changed.push(EntityChange {
                             identity: to_record.identity.clone(),
-                            from_state: Some(from_record.state.clone()),
-                            to_state: Some(to_record.state.clone()),
+                            from_state: Some(from_record.state),
+                            to_state: Some(to_record.state),
                         });
                     }
                 }
@@ -402,7 +394,7 @@ impl DurableStateManager {
             if !to_map.contains_key(key) {
                 removed.push(EntityChange {
                     identity: from_record.identity.clone(),
-                    from_state: Some(from_record.state.clone()),
+                    from_state: Some(from_record.state),
                     to_state: None,
                 });
             }
@@ -448,14 +440,14 @@ impl DurableStateManager {
                 None => added.push(EntityChange {
                     identity: cur.identity.clone(),
                     from_state: None,
-                    to_state: Some(cur.state.clone()),
+                    to_state: Some(cur.state),
                 }),
                 Some(cp_rec) => {
                     if cp_rec.state != cur.state {
                         changed.push(EntityChange {
                             identity: cur.identity.clone(),
-                            from_state: Some(cp_rec.state.clone()),
-                            to_state: Some(cur.state.clone()),
+                            from_state: Some(cp_rec.state),
+                            to_state: Some(cur.state),
                         });
                     }
                 }
@@ -466,7 +458,7 @@ impl DurableStateManager {
             if !current_map.contains_key(key) {
                 removed.push(EntityChange {
                     identity: cp_rec.identity.clone(),
-                    from_state: Some(cp_rec.state.clone()),
+                    from_state: Some(cp_rec.state),
                     to_state: None,
                 });
             }
@@ -579,6 +571,8 @@ pub enum DurableStateError {
     CheckpointNotFound { id: CheckpointId },
     /// Checkpoint has already been rolled back.
     AlreadyRolledBack { id: CheckpointId },
+    /// Stored checkpoint contains an invalid lifecycle record.
+    InvalidCheckpointRecord { id: CheckpointId, reason: String },
 }
 
 impl std::fmt::Display for DurableStateError {
@@ -589,6 +583,12 @@ impl std::fmt::Display for DurableStateError {
             }
             Self::AlreadyRolledBack { id } => {
                 write!(f, "checkpoint {id} has already been rolled back")
+            }
+            Self::InvalidCheckpointRecord { id, reason } => {
+                write!(
+                    f,
+                    "checkpoint {id} contains invalid entity record: {reason}"
+                )
             }
         }
     }
@@ -617,7 +617,7 @@ fn normalize_max_checkpoints(max: usize) -> usize {
 mod tests {
     use super::*;
     use crate::session_topology::{
-        LifecycleEntityKind, MuxPaneLifecycleState,
+        LifecycleEntityKind, MuxPaneLifecycleState, SessionLifecycleState,
     };
 
     fn pane_identity(id: u64) -> LifecycleIdentity {
@@ -631,7 +631,8 @@ mod tests {
                 pane_identity(pid),
                 LifecycleState::Pane(MuxPaneLifecycleState::Running),
                 0,
-            ).expect("register pane");
+            )
+            .expect("register pane");
         }
         reg
     }
@@ -657,9 +658,15 @@ mod tests {
         let reg = make_registry(&[1]);
         let mut mgr = DurableStateManager::new();
 
-        let id1 = mgr.checkpoint(&reg, "a", CheckpointTrigger::Manual, HashMap::new()).id;
-        let id2 = mgr.checkpoint(&reg, "b", CheckpointTrigger::Manual, HashMap::new()).id;
-        let id3 = mgr.checkpoint(&reg, "c", CheckpointTrigger::Manual, HashMap::new()).id;
+        let id1 = mgr
+            .checkpoint(&reg, "a", CheckpointTrigger::Manual, HashMap::new())
+            .id;
+        let id2 = mgr
+            .checkpoint(&reg, "b", CheckpointTrigger::Manual, HashMap::new())
+            .id;
+        let id3 = mgr
+            .checkpoint(&reg, "c", CheckpointTrigger::Manual, HashMap::new())
+            .id;
 
         assert!(id1 < id2);
         assert!(id2 < id3);
@@ -670,7 +677,9 @@ mod tests {
         let reg = make_registry(&[1]);
         let mut mgr = DurableStateManager::new();
 
-        let id = mgr.checkpoint(&reg, "test", CheckpointTrigger::Manual, HashMap::new()).id;
+        let id = mgr
+            .checkpoint(&reg, "test", CheckpointTrigger::Manual, HashMap::new())
+            .id;
         assert!(mgr.get_checkpoint(id).is_some());
         assert!(mgr.get_checkpoint(999).is_none());
     }
@@ -694,7 +703,12 @@ mod tests {
         let mut mgr = DurableStateManager::with_max_checkpoints(3);
 
         for i in 0..5 {
-            mgr.checkpoint(&reg, format!("cp-{i}"), CheckpointTrigger::Manual, HashMap::new());
+            mgr.checkpoint(
+                &reg,
+                format!("cp-{i}"),
+                CheckpointTrigger::Manual,
+                HashMap::new(),
+            );
         }
 
         assert_eq!(mgr.checkpoint_count(), 3);
@@ -709,7 +723,12 @@ mod tests {
         let mut mgr = DurableStateManager::with_max_checkpoints(0);
 
         for i in 0..3 {
-            mgr.checkpoint(&reg, format!("cp-{i}"), CheckpointTrigger::Manual, HashMap::new());
+            mgr.checkpoint(
+                &reg,
+                format!("cp-{i}"),
+                CheckpointTrigger::Manual,
+                HashMap::new(),
+            );
         }
 
         assert_eq!(mgr.checkpoint_count(), 1);
@@ -776,8 +795,12 @@ mod tests {
         let reg = make_registry(&[1, 2]);
         let mut mgr = DurableStateManager::new();
 
-        let id1 = mgr.checkpoint(&reg, "a", CheckpointTrigger::Manual, HashMap::new()).id;
-        let id2 = mgr.checkpoint(&reg, "b", CheckpointTrigger::Manual, HashMap::new()).id;
+        let id1 = mgr
+            .checkpoint(&reg, "a", CheckpointTrigger::Manual, HashMap::new())
+            .id;
+        let id2 = mgr
+            .checkpoint(&reg, "b", CheckpointTrigger::Manual, HashMap::new())
+            .id;
 
         let diff = mgr.diff(id1, id2).unwrap();
         assert!(diff.is_empty());
@@ -787,10 +810,14 @@ mod tests {
     fn diff_added_entity() {
         let reg1 = make_registry(&[1]);
         let mut mgr = DurableStateManager::new();
-        let id1 = mgr.checkpoint(&reg1, "before", CheckpointTrigger::Manual, HashMap::new()).id;
+        let id1 = mgr
+            .checkpoint(&reg1, "before", CheckpointTrigger::Manual, HashMap::new())
+            .id;
 
         let reg2 = make_registry(&[1, 2]);
-        let id2 = mgr.checkpoint(&reg2, "after", CheckpointTrigger::Manual, HashMap::new()).id;
+        let id2 = mgr
+            .checkpoint(&reg2, "after", CheckpointTrigger::Manual, HashMap::new())
+            .id;
 
         let diff = mgr.diff(id1, id2).unwrap();
         assert_eq!(diff.added.len(), 1);
@@ -802,10 +829,14 @@ mod tests {
     fn diff_removed_entity() {
         let reg1 = make_registry(&[1, 2]);
         let mut mgr = DurableStateManager::new();
-        let id1 = mgr.checkpoint(&reg1, "before", CheckpointTrigger::Manual, HashMap::new()).id;
+        let id1 = mgr
+            .checkpoint(&reg1, "before", CheckpointTrigger::Manual, HashMap::new())
+            .id;
 
         let reg2 = make_registry(&[1]);
-        let id2 = mgr.checkpoint(&reg2, "after", CheckpointTrigger::Manual, HashMap::new()).id;
+        let id2 = mgr
+            .checkpoint(&reg2, "after", CheckpointTrigger::Manual, HashMap::new())
+            .id;
 
         let diff = mgr.diff(id1, id2).unwrap();
         assert_eq!(diff.added.len(), 0);
@@ -816,15 +847,20 @@ mod tests {
     fn diff_changed_state() {
         let reg1 = make_registry(&[1]);
         let mut mgr = DurableStateManager::new();
-        let id1 = mgr.checkpoint(&reg1, "before", CheckpointTrigger::Manual, HashMap::new()).id;
+        let id1 = mgr
+            .checkpoint(&reg1, "before", CheckpointTrigger::Manual, HashMap::new())
+            .id;
 
         let mut reg2 = LifecycleRegistry::new();
         reg2.register_entity(
             pane_identity(1),
             LifecycleState::Pane(MuxPaneLifecycleState::Draining),
             0,
-        ).expect("register pane");
-        let id2 = mgr.checkpoint(&reg2, "after", CheckpointTrigger::Manual, HashMap::new()).id;
+        )
+        .expect("register pane");
+        let id2 = mgr
+            .checkpoint(&reg2, "after", CheckpointTrigger::Manual, HashMap::new())
+            .id;
 
         let diff = mgr.diff(id1, id2).unwrap();
         assert_eq!(diff.changed.len(), 1);
@@ -845,7 +881,9 @@ mod tests {
     fn diff_from_current() {
         let reg = make_registry(&[1, 2]);
         let mut mgr = DurableStateManager::new();
-        let id = mgr.checkpoint(&reg, "snap", CheckpointTrigger::Manual, HashMap::new()).id;
+        let id = mgr
+            .checkpoint(&reg, "snap", CheckpointTrigger::Manual, HashMap::new())
+            .id;
 
         // Current registry is the same as checkpoint
         let diff = mgr.diff_from_current(id, &reg).unwrap();
@@ -866,14 +904,25 @@ mod tests {
         let reg_initial = make_registry(&[1, 2]);
         let mut mgr = DurableStateManager::new();
 
-        let cp_id = mgr.checkpoint(&reg_initial, "initial", CheckpointTrigger::Manual, HashMap::new()).id;
+        let cp_id = mgr
+            .checkpoint(
+                &reg_initial,
+                "initial",
+                CheckpointTrigger::Manual,
+                HashMap::new(),
+            )
+            .id;
 
         // Modify registry
         let mut reg_modified = make_registry(&[1, 2, 3]);
 
-        let record = mgr.rollback(cp_id, &mut reg_modified, "test rollback").unwrap();
+        let record = mgr
+            .rollback(cp_id, &mut reg_modified, "test rollback")
+            .unwrap();
         assert_eq!(record.target_checkpoint_id, cp_id);
-        assert!(record.removed_entity_count > 0 || record.restored_entity_count == 0);
+        assert_eq!(record.removed_entity_count, 1);
+        assert_eq!(record.restored_entity_count, 0);
+        assert_eq!(reg_modified.snapshot(), reg_initial.snapshot());
     }
 
     #[test]
@@ -893,7 +942,9 @@ mod tests {
         let reg = make_registry(&[1]);
         let mut mgr = DurableStateManager::new();
 
-        let cp_id = mgr.checkpoint(&reg, "snap", CheckpointTrigger::Manual, HashMap::new()).id;
+        let cp_id = mgr
+            .checkpoint(&reg, "snap", CheckpointTrigger::Manual, HashMap::new())
+            .id;
 
         let mut reg_current = make_registry(&[1, 2]);
         mgr.rollback(cp_id, &mut reg_current, "recovery").unwrap();
@@ -907,12 +958,15 @@ mod tests {
         let reg = make_registry(&[1]);
         let mut mgr = DurableStateManager::new();
 
-        let cp1 = mgr.checkpoint(&reg, "cp1", CheckpointTrigger::Manual, HashMap::new()).id;
+        let cp1 = mgr
+            .checkpoint(&reg, "cp1", CheckpointTrigger::Manual, HashMap::new())
+            .id;
         mgr.checkpoint(&reg, "cp2", CheckpointTrigger::Manual, HashMap::new());
         mgr.checkpoint(&reg, "cp3", CheckpointTrigger::Manual, HashMap::new());
 
         let mut reg_current = make_registry(&[1]);
-        mgr.rollback(cp1, &mut reg_current, "rollback to cp1").unwrap();
+        mgr.rollback(cp1, &mut reg_current, "rollback to cp1")
+            .unwrap();
 
         let summaries = mgr.list_checkpoints();
         // cp1 should not be rolled_back, cp2 and cp3 should be
@@ -932,15 +986,58 @@ mod tests {
         let reg = make_registry(&[1]);
         let mut mgr = DurableStateManager::with_max_checkpoints(3);
 
-        let cp1 = mgr.checkpoint(&reg, "cp1", CheckpointTrigger::Manual, HashMap::new()).id;
+        let cp1 = mgr
+            .checkpoint(&reg, "cp1", CheckpointTrigger::Manual, HashMap::new())
+            .id;
         mgr.checkpoint(&reg, "cp2", CheckpointTrigger::Manual, HashMap::new());
         mgr.checkpoint(&reg, "cp3", CheckpointTrigger::Manual, HashMap::new());
 
         let mut reg_current = make_registry(&[1, 2]);
-        mgr.rollback(cp1, &mut reg_current, "rollback with retention").unwrap();
+        mgr.rollback(cp1, &mut reg_current, "rollback with retention")
+            .unwrap();
 
         assert_eq!(mgr.checkpoint_count(), 3);
         assert!(mgr.rollback_history().len() == 1);
+    }
+
+    #[test]
+    fn rollback_failure_does_not_mutate_manager_or_registry() {
+        let mut reg = make_registry(&[1, 2]);
+        let mut mgr = DurableStateManager::new();
+
+        let cp_id = mgr
+            .checkpoint(&reg, "base", CheckpointTrigger::Manual, HashMap::new())
+            .id;
+
+        // Corrupt checkpoint data with an invalid kind/state pair to force
+        // rollback rebuild failure.
+        let bad_record = LifecycleEntityRecord {
+            identity: pane_identity(99),
+            state: LifecycleState::Session(SessionLifecycleState::Active),
+            version: 0,
+            updated_at_ms: 0,
+            last_event: None,
+        };
+        let cp_idx = mgr
+            .checkpoints
+            .iter()
+            .position(|cp| cp.id == cp_id)
+            .expect("checkpoint exists");
+        mgr.checkpoints[cp_idx].entities.push(bad_record);
+
+        let before_snapshot = reg.snapshot();
+        let before_checkpoint_count = mgr.checkpoint_count();
+        let before_next_id = mgr.next_id;
+
+        let err = mgr.rollback(cp_id, &mut reg, "corrupt checkpoint").unwrap_err();
+        assert!(matches!(
+            err,
+            DurableStateError::InvalidCheckpointRecord { id, .. } if id == cp_id
+        ));
+        assert_eq!(reg.snapshot(), before_snapshot);
+        assert_eq!(mgr.checkpoint_count(), before_checkpoint_count);
+        assert_eq!(mgr.next_id, before_next_id);
+        assert!(mgr.rollback_history().is_empty());
     }
 
     // -------------------------------------------------------------------------
@@ -965,11 +1062,15 @@ mod tests {
     fn checkpoint_trigger_serde() {
         let triggers = vec![
             CheckpointTrigger::Manual,
-            CheckpointTrigger::PreOperation { operation: "split".into() },
+            CheckpointTrigger::PreOperation {
+                operation: "split".into(),
+            },
             CheckpointTrigger::Periodic,
             CheckpointTrigger::PreShutdown,
             CheckpointTrigger::PostRecovery,
-            CheckpointTrigger::FleetProvisioning { fleet_name: "alpha".into() },
+            CheckpointTrigger::FleetProvisioning {
+                fleet_name: "alpha".into(),
+            },
         ];
 
         for trigger in &triggers {
@@ -991,6 +1092,13 @@ mod tests {
         let err = DurableStateError::AlreadyRolledBack { id: 7 };
         assert!(err.to_string().contains("7"));
         assert!(err.to_string().contains("rolled back"));
+
+        let err = DurableStateError::InvalidCheckpointRecord {
+            id: 9,
+            reason: "kind mismatch".to_string(),
+        };
+        assert!(err.to_string().contains("9"));
+        assert!(err.to_string().contains("invalid entity record"));
     }
 
     // -------------------------------------------------------------------------
