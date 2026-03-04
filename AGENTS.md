@@ -237,17 +237,21 @@ frankenterm/
 ├── Cargo.toml                         # Workspace root
 ├── crates/
 │   ├── frankenterm/                   # CLI binary (main.rs)
-│   └── frankenterm-core/             # Core library
-│       └── src/
-│           ├── runtime.rs            # Observation runtime orchestration
-│           ├── config.rs             # Configuration parsing
-│           ├── ingest.rs             # Pane discovery + delta extraction
-│           ├── patterns.rs           # Pattern detection engine
-│           ├── events.rs             # Event bus and detection fanout
-│           ├── workflows/            # Workflow engine modules (runner/engine/locks/steps)
-│           ├── policy.rs             # Safety/access control
-│           ├── storage.rs            # SQLite + FTS5
-│           └── wezterm.rs            # Terminal backend adapter (current compatibility bridge)
+│   ├── frankenterm-core/             # Core library
+│   │   └── src/
+│   │       ├── runtime.rs            # Observation runtime orchestration
+│   │       ├── runtime_compat.rs     # Runtime bridge (tokio/asupersync adapters)
+│   │       ├── ingest.rs             # Pane discovery + delta extraction
+│   │       ├── patterns.rs           # Pattern detection engine
+│   │       ├── events.rs             # Event bus and detection fanout
+│   │       ├── workflows/            # Workflow modules (engine/runner/lock/handlers/traits)
+│   │       ├── policy.rs             # Safety/access control
+│   │       ├── storage.rs            # SQLite + FTS5
+│   │       └── wezterm.rs            # Terminal backend adapter (current compatibility bridge)
+│   ├── frankenterm-gui/              # GUI binary crate
+│   ├── frankenterm-mux-server/       # Headless mux server binary crate
+│   ├── frankenterm-mux-server-impl/  # Shared mux-server implementation
+│   └── frankenterm-alloc/            # Allocator/telemetry support crate
 ├── frankenterm/                       # In-tree FrankenTerm crates (ex-WezTerm)
 │   ├── async_ossl/                   # Async OpenSSL
 │   ├── codec/                        # Wire codec
@@ -261,6 +265,22 @@ frankenterm/
 ├── docs/                              # Documentation
 └── fixtures/                          # Test fixtures
 ```
+
+### Current Module Map (Code-Grounded)
+
+| Surface | Primary Location | Responsibility |
+|---------|------------------|----------------|
+| CLI command routing | `crates/frankenterm/src/main.rs` | Parses `Commands`/`RobotCommands` and dispatches watch/robot/workflow/mcp flows |
+| Runtime orchestration | `crates/frankenterm-core/src/runtime.rs` | Discovery, capture, persistence, maintenance task graph |
+| Runtime adapters | `crates/frankenterm-core/src/runtime_compat.rs` | Runtime/channel/net/time compatibility seam |
+| Ingest and deltas | `crates/frankenterm-core/src/ingest.rs` | Pane discovery, overlap matching, explicit gap semantics |
+| Persistence and search | `crates/frankenterm-core/src/storage.rs` + `src/search/` | SQLite schema/migrations, FTS5, lexical/semantic/hybrid query paths |
+| Pattern detection | `crates/frankenterm-core/src/patterns.rs` | Rule packs, anchor/regex evaluation, dedupe context |
+| Event fanout | `crates/frankenterm-core/src/events.rs` | Bounded broadcast bus + typed runtime events |
+| Workflow runtime | `crates/frankenterm-core/src/workflows/` | Engine/runner/lock + workflow traits/handlers |
+| Policy gates | `crates/frankenterm-core/src/policy.rs` | Authorize/deny/require-approval decisions and rate limiting |
+| Robot/MCP schemas | `crates/frankenterm-core/src/robot_types.rs` + `src/mcp*.rs` | Machine-facing envelopes and MCP tool/resource contracts |
+| Backend bridge | `crates/frankenterm-core/src/wezterm.rs` | Compatibility adapter for backend discovery, read/write, and pane ops |
 
 ### Quick Reference for AI Agents
 
@@ -352,7 +372,7 @@ ft robot send 1 "y" --wait-for "confirmed"
 
 ```bash
 # Wait for pattern with timeout (seconds)
-ft robot wait-for 0 "core.codex:usage_reached" --timeout-secs 3600
+ft robot wait-for 0 "codex.usage.reached" --timeout-secs 3600
 
 # Wait for completion marker
 ft robot wait-for 0 "Done" --timeout-secs 60

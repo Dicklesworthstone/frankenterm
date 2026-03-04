@@ -80,7 +80,7 @@ $ ft robot --format toon --stats state
 $ ft robot get-text 0 --tail 50
 
 # Wait for a specific pattern (e.g., agent hitting rate limit)
-$ ft robot wait-for 0 "core.codex:usage_reached" --timeout-secs 3600
+$ ft robot wait-for 0 "codex.usage.reached" --timeout-secs 3600
 
 # Search all captured output (lexical default)
 $ ft robot search "error: compilation failed"
@@ -265,7 +265,7 @@ ft robot search "compilation failed" --limit 20
 
 ```bash
 # Wait for an agent to hit its rate limit
-ft robot wait-for 0 "core.codex:usage_reached"
+ft robot wait-for 0 "codex.usage.reached"
 
 # Then send a command to handle it
 ft robot send 0 "/compact"
@@ -569,15 +569,32 @@ send_text = { max_per_second = 2 }
 
 - `crates/frankenterm/src/main.rs` — CLI entrypoint and command routing (`watch`, `robot`, `workflow`, `mcp`, etc.)
 - `crates/frankenterm-core/src/runtime.rs` — watcher runtime orchestration (discovery, capture, persistence, maintenance)
+- `crates/frankenterm-core/src/runtime_compat.rs` — runtime/channel/net/time compatibility seam
 - `crates/frankenterm-core/src/ingest.rs` — pane discovery + delta extraction + gap semantics
 - `crates/frankenterm-core/src/storage.rs` — SQLite schema/migrations, writer path, FTS5 integration
 - `crates/frankenterm-core/src/patterns.rs` — rule packs and detection engine
 - `crates/frankenterm-core/src/events.rs` — event bus + typed runtime events
-- `crates/frankenterm-core/src/workflows/` — workflow engine modules (no single `workflows.rs` file)
+- `crates/frankenterm-core/src/workflows/` — workflow engine modules (`engine.rs`, `runner.rs`, `lock.rs`, handlers/traits; no single `workflows.rs`)
 - `crates/frankenterm-core/src/policy.rs` — safety gates, approval/rate-limit decisions
+- `crates/frankenterm-core/src/robot_types.rs` + `src/ui_query.rs` — machine envelopes and shared query/view types
 - `crates/frankenterm-core/src/mcp.rs` + `src/mcp_*` — MCP tool/resource surface (feature-gated)
 
 For a deeper architecture writeup (OSC 133 prompt markers, gap semantics, library map), see `docs/architecture.md`.
+
+### Concise Module Map
+
+| Surface | Primary Location | Responsibility |
+|---------|------------------|----------------|
+| CLI dispatch | `crates/frankenterm/src/main.rs` | Command parsing and routing for watch/robot/workflow/mcp |
+| Runtime loop | `crates/frankenterm-core/src/runtime.rs` | Discovery/capture/persistence/maintenance task orchestration |
+| Runtime compatibility | `crates/frankenterm-core/src/runtime_compat.rs` | Async runtime and primitive compatibility layer |
+| Capture + delta | `crates/frankenterm-core/src/ingest.rs` | Overlap matching, gap detection, capture metadata |
+| Storage + query | `crates/frankenterm-core/src/storage.rs` + `src/search/` | SQLite schema, FTS5, lexical/semantic/hybrid retrieval |
+| Detection | `crates/frankenterm-core/src/patterns.rs` | Rule pack loading, anchor/regex matching, dedupe |
+| Events | `crates/frankenterm-core/src/events.rs` | Bounded broadcast fanout and typed event channels |
+| Workflows | `crates/frankenterm-core/src/workflows/` | Workflow traits, engine, runner, pane lock coordination |
+| Policy | `crates/frankenterm-core/src/policy.rs` | Authorization, rate limits, approvals, audit outcomes |
+| Robot + MCP types | `crates/frankenterm-core/src/robot_types.rs` + `src/mcp*.rs` | Structured machine contracts for robot and MCP surfaces |
 
 ### Data Flow
 
@@ -599,14 +616,14 @@ For a deeper architecture writeup (OSC 133 prompt markers, gap semantics, librar
 
 | Agent | Pattern Examples |
 |-------|------------------|
-| **Codex** | `core.codex:usage_reached`, `core.codex:compaction_complete` |
-| **Claude Code** | `core.claude:rate_limited`, `core.claude:approval_needed` |
-| **Gemini** | `core.gemini:quota_exceeded`, `core.gemini:error` |
-| **Terminal Runtime** | `core.wezterm:pane_closed`, `core.wezterm:title_changed` |
+| **Codex** | `codex.usage.reached`, `codex.rate_limit.detected` |
+| **Claude Code** | `claude_code.usage.reached`, `claude_code.approval_needed` |
+| **Gemini** | `gemini.usage.reached`, `gemini.rate_limit.detected` |
+| **Terminal Runtime** | `wezterm.mux.connection_lost`, `wezterm.pane.exited` |
 
 ### Pattern IDs
 
-Every detection has a stable `rule_id` like `core.codex:usage_reached`. Use these in:
+Every detection has a stable `rule_id` like `codex.usage.reached`. Use these in:
 - `ft robot wait-for <pane_id> <rule_id>` — wait for specific condition
 - Workflow triggers — automatically react to patterns
 - Allowlists — suppress false positives
