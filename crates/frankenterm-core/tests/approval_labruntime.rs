@@ -18,7 +18,7 @@ use frankenterm_core::approval::{ApprovalAuditContext, ApprovalStore};
 use frankenterm_core::config::ApprovalConfig;
 use frankenterm_core::error::Error;
 use frankenterm_core::policy::{
-    ActionKind, ActorKind, PaneCapabilities, PolicyDecision, PolicyInput,
+    ActionKind, ActorKind, PaneCapabilities, PolicyDecision, PolicyInput, PolicySurface,
 };
 use frankenterm_core::storage::{AuditQuery, PaneRecord, StorageHandle, now_ms};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -254,6 +254,36 @@ fn approval_different_action_fingerprint_prevents_consumption() {
             .await
             .unwrap();
         assert!(consumed.is_some(), "Token should work with matching input");
+
+        cleanup(storage, &db_path).await;
+    });
+}
+
+#[test]
+fn approval_different_policy_surface_prevents_consumption() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let (storage, db_path) = setup_storage("surface_scope").await;
+        let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+        let input = base_input().with_surface(PolicySurface::Robot);
+        let request = store.issue(&input, None).await.unwrap();
+
+        let different_surface = input.clone().with_surface(PolicySurface::Mcp);
+        let consumed = store
+            .consume(&request.allow_once_code, &different_surface)
+            .await
+            .unwrap();
+        assert!(
+            consumed.is_none(),
+            "Token should be scoped to the same policy surface"
+        );
+
+        // Original input should still work
+        let consumed = store
+            .consume(&request.allow_once_code, &input)
+            .await
+            .unwrap();
+        assert!(consumed.is_some(), "Token should work with matching surface");
 
         cleanup(storage, &db_path).await;
     });

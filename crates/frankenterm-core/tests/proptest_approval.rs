@@ -15,6 +15,7 @@
 //! 10. fingerprint_for_input: agent_type changes fingerprint
 //! 11. fingerprint_for_input: pane_title changes fingerprint
 //! 12. fingerprint_for_input: pane_cwd changes fingerprint
+//! 24. fingerprint_for_input: policy surface changes fingerprint
 //! 13. hash_allow_once_code: deterministic
 //! 14. hash_allow_once_code: starts with "sha256:" prefix
 //! 15. hash_allow_once_code: hex digest is 64 chars
@@ -33,7 +34,7 @@ use frankenterm_core::approval::{
     ApprovalAuditContext, ApprovalScope, fingerprint_for_input, hash_allow_once_code,
 };
 use frankenterm_core::config::ApprovalConfig;
-use frankenterm_core::policy::{ActionKind, ActorKind, PolicyInput};
+use frankenterm_core::policy::{ActionKind, ActorKind, PolicyInput, PolicySurface};
 
 // =============================================================================
 // Strategies
@@ -71,6 +72,19 @@ fn arb_actor_kind() -> impl Strategy<Value = ActorKind> {
     ]
 }
 
+fn arb_policy_surface() -> impl Strategy<Value = PolicySurface> {
+    prop_oneof![
+        Just(PolicySurface::Unknown),
+        Just(PolicySurface::Mux),
+        Just(PolicySurface::Swarm),
+        Just(PolicySurface::Robot),
+        Just(PolicySurface::Connector),
+        Just(PolicySurface::Workflow),
+        Just(PolicySurface::Mcp),
+        Just(PolicySurface::Ipc),
+    ]
+}
+
 fn arb_policy_input() -> impl Strategy<Value = PolicyInput> {
     (
         arb_action_kind(),
@@ -83,6 +97,7 @@ fn arb_policy_input() -> impl Strategy<Value = PolicyInput> {
         proptest::option::of("[a-zA-Z0-9_]{1,15}"),
         proptest::option::of("[a-zA-Z0-9 /-]{1,30}"),
         proptest::option::of("[a-zA-Z0-9/]{1,30}"),
+        proptest::option::of(arb_policy_surface()),
     )
         .prop_map(
             |(
@@ -96,6 +111,7 @@ fn arb_policy_input() -> impl Strategy<Value = PolicyInput> {
                 agent_type,
                 pane_title,
                 pane_cwd,
+                surface,
             )| {
                 let mut input = PolicyInput::new(action, actor);
                 if let Some(pid) = pane_id {
@@ -121,6 +137,9 @@ fn arb_policy_input() -> impl Strategy<Value = PolicyInput> {
                 }
                 if let Some(pc) = pane_cwd {
                     input = input.with_pane_cwd(pc);
+                }
+                if let Some(surface) = surface {
+                    input = input.with_surface(surface);
                 }
                 input
             },
@@ -353,6 +372,29 @@ proptest! {
         prop_assume!(c1 != c2);
         let i1 = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane_cwd(&c1);
         let i2 = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane_cwd(&c2);
+        prop_assert_ne!(fingerprint_for_input(&i1), fingerprint_for_input(&i2));
+    }
+}
+
+// =============================================================================
+// Property 24: different policy surface → different fingerprint
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn fingerprint_surface_sensitivity(
+        s1 in arb_policy_surface(),
+        s2 in arb_policy_surface(),
+    ) {
+        prop_assume!(s1 != s2);
+        let i1 = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_surface(s1);
+        let i2 = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_surface(s2);
         prop_assert_ne!(fingerprint_for_input(&i1), fingerprint_for_input(&i2));
     }
 }

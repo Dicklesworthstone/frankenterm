@@ -300,6 +300,9 @@ pub fn fingerprint_for_input(input: &PolicyInput) -> String {
     canonical.push_str("action_kind=");
     canonical.push_str(input.action.as_str());
     canonical.push('|');
+    canonical.push_str("surface=");
+    canonical.push_str(input.surface.as_str());
+    canonical.push('|');
     canonical.push_str("pane_id=");
     if let Some(pane_id) = input.pane_id {
         canonical.push_str(&pane_id.to_string());
@@ -401,7 +404,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{ActionKind, ActorKind, PaneCapabilities, PolicyInput};
+    use crate::policy::{ActionKind, ActorKind, PaneCapabilities, PolicyInput, PolicySurface};
     use crate::storage::{AuditQuery, PaneRecord, StorageHandle};
 
     fn run_async_test<F>(future: F)
@@ -929,14 +932,34 @@ mod tests {
 
     #[test]
     fn fingerprint_actor_kind_does_not_change_hash() {
-        // Actor kind is NOT part of the fingerprint canonical string
-        let robot = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(1);
-        let human = PolicyInput::new(ActionKind::SendText, ActorKind::Human).with_pane(1);
+        // Actor kind is NOT part of the fingerprint canonical string when surface is fixed.
+        let robot = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_surface(PolicySurface::Mux);
+        let human = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
+            .with_pane(1)
+            .with_surface(PolicySurface::Mux);
 
         assert_eq!(
             fingerprint_for_input(&robot),
             fingerprint_for_input(&human),
             "Actor kind should not affect fingerprint"
+        );
+    }
+
+    #[test]
+    fn fingerprint_surface_changes_hash() {
+        let robot_surface = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_surface(PolicySurface::Robot);
+        let mcp_surface = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_surface(PolicySurface::Mcp);
+
+        assert_ne!(
+            fingerprint_for_input(&robot_surface),
+            fingerprint_for_input(&mcp_surface),
+            "Policy surface should affect fingerprint"
         );
     }
 
