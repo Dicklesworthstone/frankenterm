@@ -1055,7 +1055,7 @@ impl ResizeScheduler {
                 None,
                 ResizeLifecycleStage::Failed,
                 ResizeLifecycleDetail::ActiveCancelledSuperseded {
-                    by_seq: latest_seq.unwrap(),
+                    superseded_by_seq: latest_seq.unwrap(),
                 },
             );
             self.publish_debug_snapshot();
@@ -3169,9 +3169,9 @@ mod tests {
 
         // Schedule 3 empty frames (no other work, but pane 1 won't fit)
         // Actually need another pane to take the slot each time
-        for _ in 0..4 {
+        for i in 0..4 {
             let _ =
-                scheduler.submit_intent(intent(2, 1, ResizeWorkClass::Interactive, 1, 100 + _));
+                scheduler.submit_intent(intent(2, 1, ResizeWorkClass::Interactive, 1, 100 + i));
             let _ = scheduler.schedule_frame();
             assert!(scheduler.complete_active(2, 1));
         }
