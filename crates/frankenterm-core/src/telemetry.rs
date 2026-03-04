@@ -766,7 +766,24 @@ impl TelemetryCollector {
                 break;
             }
 
-            self.sample_once();
+            let pid = self.config.mux_server_pid;
+            let snap_opt = crate::runtime_compat::spawn_blocking(move || {
+                ResourceSnapshot::collect(pid)
+            })
+            .await
+            .unwrap_or(None);
+
+            if let Some(snap) = snap_opt {
+                self.buffer.push(snap);
+                self.sample_count.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    pid,
+                    samples = self.sample_count.load(Ordering::Relaxed),
+                    "Telemetry sample collected"
+                );
+            } else {
+                warn!(pid, "Failed to collect telemetry sample");
+            }
         }
     }
 

@@ -7,7 +7,10 @@ use crate::config as wa_config;
 #[cfg(feature = "asupersync-runtime")]
 use crate::cx::{self, Cx};
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
-use crate::runtime_compat::{mpsc, task, timeout, watch};
+use crate::runtime_compat::{
+    mpsc, mpsc_recv_option, mpsc_reserve_send, mpsc_try_reserve_send, task, timeout, watch,
+    watch_borrow_and_update_clone, watch_changed,
+};
 use codec::{
     CODEC_VERSION, CompressionMode, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
     GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, ListPanes,
@@ -956,68 +959,24 @@ pub struct PaneOutputSubscription {
 }
 
 async fn pane_delta_recv(rx: &mut mpsc::Receiver<PaneDelta>) -> Option<PaneDelta> {
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        let cx = crate::cx::for_testing();
-        rx.recv(&cx).await.ok()
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        rx.recv().await
-    }
+    mpsc_recv_option(rx).await
 }
 
 async fn pane_delta_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) {
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        let cx = crate::cx::for_testing();
-        if let Ok(permit) = tx.reserve(&cx).await {
-            permit.send(delta);
-        }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        if let Ok(permit) = tx.reserve().await {
-            permit.send(delta);
-        }
-    }
+    let _ = mpsc_reserve_send(tx, delta).await;
 }
 
 fn pane_delta_try_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) -> bool {
-    if let Ok(permit) = tx.try_reserve() {
-        permit.send(delta);
-        true
-    } else {
-        false
-    }
+    mpsc_try_reserve_send(tx, delta)
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)] // mut needed for tokio borrow_and_update path
 fn cancel_requested(cancel_rx: &mut watch::Receiver<bool>) -> bool {
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        cancel_rx.borrow_and_clone()
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        *cancel_rx.borrow_and_update()
-    }
+    watch_borrow_and_update_clone(cancel_rx)
 }
 
 async fn wait_for_cancel_change(cancel_rx: &mut watch::Receiver<bool>) -> bool {
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        let cx = crate::cx::for_testing();
-        cancel_rx.changed(&cx).await.is_ok()
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        cancel_rx.changed().await.is_ok()
-    }
+    watch_changed(cancel_rx).await.is_ok()
 }
 
 impl PaneOutputSubscription {
@@ -1787,6 +1746,120 @@ mod tests {
     }
 
     #[test]
+    fn await_response_reuses_stashed_out_of_order_response_for_later_serial() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("stashed-out-of-order.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut list_serials = Vec::new();
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let response =
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "stashed-response-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    });
+                                let mut out = Vec::new();
+                                response
+                                    .encode(&mut out, decoded.serial)
+                                    .expect("encode response");
+                                stream.write_all(&out).await.expect("write response");
+                            }
+                            Pdu::SetClientId(_) => {
+                                let mut out = Vec::new();
+                                Pdu::UnitResponse(UnitResponse {})
+                                    .encode(&mut out, decoded.serial)
+                                    .expect("encode response");
+                                stream.write_all(&out).await.expect("write response");
+                            }
+                            Pdu::ListPanes(_) => {
+                                list_serials.push(decoded.serial);
+                                if list_serials.len() == 2 {
+                                    for serial in list_serials.iter().rev().copied() {
+                                        let response = Pdu::ListPanesResponse(ListPanesResponse {
+                                            tabs: Vec::new(),
+                                            tab_titles: Vec::new(),
+                                            window_titles: HashMap::new(),
+                                        });
+                                        let mut out = Vec::new();
+                                        response.encode(&mut out, serial).expect("encode response");
+                                        stream.write_all(&out).await.expect("write response");
+                                    }
+                                    return;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+
+            let first_serial = client
+                .send_request_only(Pdu::ListPanes(ListPanes {}))
+                .await
+                .expect("send first list panes request");
+            let second_serial = client
+                .send_request_only(Pdu::ListPanes(ListPanes {}))
+                .await
+                .expect("send second list panes request");
+            assert_ne!(first_serial, second_serial);
+
+            let first_response = client
+                .await_response(first_serial)
+                .await
+                .expect("await first response");
+            assert!(
+                matches!(first_response, Pdu::ListPanesResponse(_)),
+                "first serial should resolve to ListPanesResponse"
+            );
+            assert!(
+                client.pending_responses.contains_key(&second_serial),
+                "out-of-order second response should be stashed"
+            );
+
+            let second_response = client
+                .await_response(second_serial)
+                .await
+                .expect("await second response from stash");
+            assert!(
+                matches!(second_response, Pdu::ListPanesResponse(_)),
+                "second serial should resolve from pending response stash"
+            );
+            assert!(
+                !client.pending_responses.contains_key(&second_serial),
+                "pending stash should be drained after serving the second response"
+            );
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
     fn concurrent_connect_attempts_assign_unique_connection_ids() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -1823,11 +1896,13 @@ mod tests {
                                         })
                                     }
                                     Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
-                                    Pdu::ListPanes(_) => Pdu::ListPanesResponse(ListPanesResponse {
-                                        tabs: Vec::new(),
-                                        tab_titles: Vec::new(),
-                                        window_titles: HashMap::new(),
-                                    }),
+                                    Pdu::ListPanes(_) => {
+                                        Pdu::ListPanesResponse(ListPanesResponse {
+                                            tabs: Vec::new(),
+                                            tab_titles: Vec::new(),
+                                            window_titles: HashMap::new(),
+                                        })
+                                    }
                                     _ => continue,
                                 };
 
@@ -2504,6 +2579,54 @@ mod tests {
                 DirectMuxError::SocketNotFound(_) => {}
                 other => panic!("expected SocketNotFound, got: {other}"),
             }
+        });
+    }
+
+    #[test]
+    fn connect_times_out_when_server_stalls_during_codec_handshake() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("connect-read-timeout.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for connect timeout test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    assert!(read > 0, "expected codec handshake request bytes");
+
+                    // Keep the socket open without sending a codec response so
+                    // client-side read timeout handling is exercised.
+                    sleep(Duration::from_millis(150)).await;
+                });
+            });
+
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should become ready");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.read_timeout = Duration::from_millis(40);
+
+            let err = DirectMuxClient::connect(config)
+                .await
+                .expect_err("connect should fail when codec handshake stalls");
+            assert!(
+                matches!(err, DirectMuxError::ReadTimeout),
+                "expected ReadTimeout, got: {err}"
+            );
+
+            server.join().expect("server thread should exit cleanly");
         });
     }
 

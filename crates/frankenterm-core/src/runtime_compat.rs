@@ -165,6 +165,10 @@ pub fn clear_runtime_handle() {
     ASUPERSYNC_HANDLE.with(|cell| cell.replace(None));
 }
 
+/// No-op for builds that do not install an asupersync runtime handle.
+#[cfg(not(feature = "asupersync-runtime"))]
+pub fn clear_runtime_handle() {}
+
 #[cfg(feature = "asupersync-runtime")]
 #[derive(Debug)]
 pub struct Mutex<T> {
@@ -1331,6 +1335,45 @@ pub async fn mpsc_send<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::Se
     }
 }
 
+/// Reserves one mpsc slot and commits `value`, returning whether delivery was
+/// accepted by an active receiver.
+///
+/// Transitional helper retained for migration-era tests. New production
+/// call-sites should prefer explicit reserve/commit semantics.
+pub async fn mpsc_reserve_send<T>(tx: &mpsc::Sender<T>, value: T) -> bool {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_testing();
+        if let Ok(permit) = tx.reserve(&cx).await {
+            permit.send(value);
+            return true;
+        }
+        false
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        if let Ok(permit) = tx.reserve().await {
+            permit.send(value);
+            return true;
+        }
+        false
+    }
+}
+
+/// Attempts an immediate reserve/commit send and reports whether delivery was
+/// accepted.
+///
+/// Transitional helper retained for migration-era tests. New production
+/// call-sites should prefer explicit reserve/commit semantics.
+pub fn mpsc_try_reserve_send<T>(tx: &mpsc::Sender<T>, value: T) -> bool {
+    if let Ok(permit) = tx.try_reserve() {
+        permit.send(value);
+        return true;
+    }
+    false
+}
+
 /// Checks whether a watch receiver has observed a new value.
 ///
 /// Returns `false` if the channel has closed.
@@ -1463,29 +1506,45 @@ mod tests {
         rt.spawn_detached(async {});
     }
 
-    #[tokio::test]
-    async fn sleep_completes() {
-        let start = std::time::Instant::now();
-        sleep(Duration::from_millis(10)).await;
-        let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_millis(5));
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build runtime for async test");
+        runtime.block_on(future);
     }
 
-    #[tokio::test]
-    async fn timeout_succeeds_before_deadline() {
-        let result = timeout(Duration::from_secs(1), async { 99 }).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 99);
+    #[test]
+    fn sleep_completes() {
+        run_async_test(async {
+            let start = std::time::Instant::now();
+            sleep(Duration::from_millis(10)).await;
+            let elapsed = start.elapsed();
+            assert!(elapsed >= Duration::from_millis(5));
+        });
     }
 
-    #[tokio::test]
-    async fn timeout_expires_returns_error() {
-        let result = timeout(Duration::from_millis(10), async {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            42
-        })
-        .await;
-        assert!(result.is_err());
+    #[test]
+    fn timeout_succeeds_before_deadline() {
+        run_async_test(async {
+            let result = timeout(Duration::from_secs(1), async { 99 }).await;
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), 99);
+        });
+    }
+
+    #[test]
+    fn timeout_expires_returns_error() {
+        run_async_test(async {
+            let result = timeout(Duration::from_millis(10), async {
+                sleep(Duration::from_secs(10)).await;
+                42
+            })
+            .await;
+            assert!(result.is_err());
+        });
     }
 
     #[test]
@@ -1513,282 +1572,336 @@ mod tests {
     // Mutex tests
     // ========================================================================
 
-    #[tokio::test]
-    async fn mutex_lock_and_read() {
-        let m = Mutex::new(42);
-        let guard = m.lock().await;
-        assert_eq!(*guard, 42);
+    #[test]
+    fn mutex_lock_and_read() {
+        run_async_test(async {
+            let m = Mutex::new(42);
+            let guard = m.lock().await;
+            assert_eq!(*guard, 42);
+        });
     }
 
-    #[tokio::test]
-    async fn mutex_lock_and_mutate() {
-        let m = Mutex::new(0);
-        {
-            let mut guard = m.lock().await;
-            *guard = 99;
-        }
-        let guard = m.lock().await;
-        assert_eq!(*guard, 99);
+    #[test]
+    fn mutex_lock_and_mutate() {
+        run_async_test(async {
+            let m = Mutex::new(0);
+            {
+                let mut guard = m.lock().await;
+                *guard = 99;
+            }
+            let guard = m.lock().await;
+            assert_eq!(*guard, 99);
+        });
     }
 
-    #[tokio::test]
-    async fn mutex_sequential_locks() {
-        let m = Mutex::new(vec![1, 2, 3]);
-        {
-            let mut guard = m.lock().await;
-            guard.push(4);
-        }
-        let guard = m.lock().await;
-        assert_eq!(*guard, vec![1, 2, 3, 4]);
+    #[test]
+    fn mutex_sequential_locks() {
+        run_async_test(async {
+            let m = Mutex::new(vec![1, 2, 3]);
+            {
+                let mut guard = m.lock().await;
+                guard.push(4);
+            }
+            let guard = m.lock().await;
+            assert_eq!(*guard, vec![1, 2, 3, 4]);
+        });
     }
 
     // ========================================================================
     // RwLock tests
     // ========================================================================
 
-    #[tokio::test]
-    async fn rwlock_read() {
-        let rw = RwLock::new("hello".to_string());
-        let guard = rw.read().await;
-        assert_eq!(&*guard, "hello");
+    #[test]
+    fn rwlock_read() {
+        run_async_test(async {
+            let rw = RwLock::new("hello".to_string());
+            let guard = rw.read().await;
+            assert_eq!(&*guard, "hello");
+        });
     }
 
-    #[tokio::test]
-    async fn rwlock_write() {
-        let rw = RwLock::new(0);
-        {
-            let mut guard = rw.write().await;
-            *guard = 42;
-        }
-        let guard = rw.read().await;
-        assert_eq!(*guard, 42);
+    #[test]
+    fn rwlock_write() {
+        run_async_test(async {
+            let rw = RwLock::new(0);
+            {
+                let mut guard = rw.write().await;
+                *guard = 42;
+            }
+            let guard = rw.read().await;
+            assert_eq!(*guard, 42);
+        });
     }
 
-    #[tokio::test]
-    async fn rwlock_multiple_sequential_readers() {
-        let rw = RwLock::new(100);
-        let r1 = rw.read().await;
-        assert_eq!(*r1, 100);
-        drop(r1);
-        let r2 = rw.read().await;
-        assert_eq!(*r2, 100);
+    #[test]
+    fn rwlock_multiple_sequential_readers() {
+        run_async_test(async {
+            let rw = RwLock::new(100);
+            let r1 = rw.read().await;
+            assert_eq!(*r1, 100);
+            drop(r1);
+            let r2 = rw.read().await;
+            assert_eq!(*r2, 100);
+        });
     }
 
     // ========================================================================
     // Semaphore tests
     // ========================================================================
 
-    #[tokio::test]
-    async fn semaphore_available_permits() {
-        let sem = Semaphore::new(3);
-        assert_eq!(sem.available_permits(), 3);
+    #[test]
+    fn semaphore_available_permits() {
+        run_async_test(async {
+            let sem = Semaphore::new(3);
+            assert_eq!(sem.available_permits(), 3);
+        });
     }
 
-    #[tokio::test]
-    async fn semaphore_acquire_decrements_permits() {
-        let sem = Semaphore::new(2);
-        let _p1 = sem.acquire().await.expect("acquire 1");
-        assert_eq!(sem.available_permits(), 1);
+    #[test]
+    fn semaphore_acquire_decrements_permits() {
+        run_async_test(async {
+            let sem = Semaphore::new(2);
+            let _p1 = sem.acquire().await.expect("acquire 1");
+            assert_eq!(sem.available_permits(), 1);
+        });
     }
 
-    #[tokio::test]
-    async fn semaphore_release_on_drop() {
-        let sem = Semaphore::new(1);
-        {
-            let _p = sem.acquire().await.expect("acquire");
-            assert_eq!(sem.available_permits(), 0);
-        }
-        assert_eq!(sem.available_permits(), 1);
+    #[test]
+    fn semaphore_release_on_drop() {
+        run_async_test(async {
+            let sem = Semaphore::new(1);
+            {
+                let _p = sem.acquire().await.expect("acquire");
+                assert_eq!(sem.available_permits(), 0);
+            }
+            assert_eq!(sem.available_permits(), 1);
+        });
     }
 
-    #[tokio::test]
-    async fn semaphore_try_acquire_success() {
-        let sem = Semaphore::new(1);
-        let p = sem.try_acquire();
-        assert!(p.is_ok());
+    #[test]
+    fn semaphore_try_acquire_success() {
+        run_async_test(async {
+            let sem = Semaphore::new(1);
+            let p = sem.try_acquire();
+            assert!(p.is_ok());
+        });
     }
 
-    #[tokio::test]
-    async fn semaphore_try_acquire_no_permits() {
-        let sem = Semaphore::new(1);
-        let _held = sem.acquire().await.expect("acquire");
-        let err = sem.try_acquire();
-        assert!(err.is_err());
+    #[test]
+    fn semaphore_try_acquire_no_permits() {
+        run_async_test(async {
+            let sem = Semaphore::new(1);
+            let _held = sem.acquire().await.expect("acquire");
+            let err = sem.try_acquire();
+            assert!(err.is_err());
+        });
     }
 
-    #[tokio::test]
-    async fn semaphore_try_acquire_owned_success() {
-        let sem = std::sync::Arc::new(Semaphore::new(2));
-        let p = sem.clone().try_acquire_owned();
-        assert!(p.is_ok());
+    #[test]
+    fn semaphore_try_acquire_owned_success() {
+        run_async_test(async {
+            let sem = std::sync::Arc::new(Semaphore::new(2));
+            let p = sem.clone().try_acquire_owned();
+            assert!(p.is_ok());
+        });
     }
 
-    #[tokio::test]
-    async fn semaphore_try_acquire_owned_no_permits() {
-        let sem = std::sync::Arc::new(Semaphore::new(1));
-        let _held = sem.clone().acquire_owned().await.expect("acquire");
-        let err = sem.clone().try_acquire_owned();
-        assert!(err.is_err());
+    #[test]
+    fn semaphore_try_acquire_owned_no_permits() {
+        run_async_test(async {
+            let sem = std::sync::Arc::new(Semaphore::new(1));
+            let _held = sem.clone().acquire_owned().await.expect("acquire");
+            let err = sem.clone().try_acquire_owned();
+            assert!(err.is_err());
+        });
     }
 
     // ========================================================================
     // MPSC channel tests
     // ========================================================================
 
-    #[tokio::test]
-    async fn mpsc_send_recv() {
-        let (tx, mut rx) = mpsc::channel(10);
-        #[cfg(feature = "asupersync-runtime")]
-        {
-            let cx = asupersync::Cx::for_testing();
-            tx.send(&cx, 42).await.expect("send");
-            let val = rx.recv(&cx).await.expect("recv");
-            assert_eq!(val, 42);
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            tx.send(42).await.expect("send");
-            let val = rx.recv().await.expect("recv");
-            assert_eq!(val, 42);
-        }
-    }
-
-    #[tokio::test]
-    async fn mpsc_multiple_messages_fifo() {
-        let (tx, mut rx) = mpsc::channel(10);
-        #[cfg(feature = "asupersync-runtime")]
-        {
-            let cx = asupersync::Cx::for_testing();
-            for i in 0..5 {
-                tx.send(&cx, i).await.expect("send");
-            }
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            for i in 0..5 {
-                tx.send(i).await.expect("send");
-            }
-        }
-        for i in 0..5 {
+    #[test]
+    fn mpsc_send_recv() {
+        run_async_test(async {
+            let (tx, mut rx) = mpsc::channel(10);
             #[cfg(feature = "asupersync-runtime")]
             {
                 let cx = asupersync::Cx::for_testing();
+                tx.send(&cx, 42).await.expect("send");
                 let val = rx.recv(&cx).await.expect("recv");
-                assert_eq!(val, i);
+                assert_eq!(val, 42);
             }
             #[cfg(not(feature = "asupersync-runtime"))]
             {
+                tx.send(42).await.expect("send");
                 let val = rx.recv().await.expect("recv");
-                assert_eq!(val, i);
+                assert_eq!(val, 42);
             }
-        }
+        });
     }
 
-    #[tokio::test]
-    async fn mpsc_send_and_recv_option_helpers_roundtrip() {
-        let (tx, mut rx) = mpsc::channel(4);
-        mpsc_send(&tx, 7).await.expect("send helper");
-        let got = mpsc_recv_option(&mut rx).await;
-        assert_eq!(got, Some(7));
+    #[test]
+    fn mpsc_multiple_messages_fifo() {
+        run_async_test(async {
+            let (tx, mut rx) = mpsc::channel(10);
+            #[cfg(feature = "asupersync-runtime")]
+            {
+                let cx = asupersync::Cx::for_testing();
+                for i in 0..5 {
+                    tx.send(&cx, i).await.expect("send");
+                }
+            }
+            #[cfg(not(feature = "asupersync-runtime"))]
+            {
+                for i in 0..5 {
+                    tx.send(i).await.expect("send");
+                }
+            }
+            for i in 0..5 {
+                #[cfg(feature = "asupersync-runtime")]
+                {
+                    let cx = asupersync::Cx::for_testing();
+                    let val = rx.recv(&cx).await.expect("recv");
+                    assert_eq!(val, i);
+                }
+                #[cfg(not(feature = "asupersync-runtime"))]
+                {
+                    let val = rx.recv().await.expect("recv");
+                    assert_eq!(val, i);
+                }
+            }
+        });
     }
 
-    #[tokio::test]
-    async fn mpsc_recv_option_helper_returns_none_when_closed() {
-        let (tx, mut rx) = mpsc::channel::<u8>(1);
-        drop(tx);
-        let got = mpsc_recv_option(&mut rx).await;
-        assert_eq!(got, None);
+    #[test]
+    fn mpsc_send_and_recv_option_helpers_roundtrip() {
+        run_async_test(async {
+            let (tx, mut rx) = mpsc::channel(4);
+            mpsc_send(&tx, 7).await.expect("send helper");
+            let got = mpsc_recv_option(&mut rx).await;
+            assert_eq!(got, Some(7));
+        });
+    }
+
+    #[test]
+    fn mpsc_recv_option_helper_returns_none_when_closed() {
+        run_async_test(async {
+            let (tx, mut rx) = mpsc::channel::<u8>(1);
+            drop(tx);
+            let got = mpsc_recv_option(&mut rx).await;
+            assert_eq!(got, None);
+        });
     }
 
     // ========================================================================
     // Watch channel tests
     // ========================================================================
 
-    #[tokio::test]
-    async fn watch_initial_value() {
-        let (_, rx) = watch::channel(42);
-        assert_eq!(*rx.borrow(), 42);
+    #[test]
+    fn watch_initial_value() {
+        run_async_test(async {
+            let (_, rx) = watch::channel(42);
+            assert_eq!(*rx.borrow(), 42);
+        });
     }
 
-    #[tokio::test]
-    async fn watch_send_updates_value() {
-        let (tx, rx) = watch::channel(0);
-        tx.send(99).expect("send");
-        assert_eq!(*rx.borrow(), 99);
+    #[test]
+    fn watch_send_updates_value() {
+        run_async_test(async {
+            let (tx, rx) = watch::channel(0);
+            tx.send(99).expect("send");
+            assert_eq!(*rx.borrow(), 99);
+        });
     }
 
-    #[tokio::test]
-    async fn watch_has_changed_detects_new_value() {
-        let (tx, mut rx) = watch::channel(0u32);
-        assert!(!watch_has_changed(&rx));
-        tx.send(5).expect("send");
-        assert!(watch_has_changed(&rx));
-        let latest = watch_borrow_and_update_clone(&mut rx);
-        assert_eq!(latest, 5);
+    #[test]
+    fn watch_has_changed_detects_new_value() {
+        run_async_test(async {
+            let (tx, mut rx) = watch::channel(0u32);
+            assert!(!watch_has_changed(&rx));
+            tx.send(5).expect("send");
+            assert!(watch_has_changed(&rx));
+            let latest = watch_borrow_and_update_clone(&mut rx);
+            assert_eq!(latest, 5);
+        });
     }
 
-    #[tokio::test]
-    async fn watch_has_changed_handles_closed_channel() {
-        let (tx, rx) = watch::channel(42u32);
-        drop(tx);
-        assert!(!watch_has_changed(&rx));
+    #[test]
+    fn watch_has_changed_handles_closed_channel() {
+        run_async_test(async {
+            let (tx, rx) = watch::channel(42u32);
+            drop(tx);
+            assert!(!watch_has_changed(&rx));
+        });
     }
 
-    #[tokio::test]
-    async fn watch_borrow_and_update_clone_returns_latest_value() {
-        let (tx, mut rx) = watch::channel(vec![1u8, 2u8]);
-        tx.send(vec![3u8, 4u8]).expect("send");
-        let latest = watch_borrow_and_update_clone(&mut rx);
-        assert_eq!(latest, vec![3u8, 4u8]);
+    #[test]
+    fn watch_borrow_and_update_clone_returns_latest_value() {
+        run_async_test(async {
+            let (tx, mut rx) = watch::channel(vec![1u8, 2u8]);
+            tx.send(vec![3u8, 4u8]).expect("send");
+            let latest = watch_borrow_and_update_clone(&mut rx);
+            assert_eq!(latest, vec![3u8, 4u8]);
+        });
     }
 
     // ========================================================================
     // Broadcast channel tests
     // ========================================================================
 
-    #[tokio::test]
-    async fn broadcast_send_recv() {
-        let (tx, mut rx) = broadcast::channel(16);
-        tx.send(42).expect("send");
-        let val = rx.recv().await.expect("recv");
-        assert_eq!(val, 42);
+    #[test]
+    fn broadcast_send_recv() {
+        run_async_test(async {
+            let (tx, mut rx) = broadcast::channel(16);
+            tx.send(42).expect("send");
+            let val = rx.recv().await.expect("recv");
+            assert_eq!(val, 42);
+        });
     }
 
-    #[tokio::test]
-    async fn broadcast_multiple_receivers() {
-        let (tx, mut rx1) = broadcast::channel(16);
-        let mut rx2 = tx.subscribe();
-        tx.send(7).expect("send");
-        assert_eq!(rx1.recv().await.expect("r1"), 7);
-        assert_eq!(rx2.recv().await.expect("r2"), 7);
+    #[test]
+    fn broadcast_multiple_receivers() {
+        run_async_test(async {
+            let (tx, mut rx1) = broadcast::channel(16);
+            let mut rx2 = tx.subscribe();
+            tx.send(7).expect("send");
+            assert_eq!(rx1.recv().await.expect("r1"), 7);
+            assert_eq!(rx2.recv().await.expect("r2"), 7);
+        });
     }
 
     // ========================================================================
     // Sleep and timeout edge cases
     // ========================================================================
 
-    #[tokio::test]
-    async fn sleep_zero_duration_completes_immediately() {
-        let start = std::time::Instant::now();
-        sleep(Duration::ZERO).await;
-        assert!(start.elapsed() < Duration::from_millis(100));
+    #[test]
+    fn sleep_zero_duration_completes_immediately() {
+        run_async_test(async {
+            let start = std::time::Instant::now();
+            sleep(Duration::ZERO).await;
+            assert!(start.elapsed() < Duration::from_millis(100));
+        });
     }
 
-    #[tokio::test]
-    async fn timeout_with_immediate_future() {
-        let result = timeout(Duration::from_millis(100), async { "fast" }).await;
-        assert_eq!(result.unwrap(), "fast");
+    #[test]
+    fn timeout_with_immediate_future() {
+        run_async_test(async {
+            let result = timeout(Duration::from_millis(100), async { "fast" }).await;
+            assert_eq!(result.unwrap(), "fast");
+        });
     }
 
-    #[tokio::test]
-    async fn timeout_error_is_string() {
-        let result = timeout(Duration::from_millis(1), async {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-        })
-        .await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(!err.is_empty());
+    #[test]
+    fn timeout_error_is_string() {
+        run_async_test(async {
+            let result = timeout(Duration::from_millis(1), async {
+                sleep(Duration::from_secs(10)).await;
+            })
+            .await;
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(!err.is_empty());
+        });
     }
 
     // ========================================================================
@@ -2148,6 +2261,28 @@ mod tests {
         drop(rx);
         let result = mpsc_send(&tx, 42).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn mpsc_reserve_send_roundtrip() {
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(mpsc_reserve_send(&tx, 11).await);
+        assert_eq!(mpsc_recv_option(&mut rx).await, Some(11));
+    }
+
+    #[tokio::test]
+    async fn mpsc_reserve_send_returns_false_when_receiver_closed() {
+        let (tx, rx) = mpsc::channel::<i32>(1);
+        drop(rx);
+        assert!(!mpsc_reserve_send(&tx, 7).await);
+    }
+
+    #[tokio::test]
+    async fn mpsc_try_reserve_send_reports_full_queue() {
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(mpsc_try_reserve_send(&tx, 1));
+        assert!(!mpsc_try_reserve_send(&tx, 2));
+        assert_eq!(mpsc_recv_option(&mut rx).await, Some(1));
     }
 
     #[tokio::test]
