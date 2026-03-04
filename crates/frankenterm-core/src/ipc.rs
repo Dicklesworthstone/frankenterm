@@ -242,22 +242,9 @@ fn rpc_required_scope(args: &[String]) -> IpcScope {
 
     match cmd.as_str() {
         "send" | "approve" => IpcScope::Write,
-        "help"
-        | "quickstart"
-        | "quick-start"
-        | "state"
-        | "get-text"
-        | "gettext"
-        | "wait-for"
-        | "waitfor"
-        | "search"
-        | "search-explain"
-        | "searchexplain"
-        | "cass"
-        | "why"
-        | "rules"
-        | "agents"
-        | "health" => IpcScope::Read,
+        "help" | "quickstart" | "quick-start" | "state" | "get-text" | "gettext" | "wait-for"
+        | "waitfor" | "search" | "search-explain" | "searchexplain" | "cass" | "why" | "rules"
+        | "agents" | "health" => IpcScope::Read,
         "events" => match subcmd.as_deref() {
             Some("annotate" | "triage" | "label") => IpcScope::Write,
             _ => IpcScope::Read,

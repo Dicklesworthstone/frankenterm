@@ -334,8 +334,9 @@ impl DispatchResult {
 pub fn validate_required_str(args: &serde_json::Value, field: &str) -> Result<String, String> {
     args.get(field)
         .and_then(|v| v.as_str())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(ToString::to_string)
         .ok_or_else(|| format!("missing or empty required field: {field}"))
 }
 
@@ -343,8 +344,9 @@ pub fn validate_required_str(args: &serde_json::Value, field: &str) -> Result<St
 pub fn validate_optional_str(args: &serde_json::Value, field: &str) -> Option<String> {
     args.get(field)
         .and_then(|v| v.as_str())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(ToString::to_string)
 }
 
 /// Validate an optional integer with a default.
@@ -578,6 +580,13 @@ mod tests {
     }
 
     #[test]
+    fn validate_required_str_whitespace_only_rejected() {
+        let args = serde_json::json!({"trace": "   \n\t"});
+        let result = validate_required_str(&args, "trace");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn validate_optional_str_present() {
         let args = serde_json::json!({"budget": "budget.toml"});
         assert_eq!(
@@ -589,6 +598,12 @@ mod tests {
     #[test]
     fn validate_optional_str_missing() {
         let args = serde_json::json!({});
+        assert_eq!(validate_optional_str(&args, "budget"), None);
+    }
+
+    #[test]
+    fn validate_optional_str_whitespace_returns_none() {
+        let args = serde_json::json!({"budget": "   "});
         assert_eq!(validate_optional_str(&args, "budget"), None);
     }
 
