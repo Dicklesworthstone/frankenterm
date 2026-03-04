@@ -239,10 +239,12 @@ frankenterm/
 │   ├── frankenterm/                   # CLI binary (main.rs)
 │   └── frankenterm-core/             # Core library
 │       └── src/
+│           ├── runtime.rs            # Observation runtime orchestration
 │           ├── config.rs             # Configuration parsing
-│           ├── ingest.rs             # Pane output capture
+│           ├── ingest.rs             # Pane discovery + delta extraction
 │           ├── patterns.rs           # Pattern detection engine
-│           ├── workflows.rs          # Workflow execution
+│           ├── events.rs             # Event bus and detection fanout
+│           ├── workflows/            # Workflow engine modules (runner/engine/locks/steps)
 │           ├── policy.rs             # Safety/access control
 │           ├── storage.rs            # SQLite + FTS5
 │           └── wezterm.rs            # Terminal backend adapter (current compatibility bridge)

@@ -81,6 +81,7 @@ Core passive loop contract: observe/store/detect only. Side effects are delegate
 - `events.rs`: bounded broadcast fanout and typed event stream (`PatternDetected`, `GapDetected`, workflow lifecycle, user-var events).
 - `workflows/`: durable workflow trait/execution engine/runner/locks and step orchestration.
 - `policy.rs`: action authorization model (`ActionKind`, `ActorKind`, `PolicyDecision`) and gating helpers.
+- Documentation parity note: workflow runtime code is directory-backed under `workflows/`; there is no standalone `workflows.rs`.
 
 ### Storage model (authoritative persistence seam)
 

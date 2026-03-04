@@ -565,6 +565,18 @@ send_text = { max_per_second = 2 }
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Key Source Files (Current)
+
+- `crates/frankenterm/src/main.rs` — CLI entrypoint and command routing (`watch`, `robot`, `workflow`, `mcp`, etc.)
+- `crates/frankenterm-core/src/runtime.rs` — watcher runtime orchestration (discovery, capture, persistence, maintenance)
+- `crates/frankenterm-core/src/ingest.rs` — pane discovery + delta extraction + gap semantics
+- `crates/frankenterm-core/src/storage.rs` — SQLite schema/migrations, writer path, FTS5 integration
+- `crates/frankenterm-core/src/patterns.rs` — rule packs and detection engine
+- `crates/frankenterm-core/src/events.rs` — event bus + typed runtime events
+- `crates/frankenterm-core/src/workflows/` — workflow engine modules (no single `workflows.rs` file)
+- `crates/frankenterm-core/src/policy.rs` — safety gates, approval/rate-limit decisions
+- `crates/frankenterm-core/src/mcp.rs` + `src/mcp_*` — MCP tool/resource surface (feature-gated)
+
 For a deeper architecture writeup (OSC 133 prompt markers, gap semantics, library map), see `docs/architecture.md`.
 
 ### Data Flow
