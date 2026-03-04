@@ -3,17 +3,17 @@ use crate::config::ConfigMap;
 use crate::dirwrap::DirWrap;
 use crate::filewrap::FileWrap;
 use crate::pty::*;
-use crate::runtime::channel::{bounded, Receiver, Sender, TryRecvError};
+use crate::runtime::channel::{Receiver, Sender, TryRecvError, bounded};
 use crate::session::{Exec, ExecResult, SessionEvent, SessionRequest, SignalChannel};
 use crate::sessionwrap::SessionWrap;
 use crate::sftp::dir::{Dir, DirId, DirRequest};
 use crate::sftp::file::{File, FileId, FileRequest};
 use crate::sftp::{OpenWithMode, SftpChannelResult, SftpRequest};
 use crate::sftpwrap::SftpWrap;
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use camino::Utf8PathBuf;
 use filedescriptor::{
-    poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT,
+    AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT, poll, pollfd, socketpair,
 };
 use portable_pty::ExitStatus;
 use socket2::{Domain, Socket, Type};
@@ -28,6 +28,10 @@ use std::time::{Duration, Instant};
 /// limit, reads are paused until data is drained, providing natural
 /// backpressure to the SSH channel.
 const MAX_DESCRIPTOR_BUF_SIZE: usize = 4 * 1024 * 1024;
+/// Initial poll delay when the session loop is active.
+const INITIAL_POLL_DELAY: Duration = Duration::from_millis(100);
+/// Upper bound for poll backoff to avoid multi-minute/hour stalls.
+const MAX_POLL_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub(crate) struct DescriptorState {
@@ -451,7 +455,7 @@ impl SessionInner {
     }
 
     fn request_loop(&mut self, sess: &mut SessionWrap) -> anyhow::Result<()> {
-        let mut sleep_delay = Duration::from_millis(100);
+        let mut sleep_delay = INITIAL_POLL_DELAY;
 
         loop {
             self.do_keepalive(sess)?;
@@ -501,11 +505,11 @@ impl SessionInner {
             }
 
             poll(&mut poll_array, Some(sleep_delay)).context("poll")?;
-            sleep_delay += sleep_delay;
+            sleep_delay = next_poll_delay(sleep_delay);
 
             for (idx, poll) in poll_array.iter().enumerate() {
                 if poll.revents != 0 {
-                    sleep_delay = Duration::from_millis(100);
+                    sleep_delay = INITIAL_POLL_DELAY;
                 }
                 if idx == 0 || idx == 1 {
                     // Dealt with at the top of the loop
@@ -530,7 +534,9 @@ impl SessionInner {
                         }
                     } else {
                         if info.exited && state.buf.is_empty() {
-                            log::trace!("channel {channel_id} exited and we have no data to send to fd {fd_num}: close it!");
+                            log::trace!(
+                                "channel {channel_id} exited and we have no data to send to fd {fd_num}: close it!"
+                            );
                             state.fd.take();
                         } else {
                             // We can write our buffered output
@@ -1093,15 +1099,39 @@ fn write_from_buf<W: Write>(w: &mut W, buf: &mut VecDeque<u8>) -> std::io::Resul
     }
 }
 
+fn next_poll_delay(current: Duration) -> Duration {
+    current
+        .checked_mul(2)
+        .unwrap_or(MAX_POLL_DELAY)
+        .min(MAX_POLL_DELAY)
+}
+
 fn read_into_buf<R: Read>(r: &mut R, buf: &mut VecDeque<u8>) -> std::io::Result<()> {
-    if buf.len() >= MAX_DESCRIPTOR_BUF_SIZE {
+    let current_len = buf.len();
+    if current_len >= MAX_DESCRIPTOR_BUF_SIZE {
         // Buffer is full — apply backpressure by not reading more data.
         // The caller will drain via write_from_buf, then resume reads.
         return Ok(());
     }
-    let current_len = buf.len();
-    buf.resize(buf.capacity(), 0);
-    let target_buf = &mut buf.make_contiguous()[current_len..];
+
+    // Ensure we never issue a zero-length read when len == capacity; that can
+    // incorrectly look like EOF and cause unnecessary channel teardown.
+    if current_len == buf.capacity() {
+        let remaining_budget = MAX_DESCRIPTOR_BUF_SIZE.saturating_sub(current_len);
+        if remaining_budget == 0 {
+            return Ok(());
+        }
+        buf.reserve(remaining_budget.min(8192));
+    }
+
+    let writable = (buf.capacity().saturating_sub(current_len))
+        .min(MAX_DESCRIPTOR_BUF_SIZE.saturating_sub(current_len));
+    if writable == 0 {
+        return Ok(());
+    }
+
+    buf.resize(current_len + writable, 0);
+    let target_buf = &mut buf.make_contiguous()[current_len..current_len + writable];
     match r.read(target_buf) {
         Ok(len) => {
             buf.resize(current_len + len, 0);
@@ -1149,5 +1179,32 @@ impl Drop for KillOnDropChild {
         if let Err(err) = self.0.wait() {
             log::error!("Error waiting for ProxyCommand to finish: {}", err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_delay_backoff_caps() {
+        let mut delay = INITIAL_POLL_DELAY;
+        for _ in 0..64 {
+            delay = next_poll_delay(delay);
+        }
+        assert_eq!(delay, MAX_POLL_DELAY);
+    }
+
+    #[test]
+    fn read_into_buf_grows_when_len_equals_capacity() {
+        let mut buf = VecDeque::with_capacity(4);
+        buf.extend([1_u8, 2, 3, 4]);
+        assert_eq!(buf.len(), buf.capacity());
+
+        let mut reader = std::io::Cursor::new(vec![5_u8, 6, 7]);
+        read_into_buf(&mut reader, &mut buf).expect("read into full-capacity buffer should work");
+
+        let got: Vec<u8> = buf.into_iter().collect();
+        assert_eq!(got, vec![1, 2, 3, 4, 5, 6, 7]);
     }
 }
