@@ -15,6 +15,7 @@ CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/rch-e2e-ft124z4}"
 export CARGO_TARGET_DIR
 
 LAST_STEP_LOG=""
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|Failed to connect to ubuntu@'
 
 emit_log() {
   local component="$1"
@@ -64,6 +65,11 @@ run_step() {
   return ${rc}
 }
 
+rch_fail_open_detected() {
+  local log_path="$1"
+  grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${log_path}"
+}
+
 require_cmd() {
   local cmd="$1"
   if ! command -v "${cmd}" >/dev/null 2>&1; then
@@ -103,10 +109,23 @@ fi
 
 emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
 
+emit_log "preflight" "rch_remote_smoke" "cargo_version" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
+if run_step rch_remote_smoke rch exec -- env TMPDIR=/tmp cargo --version; then
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
+    emit_log "preflight" "rch_remote_smoke" "cargo_version" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    echo "rch remote smoke check failed-open to local execution; refusing offload policy violation" >&2
+    exit 3
+  fi
+  emit_log "preflight" "rch_remote_smoke" "cargo_version" "passed" "remote_exec_confirmed" "none" "$(basename "${LAST_STEP_LOG}")"
+else
+  emit_log "preflight" "rch_remote_smoke" "cargo_version" "failed" "rch_remote_smoke_failed" "RCH-REMOTE-SMOKE-FAIL" "$(basename "${LAST_STEP_LOG}")"
+  exit 2
+fi
+
 emit_log "validation" "nominal_path" "tailer_labruntime_tests" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
 if run_step nominal_labruntime \
   rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --test tailer_labruntime --features asupersync-runtime -- --nocapture; then
-  if grep -q "\[RCH\] local" "${LAST_STEP_LOG}"; then
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
     emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
     echo "rch fell back to local execution; failing per offload-only policy" >&2
     exit 3
@@ -124,7 +143,7 @@ run_step failure_missing_feature \
 missing_feature_rc=$?
 set -e
 
-if grep -q "\[RCH\] local" "${LAST_STEP_LOG}"; then
+if rch_fail_open_detected "${LAST_STEP_LOG}"; then
   emit_log "validation" "failure_injection_path" "bench_without_feature" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
   echo "rch fell back to local execution; failing per offload-only policy" >&2
   exit 3
@@ -145,7 +164,7 @@ emit_log "validation" "failure_injection_path" "bench_without_feature" "passed" 
 emit_log "validation" "recovery_path" "bench_with_feature" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
 if run_step recovery_with_feature \
   rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check -p frankenterm-core --bench tailer --features asupersync-runtime --message-format short; then
-  if grep -q "\[RCH\] local" "${LAST_STEP_LOG}"; then
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
     emit_log "validation" "recovery_path" "bench_with_feature" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
     echo "rch fell back to local execution; failing per offload-only policy" >&2
     exit 3

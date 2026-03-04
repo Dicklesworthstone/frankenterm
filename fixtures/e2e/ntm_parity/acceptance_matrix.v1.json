@@ -1,0 +1,51 @@
+{
+  "schema_version": "1.0",
+  "bead_id": "ft-3681t.8.1",
+  "title": "NTM parity acceptance matrix",
+  "gates": {
+    "blocking_scenarios": {
+      "required_ids": [
+        "NTM-PARITY-001",
+        "NTM-PARITY-002",
+        "NTM-PARITY-003",
+        "NTM-PARITY-004",
+        "NTM-PARITY-005",
+        "NTM-PARITY-006",
+        "NTM-PARITY-011"
+      ],
+      "rule": "all must pass"
+    },
+    "high_priority_scenarios": {
+      "required_pass_rate": 0.9,
+      "ids": [
+        "NTM-PARITY-007",
+        "NTM-PARITY-008",
+        "NTM-PARITY-009",
+        "NTM-PARITY-010",
+        "NTM-PARITY-012"
+      ]
+    },
+    "envelope_contract": {
+      "rule": "every scenario output must include an envelope with either ok=true or a structured error.code"
+    },
+    "divergence_budget": {
+      "max_blocking_divergence": 0,
+      "max_high_priority_divergence": 1,
+      "notes": "Intentional deltas must be documented with rationale and migration impact."
+    }
+  },
+  "result_schema": {
+    "scenario_id": "string",
+    "status": "pass|fail|intentional-delta|untested",
+    "artifacts": ["string"],
+    "notes": "string"
+  },
+  "artifacts_contract": {
+    "required_files": [
+      "summary.json",
+      "raw_command_outputs.jsonl",
+      "assertion_results.json"
+    ],
+    "artifact_root": "artifacts/e2e/ntm_parity/<run_id>/"
+  }
+}

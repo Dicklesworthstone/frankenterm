@@ -66,6 +66,13 @@ classify_command_json() {
     }'
 }
 
+worker_context_is_local() {
+  local worker_context="$1"
+  local normalized
+  normalized="$(echo "${worker_context}" | tr '[:upper:]' '[:lower:]')"
+  [[ "${normalized}" == *local* || "${normalized}" == *fallback* ]]
+}
+
 validate_evidence_file() {
   local evidence_file="$1"
 
@@ -148,11 +155,18 @@ validate_evidence_file() {
       return 1
     fi
 
-    if [[ "${declared_is_heavy}" == "true" && "${declared_used_rch}" == "false" ]]; then
-      [[ -n "${fallback_reason}" && -n "${fallback_approved}" ]] || {
-        echo "run[$i] heavy local fallback requires fallback_reason_code and fallback_approved_by" >&2
-        return 1
-      }
+    if [[ "${declared_is_heavy}" == "true" ]]; then
+      local heavy_execution_context_is_local="false"
+      if worker_context_is_local "${worker_context}"; then
+        heavy_execution_context_is_local="true"
+      fi
+
+      if [[ "${declared_used_rch}" == "false" || "${heavy_execution_context_is_local}" == "true" ]]; then
+        [[ -n "${fallback_reason}" && -n "${fallback_approved}" ]] || {
+          echo "run[$i] heavy run requires fallback_reason_code and fallback_approved_by when executed without remote rch confirmation" >&2
+          return 1
+        }
+      fi
     fi
   done
 
@@ -220,7 +234,42 @@ run_self_test() {
 JSON
 
   validate_evidence_file "${tmp_evidence}" >/dev/null
-  rm -f "${tmp_evidence}"
+
+  local tmp_fail_open tmp_fail_open_recovered
+  tmp_fail_open="$(mktemp)"
+  tmp_fail_open_recovered="$(mktemp)"
+
+  cat > "${tmp_fail_open}" <<'JSON'
+{
+  "schema_version": 1,
+  "bead_id": "ft-e34d9.10.1.4",
+  "policy_version": "1.0.0",
+  "runs": [
+    {
+      "timestamp": "2026-02-25T00:02:00Z",
+      "command": "rch exec -- cargo check --workspace --all-targets",
+      "is_heavy": true,
+      "used_rch": true,
+      "worker_context": "local_fallback",
+      "artifact_paths": ["tests/e2e/logs/mock.jsonl"],
+      "elapsed_seconds": 4.2,
+      "exit_status": 0,
+      "residual_risk_notes": ""
+    }
+  ]
+}
+JSON
+
+  if validate_evidence_file "${tmp_fail_open}" >/dev/null 2>&1; then
+    echo "self-test failed: heavy local execution after rch wrapper must require fallback metadata" >&2
+    rm -f "${tmp_evidence}" "${tmp_fail_open}" "${tmp_fail_open_recovered}"
+    return 1
+  fi
+
+  jq '.runs[0].fallback_reason_code = "RCH-LOCAL-FALLBACK" | .runs[0].fallback_approved_by = "human-operator"' "${tmp_fail_open}" > "${tmp_fail_open_recovered}"
+  validate_evidence_file "${tmp_fail_open_recovered}" >/dev/null
+
+  rm -f "${tmp_evidence}" "${tmp_fail_open}" "${tmp_fail_open_recovered}"
   echo "Self-test passed"
 }
 

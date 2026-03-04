@@ -135,6 +135,8 @@ the core platform being functional.
 | 8c | ft-3681t.8.5 | NTM decommission + docs | .8.4 | .8.6 |
 | 8d | ft-3681t.8.6 | Migration rehearsal/rollback drills | all above | (quality gate) |
 
+Cutover playbook artifact (living draft): `docs/ntm-cutover-playbook-ft-3681t.8.4.md`
+
 ### Track 5: Operator UX (Parallel with Track 3-4)
 
 **Goal**: Build the human-facing surfaces that make the system usable.
@@ -300,6 +302,10 @@ before the epic itself can be marked CLOSED.
 4. **RusticDeer**: Complete this execution plan (ft-3681t.1.4)
 5. **Draft early**: Start ft-3681t.8.1 (parity corpus) as a living document
    that grows alongside implementation
+   - Seed artifacts now tracked at:
+     - `docs/ntm-parity-corpus-ft-3681t.8.1.md`
+     - `fixtures/e2e/ntm_parity/corpus.v1.json`
+     - `fixtures/e2e/ntm_parity/acceptance_matrix.v1.json`
 
 ## 9. Program Metrics Dashboard
 

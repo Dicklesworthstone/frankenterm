@@ -1,4 +1,5 @@
 #![allow(clippy::ignored_unit_patterns)]
+#![cfg(feature = "agent-mail")]
 
 //! Property-based tests for the mission_agent_mail coordination kernel.
 //!

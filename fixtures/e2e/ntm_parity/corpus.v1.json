@@ -1,0 +1,174 @@
+{
+  "schema_version": "1.0",
+  "bead_id": "ft-3681t.8.1",
+  "title": "NTM parity corpus",
+  "updated_at": "2026-03-04",
+  "notes": "Drafted early per execution-plan guidance. Designed for machine-verifiable parity checks and shadow runs.",
+  "scenarios": [
+    {
+      "id": "NTM-PARITY-001",
+      "domain": "state_discovery",
+      "priority": "blocking",
+      "ntm_equivalent": "ntm state/list panes",
+      "ft_command": "ft robot --format json state",
+      "success_assertions": [
+        { "path": "$.ok", "op": "eq", "value": true },
+        { "path": "$.data.panes", "op": "is_array" }
+      ],
+      "failure_assertions": [],
+      "artifact_key": "state_snapshot"
+    },
+    {
+      "id": "NTM-PARITY-002",
+      "domain": "pane_read",
+      "priority": "blocking",
+      "ntm_equivalent": "ntm pane text/read",
+      "ft_command": "ft robot --format json get-text <pane_id> --tail 50",
+      "success_assertions": [
+        { "path": "$.ok", "op": "eq", "value": true },
+        { "path": "$.data", "op": "has_any", "value": ["text", "lines", "content"] }
+      ],
+      "failure_assertions": [
+        { "path": "$.error.code", "op": "eq", "value": "robot.pane_not_found" }
+      ],
+      "artifact_key": "pane_tail_capture"
+    },
+    {
+      "id": "NTM-PARITY-003",
+      "domain": "pane_send",
+      "priority": "blocking",
+      "ntm_equivalent": "ntm send input (dry-run)",
+      "ft_command": "ft robot --format json send <pane_id> \"echo parity\" --dry-run",
+      "success_assertions": [
+        { "path": "$.ok", "op": "eq", "value": true },
+        { "path": "$.data", "op": "has_any", "value": ["dry_run", "preview", "command"] }
+      ],
+      "failure_assertions": [
+        { "path": "$.error.code", "op": "eq", "value": "robot.policy_denied" }
+      ],
+      "artifact_key": "send_dry_run_envelope"
+    },
+    {
+      "id": "NTM-PARITY-004",
+      "domain": "wait_sync",
+      "priority": "blocking",
+      "ntm_equivalent": "ntm wait-for pattern",
+      "ft_command": "ft robot --format json wait-for <pane_id> \"Done\" --timeout-secs 60",
+      "success_assertions": [
+        { "path": "$.ok", "op": "eq", "value": true }
+      ],
+      "failure_assertions": [
+        { "path": "$.error.code", "op": "eq", "value": "robot.timeout" }
+      ],
+      "artifact_key": "wait_for_trace"
+    },
+    {
+      "id": "NTM-PARITY-005",
+      "domain": "search",
+      "priority": "blocking",
+      "ntm_equivalent": "ntm search captured output",
+      "ft_command": "ft robot --format json search \"error\" --limit 5",
+      "success_assertions": [
+        { "path": "$.ok", "op": "eq", "value": true },
+        { "path": "$.data", "op": "has_any", "value": ["matches", "results", "items"] }
+      ],
+      "failure_assertions": [],
+      "artifact_key": "search_results"
+    },
+    {
+      "id": "NTM-PARITY-006",
+      "domain": "events",
+      "priority": "blocking",
+      "ntm_equivalent": "ntm events stream/query",
+      "ft_command": "ft robot --format json events --unhandled --limit 10",
+      "success_assertions": [
+        { "path": "$.ok", "op": "eq", "value": true },
+        { "path": "$.data", "op": "has_any", "value": ["events", "items"] }
+      ],
+      "failure_assertions": [],
+      "artifact_key": "events_unhandled"
+    },
+    {
+      "id": "NTM-PARITY-007",
+      "domain": "rule_introspection",
+      "priority": "high",
+      "ntm_equivalent": "ntm pattern rule inspect",
+      "ft_command": "ft robot --format json rules list --verbose",
+      "success_assertions": [
+        { "path": "$.ok", "op": "eq", "value": true },
+        { "path": "$.data", "op": "has_any", "value": ["rules", "items"] }
+      ],
+      "failure_assertions": [],
+      "artifact_key": "rules_inventory"
+    },
+    {
+      "id": "NTM-PARITY-008",
+      "domain": "rule_validation",
+      "priority": "high",
+      "ntm_equivalent": "ntm rules test/lint workflow",
+      "ft_command": "ft robot --format json rules test \"Usage limit reached\"",
+      "success_assertions": [
+        { "path": "$.ok", "op": "eq", "value": true },
+        { "path": "$.data", "op": "has_any", "value": ["matches", "detections", "results"] }
+      ],
+      "failure_assertions": [],
+      "artifact_key": "rules_test_trace"
+    },
+    {
+      "id": "NTM-PARITY-009",
+      "domain": "session_snapshot",
+      "priority": "high",
+      "ntm_equivalent": "ntm session checkpoint",
+      "ft_command": "ft snapshot save -f json",
+      "success_assertions": [
+        { "path": "$.ok", "op": "eq", "value": true },
+        { "path": "$.data", "op": "has_any", "value": ["id", "snapshot_id"] }
+      ],
+      "failure_assertions": [],
+      "artifact_key": "snapshot_create"
+    },
+    {
+      "id": "NTM-PARITY-010",
+      "domain": "session_inventory",
+      "priority": "high",
+      "ntm_equivalent": "ntm session list/show",
+      "ft_command": "ft session list -f json",
+      "success_assertions": [
+        { "path": "$.ok", "op": "eq", "value": true },
+        { "path": "$.data", "op": "has_any", "value": ["sessions", "items"] }
+      ],
+      "failure_assertions": [],
+      "artifact_key": "session_list"
+    },
+    {
+      "id": "NTM-PARITY-011",
+      "domain": "policy_guard",
+      "priority": "blocking",
+      "ntm_equivalent": "ntm approval/policy deny envelope",
+      "ft_command": "ft robot --format json send <pane_id> \"dangerous command\"",
+      "success_assertions": [
+        { "path": "$.ok", "op": "eq", "value": true }
+      ],
+      "failure_assertions": [
+        {
+          "path": "$.error.code",
+          "op": "in",
+          "value": ["robot.policy_denied", "robot.require_approval"]
+        }
+      ],
+      "artifact_key": "policy_decision_trace"
+    },
+    {
+      "id": "NTM-PARITY-012",
+      "domain": "output_efficiency",
+      "priority": "high",
+      "ntm_equivalent": "machine-efficient output mode",
+      "ft_command": "ft robot --format toon --stats state",
+      "success_assertions": [
+        { "path": "$stderr", "op": "contains", "value": "tokens" }
+      ],
+      "failure_assertions": [],
+      "artifact_key": "toon_stats_capture"
+    }
+  ]
+}
