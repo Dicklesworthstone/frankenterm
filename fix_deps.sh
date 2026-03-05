@@ -6,7 +6,7 @@ br list --json | jq -r '.[] | "\(.id)|\(.title)"' > issues.tmp
 
 function get_id() {
     local title="$1"
-    grep "$title" issues.tmp | head -n 1 | cut -d'|' -f1
+    grep "$title" issues.tmp | head -n 1 | cut -d'|' -f1 || true
 }
 
 # Epic 1

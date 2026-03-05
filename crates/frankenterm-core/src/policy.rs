@@ -1705,21 +1705,20 @@ fn has_trauma_bypass_prefix(text: &str) -> bool {
         trimmed = stripped.trim_start();
     }
 
-    // If the assignment itself contains command substitution or chaining,
-    // it's a potential bypass attempt.
-    if trimmed.contains("$(") || trimmed.contains('`') || trimmed.contains(';') {
-        return true;
-    }
+    let mut found_bypass = false;
 
     while let Some(mat) = VAR_ASSIGN.find(trimmed) {
+        let assignment = &trimmed[..mat.end()];
+        if assignment.contains("FT_BYPASS_TRAUMA=1") 
+            || assignment.contains("FT_BYPASS_TRAUMA=\"1\"") 
+            || assignment.contains("FT_BYPASS_TRAUMA='1'") 
+        {
+            found_bypass = true;
+        }
         trimmed = &trimmed[mat.end()..];
     }
 
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    false
+    found_bypass
 }
 
 #[must_use]

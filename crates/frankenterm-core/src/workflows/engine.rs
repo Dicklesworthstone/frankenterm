@@ -299,7 +299,7 @@ pub(super) fn compute_next_step(step_logs: &[crate::storage::WorkflowStepLogReco
                 if let Some(data) = &log.result_data {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
                         if let Some(step) = json
-                            .pointer("/step_result/JumpTo/step")
+                            .get("step")
                             .and_then(|v| v.as_u64())
                         {
                             return step as usize;
@@ -948,11 +948,8 @@ mod tests {
     fn compute_next_step_jump_to() {
         let mut jump_log = make_step_log(2, "jump_to");
         jump_log.result_data = Some(serde_json::json!({
-            "step_result": {
-                "JumpTo": {
-                    "step": 5
-                }
-            }
+            "type": "jump_to",
+            "step": 5
         }).to_string());
         
         let logs = vec![

@@ -226,9 +226,15 @@ mod ossl;
 
 pub fn spawn_listener() -> anyhow::Result<()> {
     let config = configuration();
-    for unix_dom in &config.unix_domains {
-        // SAFETY: called during single-threaded startup of the listener.
+
+    // SAFETY: Setting environment variables must be done before any worker threads
+    // are spawned to avoid data races and undefined behavior. We set it to the first
+    // unix domain socket path, which will be inherited by any shell processes we spawn.
+    if let Some(unix_dom) = config.unix_domains.first() {
         unsafe { std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path()) };
+    }
+
+    for unix_dom in &config.unix_domains {
         let mut listener =
             frankenterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)?;
         thread::spawn(move || {

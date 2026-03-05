@@ -48,11 +48,11 @@ install_ft() {
     log_info "Installing ft (frankenterm)..."
 
     # Use cargo install from git
-    if cargo install --git "$REPO_URL" "$BINARY_NAME" --locked; then
+    if cargo install --git "$REPO_URL" frankenterm --bin "$BINARY_NAME" --locked; then
         log_success "ft installed successfully"
     else
         log_warn "Locked install failed, trying without --locked"
-        cargo install --git "$REPO_URL" "$BINARY_NAME"
+        cargo install --git "$REPO_URL" frankenterm --bin "$BINARY_NAME"
     fi
 }
 
