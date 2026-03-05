@@ -120,6 +120,10 @@ windows = { workspace = true, features = [
     "Win32_UI_Shell",
 ]}
 
+[dev-dependencies]
+benchmarking = "0.4.13"
+k9.workspace = true
+
 # NOTE: Workspace lints intentionally omitted - vendored GUI code carries
 # upstream style that does not conform to our pedantic clippy profile.
 # Linting will be incrementally enabled as the code is FrankenTerm-ified.

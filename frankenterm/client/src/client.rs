@@ -1031,7 +1031,7 @@ impl Reconnectable {
                         remote_address, remote_host_name,
                     )
                 })?,
-        ))?);
+                ))?);
         ui.output_str("TLS Connected!\n");
         Ok(stream)
     }

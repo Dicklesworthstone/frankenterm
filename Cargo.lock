@@ -629,6 +629,12 @@ name = "base91"
 version = "0.1.0"
 
 [[package]]
+name = "benchmarking"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c335a9de639ba6a3e4107fe7763c9dcd4eb9422575f1191c2b8f2009f03fe4a"
+
+[[package]]
 name = "bincode-next"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3330,6 +3336,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "benchmarking",
  "bitflags 1.3.2",
  "bytemuck",
  "chrono",
@@ -3358,6 +3365,7 @@ dependencies = [
  "hdrhistogram",
  "http_req",
  "image",
+ "k9",
  "lazy_static",
  "lfucache",
  "libc",

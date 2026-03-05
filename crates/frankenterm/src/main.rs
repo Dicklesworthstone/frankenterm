@@ -6037,6 +6037,19 @@ async fn authorize_read_or_search_policy(
     (engine.authorize(&input), domain)
 }
 
+fn workflow_run_policy_input(
+    pane_id: u64,
+    workflow_name: &str,
+) -> frankenterm_core::policy::PolicyInput {
+    frankenterm_core::policy::PolicyInput::new(
+        frankenterm_core::policy::ActionKind::WorkflowRun,
+        frankenterm_core::policy::ActorKind::Human,
+    )
+    .with_surface(frankenterm_core::policy::PolicySurface::Workflow)
+    .with_pane(pane_id)
+    .with_workflow(workflow_name)
+}
+
 fn search_lints_have_errors(lints: &[frankenterm_core::storage::SearchLint]) -> bool {
     lints
         .iter()
@@ -21867,13 +21880,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     .with_command_gate_config(config.safety.command_gate.clone())
                     .with_policy_rules(config.safety.rules.clone());
 
-                    let input = frankenterm_core::policy::PolicyInput::new(
-                        frankenterm_core::policy::ActionKind::WorkflowRun,
-                        frankenterm_core::policy::ActorKind::Human,
-                    )
-                    .with_surface(frankenterm_core::policy::PolicySurface::Workflow)
-                    .with_pane(pane_id)
-                    .with_workflow(&name);
+                    let input = workflow_run_policy_input(pane_id, &name);
 
                     let decision = engine.authorize(&input);
                     let (decision, approval_request) = if decision.requires_approval() {
@@ -22414,13 +22421,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     .with_command_gate_config(config.safety.command_gate.clone())
                     .with_policy_rules(config.safety.rules.clone());
 
-                    let input = frankenterm_core::policy::PolicyInput::new(
-                        frankenterm_core::policy::ActionKind::WorkflowRun,
-                        frankenterm_core::policy::ActorKind::Human,
-                    )
-                    .with_surface(frankenterm_core::policy::PolicySurface::Workflow)
-                    .with_pane(pane_id)
-                    .with_workflow(&workflow_name);
+                    let input = workflow_run_policy_input(pane_id, &workflow_name);
 
                     let mut decision = engine.authorize(&input);
                     if decision.requires_approval() {
@@ -43130,6 +43131,22 @@ log_level = "debug"
             context.surface,
             frankenterm_core::policy::PolicySurface::Mux
         );
+    }
+
+    #[test]
+    fn workflow_run_policy_input_uses_workflow_surface_contract() {
+        let input = workflow_run_policy_input(42, "handle_usage_limits");
+        assert_eq!(
+            input.action,
+            frankenterm_core::policy::ActionKind::WorkflowRun
+        );
+        assert_eq!(input.actor, frankenterm_core::policy::ActorKind::Human);
+        assert_eq!(
+            input.surface,
+            frankenterm_core::policy::PolicySurface::Workflow
+        );
+        assert_eq!(input.pane_id, Some(42));
+        assert_eq!(input.workflow_id.as_deref(), Some("handle_usage_limits"));
     }
 
     #[test]

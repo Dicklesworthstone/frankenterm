@@ -6,9 +6,11 @@ use std::time::Duration;
 use crate::config as wa_config;
 #[cfg(feature = "asupersync-runtime")]
 use crate::cx::{self, Cx};
+#[cfg(test)]
+use crate::runtime_compat::mpsc_reserve_send;
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
 use crate::runtime_compat::{
-    mpsc, mpsc_recv_option, mpsc_reserve_send, mpsc_try_reserve_send, task, timeout, watch,
+    mpsc, mpsc_recv_option, mpsc_try_reserve_send, task, timeout, watch,
     watch_borrow_and_update_clone, watch_changed,
 };
 use codec::{
@@ -962,6 +964,7 @@ async fn pane_delta_recv(rx: &mut mpsc::Receiver<PaneDelta>) -> Option<PaneDelta
     mpsc_recv_option(rx).await
 }
 
+#[cfg(test)]
 async fn pane_delta_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) {
     let _ = mpsc_reserve_send(tx, delta).await;
 }
