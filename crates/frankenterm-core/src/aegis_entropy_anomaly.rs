@@ -215,7 +215,11 @@ impl EProcess {
         } else {
             self.collapse_streak = 0;
             // Decay toward 1.0 when entropy is normal
-            self.e_value *= self.decay;
+            if self.e_value > 1.0 {
+                self.e_value = (1.0 + (self.e_value - 1.0) * self.decay).max(1.0);
+            } else if self.e_value < 1.0 {
+                self.e_value = (1.0 - (1.0 - self.e_value) * self.decay).min(1.0);
+            }
         }
 
         // Clamp to prevent overflow/underflow
@@ -689,8 +693,8 @@ mod tests {
         for _ in 0..10 {
             ep.update(5.0, false, 5.0, 1.0, 1.0, 0.5, 3);
         }
-        // E-value should decay below 1.0
-        assert!(ep.e_value() < 1.0);
+        // E-value should stay at 1.0, not drop below
+        assert!((ep.e_value() - 1.0).abs() < 1e-10);
         assert_eq!(ep.n_observations(), 10);
         assert!(!ep.is_rejected());
     }

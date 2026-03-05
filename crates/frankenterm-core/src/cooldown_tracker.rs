@@ -55,11 +55,11 @@ impl CooldownEntry {
     }
 
     fn is_expired(&self, now: Instant) -> bool {
-        now.duration_since(self.last_seen) >= self.cooldown
+        now.saturating_duration_since(self.last_seen) >= self.cooldown
     }
 
     fn remaining(&self, now: Instant) -> Duration {
-        let elapsed = now.duration_since(self.last_seen);
+        let elapsed = now.saturating_duration_since(self.last_seen);
         self.cooldown.saturating_sub(elapsed)
     }
 }

@@ -298,6 +298,9 @@ pub struct OrSet<T: Ord + Clone + Hash> {
     seq: u64,
     /// Map from element → set of (replica_id, seq) tags
     entries: BTreeMap<T, BTreeSet<(ReplicaId, u64)>>,
+    /// Tombstones for removed tags
+    #[serde(default)]
+    tombstones: BTreeSet<(ReplicaId, u64)>,
 }
 
 impl<T: Ord + Clone + Hash> OrSet<T> {
@@ -308,6 +311,7 @@ impl<T: Ord + Clone + Hash> OrSet<T> {
             replica_id: replica_id.into(),
             seq: 0,
             entries: BTreeMap::new(),
+            tombstones: BTreeSet::new(),
         }
     }
 
@@ -318,23 +322,30 @@ impl<T: Ord + Clone + Hash> OrSet<T> {
         self.entries.entry(item).or_default().insert(tag);
     }
 
-    /// Remove an element by removing all currently-observed tags.
+    /// Remove an element by moving all currently-observed tags to tombstones.
     pub fn remove(&mut self, item: &T) {
-        self.entries.remove(item);
+        if let Some(tags) = self.entries.get_mut(item) {
+            for tag in tags.iter() {
+                self.tombstones.insert(tag.clone());
+            }
+            tags.clear();
+        }
     }
 
-    /// Check if element is in the set (has at least one tag).
+    /// Check if element is in the set (has at least one tag not in tombstones).
     #[must_use]
     pub fn contains(&self, item: &T) -> bool {
-        self.entries.get(item).is_some_and(|tags| !tags.is_empty())
+        self.entries.get(item).is_some_and(|tags| {
+            tags.iter().any(|tag| !self.tombstones.contains(tag))
+        })
     }
 
     /// Number of distinct elements.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries
-            .iter()
-            .filter(|(_, tags)| !tags.is_empty())
+            .values()
+            .filter(|tags| tags.iter().any(|tag| !self.tombstones.contains(tag)))
             .count()
     }
 
@@ -349,21 +360,30 @@ impl<T: Ord + Clone + Hash> OrSet<T> {
     pub fn elements(&self) -> Vec<&T> {
         self.entries
             .iter()
-            .filter(|(_, tags)| !tags.is_empty())
+            .filter(|(_, tags)| tags.iter().any(|tag| !self.tombstones.contains(tag)))
             .map(|(k, _)| k)
             .collect()
     }
 
     /// Merge another OR-Set. Add-wins: tags from both sides are unioned.
-    /// Only tags that were explicitly removed on one side (and not re-added)
-    /// disappear.
+    /// Only tags that were explicitly removed on either side disappear.
     pub fn merge(&mut self, other: &OrSet<T>) {
+        for tag in &other.tombstones {
+            self.tombstones.insert(tag.clone());
+        }
+
         for (item, other_tags) in &other.entries {
             let local_tags = self.entries.entry(item.clone()).or_default();
             for tag in other_tags {
                 local_tags.insert(tag.clone());
             }
         }
+        
+        // Remove tombstoned tags from entries to keep maps small
+        for tags in self.entries.values_mut() {
+            tags.retain(|tag| !self.tombstones.contains(tag));
+        }
+
         // Update our seq to be at least as high as any observed
         for tags in self.entries.values() {
             for (rid, s) in tags {

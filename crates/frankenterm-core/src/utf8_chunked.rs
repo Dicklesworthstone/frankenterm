@@ -159,27 +159,7 @@ impl Utf8ChunkedValidator {
         // Find the longest valid UTF-8 prefix
         match std::str::from_utf8(remaining) {
             Ok(_) => {
-                // Check if there's a trailing incomplete code point
-                let trailing = trailing_incomplete_len(remaining);
-                let valid_end = remaining.len() - trailing;
-
-                if trailing > 0 {
-                    // Buffer the trailing partial
-                    self.pending[..trailing].copy_from_slice(&remaining[valid_end..]);
-                    self.pending_len = trailing as u8;
-                    self.expected_len = utf8_char_width(remaining[valid_end]);
-
-                    // The entire chunk validated, but we're buffering the end
-                    // Actually if from_utf8 succeeded, there's no incomplete sequence —
-                    // the whole thing is valid. So trailing should be 0.
-                    // from_utf8 only succeeds on complete UTF-8. So this branch
-                    // means everything is valid.
-                    total_valid += remaining.len();
-                    self.pending_len = 0;
-                    self.expected_len = 0;
-                } else {
-                    total_valid += remaining.len();
-                }
+                total_valid += remaining.len();
             }
             Err(e) => {
                 // Valid prefix up to the error
@@ -324,17 +304,6 @@ fn utf8_char_width(lead: u8) -> u8 {
         0xF0..=0xF4 => 4,
         _ => 1, // invalid lead byte — treat as 1
     }
-}
-
-/// Count trailing bytes that form an incomplete UTF-8 code point.
-///
-/// Scans backwards from the end of a valid UTF-8 slice. Since `from_utf8`
-/// succeeded, any trailing bytes that look like a lead+continuations are
-/// actually complete. This function returns 0 for valid UTF-8.
-#[inline]
-fn trailing_incomplete_len(_bytes: &[u8]) -> usize {
-    // If from_utf8 succeeded, there are no incomplete sequences.
-    0
 }
 
 /// Validate a complete byte buffer as UTF-8, returning the valid prefix length.

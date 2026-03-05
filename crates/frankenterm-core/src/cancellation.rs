@@ -302,6 +302,7 @@ impl CancellationToken {
     #[must_use]
     pub fn child(&self, child_scope_id: ScopeId) -> Self {
         let child = CancellationToken::new(child_scope_id);
+        let mut children = self.inner.children.lock().expect("lock not poisoned");
         // If parent is already cancelled, cancel child immediately
         if self.is_cancelled() {
             let reason = self.reason().map(|_| ShutdownReason::ParentShutdown {
@@ -312,7 +313,6 @@ impl CancellationToken {
                 *child.inner.reason.lock().expect("lock not poisoned") = Some(r);
             }
         }
-        let mut children = self.inner.children.lock().expect("lock not poisoned");
         children.push(Arc::clone(&child.inner));
         child
     }
@@ -333,24 +333,11 @@ impl CancellationToken {
 
     /// Propagate cancellation to all registered children.
     fn propagate_to_children(&self) {
-        let children = self.inner.children.lock().expect("lock not poisoned");
+        let children = {
+            self.inner.children.lock().expect("lock not poisoned").clone()
+        };
         for child in children.iter() {
-            if child
-                .cancelled
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                *child.reason.lock().expect("lock not poisoned") =
-                    Some(ShutdownReason::ParentShutdown {
-                        parent_id: self.inner.scope_id.clone(),
-                    });
-                child.generation.fetch_add(1, Ordering::Relaxed);
-                // Recursively propagate
-                let grandchildren = child.children.lock().expect("lock not poisoned");
-                for gc in grandchildren.iter() {
-                    Self::propagate_inner(gc, &child.scope_id);
-                }
-            }
+            Self::propagate_inner(child, &self.inner.scope_id);
         }
     }
 
@@ -365,7 +352,9 @@ impl CancellationToken {
                     parent_id: parent_id.clone(),
                 });
             inner.generation.fetch_add(1, Ordering::Relaxed);
-            let children = inner.children.lock().expect("lock not poisoned");
+            let children = {
+                inner.children.lock().expect("lock not poisoned").clone()
+            };
             for child in children.iter() {
                 Self::propagate_inner(child, &inner.scope_id);
             }
