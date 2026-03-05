@@ -970,6 +970,20 @@ fn pane_delta_try_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) -> bool {
     mpsc_try_reserve_send(tx, delta)
 }
 
+fn pane_delta_try_emit_ended(
+    tx: &mpsc::Sender<PaneDelta>,
+    pane_id: u64,
+    reason: impl Into<String>,
+) {
+    let _ = pane_delta_try_send(
+        tx,
+        PaneDelta::Ended {
+            pane_id,
+            reason: reason.into(),
+        },
+    );
+}
+
 #[allow(clippy::needless_pass_by_ref_mut)] // mut needed for tokio borrow_and_update path
 fn cancel_requested(cancel_rx: &mut watch::Receiver<bool>) -> bool {
     watch_borrow_and_update_clone(cancel_rx)
@@ -1027,14 +1041,7 @@ pub fn subscribe_pane_output(
         loop {
             // Check cancellation
             if cancel_requested(&mut cancel_rx) {
-                pane_delta_send(
-                    &tx,
-                    PaneDelta::Ended {
-                        pane_id,
-                        reason: "cancelled".to_string(),
-                    },
-                )
-                .await;
+                pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
                 break;
             }
 
@@ -1049,7 +1056,8 @@ pub fn subscribe_pane_output(
                     // Detect gaps in seqno
                     if let Some(prev) = last_seqno {
                         if seqno > prev + 1 {
-                            pane_delta_send(
+                            // Never block the poller on telemetry-only gap signals.
+                            let _ = pane_delta_try_send(
                                 &tx,
                                 PaneDelta::Gap {
                                     pane_id,
@@ -1060,8 +1068,7 @@ pub fn subscribe_pane_output(
                                         seqno - prev - 1
                                     ),
                                 },
-                            )
-                            .await;
+                            );
                         }
                     }
                     last_seqno = Some(seqno);
@@ -1094,14 +1101,7 @@ pub fn subscribe_pane_output(
                     has_dirty
                 }
                 Err(DirectMuxError::Disconnected) => {
-                    pane_delta_send(
-                        &tx,
-                        PaneDelta::Ended {
-                            pane_id,
-                            reason: "mux socket disconnected".to_string(),
-                        },
-                    )
-                    .await;
+                    pane_delta_try_emit_ended(&tx, pane_id, "mux socket disconnected");
                     break;
                 }
                 Err(DirectMuxError::ReadTimeout) => {
@@ -1110,14 +1110,7 @@ pub fn subscribe_pane_output(
                     false
                 }
                 Err(err) => {
-                    pane_delta_send(
-                        &tx,
-                        PaneDelta::Ended {
-                            pane_id,
-                            reason: format!("subscription error: {err}"),
-                        },
-                    )
-                    .await;
+                    pane_delta_try_emit_ended(&tx, pane_id, format!("subscription error: {err}"));
                     break;
                 }
             };
@@ -1128,14 +1121,7 @@ pub fn subscribe_pane_output(
                 timeout(wait_interval, wait_for_cancel_change(&mut cancel_rx)).await
             {
                 if !changed_ok || cancel_requested(&mut cancel_rx) {
-                    pane_delta_send(
-                        &tx,
-                        PaneDelta::Ended {
-                            pane_id,
-                            reason: "cancelled".to_string(),
-                        },
-                    )
-                    .await;
+                    pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
                     break;
                 }
             }
@@ -1181,6 +1167,7 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const COMPRESSED_MASK: u64 = 1 << 63;
 
@@ -3446,6 +3433,172 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_subscriptions_do_not_cross_talk() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("subscription-no-crosstalk.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+            let observed_panes = Arc::new(Mutex::new(HashSet::new()));
+
+            task::spawn({
+                let observed_panes = Arc::clone(&observed_panes);
+                async move {
+                    for _ in 0..2 {
+                        let (mut stream, _) = listener.accept().await.expect("accept");
+                        let observed_panes = Arc::clone(&observed_panes);
+                        task::spawn(async move {
+                            let mut read_buf = Vec::new();
+                            let mut emitted_output = false;
+
+                            loop {
+                                let mut temp = vec![0u8; 4096];
+                                let read = match unix_stream_read(&mut stream, &mut temp).await {
+                                    Ok(0) => break,
+                                    Ok(n) => n,
+                                    Err(_) => break,
+                                };
+                                read_buf.extend_from_slice(&temp[..read]);
+                                while let Ok(Some(decoded)) =
+                                    codec::Pdu::stream_decode(&mut read_buf)
+                                {
+                                    let response = match decoded.pdu {
+                                        Pdu::GetCodecVersion(_) => {
+                                            Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                                codec_vers: CODEC_VERSION,
+                                                version_string: "test".to_string(),
+                                                executable_path: PathBuf::from("/bin/wezterm"),
+                                                config_file_path: None,
+                                            })
+                                        }
+                                        Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                                        Pdu::GetPaneRenderChanges(request) => {
+                                            let pane_id = request.pane_id as u64;
+                                            {
+                                                let mut seen = observed_panes.lock().await;
+                                                seen.insert(pane_id);
+                                            }
+                                            let dirty_lines = if emitted_output {
+                                                Vec::new()
+                                            } else {
+                                                emitted_output = true;
+                                                match pane_id {
+                                                    21 => vec![0isize..1isize],
+                                                    22 => vec![0isize..1isize, 2isize..4isize],
+                                                    _ => Vec::new(),
+                                                }
+                                            };
+
+                                            Pdu::GetPaneRenderChangesResponse(
+                                                GetPaneRenderChangesResponse {
+                                                    pane_id: request.pane_id,
+                                                    mouse_grabbed: false,
+                                                    cursor_position:
+                                                        mux::renderable::StableCursorPosition::default(),
+                                                    dimensions: mux::renderable::RenderableDimensions {
+                                                        cols: 80,
+                                                        viewport_rows: 24,
+                                                        scrollback_rows: 0,
+                                                        physical_top: 0,
+                                                        scrollback_top: 0,
+                                                        dpi: 96,
+                                                        pixel_width: 0,
+                                                        pixel_height: 0,
+                                                        reverse_video: false,
+                                                    },
+                                                    dirty_lines,
+                                                    title: format!("pane-{pane_id}"),
+                                                    working_dir: None,
+                                                    bonus_lines: Vec::new().into(),
+                                                    input_serial: None,
+                                                    seqno: 1,
+                                                },
+                                            )
+                                        }
+                                        _ => continue,
+                                    };
+                                    let mut out = Vec::new();
+                                    response.encode(&mut out, decoded.serial).expect("encode");
+                                    stream.write_all(&out).await.expect("write");
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+
+            let config = SubscriptionConfig {
+                poll_interval: Duration::from_millis(10),
+                min_poll_interval: Duration::from_millis(5),
+                channel_capacity: 8,
+            };
+
+            let client_a = DirectMuxClient::connect(
+                DirectMuxClientConfig::default().with_socket_path(socket_path.clone()),
+            )
+            .await
+            .expect("connect client_a");
+            let client_b = DirectMuxClient::connect(
+                DirectMuxClientConfig::default().with_socket_path(socket_path),
+            )
+            .await
+            .expect("connect client_b");
+
+            let mut sub_a = subscribe_pane_output(client_a, 21, config.clone());
+            let mut sub_b = subscribe_pane_output(client_b, 22, config);
+
+            let mut a_counts: Option<(usize, usize)> = None;
+            let mut b_counts: Option<(usize, usize)> = None;
+
+            for _ in 0..30 {
+                if a_counts.is_none() {
+                    match timeout(Duration::from_millis(200), sub_a.next()).await {
+                        Ok(Some(PaneDelta::Output {
+                            pane_id,
+                            dirty_range_count,
+                            dirty_row_count,
+                            ..
+                        })) => {
+                            assert_eq!(pane_id, 21, "subscription A should only receive pane 21");
+                            a_counts = Some((dirty_range_count, dirty_row_count));
+                        }
+                        Ok(Some(_)) | Ok(None) | Err(_) => {}
+                    }
+                }
+                if b_counts.is_none() {
+                    match timeout(Duration::from_millis(200), sub_b.next()).await {
+                        Ok(Some(PaneDelta::Output {
+                            pane_id,
+                            dirty_range_count,
+                            dirty_row_count,
+                            ..
+                        })) => {
+                            assert_eq!(pane_id, 22, "subscription B should only receive pane 22");
+                            b_counts = Some((dirty_range_count, dirty_row_count));
+                        }
+                        Ok(Some(_)) | Ok(None) | Err(_) => {}
+                    }
+                }
+                if a_counts.is_some() && b_counts.is_some() {
+                    break;
+                }
+            }
+
+            sub_a.cancel();
+            sub_b.cancel();
+
+            let a_counts = a_counts.expect("subscription A output");
+            let b_counts = b_counts.expect("subscription B output");
+            assert_eq!(a_counts, (1, 1));
+            assert_eq!(b_counts, (2, 3));
+
+            let seen = observed_panes.lock().await;
+            assert!(seen.contains(&21), "server should observe pane 21 requests");
+            assert!(seen.contains(&22), "server should observe pane 22 requests");
+            assert_eq!(seen.len(), 2, "server should observe only requested panes");
+        });
+    }
+
+    #[test]
     fn subscription_emits_gap_when_seqno_jumps() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -3667,6 +3820,242 @@ mod tests {
                 saw_disconnect_end,
                 "expected Ended event with disconnect reason"
             );
+        });
+    }
+
+    #[test]
+    fn subscription_cancel_closes_connection_when_channel_full() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("cancel-full-channel.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+
+            let render_request_count = Arc::new(AtomicUsize::new(0));
+            let server_request_count = Arc::clone(&render_request_count);
+            let (closed_tx, closed_rx) = crate::runtime_compat::oneshot::channel::<()>();
+
+            task::spawn(async move {
+                let mut closed_tx = Some(closed_tx);
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) => {
+                            if let Some(tx) = closed_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            break;
+                        }
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(_) => {
+                                let seqno = server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: 13,
+                                    mouse_grabbed: false,
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    dirty_lines: vec![0isize..1isize],
+                                    title: "cancel-full-channel".to_string(),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno,
+                                })
+                            }
+                            _ => continue,
+                        };
+                        let mut out = Vec::new();
+                        response.encode(&mut out, decoded.serial).expect("encode");
+                        if stream.write_all(&out).await.is_err() {
+                            if let Some(tx) = closed_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let client = DirectMuxClient::connect(config).await.expect("connect");
+            let sub = subscribe_pane_output(
+                client,
+                13,
+                SubscriptionConfig {
+                    poll_interval: Duration::from_millis(5),
+                    min_poll_interval: Duration::from_millis(5),
+                    channel_capacity: 1,
+                },
+            );
+
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if render_request_count.load(Ordering::SeqCst) >= 2 {
+                        break;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("subscription should issue at least two render requests");
+
+            // Cancel without draining the receiver. Cancellation must still terminate promptly.
+            sub.cancel();
+
+            let closed = timeout(Duration::from_millis(500), closed_rx)
+                .await
+                .expect("server should observe connection close after cancellation");
+            closed.expect("server close signal should complete");
+        });
+    }
+
+    #[test]
+    fn subscription_cancel_closes_connection_when_seq_gap_emit_is_backpressured() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("cancel-gap-backpressure.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+
+            let render_request_count = Arc::new(AtomicUsize::new(0));
+            let server_request_count = Arc::clone(&render_request_count);
+            let (closed_tx, closed_rx) = crate::runtime_compat::oneshot::channel::<()>();
+
+            task::spawn(async move {
+                let mut closed_tx = Some(closed_tx);
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) => {
+                            if let Some(tx) = closed_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            break;
+                        }
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(_) => {
+                                let request_number =
+                                    server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                                let (seqno, dirty_lines) = if request_number == 1 {
+                                    (1, vec![0isize..1isize])
+                                } else {
+                                    // Force a seqno jump with no dirty output. This drives
+                                    // the poller through the gap-emission path while the
+                                    // bounded channel is already full.
+                                    (3, Vec::new())
+                                };
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: 13,
+                                    mouse_grabbed: false,
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    dirty_lines,
+                                    title: "cancel-gap-backpressure".to_string(),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno,
+                                })
+                            }
+                            _ => continue,
+                        };
+                        let mut out = Vec::new();
+                        response.encode(&mut out, decoded.serial).expect("encode");
+                        if stream.write_all(&out).await.is_err() {
+                            if let Some(tx) = closed_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let client = DirectMuxClient::connect(config).await.expect("connect");
+            let sub = subscribe_pane_output(
+                client,
+                13,
+                SubscriptionConfig {
+                    poll_interval: Duration::from_millis(5),
+                    min_poll_interval: Duration::from_millis(5),
+                    channel_capacity: 1,
+                },
+            );
+
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if render_request_count.load(Ordering::SeqCst) >= 2 {
+                        break;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("subscription should issue at least two render requests");
+
+            // Cancel without draining the receiver. Gap emission under backpressure
+            // must not block cancellation/connection teardown.
+            sub.cancel();
+
+            let closed = timeout(Duration::from_millis(500), closed_rx)
+                .await
+                .expect("server should observe connection close after cancellation");
+            closed.expect("server close signal should complete");
         });
     }
 
