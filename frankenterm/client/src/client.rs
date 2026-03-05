@@ -45,7 +45,7 @@ struct ChannelSendError;
 
 enum ReaderMessage {
     SendPdu {
-        pdu: Pdu,
+        pdu: Box<Pdu>,
         promise: Sender<anyhow::Result<Pdu>>,
     },
     Readable,
@@ -828,7 +828,7 @@ impl Reconnectable {
         // we can connect using those same credentials and avoid running through
         // the SSH authentication flow.
         if let Some(Ok(_)) = tls_client.ssh_parameters() {
-            match self.try_connect(&tls_client, ui, &remote_address, remote_host_name) {
+            match self.try_connect(&tls_client, ui, remote_address, remote_host_name) {
                 Ok(stream) => {
                     self.stream.replace(stream);
                     return Ok(());
@@ -934,7 +934,7 @@ impl Reconnectable {
 
         let cloned_ui = ui.clone();
         let stream = cloned_ui.run_and_log_error({
-            || self.try_connect(&tls_client, ui, &remote_address, remote_host_name)
+            || self.try_connect(&tls_client, ui, remote_address, remote_host_name)
         })?;
         self.stream.replace(stream);
         Ok(())
@@ -963,7 +963,7 @@ impl Reconnectable {
 
         if let Some(chain_file) = tls_client.pem_ca.as_ref() {
             connector
-                .set_certificate_chain_file(&chain_file)
+                .set_certificate_chain_file(chain_file)
                 .context(format!(
                     "set_certificate_chain_file to {} for TLS client",
                     chain_file.display()
@@ -1304,7 +1304,7 @@ impl Client {
     pub async fn send_pdu(&self, pdu: Pdu) -> anyhow::Result<Pdu> {
         let (promise, rx) = bounded(1);
         self.sender
-            .send(ReaderMessage::SendPdu { pdu, promise })
+            .send(ReaderMessage::SendPdu { pdu: Box::new(pdu), promise })
             .await
             .map_err(|_| ChannelSendError)
             .context("send_pdu send")?;
@@ -1320,7 +1320,7 @@ impl Client {
                 } else {
                     let mut clients = self.list_clients().await?.clients;
                     clients.retain(|client| client.focused_pane_id.is_some());
-                    clients.sort_by(|a, b| b.last_input.cmp(&a.last_input));
+                    clients.sort_by_key(|b| std::cmp::Reverse(b.last_input));
                     if clients.is_empty() {
                         anyhow::bail!(
                             "--pane-id was not specified and $WEZTERM_PANE

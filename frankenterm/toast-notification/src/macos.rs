@@ -114,8 +114,9 @@ static BUNDLE_CHECK: LazyLock<bool> = LazyLock::new(|| {
     valid
 });
 
-const CENTER: LazyLock<Retained<UNUserNotificationCenter>> =
-    LazyLock::new(|| UNUserNotificationCenter::currentNotificationCenter());
+fn get_center() -> Retained<UNUserNotificationCenter> {
+    unsafe { UNUserNotificationCenter::currentNotificationCenter() }
+}
 
 pub fn initialize() {
     if !*BUNDLE_CHECK {
@@ -123,7 +124,7 @@ pub fn initialize() {
     }
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        let center = CENTER;
+        let center = get_center();
         center.requestAuthorizationWithOptions_completionHandler(
             UNAuthorizationOptions::Alert
                 | UNAuthorizationOptions::Provisional
@@ -178,7 +179,7 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
         return Ok(());
     }
     initialize();
-    let center = CENTER;
+    let center = get_center();
     unsafe {
         log::debug!("show_notif center.delegate is {:?}", center.delegate());
 
@@ -204,7 +205,7 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
         );
 
         center.addNotificationRequest_withCompletionHandler(
-            &*request,
+            &request,
             Some(&RcBlock::new(move |err: *mut NSError| {
                 if err.is_null() {
                     if let Some(timeout) = toast.timeout {
@@ -214,7 +215,7 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
                             // Remove this notification
                             let ident_array =
                                 NSArray::from_retained_slice(&[NSString::from_str(&identifier)]);
-                            let c = CENTER;
+                            let c = get_center();
                             c.removeDeliveredNotificationsWithIdentifiers(&ident_array);
                         });
                     }

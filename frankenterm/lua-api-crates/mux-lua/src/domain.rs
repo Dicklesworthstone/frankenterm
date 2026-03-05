@@ -7,7 +7,7 @@ use std::sync::Arc;
 pub struct MuxDomain(pub DomainId);
 
 impl MuxDomain {
-    pub fn resolve<'a>(&self, mux: &'a Arc<Mux>) -> mlua::Result<Arc<dyn Domain>> {
+    pub fn resolve(&self, mux: &Arc<Mux>) -> mlua::Result<Arc<dyn Domain>> {
         mux.get_domain(self.0)
             .ok_or_else(|| mlua::Error::external(format!("domain id {} not found in mux", self.0)))
     }

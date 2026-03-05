@@ -14,7 +14,7 @@ use wezterm_term::{SemanticZone, StableRowIndex};
 pub struct MuxPane(pub PaneId);
 
 impl MuxPane {
-    pub fn resolve<'a>(&self, mux: &'a Arc<Mux>) -> mlua::Result<Arc<dyn Pane>> {
+    pub fn resolve(&self, mux: &Arc<Mux>) -> mlua::Result<Arc<dyn Pane>> {
         mux.get_pane(self.0)
             .ok_or_else(|| mlua::Error::external(format!("pane id {} not found in mux", self.0)))
     }
@@ -42,10 +42,10 @@ impl MuxPane {
                 0..zone.end_x.saturating_add(1)
             } else if row == zone.start_y {
                 // first line of multi-line
-                zone.start_x..usize::max_value()
+                zone.start_x..usize::MAX
             } else {
                 // some "middle" line of multi-line
-                0..usize::max_value()
+                0..usize::MAX
             }
         }
 

@@ -7,7 +7,7 @@ use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::cmp::Eq;
 use std::fmt::Debug;
-use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::rc::Rc;
 
 struct Entry<K, V> {
@@ -116,13 +116,15 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
     }
 
     fn bucket_for_key<Q: Hash>(&self, k: &Q) -> usize {
-        let mut hasher = self.hasher.build_hasher();
-        k.hash(&mut hasher);
-        (hasher.finish() as usize) % self.buckets.len()
+        (self.hasher.hash_one(k) as usize) % self.buckets.len()
     }
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     /// Grow the hash buckets in the pursuit of reducing potential
@@ -182,7 +184,7 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
                     .unwrap();
                 {
                     let mut freq = entry.freq.borrow_mut();
-                    *freq = *freq / delta;
+                    *freq /= delta;
                 }
                 self.frequency_index.insert(lfu_entry);
             }
@@ -222,10 +224,10 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         self.len = 0;
     }
 
-    pub fn get<'a, Q: ?Sized + Debug>(&'a mut self, k: &Q) -> Option<&'a V>
+    pub fn get<'a, Q>(&'a mut self, k: &Q) -> Option<&'a V>
     where
         K: Borrow<Q>,
-        Q: Hash + Eq,
+        Q: ?Sized + Debug + Hash + Eq,
     {
         let bucket = self.bucket_for_key(&k);
         let mut cursor = self.buckets.get_mut(bucket)?.front_mut();
