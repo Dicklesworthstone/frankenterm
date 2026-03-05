@@ -208,6 +208,44 @@ fn compute_compatibility_list(
         .collect()
 }
 
+fn select_surface_format(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat {
+    let first = *formats
+        .first()
+        .expect("surface capability format list should not be empty");
+    let preferred_srgb = first.add_srgb_suffix();
+    if formats.contains(&preferred_srgb) {
+        preferred_srgb
+    } else {
+        first
+    }
+}
+
+fn select_surface_view_formats(
+    format: wgpu::TextureFormat,
+    downlevel_caps: &wgpu::DownlevelCapabilities,
+) -> Vec<wgpu::TextureFormat> {
+    if downlevel_caps
+        .flags
+        .contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS)
+    {
+        vec![format.add_srgb_suffix(), format.remove_srgb_suffix()]
+    } else {
+        vec![]
+    }
+}
+
+fn select_composite_alpha_mode(
+    alpha_modes: &[wgpu::CompositeAlphaMode],
+) -> wgpu::CompositeAlphaMode {
+    if alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+        wgpu::CompositeAlphaMode::PostMultiplied
+    } else if alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+        wgpu::CompositeAlphaMode::PreMultiplied
+    } else {
+        wgpu::CompositeAlphaMode::Auto
+    }
+}
+
 impl WebGpuState {
     pub async fn new(
         window: &Window,
@@ -338,26 +376,12 @@ impl WebGpuState {
 
         let queue = Arc::new(queue);
 
-        // Explicitly request an SRGB format, if available
-        let pref_format_srgb = caps.formats[0].add_srgb_suffix();
-        let format = if caps.formats.contains(&pref_format_srgb) {
-            pref_format_srgb
-        } else {
-            caps.formats[0]
-        };
-
+        let format = select_surface_format(&caps.formats);
         // Need to check that this is supported, as trying to set
         // view_formats without it will cause surface.configure
         // to panic
         // <https://github.com/wezterm/wezterm/issues/3565>
-        let view_formats = if downlevel_caps
-            .flags
-            .contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS)
-        {
-            vec![format.add_srgb_suffix(), format.remove_srgb_suffix()]
-        } else {
-            vec![]
-        };
+        let view_formats = select_surface_view_formats(format, &downlevel_caps);
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -365,19 +389,7 @@ impl WebGpuState {
             width: dimensions.pixel_width as u32,
             height: dimensions.pixel_height as u32,
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: if caps
-                .alpha_modes
-                .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
-            {
-                wgpu::CompositeAlphaMode::PostMultiplied
-            } else if caps
-                .alpha_modes
-                .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
-            {
-                wgpu::CompositeAlphaMode::PreMultiplied
-            } else {
-                wgpu::CompositeAlphaMode::Auto
-            },
+            alpha_mode: select_composite_alpha_mode(&caps.alpha_modes),
             view_formats,
             desired_maximum_frame_latency: 2,
         };
@@ -557,5 +569,81 @@ impl WebGpuState {
             // <https://github.com/wezterm/wezterm/issues/2881>
             self.surface.configure(&self.device, &config);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{select_composite_alpha_mode, select_surface_format, select_surface_view_formats};
+
+    #[test]
+    fn surface_format_prefers_srgb_variant() {
+        let formats = [
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        ];
+
+        assert_eq!(
+            select_surface_format(&formats),
+            wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+    }
+
+    #[test]
+    fn surface_format_uses_first_when_no_srgb_variant_exists() {
+        let formats = [
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Bgra8Unorm,
+        ];
+
+        assert_eq!(
+            select_surface_format(&formats),
+            wgpu::TextureFormat::Rgba16Float
+        );
+    }
+
+    #[test]
+    fn surface_view_formats_require_support_flag() {
+        let mut caps = wgpu::DownlevelCapabilities::default();
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+
+        caps.flags
+            .remove(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS);
+        assert!(select_surface_view_formats(format, &caps).is_empty());
+
+        caps.flags
+            .insert(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS);
+        assert_eq!(
+            select_surface_view_formats(format, &caps),
+            vec![
+                wgpu::TextureFormat::Bgra8UnormSrgb,
+                wgpu::TextureFormat::Bgra8Unorm,
+            ]
+        );
+    }
+
+    #[test]
+    fn alpha_mode_prefers_post_then_pre_then_auto() {
+        assert_eq!(
+            select_composite_alpha_mode(&[
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::PreMultiplied,
+            ]),
+            wgpu::CompositeAlphaMode::PreMultiplied
+        );
+        assert_eq!(
+            select_composite_alpha_mode(&[
+                wgpu::CompositeAlphaMode::Inherit,
+                wgpu::CompositeAlphaMode::PostMultiplied,
+            ]),
+            wgpu::CompositeAlphaMode::PostMultiplied
+        );
+        assert_eq!(
+            select_composite_alpha_mode(&[
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::Inherit,
+            ]),
+            wgpu::CompositeAlphaMode::Auto
+        );
     }
 }
