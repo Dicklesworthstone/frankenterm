@@ -39,10 +39,7 @@ impl SimpleTempDir {
     }
 
     fn path_for_content(&self, content_id: ContentId) -> Result<PathBuf, Error> {
-        let path = self.root.path().join(format!("{content_id}"));
-        std::fs::create_dir_all(path.parent().unwrap())
-            .map_err(|err| Error::StorageDirIoError(path.clone(), err))?;
-        Ok(path)
+        Ok(self.root.path().join(format!("{content_id}")))
     }
 
     fn add_ref(&self, content_id: ContentId) {

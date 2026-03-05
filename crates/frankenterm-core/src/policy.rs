@@ -1633,6 +1633,20 @@ pub fn is_command_candidate(text: &str) -> bool {
         break;
     }
 
+    // Check for special shell characters before stripping variable assignments
+    // because variable assignments might contain subshells (e.g. FOO=$(rm -rf /))
+    // which should be treated as command candidates.
+    if trimmed.contains("&&")
+        || trimmed.contains("||")
+        || trimmed.contains('|')
+        || trimmed.contains('>')
+        || trimmed.contains(';')
+        || trimmed.contains("$(")
+        || trimmed.contains('`')
+    {
+        return true;
+    }
+
     // Strip leading variable assignments (e.g. FOO=bar, FOO="a b")
     while let Some(mat) = VAR_ASSIGN.find(trimmed) {
         trimmed = &trimmed[mat.end()..];
@@ -1677,13 +1691,7 @@ pub fn is_command_candidate(text: &str) -> bool {
         return true;
     }
 
-    trimmed.contains("&&")
-        || trimmed.contains("||")
-        || trimmed.contains('|')
-        || trimmed.contains('>')
-        || trimmed.contains(';')
-        || trimmed.contains("$(")
-        || trimmed.contains('`')
+    false
 }
 
 #[must_use]
@@ -1697,17 +1705,18 @@ fn has_trauma_bypass_prefix(text: &str) -> bool {
         trimmed = stripped.trim_start();
     }
 
+    // If the assignment itself contains command substitution or chaining,
+    // it's a potential bypass attempt.
+    if trimmed.contains("$(") || trimmed.contains('`') || trimmed.contains(';') {
+        return true;
+    }
+
     while let Some(mat) = VAR_ASSIGN.find(trimmed) {
-        let assign_str = trimmed[..mat.end()].trim_end();
-        if let Some((key, value)) = assign_str.split_once('=') {
-            if !is_shell_identifier(key) {
-                break;
-            }
-            if key == TRAUMA_BYPASS_ENV && (value == "1" || value == "\"1\"" || value == "'1'") {
-                return true;
-            }
-        }
         trimmed = &trimmed[mat.end()..];
+    }
+
+    if trimmed.is_empty() {
+        return false;
     }
 
     false

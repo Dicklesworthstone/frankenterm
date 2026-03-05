@@ -186,13 +186,24 @@ pub enum WorkQueueError {
     /// Work item already exists.
     DuplicateItem { id: WorkItemId },
     /// Work item is not in a valid state for the requested operation.
-    InvalidState { id: WorkItemId, current: WorkItemStatus, expected: &'static str },
+    InvalidState {
+        id: WorkItemId,
+        current: WorkItemStatus,
+        expected: &'static str,
+    },
     /// Dependency cycle detected.
     CycleDetected { ids: Vec<WorkItemId> },
     /// Agent has reached max concurrent assignments.
-    AgentAtCapacity { agent: AgentSlotId, current: u32, max: u32 },
+    AgentAtCapacity {
+        agent: AgentSlotId,
+        current: u32,
+        max: u32,
+    },
     /// Work item depends on a non-existent item.
-    DependencyNotFound { item: WorkItemId, dependency: WorkItemId },
+    DependencyNotFound {
+        item: WorkItemId,
+        dependency: WorkItemId,
+    },
     /// No ready work items available.
     QueueEmpty,
 }
@@ -202,17 +213,28 @@ impl std::fmt::Display for WorkQueueError {
         match self {
             Self::ItemNotFound { id } => write!(f, "work item '{id}' not found"),
             Self::DuplicateItem { id } => write!(f, "work item '{id}' already exists"),
-            Self::InvalidState { id, current, expected } => {
+            Self::InvalidState {
+                id,
+                current,
+                expected,
+            } => {
                 write!(f, "work item '{id}' is {current:?}, expected {expected}")
             }
             Self::CycleDetected { ids } => {
                 write!(f, "dependency cycle detected: {}", ids.join(" → "))
             }
-            Self::AgentAtCapacity { agent, current, max } => {
+            Self::AgentAtCapacity {
+                agent,
+                current,
+                max,
+            } => {
                 write!(f, "agent '{agent}' at capacity ({current}/{max})")
             }
             Self::DependencyNotFound { item, dependency } => {
-                write!(f, "work item '{item}' depends on unknown item '{dependency}'")
+                write!(
+                    f,
+                    "work item '{item}' depends on unknown item '{dependency}'"
+                )
             }
             Self::QueueEmpty => write!(f, "no ready work items"),
         }
@@ -346,7 +368,10 @@ impl SwarmWorkQueue {
     /// Enqueue multiple work items at once, resolving internal dependencies.
     ///
     /// Items are added in order, so later items can depend on earlier ones.
-    pub fn enqueue_batch(&mut self, items: Vec<WorkItem>) -> Vec<Result<WorkItemStatus, WorkQueueError>> {
+    pub fn enqueue_batch(
+        &mut self,
+        items: Vec<WorkItem>,
+    ) -> Vec<Result<WorkItemStatus, WorkQueueError>> {
         items.into_iter().map(|item| self.enqueue(item)).collect()
     }
 
@@ -421,7 +446,8 @@ impl SwarmWorkQueue {
                         + 1,
                 };
 
-                self.status.insert(item_id.clone(), WorkItemStatus::InProgress);
+                self.status
+                    .insert(item_id.clone(), WorkItemStatus::InProgress);
                 self.assignments.insert(item_id, assignment.clone());
                 *self.agent_load.entry(agent.clone()).or_insert(0) += 1;
                 self.sequence += 1;
@@ -437,9 +463,7 @@ impl SwarmWorkQueue {
         let mut candidates: Vec<(&WorkItemId, &WorkItem, u64)> = self
             .items
             .iter()
-            .filter(|(id, _)| {
-                self.status.get(*id).copied() == Some(WorkItemStatus::Ready)
-            })
+            .filter(|(id, _)| self.status.get(*id).copied() == Some(WorkItemStatus::Ready))
             .map(|(id, item)| {
                 let enqueued = self.enqueued_at.get(id).copied().unwrap_or(now);
                 (id, item, enqueued)
@@ -482,11 +506,13 @@ impl SwarmWorkQueue {
         item_id: &WorkItemId,
         agent: &AgentSlotId,
     ) -> Result<Assignment, WorkQueueError> {
-        let status = self
-            .status
-            .get(item_id)
-            .copied()
-            .ok_or_else(|| WorkQueueError::ItemNotFound { id: item_id.clone() })?;
+        let status =
+            self.status
+                .get(item_id)
+                .copied()
+                .ok_or_else(|| WorkQueueError::ItemNotFound {
+                    id: item_id.clone(),
+                })?;
 
         if status != WorkItemStatus::Ready {
             return Err(WorkQueueError::InvalidState {
@@ -519,7 +545,8 @@ impl SwarmWorkQueue {
                 + 1,
         };
 
-        self.status.insert(item_id.clone(), WorkItemStatus::InProgress);
+        self.status
+            .insert(item_id.clone(), WorkItemStatus::InProgress);
         self.assignments.insert(item_id.clone(), assignment.clone());
         *self.agent_load.entry(agent.clone()).or_insert(0) += 1;
         self.sequence += 1;
@@ -560,17 +587,37 @@ impl SwarmWorkQueue {
         success: bool,
         message: Option<String>,
     ) -> Result<CompletionRecord, WorkQueueError> {
-        let status = self
-            .status
-            .get(item_id)
-            .copied()
-            .ok_or_else(|| WorkQueueError::ItemNotFound { id: item_id.clone() })?;
+        let status =
+            self.status
+                .get(item_id)
+                .copied()
+                .ok_or_else(|| WorkQueueError::ItemNotFound {
+                    id: item_id.clone(),
+                })?;
 
         if status != WorkItemStatus::InProgress {
             return Err(WorkQueueError::InvalidState {
                 id: item_id.clone(),
                 current: status,
                 expected: "InProgress",
+            });
+        }
+
+        // Enforce assignment ownership so only the assigned agent can finish
+        // an in-flight item. This prevents cross-agent completion/failure races.
+        let assignment =
+            self.assignments
+                .get(item_id)
+                .ok_or_else(|| WorkQueueError::InvalidState {
+                    id: item_id.clone(),
+                    current: status,
+                    expected: "assigned to an agent",
+                })?;
+        if assignment.agent_slot != *agent {
+            return Err(WorkQueueError::InvalidState {
+                id: item_id.clone(),
+                current: status,
+                expected: "assigned to this agent",
             });
         }
 
@@ -593,7 +640,8 @@ impl SwarmWorkQueue {
         self.completion_log.push(record.clone());
 
         if success {
-            self.status.insert(item_id.clone(), WorkItemStatus::Completed);
+            self.status
+                .insert(item_id.clone(), WorkItemStatus::Completed);
             // Unblock dependents
             self.recompute_ready_set(item_id);
         } else {
@@ -617,11 +665,13 @@ impl SwarmWorkQueue {
 
     /// Cancel a work item. If in progress, releases the agent assignment.
     pub fn cancel(&mut self, item_id: &WorkItemId) -> Result<(), WorkQueueError> {
-        let status = self
-            .status
-            .get(item_id)
-            .copied()
-            .ok_or_else(|| WorkQueueError::ItemNotFound { id: item_id.clone() })?;
+        let status =
+            self.status
+                .get(item_id)
+                .copied()
+                .ok_or_else(|| WorkQueueError::ItemNotFound {
+                    id: item_id.clone(),
+                })?;
 
         if status.is_terminal() {
             return Err(WorkQueueError::InvalidState {
@@ -638,7 +688,8 @@ impl SwarmWorkQueue {
             }
         }
 
-        self.status.insert(item_id.clone(), WorkItemStatus::Cancelled);
+        self.status
+            .insert(item_id.clone(), WorkItemStatus::Cancelled);
         self.sequence += 1;
         Ok(())
     }
@@ -648,11 +699,17 @@ impl SwarmWorkQueue {
     // =========================================================================
 
     /// Record a heartbeat from an agent for a specific work item.
-    pub fn heartbeat(&mut self, item_id: &WorkItemId, agent: &AgentSlotId) -> Result<(), WorkQueueError> {
-        let assignment = self
-            .assignments
-            .get_mut(item_id)
-            .ok_or_else(|| WorkQueueError::ItemNotFound { id: item_id.clone() })?;
+    pub fn heartbeat(
+        &mut self,
+        item_id: &WorkItemId,
+        agent: &AgentSlotId,
+    ) -> Result<(), WorkQueueError> {
+        let assignment =
+            self.assignments
+                .get_mut(item_id)
+                .ok_or_else(|| WorkQueueError::ItemNotFound {
+                    id: item_id.clone(),
+                })?;
 
         if assignment.agent_slot != *agent {
             return Err(WorkQueueError::InvalidState {
@@ -752,11 +809,7 @@ impl SwarmWorkQueue {
             }
         }
 
-        stats.active_agents = self
-            .agent_load
-            .values()
-            .filter(|&&load| load > 0)
-            .count();
+        stats.active_agents = self.agent_load.values().filter(|&&load| load > 0).count();
 
         stats
     }
@@ -825,7 +878,8 @@ impl SwarmWorkQueue {
             // Register dependents
             for dep_id in &item.depends_on {
                 if !dep_id.is_empty() {
-                    queue.dependents
+                    queue
+                        .dependents
                         .entry(dep_id.clone())
                         .or_default()
                         .insert(item.id.clone());
@@ -839,8 +893,13 @@ impl SwarmWorkQueue {
 
         // Restore assignments
         for assignment in snapshot.assignments {
-            *queue.agent_load.entry(assignment.agent_slot.clone()).or_insert(0) += 1;
-            queue.assignments.insert(assignment.work_item_id.clone(), assignment);
+            *queue
+                .agent_load
+                .entry(assignment.agent_slot.clone())
+                .or_insert(0) += 1;
+            queue
+                .assignments
+                .insert(assignment.work_item_id.clone(), assignment);
         }
 
         // Restore completion log
@@ -941,7 +1000,10 @@ impl BeadRecord {
 
     /// Whether the bead is complete (closed or cancelled).
     pub fn is_terminal(&self) -> bool {
-        matches!(self.status.as_str(), "closed" | "cancelled" | "resolved" | "wontfix")
+        matches!(
+            self.status.as_str(),
+            "closed" | "cancelled" | "resolved" | "wontfix"
+        )
     }
 
     /// Extract the IDs this bead depends on (from the `dependencies` array).
@@ -1024,12 +1086,11 @@ impl BeadsImporter {
             if trimmed.is_empty() {
                 continue;
             }
-            let record: BeadRecord = serde_json::from_str(trimmed).map_err(|e| {
-                BeadsImportError::ParseError {
+            let record: BeadRecord =
+                serde_json::from_str(trimmed).map_err(|e| BeadsImportError::ParseError {
                     line: line_num + 1,
                     message: e.to_string(),
-                }
-            })?;
+                })?;
             records.push(record);
         }
         Ok(Self { records })
@@ -1089,9 +1150,7 @@ impl BeadsImporter {
             let existing_status = queue.item_status(&record.id);
 
             // Skip if already terminal in queue
-            if existing_status
-                .is_some_and(|s| s.is_terminal())
-            {
+            if existing_status.is_some_and(|s| s.is_terminal()) {
                 report.skipped += 1;
                 continue;
             }
@@ -1245,7 +1304,10 @@ mod tests {
     fn enqueue_with_missing_dep_fails() {
         let mut q = SwarmWorkQueue::with_defaults();
         let result = q.enqueue(item("a", 0, &["nonexistent"]));
-        assert!(matches!(result, Err(WorkQueueError::DependencyNotFound { .. })));
+        assert!(matches!(
+            result,
+            Err(WorkQueueError::DependencyNotFound { .. })
+        ));
     }
 
     // =========================================================================
@@ -1275,7 +1337,10 @@ mod tests {
 
         q.pull(&"agent".into()).unwrap();
         let result = q.pull(&"agent".into());
-        assert!(matches!(result, Err(WorkQueueError::AgentAtCapacity { .. })));
+        assert!(matches!(
+            result,
+            Err(WorkQueueError::AgentAtCapacity { .. })
+        ));
     }
 
     #[test]
@@ -1345,12 +1410,14 @@ mod tests {
 
         // Attempt 1: fail
         q.pull(&"agent".into()).unwrap();
-        q.fail(&"a".into(), &"agent".into(), Some("error 1".into())).unwrap();
+        q.fail(&"a".into(), &"agent".into(), Some("error 1".into()))
+            .unwrap();
         assert_eq!(q.item_status(&"a".into()), Some(WorkItemStatus::Ready));
 
         // Attempt 2: fail
         q.pull(&"agent".into()).unwrap();
-        q.fail(&"a".into(), &"agent".into(), Some("error 2".into())).unwrap();
+        q.fail(&"a".into(), &"agent".into(), Some("error 2".into()))
+            .unwrap();
         assert_eq!(q.item_status(&"a".into()), Some(WorkItemStatus::Failed));
     }
 
@@ -1521,7 +1588,8 @@ mod tests {
 
         // Assign and complete one
         q.pull(&"agent".into()).unwrap();
-        q.complete(&"a".into(), &"agent".into(), Some("done".into())).unwrap();
+        q.complete(&"a".into(), &"agent".into(), Some("done".into()))
+            .unwrap();
 
         let snapshot = q.snapshot();
         let json = serde_json::to_string(&snapshot).unwrap();
@@ -1529,9 +1597,18 @@ mod tests {
         let restored = SwarmWorkQueue::restore(restored_snapshot, WorkQueueConfig::default());
 
         assert_eq!(restored.stats().total_items, 3);
-        assert_eq!(restored.item_status(&"a".into()), Some(WorkItemStatus::Completed));
-        assert_eq!(restored.item_status(&"b".into()), Some(WorkItemStatus::Ready));
-        assert_eq!(restored.item_status(&"c".into()), Some(WorkItemStatus::Ready));
+        assert_eq!(
+            restored.item_status(&"a".into()),
+            Some(WorkItemStatus::Completed)
+        );
+        assert_eq!(
+            restored.item_status(&"b".into()),
+            Some(WorkItemStatus::Ready)
+        );
+        assert_eq!(
+            restored.item_status(&"c".into()),
+            Some(WorkItemStatus::Ready)
+        );
         assert_eq!(restored.completion_log().len(), 1);
     }
 
@@ -1617,7 +1694,10 @@ mod tests {
         };
         let json = serde_json::to_string(&config).unwrap();
         let restored: WorkQueueConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(config.max_concurrent_per_agent, restored.max_concurrent_per_agent);
+        assert_eq!(
+            config.max_concurrent_per_agent,
+            restored.max_concurrent_per_agent
+        );
         assert!(!restored.anti_starvation);
     }
 
@@ -1631,7 +1711,9 @@ mod tests {
             WorkQueueError::ItemNotFound { id: "x".into() },
             WorkQueueError::DuplicateItem { id: "x".into() },
             WorkQueueError::QueueEmpty,
-            WorkQueueError::CycleDetected { ids: vec!["a".into(), "b".into()] },
+            WorkQueueError::CycleDetected {
+                ids: vec!["a".into(), "b".into()],
+            },
         ];
         for e in &errors {
             let msg = format!("{e}");
@@ -1693,14 +1775,22 @@ mod tests {
     #[test]
     fn bead_record_blocking_ids() {
         let importer = BeadsImporter::from_jsonl(sample_bead_jsonl()).unwrap();
-        let ft003 = importer.actionable_records().into_iter().find(|r| r.id == "ft-003").unwrap();
+        let ft003 = importer
+            .actionable_records()
+            .into_iter()
+            .find(|r| r.id == "ft-003")
+            .unwrap();
         assert_eq!(ft003.blocking_ids(), vec!["ft-002"]);
     }
 
     #[test]
     fn bead_record_to_work_item() {
         let importer = BeadsImporter::from_jsonl(sample_bead_jsonl()).unwrap();
-        let ft002 = importer.actionable_records().into_iter().find(|r| r.id == "ft-002").unwrap();
+        let ft002 = importer
+            .actionable_records()
+            .into_iter()
+            .find(|r| r.id == "ft-002")
+            .unwrap();
         let item = ft002.to_work_item();
         assert_eq!(item.id, "ft-002");
         assert_eq!(item.title, "Core engine");
@@ -1713,12 +1803,25 @@ mod tests {
     #[test]
     fn bead_effort_by_type() {
         let make = |t: &str| BeadRecord {
-            id: "x".into(), title: "x".into(), description: String::new(),
-            status: "open".into(), priority: 0, issue_type: t.into(),
-            assignee: String::new(), created_at: String::new(), created_by: String::new(),
-            updated_at: String::new(), closed_at: String::new(), close_reason: String::new(),
-            labels: vec![], dependencies: vec![], acceptance_criteria: String::new(),
-            notes: String::new(), source_repo: String::new(), compaction_level: 0, original_size: 0,
+            id: "x".into(),
+            title: "x".into(),
+            description: String::new(),
+            status: "open".into(),
+            priority: 0,
+            issue_type: t.into(),
+            assignee: String::new(),
+            created_at: String::new(),
+            created_by: String::new(),
+            updated_at: String::new(),
+            closed_at: String::new(),
+            close_reason: String::new(),
+            labels: vec![],
+            dependencies: vec![],
+            acceptance_criteria: String::new(),
+            notes: String::new(),
+            source_repo: String::new(),
+            compaction_level: 0,
+            original_size: 0,
         };
         assert_eq!(make("epic").estimate_effort(), 8);
         assert_eq!(make("feature").estimate_effort(), 5);
@@ -1751,9 +1854,15 @@ mod tests {
         importer.sync_to_queue(&mut queue);
 
         // ft-002 should be ready (its dep ft-001 was closed → removed)
-        assert_eq!(queue.item_status(&"ft-002".to_string()), Some(WorkItemStatus::Ready));
+        assert_eq!(
+            queue.item_status(&"ft-002".to_string()),
+            Some(WorkItemStatus::Ready)
+        );
         // ft-003 depends on ft-002 (still active) → blocked
-        assert_eq!(queue.item_status(&"ft-003".to_string()), Some(WorkItemStatus::Blocked));
+        assert_eq!(
+            queue.item_status(&"ft-003".to_string()),
+            Some(WorkItemStatus::Blocked)
+        );
     }
 
     #[test]
@@ -1778,32 +1887,53 @@ mod tests {
         let importer1 = BeadsImporter::from_jsonl(open_jsonl).unwrap();
         let r1 = importer1.sync_to_queue(&mut queue);
         assert_eq!(r1.imported, 1);
-        assert_eq!(queue.item_status(&"ft-x".to_string()), Some(WorkItemStatus::Ready));
+        assert_eq!(
+            queue.item_status(&"ft-x".to_string()),
+            Some(WorkItemStatus::Ready)
+        );
 
         // Now sync the closed version
         let importer2 = BeadsImporter::from_jsonl(closed_jsonl).unwrap();
         let r2 = importer2.sync_to_queue(&mut queue);
         assert_eq!(r2.completed_from_bead, vec!["ft-x".to_string()]);
-        assert_eq!(queue.item_status(&"ft-x".to_string()), Some(WorkItemStatus::Cancelled));
+        assert_eq!(
+            queue.item_status(&"ft-x".to_string()),
+            Some(WorkItemStatus::Cancelled)
+        );
     }
 
     #[test]
     fn work_status_to_bead_status_mapping() {
         assert_eq!(work_status_to_bead_status(WorkItemStatus::Blocked), "open");
         assert_eq!(work_status_to_bead_status(WorkItemStatus::Ready), "open");
-        assert_eq!(work_status_to_bead_status(WorkItemStatus::InProgress), "in_progress");
-        assert_eq!(work_status_to_bead_status(WorkItemStatus::Completed), "closed");
+        assert_eq!(
+            work_status_to_bead_status(WorkItemStatus::InProgress),
+            "in_progress"
+        );
+        assert_eq!(
+            work_status_to_bead_status(WorkItemStatus::Completed),
+            "closed"
+        );
         assert_eq!(work_status_to_bead_status(WorkItemStatus::Failed), "open");
-        assert_eq!(work_status_to_bead_status(WorkItemStatus::Cancelled), "closed");
+        assert_eq!(
+            work_status_to_bead_status(WorkItemStatus::Cancelled),
+            "closed"
+        );
     }
 
     #[test]
     fn beads_import_error_display() {
-        let e1 = BeadsImportError::ParseError { line: 42, message: "bad json".into() };
+        let e1 = BeadsImportError::ParseError {
+            line: 42,
+            message: "bad json".into(),
+        };
         assert!(format!("{e1}").contains("42"));
         assert!(format!("{e1}").contains("bad json"));
 
-        let e2 = BeadsImportError::IoError { path: "/tmp/x".into(), message: "not found".into() };
+        let e2 = BeadsImportError::IoError {
+            path: "/tmp/x".into(),
+            message: "not found".into(),
+        };
         assert!(format!("{e2}").contains("/tmp/x"));
     }
 
