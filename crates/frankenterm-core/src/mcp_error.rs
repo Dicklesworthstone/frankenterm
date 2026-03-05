@@ -151,10 +151,7 @@ mod tests {
         ];
         let mut seen = std::collections::HashSet::new();
         for code in codes {
-            assert!(
-                seen.insert(code),
-                "Duplicate error code: {code}"
-            );
+            assert!(seen.insert(code), "Duplicate error code: {code}");
         }
     }
 
@@ -176,7 +173,10 @@ mod tests {
             MCP_ERR_CASS,
         ];
         for code in codes {
-            assert!(code.starts_with("FT-MCP-"), "Code {code} missing FT-MCP- prefix");
+            assert!(
+                code.starts_with("FT-MCP-"),
+                "Code {code} missing FT-MCP- prefix"
+            );
         }
     }
 
@@ -257,7 +257,9 @@ mod tests {
 
     #[test]
     fn map_error_config() {
-        let err = Error::Config(crate::error::ConfigError::FileNotFound("test.toml".to_string()));
+        let err = Error::Config(crate::error::ConfigError::FileNotFound(
+            "test.toml".to_string(),
+        ));
         let (code, _) = map_mcp_error(&err);
         assert_eq!(code, MCP_ERR_CONFIG);
     }
@@ -271,7 +273,9 @@ mod tests {
 
     #[test]
     fn map_error_workflow() {
-        let err = Error::Workflow(crate::error::WorkflowError::Aborted("step failed".to_string()));
+        let err = Error::Workflow(crate::error::WorkflowError::Aborted(
+            "step failed".to_string(),
+        ));
         let (code, _) = map_mcp_error(&err);
         assert_eq!(code, MCP_ERR_WORKFLOW);
     }

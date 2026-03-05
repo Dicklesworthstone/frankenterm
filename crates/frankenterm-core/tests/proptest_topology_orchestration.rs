@@ -6,14 +6,13 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::topology_orchestration::{
-    FocusGroup, LayoutNode, LayoutTemplate, OpCheckResult, TemplateRegistry, TopologyAuditEntry,
-    TopologyError, TopologyMoveDirection, TopologyOp, TopologyOrchestrator,
-    TopologySplitDirection,
-};
 use frankenterm_core::session_topology::{
     LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
     MuxPaneLifecycleState, PaneNode,
+};
+use frankenterm_core::topology_orchestration::{
+    FocusGroup, LayoutNode, LayoutTemplate, OpCheckResult, TemplateRegistry, TopologyAuditEntry,
+    TopologyError, TopologyMoveDirection, TopologyOp, TopologyOrchestrator, TopologySplitDirection,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,8 +36,14 @@ fn f64_approx_eq(a: f64, b: f64) -> bool {
 fn layout_nodes_approx_eq(a: &LayoutNode, b: &LayoutNode) -> bool {
     match (a, b) {
         (
-            LayoutNode::Slot { role: ra, weight: wa },
-            LayoutNode::Slot { role: rb, weight: wb },
+            LayoutNode::Slot {
+                role: ra,
+                weight: wa,
+            },
+            LayoutNode::Slot {
+                role: rb,
+                weight: wb,
+            },
         ) => ra == rb && f64_approx_eq(*wa, *wb),
         (LayoutNode::HSplit { children: ca }, LayoutNode::HSplit { children: cb })
         | (LayoutNode::VSplit { children: ca }, LayoutNode::VSplit { children: cb }) => {
@@ -836,7 +841,10 @@ fn layout_from_template_exact_pane_count() {
     assert!(orch.layout_from_template("grid-2x2", &[1]).is_err());
 
     // More panes than max → error
-    assert!(orch.layout_from_template("side-by-side", &[1, 2, 3]).is_err());
+    assert!(
+        orch.layout_from_template("side-by-side", &[1, 2, 3])
+            .is_err()
+    );
 
     // Exact match → ok
     assert!(orch.layout_from_template("side-by-side", &[1, 2]).is_ok());

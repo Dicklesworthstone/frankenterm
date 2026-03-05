@@ -322,9 +322,7 @@ impl QuotaGate {
                     blocking: true,
                     message: format!(
                         "All {} panes rate-limited for {}; earliest clear in {}s",
-                        summary.limited_pane_count,
-                        summary.agent_type,
-                        summary.earliest_clear_secs,
+                        summary.limited_pane_count, summary.agent_type, summary.earliest_clear_secs,
                     ),
                 });
             }
@@ -366,9 +364,7 @@ impl QuotaGate {
                 warnings.push(LaunchWarning {
                     source: WarningSource::AccountQuota,
                     blocking: false,
-                    message: format!(
-                        "Account quota is low{pct_msg} — consider switching provider"
-                    ),
+                    message: format!("Account quota is low{pct_msg} — consider switching provider"),
                 });
             }
             QuotaAvailability::Available => {}

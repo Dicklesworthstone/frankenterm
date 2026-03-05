@@ -242,17 +242,17 @@ impl ArsSecretScanner {
             // Extract surrounding context (up to 10 chars before, 20 after).
             let ctx_start = mat.start().saturating_sub(10);
             let ctx_end = (mat.end() + 20).min(text.len());
-            
+
             let mut safe_start = ctx_start;
             while safe_start > 0 && !text.is_char_boundary(safe_start) {
                 safe_start -= 1;
             }
-            
+
             let mut safe_end = ctx_end;
             while safe_end < text.len() && !text.is_char_boundary(safe_end) {
                 safe_end += 1;
             }
-            
+
             let context = &text[safe_start..safe_end];
 
             findings.push(ScanFinding {

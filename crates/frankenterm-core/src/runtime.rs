@@ -970,7 +970,7 @@ impl ObservationRuntime {
         Self {
             config,
             wezterm_handle: wezterm_handle_with_timeout(5),
-            storage: storage,
+            storage,
             pattern_engine,
             registry: Arc::new(RwLock::new(registry)),
             cursors: Arc::new(RwLock::new(HashMap::new())),

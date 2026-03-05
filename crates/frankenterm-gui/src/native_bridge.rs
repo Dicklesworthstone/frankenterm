@@ -11,9 +11,9 @@ use mux::{Mux, MuxNotification};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Channel capacity for the bounded event queue.
@@ -36,11 +36,27 @@ fn now_ms() -> u64 {
 
 /// A mux-to-wire event that's ready to serialize.
 enum BridgeEvent {
-    PaneOutput { pane_id: u64, data: Vec<u8> },
-    StateChange { pane_id: u64, state: WirePaneState },
-    UserVar { pane_id: u64, name: String, value: String },
-    PaneCreated { pane_id: u64, domain: String, cwd: Option<String> },
-    PaneDestroyed { pane_id: u64 },
+    PaneOutput {
+        pane_id: u64,
+        data: Vec<u8>,
+    },
+    StateChange {
+        pane_id: u64,
+        state: WirePaneState,
+    },
+    UserVar {
+        pane_id: u64,
+        name: String,
+        value: String,
+    },
+    PaneCreated {
+        pane_id: u64,
+        domain: String,
+        cwd: Option<String>,
+    },
+    PaneDestroyed {
+        pane_id: u64,
+    },
 }
 
 impl BridgeEvent {
@@ -52,11 +68,9 @@ impl BridgeEvent {
                 data_b64: base64::engine::general_purpose::STANDARD.encode(&data),
                 ts,
             },
-            BridgeEvent::StateChange { pane_id, state } => WireEvent::StateChange {
-                pane_id,
-                state,
-                ts,
-            },
+            BridgeEvent::StateChange { pane_id, state } => {
+                WireEvent::StateChange { pane_id, state, ts }
+            }
             BridgeEvent::UserVar {
                 pane_id,
                 name,
@@ -159,11 +173,7 @@ impl Drop for NativeEventBridge {
 }
 
 /// Background thread that reads events from the channel and writes to the socket.
-fn sender_loop(
-    socket_path: &Path,
-    rx: std_mpsc::Receiver<BridgeEvent>,
-    shutdown: &AtomicBool,
-) {
+fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown: &AtomicBool) {
     let mut backoff = INITIAL_BACKOFF;
     let mut stream: Option<UnixStream> = None;
 
@@ -175,7 +185,10 @@ fn sender_loop(
         if stream.is_none() {
             match UnixStream::connect(socket_path) {
                 Ok(s) => {
-                    log::debug!("Native event bridge: connected to {}", socket_path.display());
+                    log::debug!(
+                        "Native event bridge: connected to {}",
+                        socket_path.display()
+                    );
                     stream = Some(s);
                     backoff = INITIAL_BACKOFF;
                     sent_hello = false;
@@ -198,7 +211,9 @@ fn sender_loop(
             if let Some(ref mut s) = stream {
                 let hello = WireEvent::Hello {
                     proto: Some(1),
-                    wezterm_version: Some(concat!("FrankenTerm ", env!("CARGO_PKG_VERSION")).into()),
+                    wezterm_version: Some(
+                        concat!("FrankenTerm ", env!("CARGO_PKG_VERSION")).into(),
+                    ),
                     ts: Some(now_ms()),
                 };
                 if write_event(s, &hello).is_err() {
@@ -236,19 +251,15 @@ fn sender_loop(
 
 /// Write a single WireEvent as a JSON line to the stream.
 fn write_event(stream: &mut UnixStream, event: &WireEvent) -> Result<(), std::io::Error> {
-    let json = serde_json::to_string(event).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+    let json = serde_json::to_string(event)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     stream.write_all(json.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()
 }
 
 /// Convert a MuxNotification into a BridgeEvent and send it.
-fn handle_mux_notification(
-    notification: &MuxNotification,
-    tx: &std_mpsc::SyncSender<BridgeEvent>,
-) {
+fn handle_mux_notification(notification: &MuxNotification, tx: &std_mpsc::SyncSender<BridgeEvent>) {
     let event = match notification {
         MuxNotification::PaneOutput(pane_id) => {
             // PaneOutput only gives us the pane ID — we need to read the output.

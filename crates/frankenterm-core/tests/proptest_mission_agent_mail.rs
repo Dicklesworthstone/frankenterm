@@ -18,12 +18,11 @@ use std::collections::{HashMap, HashSet};
 use proptest::prelude::*;
 
 use frankenterm_core::mission_agent_mail::{
-    CoordinationEnvelope, CoordinationEventKind,
-    CoordinationEventRequest, CoordinationInboxMessage, CoordinationParseFailure,
-    DispatchedCoordinationMessage, FailedCoordinationMessage, InboundCoordinationMessage,
-    MissionAgentMailConfig, MissionAgentMailKernel,
-    MissionCoordinationContext, MissionMailDispatchReport, MissionMailTransport,
-    PendingAcknowledgement,
+    CoordinationEnvelope, CoordinationEventKind, CoordinationEventRequest,
+    CoordinationInboxMessage, CoordinationParseFailure, DispatchedCoordinationMessage,
+    FailedCoordinationMessage, InboundCoordinationMessage, MissionAgentMailConfig,
+    MissionAgentMailKernel, MissionCoordinationContext, MissionMailDispatchReport,
+    MissionMailTransport, PendingAcknowledgement,
 };
 
 // ---------------------------------------------------------------------------
@@ -52,7 +51,6 @@ impl MockTransport {
             .or_default()
             .push(msg);
     }
-
 }
 
 impl MissionMailTransport for MockTransport {
@@ -63,11 +61,9 @@ impl MissionMailTransport for MockTransport {
         let mut next = self.next_id.borrow_mut();
         *next += 1;
         let id = format!("msg-{}", *next);
-        self.sent.borrow_mut().push((
-            to.to_string(),
-            subject.to_string(),
-            body.to_string(),
-        ));
+        self.sent
+            .borrow_mut()
+            .push((to.to_string(), subject.to_string(), body.to_string()));
         Ok(id)
     }
 
@@ -94,16 +90,24 @@ fn arb_agent_name() -> impl Strategy<Value = String> {
 
 fn arb_coordination_context() -> impl Strategy<Value = MissionCoordinationContext> {
     (
-        arb_nonempty_string(),           // mission_id
+        arb_nonempty_string(),                       // mission_id
         proptest::option::of(arb_nonempty_string()), // fleet_id
         proptest::option::of(arb_nonempty_string()), // bead_id
         proptest::option::of(arb_nonempty_string()), // assignment_id
         proptest::option::of(arb_nonempty_string()), // thread_id
-        arb_nonempty_string(),           // correlation_id
+        arb_nonempty_string(),                       // correlation_id
         proptest::option::of(arb_nonempty_string()), // scenario_id
     )
         .prop_map(
-            |(mission_id, fleet_id, bead_id, assignment_id, thread_id, correlation_id, scenario_id)| {
+            |(
+                mission_id,
+                fleet_id,
+                bead_id,
+                assignment_id,
+                thread_id,
+                correlation_id,
+                scenario_id,
+            )| {
                 MissionCoordinationContext {
                     mission_id,
                     fleet_id,
@@ -143,7 +147,16 @@ fn arb_envelope() -> impl Strategy<Value = CoordinationEnvelope> {
         arb_metadata(),
     )
         .prop_map(
-            |(version, event_kind, ack_required, emitted_at_ms, reason_code, error_code, context, metadata)| {
+            |(
+                version,
+                event_kind,
+                ack_required,
+                emitted_at_ms,
+                reason_code,
+                error_code,
+                context,
+                metadata,
+            )| {
                 CoordinationEnvelope {
                     version,
                     event_kind,
@@ -175,7 +188,17 @@ fn arb_event_request() -> impl Strategy<Value = CoordinationEventRequest> {
         arb_metadata(),
     )
         .prop_map(
-            |(kind, summary, body, recipients, ack_required, context, reason_code, error_code, metadata)| {
+            |(
+                kind,
+                summary,
+                body,
+                recipients,
+                ack_required,
+                context,
+                reason_code,
+                error_code,
+                metadata,
+            )| {
                 CoordinationEventRequest {
                     kind,
                     summary,
@@ -229,7 +252,15 @@ fn arb_dispatched_message() -> impl Strategy<Value = DispatchedCoordinationMessa
         proptest::option::of(0..1_000_000_000i64),
     )
         .prop_map(
-            |(recipient, message_id, subject, thread_id, correlation_id, ack_required, ack_deadline_ms)| {
+            |(
+                recipient,
+                message_id,
+                subject,
+                thread_id,
+                correlation_id,
+                ack_required,
+                ack_deadline_ms,
+            )| {
                 DispatchedCoordinationMessage {
                     recipient,
                     message_id,
@@ -244,13 +275,16 @@ fn arb_dispatched_message() -> impl Strategy<Value = DispatchedCoordinationMessa
 }
 
 fn arb_failed_message() -> impl Strategy<Value = FailedCoordinationMessage> {
-    (arb_agent_name(), arb_nonempty_string(), arb_nonempty_string()).prop_map(
-        |(recipient, subject, error)| FailedCoordinationMessage {
+    (
+        arb_agent_name(),
+        arb_nonempty_string(),
+        arb_nonempty_string(),
+    )
+        .prop_map(|(recipient, subject, error)| FailedCoordinationMessage {
             recipient,
             subject,
             error,
-        },
-    )
+        })
 }
 
 fn arb_dispatch_report() -> impl Strategy<Value = MissionMailDispatchReport> {
@@ -287,15 +321,15 @@ fn arb_inbound_message() -> impl Strategy<Value = InboundCoordinationMessage> {
         any::<bool>(),
         arb_envelope(),
     )
-        .prop_map(|(message_id, from, subject, read, envelope)| {
-            InboundCoordinationMessage {
+        .prop_map(
+            |(message_id, from, subject, read, envelope)| InboundCoordinationMessage {
                 message_id,
                 from,
                 subject,
                 read,
                 envelope,
-            }
-        })
+            },
+        )
 }
 
 fn arb_pending_ack() -> impl Strategy<Value = PendingAcknowledgement> {

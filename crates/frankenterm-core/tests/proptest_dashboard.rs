@@ -6,9 +6,7 @@ use frankenterm_core::backpressure::{BackpressureSnapshot, BackpressureTier};
 use frankenterm_core::cost_tracker::{
     AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary, ProviderCostSummary,
 };
-use frankenterm_core::dashboard::{
-    DashboardManager, DashboardState, SystemHealthTier,
-};
+use frankenterm_core::dashboard::{DashboardManager, DashboardState, SystemHealthTier};
 use frankenterm_core::quota_gate::{LaunchVerdict, QuotaGateSnapshot, QuotaGateTelemetrySnapshot};
 use frankenterm_core::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
 

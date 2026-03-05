@@ -776,11 +776,10 @@ impl TelemetryCollector {
             }
 
             let pid = self.config.mux_server_pid;
-            let snap_opt = crate::runtime_compat::spawn_blocking(move || {
-                ResourceSnapshot::collect(pid)
-            })
-            .await
-            .unwrap_or(None);
+            let snap_opt =
+                crate::runtime_compat::spawn_blocking(move || ResourceSnapshot::collect(pid))
+                    .await
+                    .unwrap_or(None);
 
             if let Some(snap) = snap_opt {
                 self.buffer.push(snap);

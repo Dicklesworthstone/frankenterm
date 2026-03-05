@@ -603,11 +603,7 @@ impl Pdu {
                 // because source [consumed..consumed+remain] and dest [0..remain]
                 // overlap when consumed < remain.
                 unsafe {
-                    std::ptr::copy(
-                        buffer.as_ptr().add(consumed),
-                        buffer.as_mut_ptr(),
-                        remain,
-                    );
+                    std::ptr::copy(buffer.as_ptr().add(consumed), buffer.as_mut_ptr(), remain);
                 }
                 buffer.truncate(remain);
                 Ok(Some(decoded))

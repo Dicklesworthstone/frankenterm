@@ -1,16 +1,15 @@
 //! Property-based tests for the connector mesh federation module.
 
-use std::collections::BTreeMap;
 use proptest::prelude::*;
+use std::collections::BTreeMap;
 
 use frankenterm_core::connector_host_runtime::{
     ConnectorCapability, ConnectorFailureClass, ConnectorLifecyclePhase,
 };
 
 use frankenterm_core::connector_mesh::{
-    ConnectorMesh, ConnectorMeshConfig, HostHealth, MeshFailureEvent,
-    MeshHealthSnapshot, MeshHost, MeshTelemetrySnapshot, MeshZone,
-    RoutingDecision, RoutingRequest, RoutingStrategy,
+    ConnectorMesh, ConnectorMeshConfig, HostHealth, MeshFailureEvent, MeshHealthSnapshot, MeshHost,
+    MeshTelemetrySnapshot, MeshZone, RoutingDecision, RoutingRequest, RoutingStrategy,
 };
 
 fn arb_host_health() -> impl Strategy<Value = HostHealth> {

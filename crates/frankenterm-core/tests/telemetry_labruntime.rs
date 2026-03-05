@@ -12,8 +12,8 @@ mod common;
 
 use common::fixtures::RuntimeFixture;
 
-use frankenterm_core::telemetry::{TelemetryCollector, TelemetryConfig};
 use frankenterm_core::runtime_compat;
+use frankenterm_core::telemetry::{TelemetryCollector, TelemetryConfig};
 
 use std::sync::Arc;
 use std::time::Duration;

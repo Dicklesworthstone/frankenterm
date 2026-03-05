@@ -9,13 +9,10 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 
-use frankenterm_core::connector_host_runtime::{
-    ConnectorFailureClass, ConnectorLifecyclePhase,
-};
+use frankenterm_core::connector_host_runtime::{ConnectorFailureClass, ConnectorLifecyclePhase};
 use frankenterm_core::connector_inbound_bridge::{
-    ConnectorBridgeTelemetrySnapshot, ConnectorInboundBridge,
-    ConnectorInboundBridgeConfig, ConnectorSignal, ConnectorSignalKind,
-    SignalDeduplicator,
+    ConnectorBridgeTelemetrySnapshot, ConnectorInboundBridge, ConnectorInboundBridgeConfig,
+    ConnectorSignal, ConnectorSignalKind, SignalDeduplicator,
 };
 use frankenterm_core::events::EventBus;
 use frankenterm_core::patterns::Severity;
@@ -96,17 +93,14 @@ fn arb_signal() -> impl Strategy<Value = ConnectorSignal> {
 }
 
 fn arb_config() -> impl Strategy<Value = ConnectorInboundBridgeConfig> {
-    (
-        1usize..1000usize,
-        1u64..600u64,
-        any::<bool>(),
-    )
-        .prop_map(|(dedup_cap, dedup_ttl, reject)| ConnectorInboundBridgeConfig {
+    (1usize..1000usize, 1u64..600u64, any::<bool>()).prop_map(|(dedup_cap, dedup_ttl, reject)| {
+        ConnectorInboundBridgeConfig {
             dedup_capacity: dedup_cap,
             dedup_ttl_secs: dedup_ttl,
             reject_unknown_kinds: reject,
             rule_id_overrides: HashMap::new(),
-        })
+        }
+    })
 }
 
 // =============================================================================

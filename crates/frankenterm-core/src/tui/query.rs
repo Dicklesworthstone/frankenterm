@@ -301,8 +301,7 @@ pub struct ProductionQueryClient {
     #[allow(dead_code)]
     storage: Option<StorageHandle>,
     /// Shared dashboard manager updated by the runtime, read by TUI.
-    dashboard_manager:
-        Option<std::sync::Arc<std::sync::Mutex<crate::dashboard::DashboardManager>>>,
+    dashboard_manager: Option<std::sync::Arc<std::sync::Mutex<crate::dashboard::DashboardManager>>>,
     /// Dedicated runtime for async operations - avoids nested runtime panics
     runtime: crate::runtime_compat::Runtime,
 }
@@ -928,9 +927,7 @@ impl QueryClient for ProductionQueryClient {
             .map_err(|e| QueryError::StorageError(e.to_string()))
     }
 
-    fn dashboard_state(
-        &self,
-    ) -> Result<Option<crate::dashboard::DashboardState>, QueryError> {
+    fn dashboard_state(&self) -> Result<Option<crate::dashboard::DashboardState>, QueryError> {
         let Some(mgr) = &self.dashboard_manager else {
             return Ok(None);
         };

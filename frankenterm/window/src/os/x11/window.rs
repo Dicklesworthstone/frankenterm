@@ -1,14 +1,14 @@
 use super::*;
 use crate::bitmaps::*;
 use crate::connection::ConnectionOps;
-use crate::os::{Connection, Window, xkeysyms};
+use crate::os::{xkeysyms, Connection, Window};
 use crate::{
     Appearance, Clipboard, DeadKeyStatus, Dimensions, MouseButtons, MouseCursor, MouseEvent,
     MouseEventKind, MousePress, Point, Rect, RequestedWindowGeometry, ResizeIncrement,
     ResolvedGeometry, ScreenPoint, ScreenRect, WindowDecorations, WindowEvent, WindowEventSender,
     WindowOps, WindowState,
 };
-use anyhow::{Context as _, anyhow};
+use anyhow::{anyhow, Context as _};
 use async_trait::async_trait;
 use config::ConfigHandle;
 use promise::{Future, Promise};
@@ -764,8 +764,8 @@ impl XWindowInner {
             }
             Event::X(xcb::x::Event::ClientMessage(msg)) => {
                 let type_atom_name = conn.atom_name(msg.r#type());
-                use xcb::XidNew;
                 use xcb::x::ClientMessageData;
+                use xcb::XidNew;
                 let xdnd_msgtype_atoms = [
                     conn.atom_xdndenter,
                     conn.atom_xdndposition,
@@ -2246,6 +2246,10 @@ enum NetWmStateAction {
 
 impl NetWmStateAction {
     fn with_bool(enable: bool) -> Self {
-        if enable { Self::Add } else { Self::Remove }
+        if enable {
+            Self::Add
+        } else {
+            Self::Remove
+        }
     }
 }

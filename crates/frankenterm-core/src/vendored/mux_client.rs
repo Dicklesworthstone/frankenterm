@@ -3564,7 +3564,7 @@ mod tests {
                             assert_eq!(pane_id, 21, "subscription A should only receive pane 21");
                             a_counts = Some((dirty_range_count, dirty_row_count));
                         }
-                        Ok(Some(_)) | Ok(None) | Err(_) => {}
+                        Ok(Some(_) | None) | Err(_) => {}
                     }
                 }
                 if b_counts.is_none() {
@@ -3578,7 +3578,7 @@ mod tests {
                             assert_eq!(pane_id, 22, "subscription B should only receive pane 22");
                             b_counts = Some((dirty_range_count, dirty_row_count));
                         }
-                        Ok(Some(_)) | Ok(None) | Err(_) => {}
+                        Ok(Some(_) | None) | Err(_) => {}
                     }
                 }
                 if a_counts.is_some() && b_counts.is_some() {

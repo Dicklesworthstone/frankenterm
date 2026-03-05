@@ -361,12 +361,13 @@ mod tests {
         let handle = make_test_handle(vec![mux1, mux2, raw]);
         let domains = client_domains(&handle);
 
-        assert_eq!(domains.len(), 2, "should have 2 multiplexed SSH client domains");
+        assert_eq!(
+            domains.len(),
+            2,
+            "should have 2 multiplexed SSH client domains"
+        );
 
-        let names: Vec<&str> = domains
-            .iter()
-            .map(|d| d.name())
-            .collect();
+        let names: Vec<&str> = domains.iter().map(|d| d.name()).collect();
         assert!(names.contains(&"mux-1"));
         assert!(names.contains(&"mux-2"));
 

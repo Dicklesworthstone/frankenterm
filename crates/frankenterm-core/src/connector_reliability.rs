@@ -46,7 +46,11 @@ impl ConnectorErrorKind {
     pub const fn is_retryable(self) -> bool {
         matches!(
             self,
-            Self::Transient | Self::RateLimited | Self::ServiceUnavailable | Self::Timeout | Self::Unknown
+            Self::Transient
+                | Self::RateLimited
+                | Self::ServiceUnavailable
+                | Self::Timeout
+                | Self::Unknown
         )
     }
 
@@ -83,17 +87,37 @@ impl std::fmt::Display for ConnectorErrorKind {
 #[must_use]
 pub fn classify_connector_error(msg: &str) -> ConnectorErrorKind {
     let lower = msg.to_lowercase();
-    if lower.contains("rate limit") || lower.contains("429") || lower.contains("too many requests") {
+    if lower.contains("rate limit") || lower.contains("429") || lower.contains("too many requests")
+    {
         ConnectorErrorKind::RateLimited
-    } else if lower.contains("unauthorized") || lower.contains("forbidden") || lower.contains("401") || lower.contains("403") {
+    } else if lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("401")
+        || lower.contains("403")
+    {
         ConnectorErrorKind::AuthFailure
-    } else if lower.contains("timeout") || lower.contains("timed out") || lower.contains("deadline exceeded") {
+    } else if lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("deadline exceeded")
+    {
         ConnectorErrorKind::Timeout
-    } else if lower.contains("service unavailable") || lower.contains("503") || lower.contains("502") || lower.contains("504") {
+    } else if lower.contains("service unavailable")
+        || lower.contains("503")
+        || lower.contains("502")
+        || lower.contains("504")
+    {
         ConnectorErrorKind::ServiceUnavailable
-    } else if lower.contains("not found") || lower.contains("404") || lower.contains("invalid") || lower.contains("malformed") {
+    } else if lower.contains("not found")
+        || lower.contains("404")
+        || lower.contains("invalid")
+        || lower.contains("malformed")
+    {
         ConnectorErrorKind::Permanent
-    } else if lower.contains("connection") || lower.contains("network") || lower.contains("dns") || lower.contains("reset") {
+    } else if lower.contains("connection")
+        || lower.contains("network")
+        || lower.contains("dns")
+        || lower.contains("reset")
+    {
         ConnectorErrorKind::Transient
     } else {
         ConnectorErrorKind::Unknown
@@ -323,9 +347,8 @@ impl DeadLetterQueue {
         let max_retries = self.config.max_retries;
         let before = self.entries.len();
 
-        self.entries.retain(|e| {
-            !(e.age_ms(now_ms) > max_age || e.exceeded_max_retries(max_retries))
-        });
+        self.entries
+            .retain(|e| !(e.age_ms(now_ms) > max_age || e.exceeded_max_retries(max_retries)));
 
         let purged = before - self.entries.len();
         self.telemetry.purged += purged as u64;
@@ -643,7 +666,9 @@ impl ConnectorReliabilityController {
 
         // Auto-enqueue to DLQ if configured
         if self.config.auto_dlq && error_kind.is_retryable() {
-            let id = self.dlq.enqueue(action.clone(), &err_str, error_kind, timestamp_ms);
+            let id = self
+                .dlq
+                .enqueue(action.clone(), &err_str, error_kind, timestamp_ms);
             Some(id)
         } else {
             None
@@ -758,7 +783,10 @@ impl ReliabilityRegistry {
 
     /// Get or create a controller for a connector.
     pub fn get_or_create(&mut self, connector_id: &str) -> &mut ConnectorReliabilityController {
-        let pos = self.controllers.iter().position(|c| c.connector_id == connector_id);
+        let pos = self
+            .controllers
+            .iter()
+            .position(|c| c.connector_id == connector_id);
         match pos {
             Some(idx) => &mut self.controllers[idx],
             None => {
@@ -774,24 +802,35 @@ impl ReliabilityRegistry {
     /// Get a controller by connector ID (immutable).
     #[must_use]
     pub fn get(&self, connector_id: &str) -> Option<&ConnectorReliabilityController> {
-        self.controllers.iter().find(|c| c.connector_id == connector_id)
+        self.controllers
+            .iter()
+            .find(|c| c.connector_id == connector_id)
     }
 
     /// Get all registered connector IDs.
     #[must_use]
     pub fn connector_ids(&self) -> Vec<&str> {
-        self.controllers.iter().map(|c| c.connector_id.as_str()).collect()
+        self.controllers
+            .iter()
+            .map(|c| c.connector_id.as_str())
+            .collect()
     }
 
     /// Get telemetry snapshots for all connectors.
     #[must_use]
     pub fn all_snapshots(&self) -> Vec<ConnectorReliabilitySnapshot> {
-        self.controllers.iter().map(|c| c.telemetry_snapshot()).collect()
+        self.controllers
+            .iter()
+            .map(|c| c.telemetry_snapshot())
+            .collect()
     }
 
     /// Purge expired DLQ entries across all connectors.
     pub fn purge_all_expired(&mut self, now_ms: u64) -> usize {
-        self.controllers.iter_mut().map(|c| c.dlq_mut().purge_expired(now_ms)).sum()
+        self.controllers
+            .iter_mut()
+            .map(|c| c.dlq_mut().purge_expired(now_ms))
+            .sum()
     }
 
     /// Total DLQ depth across all connectors.
@@ -938,7 +977,12 @@ mod tests {
 
         for i in 0..5 {
             let action = sample_action("test", ConnectorActionKind::Notify);
-            dlq.enqueue(action, format!("error-{i}"), ConnectorErrorKind::Transient, 1000 + i);
+            dlq.enqueue(
+                action,
+                format!("error-{i}"),
+                ConnectorErrorKind::Transient,
+                1000 + i,
+            );
         }
 
         // Should only have 3 entries (oldest evicted)
@@ -1023,10 +1067,8 @@ mod tests {
 
     #[test]
     fn connector_reliability_controller_allow_and_record() {
-        let mut ctrl = ConnectorReliabilityController::new(
-            "slack",
-            ConnectorReliabilityConfig::default(),
-        );
+        let mut ctrl =
+            ConnectorReliabilityController::new("slack", ConnectorReliabilityConfig::default());
 
         assert!(ctrl.allow_operation());
         ctrl.record_success();
@@ -1039,10 +1081,8 @@ mod tests {
 
     #[test]
     fn connector_reliability_controller_failure_enqueues_dlq() {
-        let mut ctrl = ConnectorReliabilityController::new(
-            "github",
-            ConnectorReliabilityConfig::default(),
-        );
+        let mut ctrl =
+            ConnectorReliabilityController::new("github", ConnectorReliabilityConfig::default());
 
         let action = sample_action("github", ConnectorActionKind::Notify);
         let dlq_id = ctrl.record_failure(
@@ -1058,10 +1098,8 @@ mod tests {
 
     #[test]
     fn connector_reliability_controller_permanent_not_enqueued() {
-        let mut ctrl = ConnectorReliabilityController::new(
-            "test",
-            ConnectorReliabilityConfig::default(),
-        );
+        let mut ctrl =
+            ConnectorReliabilityController::new("test", ConnectorReliabilityConfig::default());
 
         let action = sample_action("test", ConnectorActionKind::Notify);
         let dlq_id = ctrl.record_failure(
@@ -1101,10 +1139,8 @@ mod tests {
 
     #[test]
     fn connector_reliability_controller_replay_plan() {
-        let mut ctrl = ConnectorReliabilityController::new(
-            "slack",
-            ConnectorReliabilityConfig::default(),
-        );
+        let mut ctrl =
+            ConnectorReliabilityController::new("slack", ConnectorReliabilityConfig::default());
 
         // Add some failures
         for i in 0..5 {

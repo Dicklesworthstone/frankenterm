@@ -12,9 +12,7 @@
 mod common;
 
 use common::fixtures::RuntimeFixture;
-use frankenterm_core::secrets::{
-    SecretScanEngine, SecretScanOptions, SECRET_SCAN_REPORT_VERSION,
-};
+use frankenterm_core::secrets::{SECRET_SCAN_REPORT_VERSION, SecretScanEngine, SecretScanOptions};
 use frankenterm_core::storage::{PaneRecord, StorageHandle};
 
 // ===========================================================================
@@ -115,11 +113,7 @@ fn scan_storage_with_secrets_finds_matches() {
             .await
             .expect("insert segment");
         storage
-            .append_segment(
-                1,
-                "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                None,
-            )
+            .append_segment(1, "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
             .await
             .expect("insert segment");
         let engine = SecretScanEngine::new();
@@ -241,19 +235,11 @@ fn scan_storage_filters_by_pane_id() {
             .await
             .expect("register pane 2");
         storage
-            .append_segment(
-                1,
-                "sk-abc1234567890abcdef1234567890abcdef12345678",
-                None,
-            )
+            .append_segment(1, "sk-abc1234567890abcdef1234567890abcdef12345678", None)
             .await
             .expect("insert");
         storage
-            .append_segment(
-                2,
-                "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                None,
-            )
+            .append_segment(2, "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
             .await
             .expect("insert");
         let engine = SecretScanEngine::new();
@@ -414,11 +400,7 @@ fn e2e_report_json_artifact_stable() {
             .await
             .expect("insert");
         storage
-            .append_segment(
-                1,
-                "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                None,
-            )
+            .append_segment(1, "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
             .await
             .expect("insert");
 

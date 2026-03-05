@@ -1,6 +1,6 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_executor::Executor;
-use flume::{Receiver, TryRecvError, bounded, unbounded};
+use flume::{bounded, unbounded, Receiver, TryRecvError};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

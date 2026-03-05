@@ -18,13 +18,14 @@ use frankenterm_core::recorder_storage::{
     RecorderOffset, RecorderSourceDescriptor, RecorderStorage,
 };
 use frankenterm_core::recording::{
-    RecorderControlMarkerType, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
-    RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
-    RecorderSegmentKind, RecorderTextEncoding, RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
+    RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
+    RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
 use frankenterm_core::tantivy_ingest::{
-    AppendLogEventSource, AppendLogReader, IndexCommitStats, IndexDocumentFields, IndexWriteError,
-    IndexWriter, IndexerConfig, IndexerError, IndexerRunResult, IncrementalIndexer,
+    AppendLogEventSource, AppendLogReader, IncrementalIndexer, IndexCommitStats,
+    IndexDocumentFields, IndexWriteError, IndexWriter, IndexerConfig, IndexerError,
+    IndexerRunResult,
 };
 use std::path::Path;
 use tempfile::tempdir;

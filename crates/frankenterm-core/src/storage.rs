@@ -11009,7 +11009,7 @@ fn insert_mux_session_sync(
 }
 
 fn insert_session_checkpoint_sync(
-    conn: &Connection,
+    conn: &mut Connection,
     session_id: &str,
     checkpoint_type: &str,
     state_hash: &str,
@@ -11020,7 +11020,7 @@ fn insert_session_checkpoint_sync(
 ) -> Result<i64> {
     let now = now_ms();
     let tx = conn
-        .unchecked_transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| StorageError::Database(format!("Failed to begin checkpoint txn: {e}")))?;
 
     tx.execute(
@@ -19018,7 +19018,6 @@ fn can_insert_and_consume_prepared_plan() {
 // wa-4vx.3.7: Async StorageHandle Tests
 // =========================================================================
 
-
 #[cfg(test)]
 fn run_async_test<F>(future: F)
 where
@@ -19432,9 +19431,10 @@ fn get_segments_prefers_mmap_lane_and_falls_back_to_sqlite_on_decode_error() {
         assert_eq!(sqlite_segments.len(), 2);
 
         let mmap_dir = temp_dir.path().join("segment_mmap_lane");
-        let mut mmap_store =
-            mmap_store::MmapScrollbackStore::new(mmap_store::MmapStoreConfig::new(mmap_dir.clone()))
-                .expect("create mmap store");
+        let mut mmap_store = mmap_store::MmapScrollbackStore::new(
+            mmap_store::MmapStoreConfig::new(mmap_dir.clone()),
+        )
+        .expect("create mmap store");
         for segment in sqlite_segments.iter().rev() {
             let line = encode_mmap_segment_line(segment).expect("encode mirror line");
             mmap_store
@@ -20768,8 +20768,8 @@ mod storage_handle_tests {
 
             for (idx, hit) in bundle.results.iter().enumerate() {
                 assert_eq!(hit.fusion_rank, idx);
-                let expected =
-                    hit.lexical_contribution.unwrap_or(0.0) + hit.semantic_contribution.unwrap_or(0.0);
+                let expected = hit.lexical_contribution.unwrap_or(0.0)
+                    + hit.semantic_contribution.unwrap_or(0.0);
                 assert!(
                     (hit.fusion_score - expected).abs() < 1e-6,
                     "fusion score should equal lane contributions"
@@ -20856,7 +20856,9 @@ mod storage_handle_tests {
                 assert!(hit.semantic_rank.is_none());
                 assert!(hit.semantic_contribution.is_none());
                 assert!(hit.lexical_contribution.is_some());
-                assert!((hit.fusion_score - hit.lexical_contribution.unwrap_or_default()).abs() < 1e-6);
+                assert!(
+                    (hit.fusion_score - hit.lexical_contribution.unwrap_or_default()).abs() < 1e-6
+                );
             }
 
             handle.shutdown().await.unwrap();
@@ -21373,7 +21375,8 @@ mod storage_handle_tests {
                 .unwrap();
 
             // Query step logs
-            let steps: Vec<WorkflowStepLogRecord> = handle.get_step_logs(workflow_id).await.unwrap();
+            let steps: Vec<WorkflowStepLogRecord> =
+                handle.get_step_logs(workflow_id).await.unwrap();
             assert_eq!(steps.len(), 3);
             assert_eq!(steps[0].step_name, "init");
             assert_eq!(steps[1].step_name, "send_text");
@@ -22207,7 +22210,6 @@ mod queue_depth_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
@@ -22467,7 +22469,6 @@ mod backpressure_integration_tests {
     use crate::runtime_compat::mpsc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
@@ -22626,12 +22627,13 @@ mod backpressure_integration_tests {
             }
 
             // Use a timeout to detect deadlocks
-            let result = crate::runtime_compat::timeout(std::time::Duration::from_secs(10), async {
-                for jh in handles {
-                    jh.await.unwrap();
-                }
-            })
-            .await;
+            let result =
+                crate::runtime_compat::timeout(std::time::Duration::from_secs(10), async {
+                    for jh in handles {
+                        jh.await.unwrap();
+                    }
+                })
+                .await;
 
             assert!(
                 result.is_ok(),

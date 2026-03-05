@@ -482,141 +482,16 @@ mod tests {
     #[test]
     fn export_segments_to_buffer() {
         run_async_test(async {
-        // Create temp DB
-        let tmp = std::env::temp_dir().join(format!("wa_test_export_{}.db", std::process::id()));
-        let db_path = tmp.to_string_lossy().to_string();
+            // Create temp DB
+            let tmp =
+                std::env::temp_dir().join(format!("wa_test_export_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
 
-        let storage = StorageHandle::new(&db_path).await.unwrap();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
 
-        // Insert a pane and segment
-        let pane = crate::storage::PaneRecord {
-            pane_id: 1,
-            pane_uuid: None,
-            domain: "local".to_string(),
-            window_id: None,
-            tab_id: None,
-            title: None,
-            cwd: None,
-            tty_name: None,
-            first_seen_at: 1000,
-            last_seen_at: 1000,
-            observed: true,
-            ignore_reason: None,
-            last_decision_at: None,
-        };
-        storage.upsert_pane(pane).await.unwrap();
-        storage
-            .append_segment(1, "test content", None)
-            .await
-            .unwrap();
-
-        let opts = ExportOptions {
-            kind: ExportKind::Segments,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
-
-        let mut buf = Vec::new();
-        let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-
-        assert_eq!(count, 1);
-        let output = String::from_utf8(buf).unwrap();
-        let lines: Vec<&str> = output.trim().lines().collect();
-        assert_eq!(lines.len(), 2); // header + 1 record
-
-        // Verify header
-        let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(header["_export"], true);
-        assert_eq!(header["kind"], "segments");
-        assert_eq!(header["record_count"], 1);
-
-        // Verify record
-        let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(record["content"], "test content");
-
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
-        });
-    }
-
-    #[test]
-    fn export_with_redaction() {
-        run_async_test(async {
-        let tmp =
-            std::env::temp_dir().join(format!("wa_test_export_redact_{}.db", std::process::id()));
-        let db_path = tmp.to_string_lossy().to_string();
-
-        let storage = StorageHandle::new(&db_path).await.unwrap();
-
-        let pane = crate::storage::PaneRecord {
-            pane_id: 1,
-            pane_uuid: None,
-            domain: "local".to_string(),
-            window_id: None,
-            tab_id: None,
-            title: None,
-            cwd: None,
-            tty_name: None,
-            first_seen_at: 1000,
-            last_seen_at: 1000,
-            observed: true,
-            ignore_reason: None,
-            last_decision_at: None,
-        };
-        storage.upsert_pane(pane).await.unwrap();
-        storage
-            .append_segment(
-                1,
-                "secret: sk-abc123def456ghi789jkl012mno345pqr678stu901v",
-                None,
-            )
-            .await
-            .unwrap();
-
-        let opts = ExportOptions {
-            kind: ExportKind::Segments,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: true,
-            pretty: false,
-        };
-
-        let mut buf = Vec::new();
-        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-
-        let output = String::from_utf8(buf).unwrap();
-        let lines: Vec<&str> = output.trim().lines().collect();
-        let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-        let content = record["content"].as_str().unwrap();
-        assert!(content.contains("[REDACTED]"));
-        assert!(!content.contains("sk-abc123"));
-
-        // Header should indicate redacted
-        let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(header["redacted"], true);
-
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
-        });
-    }
-
-    #[test]
-    fn export_with_pane_filter() {
-        run_async_test(async {
-        let tmp =
-            std::env::temp_dir().join(format!("wa_test_export_filter_{}.db", std::process::id()));
-        let db_path = tmp.to_string_lossy().to_string();
-
-        let storage = StorageHandle::new(&db_path).await.unwrap();
-
-        // Insert two panes
-        for pane_id in [1u64, 2u64] {
+            // Insert a pane and segment
             let pane = crate::storage::PaneRecord {
-                pane_id,
+                pane_id: 1,
                 pane_uuid: None,
                 domain: "local".to_string(),
                 window_id: None,
@@ -631,291 +506,417 @@ mod tests {
                 last_decision_at: None,
             };
             storage.upsert_pane(pane).await.unwrap();
-        }
+            storage
+                .append_segment(1, "test content", None)
+                .await
+                .unwrap();
 
-        storage.append_segment(1, "pane1 data", None).await.unwrap();
-        storage.append_segment(2, "pane2 data", None).await.unwrap();
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
 
-        // Export only pane 1
-        let opts = ExportOptions {
-            kind: ExportKind::Segments,
-            query: ExportQuery {
-                pane_id: Some(1),
-                ..Default::default()
-            },
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
 
-        let mut buf = Vec::new();
-        let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-        assert_eq!(count, 1);
+            assert_eq!(count, 1);
+            let output = String::from_utf8(buf).unwrap();
+            let lines: Vec<&str> = output.trim().lines().collect();
+            assert_eq!(lines.len(), 2); // header + 1 record
 
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("pane1 data"));
-        assert!(!output.contains("pane2 data"));
+            // Verify header
+            let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(header["_export"], true);
+            assert_eq!(header["kind"], "segments");
+            assert_eq!(header["record_count"], 1);
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            // Verify record
+            let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            assert_eq!(record["content"], "test content");
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_with_redaction() {
+        run_async_test(async {
+            let tmp = std::env::temp_dir()
+                .join(format!("wa_test_export_redact_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+
+            let pane = crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1000,
+                last_seen_at: 1000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+            storage
+                .append_segment(
+                    1,
+                    "secret: sk-abc123def456ghi789jkl012mno345pqr678stu901v",
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: true,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let output = String::from_utf8(buf).unwrap();
+            let lines: Vec<&str> = output.trim().lines().collect();
+            let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            let content = record["content"].as_str().unwrap();
+            assert!(content.contains("[REDACTED]"));
+            assert!(!content.contains("sk-abc123"));
+
+            // Header should indicate redacted
+            let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(header["redacted"], true);
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_with_pane_filter() {
+        run_async_test(async {
+            let tmp = std::env::temp_dir()
+                .join(format!("wa_test_export_filter_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+
+            // Insert two panes
+            for pane_id in [1u64, 2u64] {
+                let pane = crate::storage::PaneRecord {
+                    pane_id,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1000,
+                    last_seen_at: 1000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                };
+                storage.upsert_pane(pane).await.unwrap();
+            }
+
+            storage.append_segment(1, "pane1 data", None).await.unwrap();
+            storage.append_segment(2, "pane2 data", None).await.unwrap();
+
+            // Export only pane 1
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery {
+                    pane_id: Some(1),
+                    ..Default::default()
+                },
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 1);
+
+            let output = String::from_utf8(buf).unwrap();
+            assert!(output.contains("pane1 data"));
+            assert!(!output.contains("pane2 data"));
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_pretty_format() {
         run_async_test(async {
-        let tmp =
-            std::env::temp_dir().join(format!("wa_test_export_pretty_{}.db", std::process::id()));
-        let db_path = tmp.to_string_lossy().to_string();
+            let tmp = std::env::temp_dir()
+                .join(format!("wa_test_export_pretty_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
 
-        let storage = StorageHandle::new(&db_path).await.unwrap();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
 
-        let pane = crate::storage::PaneRecord {
-            pane_id: 1,
-            pane_uuid: None,
-            domain: "local".to_string(),
-            window_id: None,
-            tab_id: None,
-            title: None,
-            cwd: None,
-            tty_name: None,
-            first_seen_at: 1000,
-            last_seen_at: 1000,
-            observed: true,
-            ignore_reason: None,
-            last_decision_at: None,
-        };
-        storage.upsert_pane(pane).await.unwrap();
-        storage.append_segment(1, "test", None).await.unwrap();
+            let pane = crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1000,
+                last_seen_at: 1000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+            storage.append_segment(1, "test", None).await.unwrap();
 
-        let opts = ExportOptions {
-            kind: ExportKind::Segments,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: true,
-        };
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: true,
+            };
 
-        let mut buf = Vec::new();
-        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
 
-        let output = String::from_utf8(buf).unwrap();
-        // Pretty format should have indentation
-        assert!(output.contains("  \""));
+            let output = String::from_utf8(buf).unwrap();
+            // Pretty format should have indentation
+            assert!(output.contains("  \""));
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_audit_with_actor_filter() {
         run_async_test(async {
-        let tmp =
-            std::env::temp_dir().join(format!("wa_test_export_audit_{}.db", std::process::id()));
-        let db_path = tmp.to_string_lossy().to_string();
+            let tmp = std::env::temp_dir()
+                .join(format!("wa_test_export_audit_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
 
-        let storage = StorageHandle::new(&db_path).await.unwrap();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
 
-        // Insert a pane (required for FK)
-        let pane = crate::storage::PaneRecord {
-            pane_id: 1,
-            pane_uuid: None,
-            domain: "local".to_string(),
-            window_id: None,
-            tab_id: None,
-            title: None,
-            cwd: None,
-            tty_name: None,
-            first_seen_at: 1000,
-            last_seen_at: 1000,
-            observed: true,
-            ignore_reason: None,
-            last_decision_at: None,
-        };
-        storage.upsert_pane(pane).await.unwrap();
+            // Insert a pane (required for FK)
+            let pane = crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1000,
+                last_seen_at: 1000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
 
-        // Insert two audit actions with different actor_kinds
-        let action1 = crate::storage::AuditActionRecord {
-            id: 0,
-            ts: 1000,
-            actor_kind: "workflow".to_string(),
-            actor_id: Some("wf-1".to_string()),
-            correlation_id: None,
-            pane_id: Some(1),
-            domain: Some("local".to_string()),
-            action_kind: "auth_required".to_string(),
-            policy_decision: "allow".to_string(),
-            decision_reason: None,
-            rule_id: None,
-            input_summary: None,
-            verification_summary: None,
-            decision_context: None,
-            result: "ok".to_string(),
-        };
-        storage.record_audit_action(action1).await.unwrap();
+            // Insert two audit actions with different actor_kinds
+            let action1 = crate::storage::AuditActionRecord {
+                id: 0,
+                ts: 1000,
+                actor_kind: "workflow".to_string(),
+                actor_id: Some("wf-1".to_string()),
+                correlation_id: None,
+                pane_id: Some(1),
+                domain: Some("local".to_string()),
+                action_kind: "auth_required".to_string(),
+                policy_decision: "allow".to_string(),
+                decision_reason: None,
+                rule_id: None,
+                input_summary: None,
+                verification_summary: None,
+                decision_context: None,
+                result: "ok".to_string(),
+            };
+            storage.record_audit_action(action1).await.unwrap();
 
-        let action2 = crate::storage::AuditActionRecord {
-            id: 0,
-            ts: 2000,
-            actor_kind: "operator".to_string(),
-            actor_id: Some("human-1".to_string()),
-            correlation_id: None,
-            pane_id: Some(1),
-            domain: Some("local".to_string()),
-            action_kind: "send_text".to_string(),
-            policy_decision: "allow".to_string(),
-            decision_reason: None,
-            rule_id: None,
-            input_summary: None,
-            verification_summary: None,
-            decision_context: None,
-            result: "ok".to_string(),
-        };
-        storage.record_audit_action(action2).await.unwrap();
+            let action2 = crate::storage::AuditActionRecord {
+                id: 0,
+                ts: 2000,
+                actor_kind: "operator".to_string(),
+                actor_id: Some("human-1".to_string()),
+                correlation_id: None,
+                pane_id: Some(1),
+                domain: Some("local".to_string()),
+                action_kind: "send_text".to_string(),
+                policy_decision: "allow".to_string(),
+                decision_reason: None,
+                rule_id: None,
+                input_summary: None,
+                verification_summary: None,
+                decision_context: None,
+                result: "ok".to_string(),
+            };
+            storage.record_audit_action(action2).await.unwrap();
 
-        // Export with actor filter = "workflow"
-        let opts = ExportOptions {
-            kind: ExportKind::Audit,
-            query: ExportQuery::default(),
-            audit_actor: Some("workflow".to_string()),
-            audit_action: None,
-            redact: true,
-            pretty: false,
-        };
+            // Export with actor filter = "workflow"
+            let opts = ExportOptions {
+                kind: ExportKind::Audit,
+                query: ExportQuery::default(),
+                audit_actor: Some("workflow".to_string()),
+                audit_action: None,
+                redact: true,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-        assert_eq!(count, 1);
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 1);
 
-        let output = String::from_utf8(buf).unwrap();
-        let lines: Vec<&str> = output.trim().lines().collect();
-        assert_eq!(lines.len(), 2); // header + 1 record
+            let output = String::from_utf8(buf).unwrap();
+            let lines: Vec<&str> = output.trim().lines().collect();
+            assert_eq!(lines.len(), 2); // header + 1 record
 
-        // Verify the record is the workflow one
-        let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(record["actor_kind"], "workflow");
-        assert_eq!(record["action_kind"], "auth_required");
+            // Verify the record is the workflow one
+            let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            assert_eq!(record["actor_kind"], "workflow");
+            assert_eq!(record["action_kind"], "auth_required");
 
-        // Export with action filter = "send_text"
-        let opts2 = ExportOptions {
-            kind: ExportKind::Audit,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: Some("send_text".to_string()),
-            redact: true,
-            pretty: false,
-        };
+            // Export with action filter = "send_text"
+            let opts2 = ExportOptions {
+                kind: ExportKind::Audit,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: Some("send_text".to_string()),
+                redact: true,
+                pretty: false,
+            };
 
-        let mut buf2 = Vec::new();
-        let count2 = export_jsonl(&storage, &opts2, &mut buf2).await.unwrap();
-        assert_eq!(count2, 1);
+            let mut buf2 = Vec::new();
+            let count2 = export_jsonl(&storage, &opts2, &mut buf2).await.unwrap();
+            assert_eq!(count2, 1);
 
-        let output2 = String::from_utf8(buf2).unwrap();
-        let lines2: Vec<&str> = output2.trim().lines().collect();
-        let record2: serde_json::Value = serde_json::from_str(lines2[1]).unwrap();
-        assert_eq!(record2["actor_kind"], "operator");
-        assert_eq!(record2["action_kind"], "send_text");
+            let output2 = String::from_utf8(buf2).unwrap();
+            let lines2: Vec<&str> = output2.trim().lines().collect();
+            let record2: serde_json::Value = serde_json::from_str(lines2[1]).unwrap();
+            assert_eq!(record2["actor_kind"], "operator");
+            assert_eq!(record2["action_kind"], "send_text");
 
-        // Export all audit (no actor/action filter) should return 2
-        let opts3 = ExportOptions {
-            kind: ExportKind::Audit,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: true,
-            pretty: false,
-        };
+            // Export all audit (no actor/action filter) should return 2
+            let opts3 = ExportOptions {
+                kind: ExportKind::Audit,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: true,
+                pretty: false,
+            };
 
-        let mut buf3 = Vec::new();
-        let count3 = export_jsonl(&storage, &opts3, &mut buf3).await.unwrap();
-        assert_eq!(count3, 2);
+            let mut buf3 = Vec::new();
+            let count3 = export_jsonl(&storage, &opts3, &mut buf3).await.unwrap();
+            assert_eq!(count3, 2);
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_audit_redacts_fields() {
         run_async_test(async {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_export_audit_redact_{}.db",
-            std::process::id()
-        ));
-        let db_path = tmp.to_string_lossy().to_string();
+            let tmp = std::env::temp_dir().join(format!(
+                "wa_test_export_audit_redact_{}.db",
+                std::process::id()
+            ));
+            let db_path = tmp.to_string_lossy().to_string();
 
-        let storage = StorageHandle::new(&db_path).await.unwrap();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
 
-        let pane = crate::storage::PaneRecord {
-            pane_id: 1,
-            pane_uuid: None,
-            domain: "local".to_string(),
-            window_id: None,
-            tab_id: None,
-            title: None,
-            cwd: None,
-            tty_name: None,
-            first_seen_at: 1000,
-            last_seen_at: 1000,
-            observed: true,
-            ignore_reason: None,
-            last_decision_at: None,
-        };
-        storage.upsert_pane(pane).await.unwrap();
+            let pane = crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1000,
+                last_seen_at: 1000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
 
-        let action = crate::storage::AuditActionRecord {
-            id: 0,
-            ts: 1000,
-            actor_kind: "workflow".to_string(),
-            actor_id: None,
-            correlation_id: None,
-            pane_id: Some(1),
-            domain: None,
-            action_kind: "test".to_string(),
-            policy_decision: "allow".to_string(),
-            decision_reason: Some(
-                "API key: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
-            ),
-            rule_id: None,
-            input_summary: Some(
-                "input with sk-abc123def456ghi789jkl012mno345pqr678stu901v secret".to_string(),
-            ),
-            verification_summary: None,
-            decision_context: None,
-            result: "ok".to_string(),
-        };
-        storage.record_audit_action(action).await.unwrap();
+            let action = crate::storage::AuditActionRecord {
+                id: 0,
+                ts: 1000,
+                actor_kind: "workflow".to_string(),
+                actor_id: None,
+                correlation_id: None,
+                pane_id: Some(1),
+                domain: None,
+                action_kind: "test".to_string(),
+                policy_decision: "allow".to_string(),
+                decision_reason: Some(
+                    "API key: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
+                ),
+                rule_id: None,
+                input_summary: Some(
+                    "input with sk-abc123def456ghi789jkl012mno345pqr678stu901v secret".to_string(),
+                ),
+                verification_summary: None,
+                decision_context: None,
+                result: "ok".to_string(),
+            };
+            storage.record_audit_action(action).await.unwrap();
 
-        let opts = ExportOptions {
-            kind: ExportKind::Audit,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: true,
-            pretty: false,
-        };
+            let opts = ExportOptions {
+                kind: ExportKind::Audit,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: true,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
 
-        let output = String::from_utf8(buf).unwrap();
-        let lines: Vec<&str> = output.trim().lines().collect();
-        let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            let output = String::from_utf8(buf).unwrap();
+            let lines: Vec<&str> = output.trim().lines().collect();
+            let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
 
-        // Decision reason and input summary should be redacted
-        let reason = record["decision_reason"].as_str().unwrap();
-        assert!(reason.contains("[REDACTED]"));
-        assert!(!reason.contains("sk-abc123"));
+            // Decision reason and input summary should be redacted
+            let reason = record["decision_reason"].as_str().unwrap();
+            assert!(reason.contains("[REDACTED]"));
+            assert!(!reason.contains("sk-abc123"));
 
-        let summary = record["input_summary"].as_str().unwrap();
-        assert!(summary.contains("[REDACTED]"));
-        assert!(!summary.contains("sk-abc123"));
+            let summary = record["input_summary"].as_str().unwrap();
+            assert!(summary.contains("[REDACTED]"));
+            assert!(!summary.contains("sk-abc123"));
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
@@ -1630,478 +1631,478 @@ mod tests {
     #[test]
     fn export_empty_produces_header_only() {
         run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("empty").await;
+            let (storage, tmp) = test_db_with_pane("empty").await;
 
-        // Export events (none exist) — should produce header with count=0
-        let opts = ExportOptions {
-            kind: ExportKind::Events,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
+            // Export events (none exist) — should produce header with count=0
+            let opts = ExportOptions {
+                kind: ExportKind::Events,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-        assert_eq!(count, 0);
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 0);
 
-        let output = String::from_utf8(buf).unwrap();
-        let (header, records) = parse_jsonl(&output);
-        assert_eq!(header["_export"], true);
-        assert_eq!(header["kind"], "events");
-        assert_eq!(header["record_count"], 0);
-        assert!(records.is_empty());
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_eq!(header["_export"], true);
+            assert_eq!(header["kind"], "events");
+            assert_eq!(header["record_count"], 0);
+            assert!(records.is_empty());
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_gaps_end_to_end() {
         run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("gaps").await;
+            let (storage, tmp) = test_db_with_pane("gaps").await;
 
-        // Need a segment first (record_gap requires last_seq)
-        storage.append_segment(1, "before gap", None).await.unwrap();
-        // Record a gap
-        let gap = storage.record_gap(1, "timeout").await.unwrap();
-        assert!(gap.is_some(), "Gap should be recorded after segment exists");
+            // Need a segment first (record_gap requires last_seq)
+            storage.append_segment(1, "before gap", None).await.unwrap();
+            // Record a gap
+            let gap = storage.record_gap(1, "timeout").await.unwrap();
+            assert!(gap.is_some(), "Gap should be recorded after segment exists");
 
-        let opts = ExportOptions {
-            kind: ExportKind::Gaps,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
+            let opts = ExportOptions {
+                kind: ExportKind::Gaps,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-        assert_eq!(count, 1);
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 1);
 
-        let output = String::from_utf8(buf).unwrap();
-        let (header, records) = parse_jsonl(&output);
-        assert_fields_present(&header, &expected_header_fields(), "Gap export header");
-        assert_eq!(header["kind"], "gaps");
-        assert_eq!(records.len(), 1);
-        assert_fields_present(&records[0], &expected_gap_fields(), "Gap record");
-        assert_eq!(records[0]["reason"], "timeout");
-        assert_eq!(records[0]["pane_id"], 1);
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_fields_present(&header, &expected_header_fields(), "Gap export header");
+            assert_eq!(header["kind"], "gaps");
+            assert_eq!(records.len(), 1);
+            assert_fields_present(&records[0], &expected_gap_fields(), "Gap record");
+            assert_eq!(records[0]["reason"], "timeout");
+            assert_eq!(records[0]["pane_id"], 1);
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_events_end_to_end() {
         run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("events_e2e").await;
+            let (storage, tmp) = test_db_with_pane("events_e2e").await;
 
-        let event = StoredEvent {
-            id: 0,
-            pane_id: 1,
-            rule_id: "api_key_leak".to_string(),
-            agent_type: "claude_code".to_string(),
-            event_type: "secret_detected".to_string(),
-            severity: "critical".to_string(),
-            confidence: 0.95,
-            extracted: Some(serde_json::json!({"type": "openai_key"})),
-            matched_text: Some("sk-test123".to_string()),
-            segment_id: None,
-            detected_at: 1000,
-            dedupe_key: None,
-            handled_at: None,
-            handled_by_workflow_id: None,
-            handled_status: None,
-        };
-        storage.record_event(event).await.unwrap();
+            let event = StoredEvent {
+                id: 0,
+                pane_id: 1,
+                rule_id: "api_key_leak".to_string(),
+                agent_type: "claude_code".to_string(),
+                event_type: "secret_detected".to_string(),
+                severity: "critical".to_string(),
+                confidence: 0.95,
+                extracted: Some(serde_json::json!({"type": "openai_key"})),
+                matched_text: Some("sk-test123".to_string()),
+                segment_id: None,
+                detected_at: 1000,
+                dedupe_key: None,
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            };
+            storage.record_event(event).await.unwrap();
 
-        let opts = ExportOptions {
-            kind: ExportKind::Events,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
+            let opts = ExportOptions {
+                kind: ExportKind::Events,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-        assert_eq!(count, 1);
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 1);
 
-        let output = String::from_utf8(buf).unwrap();
-        let (header, records) = parse_jsonl(&output);
-        assert_eq!(header["kind"], "events");
-        assert_fields_present(&records[0], &expected_event_fields(), "Event record");
-        assert_eq!(records[0]["event_type"], "secret_detected");
-        assert_eq!(records[0]["severity"], "critical");
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_eq!(header["kind"], "events");
+            assert_fields_present(&records[0], &expected_event_fields(), "Event record");
+            assert_eq!(records[0]["event_type"], "secret_detected");
+            assert_eq!(records[0]["severity"], "critical");
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_events_with_redaction() {
         run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("events_redact").await;
+            let (storage, tmp) = test_db_with_pane("events_redact").await;
 
-        let event = StoredEvent {
-            id: 0,
-            pane_id: 1,
-            rule_id: "leak".to_string(),
-            agent_type: "codex".to_string(),
-            event_type: "secret".to_string(),
-            severity: "high".to_string(),
-            confidence: 1.0,
-            extracted: Some(
-                serde_json::json!({"key": "sk-abc123def456ghi789jkl012mno345pqr678stu901v"}),
-            ),
-            matched_text: Some(
-                "Found sk-abc123def456ghi789jkl012mno345pqr678stu901v in output".to_string(),
-            ),
-            segment_id: None,
-            detected_at: 1000,
-            dedupe_key: None,
-            handled_at: None,
-            handled_by_workflow_id: None,
-            handled_status: None,
-        };
-        storage.record_event(event).await.unwrap();
+            let event = StoredEvent {
+                id: 0,
+                pane_id: 1,
+                rule_id: "leak".to_string(),
+                agent_type: "codex".to_string(),
+                event_type: "secret".to_string(),
+                severity: "high".to_string(),
+                confidence: 1.0,
+                extracted: Some(
+                    serde_json::json!({"key": "sk-abc123def456ghi789jkl012mno345pqr678stu901v"}),
+                ),
+                matched_text: Some(
+                    "Found sk-abc123def456ghi789jkl012mno345pqr678stu901v in output".to_string(),
+                ),
+                segment_id: None,
+                detected_at: 1000,
+                dedupe_key: None,
+                handled_at: None,
+                handled_by_workflow_id: None,
+                handled_status: None,
+            };
+            storage.record_event(event).await.unwrap();
 
-        let opts = ExportOptions {
-            kind: ExportKind::Events,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: true,
-            pretty: false,
-        };
+            let opts = ExportOptions {
+                kind: ExportKind::Events,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: true,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
 
-        let output = String::from_utf8(buf).unwrap();
-        let (_header, records) = parse_jsonl(&output);
-        let matched = records[0]["matched_text"].as_str().unwrap();
-        assert!(matched.contains("[REDACTED]"));
-        assert!(!matched.contains("sk-abc123"));
+            let output = String::from_utf8(buf).unwrap();
+            let (_header, records) = parse_jsonl(&output);
+            let matched = records[0]["matched_text"].as_str().unwrap();
+            assert!(matched.contains("[REDACTED]"));
+            assert!(!matched.contains("sk-abc123"));
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_sessions_end_to_end() {
         run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("sessions").await;
+            let (storage, tmp) = test_db_with_pane("sessions").await;
 
-        let session = crate::storage::AgentSessionRecord {
-            id: 0,
-            pane_id: 1,
-            agent_type: "codex".to_string(),
-            session_id: Some("sess-42".to_string()),
-            external_id: None,
-            external_meta: None,
-            started_at: 1000,
-            ended_at: Some(5000),
-            end_reason: Some("completed".to_string()),
-            total_tokens: Some(2000),
-            input_tokens: Some(1500),
-            output_tokens: Some(500),
-            cached_tokens: None,
-            reasoning_tokens: None,
-            model_name: Some("gpt-4".to_string()),
-            estimated_cost_usd: None,
-        };
-        storage.upsert_agent_session(session).await.unwrap();
+            let session = crate::storage::AgentSessionRecord {
+                id: 0,
+                pane_id: 1,
+                agent_type: "codex".to_string(),
+                session_id: Some("sess-42".to_string()),
+                external_id: None,
+                external_meta: None,
+                started_at: 1000,
+                ended_at: Some(5000),
+                end_reason: Some("completed".to_string()),
+                total_tokens: Some(2000),
+                input_tokens: Some(1500),
+                output_tokens: Some(500),
+                cached_tokens: None,
+                reasoning_tokens: None,
+                model_name: Some("gpt-4".to_string()),
+                estimated_cost_usd: None,
+            };
+            storage.upsert_agent_session(session).await.unwrap();
 
-        let opts = ExportOptions {
-            kind: ExportKind::Sessions,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
+            let opts = ExportOptions {
+                kind: ExportKind::Sessions,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-        assert_eq!(count, 1);
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 1);
 
-        let output = String::from_utf8(buf).unwrap();
-        let (header, records) = parse_jsonl(&output);
-        assert_eq!(header["kind"], "sessions");
-        assert_fields_present(&records[0], &expected_session_fields(), "Session record");
-        assert_eq!(records[0]["agent_type"], "codex");
-        assert_eq!(records[0]["model_name"], "gpt-4");
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_eq!(header["kind"], "sessions");
+            assert_fields_present(&records[0], &expected_session_fields(), "Session record");
+            assert_eq!(records[0]["agent_type"], "codex");
+            assert_eq!(records[0]["model_name"], "gpt-4");
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_reservations_end_to_end() {
         run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("reservations").await;
+            let (storage, tmp) = test_db_with_pane("reservations").await;
 
-        storage
-            .create_reservation(1, "workflow", "wf-auth-fix", Some("fixing auth"), 60_000)
-            .await
-            .unwrap();
+            storage
+                .create_reservation(1, "workflow", "wf-auth-fix", Some("fixing auth"), 60_000)
+                .await
+                .unwrap();
 
-        let opts = ExportOptions {
-            kind: ExportKind::Reservations,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
+            let opts = ExportOptions {
+                kind: ExportKind::Reservations,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-        assert_eq!(count, 1);
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            assert_eq!(count, 1);
 
-        let output = String::from_utf8(buf).unwrap();
-        let (header, records) = parse_jsonl(&output);
-        assert_eq!(header["kind"], "reservations");
-        assert_fields_present(
-            &records[0],
-            &expected_reservation_fields(),
-            "Reservation record",
-        );
-        assert_eq!(records[0]["owner_kind"], "workflow");
-        assert_eq!(records[0]["owner_id"], "wf-auth-fix");
-        assert_eq!(records[0]["reason"], "fixing auth");
-        assert_eq!(records[0]["status"], "active");
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_eq!(header["kind"], "reservations");
+            assert_fields_present(
+                &records[0],
+                &expected_reservation_fields(),
+                "Reservation record",
+            );
+            assert_eq!(records[0]["owner_kind"], "workflow");
+            assert_eq!(records[0]["owner_id"], "wf-auth-fix");
+            assert_eq!(records[0]["reason"], "fixing auth");
+            assert_eq!(records[0]["status"], "active");
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_workflows_with_step_logs() {
         run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("workflows").await;
+            let (storage, tmp) = test_db_with_pane("workflows").await;
 
-        let wf = crate::storage::WorkflowRecord {
-            id: "wf-test-1".to_string(),
-            workflow_name: "auth_recovery".to_string(),
-            pane_id: 1,
-            trigger_event_id: None,
-            current_step: 1,
-            status: "running".to_string(),
-            wait_condition: None,
-            context: None,
-            result: None,
-            error: None,
-            started_at: 1000,
-            updated_at: 2000,
-            completed_at: None,
-        };
-        storage.upsert_workflow(wf).await.unwrap();
+            let wf = crate::storage::WorkflowRecord {
+                id: "wf-test-1".to_string(),
+                workflow_name: "auth_recovery".to_string(),
+                pane_id: 1,
+                trigger_event_id: None,
+                current_step: 1,
+                status: "running".to_string(),
+                wait_condition: None,
+                context: None,
+                result: None,
+                error: None,
+                started_at: 1000,
+                updated_at: 2000,
+                completed_at: None,
+            };
+            storage.upsert_workflow(wf).await.unwrap();
 
-        storage
-            .insert_step_log(
-                "wf-test-1",
-                None,
-                0,
-                "wait_for_prompt",
-                Some("s0".to_string()),
-                Some("wait_for".to_string()),
-                "continue",
-                Some("matched prompt".to_string()),
-                None,
-                None,
-                None,
-                1000,
-                1500,
-            )
-            .await
-            .unwrap();
+            storage
+                .insert_step_log(
+                    "wf-test-1",
+                    None,
+                    0,
+                    "wait_for_prompt",
+                    Some("s0".to_string()),
+                    Some("wait_for".to_string()),
+                    "continue",
+                    Some("matched prompt".to_string()),
+                    None,
+                    None,
+                    None,
+                    1000,
+                    1500,
+                )
+                .await
+                .unwrap();
 
-        let opts = ExportOptions {
-            kind: ExportKind::Workflows,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
+            let opts = ExportOptions {
+                kind: ExportKind::Workflows,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-        // count reflects workflow records (not step logs)
-        assert_eq!(count, 1);
+            let mut buf = Vec::new();
+            let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            // count reflects workflow records (not step logs)
+            assert_eq!(count, 1);
 
-        let output = String::from_utf8(buf).unwrap();
-        let (header, records) = parse_jsonl(&output);
-        assert_eq!(header["kind"], "workflows");
-        // Should have workflow record + step log record = 2 data lines
-        assert_eq!(records.len(), 2);
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
+            assert_eq!(header["kind"], "workflows");
+            // Should have workflow record + step log record = 2 data lines
+            assert_eq!(records.len(), 2);
 
-        // First record is the workflow
-        assert_fields_present(&records[0], &expected_workflow_fields(), "Workflow record");
-        assert_eq!(records[0]["workflow_name"], "auth_recovery");
-        assert_eq!(records[0]["status"], "running");
+            // First record is the workflow
+            assert_fields_present(&records[0], &expected_workflow_fields(), "Workflow record");
+            assert_eq!(records[0]["workflow_name"], "auth_recovery");
+            assert_eq!(records[0]["status"], "running");
 
-        // Second record is the step log
-        assert_fields_present(&records[1], &expected_step_log_fields(), "Step log record");
-        assert_eq!(records[1]["step_name"], "wait_for_prompt");
-        assert_eq!(records[1]["result_type"], "continue");
+            // Second record is the step log
+            assert_fields_present(&records[1], &expected_step_log_fields(), "Step log record");
+            assert_eq!(records[1]["step_name"], "wait_for_prompt");
+            assert_eq!(records[1]["result_type"], "continue");
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_workflows_redacts_step_logs() {
         run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("wf_redact").await;
+            let (storage, tmp) = test_db_with_pane("wf_redact").await;
 
-        let wf = crate::storage::WorkflowRecord {
-            id: "wf-redact-1".to_string(),
-            workflow_name: "fix_leak".to_string(),
-            pane_id: 1,
-            trigger_event_id: None,
-            current_step: 0,
-            status: "completed".to_string(),
-            wait_condition: None,
-            context: None,
-            result: None,
-            error: None,
-            started_at: 1000,
-            updated_at: 2000,
-            completed_at: Some(2000),
-        };
-        storage.upsert_workflow(wf).await.unwrap();
+            let wf = crate::storage::WorkflowRecord {
+                id: "wf-redact-1".to_string(),
+                workflow_name: "fix_leak".to_string(),
+                pane_id: 1,
+                trigger_event_id: None,
+                current_step: 0,
+                status: "completed".to_string(),
+                wait_condition: None,
+                context: None,
+                result: None,
+                error: None,
+                started_at: 1000,
+                updated_at: 2000,
+                completed_at: Some(2000),
+            };
+            storage.upsert_workflow(wf).await.unwrap();
 
-        storage
-            .insert_step_log(
-                "wf-redact-1",
-                None,
-                0,
-                "check",
-                None,
-                None,
-                "done",
-                Some("key sk-abc123def456ghi789jkl012mno345pqr678stu901v found".to_string()),
-                Some("policy: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012".to_string()),
-                None,
-                None,
-                1000,
-                2000,
-            )
-            .await
-            .unwrap();
+            storage
+                .insert_step_log(
+                    "wf-redact-1",
+                    None,
+                    0,
+                    "check",
+                    None,
+                    None,
+                    "done",
+                    Some("key sk-abc123def456ghi789jkl012mno345pqr678stu901v found".to_string()),
+                    Some("policy: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012".to_string()),
+                    None,
+                    None,
+                    1000,
+                    2000,
+                )
+                .await
+                .unwrap();
 
-        let opts = ExportOptions {
-            kind: ExportKind::Workflows,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: true,
-            pretty: false,
-        };
+            let opts = ExportOptions {
+                kind: ExportKind::Workflows,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: true,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
 
-        let output = String::from_utf8(buf).unwrap();
-        let (_header, records) = parse_jsonl(&output);
-        assert_eq!(records.len(), 2);
+            let output = String::from_utf8(buf).unwrap();
+            let (_header, records) = parse_jsonl(&output);
+            assert_eq!(records.len(), 2);
 
-        // Step log (second record) should be redacted
-        let step = &records[1];
-        let result_data = step["result_data"].as_str().unwrap();
-        assert!(result_data.contains("[REDACTED]"));
-        assert!(!result_data.contains("sk-abc123"));
+            // Step log (second record) should be redacted
+            let step = &records[1];
+            let result_data = step["result_data"].as_str().unwrap();
+            assert!(result_data.contains("[REDACTED]"));
+            assert!(!result_data.contains("sk-abc123"));
 
-        let policy = step["policy_summary"].as_str().unwrap();
-        assert!(policy.contains("[REDACTED]"));
-        assert!(!policy.contains("ghp_"));
+            let policy = step["policy_summary"].as_str().unwrap();
+            assert!(policy.contains("[REDACTED]"));
+            assert!(!policy.contains("ghp_"));
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_segment_schema_validation() {
         run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("seg_schema").await;
-        storage
-            .append_segment(1, "schema test content", None)
-            .await
-            .unwrap();
+            let (storage, tmp) = test_db_with_pane("seg_schema").await;
+            storage
+                .append_segment(1, "schema test content", None)
+                .await
+                .unwrap();
 
-        let opts = ExportOptions {
-            kind: ExportKind::Segments,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
 
-        let output = String::from_utf8(buf).unwrap();
-        let (header, records) = parse_jsonl(&output);
+            let output = String::from_utf8(buf).unwrap();
+            let (header, records) = parse_jsonl(&output);
 
-        // Validate header schema
-        assert_fields_present(&header, &expected_header_fields(), "Segment export header");
-        assert_eq!(header["_export"], true);
-        assert_eq!(header["kind"], "segments");
-        assert!(!header["version"].as_str().unwrap().is_empty());
+            // Validate header schema
+            assert_fields_present(&header, &expected_header_fields(), "Segment export header");
+            assert_eq!(header["_export"], true);
+            assert_eq!(header["kind"], "segments");
+            assert!(!header["version"].as_str().unwrap().is_empty());
 
-        // Validate record schema
-        assert_eq!(records.len(), 1);
-        assert_fields_present(&records[0], &expected_segment_fields(), "Segment record");
-        assert_eq!(records[0]["content"], "schema test content");
+            // Validate record schema
+            assert_eq!(records.len(), 1);
+            assert_fields_present(&records[0], &expected_segment_fields(), "Segment record");
+            assert_eq!(records[0]["content"], "schema test content");
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_header_version_matches_crate() {
         run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("version").await;
+            let (storage, tmp) = test_db_with_pane("version").await;
 
-        let opts = ExportOptions {
-            kind: ExportKind::Segments,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
 
-        let output = String::from_utf8(buf).unwrap();
-        let (header, _) = parse_jsonl(&output);
-        assert_eq!(
-            header["version"].as_str().unwrap(),
-            crate::VERSION,
-            "Export header version must match crate VERSION"
-        );
+            let output = String::from_utf8(buf).unwrap();
+            let (header, _) = parse_jsonl(&output);
+            assert_eq!(
+                header["version"].as_str().unwrap(),
+                crate::VERSION,
+                "Export header version must match crate VERSION"
+            );
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
@@ -2660,147 +2661,17 @@ mod tests {
     #[test]
     fn export_multiple_segments_count() {
         run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("multi_seg").await;
+            let (storage, tmp) = test_db_with_pane("multi_seg").await;
 
-        for i in 0..5 {
-            storage
-                .append_segment(1, &format!("segment content {}", i), None)
-                .await
-                .unwrap();
-        }
+            for i in 0..5 {
+                storage
+                    .append_segment(1, &format!("segment content {}", i), None)
+                    .await
+                    .unwrap();
+            }
 
-        let opts = ExportOptions {
-            kind: ExportKind::Segments,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
-
-        let mut buf = Vec::new();
-        let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-        assert_eq!(count, 5);
-
-        let output = String::from_utf8(buf).unwrap();
-        let (header, records) = parse_jsonl(&output);
-        assert_eq!(header["record_count"], 5);
-        assert_eq!(records.len(), 5);
-        // Verify all segments are present
-        for i in 0..5 {
-            let expected = format!("segment content {}", i);
-            assert!(
-                records.iter().any(|r| r["content"] == expected),
-                "Missing segment content {}",
-                i
-            );
-        }
-
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
-        });
-    }
-
-    #[test]
-    fn export_header_exported_at_ms_is_recent() {
-        run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("timestamp").await;
-
-        let before_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-
-        let opts = ExportOptions {
-            kind: ExportKind::Segments,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
-
-        let mut buf = Vec::new();
-        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-
-        let after_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-
-        let output = String::from_utf8(buf).unwrap();
-        let (header, _) = parse_jsonl(&output);
-        let exported_at = header["exported_at_ms"].as_i64().unwrap();
-        assert!(
-            exported_at >= before_ms,
-            "exported_at_ms ({}) should be >= before ({})",
-            exported_at,
-            before_ms
-        );
-        assert!(
-            exported_at <= after_ms,
-            "exported_at_ms ({}) should be <= after ({})",
-            exported_at,
-            after_ms
-        );
-
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
-        });
-    }
-
-    #[test]
-    fn export_header_reflects_query_filters() {
-        run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("query_hdr").await;
-
-        let opts = ExportOptions {
-            kind: ExportKind::Segments,
-            query: ExportQuery {
-                pane_id: Some(42),
-                since: Some(1000),
-                until: Some(9000),
-                limit: Some(25),
-            },
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
-
-        let mut buf = Vec::new();
-        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-
-        let output = String::from_utf8(buf).unwrap();
-        let (header, _) = parse_jsonl(&output);
-        assert_eq!(header["pane_id"], 42);
-        assert_eq!(header["since"], 1000);
-        assert_eq!(header["until"], 9000);
-        assert_eq!(header["limit"], 25);
-
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
-        });
-    }
-
-    #[test]
-    fn export_empty_all_kinds_produce_header() {
-        run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("empty_all").await;
-
-        let kinds = [
-            ExportKind::Segments,
-            ExportKind::Gaps,
-            ExportKind::Events,
-            ExportKind::Workflows,
-            ExportKind::Sessions,
-            ExportKind::Audit,
-            ExportKind::Reservations,
-        ];
-
-        for kind in &kinds {
             let opts = ExportOptions {
-                kind: *kind,
+                kind: ExportKind::Segments,
                 query: ExportQuery::default(),
                 audit_actor: None,
                 audit_action: None,
@@ -2810,74 +2681,204 @@ mod tests {
 
             let mut buf = Vec::new();
             let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-            assert_eq!(
-                count,
-                0,
-                "Empty DB should have 0 records for kind {}",
-                kind.as_str()
-            );
+            assert_eq!(count, 5);
 
             let output = String::from_utf8(buf).unwrap();
             let (header, records) = parse_jsonl(&output);
-            assert_eq!(
-                header["kind"],
-                kind.as_str(),
-                "Header kind mismatch for {}",
-                kind.as_str()
-            );
-            assert_eq!(
-                header["record_count"],
-                0,
-                "Header record_count should be 0 for {}",
-                kind.as_str()
+            assert_eq!(header["record_count"], 5);
+            assert_eq!(records.len(), 5);
+            // Verify all segments are present
+            for i in 0..5 {
+                let expected = format!("segment content {}", i);
+                assert!(
+                    records.iter().any(|r| r["content"] == expected),
+                    "Missing segment content {}",
+                    i
+                );
+            }
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_header_exported_at_ms_is_recent() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("timestamp").await;
+
+            let before_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let after_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, _) = parse_jsonl(&output);
+            let exported_at = header["exported_at_ms"].as_i64().unwrap();
+            assert!(
+                exported_at >= before_ms,
+                "exported_at_ms ({}) should be >= before ({})",
+                exported_at,
+                before_ms
             );
             assert!(
-                records.is_empty(),
-                "No data records expected for {}",
-                kind.as_str()
+                exported_at <= after_ms,
+                "exported_at_ms ({}) should be <= after ({})",
+                exported_at,
+                after_ms
             );
-        }
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_header_reflects_query_filters() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("query_hdr").await;
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery {
+                    pane_id: Some(42),
+                    since: Some(1000),
+                    until: Some(9000),
+                    limit: Some(25),
+                },
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+
+            let output = String::from_utf8(buf).unwrap();
+            let (header, _) = parse_jsonl(&output);
+            assert_eq!(header["pane_id"], 42);
+            assert_eq!(header["since"], 1000);
+            assert_eq!(header["until"], 9000);
+            assert_eq!(header["limit"], 25);
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    #[test]
+    fn export_empty_all_kinds_produce_header() {
+        run_async_test(async {
+            let (storage, tmp) = test_db_with_pane("empty_all").await;
+
+            let kinds = [
+                ExportKind::Segments,
+                ExportKind::Gaps,
+                ExportKind::Events,
+                ExportKind::Workflows,
+                ExportKind::Sessions,
+                ExportKind::Audit,
+                ExportKind::Reservations,
+            ];
+
+            for kind in &kinds {
+                let opts = ExportOptions {
+                    kind: *kind,
+                    query: ExportQuery::default(),
+                    audit_actor: None,
+                    audit_action: None,
+                    redact: false,
+                    pretty: false,
+                };
+
+                let mut buf = Vec::new();
+                let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+                assert_eq!(
+                    count,
+                    0,
+                    "Empty DB should have 0 records for kind {}",
+                    kind.as_str()
+                );
+
+                let output = String::from_utf8(buf).unwrap();
+                let (header, records) = parse_jsonl(&output);
+                assert_eq!(
+                    header["kind"],
+                    kind.as_str(),
+                    "Header kind mismatch for {}",
+                    kind.as_str()
+                );
+                assert_eq!(
+                    header["record_count"],
+                    0,
+                    "Header record_count should be 0 for {}",
+                    kind.as_str()
+                );
+                assert!(
+                    records.is_empty(),
+                    "No data records expected for {}",
+                    kind.as_str()
+                );
+            }
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 
     #[test]
     fn export_redact_false_does_not_alter_content() {
         run_async_test(async {
-        let (storage, tmp) = test_db_with_pane("no_redact").await;
+            let (storage, tmp) = test_db_with_pane("no_redact").await;
 
-        let secret = "sk-abc123def456ghi789jkl012mno345pqr678stu901v";
-        storage
-            .append_segment(1, &format!("has secret: {}", secret), None)
-            .await
-            .unwrap();
+            let secret = "sk-abc123def456ghi789jkl012mno345pqr678stu901v";
+            storage
+                .append_segment(1, &format!("has secret: {}", secret), None)
+                .await
+                .unwrap();
 
-        let opts = ExportOptions {
-            kind: ExportKind::Segments,
-            query: ExportQuery::default(),
-            audit_actor: None,
-            audit_action: None,
-            redact: false,
-            pretty: false,
-        };
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
 
-        let mut buf = Vec::new();
-        export_jsonl(&storage, &opts, &mut buf).await.unwrap();
+            let mut buf = Vec::new();
+            export_jsonl(&storage, &opts, &mut buf).await.unwrap();
 
-        let output = String::from_utf8(buf).unwrap();
-        let (_header, records) = parse_jsonl(&output);
-        let content = records[0]["content"].as_str().unwrap();
-        // Secret should NOT be redacted when redact=false
-        assert!(
-            content.contains(secret),
-            "Content should contain secret when redact is false"
-        );
-        assert!(!content.contains("[REDACTED]"));
+            let output = String::from_utf8(buf).unwrap();
+            let (_header, records) = parse_jsonl(&output);
+            let content = records[0]["content"].as_str().unwrap();
+            // Secret should NOT be redacted when redact=false
+            assert!(
+                content.contains(secret),
+                "Content should contain secret when redact is false"
+            );
+            assert!(!content.contains("[REDACTED]"));
 
-        storage.shutdown().await.unwrap();
-        let _ = std::fs::remove_file(&tmp);
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
         });
     }
 

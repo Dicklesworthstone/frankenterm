@@ -1,7 +1,7 @@
 use ahash::AHasher;
 use config::ConfigHandle;
 use intrusive_collections::{
-    intrusive_adapter, Bound, KeyAdapter, LinkedList, LinkedListLink, RBTree, RBTreeLink,
+    Bound, KeyAdapter, LinkedList, LinkedListLink, RBTree, RBTreeLink, intrusive_adapter,
 };
 use std::borrow::Borrow;
 use std::cell::RefCell;

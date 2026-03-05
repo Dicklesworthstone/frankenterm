@@ -704,6 +704,22 @@ pub mod task {
         }
     }
 
+    struct HandleContextFuture<F> {
+        handle: asupersync::runtime::RuntimeHandle,
+        future: Pin<Box<F>>,
+    }
+
+    impl<F: Future> Future for HandleContextFuture<F> {
+        type Output = F::Output;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            super::ASUPERSYNC_HANDLE.with(|cell| {
+                cell.replace(Some(self.handle.clone()));
+            });
+            self.future.as_mut().poll(cx)
+        }
+    }
+
     /// Spawn a future on the current asupersync runtime.
     ///
     /// Uses the thread-local `ASUPERSYNC_HANDLE` installed by
@@ -713,13 +729,18 @@ pub mod task {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let inner = super::ASUPERSYNC_HANDLE.with(|cell| {
+        let handle = super::ASUPERSYNC_HANDLE.with(|cell| {
             let borrow = cell.borrow();
-            let handle = borrow
+            borrow
                 .as_ref()
-                .expect("task::spawn called outside of Runtime::block_on context");
-            handle.spawn(future)
+                .cloned()
+                .expect("task::spawn called outside of Runtime::block_on context")
         });
+        let wrapped = HandleContextFuture {
+            handle: handle.clone(),
+            future: Box::pin(future),
+        };
+        let inner = handle.spawn(wrapped);
         JoinHandle {
             inner: Box::pin(inner),
         }

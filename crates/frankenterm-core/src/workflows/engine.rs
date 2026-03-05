@@ -298,10 +298,7 @@ pub(super) fn compute_next_step(step_logs: &[crate::storage::WorkflowStepLogReco
             "jump_to" => {
                 if let Some(data) = &log.result_data {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(step) = json
-                            .get("step")
-                            .and_then(|v| v.as_u64())
-                        {
+                        if let Some(step) = json.get("step").and_then(|v| v.as_u64()) {
                             return step as usize;
                         }
                     }
@@ -947,11 +944,14 @@ mod tests {
     #[test]
     fn compute_next_step_jump_to() {
         let mut jump_log = make_step_log(2, "jump_to");
-        jump_log.result_data = Some(serde_json::json!({
-            "type": "jump_to",
-            "step": 5
-        }).to_string());
-        
+        jump_log.result_data = Some(
+            serde_json::json!({
+                "type": "jump_to",
+                "step": 5
+            })
+            .to_string(),
+        );
+
         let logs = vec![
             make_step_log(0, "continue"),
             make_step_log(1, "continue"),
@@ -1136,8 +1136,7 @@ mod tests {
 
     #[test]
     fn build_verification_refs_includes_wait_for() {
-        let result =
-            StepResult::wait_for_with_timeout(WaitCondition::pattern("test.rule"), 5000);
+        let result = StepResult::wait_for_with_timeout(WaitCondition::pattern("test.rule"), 5000);
         let refs = build_verification_refs(&result, None);
         assert!(refs.is_some());
         let json: serde_json::Value = serde_json::from_str(&refs.unwrap()).unwrap();

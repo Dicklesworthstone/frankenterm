@@ -1415,9 +1415,7 @@ steps:
             DescriptorStep::WaitFor {
                 id: "w1".into(),
                 description: None,
-                matcher: DescriptorMatcher::Substring {
-                    value: "x".into(),
-                },
+                matcher: DescriptorMatcher::Substring { value: "x".into() },
                 timeout_ms: None,
             },
             DescriptorStep::Sleep {
@@ -1464,9 +1462,7 @@ steps:
         let step = DescriptorStep::WaitFor {
             id: "w1".into(),
             description: None,
-            matcher: DescriptorMatcher::Substring {
-                value: "x".into(),
-            },
+            matcher: DescriptorMatcher::Substring { value: "x".into() },
             timeout_ms: None,
         };
         assert_eq!(step.description(), "Wait for substring/regex match");
@@ -1505,9 +1501,7 @@ steps:
                 DescriptorStep::WaitFor {
                     id: "a".into(),
                     description: Some("custom wait".into()),
-                    matcher: DescriptorMatcher::Substring {
-                        value: "x".into(),
-                    },
+                    matcher: DescriptorMatcher::Substring { value: "x".into() },
                     timeout_ms: None,
                 },
                 "custom wait",
@@ -1549,9 +1543,7 @@ steps:
                     id: "f".into(),
                     description: Some("custom cond".into()),
                     test_text: "x".into(),
-                    matcher: DescriptorMatcher::Substring {
-                        value: "x".into(),
-                    },
+                    matcher: DescriptorMatcher::Substring { value: "x".into() },
                     then_steps: vec![],
                     else_steps: vec![],
                 },
@@ -2091,9 +2083,7 @@ steps:
                 "  - type: notify\n    id: s{i}\n    message: \"m\"\n"
             ));
         }
-        let yaml = format!(
-            "workflow_schema_version: 1\nname: max_steps\nsteps:\n{steps_yaml}"
-        );
+        let yaml = format!("workflow_schema_version: 1\nname: max_steps\nsteps:\n{steps_yaml}");
         assert!(DescriptorWorkflow::from_yaml_str(&yaml).is_ok());
     }
 
@@ -2105,9 +2095,7 @@ steps:
                 "  - type: notify\n    id: s{i}\n    message: \"m\"\n"
             ));
         }
-        let yaml = format!(
-            "workflow_schema_version: 1\nname: over_max\nsteps:\n{steps_yaml}"
-        );
+        let yaml = format!("workflow_schema_version: 1\nname: over_max\nsteps:\n{steps_yaml}");
         assert!(DescriptorWorkflow::from_yaml_str(&yaml).is_err());
     }
 

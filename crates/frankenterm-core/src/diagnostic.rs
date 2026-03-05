@@ -1010,8 +1010,8 @@ mod tests {
     #[test]
     fn generate_bundle_creates_all_files() {
         run_async_test(async {
-            let tmp = std::env::temp_dir()
-                .join(format!("wa_test_diag_bundle_{}.db", std::process::id()));
+            let tmp =
+                std::env::temp_dir().join(format!("wa_test_diag_bundle_{}.db", std::process::id()));
             let db_path = tmp.to_string_lossy().to_string();
 
             let storage = StorageHandle::new(&db_path).await.unwrap();
@@ -1045,8 +1045,8 @@ mod tests {
                 &config.ipc,
             );
 
-            let output_dir = std::env::temp_dir()
-                .join(format!("wa_test_diag_output_{}", std::process::id()));
+            let output_dir =
+                std::env::temp_dir().join(format!("wa_test_diag_output_{}", std::process::id()));
             let opts = DiagnosticOptions {
                 output: Some(output_dir.clone()),
                 ..Default::default()
@@ -1073,24 +1073,20 @@ mod tests {
             assert!(output_dir.join("recent_audit.json").exists());
 
             // Verify manifest is valid JSON with expected fields
-            let manifest_content =
-                fs::read_to_string(output_dir.join("manifest.json")).unwrap();
-            let manifest: serde_json::Value =
-                serde_json::from_str(&manifest_content).unwrap();
+            let manifest_content = fs::read_to_string(output_dir.join("manifest.json")).unwrap();
+            let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
             assert!(manifest["redacted"].as_bool().unwrap());
             assert!(manifest["file_count"].as_u64().unwrap() >= 8);
             assert!(!manifest["wa_version"].as_str().unwrap().is_empty());
 
             // Verify environment.json
-            let env_content =
-                fs::read_to_string(output_dir.join("environment.json")).unwrap();
+            let env_content = fs::read_to_string(output_dir.join("environment.json")).unwrap();
             let env_info: serde_json::Value = serde_json::from_str(&env_content).unwrap();
             assert!(!env_info["wa_version"].as_str().unwrap().is_empty());
             assert_eq!(env_info["schema_version"], SCHEMA_VERSION);
 
             // Verify db_health.json
-            let health_content =
-                fs::read_to_string(output_dir.join("db_health.json")).unwrap();
+            let health_content = fs::read_to_string(output_dir.join("db_health.json")).unwrap();
             let health: serde_json::Value = serde_json::from_str(&health_content).unwrap();
             assert!(health["page_count"].as_i64().unwrap() > 0);
             assert_eq!(health["table_counts"]["panes"], 1);
@@ -1185,8 +1181,7 @@ mod tests {
             }
 
             // Verify the audit file exists and has [REDACTED]
-            let audit_content =
-                fs::read_to_string(output_dir.join("recent_audit.json")).unwrap();
+            let audit_content = fs::read_to_string(output_dir.join("recent_audit.json")).unwrap();
             assert!(audit_content.contains("[REDACTED]"));
 
             storage.shutdown().await.unwrap();
@@ -1199,15 +1194,14 @@ mod tests {
     #[test]
     fn bundle_manifest_has_stable_metadata() {
         run_async_test(async {
-            let tmp = std::env::temp_dir()
-                .join(format!("wa_test_diag_meta_{}.db", std::process::id()));
+            let tmp =
+                std::env::temp_dir().join(format!("wa_test_diag_meta_{}.db", std::process::id()));
             let db_path = tmp.to_string_lossy().to_string();
             let storage = StorageHandle::new(&db_path).await.unwrap();
 
             let config = Config::default();
             let layout = WorkspaceLayout::new(
-                std::env::temp_dir()
-                    .join(format!("wa_test_diag_meta_ws_{}", std::process::id())),
+                std::env::temp_dir().join(format!("wa_test_diag_meta_ws_{}", std::process::id())),
                 &config.storage,
                 &config.ipc,
             );
@@ -1224,10 +1218,8 @@ mod tests {
                 .unwrap();
 
             // Verify manifest has all required stable metadata fields
-            let manifest_content =
-                fs::read_to_string(output_dir.join("manifest.json")).unwrap();
-            let manifest: serde_json::Value =
-                serde_json::from_str(&manifest_content).unwrap();
+            let manifest_content = fs::read_to_string(output_dir.join("manifest.json")).unwrap();
+            let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
 
             // Required fields
             assert!(manifest["wa_version"].is_string());
@@ -1241,8 +1233,7 @@ mod tests {
             assert!(files.len() >= 8);
 
             // Verify environment.json has stable fields
-            let env_content =
-                fs::read_to_string(output_dir.join("environment.json")).unwrap();
+            let env_content = fs::read_to_string(output_dir.join("environment.json")).unwrap();
             let env: serde_json::Value = serde_json::from_str(&env_content).unwrap();
             assert!(env["wa_version"].is_string());
             assert!(env["schema_version"].is_number());
@@ -1252,8 +1243,7 @@ mod tests {
             // Verify config_summary.json has stable fields
             let config_content =
                 fs::read_to_string(output_dir.join("config_summary.json")).unwrap();
-            let config_json: serde_json::Value =
-                serde_json::from_str(&config_content).unwrap();
+            let config_json: serde_json::Value = serde_json::from_str(&config_content).unwrap();
             assert!(config_json["general_log_level"].is_string());
             assert!(config_json["ingest_poll_interval_ms"].is_number());
             assert!(config_json["metrics_enabled"].is_boolean());
@@ -1268,8 +1258,8 @@ mod tests {
     #[test]
     fn bundle_includes_reservation_snapshot() {
         run_async_test(async {
-            let tmp = std::env::temp_dir()
-                .join(format!("wa_test_diag_res_{}.db", std::process::id()));
+            let tmp =
+                std::env::temp_dir().join(format!("wa_test_diag_res_{}.db", std::process::id()));
             let db_path = tmp.to_string_lossy().to_string();
             let storage = StorageHandle::new(&db_path).await.unwrap();
 
@@ -1306,8 +1296,7 @@ mod tests {
 
             let config = Config::default();
             let layout = WorkspaceLayout::new(
-                std::env::temp_dir()
-                    .join(format!("wa_test_diag_res_ws_{}", std::process::id())),
+                std::env::temp_dir().join(format!("wa_test_diag_res_ws_{}", std::process::id())),
                 &config.storage,
                 &config.ipc,
             );
@@ -1326,8 +1315,7 @@ mod tests {
             // Verify active_reservations.json contains the reservation
             let res_content =
                 fs::read_to_string(output_dir.join("active_reservations.json")).unwrap();
-            let reservations: serde_json::Value =
-                serde_json::from_str(&res_content).unwrap();
+            let reservations: serde_json::Value = serde_json::from_str(&res_content).unwrap();
             let arr = reservations.as_array().unwrap();
             assert!(
                 !arr.is_empty(),
@@ -2214,15 +2202,14 @@ mod tests {
     #[test]
     fn bundle_output_dir_reuse_generates_fresh_bundle() {
         run_async_test(async {
-            let tmp = std::env::temp_dir()
-                .join(format!("wa_test_diag_reuse_{}.db", std::process::id()));
+            let tmp =
+                std::env::temp_dir().join(format!("wa_test_diag_reuse_{}.db", std::process::id()));
             let db_path = tmp.to_string_lossy().to_string();
             let storage = StorageHandle::new(&db_path).await.unwrap();
 
             let config = Config::default();
             let layout = WorkspaceLayout::new(
-                std::env::temp_dir()
-                    .join(format!("wa_test_diag_reuse_ws_{}", std::process::id())),
+                std::env::temp_dir().join(format!("wa_test_diag_reuse_ws_{}", std::process::id())),
                 &config.storage,
                 &config.ipc,
             );
@@ -2247,10 +2234,8 @@ mod tests {
             assert!(result2.file_count >= 9);
 
             // The manifest should be from the second run (newer timestamp)
-            let manifest_content =
-                fs::read_to_string(output_dir.join("manifest.json")).unwrap();
-            let manifest: serde_json::Value =
-                serde_json::from_str(&manifest_content).unwrap();
+            let manifest_content = fs::read_to_string(output_dir.join("manifest.json")).unwrap();
+            let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
             assert!(manifest["generated_at_ms"].as_u64().unwrap() > 0);
 
             storage.shutdown().await.unwrap();

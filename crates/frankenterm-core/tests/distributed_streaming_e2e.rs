@@ -665,9 +665,10 @@ fn distributed_streaming_e2e_enforces_agent_capacity_without_cross_sender_persis
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let db_path = temp_dir.path().join("distributed_streaming_capacity.db");
-        let mut bridge = DistributedBridge::new_with_capacity(db_path.to_str().expect("db path"), 1)
-            .await
-            .expect("bridge");
+        let mut bridge =
+            DistributedBridge::new_with_capacity(db_path.to_str().expect("db path"), 1)
+                .await
+                .expect("bridge");
 
         bridge
             .ingest_envelope(WireEnvelope::new(
@@ -713,10 +714,13 @@ fn distributed_streaming_e2e_prunes_stale_sender_and_accepts_new_sender_at_capac
         let db_path = temp_dir
             .path()
             .join("distributed_streaming_stale_capacity.db");
-        let mut bridge =
-            DistributedBridge::new_with_capacity_and_stale(db_path.to_str().expect("db path"), 1, 50)
-                .await
-                .expect("bridge");
+        let mut bridge = DistributedBridge::new_with_capacity_and_stale(
+            db_path.to_str().expect("db path"),
+            1,
+            50,
+        )
+        .await
+        .expect("bridge");
 
         let mut first = WireEnvelope::new(1, "agent-cap-a", WirePayload::PaneMeta(pane_meta(41)));
         first.sent_at_ms = 100;
@@ -755,10 +759,13 @@ fn distributed_streaming_e2e_duplicate_refresh_prevents_false_stale_eviction() {
         let db_path = temp_dir
             .path()
             .join("distributed_streaming_duplicate_refresh.db");
-        let mut bridge =
-            DistributedBridge::new_with_capacity_and_stale(db_path.to_str().expect("db path"), 1, 50)
-                .await
-                .expect("bridge");
+        let mut bridge = DistributedBridge::new_with_capacity_and_stale(
+            db_path.to_str().expect("db path"),
+            1,
+            50,
+        )
+        .await
+        .expect("bridge");
 
         let mut first = WireEnvelope::new(1, "agent-dup-a", WirePayload::PaneMeta(pane_meta(51)));
         first.sent_at_ms = 100;
@@ -767,7 +774,8 @@ fn distributed_streaming_e2e_duplicate_refresh_prevents_false_stale_eviction() {
             .await
             .expect("first sender should be accepted");
 
-        let mut duplicate = WireEnvelope::new(1, "agent-dup-a", WirePayload::PaneMeta(pane_meta(51)));
+        let mut duplicate =
+            WireEnvelope::new(1, "agent-dup-a", WirePayload::PaneMeta(pane_meta(51)));
         duplicate.sent_at_ms = 130;
         bridge
             .ingest_envelope(duplicate)
@@ -797,8 +805,7 @@ fn distributed_streaming_e2e_duplicate_refresh_prevents_false_stale_eviction() {
 }
 
 #[test]
-fn distributed_streaming_e2e_accepted_regressed_timestamp_does_not_trigger_false_stale_prune()
-{
+fn distributed_streaming_e2e_accepted_regressed_timestamp_does_not_trigger_false_stale_prune() {
     run_async_test(async {
         use frankenterm_core::wire_protocol::WireProtocolError;
 
@@ -806,10 +813,13 @@ fn distributed_streaming_e2e_accepted_regressed_timestamp_does_not_trigger_false
         let db_path = temp_dir
             .path()
             .join("distributed_streaming_regressed_accepted_liveness.db");
-        let mut bridge =
-            DistributedBridge::new_with_capacity_and_stale(db_path.to_str().expect("db path"), 1, 50)
-                .await
-                .expect("bridge");
+        let mut bridge = DistributedBridge::new_with_capacity_and_stale(
+            db_path.to_str().expect("db path"),
+            1,
+            50,
+        )
+        .await
+        .expect("bridge");
 
         let mut first = WireEnvelope::new(1, "agent-reg-a", WirePayload::PaneMeta(pane_meta(61)));
         first.sent_at_ms = 100;
@@ -819,7 +829,8 @@ fn distributed_streaming_e2e_accepted_regressed_timestamp_does_not_trigger_false
             .expect("first sender should be accepted");
 
         // Sender clock regresses, but this is still a new accepted sequence.
-        let mut regressed = WireEnvelope::new(2, "agent-reg-a", WirePayload::PaneMeta(pane_meta(61)));
+        let mut regressed =
+            WireEnvelope::new(2, "agent-reg-a", WirePayload::PaneMeta(pane_meta(61)));
         regressed.sent_at_ms = 90;
         bridge
             .ingest_envelope(regressed)

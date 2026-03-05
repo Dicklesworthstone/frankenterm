@@ -240,7 +240,10 @@ fn preview_flat_retention_counts_old_events() {
         assert!(plan.dry_run);
 
         let events_table = plan.tables.iter().find(|t| t.table == "events").unwrap();
-        assert_eq!(events_table.eligible_rows, 2, "2 old events should be eligible");
+        assert_eq!(
+            events_table.eligible_rows, 2,
+            "2 old events should be eligible"
+        );
         assert_eq!(events_table.deleted_rows, 0, "preview should not delete");
         assert_eq!(events_table.retention_days, 30);
 
@@ -281,7 +284,10 @@ fn apply_flat_retention_deletes_old_events() {
 
         let events_table = plan.tables.iter().find(|t| t.table == "events").unwrap();
         assert_eq!(events_table.eligible_rows, 2);
-        assert_eq!(events_table.deleted_rows, 2, "2 old events should be deleted");
+        assert_eq!(
+            events_table.deleted_rows, 2,
+            "2 old events should be deleted"
+        );
 
         let remaining = storage.count_events_before(now + 1000).await.unwrap();
         assert_eq!(remaining, 1, "only the recent event should remain");
@@ -304,9 +310,18 @@ fn preview_tiered_retention_groups_by_tier() {
         let info_old_ts = now - 15 * 86_400_000;
         let info_recent_ts = now - 3 * 86_400_000;
 
-        storage.record_event(make_event(critical_ts, "critical", "error")).await.unwrap();
-        storage.record_event(make_event(info_old_ts, "info", "detection")).await.unwrap();
-        storage.record_event(make_event(info_recent_ts, "info", "detection")).await.unwrap();
+        storage
+            .record_event(make_event(critical_ts, "critical", "error"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(info_old_ts, "info", "detection"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(info_recent_ts, "info", "detection"))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -331,10 +346,21 @@ fn preview_tiered_retention_groups_by_tier() {
 
         let plan = cleanup_preview(&storage, &config).await.expect("preview");
 
-        let critical_tier = plan.tables.iter().find(|t| t.table.contains("critical")).unwrap();
-        assert_eq!(critical_tier.eligible_rows, 0, "critical event within retention");
+        let critical_tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("critical"))
+            .unwrap();
+        assert_eq!(
+            critical_tier.eligible_rows, 0,
+            "critical event within retention"
+        );
 
-        let info_tier = plan.tables.iter().find(|t| t.table.contains("info")).unwrap();
+        let info_tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("info"))
+            .unwrap();
         assert_eq!(info_tier.eligible_rows, 1, "only the 15-day-old info event");
 
         teardown(storage, &db_path).await;
@@ -352,10 +378,22 @@ fn apply_tiered_retention_deletes_correct_events() {
         let old_info_ts = now - 15 * 86_400_000;
         let recent_info_ts = now - 3 * 86_400_000;
 
-        storage.record_event(make_event(old_critical_ts, "critical", "error")).await.unwrap();
-        storage.record_event(make_event(recent_critical_ts, "critical", "error")).await.unwrap();
-        storage.record_event(make_event(old_info_ts, "info", "detection")).await.unwrap();
-        storage.record_event(make_event(recent_info_ts, "info", "detection")).await.unwrap();
+        storage
+            .record_event(make_event(old_critical_ts, "critical", "error"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(recent_critical_ts, "critical", "error"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(old_info_ts, "info", "detection"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(recent_info_ts, "info", "detection"))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -380,10 +418,21 @@ fn apply_tiered_retention_deletes_correct_events() {
 
         let plan = cleanup_apply(&storage, &config).await.expect("apply");
 
-        let critical_tier = plan.tables.iter().find(|t| t.table.contains("critical")).unwrap();
-        assert_eq!(critical_tier.deleted_rows, 1, "only the 100-day-old critical event");
+        let critical_tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("critical"))
+            .unwrap();
+        assert_eq!(
+            critical_tier.deleted_rows, 1,
+            "only the 100-day-old critical event"
+        );
 
-        let info_tier = plan.tables.iter().find(|t| t.table.contains("info")).unwrap();
+        let info_tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("info"))
+            .unwrap();
         assert_eq!(info_tier.deleted_rows, 1, "only the 15-day-old info event");
 
         let remaining = storage.count_events_before(now + 1000).await.unwrap();
@@ -401,10 +450,19 @@ fn tiered_retention_handled_filter() {
         let now = now_ms();
         let old_ts = now - 10 * 86_400_000;
 
-        let ev1_id = storage.record_event(make_event(old_ts, "info", "detection")).await.unwrap();
-        let _ev2_id = storage.record_event(make_event(old_ts, "info", "detection")).await.unwrap();
+        let ev1_id = storage
+            .record_event(make_event(old_ts, "info", "detection"))
+            .await
+            .unwrap();
+        let _ev2_id = storage
+            .record_event(make_event(old_ts, "info", "detection"))
+            .await
+            .unwrap();
 
-        storage.mark_event_handled(ev1_id, None, "auto").await.unwrap();
+        storage
+            .mark_event_handled(ev1_id, None, "auto")
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -419,11 +477,19 @@ fn tiered_retention_handled_filter() {
         };
 
         let plan = cleanup_preview(&storage, &config).await.expect("preview");
-        let tier = plan.tables.iter().find(|t| t.table.contains("info-handled")).unwrap();
+        let tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("info-handled"))
+            .unwrap();
         assert_eq!(tier.eligible_rows, 1, "only the handled event is eligible");
 
         let plan = cleanup_apply(&storage, &config).await.expect("apply");
-        let tier = plan.tables.iter().find(|t| t.table.contains("info-handled")).unwrap();
+        let tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("info-handled"))
+            .unwrap();
         assert_eq!(tier.deleted_rows, 1);
 
         let remaining = storage.count_events_before(now + 1000).await.unwrap();
@@ -446,19 +512,46 @@ fn apply_cleans_all_table_types() {
         let old_ts = now - 60 * 86_400_000;
         let recent_ts = now - 5 * 86_400_000;
 
-        storage.append_segment(1, "old segment", None).await.unwrap();
+        storage
+            .append_segment(1, "old segment", None)
+            .await
+            .unwrap();
 
-        storage.record_event(make_event(old_ts, "info", "test")).await.unwrap();
-        storage.record_event(make_event(recent_ts, "info", "test")).await.unwrap();
+        storage
+            .record_event(make_event(old_ts, "info", "test"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(recent_ts, "info", "test"))
+            .await
+            .unwrap();
 
-        storage.record_audit_action(make_audit(old_ts)).await.unwrap();
-        storage.record_audit_action(make_audit(recent_ts)).await.unwrap();
+        storage
+            .record_audit_action(make_audit(old_ts))
+            .await
+            .unwrap();
+        storage
+            .record_audit_action(make_audit(recent_ts))
+            .await
+            .unwrap();
 
-        storage.record_usage_metric(make_usage(old_ts)).await.unwrap();
-        storage.record_usage_metric(make_usage(recent_ts)).await.unwrap();
+        storage
+            .record_usage_metric(make_usage(old_ts))
+            .await
+            .unwrap();
+        storage
+            .record_usage_metric(make_usage(recent_ts))
+            .await
+            .unwrap();
 
-        storage.record_notification(make_notification(old_ts)).await.unwrap();
-        storage.record_notification(make_notification(recent_ts)).await.unwrap();
+        storage
+            .record_notification(make_notification(old_ts))
+            .await
+            .unwrap();
+        storage
+            .record_notification(make_notification(recent_ts))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -471,16 +564,31 @@ fn apply_cleans_all_table_types() {
         let events = plan.tables.iter().find(|t| t.table == "events").unwrap();
         assert_eq!(events.deleted_rows, 1);
 
-        let audit = plan.tables.iter().find(|t| t.table == "audit_actions").unwrap();
+        let audit = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "audit_actions")
+            .unwrap();
         assert_eq!(audit.deleted_rows, 1);
 
-        let usage = plan.tables.iter().find(|t| t.table == "usage_metrics").unwrap();
+        let usage = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "usage_metrics")
+            .unwrap();
         assert_eq!(usage.deleted_rows, 1);
 
-        let notif = plan.tables.iter().find(|t| t.table == "notification_history").unwrap();
+        let notif = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "notification_history")
+            .unwrap();
         assert_eq!(notif.deleted_rows, 1);
 
-        assert_eq!(plan.total_deleted, plan.tables.iter().map(|t| t.deleted_rows).sum::<usize>());
+        assert_eq!(
+            plan.total_deleted,
+            plan.tables.iter().map(|t| t.deleted_rows).sum::<usize>()
+        );
 
         teardown(storage, &db_path).await;
     });
@@ -498,8 +606,14 @@ fn zero_retention_days_skips_all_cleanup() {
         let now = now_ms();
         let ancient_ts = now - 365 * 86_400_000;
 
-        storage.record_event(make_event(ancient_ts, "info", "test")).await.unwrap();
-        storage.record_audit_action(make_audit(ancient_ts)).await.unwrap();
+        storage
+            .record_event(make_event(ancient_ts, "info", "test"))
+            .await
+            .unwrap();
+        storage
+            .record_audit_action(make_audit(ancient_ts))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 0,
@@ -508,11 +622,17 @@ fn zero_retention_days_skips_all_cleanup() {
         };
 
         let plan = cleanup_preview(&storage, &config).await.expect("preview");
-        assert_eq!(plan.total_eligible, 0, "nothing eligible when retention_days=0");
+        assert_eq!(
+            plan.total_eligible, 0,
+            "nothing eligible when retention_days=0"
+        );
         assert!(plan.tables.is_empty() || plan.tables.iter().all(|t| t.eligible_rows == 0));
 
         let plan = cleanup_apply(&storage, &config).await.expect("apply");
-        assert_eq!(plan.total_deleted, 0, "nothing deleted when retention_days=0");
+        assert_eq!(
+            plan.total_deleted, 0,
+            "nothing deleted when retention_days=0"
+        );
 
         teardown(storage, &db_path).await;
     });
@@ -526,8 +646,14 @@ fn tier_with_zero_retention_keeps_events_forever() {
         let now = now_ms();
         let ancient_ts = now - 365 * 86_400_000;
 
-        storage.record_event(make_event(ancient_ts, "critical", "error")).await.unwrap();
-        storage.record_event(make_event(ancient_ts, "info", "detection")).await.unwrap();
+        storage
+            .record_event(make_event(ancient_ts, "critical", "error"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(ancient_ts, "info", "detection"))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -552,14 +678,27 @@ fn tier_with_zero_retention_keeps_events_forever() {
 
         let plan = cleanup_apply(&storage, &config).await.expect("apply");
 
-        let critical_tier = plan.tables.iter().find(|t| t.table.contains("critical-forever"));
-        assert!(critical_tier.is_none(), "tier with retention_days=0 should be skipped entirely");
+        let critical_tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("critical-forever"));
+        assert!(
+            critical_tier.is_none(),
+            "tier with retention_days=0 should be skipped entirely"
+        );
 
-        let info_tier = plan.tables.iter().find(|t| t.table.contains("info-short")).unwrap();
+        let info_tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("info-short"))
+            .unwrap();
         assert_eq!(info_tier.deleted_rows, 1);
 
         let remaining = storage.count_events_before(now + 1000).await.unwrap();
-        assert_eq!(remaining, 1, "critical event preserved by zero-retention tier");
+        assert_eq!(
+            remaining, 1,
+            "critical event preserved by zero-retention tier"
+        );
 
         teardown(storage, &db_path).await;
     });
@@ -578,7 +717,10 @@ fn preview_and_apply_agree_on_eligible_counts() {
         let old_ts = now - 60 * 86_400_000;
 
         for _ in 0..5 {
-            storage.record_event(make_event(old_ts, "info", "test")).await.unwrap();
+            storage
+                .record_event(make_event(old_ts, "info", "test"))
+                .await
+                .unwrap();
         }
 
         let config = StorageConfig {
@@ -608,22 +750,52 @@ fn mixed_severity_with_default_tiers() {
         let now = now_ms();
         let ts_20d = now - 20 * 86_400_000;
 
-        storage.record_event(make_event(ts_20d, "critical", "error")).await.unwrap();
-        storage.record_event(make_event(ts_20d, "warning", "detection")).await.unwrap();
-        storage.record_event(make_event(ts_20d, "info", "detection")).await.unwrap();
-        storage.record_event(make_event(ts_20d, "info", "detection")).await.unwrap();
+        storage
+            .record_event(make_event(ts_20d, "critical", "error"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(ts_20d, "warning", "detection"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(ts_20d, "info", "detection"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(ts_20d, "info", "detection"))
+            .await
+            .unwrap();
 
         let config = StorageConfig::default();
 
         let plan = cleanup_apply(&storage, &config).await.expect("apply");
 
-        let critical_tier = plan.tables.iter().find(|t| t.table.contains("critical")).unwrap();
-        assert_eq!(critical_tier.deleted_rows, 0, "20d critical within 90d retention");
+        let critical_tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("critical"))
+            .unwrap();
+        assert_eq!(
+            critical_tier.deleted_rows, 0,
+            "20d critical within 90d retention"
+        );
 
-        let warning_tier = plan.tables.iter().find(|t| t.table.contains("warning")).unwrap();
-        assert_eq!(warning_tier.deleted_rows, 0, "20d warning within 30d retention");
+        let warning_tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("warning"))
+            .unwrap();
+        assert_eq!(
+            warning_tier.deleted_rows, 0,
+            "20d warning within 30d retention"
+        );
 
-        let info_tier = plan.tables.iter().find(|t| t.table.contains("info")).unwrap();
+        let info_tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("info"))
+            .unwrap();
         assert_eq!(info_tier.deleted_rows, 2, "20d info beyond 7d retention");
 
         let remaining = storage.count_events_before(now + 1000).await.unwrap();
@@ -641,7 +813,10 @@ fn apply_records_maintenance_event() {
         let now = now_ms();
         let old_ts = now - 60 * 86_400_000;
 
-        storage.record_event(make_event(old_ts, "info", "test")).await.unwrap();
+        storage
+            .record_event(make_event(old_ts, "info", "test"))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -676,16 +851,40 @@ fn e2e_mixed_severity_lifecycle() {
             (now - 2 * 86_400_000, "info", "detection"),
         ];
         for (ts, sev, etype) in ages {
-            storage.record_event(make_event(*ts, sev, etype)).await.unwrap();
+            storage
+                .record_event(make_event(*ts, sev, etype))
+                .await
+                .unwrap();
         }
-        storage.record_audit_action(make_audit(now - 60 * 86_400_000)).await.unwrap();
-        storage.record_audit_action(make_audit(now - 3 * 86_400_000)).await.unwrap();
-        storage.record_usage_metric(make_usage(now - 60 * 86_400_000)).await.unwrap();
-        storage.record_notification(make_notification(now - 60 * 86_400_000)).await.unwrap();
-        storage.record_notification(make_notification(now - 3 * 86_400_000)).await.unwrap();
+        storage
+            .record_audit_action(make_audit(now - 60 * 86_400_000))
+            .await
+            .unwrap();
+        storage
+            .record_audit_action(make_audit(now - 3 * 86_400_000))
+            .await
+            .unwrap();
+        storage
+            .record_usage_metric(make_usage(now - 60 * 86_400_000))
+            .await
+            .unwrap();
+        storage
+            .record_notification(make_notification(now - 60 * 86_400_000))
+            .await
+            .unwrap();
+        storage
+            .record_notification(make_notification(now - 3 * 86_400_000))
+            .await
+            .unwrap();
 
-        let before_stats = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
-        let before_events = before_stats.tables.iter().find(|t| t.name == "events").unwrap().row_count;
+        let before_stats =
+            frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
+        let before_events = before_stats
+            .tables
+            .iter()
+            .find(|t| t.name == "events")
+            .unwrap()
+            .row_count;
         assert_eq!(before_events, 7, "7 events before cleanup");
 
         let config = StorageConfig::default();
@@ -693,20 +892,44 @@ fn e2e_mixed_severity_lifecycle() {
         let preview = cleanup_preview(&storage, &config).await.expect("preview");
         assert!(preview.dry_run);
 
-        let crit_tier = preview.tables.iter().find(|t| t.table.contains("critical")).unwrap();
+        let crit_tier = preview
+            .tables
+            .iter()
+            .find(|t| t.table.contains("critical"))
+            .unwrap();
         assert_eq!(crit_tier.eligible_rows, 1, "1 old critical eligible");
 
-        let warn_tier = preview.tables.iter().find(|t| t.table.contains("warning")).unwrap();
+        let warn_tier = preview
+            .tables
+            .iter()
+            .find(|t| t.table.contains("warning"))
+            .unwrap();
         assert_eq!(warn_tier.eligible_rows, 0, "warnings within retention");
 
-        let info_tier = preview.tables.iter().find(|t| t.table.contains("info")).unwrap();
+        let info_tier = preview
+            .tables
+            .iter()
+            .find(|t| t.table.contains("info"))
+            .unwrap();
         assert_eq!(info_tier.eligible_rows, 1, "1 old info eligible");
 
-        let audit_preview = preview.tables.iter().find(|t| t.table == "audit_actions").unwrap();
+        let audit_preview = preview
+            .tables
+            .iter()
+            .find(|t| t.table == "audit_actions")
+            .unwrap();
         assert_eq!(audit_preview.eligible_rows, 1);
-        let usage_preview = preview.tables.iter().find(|t| t.table == "usage_metrics").unwrap();
+        let usage_preview = preview
+            .tables
+            .iter()
+            .find(|t| t.table == "usage_metrics")
+            .unwrap();
         assert_eq!(usage_preview.eligible_rows, 1);
-        let notif_preview = preview.tables.iter().find(|t| t.table == "notification_history").unwrap();
+        let notif_preview = preview
+            .tables
+            .iter()
+            .find(|t| t.table == "notification_history")
+            .unwrap();
         assert_eq!(notif_preview.eligible_rows, 1);
 
         let total_preview_eligible = preview.total_eligible;
@@ -714,21 +937,49 @@ fn e2e_mixed_severity_lifecycle() {
 
         let apply = cleanup_apply(&storage, &config).await.expect("apply");
         assert!(!apply.dry_run);
-        assert_eq!(apply.total_eligible, total_preview_eligible, "apply agrees with preview");
+        assert_eq!(
+            apply.total_eligible, total_preview_eligible,
+            "apply agrees with preview"
+        );
         assert_eq!(apply.total_deleted, 5, "5 total deleted");
 
-        let after_stats = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
-        let after_events = after_stats.tables.iter().find(|t| t.name == "events").unwrap().row_count;
+        let after_stats =
+            frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
+        let after_events = after_stats
+            .tables
+            .iter()
+            .find(|t| t.name == "events")
+            .unwrap()
+            .row_count;
         assert_eq!(after_events, 5, "5 events remain after cleanup");
-        assert_eq!(before_events - after_events, 2, "2 events deleted (1 critical + 1 info)");
+        assert_eq!(
+            before_events - after_events,
+            2,
+            "2 events deleted (1 critical + 1 info)"
+        );
 
-        let after_audit = after_stats.tables.iter().find(|t| t.name == "audit_actions").unwrap().row_count;
+        let after_audit = after_stats
+            .tables
+            .iter()
+            .find(|t| t.name == "audit_actions")
+            .unwrap()
+            .row_count;
         assert_eq!(after_audit, 1, "1 recent audit remains");
 
-        let after_usage = after_stats.tables.iter().find(|t| t.name == "usage_metrics").unwrap().row_count;
+        let after_usage = after_stats
+            .tables
+            .iter()
+            .find(|t| t.name == "usage_metrics")
+            .unwrap()
+            .row_count;
         assert_eq!(after_usage, 0, "old usage deleted");
 
-        let after_notif = after_stats.tables.iter().find(|t| t.name == "notification_history").unwrap().row_count;
+        let after_notif = after_stats
+            .tables
+            .iter()
+            .find(|t| t.name == "notification_history")
+            .unwrap()
+            .row_count;
         assert_eq!(after_notif, 1, "1 recent notification remains");
 
         teardown(storage, &db_path).await;
@@ -744,7 +995,10 @@ fn e2e_dry_run_is_deterministic() {
 
         for i in 0..10 {
             let ts = now - (40 + i) * 86_400_000;
-            storage.record_event(make_event(ts, "info", "detection")).await.unwrap();
+            storage
+                .record_event(make_event(ts, "info", "detection"))
+                .await
+                .unwrap();
         }
         for i in 0..3 {
             let ts = now - (40 + i) * 86_400_000;
@@ -756,18 +1010,29 @@ fn e2e_dry_run_is_deterministic() {
         let run1 = cleanup_preview(&storage, &config).await.expect("run1");
         let run2 = cleanup_preview(&storage, &config).await.expect("run2");
 
-        assert_eq!(run1.total_eligible, run2.total_eligible, "consecutive previews must be identical");
+        assert_eq!(
+            run1.total_eligible, run2.total_eligible,
+            "consecutive previews must be identical"
+        );
         assert_eq!(run1.tables.len(), run2.tables.len());
         for (t1, t2) in run1.tables.iter().zip(run2.tables.iter()) {
             assert_eq!(t1.table, t2.table);
-            assert_eq!(t1.eligible_rows, t2.eligible_rows, "table {} counts differ", t1.table);
+            assert_eq!(
+                t1.eligible_rows, t2.eligible_rows,
+                "table {} counts differ",
+                t1.table
+            );
         }
 
         let stats1 = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
         let stats2 = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
         for (s1, s2) in stats1.tables.iter().zip(stats2.tables.iter()) {
             assert_eq!(s1.name, s2.name);
-            assert_eq!(s1.row_count, s2.row_count, "stats table {} counts differ", s1.name);
+            assert_eq!(
+                s1.row_count, s2.row_count,
+                "stats table {} counts differ",
+                s1.name
+            );
         }
 
         teardown(storage, &db_path).await;
@@ -787,15 +1052,23 @@ fn e2e_apply_is_idempotent() {
                 .await
                 .unwrap();
         }
-        storage.record_audit_action(make_audit(now - 60 * 86_400_000)).await.unwrap();
+        storage
+            .record_audit_action(make_audit(now - 60 * 86_400_000))
+            .await
+            .unwrap();
 
         let config = StorageConfig::default();
 
         let first_apply = cleanup_apply(&storage, &config).await.expect("first apply");
         assert!(first_apply.total_deleted > 0, "first apply deletes rows");
 
-        let second_apply = cleanup_apply(&storage, &config).await.expect("second apply");
-        assert_eq!(second_apply.total_deleted, 0, "second apply finds nothing to delete");
+        let second_apply = cleanup_apply(&storage, &config)
+            .await
+            .expect("second apply");
+        assert_eq!(
+            second_apply.total_deleted, 0,
+            "second apply finds nothing to delete"
+        );
         assert_eq!(second_apply.total_eligible, 0);
 
         teardown(storage, &db_path).await;
@@ -809,8 +1082,14 @@ fn e2e_json_artifacts_are_stable() {
         let (storage, db_path) = setup_storage("e2e_json").await;
         let now = now_ms();
 
-        storage.record_event(make_event(now - 60 * 86_400_000, "info", "detection")).await.unwrap();
-        storage.record_event(make_event(now - 2 * 86_400_000, "critical", "error")).await.unwrap();
+        storage
+            .record_event(make_event(now - 60 * 86_400_000, "info", "detection"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(now - 2 * 86_400_000, "critical", "error"))
+            .await
+            .unwrap();
 
         let config = StorageConfig::default();
 
@@ -841,15 +1120,27 @@ fn e2e_before_after_stats_with_deletion_counts() {
         let now = now_ms();
 
         for _ in 0..3 {
-            storage.record_event(make_event(now - 60 * 86_400_000, "info", "test")).await.unwrap();
+            storage
+                .record_event(make_event(now - 60 * 86_400_000, "info", "test"))
+                .await
+                .unwrap();
         }
         for _ in 0..2 {
-            storage.record_event(make_event(now - 2 * 86_400_000, "info", "test")).await.unwrap();
+            storage
+                .record_event(make_event(now - 2 * 86_400_000, "info", "test"))
+                .await
+                .unwrap();
         }
         for _ in 0..2 {
-            storage.record_audit_action(make_audit(now - 60 * 86_400_000)).await.unwrap();
+            storage
+                .record_audit_action(make_audit(now - 60 * 86_400_000))
+                .await
+                .unwrap();
         }
-        storage.record_audit_action(make_audit(now - 2 * 86_400_000)).await.unwrap();
+        storage
+            .record_audit_action(make_audit(now - 2 * 86_400_000))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -858,23 +1149,61 @@ fn e2e_before_after_stats_with_deletion_counts() {
         };
 
         let before = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
-        let before_events = before.tables.iter().find(|t| t.name == "events").unwrap().row_count;
-        let before_audit = before.tables.iter().find(|t| t.name == "audit_actions").unwrap().row_count;
+        let before_events = before
+            .tables
+            .iter()
+            .find(|t| t.name == "events")
+            .unwrap()
+            .row_count;
+        let before_audit = before
+            .tables
+            .iter()
+            .find(|t| t.name == "audit_actions")
+            .unwrap()
+            .row_count;
         assert_eq!(before_events, 5);
         assert_eq!(before_audit, 3);
 
         let plan = cleanup_apply(&storage, &config).await.expect("apply");
 
         let after = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
-        let after_events = after.tables.iter().find(|t| t.name == "events").unwrap().row_count;
-        let after_audit = after.tables.iter().find(|t| t.name == "audit_actions").unwrap().row_count;
+        let after_events = after
+            .tables
+            .iter()
+            .find(|t| t.name == "events")
+            .unwrap()
+            .row_count;
+        let after_audit = after
+            .tables
+            .iter()
+            .find(|t| t.name == "audit_actions")
+            .unwrap()
+            .row_count;
         assert_eq!(after_events, 2, "3 old events deleted, 2 recent remain");
         assert_eq!(after_audit, 1, "2 old audit deleted, 1 recent remains");
 
-        let events_deleted = plan.tables.iter().find(|t| t.table == "events").unwrap().deleted_rows;
-        let audit_deleted = plan.tables.iter().find(|t| t.table == "audit_actions").unwrap().deleted_rows;
-        assert_eq!(events_deleted as u64, before_events - after_events, "deletion count matches stats delta");
-        assert_eq!(audit_deleted as u64, before_audit - after_audit, "audit deletion count matches stats delta");
+        let events_deleted = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "events")
+            .unwrap()
+            .deleted_rows;
+        let audit_deleted = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "audit_actions")
+            .unwrap()
+            .deleted_rows;
+        assert_eq!(
+            events_deleted as u64,
+            before_events - after_events,
+            "deletion count matches stats delta"
+        );
+        assert_eq!(
+            audit_deleted as u64,
+            before_audit - after_audit,
+            "audit deletion count matches stats delta"
+        );
 
         teardown(storage, &db_path).await;
     });
@@ -892,9 +1221,18 @@ fn tier_filters_by_event_type() {
         let now = now_ms();
         let old_ts = now - 15 * 86_400_000;
 
-        storage.record_event(make_event(old_ts, "info", "usage_limit")).await.unwrap();
-        storage.record_event(make_event(old_ts, "info", "compaction")).await.unwrap();
-        storage.record_event(make_event(old_ts, "info", "detection")).await.unwrap();
+        storage
+            .record_event(make_event(old_ts, "info", "usage_limit"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(old_ts, "info", "compaction"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(old_ts, "info", "detection"))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -910,7 +1248,11 @@ fn tier_filters_by_event_type() {
 
         let plan = cleanup_apply(&storage, &config).await.expect("apply");
 
-        let tier = plan.tables.iter().find(|t| t.table.contains("info-usage")).unwrap();
+        let tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("info-usage"))
+            .unwrap();
         assert_eq!(tier.deleted_rows, 1, "only usage_limit event matched tier");
 
         let remaining = storage.count_events_before(now + 1000).await.unwrap();
@@ -932,8 +1274,14 @@ fn preview_with_only_audit_data() {
         let now = now_ms();
         let old_ts = now - 60 * 86_400_000;
 
-        storage.record_audit_action(make_audit(old_ts)).await.unwrap();
-        storage.record_audit_action(make_audit(old_ts - 1000)).await.unwrap();
+        storage
+            .record_audit_action(make_audit(old_ts))
+            .await
+            .unwrap();
+        storage
+            .record_audit_action(make_audit(old_ts - 1000))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -942,7 +1290,11 @@ fn preview_with_only_audit_data() {
         };
 
         let plan = cleanup_preview(&storage, &config).await.expect("preview");
-        let audit = plan.tables.iter().find(|t| t.table == "audit_actions").unwrap();
+        let audit = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "audit_actions")
+            .unwrap();
         assert_eq!(audit.eligible_rows, 2);
         assert_eq!(audit.deleted_rows, 0, "preview never deletes");
 
@@ -961,7 +1313,10 @@ fn preview_with_only_usage_data() {
         let now = now_ms();
         let old_ts = now - 60 * 86_400_000;
 
-        storage.record_usage_metric(make_usage(old_ts)).await.unwrap();
+        storage
+            .record_usage_metric(make_usage(old_ts))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -970,7 +1325,11 @@ fn preview_with_only_usage_data() {
         };
 
         let plan = cleanup_preview(&storage, &config).await.expect("preview");
-        let usage = plan.tables.iter().find(|t| t.table == "usage_metrics").unwrap();
+        let usage = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "usage_metrics")
+            .unwrap();
         assert_eq!(usage.eligible_rows, 1);
 
         teardown(storage, &db_path).await;
@@ -985,7 +1344,10 @@ fn preview_with_only_notification_data() {
         let now = now_ms();
         let old_ts = now - 60 * 86_400_000;
 
-        storage.record_notification(make_notification(old_ts)).await.unwrap();
+        storage
+            .record_notification(make_notification(old_ts))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -994,7 +1356,11 @@ fn preview_with_only_notification_data() {
         };
 
         let plan = cleanup_preview(&storage, &config).await.expect("preview");
-        let notif = plan.tables.iter().find(|t| t.table == "notification_history").unwrap();
+        let notif = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "notification_history")
+            .unwrap();
         assert_eq!(notif.eligible_rows, 1);
 
         teardown(storage, &db_path).await;
@@ -1009,10 +1375,22 @@ fn apply_with_all_recent_data_deletes_nothing() {
         let now = now_ms();
         let recent_ts = now - 2 * 86_400_000;
 
-        storage.record_event(make_event(recent_ts, "info", "test")).await.unwrap();
-        storage.record_audit_action(make_audit(recent_ts)).await.unwrap();
-        storage.record_usage_metric(make_usage(recent_ts)).await.unwrap();
-        storage.record_notification(make_notification(recent_ts)).await.unwrap();
+        storage
+            .record_event(make_event(recent_ts, "info", "test"))
+            .await
+            .unwrap();
+        storage
+            .record_audit_action(make_audit(recent_ts))
+            .await
+            .unwrap();
+        storage
+            .record_usage_metric(make_usage(recent_ts))
+            .await
+            .unwrap();
+        storage
+            .record_notification(make_notification(recent_ts))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -1060,10 +1438,22 @@ fn preview_total_eligible_equals_sum_of_table_eligible() {
         let now = now_ms();
         let old_ts = now - 60 * 86_400_000;
 
-        storage.record_event(make_event(old_ts, "info", "test")).await.unwrap();
-        storage.record_audit_action(make_audit(old_ts)).await.unwrap();
-        storage.record_usage_metric(make_usage(old_ts)).await.unwrap();
-        storage.record_notification(make_notification(old_ts)).await.unwrap();
+        storage
+            .record_event(make_event(old_ts, "info", "test"))
+            .await
+            .unwrap();
+        storage
+            .record_audit_action(make_audit(old_ts))
+            .await
+            .unwrap();
+        storage
+            .record_usage_metric(make_usage(old_ts))
+            .await
+            .unwrap();
+        storage
+            .record_notification(make_notification(old_ts))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -1073,7 +1463,10 @@ fn preview_total_eligible_equals_sum_of_table_eligible() {
 
         let plan = cleanup_preview(&storage, &config).await.expect("preview");
         let table_sum: usize = plan.tables.iter().map(|t| t.eligible_rows).sum();
-        assert_eq!(plan.total_eligible, table_sum, "total_eligible must equal sum of per-table eligible_rows");
+        assert_eq!(
+            plan.total_eligible, table_sum,
+            "total_eligible must equal sum of per-table eligible_rows"
+        );
 
         teardown(storage, &db_path).await;
     });
@@ -1087,8 +1480,14 @@ fn apply_total_deleted_equals_sum_of_table_deleted() {
         let now = now_ms();
         let old_ts = now - 60 * 86_400_000;
 
-        storage.record_event(make_event(old_ts, "info", "test")).await.unwrap();
-        storage.record_audit_action(make_audit(old_ts)).await.unwrap();
+        storage
+            .record_event(make_event(old_ts, "info", "test"))
+            .await
+            .unwrap();
+        storage
+            .record_audit_action(make_audit(old_ts))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -1098,7 +1497,10 @@ fn apply_total_deleted_equals_sum_of_table_deleted() {
 
         let plan = cleanup_apply(&storage, &config).await.expect("apply");
         let table_sum: usize = plan.tables.iter().map(|t| t.deleted_rows).sum();
-        assert_eq!(plan.total_deleted, table_sum, "total_deleted must equal sum of per-table deleted_rows");
+        assert_eq!(
+            plan.total_deleted, table_sum,
+            "total_deleted must equal sum of per-table deleted_rows"
+        );
 
         teardown(storage, &db_path).await;
     });
@@ -1112,8 +1514,14 @@ fn multiple_tiers_all_zero_retention_produces_no_event_entries() {
         let now = now_ms();
         let ancient_ts = now - 365 * 86_400_000;
 
-        storage.record_event(make_event(ancient_ts, "critical", "error")).await.unwrap();
-        storage.record_event(make_event(ancient_ts, "info", "detection")).await.unwrap();
+        storage
+            .record_event(make_event(ancient_ts, "critical", "error"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(ancient_ts, "info", "detection"))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -1157,10 +1565,19 @@ fn tier_with_unhandled_filter_only_deletes_unhandled() {
         let now = now_ms();
         let old_ts = now - 10 * 86_400_000;
 
-        let ev1_id = storage.record_event(make_event(old_ts, "info", "detection")).await.unwrap();
-        let _ev2_id = storage.record_event(make_event(old_ts, "info", "detection")).await.unwrap();
+        let ev1_id = storage
+            .record_event(make_event(old_ts, "info", "detection"))
+            .await
+            .unwrap();
+        let _ev2_id = storage
+            .record_event(make_event(old_ts, "info", "detection"))
+            .await
+            .unwrap();
 
-        storage.mark_event_handled(ev1_id, None, "auto").await.unwrap();
+        storage
+            .mark_event_handled(ev1_id, None, "auto")
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 30,
@@ -1175,8 +1592,15 @@ fn tier_with_unhandled_filter_only_deletes_unhandled() {
         };
 
         let plan = cleanup_apply(&storage, &config).await.expect("apply");
-        let tier = plan.tables.iter().find(|t| t.table.contains("info-unhandled")).unwrap();
-        assert_eq!(tier.deleted_rows, 1, "only the unhandled event should be deleted");
+        let tier = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("info-unhandled"))
+            .unwrap();
+        assert_eq!(
+            tier.deleted_rows, 1,
+            "only the unhandled event should be deleted"
+        );
 
         let remaining = storage.count_events_before(now + 1000).await.unwrap();
         assert_eq!(remaining, 1, "handled event should survive");
@@ -1205,19 +1629,39 @@ fn preview_retention_days_propagated_to_table_summaries() {
 
         let plan = cleanup_preview(&storage, &config).await.expect("preview");
 
-        let special = plan.tables.iter().find(|t| t.table.contains("special")).unwrap();
+        let special = plan
+            .tables
+            .iter()
+            .find(|t| t.table.contains("special"))
+            .unwrap();
         assert_eq!(special.retention_days, 120);
 
-        let audit = plan.tables.iter().find(|t| t.table == "audit_actions").unwrap();
+        let audit = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "audit_actions")
+            .unwrap();
         assert_eq!(audit.retention_days, 45);
 
-        let usage = plan.tables.iter().find(|t| t.table == "usage_metrics").unwrap();
+        let usage = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "usage_metrics")
+            .unwrap();
         assert_eq!(usage.retention_days, 45);
 
-        let notif = plan.tables.iter().find(|t| t.table == "notification_history").unwrap();
+        let notif = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "notification_history")
+            .unwrap();
         assert_eq!(notif.retention_days, 45);
 
-        let segments = plan.tables.iter().find(|t| t.table == "output_segments").unwrap();
+        let segments = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "output_segments")
+            .unwrap();
         assert_eq!(segments.retention_days, 45);
 
         teardown(storage, &db_path).await;
@@ -1233,8 +1677,14 @@ fn preview_with_one_day_retention() {
         let ts_2d = now - 2 * 86_400_000;
         let ts_12h = now - 12 * 60 * 60 * 1000;
 
-        storage.record_event(make_event(ts_2d, "info", "test")).await.unwrap();
-        storage.record_event(make_event(ts_12h, "info", "test")).await.unwrap();
+        storage
+            .record_event(make_event(ts_2d, "info", "test"))
+            .await
+            .unwrap();
+        storage
+            .record_event(make_event(ts_12h, "info", "test"))
+            .await
+            .unwrap();
 
         let config = StorageConfig {
             retention_days: 1,
@@ -1259,7 +1709,10 @@ fn apply_with_very_short_retention_cleans_almost_everything() {
 
         for days_ago in [1, 3, 7, 14, 30] {
             let ts = now - days_ago * 86_400_000;
-            storage.record_event(make_event(ts, "info", "test")).await.unwrap();
+            storage
+                .record_event(make_event(ts, "info", "test"))
+                .await
+                .unwrap();
         }
 
         let config = StorageConfig {

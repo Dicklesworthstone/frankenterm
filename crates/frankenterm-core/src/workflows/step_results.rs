@@ -454,13 +454,8 @@ mod tests {
 
     #[test]
     fn step_result_wait_for_with_timeout() {
-        let r =
-            StepResult::wait_for_with_timeout(WaitCondition::pane_idle(1000), 5000);
-        if let StepResult::WaitFor {
-            timeout_ms,
-            ..
-        } = &r
-        {
+        let r = StepResult::wait_for_with_timeout(WaitCondition::pane_idle(1000), 5000);
+        if let StepResult::WaitFor { timeout_ms, .. } = &r {
             assert_eq!(*timeout_ms, Some(5000));
         }
     }

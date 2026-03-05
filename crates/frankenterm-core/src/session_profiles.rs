@@ -899,16 +899,18 @@ impl FleetLaunchPlan {
                 if self.slot(label).is_none() {
                     violations.push(FleetLaunchInvariantViolation {
                         reason_code: "fleet.launch_plan.phase_slot_unknown".to_string(),
-                        detail: format!("phase {} references unknown slot '{}'", phase.phase, label),
+                        detail: format!(
+                            "phase {} references unknown slot '{}'",
+                            phase.phase, label
+                        ),
                     });
                 }
             }
         }
 
-        let summed_weight = self
-            .slot_metadata
-            .iter()
-            .fold(0_u64, |acc, slot| acc.saturating_add(u64::from(slot.weight)));
+        let summed_weight = self.slot_metadata.iter().fold(0_u64, |acc, slot| {
+            acc.saturating_add(u64::from(slot.weight))
+        });
         if summed_weight > u64::from(u32::MAX) {
             violations.push(FleetLaunchInvariantViolation {
                 reason_code: "fleet.launch_plan.weight_overflow".to_string(),
@@ -1601,7 +1603,10 @@ mod tests {
         assert_eq!(fleet.launch_plan.slot_metadata[1].launch_order, 1);
         assert_eq!(fleet.launch_plan.slot_metadata[1].program, "codex-cli");
         assert_eq!(
-            fleet.launch_plan.slot("worker").map(|slot| slot.profile.as_str()),
+            fleet
+                .launch_plan
+                .slot("worker")
+                .map(|slot| slot.profile.as_str()),
             Some("agent-worker")
         );
         assert_eq!(

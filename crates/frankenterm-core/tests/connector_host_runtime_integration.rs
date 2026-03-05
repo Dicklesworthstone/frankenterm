@@ -59,7 +59,10 @@ fn connector_host_runtime_integration_degraded_path_and_recovery_contract() {
     let envelope = runtime
         .build_operation_envelope(1_090, "connector.invoke", "corr-int-1")
         .unwrap();
-    assert_eq!(envelope.protocol_version, ConnectorProtocolVersion::new(1, 0, 0));
+    assert_eq!(
+        envelope.protocol_version,
+        ConnectorProtocolVersion::new(1, 0, 0)
+    );
     assert_eq!(envelope.correlation_id, "corr-int-1");
 
     let transition_json = serde_json::to_string(&runtime.transition_history()).unwrap();
@@ -89,7 +92,10 @@ fn connector_host_runtime_integration_upgrade_and_failed_start_recovery() {
             reason_code: "token_missing".to_string(),
         }
     );
-    assert_eq!(runtime.health_snapshot(20).phase, ConnectorLifecyclePhase::Failed);
+    assert_eq!(
+        runtime.health_snapshot(20).phase,
+        ConnectorLifecyclePhase::Failed
+    );
 
     runtime
         .restart_with_probe(30, StartupProbeResult::healthy())
@@ -137,8 +143,7 @@ fn connector_host_runtime_integration_upgrade_and_failed_start_recovery() {
 #[test]
 fn connector_host_runtime_integration_sandbox_fail_closed_contract() {
     let mut config = ConnectorHostConfig::default();
-    config.sandbox.capability_envelope.allowed_capabilities =
-        vec![ConnectorCapability::ReadState];
+    config.sandbox.capability_envelope.allowed_capabilities = vec![ConnectorCapability::ReadState];
     let mut runtime = ConnectorHostRuntime::new(config).unwrap();
     runtime.start(100).unwrap();
     runtime.observe_usage(120, usage_within_budget()).unwrap();
@@ -193,8 +198,7 @@ fn connector_host_runtime_integration_sandbox_allows_scoped_targets() {
     ];
     config.sandbox.capability_envelope.filesystem_read_prefixes =
         vec!["/var/connectors/".to_string()];
-    config.sandbox.capability_envelope.network_allow_hosts =
-        vec!["*.svc.local".to_string()];
+    config.sandbox.capability_envelope.network_allow_hosts = vec!["*.svc.local".to_string()];
     let mut runtime = ConnectorHostRuntime::new(config).unwrap();
     runtime.start(1_000).unwrap();
     runtime.observe_usage(1_010, usage_within_budget()).unwrap();
@@ -228,10 +232,7 @@ fn connector_host_runtime_integration_sandbox_allows_scoped_targets() {
             .with_target("api.svc.local"),
         )
         .unwrap();
-    assert_eq!(
-        net_envelope.target.as_deref(),
-        Some("api.svc.local")
-    );
+    assert_eq!(net_envelope.target.as_deref(), Some("api.svc.local"));
 
     let decisions = runtime.sandbox_decision_history();
     assert_eq!(decisions.len(), 2);

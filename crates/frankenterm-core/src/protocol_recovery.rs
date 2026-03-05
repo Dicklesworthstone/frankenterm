@@ -1220,9 +1220,7 @@ mod tests {
                 let _ = e
                     .execute(
                         |_| async {
-                            Err::<i32, _>(
-                                "codec version mismatch: local 4 != remote 3".to_string(),
-                            )
+                            Err::<i32, _>("codec version mismatch: local 4 != remote 3".to_string())
                         },
                         |err: &String| classify_error_message(err),
                     )

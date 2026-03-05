@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
     use crate::patterns::{DetectionContext, PatternEngine};
+    use std::time::Duration;
 
     #[test]
     fn reproduction_dedup_suppresses_and_expires() {
@@ -26,6 +26,9 @@ mod tests {
 
         // Third detection after TTL
         let detections3 = engine.detect_with_context(text, &mut context);
-        assert!(!detections3.is_empty(), "Should detect again after TTL expiration");
+        assert!(
+            !detections3.is_empty(),
+            "Should detect again after TTL expiration"
+        );
     }
 }

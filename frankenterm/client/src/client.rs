@@ -1031,7 +1031,7 @@ impl Reconnectable {
                         remote_address, remote_host_name,
                     )
                 })?,
-                ))?);
+        ))?);
         ui.output_str("TLS Connected!\n");
         Ok(stream)
     }
@@ -1304,7 +1304,10 @@ impl Client {
     pub async fn send_pdu(&self, pdu: Pdu) -> anyhow::Result<Pdu> {
         let (promise, rx) = bounded(1);
         self.sender
-            .send(ReaderMessage::SendPdu { pdu: Box::new(pdu), promise })
+            .send(ReaderMessage::SendPdu {
+                pdu: Box::new(pdu),
+                promise,
+            })
             .await
             .map_err(|_| ChannelSendError)
             .context("send_pdu send")?;

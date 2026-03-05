@@ -464,13 +464,12 @@ fn labruntime_event_loop_startup_shutdown_is_clean() {
         let config = test_config();
         let (_mock, wezterm_handle) = make_mock_handle(&[0]).await;
 
-        let mut runtime =
-            frankenterm_core::runtime::ObservationRuntime::new(
-                config,
-                storage,
-                Arc::new(RwLock::new(engine)),
-            )
-            .with_wezterm_handle(wezterm_handle);
+        let mut runtime = frankenterm_core::runtime::ObservationRuntime::new(
+            config,
+            storage,
+            Arc::new(RwLock::new(engine)),
+        )
+        .with_wezterm_handle(wezterm_handle);
 
         let handle = runtime.start().await.expect("runtime should start");
 
@@ -504,13 +503,12 @@ fn labruntime_channel_dispatch_delivers_capture_events() {
 
         let (mock, wezterm_handle) = make_mock_handle(&[0]).await;
 
-        let mut runtime =
-            frankenterm_core::runtime::ObservationRuntime::new(
-                config,
-                storage,
-                Arc::new(RwLock::new(engine)),
-            )
-            .with_wezterm_handle(wezterm_handle);
+        let mut runtime = frankenterm_core::runtime::ObservationRuntime::new(
+            config,
+            storage,
+            Arc::new(RwLock::new(engine)),
+        )
+        .with_wezterm_handle(wezterm_handle);
 
         let handle = runtime.start().await.expect("runtime should start");
 
@@ -547,13 +545,12 @@ fn labruntime_shutdown_propagation_drains_all_tasks() {
         let config = test_config();
         let (_mock, wezterm_handle) = make_mock_handle(&[0, 1]).await;
 
-        let mut runtime =
-            frankenterm_core::runtime::ObservationRuntime::new(
-                config,
-                storage,
-                Arc::new(RwLock::new(engine)),
-            )
-            .with_wezterm_handle(wezterm_handle);
+        let mut runtime = frankenterm_core::runtime::ObservationRuntime::new(
+            config,
+            storage,
+            Arc::new(RwLock::new(engine)),
+        )
+        .with_wezterm_handle(wezterm_handle);
 
         let handle = runtime.start().await.expect("runtime should start");
 

@@ -86,13 +86,8 @@ fn budget_critical_blocks_launch() {
     cost_tracker.record_usage(1, AgentType::Codex, 100_000, 65.0, 100);
 
     let mut gate = QuotaGate::new();
-    let decision = gate.evaluate_from_trackers(
-        AgentType::Codex,
-        &mut cost_tracker,
-        None,
-        None,
-        None,
-    );
+    let decision =
+        gate.evaluate_from_trackers(AgentType::Codex, &mut cost_tracker, None, None, None);
 
     assert_eq!(decision.verdict, LaunchVerdict::Block);
     assert!(decision.is_blocked());
@@ -230,23 +225,13 @@ fn cross_provider_budget_isolation() {
     let mut gate = QuotaGate::new();
 
     // Codex should be blocked
-    let codex_decision = gate.evaluate_from_trackers(
-        AgentType::Codex,
-        &mut cost_tracker,
-        None,
-        None,
-        None,
-    );
+    let codex_decision =
+        gate.evaluate_from_trackers(AgentType::Codex, &mut cost_tracker, None, None, None);
     assert_eq!(codex_decision.verdict, LaunchVerdict::Block);
 
     // ClaudeCode should be allowed (Codex's budget doesn't affect it)
-    let claude_decision = gate.evaluate_from_trackers(
-        AgentType::ClaudeCode,
-        &mut cost_tracker,
-        None,
-        None,
-        None,
-    );
+    let claude_decision =
+        gate.evaluate_from_trackers(AgentType::ClaudeCode, &mut cost_tracker, None, None, None);
     assert_eq!(claude_decision.verdict, LaunchVerdict::Allow);
 }
 
@@ -309,22 +294,12 @@ fn cost_dashboard_feeds_into_gate() {
 
     // Codex: 90% of $100 budget → warning
     let mut gate = QuotaGate::new();
-    let codex_decision = gate.evaluate_from_trackers(
-        AgentType::Codex,
-        &mut cost_tracker,
-        None,
-        None,
-        None,
-    );
+    let codex_decision =
+        gate.evaluate_from_trackers(AgentType::Codex, &mut cost_tracker, None, None, None);
     assert_eq!(codex_decision.verdict, LaunchVerdict::Warn);
 
     // Gemini: 7.5% of $200 budget → allow
-    let gemini_decision = gate.evaluate_from_trackers(
-        AgentType::Gemini,
-        &mut cost_tracker,
-        None,
-        None,
-        None,
-    );
+    let gemini_decision =
+        gate.evaluate_from_trackers(AgentType::Gemini, &mut cost_tracker, None, None, None);
     assert_eq!(gemini_decision.verdict, LaunchVerdict::Allow);
 }

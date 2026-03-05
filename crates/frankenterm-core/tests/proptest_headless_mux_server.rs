@@ -3,12 +3,11 @@
 use proptest::prelude::*;
 
 use frankenterm_core::headless_mux_server::{
-    HeadlessMuxServer, PeerStatus, RemoteRequest, RemoteResponse,
-    ServerConfig, ServerNodeId,
+    HeadlessMuxServer, PeerStatus, RemoteRequest, RemoteResponse, ServerConfig, ServerNodeId,
 };
 use frankenterm_core::session_topology::{
-    LifecycleEntityKind, LifecycleIdentity, LifecycleState,
-    MuxPaneLifecycleState, WindowLifecycleState,
+    LifecycleEntityKind, LifecycleIdentity, LifecycleState, MuxPaneLifecycleState,
+    WindowLifecycleState,
 };
 
 fn arb_peer_status() -> impl Strategy<Value = PeerStatus> {
@@ -41,8 +40,8 @@ fn arb_config() -> impl Strategy<Value = ServerConfig> {
         any::<bool>(),
         100u32..100_000u32,
     )
-        .prop_map(|(max_conn, hb_interval, peer_timeout, auto_cp, max_panes)| {
-            ServerConfig {
+        .prop_map(
+            |(max_conn, hb_interval, peer_timeout, auto_cp, max_panes)| ServerConfig {
                 bind_address: "0.0.0.0:9876".into(),
                 node_id: "test-node".into(),
                 label: None,
@@ -51,8 +50,8 @@ fn arb_config() -> impl Strategy<Value = ServerConfig> {
                 peer_timeout_ms: peer_timeout,
                 auto_checkpoint: auto_cp,
                 max_panes,
-            }
-        })
+            },
+        )
 }
 
 fn make_server() -> HeadlessMuxServer {
@@ -60,13 +59,7 @@ fn make_server() -> HeadlessMuxServer {
 }
 
 fn register_pane(server: &mut HeadlessMuxServer, id: u64) {
-    let identity = LifecycleIdentity::new(
-        LifecycleEntityKind::Pane,
-        "default",
-        "local",
-        id,
-        1,
-    );
+    let identity = LifecycleIdentity::new(LifecycleEntityKind::Pane, "default", "local", id, 1);
     server
         .registry_mut()
         .register_entity(

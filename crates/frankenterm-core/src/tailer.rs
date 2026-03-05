@@ -1577,7 +1577,8 @@ mod tests {
             let shutdown = Arc::new(AtomicBool::new(false));
             let source = Arc::new(StaticSource);
 
-            let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
             assert_eq!(supervisor.active_count(), 0);
 
@@ -1627,7 +1628,8 @@ mod tests {
                 }
             }
 
-            let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
             let mut panes = HashMap::new();
             for pane_id in 1..=4 {
@@ -1675,7 +1677,8 @@ mod tests {
                 cursor_guard.insert(2, PaneCursor::new(2));
             }
 
-            let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
             let mut panes = HashMap::new();
             panes.insert(1, make_pane(1));
@@ -1734,7 +1737,8 @@ mod tests {
                 cursor_guard.insert(2, PaneCursor::new(2));
             }
 
-            let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
             let mut panes = HashMap::new();
             panes.insert(1, make_pane(1));
@@ -1784,7 +1788,8 @@ mod tests {
                 cursor_guard.insert(1, PaneCursor::new(1));
             }
 
-            let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
             let mut panes = HashMap::new();
             panes.insert(1, make_pane(1));
@@ -2017,7 +2022,8 @@ mod tests {
                 cursor_guard.insert(1, PaneCursor::new(1));
             }
 
-            let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
             let mut panes = HashMap::new();
             panes.insert(1, make_pane(1));
@@ -2333,8 +2339,9 @@ mod tests {
                 }
             }
 
-            let mut supervisor =
-                TailerSupervisor::with_budget(config, tx, cursors, registry, shutdown, source, budget);
+            let mut supervisor = TailerSupervisor::with_budget(
+                config, tx, cursors, registry, shutdown, source, budget,
+            );
 
             let mut panes = HashMap::new();
             for pane_id in 1..=4 {
@@ -2549,8 +2556,9 @@ mod tests {
                 max_bytes_per_sec: 1000,
             };
 
-            let mut supervisor =
-                TailerSupervisor::with_budget(config, tx, cursors, registry, shutdown, source, budget);
+            let mut supervisor = TailerSupervisor::with_budget(
+                config, tx, cursors, registry, shutdown, source, budget,
+            );
 
             let mut panes = HashMap::new();
             panes.insert(1, make_pane(1));
@@ -3322,7 +3330,8 @@ mod tests {
             let shutdown = Arc::new(AtomicBool::new(false));
             let source = Arc::new(StaticSource);
 
-            let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
             let mut panes = HashMap::new();
             panes.insert(1, make_pane(1));

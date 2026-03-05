@@ -984,7 +984,9 @@ mod tests {
         );
 
         // Tamper with entry 0's payload without updating the hash.
-        ledger.entries[0].payload.insert("tampered".to_string(), EvidenceValue::Bool(true));
+        ledger.entries[0]
+            .payload
+            .insert("tampered".to_string(), EvidenceValue::Bool(true));
 
         let verification = ledger.verify_chain();
         assert!(!verification.is_valid);

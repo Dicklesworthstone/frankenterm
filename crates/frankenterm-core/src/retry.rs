@@ -1238,8 +1238,7 @@ mod tests {
         run_async_test(async {
             let policy = RetryPolicy::default();
 
-            let outcome =
-                with_retry_outcome(&policy, || async { Ok::<_, Error>("hello") }).await;
+            let outcome = with_retry_outcome(&policy, || async { Ok::<_, Error>("hello") }).await;
 
             assert!(outcome.result.is_ok());
             assert_eq!(outcome.attempts, 1);

@@ -140,6 +140,8 @@ pub struct PaneBelief {
     cached_entropy: f64,
     /// Last observation timestamp (epoch ms).
     last_observed_ms: u64,
+    /// Last time entropy drift was applied (epoch ms).
+    last_drift_ms: u64,
     /// Importance weight for this pane.
     importance: f64,
     /// Base cost of polling this pane (ms).
@@ -158,6 +160,7 @@ impl PaneBelief {
             log_probs,
             cached_entropy: entropy,
             last_observed_ms: now_ms,
+            last_drift_ms: now_ms,
             importance,
             cost_ms,
             observation_count: 0,
@@ -188,6 +191,7 @@ impl PaneBelief {
         }
         self.recompute_entropy();
         self.last_observed_ms = now_ms;
+        self.last_drift_ms = now_ms;
         self.observation_count += 1;
     }
 
@@ -369,10 +373,11 @@ impl VoiScheduler {
         let max_entropy = self.config.max_entropy;
 
         for belief in self.beliefs.values_mut() {
-            if belief.last_observed_ms < now_ms {
-                let dt_secs = (now_ms - belief.last_observed_ms) as f64 / 1000.0;
+            if belief.last_drift_ms < now_ms {
+                let dt_secs = (now_ms - belief.last_drift_ms) as f64 / 1000.0;
                 let new_entropy = (belief.cached_entropy + dt_secs * drift_rate).min(max_entropy);
                 belief.cached_entropy = new_entropy;
+                belief.last_drift_ms = now_ms;
             }
         }
     }
@@ -381,7 +386,7 @@ impl VoiScheduler {
     fn compute_voi(&self, pane_id: u64, now_ms: u64) -> Option<f64> {
         let belief = self.beliefs.get(&pane_id)?;
 
-        let dt_secs = (now_ms.saturating_sub(belief.last_observed_ms)) as f64 / 1000.0;
+        let dt_secs = (now_ms.saturating_sub(belief.last_drift_ms)) as f64 / 1000.0;
         let current_h = (belief.cached_entropy + dt_secs * self.config.entropy_drift_rate)
             .min(self.config.max_entropy);
 
@@ -415,7 +420,7 @@ impl VoiScheduler {
         let mut total_entropy = 0.0;
 
         for (&pane_id, belief) in &self.beliefs {
-            let dt_secs = (now_ms.saturating_sub(belief.last_observed_ms)) as f64 / 1000.0;
+            let dt_secs = (now_ms.saturating_sub(belief.last_drift_ms)) as f64 / 1000.0;
             let current_h = (belief.cached_entropy + dt_secs * self.config.entropy_drift_rate)
                 .min(self.config.max_entropy);
             total_entropy += current_h;

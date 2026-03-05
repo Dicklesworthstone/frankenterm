@@ -1,10 +1,10 @@
 use super::confirm;
 use crate::TermWindow;
+use mux::Mux;
 use mux::pane::PaneId;
 use mux::tab::TabId;
 use mux::termwiztermtab::TermWizTerminal;
 use mux::window::WindowId;
-use mux::Mux;
 
 pub fn confirm_close_pane(
     pane_id: PaneId,

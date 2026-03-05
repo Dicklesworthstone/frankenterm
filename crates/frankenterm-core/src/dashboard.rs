@@ -334,7 +334,11 @@ impl DashboardManager {
         }
 
         // Rate limits contribute to health.
-        if rate_limits.providers.iter().any(|p| p.status == "fully_limited") {
+        if rate_limits
+            .providers
+            .iter()
+            .any(|p| p.status == "fully_limited")
+        {
             overall = overall.max(SystemHealthTier::Red);
         } else if rate_limits.limited_provider_count > 0 {
             overall = overall.max(SystemHealthTier::Yellow);
@@ -402,11 +406,7 @@ impl DashboardManager {
             }
         }
 
-        let alerts = snap
-            .alerts
-            .iter()
-            .map(budget_alert_to_view)
-            .collect();
+        let alerts = snap.alerts.iter().map(budget_alert_to_view).collect();
 
         CostPanel {
             providers,

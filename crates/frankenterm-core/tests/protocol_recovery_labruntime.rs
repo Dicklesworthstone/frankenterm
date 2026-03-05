@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use frankenterm_core::protocol_recovery::{
-    classify_error_message, ProtocolErrorKind, RecoveryConfig, RecoveryEngine, RecoveryError,
-};
 use frankenterm_core::circuit_breaker::CircuitStateKind;
+use frankenterm_core::protocol_recovery::{
+    ProtocolErrorKind, RecoveryConfig, RecoveryEngine, RecoveryError, classify_error_message,
+};
 
 use common::fixtures::RuntimeFixture;
 

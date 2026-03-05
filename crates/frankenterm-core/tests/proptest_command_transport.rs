@@ -324,7 +324,7 @@ fn route_skips_non_running_panes() {
 
     let result = router.route(&req, &reg).unwrap();
     assert_eq!(result.delivered_count(), 2); // 100, 102
-    assert_eq!(result.skipped_count(), 1);   // 101 (closed)
+    assert_eq!(result.skipped_count(), 1); // 101 (closed)
     assert!(!result.all_delivered());
 }
 
@@ -423,8 +423,16 @@ fn interrupt_signal_bytes_nonempty() {
 #[test]
 fn scope_labels_include_type_prefix() {
     assert!(CommandScope::pane(pane_id(1)).label().starts_with("pane:"));
-    assert!(CommandScope::window(window_id(1)).label().starts_with("window:"));
-    assert!(CommandScope::session(session_id(1)).label().starts_with("session:"));
+    assert!(
+        CommandScope::window(window_id(1))
+            .label()
+            .starts_with("window:")
+    );
+    assert!(
+        CommandScope::session(session_id(1))
+            .label()
+            .starts_with("session:")
+    );
     assert_eq!(CommandScope::fleet().label(), "fleet:*");
 }
 
@@ -437,31 +445,11 @@ fn delivery_status_predicates() {
     assert!(DeliveryStatus::Delivered.is_delivered());
     assert!(!DeliveryStatus::Delivered.is_skipped());
 
-    assert!(
-        DeliveryStatus::Skipped {
-            reason: "x".into()
-        }
-        .is_skipped()
-    );
-    assert!(
-        !DeliveryStatus::Skipped {
-            reason: "x".into()
-        }
-        .is_delivered()
-    );
+    assert!(DeliveryStatus::Skipped { reason: "x".into() }.is_skipped());
+    assert!(!DeliveryStatus::Skipped { reason: "x".into() }.is_delivered());
 
-    assert!(
-        !DeliveryStatus::PolicyDenied {
-            reason: "x".into()
-        }
-        .is_delivered()
-    );
-    assert!(
-        !DeliveryStatus::RoutingError {
-            reason: "x".into()
-        }
-        .is_delivered()
-    );
+    assert!(!DeliveryStatus::PolicyDenied { reason: "x".into() }.is_delivered());
+    assert!(!DeliveryStatus::RoutingError { reason: "x".into() }.is_delivered());
 }
 
 // ---------------------------------------------------------------------------
@@ -476,5 +464,8 @@ fn command_result_all_delivered_requires_nonempty() {
         dry_run: false,
         elapsed_us: 0,
     };
-    assert!(!empty.all_delivered(), "empty deliveries → not all_delivered");
+    assert!(
+        !empty.all_delivered(),
+        "empty deliveries → not all_delivered"
+    );
 }

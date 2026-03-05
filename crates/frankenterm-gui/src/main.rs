@@ -9,14 +9,15 @@ use crate::customglyph::BlockKey;
 use crate::glyphcache::GlyphCache;
 use crate::utilsprites::RenderMetrics;
 use ::window::*;
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use clap::builder::ValueParser;
 use clap::{Parser, ValueHint};
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{ConfigHandle, SerialDomain, SshDomain, SshMultiplexing};
+use frankenterm_mux_server_impl::update_mux_domains;
+use mux::Mux;
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
-use mux::Mux;
 use mux_lua::MuxDomain;
 use portable_pty::cmdbuilder::CommandBuilder;
 use promise::spawn::block_on;
@@ -32,21 +33,20 @@ use termwiz::surface::{Line, SEQ_ZERO};
 use unicode_normalization::UnicodeNormalization;
 use wezterm_bidi::Direction;
 use wezterm_client::domain::ClientDomain;
-use wezterm_font::shaper::PresentationWidth;
 use wezterm_font::FontConfiguration;
+use wezterm_font::shaper::PresentationWidth;
 use wezterm_gui_subcommands::*;
-use frankenterm_mux_server_impl::update_mux_domains;
 use wezterm_toast_notification::*;
 
 mod colorease;
-mod dashboard;
-mod native_bridge;
 mod commands;
 mod customglyph;
+mod dashboard;
 mod download;
 mod frontend;
 mod glyphcache;
 mod inputmap;
+mod native_bridge;
 mod overlay;
 mod quad;
 mod renderstate;
@@ -69,7 +69,7 @@ mod utilsprites;
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 pub use selection::SelectionMode;
-pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DATA};
+pub use termwindow::{ICON_DATA, TermWindow, set_window_class, set_window_position};
 
 // ---------------------------------------------------------------------------
 // Bootstrap (inlined from env-bootstrap, minus Lua registration)
@@ -432,8 +432,7 @@ async fn async_run_terminal_gui(
     should_publish: bool,
 ) -> anyhow::Result<()> {
     let pid = std::process::id();
-    let unix_socket_path =
-        config::RUNTIME_DIR.join(format!("frankenterm-gui-sock-{}", pid));
+    let unix_socket_path = config::RUNTIME_DIR.join(format!("frankenterm-gui-sock-{}", pid));
     #[allow(unused_unsafe)]
     unsafe {
         std::env::set_var("FRANKENTERM_UNIX_SOCKET", unix_socket_path.clone());

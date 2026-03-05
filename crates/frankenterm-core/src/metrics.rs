@@ -1080,8 +1080,8 @@ mod pure_tests {
 #[cfg(all(test, feature = "metrics"))]
 mod tests {
     use super::*;
-    use crate::runtime_compat::io::{AsyncReadExt, AsyncWriteExt};
     use crate::runtime_compat::CompatRuntime;
+    use crate::runtime_compat::io::{AsyncReadExt, AsyncWriteExt};
 
     fn run_async_test<F>(future: F)
     where

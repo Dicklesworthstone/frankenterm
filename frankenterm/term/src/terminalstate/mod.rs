@@ -1378,7 +1378,7 @@ impl TerminalState {
             Mode::QueryDecPrivateMode(DecPrivateMode::Code(code)) => (true, code.to_u16().unwrap()),
             Mode::QueryDecPrivateMode(DecPrivateMode::Unspecified(code)) => (true, *code),
             Mode::QueryMode(TerminalMode::Code(code)) => (false, code.to_u16().unwrap()),
-            Mode::QueryMode(TerminalMode::Unspecified(code)) => {
+            Mode::QueryMode(TerminalMode::Unspecified(_code)) => {
                 unreachable!("unhandled {:?}", mode);
             }
             _ => unreachable!(),

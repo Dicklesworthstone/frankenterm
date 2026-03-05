@@ -830,21 +830,21 @@ proptest! {
 #[test]
 fn empty_topology_restores_empty() {
     run_async_test(async {
-    let topo = TopologySnapshot {
-        schema_version: 1,
-        captured_at: 1_700_000_000,
-        workspace_id: None,
-        windows: vec![],
-    };
+        let topo = TopologySnapshot {
+            schema_version: 1,
+            captured_at: 1_700_000_000,
+            workspace_id: None,
+            windows: vec![],
+        };
 
-    let mock = Arc::new(MockWezterm::new());
-    let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
-    let result = restorer.restore(&topo).await.unwrap();
+        let mock = Arc::new(MockWezterm::new());
+        let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
+        let result = restorer.restore(&topo).await.unwrap();
 
-    assert_eq!(result.pane_id_map.len(), 0);
-    assert_eq!(result.windows_created, 0);
-    assert_eq!(result.tabs_created, 0);
-    assert_eq!(result.panes_created, 0);
+        assert_eq!(result.pane_id_map.len(), 0);
+        assert_eq!(result.windows_created, 0);
+        assert_eq!(result.tabs_created, 0);
+        assert_eq!(result.panes_created, 0);
     });
 }
 
@@ -852,41 +852,41 @@ fn empty_topology_restores_empty() {
 #[test]
 fn single_pane_topology_restores() {
     run_async_test(async {
-    let topo = TopologySnapshot {
-        schema_version: 1,
-        captured_at: 1_700_000_000,
-        workspace_id: Some("default".to_string()),
-        windows: vec![WindowSnapshot {
-            window_id: 0,
-            title: None,
-            position: None,
-            size: None,
-            tabs: vec![TabSnapshot {
-                tab_id: 0,
+        let topo = TopologySnapshot {
+            schema_version: 1,
+            captured_at: 1_700_000_000,
+            workspace_id: Some("default".to_string()),
+            windows: vec![WindowSnapshot {
+                window_id: 0,
                 title: None,
-                pane_tree: PaneNode::Leaf {
-                    pane_id: 1,
-                    rows: 24,
-                    cols: 80,
-                    cwd: Some("/home/user".to_string()),
-                    title: Some("bash".to_string()),
-                    is_active: true,
-                },
-                active_pane_id: Some(1),
+                position: None,
+                size: None,
+                tabs: vec![TabSnapshot {
+                    tab_id: 0,
+                    title: None,
+                    pane_tree: PaneNode::Leaf {
+                        pane_id: 1,
+                        rows: 24,
+                        cols: 80,
+                        cwd: Some("/home/user".to_string()),
+                        title: Some("bash".to_string()),
+                        is_active: true,
+                    },
+                    active_pane_id: Some(1),
+                }],
+                active_tab_index: Some(0),
             }],
-            active_tab_index: Some(0),
-        }],
-    };
+        };
 
-    let mock = Arc::new(MockWezterm::new());
-    let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
-    let result = restorer.restore(&topo).await.unwrap();
+        let mock = Arc::new(MockWezterm::new());
+        let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
+        let result = restorer.restore(&topo).await.unwrap();
 
-    assert_eq!(result.pane_id_map.len(), 1);
-    assert!(result.pane_id_map.contains_key(&1));
-    assert_eq!(result.windows_created, 1);
-    assert_eq!(result.tabs_created, 1);
-    assert_eq!(result.panes_created, 1);
+        assert_eq!(result.pane_id_map.len(), 1);
+        assert!(result.pane_id_map.contains_key(&1));
+        assert_eq!(result.windows_created, 1);
+        assert_eq!(result.tabs_created, 1);
+        assert_eq!(result.panes_created, 1);
     });
 }
 
@@ -894,60 +894,60 @@ fn single_pane_topology_restores() {
 #[test]
 fn max_complexity_topology_restores() {
     run_async_test(async {
-    // Build a deep split tree: 5 levels, ~31 panes
-    fn deep_tree(depth: u32, next_id: &mut u64) -> PaneNode {
-        if depth == 0 {
-            let id = *next_id;
-            *next_id += 1;
-            return PaneNode::Leaf {
-                pane_id: id,
-                rows: 24,
-                cols: 80,
-                cwd: Some("/tmp".to_string()),
-                title: None,
-                is_active: false,
-            };
-        }
-        let left = deep_tree(depth - 1, next_id);
-        let right = deep_tree(depth - 1, next_id);
-        if depth % 2 == 0 {
-            PaneNode::HSplit {
-                children: vec![(0.5, left), (0.5, right)],
+        // Build a deep split tree: 5 levels, ~31 panes
+        fn deep_tree(depth: u32, next_id: &mut u64) -> PaneNode {
+            if depth == 0 {
+                let id = *next_id;
+                *next_id += 1;
+                return PaneNode::Leaf {
+                    pane_id: id,
+                    rows: 24,
+                    cols: 80,
+                    cwd: Some("/tmp".to_string()),
+                    title: None,
+                    is_active: false,
+                };
             }
-        } else {
-            PaneNode::VSplit {
-                children: vec![(0.5, left), (0.5, right)],
+            let left = deep_tree(depth - 1, next_id);
+            let right = deep_tree(depth - 1, next_id);
+            if depth % 2 == 0 {
+                PaneNode::HSplit {
+                    children: vec![(0.5, left), (0.5, right)],
+                }
+            } else {
+                PaneNode::VSplit {
+                    children: vec![(0.5, left), (0.5, right)],
+                }
             }
         }
-    }
 
-    let mut next_id = 1u64;
-    let topo = TopologySnapshot {
-        schema_version: 1,
-        captured_at: 1_700_000_000,
-        workspace_id: Some("default".to_string()),
-        windows: vec![WindowSnapshot {
-            window_id: 0,
-            title: None,
-            position: None,
-            size: None,
-            tabs: vec![TabSnapshot {
-                tab_id: 0,
+        let mut next_id = 1u64;
+        let topo = TopologySnapshot {
+            schema_version: 1,
+            captured_at: 1_700_000_000,
+            workspace_id: Some("default".to_string()),
+            windows: vec![WindowSnapshot {
+                window_id: 0,
                 title: None,
-                pane_tree: deep_tree(5, &mut next_id),
-                active_pane_id: Some(1),
+                position: None,
+                size: None,
+                tabs: vec![TabSnapshot {
+                    tab_id: 0,
+                    title: None,
+                    pane_tree: deep_tree(5, &mut next_id),
+                    active_pane_id: Some(1),
+                }],
+                active_tab_index: Some(0),
             }],
-            active_tab_index: Some(0),
-        }],
-    };
+        };
 
-    let expected_panes = (next_id - 1) as usize; // 32 leaves (2^5)
-    let mock = Arc::new(MockWezterm::new());
-    let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
-    let result = restorer.restore(&topo).await.unwrap();
+        let expected_panes = (next_id - 1) as usize; // 32 leaves (2^5)
+        let mock = Arc::new(MockWezterm::new());
+        let restorer = LayoutRestorer::new(mock, RestoreConfig::default());
+        let result = restorer.restore(&topo).await.unwrap();
 
-    assert_eq!(result.pane_id_map.len(), expected_panes);
-    assert_eq!(result.panes_created, expected_panes);
+        assert_eq!(result.pane_id_map.len(), expected_panes);
+        assert_eq!(result.panes_created, expected_panes);
     });
 }
 

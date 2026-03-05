@@ -27,8 +27,8 @@ use frankenterm_core::session_topology::{
     SessionLifecycleState, WindowLifecycleState,
 };
 use frankenterm_core::topology_orchestration::{
-    LayoutNode, LayoutTemplate, OpCheckResult, TemplateRegistry, TopologyOp,
-    TopologyOrchestrator, TopologySplitDirection,
+    LayoutNode, LayoutTemplate, OpCheckResult, TemplateRegistry, TopologyOp, TopologyOrchestrator,
+    TopologySplitDirection,
 };
 
 // =============================================================================
@@ -52,7 +52,9 @@ fn register_entity(
     state: LifecycleState,
 ) {
     let identity = LifecycleIdentity::new(kind, "e2e-workspace", "local", id, 1);
-    registry.register_entity(identity, state, 0).expect("register");
+    registry
+        .register_entity(identity, state, 0)
+        .expect("register");
 }
 
 fn register_pane(registry: &mut LifecycleRegistry, id: u64) {
@@ -221,7 +223,11 @@ fn topology_orchestrator_validates_split_operations() {
         ratio: 0.5,
     };
     let check = orch.validate_op(&op, &registry);
-    assert_eq!(check, OpCheckResult::Ok, "50/50 horizontal split should be valid");
+    assert_eq!(
+        check,
+        OpCheckResult::Ok,
+        "50/50 horizontal split should be valid"
+    );
 
     // Invalid split (ratio out of bounds)
     let op_bad = TopologyOp::Split {
@@ -230,7 +236,11 @@ fn topology_orchestrator_validates_split_operations() {
         ratio: 1.5,
     };
     let check_bad = orch.validate_op(&op_bad, &registry);
-    assert_ne!(check_bad, OpCheckResult::Ok, "ratio > 1.0 should be invalid");
+    assert_ne!(
+        check_bad,
+        OpCheckResult::Ok,
+        "ratio > 1.0 should be invalid"
+    );
 }
 
 #[test]
@@ -286,9 +296,18 @@ fn command_dedup_prevents_duplicate_execution() {
 
     let id = "cmd-dup-test";
     let now = 1000u64;
-    assert!(!dedup.is_duplicate(id, now), "First submission should not be duplicate");
-    assert!(dedup.is_duplicate(id, now), "Second submission should be duplicate");
-    assert!(dedup.is_duplicate(id, now), "Third submission should be duplicate");
+    assert!(
+        !dedup.is_duplicate(id, now),
+        "First submission should not be duplicate"
+    );
+    assert!(
+        dedup.is_duplicate(id, now),
+        "Second submission should be duplicate"
+    );
+    assert!(
+        dedup.is_duplicate(id, now),
+        "Third submission should be duplicate"
+    );
 }
 
 // =============================================================================
@@ -329,7 +348,10 @@ fn profile_resolution_merges_overrides() {
     };
 
     let base = reg.get_profile("dev-shell").unwrap().clone();
-    assert!(base.spawn_command.is_some(), "dev-shell should have spawn command");
+    assert!(
+        base.spawn_command.is_some(),
+        "dev-shell should have spawn command"
+    );
 }
 
 // =============================================================================
@@ -347,12 +369,14 @@ fn checkpoint_captures_and_restores_entity_state() {
     register_session(&mut registry, 100);
 
     // Checkpoint
-    let cp_id = state_mgr.checkpoint(
-        &registry,
-        "before-mutation",
-        CheckpointTrigger::Manual,
-        HashMap::new(),
-    ).id;
+    let cp_id = state_mgr
+        .checkpoint(
+            &registry,
+            "before-mutation",
+            CheckpointTrigger::Manual,
+            HashMap::new(),
+        )
+        .id;
     assert!(cp_id > 0);
 
     // Mutate state — add more entities
@@ -380,22 +404,26 @@ fn multiple_checkpoints_maintain_independent_snapshots() {
 
     register_pane(&mut registry, 1);
 
-    let cp1_id = state_mgr.checkpoint(
-        &registry,
-        "cp1-one-pane",
-        CheckpointTrigger::Manual,
-        HashMap::new(),
-    ).id;
+    let cp1_id = state_mgr
+        .checkpoint(
+            &registry,
+            "cp1-one-pane",
+            CheckpointTrigger::Manual,
+            HashMap::new(),
+        )
+        .id;
 
     register_pane(&mut registry, 2);
     register_pane(&mut registry, 3);
 
-    let _cp2_id = state_mgr.checkpoint(
-        &registry,
-        "cp2-three-panes",
-        CheckpointTrigger::Manual,
-        HashMap::new(),
-    ).id;
+    let _cp2_id = state_mgr
+        .checkpoint(
+            &registry,
+            "cp2-three-panes",
+            CheckpointTrigger::Manual,
+            HashMap::new(),
+        )
+        .id;
 
     register_pane(&mut registry, 4);
 
@@ -415,22 +443,21 @@ fn state_diff_detects_changes() {
 
     register_pane(&mut registry, 1);
 
-    let cp_id = state_mgr.checkpoint(
-        &registry,
-        "baseline",
-        CheckpointTrigger::Manual,
-        HashMap::new(),
-    ).id;
+    let cp_id = state_mgr
+        .checkpoint(
+            &registry,
+            "baseline",
+            CheckpointTrigger::Manual,
+            HashMap::new(),
+        )
+        .id;
 
     register_pane(&mut registry, 2);
 
     let diff = state_mgr.diff_from_current(cp_id, &registry);
     assert!(diff.is_ok(), "Diff should succeed");
     let d = diff.unwrap();
-    assert!(
-        d.change_count() > 0,
-        "Should detect added entity as change"
-    );
+    assert!(d.change_count() > 0, "Should detect added entity as change");
 }
 
 // =============================================================================
@@ -532,17 +559,23 @@ fn headless_server_federation_with_health_checks() {
     });
 
     // Register local pane
-    server.registry_mut().register_entity(
-        LifecycleIdentity::new(LifecycleEntityKind::Pane, "fed", "local", 1, 1),
-        LifecycleState::Pane(MuxPaneLifecycleState::Running),
-        0,
-    ).unwrap();
+    server
+        .registry_mut()
+        .register_entity(
+            LifecycleIdentity::new(LifecycleEntityKind::Pane, "fed", "local", 1, 1),
+            LifecycleState::Pane(MuxPaneLifecycleState::Running),
+            0,
+        )
+        .unwrap();
 
     // Federated count includes local + remote connected peers
     // peer-2 was joined with heartbeat_at = epoch_ms() so it's still "connected"
     // but its pane_count is 0
     let total = server.federated_pane_count();
-    assert!(total >= 6, "Expected at least 6 federated panes (1 local + 5 from peer-1), got {total}");
+    assert!(
+        total >= 6,
+        "Expected at least 6 federated panes (1 local + 5 from peer-1), got {total}"
+    );
 
     // Check health — peer-2 has a very recent heartbeat (just joined), so it might not
     // be unreachable yet. Let's manually set it to old.
@@ -585,12 +618,16 @@ fn cross_module_lifecycle_transitions_survive_checkpoint_rollback() {
     register_pane(&mut registry, 2);
 
     // Checkpoint "healthy state"
-    let cp_id = state_mgr.checkpoint(
-        &registry,
-        "healthy",
-        CheckpointTrigger::PreOperation { operation: "test".into() },
-        HashMap::new(),
-    ).id;
+    let cp_id = state_mgr
+        .checkpoint(
+            &registry,
+            "healthy",
+            CheckpointTrigger::PreOperation {
+                operation: "test".into(),
+            },
+            HashMap::new(),
+        )
+        .id;
 
     // Transition pane 1 to closed
     let req = LifecycleTransitionRequest {
@@ -651,10 +688,16 @@ fn profile_informs_topology_template_selection() {
 
     // Template registry has templates that match fleet use cases
     let swarm = template_reg.get("swarm-1+3");
-    assert!(swarm.is_some(), "swarm-1+3 template should exist for agent fleets");
+    assert!(
+        swarm.is_some(),
+        "swarm-1+3 template should exist for agent fleets"
+    );
 
     let grid = template_reg.get("grid-2x2");
-    assert!(grid.is_some(), "grid-2x2 template should exist for monitoring");
+    assert!(
+        grid.is_some(),
+        "grid-2x2 template should exist for monitoring"
+    );
 }
 
 // =============================================================================
@@ -667,17 +710,23 @@ fn headless_entity_listing_consistent_with_registry() {
 
     // Register mixed entities
     for i in 1..=3 {
-        server.registry_mut().register_entity(
-            LifecycleIdentity::new(LifecycleEntityKind::Pane, "ws", "local", i, 1),
-            LifecycleState::Pane(MuxPaneLifecycleState::Running),
-            0,
-        ).unwrap();
+        server
+            .registry_mut()
+            .register_entity(
+                LifecycleIdentity::new(LifecycleEntityKind::Pane, "ws", "local", i, 1),
+                LifecycleState::Pane(MuxPaneLifecycleState::Running),
+                0,
+            )
+            .unwrap();
     }
-    server.registry_mut().register_entity(
-        LifecycleIdentity::new(LifecycleEntityKind::Session, "ws", "local", 100, 1),
-        LifecycleState::Session(SessionLifecycleState::Active),
-        0,
-    ).unwrap();
+    server
+        .registry_mut()
+        .register_entity(
+            LifecycleIdentity::new(LifecycleEntityKind::Session, "ws", "local", 100, 1),
+            LifecycleState::Session(SessionLifecycleState::Active),
+            0,
+        )
+        .unwrap();
 
     // List all via remote
     match server.handle_request(RemoteRequest::ListEntities { kind_filter: None }) {
@@ -746,9 +795,8 @@ fn all_remote_request_variants_serde_roundtrip() {
     ];
 
     for (i, req) in requests.iter().enumerate() {
-        let json = serde_json::to_string(req).unwrap_or_else(|e| {
-            panic!("Failed to serialize request variant {i}: {e}")
-        });
+        let json = serde_json::to_string(req)
+            .unwrap_or_else(|e| panic!("Failed to serialize request variant {i}: {e}"));
         let deserialized: RemoteRequest = serde_json::from_str(&json).unwrap_or_else(|e| {
             panic!("Failed to deserialize request variant {i}: {e}\nJSON: {json}")
         });
@@ -941,13 +989,20 @@ fn checkpoint_triggers_are_recorded() {
 
     let triggers = [
         CheckpointTrigger::Manual,
-        CheckpointTrigger::PreOperation { operation: "test".into() },
+        CheckpointTrigger::PreOperation {
+            operation: "test".into(),
+        },
         CheckpointTrigger::Periodic,
         CheckpointTrigger::PreShutdown,
     ];
 
     for trigger in &triggers {
-        state_mgr.checkpoint(&registry, &format!("{trigger:?}"), trigger.clone(), HashMap::new());
+        state_mgr.checkpoint(
+            &registry,
+            &format!("{trigger:?}"),
+            trigger.clone(),
+            HashMap::new(),
+        );
     }
 
     let cps = state_mgr.list_checkpoints();
@@ -1036,24 +1091,33 @@ fn full_fleet_provision_checkpoint_rollback_scenario() {
     });
 
     // Provision a fleet: 1 session + 1 window + 4 panes
-    server.registry_mut().register_entity(
-        LifecycleIdentity::new(LifecycleEntityKind::Session, "fleet", "local", 1, 1),
-        LifecycleState::Session(SessionLifecycleState::Active),
-        0,
-    ).unwrap();
+    server
+        .registry_mut()
+        .register_entity(
+            LifecycleIdentity::new(LifecycleEntityKind::Session, "fleet", "local", 1, 1),
+            LifecycleState::Session(SessionLifecycleState::Active),
+            0,
+        )
+        .unwrap();
 
-    server.registry_mut().register_entity(
-        LifecycleIdentity::new(LifecycleEntityKind::Window, "fleet", "local", 1, 1),
-        LifecycleState::Window(WindowLifecycleState::Active),
-        0,
-    ).unwrap();
+    server
+        .registry_mut()
+        .register_entity(
+            LifecycleIdentity::new(LifecycleEntityKind::Window, "fleet", "local", 1, 1),
+            LifecycleState::Window(WindowLifecycleState::Active),
+            0,
+        )
+        .unwrap();
 
     for i in 1..=4 {
-        server.registry_mut().register_entity(
-            LifecycleIdentity::new(LifecycleEntityKind::Pane, "fleet", "local", i, 1),
-            LifecycleState::Pane(MuxPaneLifecycleState::Running),
-            0,
-        ).unwrap();
+        server
+            .registry_mut()
+            .register_entity(
+                LifecycleIdentity::new(LifecycleEntityKind::Pane, "fleet", "local", i, 1),
+                LifecycleState::Pane(MuxPaneLifecycleState::Running),
+                0,
+            )
+            .unwrap();
     }
 
     // Checkpoint the healthy fleet
@@ -1076,11 +1140,14 @@ fn full_fleet_provision_checkpoint_rollback_scenario() {
 
     // Simulate damage: add unexpected panes (e.g., a runaway process)
     for i in 100..110 {
-        server.registry_mut().register_entity(
-            LifecycleIdentity::new(LifecycleEntityKind::Pane, "fleet", "local", i, 1),
-            LifecycleState::Pane(MuxPaneLifecycleState::Running),
-            0,
-        ).unwrap();
+        server
+            .registry_mut()
+            .register_entity(
+                LifecycleIdentity::new(LifecycleEntityKind::Pane, "fleet", "local", i, 1),
+                LifecycleState::Pane(MuxPaneLifecycleState::Running),
+                0,
+            )
+            .unwrap();
     }
 
     // Verify 14 panes now

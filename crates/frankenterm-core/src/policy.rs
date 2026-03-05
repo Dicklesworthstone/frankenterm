@@ -1702,9 +1702,9 @@ fn has_trauma_bypass_prefix(text: &str) -> bool {
 
         while let Some(mat) = VAR_ASSIGN.find(trimmed) {
             let assignment = &trimmed[..mat.end()];
-            if assignment.contains("FT_BYPASS_TRAUMA=1") 
-                || assignment.contains("FT_BYPASS_TRAUMA=\"1\"") 
-                || assignment.contains("FT_BYPASS_TRAUMA='1'") 
+            if assignment.contains("FT_BYPASS_TRAUMA=1")
+                || assignment.contains("FT_BYPASS_TRAUMA=\"1\"")
+                || assignment.contains("FT_BYPASS_TRAUMA='1'")
             {
                 return true;
             }

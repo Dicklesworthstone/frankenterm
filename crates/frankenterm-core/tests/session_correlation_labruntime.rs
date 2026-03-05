@@ -78,16 +78,10 @@ fn correlate_and_persist_override_updates_session() {
         options.override_session_id = Some("cass-override".to_string());
 
         let cass = CassClient::new();
-        let correlation = correlate_and_persist_for_pane(
-            &handle,
-            &cass,
-            1,
-            CassAgent::ClaudeCode,
-            now,
-            &options,
-        )
-        .await
-        .unwrap();
+        let correlation =
+            correlate_and_persist_for_pane(&handle, &cass, 1, CassAgent::ClaudeCode, now, &options)
+                .await
+                .unwrap();
 
         let updated = handle.get_agent_session(session_id).await.unwrap().unwrap();
         assert_eq!(updated.external_id.as_deref(), Some("cass-override"));

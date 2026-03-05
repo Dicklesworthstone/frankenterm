@@ -8,7 +8,7 @@ use frankenterm_core::replay_fixture_harvest::{
     ArtifactReader, ArtifactWriterConfig, FixtureHarvester, FtreplayValidator, FtreplayWriter,
     HarvestSource,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
 #[derive(Debug, Default, Clone)]

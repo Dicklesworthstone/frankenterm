@@ -152,9 +152,7 @@ impl Default for ServerConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteRequest {
     /// Execute a command on the mux.
-    Command {
-        request: CommandRequest,
-    },
+    Command { request: CommandRequest },
     /// Query server status.
     Status,
     /// List all managed entities.
@@ -163,9 +161,7 @@ pub enum RemoteRequest {
         kind_filter: Option<LifecycleEntityKind>,
     },
     /// Create a checkpoint.
-    Checkpoint {
-        label: String,
-    },
+    Checkpoint { label: String },
     /// Rollback to a checkpoint.
     Rollback {
         checkpoint_id: CheckpointId,
@@ -176,20 +172,13 @@ pub enum RemoteRequest {
     /// List federated peers.
     ListPeers,
     /// Join a federation (register as peer).
-    JoinFederation {
-        peer: ServerNodeId,
-    },
+    JoinFederation { peer: ServerNodeId },
     /// Leave federation.
-    LeaveFederation {
-        node_id: String,
-    },
+    LeaveFederation { node_id: String },
     /// Ping (health check).
     Ping,
     /// Heartbeat from a federated peer.
-    Heartbeat {
-        from: ServerNodeId,
-        pane_count: u32,
-    },
+    Heartbeat { from: ServerNodeId, pane_count: u32 },
 }
 
 /// A remote control response.
@@ -197,54 +186,29 @@ pub enum RemoteRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteResponse {
     /// Command execution result.
-    CommandResult {
-        result: CommandResult,
-    },
+    CommandResult { result: CommandResult },
     /// Server status.
-    Status {
-        status: ServerStatus,
-    },
+    Status { status: ServerStatus },
     /// Entity listing.
-    Entities {
-        entities: Vec<EntityInfo>,
-    },
+    Entities { entities: Vec<EntityInfo> },
     /// Checkpoint created.
-    CheckpointCreated {
-        id: CheckpointId,
-        label: String,
-    },
+    CheckpointCreated { id: CheckpointId, label: String },
     /// Rollback completed.
-    RollbackComplete {
-        restored: usize,
-        removed: usize,
-    },
+    RollbackComplete { restored: usize, removed: usize },
     /// Checkpoint listing.
-    Checkpoints {
-        checkpoints: Vec<CheckpointInfo>,
-    },
+    Checkpoints { checkpoints: Vec<CheckpointInfo> },
     /// Peer listing.
-    Peers {
-        peers: Vec<PeerInfo>,
-    },
+    Peers { peers: Vec<PeerInfo> },
     /// Federation join acknowledged.
-    FederationJoined {
-        node_id: String,
-    },
+    FederationJoined { node_id: String },
     /// Federation leave acknowledged.
-    FederationLeft {
-        node_id: String,
-    },
+    FederationLeft { node_id: String },
     /// Pong response.
-    Pong {
-        server_time: u64,
-    },
+    Pong { server_time: u64 },
     /// Heartbeat acknowledged.
     HeartbeatAck,
     /// Error response.
-    Error {
-        code: String,
-        message: String,
-    },
+    Error { code: String, message: String },
 }
 
 /// Summary of server status.
@@ -380,10 +344,7 @@ impl HeadlessMuxServer {
                     CheckpointTrigger::Manual,
                     HashMap::new(),
                 );
-                RemoteResponse::CheckpointCreated {
-                    id: cp.id,
-                    label,
-                }
+                RemoteResponse::CheckpointCreated { id: cp.id, label }
             }
 
             RemoteRequest::Rollback {
@@ -491,7 +452,9 @@ impl HeadlessMuxServer {
 
     /// Get total pane count across all federated nodes (including self).
     pub fn federated_pane_count(&self) -> u64 {
-        let local = self.registry.entity_count_by_kind(LifecycleEntityKind::Pane) as u64;
+        let local = self
+            .registry
+            .entity_count_by_kind(LifecycleEntityKind::Pane) as u64;
         let remote: u64 = self
             .peers
             .values()
@@ -511,10 +474,13 @@ impl HeadlessMuxServer {
             node_id: self.config.node_id.clone(),
             label: self.config.label.clone(),
             uptime_ms: now.saturating_sub(self.started_at),
-            pane_count: self.registry.entity_count_by_kind(LifecycleEntityKind::Pane) as u32,
+            pane_count: self
+                .registry
+                .entity_count_by_kind(LifecycleEntityKind::Pane) as u32,
             session_count: self
                 .registry
-                .entity_count_by_kind(LifecycleEntityKind::Session) as u32,
+                .entity_count_by_kind(LifecycleEntityKind::Session)
+                as u32,
             window_count: self
                 .registry
                 .entity_count_by_kind(LifecycleEntityKind::Window) as u32,
@@ -557,13 +523,7 @@ mod tests {
     }
 
     fn register_pane(server: &mut HeadlessMuxServer, id: u64) {
-        let identity = LifecycleIdentity::new(
-            LifecycleEntityKind::Pane,
-            "default",
-            "local",
-            id,
-            1,
-        );
+        let identity = LifecycleIdentity::new(LifecycleEntityKind::Pane, "default", "local", id, 1);
         server
             .registry_mut()
             .register_entity(
@@ -644,11 +604,14 @@ mod tests {
         register_pane(&mut server, 1);
 
         // Register a window
-        server.registry_mut().register_entity(
-            LifecycleIdentity::new(LifecycleEntityKind::Window, "default", "local", 100, 1),
-            LifecycleState::Window(WindowLifecycleState::Active),
-            0,
-        ).unwrap();
+        server
+            .registry_mut()
+            .register_entity(
+                LifecycleIdentity::new(LifecycleEntityKind::Window, "default", "local", 100, 1),
+                LifecycleState::Window(WindowLifecycleState::Active),
+                0,
+            )
+            .unwrap();
 
         match server.handle_request(RemoteRequest::ListEntities {
             kind_filter: Some(LifecycleEntityKind::Pane),

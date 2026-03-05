@@ -607,15 +607,16 @@ impl OutboundSandboxChecker {
         capability: ConnectorCapability,
     ) -> SandboxCheckResult {
         let zone = self.zones.get(connector).unwrap_or(&self.default_zone);
-        if zone.capability_envelope.allowed_capabilities.contains(&capability) {
+        if zone
+            .capability_envelope
+            .allowed_capabilities
+            .contains(&capability)
+        {
             SandboxCheckResult::Allowed
         } else if zone.fail_closed {
             SandboxCheckResult::Denied {
                 zone_id: zone.zone_id.clone(),
-                reason: format!(
-                    "sandbox.denied.capability.{}",
-                    capability.as_str()
-                ),
+                reason: format!("sandbox.denied.capability.{}", capability.as_str()),
             }
         } else {
             SandboxCheckResult::Allowed
@@ -661,12 +662,8 @@ impl ConnectorOutboundBridge {
         let dedup_ttl = Duration::from_secs(config.dedup_ttl_secs);
         Self {
             deduplicator: OutboundDeduplicator::new(config.dedup_capacity, dedup_ttl),
-            dispatch_queue: VecDeque::with_capacity(
-                config.dispatch_queue_capacity.min(4096),
-            ),
-            dispatch_history: VecDeque::with_capacity(
-                config.dispatch_history_capacity.min(1024),
-            ),
+            dispatch_queue: VecDeque::with_capacity(config.dispatch_queue_capacity.min(4096)),
+            dispatch_history: VecDeque::with_capacity(config.dispatch_history_capacity.min(1024)),
             config,
             rules: Vec::new(),
             sandbox: OutboundSandboxChecker::new(),
@@ -706,17 +703,14 @@ impl ConnectorOutboundBridge {
         self.telemetry.events_received += 1;
 
         // Generate or use existing correlation ID
-        let correlation_id = event
-            .correlation_id
-            .clone()
-            .unwrap_or_else(|| {
-                format!(
-                    "out-{}-{}-{}",
-                    event.source.as_str(),
-                    event.timestamp_ms,
-                    event.pane_id.unwrap_or(0)
-                )
-            });
+        let correlation_id = event.correlation_id.clone().unwrap_or_else(|| {
+            format!(
+                "out-{}-{}-{}",
+                event.source.as_str(),
+                event.timestamp_ms,
+                event.pane_id.unwrap_or(0)
+            )
+        });
 
         // 1. Deduplication
         if event.correlation_id.is_some()
@@ -740,11 +734,8 @@ impl ConnectorOutboundBridge {
         }
 
         // 2. Match routing rules
-        let matched_rules: Vec<&OutboundRoutingRule> = self
-            .rules
-            .iter()
-            .filter(|r| r.matches(event))
-            .collect();
+        let matched_rules: Vec<&OutboundRoutingRule> =
+            self.rules.iter().filter(|r| r.matches(event)).collect();
 
         if matched_rules.is_empty() {
             self.telemetry.events_unmatched += 1;
@@ -999,8 +990,7 @@ mod tests {
             enforce_sandbox: false,
         };
         let json = serde_json::to_string(&config).unwrap();
-        let deserialized: ConnectorOutboundBridgeConfig =
-            serde_json::from_str(&json).unwrap();
+        let deserialized: ConnectorOutboundBridgeConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.dedup_capacity, 2048);
         assert_eq!(deserialized.dedup_ttl_secs, 600);
         assert!(deserialized.reject_unmatched_events);
@@ -1011,18 +1001,33 @@ mod tests {
 
     #[test]
     fn connector_outbound_bridge_event_source_labels() {
-        assert_eq!(OutboundEventSource::PatternDetected.as_str(), "pattern_detected");
-        assert_eq!(OutboundEventSource::PaneLifecycle.as_str(), "pane_lifecycle");
-        assert_eq!(OutboundEventSource::WorkflowLifecycle.as_str(), "workflow_lifecycle");
+        assert_eq!(
+            OutboundEventSource::PatternDetected.as_str(),
+            "pattern_detected"
+        );
+        assert_eq!(
+            OutboundEventSource::PaneLifecycle.as_str(),
+            "pane_lifecycle"
+        );
+        assert_eq!(
+            OutboundEventSource::WorkflowLifecycle.as_str(),
+            "workflow_lifecycle"
+        );
         assert_eq!(OutboundEventSource::UserAction.as_str(), "user_action");
-        assert_eq!(OutboundEventSource::PolicyDecision.as_str(), "policy_decision");
+        assert_eq!(
+            OutboundEventSource::PolicyDecision.as_str(),
+            "policy_decision"
+        );
         assert_eq!(OutboundEventSource::HealthAlert.as_str(), "health_alert");
         assert_eq!(OutboundEventSource::Custom.as_str(), "custom");
     }
 
     #[test]
     fn connector_outbound_bridge_event_source_display() {
-        assert_eq!(format!("{}", OutboundEventSource::PatternDetected), "pattern_detected");
+        assert_eq!(
+            format!("{}", OutboundEventSource::PatternDetected),
+            "pattern_detected"
+        );
     }
 
     // ---- Action kind ----
@@ -1031,10 +1036,16 @@ mod tests {
     fn connector_outbound_bridge_action_kind_labels() {
         assert_eq!(ConnectorActionKind::Notify.as_str(), "notify");
         assert_eq!(ConnectorActionKind::Ticket.as_str(), "ticket");
-        assert_eq!(ConnectorActionKind::TriggerWorkflow.as_str(), "trigger_workflow");
+        assert_eq!(
+            ConnectorActionKind::TriggerWorkflow.as_str(),
+            "trigger_workflow"
+        );
         assert_eq!(ConnectorActionKind::AuditLog.as_str(), "audit_log");
         assert_eq!(ConnectorActionKind::Invoke.as_str(), "invoke");
-        assert_eq!(ConnectorActionKind::CredentialAction.as_str(), "credential_action");
+        assert_eq!(
+            ConnectorActionKind::CredentialAction.as_str(),
+            "credential_action"
+        );
     }
 
     #[test]
@@ -1058,7 +1069,9 @@ mod tests {
     #[test]
     fn connector_outbound_bridge_severity_ranking() {
         assert!(severity_rank(OutboundSeverity::Info) < severity_rank(OutboundSeverity::Warning));
-        assert!(severity_rank(OutboundSeverity::Warning) < severity_rank(OutboundSeverity::Critical));
+        assert!(
+            severity_rank(OutboundSeverity::Warning) < severity_rank(OutboundSeverity::Critical)
+        );
     }
 
     // ---- Deduplicator ----
@@ -1227,8 +1240,7 @@ mod tests {
             ConnectorActionKind::Notify,
         ));
 
-        let event = make_event("test", OutboundEventSource::Custom)
-            .with_correlation_id("dedup-1");
+        let event = make_event("test", OutboundEventSource::Custom).with_correlation_id("dedup-1");
         let r1 = bridge.process_event(&event).unwrap();
         assert!(!r1.deduplicated);
         assert_eq!(r1.actions_dispatched.len(), 1);
@@ -1435,8 +1447,8 @@ mod tests {
         bridge.process_event(&event2).unwrap();
 
         // Duplicate
-        let event3 = make_event("test", OutboundEventSource::PatternDetected)
-            .with_correlation_id("dup-1");
+        let event3 =
+            make_event("test", OutboundEventSource::PatternDetected).with_correlation_id("dup-1");
         bridge.process_event(&event3).unwrap();
         bridge.process_event(&event3).unwrap();
 
@@ -1462,8 +1474,7 @@ mod tests {
             dispatch_queue_overflows: 0,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
-        let deserialized: OutboundBridgeTelemetrySnapshot =
-            serde_json::from_str(&json).unwrap();
+        let deserialized: OutboundBridgeTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snapshot, deserialized);
     }
 
@@ -1620,8 +1631,20 @@ mod tests {
     fn connector_outbound_bridge_rule_count() {
         let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
         assert_eq!(bridge.rule_count(), 0);
-        bridge.add_rule(make_rule("r1", None, None, "a", ConnectorActionKind::Notify));
-        bridge.add_rule(make_rule("r2", None, None, "b", ConnectorActionKind::Ticket));
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "a",
+            ConnectorActionKind::Notify,
+        ));
+        bridge.add_rule(make_rule(
+            "r2",
+            None,
+            None,
+            "b",
+            ConnectorActionKind::Ticket,
+        ));
         assert_eq!(bridge.rule_count(), 2);
     }
 
@@ -1639,8 +1662,7 @@ mod tests {
             ConnectorActionKind::Notify,
         ));
 
-        let event = make_event("test", OutboundEventSource::PatternDetected)
-            .with_pane_id(42);
+        let event = make_event("test", OutboundEventSource::PatternDetected).with_pane_id(42);
         let result = bridge.process_event(&event).unwrap();
         assert!(result.correlation_id.starts_with("out-pattern_detected-"));
         assert!(result.correlation_id.contains("-42"));

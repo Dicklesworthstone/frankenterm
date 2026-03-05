@@ -238,10 +238,12 @@ pub fn validate_token(
         if presented_norm.as_deref() != Some(expected_norm.as_str()) {
             return Err(DistributedSecurityError::AuthFailed);
         }
-        if let Some(client_identity) = client_identity {
-            if normalize_identity(client_identity) != expected_norm {
-                return Err(DistributedSecurityError::AuthFailed);
-            }
+        let Some(client_identity) = client_identity.map(str::trim).filter(|value| !value.is_empty())
+        else {
+            return Err(DistributedSecurityError::AuthFailed);
+        };
+        if normalize_identity(client_identity) != expected_norm {
+            return Err(DistributedSecurityError::AuthFailed);
         }
     }
 
@@ -2353,7 +2355,7 @@ mod tests {
                 DistributedAuthMode::Token,
                 Some("agent:secret"),
                 Some("agent:secret"),
-                None,
+                Some("agent"),
             )
             .is_ok()
         );
@@ -2379,10 +2381,23 @@ mod tests {
                 DistributedAuthMode::Token,
                 Some("Agent-A:secret"),
                 Some("agent-a:secret"),
-                None,
+                Some("agent-a"),
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn validate_token_identity_requires_client_identity() {
+        assert!(matches!(
+            validate_token(
+                DistributedAuthMode::Token,
+                Some("agent-a:secret"),
+                Some("agent-a:secret"),
+                None,
+            ),
+            Err(DistributedSecurityError::AuthFailed)
+        ));
     }
 
     #[test]

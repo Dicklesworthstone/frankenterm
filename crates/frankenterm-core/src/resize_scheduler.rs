@@ -3169,8 +3169,7 @@ mod tests {
         // Schedule 3 empty frames (no other work, but pane 1 won't fit)
         // Actually need another pane to take the slot each time
         for i in 0..4 {
-            let _ =
-                scheduler.submit_intent(intent(2, 1, ResizeWorkClass::Interactive, 1, 100 + i));
+            let _ = scheduler.submit_intent(intent(2, 1, ResizeWorkClass::Interactive, 1, 100 + i));
             let _ = scheduler.schedule_frame();
             assert!(scheduler.complete_active(2, 1));
         }

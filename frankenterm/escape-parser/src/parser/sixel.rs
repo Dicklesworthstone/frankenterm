@@ -406,10 +406,7 @@ mod test {
         b.push(b'#');
         b.push(b'3');
         b.finish();
-        assert_eq!(
-            b.sixel.data,
-            vec![SixelData::SelectColorMapEntry(3)]
-        );
+        assert_eq!(b.sixel.data, vec![SixelData::SelectColorMapEntry(3)]);
     }
 
     #[test]
@@ -422,7 +419,9 @@ mod test {
         b.push(b';');
         b.push(b'2'); // system = RGB
         b.push(b';');
-        b.push(b'1'); b.push(b'0'); b.push(b'0'); // r = 100%
+        b.push(b'1');
+        b.push(b'0');
+        b.push(b'0'); // r = 100%
         b.push(b';');
         b.push(b'0'); // g = 0%
         b.push(b';');
@@ -445,11 +444,16 @@ mod test {
         b.push(b';');
         b.push(b'1'); // system = HLS
         b.push(b';');
-        b.push(b'1'); b.push(b'2'); b.push(b'0'); // hue = 120
+        b.push(b'1');
+        b.push(b'2');
+        b.push(b'0'); // hue = 120
         b.push(b';');
-        b.push(b'5'); b.push(b'0'); // lightness = 50
+        b.push(b'5');
+        b.push(b'0'); // lightness = 50
         b.push(b';');
-        b.push(b'1'); b.push(b'0'); b.push(b'0'); // saturation = 100
+        b.push(b'1');
+        b.push(b'0');
+        b.push(b'0'); // saturation = 100
         b.finish();
         assert_eq!(
             b.sixel.data,
@@ -471,9 +475,11 @@ mod test {
         b.push(b';');
         b.push(b'2'); // pad
         b.push(b';');
-        b.push(b'1'); b.push(b'0'); // width = 10
+        b.push(b'1');
+        b.push(b'0'); // width = 10
         b.push(b';');
-        b.push(b'2'); b.push(b'0'); // height = 20
+        b.push(b'2');
+        b.push(b'0'); // height = 20
         b.finish();
         assert_eq!(b.sixel.pan, 3);
         assert_eq!(b.sixel.pad, 2);

@@ -2186,7 +2186,9 @@ mod test {
             application_cursor_keys: false,
             modify_other_keys: None,
         };
-        let result = KeyCode::Char('a').encode(Modifiers::NONE, mode, false).unwrap();
+        let result = KeyCode::Char('a')
+            .encode(Modifiers::NONE, mode, false)
+            .unwrap();
         assert_eq!(result, "");
     }
 
@@ -2199,7 +2201,9 @@ mod test {
             modify_other_keys: None,
         };
         assert_eq!(
-            KeyCode::Char('x').encode(Modifiers::NONE, mode, true).unwrap(),
+            KeyCode::Char('x')
+                .encode(Modifiers::NONE, mode, true)
+                .unwrap(),
             "x"
         );
     }
@@ -2255,7 +2259,9 @@ mod test {
             modify_other_keys: None,
         };
         assert_eq!(
-            KeyCode::Backspace.encode(Modifiers::NONE, mode, true).unwrap(),
+            KeyCode::Backspace
+                .encode(Modifiers::NONE, mode, true)
+                .unwrap(),
             "\x7f"
         );
     }
@@ -2269,7 +2275,9 @@ mod test {
             modify_other_keys: None,
         };
         assert_eq!(
-            KeyCode::Backspace.encode(Modifiers::ALT, mode, true).unwrap(),
+            KeyCode::Backspace
+                .encode(Modifiers::ALT, mode, true)
+                .unwrap(),
             "\x1b\x7f"
         );
     }
@@ -2311,19 +2319,27 @@ mod test {
             modify_other_keys: None,
         };
         assert_eq!(
-            KeyCode::UpArrow.encode(Modifiers::NONE, mode, true).unwrap(),
+            KeyCode::UpArrow
+                .encode(Modifiers::NONE, mode, true)
+                .unwrap(),
             "\x1bOA"
         );
         assert_eq!(
-            KeyCode::DownArrow.encode(Modifiers::NONE, mode, true).unwrap(),
+            KeyCode::DownArrow
+                .encode(Modifiers::NONE, mode, true)
+                .unwrap(),
             "\x1bOB"
         );
         assert_eq!(
-            KeyCode::RightArrow.encode(Modifiers::NONE, mode, true).unwrap(),
+            KeyCode::RightArrow
+                .encode(Modifiers::NONE, mode, true)
+                .unwrap(),
             "\x1bOC"
         );
         assert_eq!(
-            KeyCode::LeftArrow.encode(Modifiers::NONE, mode, true).unwrap(),
+            KeyCode::LeftArrow
+                .encode(Modifiers::NONE, mode, true)
+                .unwrap(),
             "\x1bOD"
         );
     }
@@ -2337,7 +2353,9 @@ mod test {
             modify_other_keys: None,
         };
         assert_eq!(
-            KeyCode::UpArrow.encode(Modifiers::SHIFT, mode, true).unwrap(),
+            KeyCode::UpArrow
+                .encode(Modifiers::SHIFT, mode, true)
+                .unwrap(),
             "\x1b[1;2A"
         );
     }
@@ -2351,7 +2369,9 @@ mod test {
             modify_other_keys: None,
         };
         assert_eq!(
-            KeyCode::LeftArrow.encode(Modifiers::CTRL, mode, true).unwrap(),
+            KeyCode::LeftArrow
+                .encode(Modifiers::CTRL, mode, true)
+                .unwrap(),
             "\x1b[1;5D"
         );
     }
@@ -2376,7 +2396,9 @@ mod test {
         ];
         for (n, seq) in expected {
             assert_eq!(
-                KeyCode::Function(n).encode(Modifiers::NONE, mode, true).unwrap(),
+                KeyCode::Function(n)
+                    .encode(Modifiers::NONE, mode, true)
+                    .unwrap(),
                 seq,
                 "F{}",
                 n
@@ -2393,7 +2415,9 @@ mod test {
             modify_other_keys: None,
         };
         assert_eq!(
-            KeyCode::Function(1).encode(Modifiers::SHIFT, mode, true).unwrap(),
+            KeyCode::Function(1)
+                .encode(Modifiers::SHIFT, mode, true)
+                .unwrap(),
             "\x1b[1;2P"
         );
     }
@@ -2435,7 +2459,9 @@ mod test {
             modify_other_keys: None,
         };
         assert_eq!(
-            KeyCode::Char('a').encode(Modifiers::ALT, mode, true).unwrap(),
+            KeyCode::Char('a')
+                .encode(Modifiers::ALT, mode, true)
+                .unwrap(),
             "\x1ba"
         );
     }
@@ -2450,7 +2476,9 @@ mod test {
         };
         // In CSI-u mode, ambiguous ctrl chars get CSI-u encoding
         assert_eq!(
-            KeyCode::Char('i').encode(Modifiers::CTRL, mode, true).unwrap(),
+            KeyCode::Char('i')
+                .encode(Modifiers::CTRL, mode, true)
+                .unwrap(),
             "\x1b[105;5u"
         );
     }
@@ -2517,7 +2545,9 @@ mod test {
         };
         // \x7f should be treated as Delete
         assert_eq!(
-            KeyCode::Char('\x7f').encode(Modifiers::NONE, mode, true).unwrap(),
+            KeyCode::Char('\x7f')
+                .encode(Modifiers::NONE, mode, true)
+                .unwrap(),
             "\x1b[3~"
         );
     }
@@ -2532,7 +2562,9 @@ mod test {
         };
         // \x08 should be treated as Backspace
         assert_eq!(
-            KeyCode::Char('\x08').encode(Modifiers::NONE, mode, true).unwrap(),
+            KeyCode::Char('\x08')
+                .encode(Modifiers::NONE, mode, true)
+                .unwrap(),
             "\x7f"
         );
     }
@@ -2550,7 +2582,9 @@ mod test {
             "\x1b[5~"
         );
         assert_eq!(
-            KeyCode::PageDown.encode(Modifiers::NONE, mode, true).unwrap(),
+            KeyCode::PageDown
+                .encode(Modifiers::NONE, mode, true)
+                .unwrap(),
             "\x1b[6~"
         );
         assert_eq!(

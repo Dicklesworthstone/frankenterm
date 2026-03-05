@@ -16,8 +16,8 @@ mod common;
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::events::{EventFilter, NotificationGate, NotifyDecision};
 use frankenterm_core::notifications::{
-    NotificationDelivery, NotificationFuture, NotificationPayload,
-    NotificationPipeline, NotificationSender, RateLimitedSender,
+    NotificationDelivery, NotificationFuture, NotificationPayload, NotificationPipeline,
+    NotificationSender, RateLimitedSender,
 };
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use std::sync::{Arc, Mutex};
@@ -321,10 +321,8 @@ fn notif_pipeline_with_mute_store_blocks_muted_events() {
         use frankenterm_core::events::event_identity_key;
         use frankenterm_core::storage::{EventMuteRecord, StorageHandle};
 
-        let db_path = std::env::temp_dir().join(format!(
-            "wa_notif_labrt_mute_{}.db",
-            std::process::id()
-        ));
+        let db_path =
+            std::env::temp_dir().join(format!("wa_notif_labrt_mute_{}.db", std::process::id()));
         let db_str = db_path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_str}-wal"));
@@ -352,8 +350,7 @@ fn notif_pipeline_with_mute_store_blocks_muted_events() {
             NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sender = MockSender::new("mock", Arc::clone(&sent));
-        let storage_arc =
-            Arc::new(frankenterm_core::runtime_compat::RwLock::new(storage));
+        let storage_arc = Arc::new(frankenterm_core::runtime_compat::RwLock::new(storage));
         let mut pipeline =
             NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
 

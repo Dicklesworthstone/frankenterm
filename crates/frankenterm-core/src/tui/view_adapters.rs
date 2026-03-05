@@ -2843,8 +2843,7 @@ mod tests {
     fn sample_dashboard_state() -> crate::dashboard::DashboardState {
         use crate::backpressure::{BackpressureSnapshot, BackpressureTier};
         use crate::cost_tracker::{
-            BudgetAlert, AlertSeverity, CostDashboardSnapshot, PaneCostSummary,
-            ProviderCostSummary,
+            AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary, ProviderCostSummary,
         };
         use crate::dashboard::DashboardManager;
         use crate::quota_gate::{QuotaGateSnapshot, QuotaGateTelemetrySnapshot};

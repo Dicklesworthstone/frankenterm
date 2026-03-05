@@ -13,8 +13,8 @@ use frankenterm_core::accounts::QuotaAvailability;
 use frankenterm_core::cost_tracker::{AlertSeverity, BudgetAlert};
 use frankenterm_core::patterns::AgentType;
 use frankenterm_core::quota_gate::{
-    LaunchDecision, LaunchVerdict, QuotaGate, QuotaGateTelemetrySnapshot,
-    QuotaSignals, WarningSource,
+    LaunchDecision, LaunchVerdict, QuotaGate, QuotaGateTelemetrySnapshot, QuotaSignals,
+    WarningSource,
 };
 use frankenterm_core::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
 use proptest::prelude::*;
@@ -65,8 +65,9 @@ fn arb_budget_alert(provider: String) -> impl Strategy<Value = BudgetAlert> {
 }
 
 /// Strategy for a rate limit summary.
-fn arb_rate_limit_summary(agent_type_str: String) -> impl Strategy<Value = ProviderRateLimitSummary>
-{
+fn arb_rate_limit_summary(
+    agent_type_str: String,
+) -> impl Strategy<Value = ProviderRateLimitSummary> {
     (
         arb_rate_limit_status(),
         0usize..20,

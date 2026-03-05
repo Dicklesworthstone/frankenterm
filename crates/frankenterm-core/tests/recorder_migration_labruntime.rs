@@ -24,8 +24,8 @@ use frankenterm_core::recording::{
     RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ===========================================================================
 // Test helpers: mock reader + mock storage
@@ -260,9 +260,7 @@ impl RecorderStorage for MockMigrationStorage {
         self.health.clone()
     }
 
-    async fn lag_metrics(
-        &self,
-    ) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
+    async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
         Ok(RecorderStorageLag {
             latest_offset: None,
             consumers: vec![],
@@ -365,9 +363,7 @@ impl RecorderStorage for MockCheckpointStorage {
         self.health.clone()
     }
 
-    async fn lag_metrics(
-        &self,
-    ) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
+    async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
         Ok(RecorderStorageLag {
             latest_offset: None,
             consumers: self.consumers.clone(),

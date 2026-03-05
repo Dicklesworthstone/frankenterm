@@ -2865,8 +2865,8 @@ mod tests {
         run_async_test(async {
             use crate::storage::{EventMuteRecord, StorageHandle};
 
-            let db_path = std::env::temp_dir()
-                .join(format!("wa_e2e_mute_expiry_{}.db", std::process::id()));
+            let db_path =
+                std::env::temp_dir().join(format!("wa_e2e_mute_expiry_{}.db", std::process::id()));
             let db_str = db_path.to_string_lossy().to_string();
             let _ = std::fs::remove_file(&db_path);
             let _ = std::fs::remove_file(format!("{db_str}-wal"));

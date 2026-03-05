@@ -163,10 +163,7 @@ fn make_quota(evaluations: u64) -> QuotaGateSnapshot {
     }
 }
 
-fn populate_manager(
-    provider_count: usize,
-    pane_count: usize,
-) -> DashboardManager {
+fn populate_manager(provider_count: usize, pane_count: usize) -> DashboardManager {
     let mut mgr = DashboardManager::new();
     mgr.update_costs(make_cost_snapshot(provider_count, pane_count));
     mgr.update_rate_limits(make_rate_limits(provider_count));
@@ -191,13 +188,17 @@ fn bench_dashboard_snapshot(c: &mut Criterion) {
 
     for &(providers, panes, label) in configs {
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(BenchmarkId::from_parameter(label), &(providers, panes), |b, &(p, n)| {
-            let mut mgr = populate_manager(p, n);
-            b.iter(|| {
-                let state = mgr.snapshot();
-                black_box(&state);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &(providers, panes),
+            |b, &(p, n)| {
+                let mut mgr = populate_manager(p, n);
+                b.iter(|| {
+                    let state = mgr.snapshot();
+                    black_box(&state);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -218,14 +219,18 @@ fn bench_dashboard_adapt(c: &mut Criterion) {
 
     for &(providers, panes, label) in configs {
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(BenchmarkId::from_parameter(label), &(providers, panes), |b, &(p, n)| {
-            let mut mgr = populate_manager(p, n);
-            let state = mgr.snapshot();
-            b.iter(|| {
-                let model = adapt_dashboard(black_box(&state));
-                black_box(&model);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &(providers, panes),
+            |b, &(p, n)| {
+                let mut mgr = populate_manager(p, n);
+                let state = mgr.snapshot();
+                b.iter(|| {
+                    let model = adapt_dashboard(black_box(&state));
+                    black_box(&model);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -246,14 +251,18 @@ fn bench_dashboard_snapshot_adapt_combined(c: &mut Criterion) {
 
     for &(providers, panes, label) in configs {
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(BenchmarkId::from_parameter(label), &(providers, panes), |b, &(p, n)| {
-            let mut mgr = populate_manager(p, n);
-            b.iter(|| {
-                let state = mgr.snapshot();
-                let model = adapt_dashboard(black_box(&state));
-                black_box(&model);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &(providers, panes),
+            |b, &(p, n)| {
+                let mut mgr = populate_manager(p, n);
+                b.iter(|| {
+                    let state = mgr.snapshot();
+                    let model = adapt_dashboard(black_box(&state));
+                    black_box(&model);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -317,20 +326,21 @@ fn bench_dashboard_incremental_update(c: &mut Criterion) {
 fn bench_dashboard_summary_line(c: &mut Criterion) {
     let mut group = c.benchmark_group("dashboard_summary_line");
 
-    let configs: &[(usize, usize, &str)] = &[
-        (3, 5, "small"),
-        (16, 200, "large"),
-    ];
+    let configs: &[(usize, usize, &str)] = &[(3, 5, "small"), (16, 200, "large")];
 
     for &(providers, panes, label) in configs {
-        group.bench_with_input(BenchmarkId::from_parameter(label), &(providers, panes), |b, &(p, n)| {
-            let mut mgr = populate_manager(p, n);
-            let state = mgr.snapshot();
-            b.iter(|| {
-                let line = state.summary_line();
-                black_box(&line);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &(providers, panes),
+            |b, &(p, n)| {
+                let mut mgr = populate_manager(p, n);
+                let state = mgr.snapshot();
+                b.iter(|| {
+                    let line = state.summary_line();
+                    black_box(&line);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -343,10 +353,8 @@ fn bench_dashboard_summary_line(c: &mut Criterion) {
 fn bench_dashboard_serde(c: &mut Criterion) {
     let mut group = c.benchmark_group("dashboard_serde");
 
-    let configs: &[(usize, usize, &str)] = &[
-        (3, 5, "small_3p_5panes"),
-        (16, 200, "large_16p_200panes"),
-    ];
+    let configs: &[(usize, usize, &str)] =
+        &[(3, 5, "small_3p_5panes"), (16, 200, "large_16p_200panes")];
 
     for &(providers, panes, label) in configs {
         group.bench_with_input(

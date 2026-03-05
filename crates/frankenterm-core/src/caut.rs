@@ -307,6 +307,7 @@ impl CautClient {
     async fn run(&self, args: &[String]) -> Result<String, CautError> {
         let mut cmd = Command::new(&self.binary);
         cmd.args(args);
+        cmd.kill_on_drop(true);
 
         let output = match timeout(self.timeout, cmd.output()).await {
             Ok(result) => result.map_err(|err| categorize_io_error(&err))?,

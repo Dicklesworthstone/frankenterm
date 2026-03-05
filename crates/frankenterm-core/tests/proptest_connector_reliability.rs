@@ -7,15 +7,14 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 
+use frankenterm_core::connector_outbound_bridge::ConnectorAction;
 use frankenterm_core::connector_outbound_bridge::ConnectorActionKind;
 use frankenterm_core::connector_reliability::{
     ConnectorCircuitConfig, ConnectorErrorKind, ConnectorReliabilityConfig,
-    ConnectorReliabilityController, ConnectorReliabilitySnapshot,
-    DeadLetterEntry, DeadLetterQueue, DeadLetterQueueConfig,
-    DeadLetterTelemetrySnapshot, ReliabilityRegistry, ReplayPlan,
+    ConnectorReliabilityController, ConnectorReliabilitySnapshot, DeadLetterEntry, DeadLetterQueue,
+    DeadLetterQueueConfig, DeadLetterTelemetrySnapshot, ReliabilityRegistry, ReplayPlan,
     ReplayPolicy, ReplayResult, classify_connector_error,
 };
-use frankenterm_core::connector_outbound_bridge::ConnectorAction;
 
 // =============================================================================
 // Strategies

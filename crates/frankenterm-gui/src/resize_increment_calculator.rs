@@ -1,5 +1,5 @@
-use ::window::parameters::Border;
 use ::window::ResizeIncrement;
+use ::window::parameters::Border;
 
 pub struct ResizeIncrementCalculator {
     pub x: u16,

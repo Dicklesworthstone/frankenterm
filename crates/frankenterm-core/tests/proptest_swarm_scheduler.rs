@@ -19,18 +19,18 @@ use frankenterm_core::swarm_work_queue::{QueueStats, SwarmWorkQueue, WorkItem, W
 
 fn arb_scheduler_config() -> impl Strategy<Value = SchedulerConfig> {
     (
-        1_000u64..300_000,    // scale_up_cooldown_ms
-        2_000u64..600_000,    // scale_down_cooldown_ms
-        1u32..4,              // min_fleet_size
-        5u32..128,            // max_fleet_size
-        0.5f64..0.99,         // scale_up_threshold
-        0.01f64..0.49,        // scale_down_threshold
-        0.1f64..0.9,          // rebalance_imbalance_threshold
-        2u32..10,             // max_consecutive_scale_ops
-        5_000u64..120_000,    // agent_startup_grace_ms
-        10_000u64..600_000,   // circuit_breaker_reset_ms
-        1u32..8,              // max_scale_step
-        0.1f64..0.9,          // failure_rate_suppress_threshold
+        1_000u64..300_000,  // scale_up_cooldown_ms
+        2_000u64..600_000,  // scale_down_cooldown_ms
+        1u32..4,            // min_fleet_size
+        5u32..128,          // max_fleet_size
+        0.5f64..0.99,       // scale_up_threshold
+        0.01f64..0.49,      // scale_down_threshold
+        0.1f64..0.9,        // rebalance_imbalance_threshold
+        2u32..10,           // max_consecutive_scale_ops
+        5_000u64..120_000,  // agent_startup_grace_ms
+        10_000u64..600_000, // circuit_breaker_reset_ms
+        1u32..8,            // max_scale_step
+        0.1f64..0.9,        // failure_rate_suppress_threshold
     )
         .prop_map(
             |(
@@ -67,16 +67,24 @@ fn arb_scheduler_config() -> impl Strategy<Value = SchedulerConfig> {
 
 fn arb_queue_pressure() -> impl Strategy<Value = QueuePressure> {
     (
-        0.0f64..1.0,  // ready_ratio
-        0.0f64..1.0,  // utilization
-        0u32..100,    // starvation_count
-        0.0f64..1.0,  // failure_rate
-        0u32..1000,   // pending_items
-        0u32..64,     // active_agents
-        0u32..256,    // total_capacity
+        0.0f64..1.0, // ready_ratio
+        0.0f64..1.0, // utilization
+        0u32..100,   // starvation_count
+        0.0f64..1.0, // failure_rate
+        0u32..1000,  // pending_items
+        0u32..64,    // active_agents
+        0u32..256,   // total_capacity
     )
         .prop_map(
-            |(ready_ratio, utilization, starvation_count, failure_rate, pending_items, active_agents, total_capacity)| {
+            |(
+                ready_ratio,
+                utilization,
+                starvation_count,
+                failure_rate,
+                pending_items,
+                active_agents,
+                total_capacity,
+            )| {
                 QueuePressure {
                     ready_ratio,
                     utilization,
@@ -114,9 +122,8 @@ fn arb_agent_load_snapshot() -> impl Strategy<Value = AgentLoadSnapshot> {
 }
 
 fn arb_work_assignment() -> impl Strategy<Value = WorkAssignment> {
-    ("[a-z][a-z0-9_-]{2,12}", "[a-z][a-z0-9_-]{2,12}").prop_map(|(item_id, agent_id)| {
-        WorkAssignment { item_id, agent_id }
-    })
+    ("[a-z][a-z0-9_-]{2,12}", "[a-z][a-z0-9_-]{2,12}")
+        .prop_map(|(item_id, agent_id)| WorkAssignment { item_id, agent_id })
 }
 
 fn arb_rebalance_move() -> impl Strategy<Value = RebalanceMove> {
@@ -141,11 +148,10 @@ fn arb_scheduler_decision() -> impl Strategy<Value = SchedulerDecision> {
             .prop_map(|assignments| SchedulerDecision::AssignWork { assignments }),
         prop::collection::vec(arb_rebalance_move(), 1..=3)
             .prop_map(|moves| SchedulerDecision::Rebalance { moves }),
-        (1u32..8, "[a-z ]{5,30}")
-            .prop_map(|(n, reason)| SchedulerDecision::ScaleUp {
-                additional_agents: n,
-                reason,
-            }),
+        (1u32..8, "[a-z ]{5,30}").prop_map(|(n, reason)| SchedulerDecision::ScaleUp {
+            additional_agents: n,
+            reason,
+        }),
         (
             prop::collection::vec("[a-z][a-z0-9_-]{2,12}", 1..=4),
             "[a-z ]{5,30}",
@@ -154,10 +160,11 @@ fn arb_scheduler_decision() -> impl Strategy<Value = SchedulerDecision> {
                 remove_agents: agents,
                 reason,
             }),
-        prop::collection::vec("[a-z][a-z0-9_-]{2,12}", 1..=5)
-            .prop_map(|items| SchedulerDecision::ReclaimStale {
+        prop::collection::vec("[a-z][a-z0-9_-]{2,12}", 1..=5).prop_map(|items| {
+            SchedulerDecision::ReclaimStale {
                 reclaimed_items: items,
-            }),
+            }
+        }),
     ]
 }
 
@@ -201,10 +208,8 @@ fn arb_scheduler_error() -> impl Strategy<Value = SchedulerError> {
                 resets_at,
             }
         }),
-        (0u32..128, 0u32..128).prop_map(|(current, max)| SchedulerError::AtMaxCapacity {
-            current,
-            max,
-        }),
+        (0u32..128, 0u32..128)
+            .prop_map(|(current, max)| SchedulerError::AtMaxCapacity { current, max }),
         (0u32..128, 0u32..128)
             .prop_map(|(current, min)| SchedulerError::AtMinCapacity { current, min }),
         ("[a-z-]{3,15}", 0u64..300_000).prop_map(|(operation, remaining_ms)| {

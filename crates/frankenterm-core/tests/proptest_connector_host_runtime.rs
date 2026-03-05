@@ -41,30 +41,40 @@ fn arb_protocol_version() -> impl Strategy<Value = ConnectorProtocolVersion> {
 }
 
 fn arb_valid_budgets() -> impl Strategy<Value = ConnectorRuntimeBudgets> {
-    (1u32..2000, 1u64..1_073_741_824, 1u64..100_000_000, 1u32..1024).prop_map(
-        |(cpu, mem, io, ops)| ConnectorRuntimeBudgets {
+    (
+        1u32..2000,
+        1u64..1_073_741_824,
+        1u64..100_000_000,
+        1u32..1024,
+    )
+        .prop_map(|(cpu, mem, io, ops)| ConnectorRuntimeBudgets {
             cpu_millis_per_second: cpu,
             memory_bytes: mem,
             io_bytes_per_second: io,
             max_inflight_ops: ops,
-        },
-    )
+        })
 }
 
 fn arb_valid_config() -> impl Strategy<Value = ConnectorHostConfig> {
-    (arb_valid_budgets(), 1u64..60_000, 1u64..30_000, 1u64..60_000).prop_map(
-        |(budgets, startup_timeout_ms, heartbeat_interval_ms, failure_backoff_ms)| {
-            ConnectorHostConfig {
-                host_id: "proptest-host".to_string(),
-                protocol_version: ConnectorProtocolVersion::default(),
-                budgets,
-                startup_timeout_ms,
-                heartbeat_interval_ms,
-                failure_backoff_ms,
-                sandbox: ConnectorSandboxZone::default(),
-            }
-        },
+    (
+        arb_valid_budgets(),
+        1u64..60_000,
+        1u64..30_000,
+        1u64..60_000,
     )
+        .prop_map(
+            |(budgets, startup_timeout_ms, heartbeat_interval_ms, failure_backoff_ms)| {
+                ConnectorHostConfig {
+                    host_id: "proptest-host".to_string(),
+                    protocol_version: ConnectorProtocolVersion::default(),
+                    budgets,
+                    startup_timeout_ms,
+                    heartbeat_interval_ms,
+                    failure_backoff_ms,
+                    sandbox: ConnectorSandboxZone::default(),
+                }
+            },
+        )
 }
 
 fn arb_usage_within(budgets: &ConnectorRuntimeBudgets) -> ConnectorRuntimeUsage {
@@ -493,29 +503,57 @@ fn upgrade_requires_higher_version() {
 
     // Same version rejected
     let err = rt
-        .upgrade_and_restart(200, ConnectorProtocolVersion::new(1, 0, 0), StartupProbeResult::healthy())
+        .upgrade_and_restart(
+            200,
+            ConnectorProtocolVersion::new(1, 0, 0),
+            StartupProbeResult::healthy(),
+        )
         .unwrap_err();
-    assert!(matches!(err, ConnectorHostRuntimeError::ProtocolUpgradeRejected { .. }));
+    assert!(matches!(
+        err,
+        ConnectorHostRuntimeError::ProtocolUpgradeRejected { .. }
+    ));
 
     // Lower version rejected
     let err = rt
-        .upgrade_and_restart(300, ConnectorProtocolVersion::new(0, 9, 0), StartupProbeResult::healthy())
+        .upgrade_and_restart(
+            300,
+            ConnectorProtocolVersion::new(0, 9, 0),
+            StartupProbeResult::healthy(),
+        )
         .unwrap_err();
-    assert!(matches!(err, ConnectorHostRuntimeError::ProtocolUpgradeRejected { .. }));
+    assert!(matches!(
+        err,
+        ConnectorHostRuntimeError::ProtocolUpgradeRejected { .. }
+    ));
 
     // Higher version succeeds
-    rt.upgrade_and_restart(400, ConnectorProtocolVersion::new(1, 1, 0), StartupProbeResult::healthy())
-        .unwrap();
-    assert_eq!(rt.config().protocol_version, ConnectorProtocolVersion::new(1, 1, 0));
+    rt.upgrade_and_restart(
+        400,
+        ConnectorProtocolVersion::new(1, 1, 0),
+        StartupProbeResult::healthy(),
+    )
+    .unwrap();
+    assert_eq!(
+        rt.config().protocol_version,
+        ConnectorProtocolVersion::new(1, 1, 0)
+    );
 }
 
 #[test]
 fn upgrade_from_stopped_updates_version_without_starting() {
     let mut rt = ConnectorHostRuntime::new(ConnectorHostConfig::default()).unwrap();
 
-    rt.upgrade_and_restart(100, ConnectorProtocolVersion::new(2, 0, 0), StartupProbeResult::healthy())
-        .unwrap();
-    assert_eq!(rt.config().protocol_version, ConnectorProtocolVersion::new(2, 0, 0));
+    rt.upgrade_and_restart(
+        100,
+        ConnectorProtocolVersion::new(2, 0, 0),
+        StartupProbeResult::healthy(),
+    )
+    .unwrap();
+    assert_eq!(
+        rt.config().protocol_version,
+        ConnectorProtocolVersion::new(2, 0, 0)
+    );
     // Host should still be stopped since it was never started
     assert_eq!(rt.state().phase(), ConnectorLifecyclePhase::Stopped);
 }
@@ -546,7 +584,10 @@ fn mark_failure_rejects_empty_reason_code() {
     let err = rt
         .mark_failure(200, ConnectorFailureClass::Auth, "")
         .unwrap_err();
-    assert!(matches!(err, ConnectorHostRuntimeError::InvalidConfig { .. }));
+    assert!(matches!(
+        err,
+        ConnectorHostRuntimeError::InvalidConfig { .. }
+    ));
 }
 
 #[test]
@@ -587,7 +628,10 @@ fn exceeded_dimension_reports_first_exceeded() {
         io_bytes_in_window: budgets.io_bytes_per_second + 1,
         inflight_ops: 0,
     };
-    assert_eq!(usage.exceeded_dimension(&budgets), Some("io_bytes_per_second"));
+    assert_eq!(
+        usage.exceeded_dimension(&budgets),
+        Some("io_bytes_per_second")
+    );
 
     // Max inflight ops exceeded
     let usage = ConnectorRuntimeUsage {
@@ -696,7 +740,10 @@ fn envelope_rejects_empty_action() {
     let mut rt = ConnectorHostRuntime::new(ConnectorHostConfig::default()).unwrap();
     rt.start(100).unwrap();
     let err = rt.build_operation_envelope(200, "", "corr-1").unwrap_err();
-    assert!(matches!(err, ConnectorHostRuntimeError::InvalidConfig { .. }));
+    assert!(matches!(
+        err,
+        ConnectorHostRuntimeError::InvalidConfig { .. }
+    ));
 }
 
 #[test]
@@ -706,7 +753,10 @@ fn envelope_rejects_whitespace_action() {
     let err = rt
         .build_operation_envelope(200, "  ", "corr-1")
         .unwrap_err();
-    assert!(matches!(err, ConnectorHostRuntimeError::InvalidConfig { .. }));
+    assert!(matches!(
+        err,
+        ConnectorHostRuntimeError::InvalidConfig { .. }
+    ));
 }
 
 #[test]
@@ -716,5 +766,8 @@ fn envelope_rejects_empty_correlation_id() {
     let err = rt
         .build_operation_envelope(200, "test.action", "")
         .unwrap_err();
-    assert!(matches!(err, ConnectorHostRuntimeError::InvalidConfig { .. }));
+    assert!(matches!(
+        err,
+        ConnectorHostRuntimeError::InvalidConfig { .. }
+    ));
 }

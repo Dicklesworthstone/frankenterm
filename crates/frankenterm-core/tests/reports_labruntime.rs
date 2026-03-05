@@ -11,11 +11,11 @@
 mod common;
 
 use common::fixtures::RuntimeFixture;
-use frankenterm_core::reports::{generate_session_report, ReportOptions};
+use frankenterm_core::VERSION;
+use frankenterm_core::reports::{ReportOptions, generate_session_report};
 use frankenterm_core::storage::{
     AuditActionRecord, PaneRecord, StorageHandle, StoredEvent, WorkflowRecord,
 };
-use frankenterm_core::VERSION;
 
 // ===========================================================================
 // Helpers
@@ -156,15 +156,37 @@ fn report_with_workflows() {
 
         storage
             .insert_step_log(
-                "wf-auth-1", None, 0, "wait_for_prompt", None, None, "continue",
-                None, None, None, None, 1000, 1500,
+                "wf-auth-1",
+                None,
+                0,
+                "wait_for_prompt",
+                None,
+                None,
+                "continue",
+                None,
+                None,
+                None,
+                None,
+                1000,
+                1500,
             )
             .await
             .unwrap();
         storage
             .insert_step_log(
-                "wf-auth-1", None, 1, "send_credentials", None, None, "done",
-                None, None, None, None, 1500, 3000,
+                "wf-auth-1",
+                None,
+                1,
+                "send_credentials",
+                None,
+                None,
+                "done",
+                None,
+                None,
+                None,
+                None,
+                1500,
+                3000,
             )
             .await
             .unwrap();
@@ -346,9 +368,7 @@ fn report_with_redaction() {
             severity: "critical".to_string(),
             confidence: 1.0,
             extracted: None,
-            matched_text: Some(
-                "Key: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
-            ),
+            matched_text: Some("Key: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string()),
             segment_id: None,
             detected_at: 2000,
             dedupe_key: None,
@@ -368,9 +388,7 @@ fn report_with_redaction() {
             wait_condition: None,
             context: None,
             result: None,
-            error: Some(
-                "Token ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012 expired".to_string(),
-            ),
+            error: Some("Token ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456789012 expired".to_string()),
             started_at: 1000,
             updated_at: 2000,
             completed_at: Some(2000),
@@ -535,15 +553,37 @@ fn report_full_fixture() {
 
         storage
             .insert_step_log(
-                "wf-full-1", None, 0, "detect_prompt", None, None, "continue",
-                None, None, None, None, 2000, 2500,
+                "wf-full-1",
+                None,
+                0,
+                "detect_prompt",
+                None,
+                None,
+                "continue",
+                None,
+                None,
+                None,
+                None,
+                2000,
+                2500,
             )
             .await
             .unwrap();
         storage
             .insert_step_log(
-                "wf-full-1", None, 1, "authenticate", None, None, "done",
-                None, None, None, None, 2500, 4000,
+                "wf-full-1",
+                None,
+                1,
+                "authenticate",
+                None,
+                None,
+                "done",
+                None,
+                None,
+                None,
+                None,
+                2500,
+                4000,
             )
             .await
             .unwrap();

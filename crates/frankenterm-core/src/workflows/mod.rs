@@ -405,16 +405,16 @@ mod tests {
     #[test]
     fn stub_workflow_executes_steps_correctly() {
         run_async_test(async {
-        let workflow = StubWorkflow::new();
+            let workflow = StubWorkflow::new();
 
-        // Create a minimal context for testing
-        // Note: In real usage, this would have an actual StorageHandle
-        // For this test, we just verify the step execution logic
+            // Create a minimal context for testing
+            // Note: In real usage, this would have an actual StorageHandle
+            // For this test, we just verify the step execution logic
 
-        // We can't easily create a WorkflowContext without a real StorageHandle,
-        // but we can verify the workflow's step logic independently
-        let steps = workflow.steps();
-        assert_eq!(steps.len(), 3);
+            // We can't easily create a WorkflowContext without a real StorageHandle,
+            // but we can verify the workflow's step logic independently
+            let steps = workflow.steps();
+            assert_eq!(steps.len(), 3);
         });
     }
 
@@ -810,209 +810,210 @@ mod tests {
     #[test]
     fn pattern_wait_succeeds_on_immediate_match() {
         run_async_test(async {
-        let source = MockPaneSource::new(vec![
-            "Conversation compacted 100,000 tokens to 25,000 tokens".to_string(),
-        ]);
-        let engine = PatternEngine::new();
+            let source = MockPaneSource::new(vec![
+                "Conversation compacted 100,000 tokens to 25,000 tokens".to_string(),
+            ]);
+            let engine = PatternEngine::new();
 
-        let executor =
-            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
-                tail_lines: 200,
-                poll_initial: Duration::from_millis(1),
-                poll_max: Duration::from_millis(10),
-                max_polls: 100,
-                allow_idle_heuristics: true,
-            });
+            let executor =
+                WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                    tail_lines: 200,
+                    poll_initial: Duration::from_millis(1),
+                    poll_max: Duration::from_millis(10),
+                    max_polls: 100,
+                    allow_idle_heuristics: true,
+                });
 
-        let condition = WaitCondition::pattern("claude_code.compaction");
-        let result = executor
-            .execute(&condition, 1, Duration::from_secs(5))
-            .await;
+            let condition = WaitCondition::pattern("claude_code.compaction");
+            let result = executor
+                .execute(&condition, 1, Duration::from_secs(5))
+                .await;
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_satisfied());
-        assert_eq!(source.calls(), 1);
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert!(result.is_satisfied());
+            assert_eq!(source.calls(), 1);
         });
     }
 
     #[test]
     fn pattern_wait_times_out_on_no_match() {
         run_async_test(async {
-        let source = MockPaneSource::new(vec!["no matching pattern here".to_string()]);
-        let engine = PatternEngine::new();
+            let source = MockPaneSource::new(vec!["no matching pattern here".to_string()]);
+            let engine = PatternEngine::new();
 
-        let executor =
-            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
-                tail_lines: 200,
-                poll_initial: Duration::from_millis(1),
-                poll_max: Duration::from_millis(5),
-                max_polls: 5,
-                allow_idle_heuristics: true,
-            });
+            let executor =
+                WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                    tail_lines: 200,
+                    poll_initial: Duration::from_millis(1),
+                    poll_max: Duration::from_millis(5),
+                    max_polls: 5,
+                    allow_idle_heuristics: true,
+                });
 
-        let condition = WaitCondition::pattern("claude_code.compaction");
-        let result = executor
-            .execute(&condition, 1, Duration::from_millis(20))
-            .await;
+            let condition = WaitCondition::pattern("claude_code.compaction");
+            let result = executor
+                .execute(&condition, 1, Duration::from_millis(20))
+                .await;
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_timed_out());
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert!(result.is_timed_out());
         });
     }
 
     #[test]
     fn pattern_wait_succeeds_after_multiple_polls() {
         run_async_test(async {
-        let source = MockPaneSource::new(vec![
-            "no match yet".to_string(),
-            "still no match".to_string(),
-            "Conversation compacted 100,000 tokens to 25,000 tokens".to_string(),
-        ]);
-        let engine = PatternEngine::new();
+            let source = MockPaneSource::new(vec![
+                "no match yet".to_string(),
+                "still no match".to_string(),
+                "Conversation compacted 100,000 tokens to 25,000 tokens".to_string(),
+            ]);
+            let engine = PatternEngine::new();
 
-        let executor =
-            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
-                tail_lines: 200,
-                poll_initial: Duration::from_millis(1),
-                poll_max: Duration::from_millis(5),
-                max_polls: 100,
-                allow_idle_heuristics: true,
-            });
+            let executor =
+                WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                    tail_lines: 200,
+                    poll_initial: Duration::from_millis(1),
+                    poll_max: Duration::from_millis(5),
+                    max_polls: 100,
+                    allow_idle_heuristics: true,
+                });
 
-        let condition = WaitCondition::pattern("claude_code.compaction");
-        let result = executor
-            .execute(&condition, 1, Duration::from_secs(5))
-            .await;
+            let condition = WaitCondition::pattern("claude_code.compaction");
+            let result = executor
+                .execute(&condition, 1, Duration::from_secs(5))
+                .await;
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_satisfied());
-        assert!(source.calls() >= 3);
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert!(result.is_satisfied());
+            assert!(source.calls() >= 3);
         });
     }
 
     #[test]
     fn text_match_wait_succeeds_on_substring() {
         run_async_test(async {
-        let source = MockPaneSource::new(vec!["booting".to_string(), "ready> prompt".to_string()]);
-        let engine = PatternEngine::new();
+            let source =
+                MockPaneSource::new(vec!["booting".to_string(), "ready> prompt".to_string()]);
+            let engine = PatternEngine::new();
 
-        let executor =
-            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
-                tail_lines: 200,
-                poll_initial: Duration::from_millis(1),
-                poll_max: Duration::from_millis(5),
-                max_polls: 100,
-                allow_idle_heuristics: true,
-            });
+            let executor =
+                WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                    tail_lines: 200,
+                    poll_initial: Duration::from_millis(1),
+                    poll_max: Duration::from_millis(5),
+                    max_polls: 100,
+                    allow_idle_heuristics: true,
+                });
 
-        let condition = WaitCondition::text_match(TextMatch::substring("ready>"));
-        let result = executor
-            .execute(&condition, 1, Duration::from_secs(5))
-            .await;
+            let condition = WaitCondition::text_match(TextMatch::substring("ready>"));
+            let result = executor
+                .execute(&condition, 1, Duration::from_secs(5))
+                .await;
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_satisfied());
-        assert!(source.calls() >= 2);
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert!(result.is_satisfied());
+            assert!(source.calls() >= 2);
         });
     }
 
     #[test]
     fn text_match_wait_succeeds_on_regex() {
         run_async_test(async {
-        let source = MockPaneSource::new(vec![
-            "waiting".to_string(),
-            "completed in 123ms".to_string(),
-        ]);
-        let engine = PatternEngine::new();
+            let source = MockPaneSource::new(vec![
+                "waiting".to_string(),
+                "completed in 123ms".to_string(),
+            ]);
+            let engine = PatternEngine::new();
 
-        let executor =
-            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
-                tail_lines: 200,
-                poll_initial: Duration::from_millis(1),
-                poll_max: Duration::from_millis(5),
-                max_polls: 100,
-                allow_idle_heuristics: true,
-            });
+            let executor =
+                WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                    tail_lines: 200,
+                    poll_initial: Duration::from_millis(1),
+                    poll_max: Duration::from_millis(5),
+                    max_polls: 100,
+                    allow_idle_heuristics: true,
+                });
 
-        let condition = WaitCondition::text_match(TextMatch::regex(r"completed in \d+ms"));
-        let result = executor
-            .execute(&condition, 1, Duration::from_secs(5))
-            .await;
+            let condition = WaitCondition::text_match(TextMatch::regex(r"completed in \d+ms"));
+            let result = executor
+                .execute(&condition, 1, Duration::from_secs(5))
+                .await;
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_satisfied());
-        assert!(source.calls() >= 2);
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert!(result.is_satisfied());
+            assert!(source.calls() >= 2);
         });
     }
 
     #[test]
     fn pane_idle_succeeds_with_osc133_prompt_active() {
         run_async_test(async {
-        use crate::ingest::{Osc133State, ShellState};
+            use crate::ingest::{Osc133State, ShellState};
 
-        let source = MockPaneSource::new(vec!["some text".to_string()]);
-        let engine = PatternEngine::new();
-        let mut osc_state = Osc133State::new();
-        osc_state.state = ShellState::PromptActive;
+            let source = MockPaneSource::new(vec!["some text".to_string()]);
+            let engine = PatternEngine::new();
+            let mut osc_state = Osc133State::new();
+            osc_state.state = ShellState::PromptActive;
 
-        let executor = WaitConditionExecutor::new(&source, &engine)
-            .with_osc_state(&osc_state)
-            .with_options(WaitConditionOptions {
-                tail_lines: 200,
-                poll_initial: Duration::from_millis(1),
-                poll_max: Duration::from_millis(5),
-                max_polls: 100,
-                allow_idle_heuristics: true,
-            });
+            let executor = WaitConditionExecutor::new(&source, &engine)
+                .with_osc_state(&osc_state)
+                .with_options(WaitConditionOptions {
+                    tail_lines: 200,
+                    poll_initial: Duration::from_millis(1),
+                    poll_max: Duration::from_millis(5),
+                    max_polls: 100,
+                    allow_idle_heuristics: true,
+                });
 
-        // idle_threshold_ms = 0 means immediate satisfaction when idle
-        let condition = WaitCondition::pane_idle(0);
-        let result = executor
-            .execute(&condition, 1, Duration::from_secs(5))
-            .await;
+            // idle_threshold_ms = 0 means immediate satisfaction when idle
+            let condition = WaitCondition::pane_idle(0);
+            let result = executor
+                .execute(&condition, 1, Duration::from_secs(5))
+                .await;
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_satisfied());
-        if let WaitConditionResult::Satisfied { context, .. } = result {
-            assert!(context.unwrap().contains("osc133"));
-        }
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert!(result.is_satisfied());
+            if let WaitConditionResult::Satisfied { context, .. } = result {
+                assert!(context.unwrap().contains("osc133"));
+            }
         });
     }
 
     #[test]
     fn pane_idle_times_out_with_osc133_command_running() {
         run_async_test(async {
-        use crate::ingest::{Osc133State, ShellState};
+            use crate::ingest::{Osc133State, ShellState};
 
-        let source = MockPaneSource::new(vec!["running command...".to_string()]);
-        let engine = PatternEngine::new();
-        let mut osc_state = Osc133State::new();
-        osc_state.state = ShellState::CommandRunning;
+            let source = MockPaneSource::new(vec!["running command...".to_string()]);
+            let engine = PatternEngine::new();
+            let mut osc_state = Osc133State::new();
+            osc_state.state = ShellState::CommandRunning;
 
-        let executor = WaitConditionExecutor::new(&source, &engine)
-            .with_osc_state(&osc_state)
-            .with_options(WaitConditionOptions {
-                tail_lines: 200,
-                poll_initial: Duration::from_millis(1),
-                poll_max: Duration::from_millis(5),
-                max_polls: 5,
-                allow_idle_heuristics: true,
-            });
+            let executor = WaitConditionExecutor::new(&source, &engine)
+                .with_osc_state(&osc_state)
+                .with_options(WaitConditionOptions {
+                    tail_lines: 200,
+                    poll_initial: Duration::from_millis(1),
+                    poll_max: Duration::from_millis(5),
+                    max_polls: 5,
+                    allow_idle_heuristics: true,
+                });
 
-        let condition = WaitCondition::pane_idle(0);
-        let result = executor
-            .execute(&condition, 1, Duration::from_millis(20))
-            .await;
+            let condition = WaitCondition::pane_idle(0);
+            let result = executor
+                .execute(&condition, 1, Duration::from_millis(20))
+                .await;
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_timed_out());
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert!(result.is_timed_out());
         });
     }
 
@@ -1152,7 +1153,7 @@ steps:
     #[test]
     fn descriptor_send_ctrl_requires_injector() {
         run_async_test(async {
-        let yaml = r#"
+            let yaml = r#"
 workflow_schema_version: 1
 name: "ctrl_only"
 steps:
@@ -1160,32 +1161,33 @@ steps:
     id: interrupt
     key: ctrl_c
 "#;
-        let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
-        let workflow = DescriptorWorkflow::new(descriptor);
+            let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
+            let workflow = DescriptorWorkflow::new(descriptor);
 
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("descriptor_send_ctrl.db")
-            .to_string_lossy()
-            .to_string();
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("descriptor_send_ctrl.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
 
-        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-ctrl");
-        let result = workflow.execute_step(&mut ctx, 0).await;
-        match result {
-            StepResult::Abort { reason } => {
-                assert!(reason.contains("No injector configured"));
+            let mut ctx =
+                WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-ctrl");
+            let result = workflow.execute_step(&mut ctx, 0).await;
+            match result {
+                StepResult::Abort { reason } => {
+                    assert!(reason.contains("No injector configured"));
+                }
+                other => panic!("Expected abort, got: {other:?}"),
             }
-            other => panic!("Expected abort, got: {other:?}"),
-        }
         });
     }
 
     #[test]
     fn descriptor_workflow_logs_policy_summary_on_send_text() {
         run_async_test(async {
-        let yaml = r#"
+            let yaml = r#"
 workflow_schema_version: 1
 name: "send_text_policy"
 steps:
@@ -1193,75 +1195,75 @@ steps:
     id: send_cmd
     text: "echo secret"
 "#;
-        let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
-        let workflow: Arc<dyn Workflow> = Arc::new(DescriptorWorkflow::new(descriptor));
+            let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
+            let workflow: Arc<dyn Workflow> = Arc::new(DescriptorWorkflow::new(descriptor));
 
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("descriptor_policy.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("descriptor_policy.db")
+                .to_string_lossy()
+                .to_string();
 
-        let engine = WorkflowEngine::default();
-        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let injector = Arc::new(crate::runtime_compat::Mutex::new(
-            crate::policy::PolicyGatedInjector::new(
-                crate::policy::PolicyEngine::strict(),
-                default_wezterm_handle(),
-            ),
-        ));
-        let runner = WorkflowRunner::new(
-            engine,
-            lock_manager,
-            Arc::clone(&storage),
-            injector,
-            WorkflowRunnerConfig::default(),
-        );
+            let engine = WorkflowEngine::default();
+            let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let injector = Arc::new(crate::runtime_compat::Mutex::new(
+                crate::policy::PolicyGatedInjector::new(
+                    crate::policy::PolicyEngine::strict(),
+                    default_wezterm_handle(),
+                ),
+            ));
+            let runner = WorkflowRunner::new(
+                engine,
+                lock_manager,
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
 
-        let pane_id = 101u64;
-        create_test_pane(&storage, pane_id).await;
-        runner.register_workflow(Arc::clone(&workflow));
+            let pane_id = 101u64;
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::clone(&workflow));
 
-        let execution_id = generate_workflow_id(workflow.name());
-        runner
-            .engine
-            .start_with_id(
-                &storage,
-                execution_id.clone(),
-                workflow.name(),
-                pane_id,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+            let execution_id = generate_workflow_id(workflow.name());
+            runner
+                .engine
+                .start_with_id(
+                    &storage,
+                    execution_id.clone(),
+                    workflow.name(),
+                    pane_id,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
 
-        let result = runner
-            .run_workflow(pane_id, workflow, &execution_id, 0)
-            .await;
-        assert!(result.is_aborted(), "Expected policy-gated abort");
+            let result = runner
+                .run_workflow(pane_id, workflow, &execution_id, 0)
+                .await;
+            assert!(result.is_aborted(), "Expected policy-gated abort");
 
-        let logs = storage.get_step_logs(&execution_id).await.unwrap();
-        assert_eq!(logs.len(), 1, "Expected a single step log entry");
+            let logs = storage.get_step_logs(&execution_id).await.unwrap();
+            assert_eq!(logs.len(), 1, "Expected a single step log entry");
 
-        let policy_summary = logs[0]
-            .policy_summary
-            .as_ref()
-            .expect("policy summary missing");
-        let summary_json: serde_json::Value = serde_json::from_str(policy_summary).unwrap();
-        assert_ne!(
-            summary_json.get("decision").and_then(|v| v.as_str()),
-            Some("allow")
-        );
+            let policy_summary = logs[0]
+                .policy_summary
+                .as_ref()
+                .expect("policy summary missing");
+            let summary_json: serde_json::Value = serde_json::from_str(policy_summary).unwrap();
+            assert_ne!(
+                summary_json.get("decision").and_then(|v| v.as_str()),
+                Some("allow")
+            );
         });
     }
 
     #[test]
     fn workflow_runner_emits_step_and_policy_decision_capture_events() {
         run_async_test(async {
-        let yaml = r#"
+            let yaml = r#"
 workflow_schema_version: 1
 name: "decision_capture_flow"
 steps:
@@ -1269,87 +1271,87 @@ steps:
     id: send_cmd
     text: "echo hello"
 "#;
-        let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
-        let workflow: Arc<dyn Workflow> = Arc::new(DescriptorWorkflow::new(descriptor));
+            let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
+            let workflow: Arc<dyn Workflow> = Arc::new(DescriptorWorkflow::new(descriptor));
 
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("workflow_decision_capture.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("workflow_decision_capture.db")
+                .to_string_lossy()
+                .to_string();
 
-        let engine = WorkflowEngine::default();
-        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let injector = Arc::new(crate::runtime_compat::Mutex::new(
-            crate::policy::PolicyGatedInjector::new(
-                crate::policy::PolicyEngine::strict(),
-                default_wezterm_handle(),
-            ),
-        ));
+            let engine = WorkflowEngine::default();
+            let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let injector = Arc::new(crate::runtime_compat::Mutex::new(
+                crate::policy::PolicyGatedInjector::new(
+                    crate::policy::PolicyEngine::strict(),
+                    default_wezterm_handle(),
+                ),
+            ));
 
-        let sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
-        let replay_adapter = Arc::new(crate::replay_capture::CaptureAdapter::new(
-            sink.clone(),
-            crate::replay_capture::CaptureConfig::default(),
-        ));
+            let sink = Arc::new(crate::replay_capture::CollectingCaptureSink::new());
+            let replay_adapter = Arc::new(crate::replay_capture::CaptureAdapter::new(
+                sink.clone(),
+                crate::replay_capture::CaptureConfig::default(),
+            ));
 
-        let runner = WorkflowRunner::new(
-            engine,
-            lock_manager,
-            Arc::clone(&storage),
-            injector,
-            WorkflowRunnerConfig::default(),
-        )
-        .with_replay_capture_adapter(replay_adapter);
-
-        let pane_id = 101u64;
-        create_test_pane(&storage, pane_id).await;
-        runner.register_workflow(Arc::clone(&workflow));
-
-        let execution_id = generate_workflow_id(workflow.name());
-        runner
-            .engine
-            .start_with_id(
-                &storage,
-                execution_id.clone(),
-                workflow.name(),
-                pane_id,
-                None,
-                None,
+            let runner = WorkflowRunner::new(
+                engine,
+                lock_manager,
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
             )
-            .await
-            .unwrap();
+            .with_replay_capture_adapter(replay_adapter);
 
-        let result = runner
-            .run_workflow(pane_id, workflow, &execution_id, 0)
-            .await;
-        assert!(result.is_aborted(), "Expected policy-gated abort");
+            let pane_id = 101u64;
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::clone(&workflow));
 
-        let events = sink.recorder_events();
-        assert!(
-            events.iter().any(|event| {
-                matches!(
-                    &event.payload,
-                    crate::recording::RecorderEventPayload::ControlMarker { details, .. }
-                        if details.get("decision_type")
-                            == Some(&serde_json::json!("WorkflowStep"))
+            let execution_id = generate_workflow_id(workflow.name());
+            runner
+                .engine
+                .start_with_id(
+                    &storage,
+                    execution_id.clone(),
+                    workflow.name(),
+                    pane_id,
+                    None,
+                    None,
                 )
-            }),
-            "expected workflow_step decision provenance event"
-        );
-        assert!(
-            events.iter().any(|event| {
-                matches!(
-                    &event.payload,
-                    crate::recording::RecorderEventPayload::ControlMarker { details, .. }
-                        if details.get("decision_type")
-                            == Some(&serde_json::json!("PolicyEvaluation"))
-                )
-            }),
-            "expected policy_evaluation decision provenance event"
-        );
+                .await
+                .unwrap();
+
+            let result = runner
+                .run_workflow(pane_id, workflow, &execution_id, 0)
+                .await;
+            assert!(result.is_aborted(), "Expected policy-gated abort");
+
+            let events = sink.recorder_events();
+            assert!(
+                events.iter().any(|event| {
+                    matches!(
+                        &event.payload,
+                        crate::recording::RecorderEventPayload::ControlMarker { details, .. }
+                            if details.get("decision_type")
+                                == Some(&serde_json::json!("WorkflowStep"))
+                    )
+                }),
+                "expected workflow_step decision provenance event"
+            );
+            assert!(
+                events.iter().any(|event| {
+                    matches!(
+                        &event.payload,
+                        crate::recording::RecorderEventPayload::ControlMarker { details, .. }
+                            if details.get("decision_type")
+                                == Some(&serde_json::json!("PolicyEvaluation"))
+                    )
+                }),
+                "expected policy_evaluation decision provenance event"
+            );
         });
     }
 
@@ -1506,7 +1508,7 @@ steps:
     #[test]
     fn descriptor_notify_step_returns_continue() {
         run_async_test(async {
-        let yaml = r#"
+            let yaml = r#"
 workflow_schema_version: 1
 name: "notify_exec"
 steps:
@@ -1514,24 +1516,25 @@ steps:
     id: alert
     message: "test notification"
 "#;
-        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("notify.db")
-            .to_string_lossy()
-            .to_string();
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-notify");
-        let result = workflow.execute_step(&mut ctx, 0).await;
-        assert!(result.is_continue());
+            let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("notify.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let mut ctx =
+                WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-notify");
+            let result = workflow.execute_step(&mut ctx, 0).await;
+            assert!(result.is_continue());
         });
     }
 
     #[test]
     fn descriptor_log_step_returns_continue() {
         run_async_test(async {
-        let yaml = r#"
+            let yaml = r#"
 workflow_schema_version: 1
 name: "log_exec"
 steps:
@@ -1539,20 +1542,20 @@ steps:
     id: entry
     message: "audit trail entry"
 "#;
-        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("log.db").to_string_lossy().to_string();
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-log");
-        let result = workflow.execute_step(&mut ctx, 0).await;
-        assert!(result.is_continue());
+            let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir.path().join("log.db").to_string_lossy().to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-log");
+            let result = workflow.execute_step(&mut ctx, 0).await;
+            assert!(result.is_continue());
         });
     }
 
     #[test]
     fn descriptor_abort_step_returns_abort() {
         run_async_test(async {
-        let yaml = r#"
+            let yaml = r#"
 workflow_schema_version: 1
 name: "abort_exec"
 steps:
@@ -1560,27 +1563,28 @@ steps:
     id: bail
     reason: "cannot proceed"
 "#;
-        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("abort.db")
-            .to_string_lossy()
-            .to_string();
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-abort");
-        let result = workflow.execute_step(&mut ctx, 0).await;
-        match result {
-            StepResult::Abort { reason } => assert_eq!(reason, "cannot proceed"),
-            other => panic!("Expected Abort, got: {other:?}"),
-        }
+            let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("abort.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let mut ctx =
+                WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-abort");
+            let result = workflow.execute_step(&mut ctx, 0).await;
+            match result {
+                StepResult::Abort { reason } => assert_eq!(reason, "cannot proceed"),
+                other => panic!("Expected Abort, got: {other:?}"),
+            }
         });
     }
 
     #[test]
     fn descriptor_conditional_then_branch() {
         run_async_test(async {
-        let yaml = r#"
+            let yaml = r#"
 workflow_schema_version: 1
 name: "cond_then"
 steps:
@@ -1599,25 +1603,26 @@ steps:
         id: ok
         message: "all clear"
 "#;
-        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("cond.db")
-            .to_string_lossy()
-            .to_string();
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-cond");
-        // test_text contains "error" so then_steps should run (notify returns Continue)
-        let result = workflow.execute_step(&mut ctx, 0).await;
-        assert!(result.is_continue());
+            let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("cond.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let mut ctx =
+                WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-cond");
+            // test_text contains "error" so then_steps should run (notify returns Continue)
+            let result = workflow.execute_step(&mut ctx, 0).await;
+            assert!(result.is_continue());
         });
     }
 
     #[test]
     fn descriptor_conditional_else_branch() {
         run_async_test(async {
-        let yaml = r#"
+            let yaml = r#"
 workflow_schema_version: 1
 name: "cond_else"
 steps:
@@ -1636,38 +1641,38 @@ steps:
         id: ok
         message: "all clear"
 "#;
-        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("cond_else.db")
-            .to_string_lossy()
-            .to_string();
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let mut ctx =
-            WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-cond-else");
-        // test_text does NOT contain "error" so else branch runs (notify returns Continue).
-        // Conditionals compile to multiple executable steps (JumpIfFalse + body + Jump);
-        // simulate the engine loop: Continue advances to the next step, JumpTo jumps,
-        // and Abort/Done/etc. are terminal.
-        let num_steps = workflow.step_count();
-        let mut step = 0usize;
-        let result = loop {
-            let r = workflow.execute_step(&mut ctx, step).await;
-            match r {
-                StepResult::JumpTo { step: target } => step = target,
-                StepResult::Continue if step + 1 < num_steps => step += 1,
-                other => break other,
-            }
-        };
-        assert!(result.is_continue());
+            let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("cond_else.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let mut ctx =
+                WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-cond-else");
+            // test_text does NOT contain "error" so else branch runs (notify returns Continue).
+            // Conditionals compile to multiple executable steps (JumpIfFalse + body + Jump);
+            // simulate the engine loop: Continue advances to the next step, JumpTo jumps,
+            // and Abort/Done/etc. are terminal.
+            let num_steps = workflow.step_count();
+            let mut step = 0usize;
+            let result = loop {
+                let r = workflow.execute_step(&mut ctx, step).await;
+                match r {
+                    StepResult::JumpTo { step: target } => step = target,
+                    StepResult::Continue if step + 1 < num_steps => step += 1,
+                    other => break other,
+                }
+            };
+            assert!(result.is_continue());
         });
     }
 
     #[test]
     fn descriptor_conditional_then_with_abort() {
         run_async_test(async {
-        let yaml = r#"
+            let yaml = r#"
 workflow_schema_version: 1
 name: "cond_abort"
 steps:
@@ -1683,39 +1688,39 @@ steps:
         reason: "fatal error"
     else_steps: []
 "#;
-        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("cond_abort.db")
-            .to_string_lossy()
-            .to_string();
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let mut ctx =
-            WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-cond-abort");
-        // Conditionals compile to multiple executable steps; simulate the engine loop:
-        // Continue advances to the next step, JumpTo jumps, Abort/Done/etc. are terminal.
-        let num_steps = workflow.step_count();
-        let mut step = 0usize;
-        let result = loop {
-            let r = workflow.execute_step(&mut ctx, step).await;
-            match r {
-                StepResult::JumpTo { step: target } => step = target,
-                StepResult::Continue if step + 1 < num_steps => step += 1,
-                other => break other,
+            let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("cond_abort.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let mut ctx =
+                WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-cond-abort");
+            // Conditionals compile to multiple executable steps; simulate the engine loop:
+            // Continue advances to the next step, JumpTo jumps, Abort/Done/etc. are terminal.
+            let num_steps = workflow.step_count();
+            let mut step = 0usize;
+            let result = loop {
+                let r = workflow.execute_step(&mut ctx, step).await;
+                match r {
+                    StepResult::JumpTo { step: target } => step = target,
+                    StepResult::Continue if step + 1 < num_steps => step += 1,
+                    other => break other,
+                }
+            };
+            match result {
+                StepResult::Abort { reason } => assert_eq!(reason, "fatal error"),
+                other => panic!("Expected Abort, got: {other:?}"),
             }
-        };
-        match result {
-            StepResult::Abort { reason } => assert_eq!(reason, "fatal error"),
-            other => panic!("Expected Abort, got: {other:?}"),
-        }
         });
     }
 
     #[test]
     fn descriptor_loop_repeats_steps() {
         run_async_test(async {
-        let yaml = r#"
+            let yaml = r#"
 workflow_schema_version: 1
 name: "loop_test"
 steps:
@@ -1727,25 +1732,26 @@ steps:
         id: tick
         message: "iteration"
 "#;
-        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("loop.db")
-            .to_string_lossy()
-            .to_string();
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-loop");
-        // All body steps are log (Continue), so loop completes with Continue
-        let result = workflow.execute_step(&mut ctx, 0).await;
-        assert!(result.is_continue());
+            let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("loop.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let mut ctx =
+                WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-loop");
+            // All body steps are log (Continue), so loop completes with Continue
+            let result = workflow.execute_step(&mut ctx, 0).await;
+            assert!(result.is_continue());
         });
     }
 
     #[test]
     fn descriptor_loop_aborts_on_abort_step() {
         run_async_test(async {
-        let yaml = r#"
+            let yaml = r#"
 workflow_schema_version: 1
 name: "loop_abort"
 steps:
@@ -1757,21 +1763,21 @@ steps:
         id: bail
         reason: "stop early"
 "#;
-        let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("loop_abort.db")
-            .to_string_lossy()
-            .to_string();
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let mut ctx =
-            WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-loop-abort");
-        let result = workflow.execute_step(&mut ctx, 0).await;
-        match result {
-            StepResult::Abort { reason } => assert_eq!(reason, "stop early"),
-            other => panic!("Expected Abort, got: {other:?}"),
-        }
+            let workflow = DescriptorWorkflow::from_yaml_str(yaml).unwrap();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("loop_abort.db")
+                .to_string_lossy()
+                .to_string();
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let mut ctx =
+                WorkflowContext::new(storage, 1, PaneCapabilities::default(), "exec-loop-abort");
+            let result = workflow.execute_step(&mut ctx, 0).await;
+            match result {
+                StepResult::Abort { reason } => assert_eq!(reason, "stop early"),
+                other => panic!("Expected Abort, got: {other:?}"),
+            }
         });
     }
 
@@ -2027,178 +2033,178 @@ steps:
     #[test]
     fn pane_idle_uses_heuristics_when_no_osc133() {
         run_async_test(async {
-        let source = MockPaneSource::new(vec!["user@host:~$ ".to_string()]);
-        let engine = PatternEngine::new();
+            let source = MockPaneSource::new(vec!["user@host:~$ ".to_string()]);
+            let engine = PatternEngine::new();
 
-        let executor =
-            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
-                tail_lines: 200,
-                poll_initial: Duration::from_millis(1),
-                poll_max: Duration::from_millis(5),
-                max_polls: 100,
-                allow_idle_heuristics: true,
-            });
+            let executor =
+                WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                    tail_lines: 200,
+                    poll_initial: Duration::from_millis(1),
+                    poll_max: Duration::from_millis(5),
+                    max_polls: 100,
+                    allow_idle_heuristics: true,
+                });
 
-        let condition = WaitCondition::pane_idle(0);
-        let result = executor
-            .execute(&condition, 1, Duration::from_secs(5))
-            .await;
+            let condition = WaitCondition::pane_idle(0);
+            let result = executor
+                .execute(&condition, 1, Duration::from_secs(5))
+                .await;
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_satisfied());
-        if let WaitConditionResult::Satisfied { context, .. } = result {
-            assert!(context.unwrap().contains("heuristic"));
-        }
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert!(result.is_satisfied());
+            if let WaitConditionResult::Satisfied { context, .. } = result {
+                assert!(context.unwrap().contains("heuristic"));
+            }
         });
     }
 
     #[test]
     fn pane_idle_respects_threshold_duration() {
         run_async_test(async {
-        use crate::ingest::{Osc133State, ShellState};
+            use crate::ingest::{Osc133State, ShellState};
 
-        let source = MockPaneSource::new(vec!["some text".to_string()]);
-        let engine = PatternEngine::new();
-        let mut osc_state = Osc133State::new();
-        osc_state.state = ShellState::PromptActive;
+            let source = MockPaneSource::new(vec!["some text".to_string()]);
+            let engine = PatternEngine::new();
+            let mut osc_state = Osc133State::new();
+            osc_state.state = ShellState::PromptActive;
 
-        let executor = WaitConditionExecutor::new(&source, &engine)
-            .with_osc_state(&osc_state)
-            .with_options(WaitConditionOptions {
-                tail_lines: 200,
-                poll_initial: Duration::from_millis(10),
-                poll_max: Duration::from_millis(50),
-                max_polls: 100,
-                allow_idle_heuristics: true,
-            });
+            let executor = WaitConditionExecutor::new(&source, &engine)
+                .with_osc_state(&osc_state)
+                .with_options(WaitConditionOptions {
+                    tail_lines: 200,
+                    poll_initial: Duration::from_millis(10),
+                    poll_max: Duration::from_millis(50),
+                    max_polls: 100,
+                    allow_idle_heuristics: true,
+                });
 
-        // Require 50ms idle threshold
-        let condition = WaitCondition::pane_idle(50);
-        let start = std::time::Instant::now();
-        let result = executor
-            .execute(&condition, 1, Duration::from_secs(5))
-            .await;
-        let elapsed = start.elapsed();
+            // Require 50ms idle threshold
+            let condition = WaitCondition::pane_idle(50);
+            let start = std::time::Instant::now();
+            let result = executor
+                .execute(&condition, 1, Duration::from_secs(5))
+                .await;
+            let elapsed = start.elapsed();
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_satisfied());
-        // Should have waited at least the threshold duration
-        assert!(elapsed >= Duration::from_millis(50));
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert!(result.is_satisfied());
+            // Should have waited at least the threshold duration
+            assert!(elapsed >= Duration::from_millis(50));
         });
     }
 
     #[test]
     fn stable_tail_succeeds_after_stability_window() {
         run_async_test(async {
-        let source = MockPaneSource::new(vec![
-            "compaction in progress".to_string(),
-            "compaction in progress".to_string(),
-            "compaction in progress".to_string(),
-        ]);
-        let engine = PatternEngine::new();
+            let source = MockPaneSource::new(vec![
+                "compaction in progress".to_string(),
+                "compaction in progress".to_string(),
+                "compaction in progress".to_string(),
+            ]);
+            let engine = PatternEngine::new();
 
-        let executor =
-            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
-                tail_lines: 200,
-                poll_initial: Duration::from_millis(1),
-                poll_max: Duration::from_millis(5),
-                max_polls: 100,
-                allow_idle_heuristics: true,
-            });
+            let executor =
+                WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                    tail_lines: 200,
+                    poll_initial: Duration::from_millis(1),
+                    poll_max: Duration::from_millis(5),
+                    max_polls: 100,
+                    allow_idle_heuristics: true,
+                });
 
-        let condition = WaitCondition::stable_tail(1);
-        let result = executor
-            .execute(&condition, 1, Duration::from_millis(50))
-            .await;
+            let condition = WaitCondition::stable_tail(1);
+            let result = executor
+                .execute(&condition, 1, Duration::from_millis(50))
+                .await;
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_satisfied());
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert!(result.is_satisfied());
         });
     }
 
     #[test]
     fn stable_tail_times_out_when_changing() {
         run_async_test(async {
-        let source = MockPaneSource::new(vec![
-            "line 1".to_string(),
-            "line 2".to_string(),
-            "line 3".to_string(),
-            "line 4".to_string(),
-        ]);
-        let engine = PatternEngine::new();
+            let source = MockPaneSource::new(vec![
+                "line 1".to_string(),
+                "line 2".to_string(),
+                "line 3".to_string(),
+                "line 4".to_string(),
+            ]);
+            let engine = PatternEngine::new();
 
-        let executor =
-            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
-                tail_lines: 200,
-                poll_initial: Duration::from_millis(1),
-                poll_max: Duration::from_millis(5),
-                max_polls: 5,
-                allow_idle_heuristics: true,
-            });
+            let executor =
+                WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                    tail_lines: 200,
+                    poll_initial: Duration::from_millis(1),
+                    poll_max: Duration::from_millis(5),
+                    max_polls: 5,
+                    allow_idle_heuristics: true,
+                });
 
-        let condition = WaitCondition::stable_tail(100);
-        let result = executor
-            .execute(&condition, 1, Duration::from_millis(10))
-            .await;
+            let condition = WaitCondition::stable_tail(100);
+            let result = executor
+                .execute(&condition, 1, Duration::from_millis(10))
+                .await;
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_timed_out());
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert!(result.is_timed_out());
         });
     }
 
     #[test]
     fn external_wait_returns_unsupported() {
         run_async_test(async {
-        let source = MockPaneSource::new(vec!["text".to_string()]);
-        let engine = PatternEngine::new();
+            let source = MockPaneSource::new(vec!["text".to_string()]);
+            let engine = PatternEngine::new();
 
-        let executor = WaitConditionExecutor::new(&source, &engine);
-        let condition = WaitCondition::external("my_signal");
-        let result = executor
-            .execute(&condition, 1, Duration::from_secs(5))
-            .await;
+            let executor = WaitConditionExecutor::new(&source, &engine);
+            let condition = WaitCondition::external("my_signal");
+            let result = executor
+                .execute(&condition, 1, Duration::from_secs(5))
+                .await;
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        match result {
-            WaitConditionResult::Unsupported { reason } => {
-                assert!(reason.contains("my_signal"));
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            match result {
+                WaitConditionResult::Unsupported { reason } => {
+                    assert!(reason.contains("my_signal"));
+                }
+                _ => panic!("Expected Unsupported"),
             }
-            _ => panic!("Expected Unsupported"),
-        }
         });
     }
 
     #[test]
     fn wait_respects_max_polls() {
         run_async_test(async {
-        let source = MockPaneSource::new(vec!["no match".to_string()]);
-        let engine = PatternEngine::new();
+            let source = MockPaneSource::new(vec!["no match".to_string()]);
+            let engine = PatternEngine::new();
 
-        let executor =
-            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
-                tail_lines: 200,
-                poll_initial: Duration::from_millis(1),
-                poll_max: Duration::from_millis(1),
-                max_polls: 3,
-                allow_idle_heuristics: true,
-            });
+            let executor =
+                WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
+                    tail_lines: 200,
+                    poll_initial: Duration::from_millis(1),
+                    poll_max: Duration::from_millis(1),
+                    max_polls: 3,
+                    allow_idle_heuristics: true,
+                });
 
-        let condition = WaitCondition::pattern("nonexistent.rule");
-        let result = executor
-            .execute(&condition, 1, Duration::from_secs(60))
-            .await;
+            let condition = WaitCondition::pattern("nonexistent.rule");
+            let result = executor
+                .execute(&condition, 1, Duration::from_secs(60))
+                .await;
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_timed_out());
-        if let WaitConditionResult::TimedOut { polls, .. } = result {
-            assert!(polls <= 3);
-        }
+            assert!(result.is_ok());
+            let result = result.unwrap();
+            assert!(result.is_timed_out());
+            if let WaitConditionResult::TimedOut { polls, .. } = result {
+                assert!(polls <= 3);
+            }
         });
     }
 
@@ -4393,44 +4399,44 @@ steps:
     #[test]
     fn policy_gated_injector_returns_denied_for_running_command() {
         run_async_test(async {
-        use crate::policy::{
-            ActorKind, InjectionResult, PaneCapabilities, PolicyEngine, PolicyGatedInjector,
-        };
+            use crate::policy::{
+                ActorKind, InjectionResult, PaneCapabilities, PolicyEngine, PolicyGatedInjector,
+            };
 
-        // Create a strict policy engine (requires prompt active)
-        let engine = PolicyEngine::strict();
-        let client = default_wezterm_handle();
-        let mut injector = PolicyGatedInjector::new(engine, client);
+            // Create a strict policy engine (requires prompt active)
+            let engine = PolicyEngine::strict();
+            let client = default_wezterm_handle();
+            let mut injector = PolicyGatedInjector::new(engine, client);
 
-        // Create capabilities where command is running (not at prompt)
-        let caps = PaneCapabilities::running();
+            // Create capabilities where command is running (not at prompt)
+            let caps = PaneCapabilities::running();
 
-        // Try to send text - should be denied by policy
-        let result = injector
-            .send_text(
-                42,
-                "echo test",
-                ActorKind::Workflow,
-                &caps,
-                Some("wf-test-002"),
-            )
-            .await;
+            // Try to send text - should be denied by policy
+            let result = injector
+                .send_text(
+                    42,
+                    "echo test",
+                    ActorKind::Workflow,
+                    &caps,
+                    Some("wf-test-002"),
+                )
+                .await;
 
-        // Verify it's denied
-        assert!(
-            result.is_denied(),
-            "Expected denied result, got: {result:?}"
-        );
-
-        // Verify the rule ID
-        if let InjectionResult::Denied { decision, .. } = result {
-            assert_eq!(
-                decision.rule_id(),
-                Some("policy.prompt_required"),
-                "Expected policy.prompt_required rule, got: {:?}",
-                decision.rule_id()
+            // Verify it's denied
+            assert!(
+                result.is_denied(),
+                "Expected denied result, got: {result:?}"
             );
-        }
+
+            // Verify the rule ID
+            if let InjectionResult::Denied { decision, .. } = result {
+                assert_eq!(
+                    decision.rule_id(),
+                    Some("policy.prompt_required"),
+                    "Expected policy.prompt_required rule, got: {:?}",
+                    decision.rule_id()
+                );
+            }
         });
     }
 
@@ -5046,42 +5052,42 @@ steps:
     #[test]
     fn handle_compaction_execute_step0_prompt_active_continues() {
         run_async_test(async {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_step0.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_step0.db")
+                .to_string_lossy()
+                .to_string();
 
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
 
-        // Create PromptActive capabilities
-        let prompt_caps = PaneCapabilities {
-            alt_screen: Some(false),
-            command_running: false,
-            has_recent_gap: false,
-            ..Default::default()
-        };
+            // Create PromptActive capabilities
+            let prompt_caps = PaneCapabilities {
+                alt_screen: Some(false),
+                command_running: false,
+                has_recent_gap: false,
+                ..Default::default()
+            };
 
-        let mut ctx = WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-step0-001");
+            let mut ctx = WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-step0-001");
 
-        let workflow = HandleCompaction::new();
-        let result = workflow.execute_step(&mut ctx, 0).await;
+            let workflow = HandleCompaction::new();
+            let result = workflow.execute_step(&mut ctx, 0).await;
 
-        // Step 0 should return Continue for valid state
-        match result {
-            StepResult::Continue => {
-                // Success - guards passed
+            // Step 0 should return Continue for valid state
+            match result {
+                StepResult::Continue => {
+                    // Success - guards passed
+                }
+                StepResult::Abort { reason } => {
+                    panic!("Step 0 should not abort for PromptActive state: {}", reason);
+                }
+                other => {
+                    panic!("Unexpected step result for step 0: {:?}", other);
+                }
             }
-            StepResult::Abort { reason } => {
-                panic!("Step 0 should not abort for PromptActive state: {}", reason);
-            }
-            other => {
-                panic!("Unexpected step result for step 0: {:?}", other);
-            }
-        }
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -5090,49 +5096,49 @@ steps:
     #[test]
     fn handle_compaction_execute_step0_alt_screen_aborts() {
         run_async_test(async {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_step0_alt.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_step0_alt.db")
+                .to_string_lossy()
+                .to_string();
 
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
 
-        // Create AltScreen capabilities
-        let alt_caps = PaneCapabilities {
-            alt_screen: Some(true),
-            command_running: false,
-            has_recent_gap: false,
-            ..Default::default()
-        };
+            // Create AltScreen capabilities
+            let alt_caps = PaneCapabilities {
+                alt_screen: Some(true),
+                command_running: false,
+                has_recent_gap: false,
+                ..Default::default()
+            };
 
-        let mut ctx = WorkflowContext::new(storage.clone(), 42, alt_caps, "test-step0-alt-001");
+            let mut ctx = WorkflowContext::new(storage.clone(), 42, alt_caps, "test-step0-alt-001");
 
-        let workflow = HandleCompaction::new();
-        let result = workflow.execute_step(&mut ctx, 0).await;
+            let workflow = HandleCompaction::new();
+            let result = workflow.execute_step(&mut ctx, 0).await;
 
-        // Step 0 should abort for AltScreen
-        match result {
-            StepResult::Abort { reason } => {
-                assert!(
-                    reason.contains("alt-screen"),
-                    "Abort reason should mention 'alt-screen': {}",
-                    reason
-                );
+            // Step 0 should abort for AltScreen
+            match result {
+                StepResult::Abort { reason } => {
+                    assert!(
+                        reason.contains("alt-screen"),
+                        "Abort reason should mention 'alt-screen': {}",
+                        reason
+                    );
+                }
+                StepResult::Continue => {
+                    panic!("Step 0 should abort for AltScreen state, got Continue");
+                }
+                other => {
+                    panic!(
+                        "Unexpected step result for step 0 with AltScreen: {:?}",
+                        other
+                    );
+                }
             }
-            StepResult::Continue => {
-                panic!("Step 0 should abort for AltScreen state, got Continue");
-            }
-            other => {
-                panic!(
-                    "Unexpected step result for step 0 with AltScreen: {:?}",
-                    other
-                );
-            }
-        }
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -5141,39 +5147,39 @@ steps:
     #[test]
     fn handle_compaction_execute_step1_returns_continue() {
         run_async_test(async {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_step1.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_step1.db")
+                .to_string_lossy()
+                .to_string();
 
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
 
-        let prompt_caps = PaneCapabilities {
-            alt_screen: Some(false),
-            command_running: false,
-            has_recent_gap: false,
-            ..Default::default()
-        };
+            let prompt_caps = PaneCapabilities {
+                alt_screen: Some(false),
+                command_running: false,
+                has_recent_gap: false,
+                ..Default::default()
+            };
 
-        let mut ctx = WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-step1-001");
+            let mut ctx = WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-step1-001");
 
-        let workflow = HandleCompaction::new()
-            .with_stabilization_ms(0)
-            .with_idle_timeout_ms(50);
-        let result = workflow.execute_step(&mut ctx, 1).await;
+            let workflow = HandleCompaction::new()
+                .with_stabilization_ms(0)
+                .with_idle_timeout_ms(50);
+            let result = workflow.execute_step(&mut ctx, 1).await;
 
-        // Step 1 should return Continue once stabilized
-        match result {
-            StepResult::Continue => {}
-            StepResult::Abort { reason } => {
-                panic!("Step 1 should not abort when stabilization is zero: {reason}");
+            // Step 1 should return Continue once stabilized
+            match result {
+                StepResult::Continue => {}
+                StepResult::Abort { reason } => {
+                    panic!("Step 1 should not abort when stabilization is zero: {reason}");
+                }
+                other => panic!("Step 1 should return Continue, got: {:?}", other),
             }
-            other => panic!("Step 1 should return Continue, got: {:?}", other),
-        }
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -5182,44 +5188,44 @@ steps:
     #[test]
     fn handle_compaction_execute_step2_no_injector_aborts() {
         run_async_test(async {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_step2_no_inj.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_step2_no_inj.db")
+                .to_string_lossy()
+                .to_string();
 
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
 
-        let prompt_caps = PaneCapabilities {
-            alt_screen: Some(false),
-            command_running: false,
-            has_recent_gap: false,
-            ..Default::default()
-        };
+            let prompt_caps = PaneCapabilities {
+                alt_screen: Some(false),
+                command_running: false,
+                has_recent_gap: false,
+                ..Default::default()
+            };
 
-        // Create context WITHOUT injector
-        let mut ctx =
-            WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-step2-no-inj-001");
+            // Create context WITHOUT injector
+            let mut ctx =
+                WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-step2-no-inj-001");
 
-        let workflow = HandleCompaction::new();
-        let result = workflow.execute_step(&mut ctx, 2).await;
+            let workflow = HandleCompaction::new();
+            let result = workflow.execute_step(&mut ctx, 2).await;
 
-        // Step 2 should abort without injector
-        match result {
-            StepResult::Abort { reason } => {
-                assert!(
-                    reason.to_lowercase().contains("injector"),
-                    "Abort reason should mention missing injector: {}",
-                    reason
-                );
+            // Step 2 should abort without injector
+            match result {
+                StepResult::Abort { reason } => {
+                    assert!(
+                        reason.to_lowercase().contains("injector"),
+                        "Abort reason should mention missing injector: {}",
+                        reason
+                    );
+                }
+                other => {
+                    panic!("Step 2 should abort without injector, got: {:?}", other);
+                }
             }
-            other => {
-                panic!("Step 2 should abort without injector, got: {:?}", other);
-            }
-        }
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -5228,41 +5234,41 @@ steps:
     #[test]
     fn handle_compaction_execute_invalid_step_aborts() {
         run_async_test(async {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_invalid_step.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_invalid_step.db")
+                .to_string_lossy()
+                .to_string();
 
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
 
-        let prompt_caps = PaneCapabilities::default();
+            let prompt_caps = PaneCapabilities::default();
 
-        let mut ctx =
-            WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-invalid-step-001");
+            let mut ctx =
+                WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-invalid-step-001");
 
-        let workflow = HandleCompaction::new();
+            let workflow = HandleCompaction::new();
 
-        // Try to execute step beyond the workflow's steps
-        let invalid_step = workflow.step_count() + 1;
-        let result = workflow.execute_step(&mut ctx, invalid_step).await;
+            // Try to execute step beyond the workflow's steps
+            let invalid_step = workflow.step_count() + 1;
+            let result = workflow.execute_step(&mut ctx, invalid_step).await;
 
-        // Should abort for invalid step
-        match result {
-            StepResult::Abort { reason } => {
-                assert!(
-                    reason.contains("step") || reason.contains("index"),
-                    "Abort reason should mention invalid step: {}",
-                    reason
-                );
+            // Should abort for invalid step
+            match result {
+                StepResult::Abort { reason } => {
+                    assert!(
+                        reason.contains("step") || reason.contains("index"),
+                        "Abort reason should mention invalid step: {}",
+                        reason
+                    );
+                }
+                other => {
+                    panic!("Invalid step should abort, got: {:?}", other);
+                }
             }
-            other => {
-                panic!("Invalid step should abort, got: {:?}", other);
-            }
-        }
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -5588,50 +5594,50 @@ steps:
     #[test]
     fn lock_released_on_workflow_completion() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_lock_complete.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_lock_complete.db")
+                .to_string_lossy()
+                .to_string();
 
-        let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
-        let pane_id = 42u64;
+            let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
+            let pane_id = 42u64;
 
-        create_test_pane(&storage, pane_id).await;
-        runner.register_workflow(Arc::new(SimpleCompletingWorkflow));
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(SimpleCompletingWorkflow));
 
-        // Start workflow - acquires lock
-        let detection = make_test_detection("simple_complete.test");
-        let start_result = runner.handle_detection(pane_id, &detection, None).await;
-        assert!(start_result.is_started(), "Workflow should start");
+            // Start workflow - acquires lock
+            let detection = make_test_detection("simple_complete.test");
+            let start_result = runner.handle_detection(pane_id, &detection, None).await;
+            assert!(start_result.is_started(), "Workflow should start");
 
-        // Lock should be held
-        assert!(
-            lock_manager.is_locked(pane_id).is_some(),
-            "Lock should be held after starting workflow"
-        );
+            // Lock should be held
+            assert!(
+                lock_manager.is_locked(pane_id).is_some(),
+                "Lock should be held after starting workflow"
+            );
 
-        // Run the workflow to completion
-        let workflow = runner.find_workflow_by_name("simple_completing").unwrap();
-        let execution_id = start_result.execution_id().unwrap();
-        let exec_result = runner
-            .run_workflow(pane_id, workflow, execution_id, 0)
-            .await;
+            // Run the workflow to completion
+            let workflow = runner.find_workflow_by_name("simple_completing").unwrap();
+            let execution_id = start_result.execution_id().unwrap();
+            let exec_result = runner
+                .run_workflow(pane_id, workflow, execution_id, 0)
+                .await;
 
-        // Verify workflow completed
-        assert!(
-            exec_result.is_completed(),
-            "Workflow should complete successfully"
-        );
+            // Verify workflow completed
+            assert!(
+                exec_result.is_completed(),
+                "Workflow should complete successfully"
+            );
 
-        // Lock should be released after completion
-        assert!(
-            lock_manager.is_locked(pane_id).is_none(),
-            "Lock should be released after workflow completion"
-        );
+            // Lock should be released after completion
+            assert!(
+                lock_manager.is_locked(pane_id).is_none(),
+                "Lock should be released after workflow completion"
+            );
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -5639,53 +5645,53 @@ steps:
     #[test]
     fn lock_released_on_workflow_abort() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_lock_abort.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_lock_abort.db")
+                .to_string_lossy()
+                .to_string();
 
-        let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
-        let pane_id = 43u64;
+            let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
+            let pane_id = 43u64;
 
-        create_test_pane(&storage, pane_id).await;
-        runner.register_workflow(Arc::new(AbortingWorkflow::new("Test abort reason")));
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(AbortingWorkflow::new("Test abort reason")));
 
-        // Start workflow - acquires lock
-        let detection = make_test_detection("abort_test.trigger");
-        let start_result = runner.handle_detection(pane_id, &detection, None).await;
-        assert!(start_result.is_started(), "Workflow should start");
+            // Start workflow - acquires lock
+            let detection = make_test_detection("abort_test.trigger");
+            let start_result = runner.handle_detection(pane_id, &detection, None).await;
+            assert!(start_result.is_started(), "Workflow should start");
 
-        // Lock should be held
-        assert!(
-            lock_manager.is_locked(pane_id).is_some(),
-            "Lock should be held after starting workflow"
-        );
-
-        // Run the workflow (will abort)
-        let workflow = runner.find_workflow_by_name("aborting_workflow").unwrap();
-        let execution_id = start_result.execution_id().unwrap();
-        let exec_result = runner
-            .run_workflow(pane_id, workflow, execution_id, 0)
-            .await;
-
-        // Verify workflow aborted
-        assert!(exec_result.is_aborted(), "Workflow should abort");
-        if let WorkflowExecutionResult::Aborted { reason, .. } = &exec_result {
+            // Lock should be held
             assert!(
-                reason.contains("Test abort reason"),
-                "Abort should have expected reason"
+                lock_manager.is_locked(pane_id).is_some(),
+                "Lock should be held after starting workflow"
             );
-        }
 
-        // Lock should be released after abort
-        assert!(
-            lock_manager.is_locked(pane_id).is_none(),
-            "Lock should be released after workflow abort"
-        );
+            // Run the workflow (will abort)
+            let workflow = runner.find_workflow_by_name("aborting_workflow").unwrap();
+            let execution_id = start_result.execution_id().unwrap();
+            let exec_result = runner
+                .run_workflow(pane_id, workflow, execution_id, 0)
+                .await;
 
-        storage.shutdown().await.unwrap();
+            // Verify workflow aborted
+            assert!(exec_result.is_aborted(), "Workflow should abort");
+            if let WorkflowExecutionResult::Aborted { reason, .. } = &exec_result {
+                assert!(
+                    reason.contains("Test abort reason"),
+                    "Abort should have expected reason"
+                );
+            }
+
+            // Lock should be released after abort
+            assert!(
+                lock_manager.is_locked(pane_id).is_none(),
+                "Lock should be released after workflow abort"
+            );
+
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -5693,64 +5699,64 @@ steps:
     #[test]
     fn per_pane_lock_prevents_concurrent_workflows() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_lock_concurrent.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_lock_concurrent.db")
+                .to_string_lossy()
+                .to_string();
 
-        let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
-        let pane_id = 44u64;
+            let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
+            let pane_id = 44u64;
 
-        create_test_pane(&storage, pane_id).await;
-        runner.register_workflow(Arc::new(MultiStepWorkflow::new()));
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(MultiStepWorkflow::new()));
 
-        // Start first workflow
-        let detection1 = make_test_detection("multi_step.first");
-        let start_result1 = runner.handle_detection(pane_id, &detection1, None).await;
-        assert!(start_result1.is_started(), "First workflow should start");
+            // Start first workflow
+            let detection1 = make_test_detection("multi_step.first");
+            let start_result1 = runner.handle_detection(pane_id, &detection1, None).await;
+            assert!(start_result1.is_started(), "First workflow should start");
 
-        // Verify lock is held by first workflow
-        let lock_info = lock_manager.is_locked(pane_id);
-        assert!(lock_info.is_some(), "Lock should be held");
-        let info = lock_info.unwrap();
-        assert_eq!(info.workflow_name, "multi_step");
+            // Verify lock is held by first workflow
+            let lock_info = lock_manager.is_locked(pane_id);
+            assert!(lock_info.is_some(), "Lock should be held");
+            let info = lock_info.unwrap();
+            assert_eq!(info.workflow_name, "multi_step");
 
-        // Try to start second workflow on same pane
-        let detection2 = make_test_detection("multi_step.second");
-        let start_result2 = runner.handle_detection(pane_id, &detection2, None).await;
+            // Try to start second workflow on same pane
+            let detection2 = make_test_detection("multi_step.second");
+            let start_result2 = runner.handle_detection(pane_id, &detection2, None).await;
 
-        // Second workflow should be blocked
-        assert!(
-            start_result2.is_locked(),
-            "Second workflow should be blocked by lock"
-        );
-        if let WorkflowStartResult::PaneLocked {
-            held_by_workflow, ..
-        } = start_result2
-        {
-            assert_eq!(
-                held_by_workflow, "multi_step",
-                "Lock should be held by first workflow"
+            // Second workflow should be blocked
+            assert!(
+                start_result2.is_locked(),
+                "Second workflow should be blocked by lock"
             );
-        }
+            if let WorkflowStartResult::PaneLocked {
+                held_by_workflow, ..
+            } = start_result2
+            {
+                assert_eq!(
+                    held_by_workflow, "multi_step",
+                    "Lock should be held by first workflow"
+                );
+            }
 
-        // Complete first workflow to release lock
-        let workflow = runner.find_workflow_by_name("multi_step").unwrap();
-        let exec_id = start_result1.execution_id().unwrap();
-        let _ = runner
-            .run_workflow(pane_id, workflow.clone(), exec_id, 0)
-            .await;
+            // Complete first workflow to release lock
+            let workflow = runner.find_workflow_by_name("multi_step").unwrap();
+            let exec_id = start_result1.execution_id().unwrap();
+            let _ = runner
+                .run_workflow(pane_id, workflow.clone(), exec_id, 0)
+                .await;
 
-        // Now second workflow can start
-        let start_result3 = runner.handle_detection(pane_id, &detection2, None).await;
-        assert!(
-            start_result3.is_started(),
-            "Workflow should start after lock released"
-        );
+            // Now second workflow can start
+            let start_result3 = runner.handle_detection(pane_id, &detection2, None).await;
+            assert!(
+                start_result3.is_started(),
+                "Workflow should start after lock released"
+            );
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -5762,58 +5768,58 @@ steps:
     #[test]
     fn step_logs_written_correctly() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_step_logs.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_step_logs.db")
+                .to_string_lossy()
+                .to_string();
 
-        let (runner, storage, _lock_manager) = create_test_runner(&db_path).await;
-        let pane_id = 45u64;
+            let (runner, storage, _lock_manager) = create_test_runner(&db_path).await;
+            let pane_id = 45u64;
 
-        create_test_pane(&storage, pane_id).await;
-        runner.register_workflow(Arc::new(MultiStepWorkflow::new()));
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(MultiStepWorkflow::new()));
 
-        // Start and run workflow
-        let detection = make_test_detection("multi_step.log_test");
-        let start_result = runner.handle_detection(pane_id, &detection, None).await;
-        assert!(start_result.is_started());
+            // Start and run workflow
+            let detection = make_test_detection("multi_step.log_test");
+            let start_result = runner.handle_detection(pane_id, &detection, None).await;
+            assert!(start_result.is_started());
 
-        let workflow = runner.find_workflow_by_name("multi_step").unwrap();
-        let execution_id = start_result.execution_id().unwrap();
-        let exec_result = runner
-            .run_workflow(pane_id, workflow, execution_id, 0)
-            .await;
+            let workflow = runner.find_workflow_by_name("multi_step").unwrap();
+            let execution_id = start_result.execution_id().unwrap();
+            let exec_result = runner
+                .run_workflow(pane_id, workflow, execution_id, 0)
+                .await;
 
-        assert!(
-            exec_result.is_completed(),
-            "Workflow should complete: {exec_result:?}"
-        );
+            assert!(
+                exec_result.is_completed(),
+                "Workflow should complete: {exec_result:?}"
+            );
 
-        // Verify step logs were written
-        let step_logs = storage.get_step_logs(execution_id).await.unwrap();
+            // Verify step logs were written
+            let step_logs = storage.get_step_logs(execution_id).await.unwrap();
 
-        // Multi-step workflow has 4 steps (0, 1, 2, 3)
-        assert_eq!(step_logs.len(), 4, "Should have 4 step log entries");
+            // Multi-step workflow has 4 steps (0, 1, 2, 3)
+            assert_eq!(step_logs.len(), 4, "Should have 4 step log entries");
 
-        // Verify each step log
-        for (i, log) in step_logs.iter().enumerate() {
-            assert_eq!(log.workflow_id, execution_id);
-            assert_eq!(log.step_index, i);
-            assert_eq!(log.step_name, format!("step_{i}"));
-            assert!(log.started_at > 0, "Started timestamp should be set");
-            assert!(log.completed_at >= log.started_at, "Completed >= started");
-            assert!(log.duration_ms >= 0, "Duration should be non-negative");
-        }
+            // Verify each step log
+            for (i, log) in step_logs.iter().enumerate() {
+                assert_eq!(log.workflow_id, execution_id);
+                assert_eq!(log.step_index, i);
+                assert_eq!(log.step_name, format!("step_{i}"));
+                assert!(log.started_at > 0, "Started timestamp should be set");
+                assert!(log.completed_at >= log.started_at, "Completed >= started");
+                assert!(log.duration_ms >= 0, "Duration should be non-negative");
+            }
 
-        // First 3 steps should be "continue", last should be "done"
-        assert_eq!(step_logs[0].result_type, "continue");
-        assert_eq!(step_logs[1].result_type, "continue");
-        assert_eq!(step_logs[2].result_type, "continue");
-        assert_eq!(step_logs[3].result_type, "done");
+            // First 3 steps should be "continue", last should be "done"
+            assert_eq!(step_logs[0].result_type, "continue");
+            assert_eq!(step_logs[1].result_type, "continue");
+            assert_eq!(step_logs[2].result_type, "continue");
+            assert_eq!(step_logs[3].result_type, "done");
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -5821,76 +5827,76 @@ steps:
     #[test]
     fn send_text_step_logs_audit_action_id() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_send_text_audit.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_send_text_audit.db")
+                .to_string_lossy()
+                .to_string();
 
-        let engine = WorkflowEngine::default();
-        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let wezterm: crate::wezterm::WeztermHandle = Arc::new(MockWezterm);
-        let injector = Arc::new(crate::runtime_compat::Mutex::new(
-            crate::policy::PolicyGatedInjector::with_storage(
-                crate::policy::PolicyEngine::permissive(),
-                wezterm,
-                storage.as_ref().clone(),
-            ),
-        ));
+            let engine = WorkflowEngine::default();
+            let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let wezterm: crate::wezterm::WeztermHandle = Arc::new(MockWezterm);
+            let injector = Arc::new(crate::runtime_compat::Mutex::new(
+                crate::policy::PolicyGatedInjector::with_storage(
+                    crate::policy::PolicyEngine::permissive(),
+                    wezterm,
+                    storage.as_ref().clone(),
+                ),
+            ));
 
-        let runner = WorkflowRunner::new(
-            engine,
-            Arc::clone(&lock_manager),
-            Arc::clone(&storage),
-            injector,
-            WorkflowRunnerConfig::default(),
-        );
+            let runner = WorkflowRunner::new(
+                engine,
+                Arc::clone(&lock_manager),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
 
-        let pane_id = 60u64;
-        create_test_pane(&storage, pane_id).await;
-        runner.register_workflow(Arc::new(PromptSendWorkflow));
+            let pane_id = 60u64;
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(PromptSendWorkflow));
 
-        let detection = make_test_detection("prompt_send.audit");
-        let start_result = runner.handle_detection(pane_id, &detection, None).await;
-        assert!(start_result.is_started());
-        let execution_id = start_result.execution_id().unwrap();
+            let detection = make_test_detection("prompt_send.audit");
+            let start_result = runner.handle_detection(pane_id, &detection, None).await;
+            assert!(start_result.is_started());
+            let execution_id = start_result.execution_id().unwrap();
 
-        let workflow = runner.find_workflow_by_name("prompt_send").unwrap();
-        let exec_result = runner
-            .run_workflow(pane_id, workflow, execution_id, 0)
-            .await;
-        assert!(
-            exec_result.is_completed(),
-            "Workflow should complete: {exec_result:?}"
-        );
+            let workflow = runner.find_workflow_by_name("prompt_send").unwrap();
+            let exec_result = runner
+                .run_workflow(pane_id, workflow, execution_id, 0)
+                .await;
+            assert!(
+                exec_result.is_completed(),
+                "Workflow should complete: {exec_result:?}"
+            );
 
-        let step_logs = storage.get_step_logs(execution_id).await.unwrap();
-        let send_log = step_logs
-            .iter()
-            .find(|log| log.step_name == "send")
-            .expect("send_text step log missing");
-        let audit_action_id = send_log.audit_action_id.expect("audit_action_id missing");
+            let step_logs = storage.get_step_logs(execution_id).await.unwrap();
+            let send_log = step_logs
+                .iter()
+                .find(|log| log.step_name == "send")
+                .expect("send_text step log missing");
+            let audit_action_id = send_log.audit_action_id.expect("audit_action_id missing");
 
-        let history = storage
-            .get_action_history(crate::storage::ActionHistoryQuery {
-                actor_id: Some(execution_id.to_string()),
-                action_kind: Some("send_text".to_string()),
-                limit: Some(10),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let entry = history
-            .iter()
-            .find(|row| row.id == audit_action_id)
-            .expect("action_history entry missing");
+            let history = storage
+                .get_action_history(crate::storage::ActionHistoryQuery {
+                    actor_id: Some(execution_id.to_string()),
+                    action_kind: Some("send_text".to_string()),
+                    limit: Some(10),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let entry = history
+                .iter()
+                .find(|row| row.id == audit_action_id)
+                .expect("action_history entry missing");
 
-        assert_eq!(entry.workflow_id.as_deref(), Some(execution_id));
-        assert_eq!(entry.step_name.as_deref(), Some("send"));
+            assert_eq!(entry.workflow_id.as_deref(), Some(execution_id));
+            assert_eq!(entry.step_name.as_deref(), Some("send"));
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -5898,80 +5904,80 @@ steps:
     #[test]
     fn workflow_completion_updates_undo_metadata() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_workflow_completion_audit.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_workflow_completion_audit.db")
+                .to_string_lossy()
+                .to_string();
 
-        let (runner, storage, _lock_manager) = create_test_runner(&db_path).await;
-        let pane_id = 61u64;
+            let (runner, storage, _lock_manager) = create_test_runner(&db_path).await;
+            let pane_id = 61u64;
 
-        create_test_pane(&storage, pane_id).await;
-        runner.register_workflow(Arc::new(MultiStepWorkflow::new()));
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(MultiStepWorkflow::new()));
 
-        let detection = make_test_detection("multi_step.audit");
-        let start_result = runner.handle_detection(pane_id, &detection, None).await;
-        assert!(start_result.is_started());
-        let execution_id = start_result.execution_id().unwrap();
+            let detection = make_test_detection("multi_step.audit");
+            let start_result = runner.handle_detection(pane_id, &detection, None).await;
+            assert!(start_result.is_started());
+            let execution_id = start_result.execution_id().unwrap();
 
-        let workflow = runner.find_workflow_by_name("multi_step").unwrap();
-        let exec_result = runner
-            .run_workflow(pane_id, workflow, execution_id, 0)
-            .await;
-        assert!(
-            exec_result.is_completed(),
-            "Workflow should complete: {exec_result:?}"
-        );
+            let workflow = runner.find_workflow_by_name("multi_step").unwrap();
+            let exec_result = runner
+                .run_workflow(pane_id, workflow, execution_id, 0)
+                .await;
+            assert!(
+                exec_result.is_completed(),
+                "Workflow should complete: {exec_result:?}"
+            );
 
-        let start_actions = storage
-            .get_action_history(crate::storage::ActionHistoryQuery {
-                actor_id: Some(execution_id.to_string()),
-                action_kind: Some("workflow_start".to_string()),
-                limit: Some(5),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let start = start_actions
-            .first()
-            .expect("workflow_start action missing");
-        assert_eq!(start.undoable, Some(false));
-        assert_eq!(start.undo_strategy.as_deref(), Some("workflow_abort"));
-        assert_eq!(
-            start.undo_hint.as_deref(),
-            Some("workflow no longer running")
-        );
+            let start_actions = storage
+                .get_action_history(crate::storage::ActionHistoryQuery {
+                    actor_id: Some(execution_id.to_string()),
+                    action_kind: Some("workflow_start".to_string()),
+                    limit: Some(5),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let start = start_actions
+                .first()
+                .expect("workflow_start action missing");
+            assert_eq!(start.undoable, Some(false));
+            assert_eq!(start.undo_strategy.as_deref(), Some("workflow_abort"));
+            assert_eq!(
+                start.undo_hint.as_deref(),
+                Some("workflow no longer running")
+            );
 
-        let completed = storage
-            .get_action_history(crate::storage::ActionHistoryQuery {
-                actor_id: Some(execution_id.to_string()),
-                action_kind: Some("workflow_completed".to_string()),
-                limit: Some(5),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(!completed.is_empty(), "workflow_completed action missing");
+            let completed = storage
+                .get_action_history(crate::storage::ActionHistoryQuery {
+                    actor_id: Some(execution_id.to_string()),
+                    action_kind: Some("workflow_completed".to_string()),
+                    limit: Some(5),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(!completed.is_empty(), "workflow_completed action missing");
 
-        let steps = storage
-            .get_action_history(crate::storage::ActionHistoryQuery {
-                actor_id: Some(execution_id.to_string()),
-                action_kind: Some("workflow_step".to_string()),
-                limit: Some(10),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(
-            steps
-                .iter()
-                .any(|row| row.step_name.as_deref() == Some("step_0")),
-            "workflow_step entries should include step_name"
-        );
+            let steps = storage
+                .get_action_history(crate::storage::ActionHistoryQuery {
+                    actor_id: Some(execution_id.to_string()),
+                    action_kind: Some("workflow_step".to_string()),
+                    limit: Some(10),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(
+                steps
+                    .iter()
+                    .any(|row| row.step_name.as_deref() == Some("step_0")),
+                "workflow_step entries should include step_name"
+            );
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -5979,85 +5985,87 @@ steps:
     #[test]
     fn workflow_abort_updates_undo_metadata() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_workflow_abort_audit.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_workflow_abort_audit.db")
+                .to_string_lossy()
+                .to_string();
 
-        let (runner, storage, _lock_manager) = create_test_runner(&db_path).await;
-        let pane_id = 62u64;
+            let (runner, storage, _lock_manager) = create_test_runner(&db_path).await;
+            let pane_id = 62u64;
 
-        create_test_pane(&storage, pane_id).await;
-        runner.register_workflow(Arc::new(MultiStepWorkflow::failing_at(2)));
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(MultiStepWorkflow::failing_at(2)));
 
-        let detection = make_test_detection("multi_step.abort_audit");
-        let start_result = runner.handle_detection(pane_id, &detection, None).await;
-        assert!(start_result.is_started());
-        let execution_id = start_result.execution_id().unwrap();
+            let detection = make_test_detection("multi_step.abort_audit");
+            let start_result = runner.handle_detection(pane_id, &detection, None).await;
+            assert!(start_result.is_started());
+            let execution_id = start_result.execution_id().unwrap();
 
-        let workflow = runner.find_workflow_by_name("multi_step").unwrap();
-        let exec_result = runner
-            .run_workflow(pane_id, workflow, execution_id, 0)
-            .await;
-        assert!(
-            exec_result.is_aborted(),
-            "Workflow should abort: {exec_result:?}"
-        );
+            let workflow = runner.find_workflow_by_name("multi_step").unwrap();
+            let exec_result = runner
+                .run_workflow(pane_id, workflow, execution_id, 0)
+                .await;
+            assert!(
+                exec_result.is_aborted(),
+                "Workflow should abort: {exec_result:?}"
+            );
 
-        let start_actions = storage
-            .get_action_history(crate::storage::ActionHistoryQuery {
-                actor_id: Some(execution_id.to_string()),
-                action_kind: Some("workflow_start".to_string()),
-                limit: Some(5),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let start = start_actions
-            .first()
-            .expect("workflow_start action missing");
-        assert_eq!(start.undoable, Some(false));
-        assert_eq!(start.undo_strategy.as_deref(), Some("workflow_abort"));
-        assert_eq!(
-            start.undo_hint.as_deref(),
-            Some("workflow no longer running")
-        );
-
-        let aborted = storage
-            .get_action_history(crate::storage::ActionHistoryQuery {
-                actor_id: Some(execution_id.to_string()),
-                action_kind: Some("workflow_aborted".to_string()),
-                limit: Some(5),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(!aborted.is_empty(), "workflow_aborted action missing");
-
-        let steps = storage
-            .get_action_history(crate::storage::ActionHistoryQuery {
-                actor_id: Some(execution_id.to_string()),
-                action_kind: Some("workflow_step".to_string()),
-                limit: Some(10),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(
-            steps.iter().any(|row| {
-                row.input_summary.as_ref().is_some_and(|summary| {
-                    serde_json::from_str::<serde_json::Value>(summary)
-                        .ok()
-                        .and_then(|value| value.get("parent_action_id").and_then(|v| v.as_i64()))
-                        == Some(start.id)
+            let start_actions = storage
+                .get_action_history(crate::storage::ActionHistoryQuery {
+                    actor_id: Some(execution_id.to_string()),
+                    action_kind: Some("workflow_start".to_string()),
+                    limit: Some(5),
+                    ..Default::default()
                 })
-            }),
-            "workflow_step input_summary should include parent_action_id"
-        );
+                .await
+                .unwrap();
+            let start = start_actions
+                .first()
+                .expect("workflow_start action missing");
+            assert_eq!(start.undoable, Some(false));
+            assert_eq!(start.undo_strategy.as_deref(), Some("workflow_abort"));
+            assert_eq!(
+                start.undo_hint.as_deref(),
+                Some("workflow no longer running")
+            );
 
-        storage.shutdown().await.unwrap();
+            let aborted = storage
+                .get_action_history(crate::storage::ActionHistoryQuery {
+                    actor_id: Some(execution_id.to_string()),
+                    action_kind: Some("workflow_aborted".to_string()),
+                    limit: Some(5),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(!aborted.is_empty(), "workflow_aborted action missing");
+
+            let steps = storage
+                .get_action_history(crate::storage::ActionHistoryQuery {
+                    actor_id: Some(execution_id.to_string()),
+                    action_kind: Some("workflow_step".to_string()),
+                    limit: Some(10),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(
+                steps.iter().any(|row| {
+                    row.input_summary.as_ref().is_some_and(|summary| {
+                        serde_json::from_str::<serde_json::Value>(summary)
+                            .ok()
+                            .and_then(|value| {
+                                value.get("parent_action_id").and_then(|v| v.as_i64())
+                            })
+                            == Some(start.id)
+                    })
+                }),
+                "workflow_step input_summary should include parent_action_id"
+            );
+
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -6065,89 +6073,89 @@ steps:
     #[test]
     fn idempotent_step_skip_prevents_double_send() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_idempotent_skip.db")
-            .to_string_lossy()
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_idempotent_skip.db")
+                .to_string_lossy()
+                .to_string();
+
+            let engine = WorkflowEngine::default();
+            let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let wezterm: crate::wezterm::WeztermHandle = Arc::new(
+                crate::wezterm::WeztermClient::with_socket("/tmp/wa-test-nonexistent.sock"),
+            );
+            let injector = Arc::new(crate::runtime_compat::Mutex::new(
+                crate::policy::PolicyGatedInjector::new(
+                    crate::policy::PolicyEngine::permissive(),
+                    wezterm,
+                ),
+            ));
+
+            let runner = WorkflowRunner::new(
+                engine,
+                Arc::clone(&lock_manager),
+                Arc::clone(&storage),
+                injector,
+                WorkflowRunnerConfig::default(),
+            );
+
+            let pane_id = 47u64;
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(IdempotentSendWorkflow));
+
+            let detection = make_test_detection("idempotent_send.test");
+            let start_result = runner.handle_detection(pane_id, &detection, None).await;
+            assert!(start_result.is_started());
+            let execution_id = start_result.execution_id().unwrap();
+
+            let workflow = runner.find_workflow_by_name("idempotent_send").unwrap();
+            let ctx = WorkflowContext::new(
+                Arc::clone(&storage),
+                pane_id,
+                PaneCapabilities::default(),
+                execution_id,
+            );
+            let plan = workflow
+                .to_action_plan(&ctx, execution_id)
+                .expect("plan required");
+            let step = &plan.steps[0];
+
+            let result_data = serde_json::json!({
+                "idempotency_key": step.step_id.0,
+            })
             .to_string();
 
-        let engine = WorkflowEngine::default();
-        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let wezterm: crate::wezterm::WeztermHandle = Arc::new(
-            crate::wezterm::WeztermClient::with_socket("/tmp/wa-test-nonexistent.sock"),
-        );
-        let injector = Arc::new(crate::runtime_compat::Mutex::new(
-            crate::policy::PolicyGatedInjector::new(
-                crate::policy::PolicyEngine::permissive(),
-                wezterm,
-            ),
-        ));
+            storage
+                .insert_step_log(
+                    execution_id,
+                    None,
+                    0,
+                    "send",
+                    Some(step.step_id.0.clone()),
+                    Some(step.action.action_type_name().to_string()),
+                    "continue",
+                    Some(result_data),
+                    None,
+                    None,
+                    None,
+                    now_ms(),
+                    now_ms(),
+                )
+                .await
+                .unwrap();
 
-        let runner = WorkflowRunner::new(
-            engine,
-            Arc::clone(&lock_manager),
-            Arc::clone(&storage),
-            injector,
-            WorkflowRunnerConfig::default(),
-        );
+            let exec_result = runner
+                .run_workflow(pane_id, workflow, execution_id, 0)
+                .await;
 
-        let pane_id = 47u64;
-        create_test_pane(&storage, pane_id).await;
-        runner.register_workflow(Arc::new(IdempotentSendWorkflow));
+            assert!(
+                exec_result.is_completed(),
+                "Workflow should complete when idempotent step is skipped"
+            );
 
-        let detection = make_test_detection("idempotent_send.test");
-        let start_result = runner.handle_detection(pane_id, &detection, None).await;
-        assert!(start_result.is_started());
-        let execution_id = start_result.execution_id().unwrap();
-
-        let workflow = runner.find_workflow_by_name("idempotent_send").unwrap();
-        let ctx = WorkflowContext::new(
-            Arc::clone(&storage),
-            pane_id,
-            PaneCapabilities::default(),
-            execution_id,
-        );
-        let plan = workflow
-            .to_action_plan(&ctx, execution_id)
-            .expect("plan required");
-        let step = &plan.steps[0];
-
-        let result_data = serde_json::json!({
-            "idempotency_key": step.step_id.0,
-        })
-        .to_string();
-
-        storage
-            .insert_step_log(
-                execution_id,
-                None,
-                0,
-                "send",
-                Some(step.step_id.0.clone()),
-                Some(step.action.action_type_name().to_string()),
-                "continue",
-                Some(result_data),
-                None,
-                None,
-                None,
-                now_ms(),
-                now_ms(),
-            )
-            .await
-            .unwrap();
-
-        let exec_result = runner
-            .run_workflow(pane_id, workflow, execution_id, 0)
-            .await;
-
-        assert!(
-            exec_result.is_completed(),
-            "Workflow should complete when idempotent step is skipped"
-        );
-
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -6155,46 +6163,46 @@ steps:
     #[test]
     fn step_logs_record_abort() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_step_logs_abort.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_step_logs_abort.db")
+                .to_string_lossy()
+                .to_string();
 
-        let (runner, storage, _lock_manager) = create_test_runner(&db_path).await;
-        let pane_id = 46u64;
+            let (runner, storage, _lock_manager) = create_test_runner(&db_path).await;
+            let pane_id = 46u64;
 
-        create_test_pane(&storage, pane_id).await;
-        // Workflow that fails at step 2
-        runner.register_workflow(Arc::new(MultiStepWorkflow::failing_at(2)));
+            create_test_pane(&storage, pane_id).await;
+            // Workflow that fails at step 2
+            runner.register_workflow(Arc::new(MultiStepWorkflow::failing_at(2)));
 
-        // Start and run workflow
-        let detection = make_test_detection("multi_step.abort_log_test");
-        let start_result = runner.handle_detection(pane_id, &detection, None).await;
-        assert!(start_result.is_started());
+            // Start and run workflow
+            let detection = make_test_detection("multi_step.abort_log_test");
+            let start_result = runner.handle_detection(pane_id, &detection, None).await;
+            assert!(start_result.is_started());
 
-        let workflow = runner.find_workflow_by_name("multi_step").unwrap();
-        let execution_id = start_result.execution_id().unwrap();
-        let exec_result = runner
-            .run_workflow(pane_id, workflow, execution_id, 0)
-            .await;
+            let workflow = runner.find_workflow_by_name("multi_step").unwrap();
+            let execution_id = start_result.execution_id().unwrap();
+            let exec_result = runner
+                .run_workflow(pane_id, workflow, execution_id, 0)
+                .await;
 
-        assert!(exec_result.is_aborted(), "Workflow should abort");
+            assert!(exec_result.is_aborted(), "Workflow should abort");
 
-        // Verify step logs
-        let step_logs = storage.get_step_logs(execution_id).await.unwrap();
+            // Verify step logs
+            let step_logs = storage.get_step_logs(execution_id).await.unwrap();
 
-        // Should have 3 step logs (steps 0, 1, 2 where 2 aborts)
-        assert_eq!(step_logs.len(), 3, "Should have 3 step log entries");
+            // Should have 3 step logs (steps 0, 1, 2 where 2 aborts)
+            assert_eq!(step_logs.len(), 3, "Should have 3 step log entries");
 
-        // Steps 0 and 1 should be "continue"
-        assert_eq!(step_logs[0].result_type, "continue");
-        assert_eq!(step_logs[1].result_type, "continue");
-        // Step 2 should be "abort"
-        assert_eq!(step_logs[2].result_type, "abort");
+            // Steps 0 and 1 should be "continue"
+            assert_eq!(step_logs[0].result_type, "continue");
+            assert_eq!(step_logs[1].result_type, "continue");
+            // Step 2 should be "abort"
+            assert_eq!(step_logs[2].result_type, "abort");
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -6206,73 +6214,73 @@ steps:
     #[test]
     fn engine_resume_finds_correct_step() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_resume.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_resume.db")
+                .to_string_lossy()
+                .to_string();
 
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let engine = WorkflowEngine::new(3);
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let engine = WorkflowEngine::new(3);
 
-        // Create a test pane
-        create_test_pane(&storage, 50).await;
+            // Create a test pane
+            create_test_pane(&storage, 50).await;
 
-        // Start a workflow
-        let execution = engine
-            .start(&storage, "test_workflow", 50, None, None)
-            .await
-            .unwrap();
+            // Start a workflow
+            let execution = engine
+                .start(&storage, "test_workflow", 50, None, None)
+                .await
+                .unwrap();
 
-        // Manually insert step logs to simulate partial execution
-        // Steps 0 and 1 completed, step 2 was in progress
-        storage
-            .insert_step_log(
-                &execution.id,
-                None,
-                0,
-                "step_0",
-                None,
-                None,
-                "continue",
-                None,
-                None,
-                None,
-                None,
-                1000,
-                1100,
-            )
-            .await
-            .unwrap();
-        storage
-            .insert_step_log(
-                &execution.id,
-                None,
-                1,
-                "step_1",
-                None,
-                None,
-                "continue",
-                None,
-                None,
-                None,
-                None,
-                1100,
-                1200,
-            )
-            .await
-            .unwrap();
+            // Manually insert step logs to simulate partial execution
+            // Steps 0 and 1 completed, step 2 was in progress
+            storage
+                .insert_step_log(
+                    &execution.id,
+                    None,
+                    0,
+                    "step_0",
+                    None,
+                    None,
+                    "continue",
+                    None,
+                    None,
+                    None,
+                    None,
+                    1000,
+                    1100,
+                )
+                .await
+                .unwrap();
+            storage
+                .insert_step_log(
+                    &execution.id,
+                    None,
+                    1,
+                    "step_1",
+                    None,
+                    None,
+                    "continue",
+                    None,
+                    None,
+                    None,
+                    None,
+                    1100,
+                    1200,
+                )
+                .await
+                .unwrap();
 
-        // Resume should find next step is 2
-        let resume_result = engine.resume(&storage, &execution.id).await.unwrap();
-        assert!(resume_result.is_some(), "Should find incomplete workflow");
+            // Resume should find next step is 2
+            let resume_result = engine.resume(&storage, &execution.id).await.unwrap();
+            assert!(resume_result.is_some(), "Should find incomplete workflow");
 
-        let (resumed_exec, next_step) = resume_result.unwrap();
-        assert_eq!(resumed_exec.id, execution.id);
-        assert_eq!(next_step, 2, "Next step should be 2 (after steps 0, 1)");
+            let (resumed_exec, next_step) = resume_result.unwrap();
+            assert_eq!(resumed_exec.id, execution.id);
+            assert_eq!(next_step, 2, "Next step should be 2 (after steps 0, 1)");
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -6280,74 +6288,74 @@ steps:
     #[test]
     fn find_incomplete_workflows_returns_running_and_waiting() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_find_incomplete.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_find_incomplete.db")
+                .to_string_lossy()
+                .to_string();
 
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let engine = WorkflowEngine::new(3);
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let engine = WorkflowEngine::new(3);
 
-        // Create test panes
-        create_test_pane(&storage, 51).await;
-        create_test_pane(&storage, 52).await;
-        create_test_pane(&storage, 53).await;
+            // Create test panes
+            create_test_pane(&storage, 51).await;
+            create_test_pane(&storage, 52).await;
+            create_test_pane(&storage, 53).await;
 
-        // Start multiple workflows in different states
-        let exec1 = engine
-            .start(&storage, "workflow_1", 51, None, None)
-            .await
-            .unwrap();
-        let exec2 = engine
-            .start(&storage, "workflow_2", 52, None, None)
-            .await
-            .unwrap();
-        let exec3 = engine
-            .start(&storage, "workflow_3", 53, None, None)
-            .await
-            .unwrap();
+            // Start multiple workflows in different states
+            let exec1 = engine
+                .start(&storage, "workflow_1", 51, None, None)
+                .await
+                .unwrap();
+            let exec2 = engine
+                .start(&storage, "workflow_2", 52, None, None)
+                .await
+                .unwrap();
+            let exec3 = engine
+                .start(&storage, "workflow_3", 53, None, None)
+                .await
+                .unwrap();
 
-        // Mark exec2 as waiting
-        engine
-            .update_status(
-                &storage,
-                &exec2.id,
-                ExecutionStatus::Waiting,
-                1,
-                Some(&WaitCondition::pane_idle(1000)),
-                None,
-            )
-            .await
-            .unwrap();
+            // Mark exec2 as waiting
+            engine
+                .update_status(
+                    &storage,
+                    &exec2.id,
+                    ExecutionStatus::Waiting,
+                    1,
+                    Some(&WaitCondition::pane_idle(1000)),
+                    None,
+                )
+                .await
+                .unwrap();
 
-        // Mark exec3 as completed (should not be returned)
-        engine
-            .update_status(
-                &storage,
-                &exec3.id,
-                ExecutionStatus::Completed,
-                2,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+            // Mark exec3 as completed (should not be returned)
+            engine
+                .update_status(
+                    &storage,
+                    &exec3.id,
+                    ExecutionStatus::Completed,
+                    2,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
 
-        // Find incomplete workflows
-        let incomplete = storage.find_incomplete_workflows().await.unwrap();
+            // Find incomplete workflows
+            let incomplete = storage.find_incomplete_workflows().await.unwrap();
 
-        // Should find exec1 (running) and exec2 (waiting), not exec3 (completed)
-        assert_eq!(incomplete.len(), 2, "Should find 2 incomplete workflows");
+            // Should find exec1 (running) and exec2 (waiting), not exec3 (completed)
+            assert_eq!(incomplete.len(), 2, "Should find 2 incomplete workflows");
 
-        let incomplete_ids: std::collections::HashSet<_> =
-            incomplete.iter().map(|w| w.id.as_str()).collect();
-        assert!(incomplete_ids.contains(exec1.id.as_str()));
-        assert!(incomplete_ids.contains(exec2.id.as_str()));
-        assert!(!incomplete_ids.contains(exec3.id.as_str()));
+            let incomplete_ids: std::collections::HashSet<_> =
+                incomplete.iter().map(|w| w.id.as_str()).collect();
+            assert!(incomplete_ids.contains(exec1.id.as_str()));
+            assert!(incomplete_ids.contains(exec2.id.as_str()));
+            assert!(!incomplete_ids.contains(exec3.id.as_str()));
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -6355,88 +6363,88 @@ steps:
     #[test]
     fn resume_incomplete_resumes_from_last_step() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_resume_incomplete.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_resume_incomplete.db")
+                .to_string_lossy()
+                .to_string();
 
-        let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
-        let pane_id = 54u64;
+            let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
+            let pane_id = 54u64;
 
-        create_test_pane(&storage, pane_id).await;
-        runner.register_workflow(Arc::new(MultiStepWorkflow::new()));
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(MultiStepWorkflow::new()));
 
-        // Start workflow and simulate partial execution
-        let detection = make_test_detection("multi_step.resume_test");
-        let start_result = runner.handle_detection(pane_id, &detection, None).await;
-        assert!(start_result.is_started());
-        let execution_id = start_result.execution_id().unwrap().to_string();
+            // Start workflow and simulate partial execution
+            let detection = make_test_detection("multi_step.resume_test");
+            let start_result = runner.handle_detection(pane_id, &detection, None).await;
+            assert!(start_result.is_started());
+            let execution_id = start_result.execution_id().unwrap().to_string();
 
-        // Insert step logs for steps 0 and 1 (completed)
-        storage
-            .insert_step_log(
-                &execution_id,
-                None,
-                0,
-                "step_0",
-                None,
-                None,
-                "continue",
-                None,
-                None,
-                None,
-                None,
-                1000,
-                1100,
-            )
-            .await
-            .unwrap();
-        storage
-            .insert_step_log(
-                &execution_id,
-                None,
-                1,
-                "step_1",
-                None,
-                None,
-                "continue",
-                None,
-                None,
-                None,
-                None,
-                1100,
-                1200,
-            )
-            .await
-            .unwrap();
+            // Insert step logs for steps 0 and 1 (completed)
+            storage
+                .insert_step_log(
+                    &execution_id,
+                    None,
+                    0,
+                    "step_0",
+                    None,
+                    None,
+                    "continue",
+                    None,
+                    None,
+                    None,
+                    None,
+                    1000,
+                    1100,
+                )
+                .await
+                .unwrap();
+            storage
+                .insert_step_log(
+                    &execution_id,
+                    None,
+                    1,
+                    "step_1",
+                    None,
+                    None,
+                    "continue",
+                    None,
+                    None,
+                    None,
+                    None,
+                    1100,
+                    1200,
+                )
+                .await
+                .unwrap();
 
-        // Release the lock to simulate a restart scenario
-        lock_manager.force_release(pane_id);
+            // Release the lock to simulate a restart scenario
+            lock_manager.force_release(pane_id);
 
-        // Call resume_incomplete
-        let results = runner.resume_incomplete().await;
+            // Call resume_incomplete
+            let results = runner.resume_incomplete().await;
 
-        // Should have resumed and completed the workflow
-        assert_eq!(results.len(), 1, "Should resume 1 workflow");
-        assert!(
-            results[0].is_completed(),
-            "Resumed workflow should complete"
-        );
+            // Should have resumed and completed the workflow
+            assert_eq!(results.len(), 1, "Should resume 1 workflow");
+            assert!(
+                results[0].is_completed(),
+                "Resumed workflow should complete"
+            );
 
-        // Verify step logs show resumed execution (steps 2 and 3)
-        let step_logs = storage.get_step_logs(&execution_id).await.unwrap();
+            // Verify step logs show resumed execution (steps 2 and 3)
+            let step_logs = storage.get_step_logs(&execution_id).await.unwrap();
 
-        // Should have 4 step logs total now
-        assert_eq!(step_logs.len(), 4, "Should have 4 step logs after resume");
+            // Should have 4 step logs total now
+            assert_eq!(step_logs.len(), 4, "Should have 4 step logs after resume");
 
-        // Steps 0, 1 were from before, steps 2, 3 from resume
-        assert_eq!(step_logs[2].step_index, 2);
-        assert_eq!(step_logs[3].step_index, 3);
-        assert_eq!(step_logs[3].result_type, "done");
+            // Steps 0, 1 were from before, steps 2, 3 from resume
+            assert_eq!(step_logs[2].step_index, 2);
+            assert_eq!(step_logs[3].step_index, 3);
+            assert_eq!(step_logs[3].result_type, "done");
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -6444,52 +6452,52 @@ steps:
     #[test]
     fn aborted_workflows_not_resumed() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir
-            .path()
-            .join("test_aborted_not_resumed.db")
-            .to_string_lossy()
-            .to_string();
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_aborted_not_resumed.db")
+                .to_string_lossy()
+                .to_string();
 
-        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-        let engine = WorkflowEngine::new(3);
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+            let engine = WorkflowEngine::new(3);
 
-        // Create test pane
-        create_test_pane(&storage, 55).await;
+            // Create test pane
+            create_test_pane(&storage, 55).await;
 
-        // Start a workflow and mark it aborted
-        let execution = engine
-            .start(&storage, "test_workflow", 55, None, None)
-            .await
-            .unwrap();
+            // Start a workflow and mark it aborted
+            let execution = engine
+                .start(&storage, "test_workflow", 55, None, None)
+                .await
+                .unwrap();
 
-        engine
-            .update_status(
-                &storage,
-                &execution.id,
-                ExecutionStatus::Aborted,
-                1,
-                None,
-                Some("Test abort"),
-            )
-            .await
-            .unwrap();
+            engine
+                .update_status(
+                    &storage,
+                    &execution.id,
+                    ExecutionStatus::Aborted,
+                    1,
+                    None,
+                    Some("Test abort"),
+                )
+                .await
+                .unwrap();
 
-        // Find incomplete - should not include aborted workflow
-        let incomplete = storage.find_incomplete_workflows().await.unwrap();
-        assert!(
-            incomplete.is_empty(),
-            "Aborted workflow should not be in incomplete list"
-        );
+            // Find incomplete - should not include aborted workflow
+            let incomplete = storage.find_incomplete_workflows().await.unwrap();
+            assert!(
+                incomplete.is_empty(),
+                "Aborted workflow should not be in incomplete list"
+            );
 
-        // Resume should return None
-        let resume_result = engine.resume(&storage, &execution.id).await.unwrap();
-        assert!(
-            resume_result.is_none(),
-            "Aborted workflow should not be resumable"
-        );
+            // Resume should return None
+            let resume_result = engine.resume(&storage, &execution.id).await.unwrap();
+            assert!(
+                resume_result.is_none(),
+                "Aborted workflow should not be resumable"
+            );
 
-        storage.shutdown().await.unwrap();
+            storage.shutdown().await.unwrap();
         });
     }
 
@@ -6550,129 +6558,129 @@ steps:
     #[test]
     fn codex_exit_sends_one_ctrl_c_when_summary_present() {
         run_async_test(async {
-        let source = TestTextSource::new(vec![
-            "Token usage: total=10 input=5 (+ 0 cached) output=5\nTo resume, run: codex resume 123e4567-e89b-12d3-a456-426614174000",
-        ]);
-        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter_clone = Arc::clone(&counter);
-        let send_ctrl_c = move || {
-            let counter = Arc::clone(&counter_clone);
-            async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(allowed_ctrl_c_result())
-            }
-        };
+            let source = TestTextSource::new(vec![
+                "Token usage: total=10 input=5 (+ 0 cached) output=5\nTo resume, run: codex resume 123e4567-e89b-12d3-a456-426614174000",
+            ]);
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter_clone = Arc::clone(&counter);
+            let send_ctrl_c = move || {
+                let counter = Arc::clone(&counter_clone);
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(allowed_ctrl_c_result())
+                }
+            };
 
-        let options = CodexExitOptions {
-            grace_timeout_ms: 0,
-            summary_timeout_ms: 0,
-            wait_options: wait_options_single_poll(),
-        };
+            let options = CodexExitOptions {
+                grace_timeout_ms: 0,
+                summary_timeout_ms: 0,
+                wait_options: wait_options_single_poll(),
+            };
 
-        let result = codex_exit_and_wait_for_summary(1, &source, send_ctrl_c, &options)
-            .await
-            .expect("exit should succeed");
+            let result = codex_exit_and_wait_for_summary(1, &source, send_ctrl_c, &options)
+                .await
+                .expect("exit should succeed");
 
-        assert_eq!(result.ctrl_c_count, 1);
-        assert!(result.summary.matched);
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(result.ctrl_c_count, 1);
+            assert!(result.summary.matched);
+            assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
         });
     }
 
     #[test]
     fn codex_exit_sends_second_ctrl_c_when_grace_times_out() {
         run_async_test(async {
-        let source = TestTextSource::new(vec![
-            "still running...",
-            "Token usage: total=10 input=5 (+ 0 cached) output=5\nTo resume, run: codex resume 123e4567-e89b-12d3-a456-426614174000",
-        ]);
-        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter_clone = Arc::clone(&counter);
-        let send_ctrl_c = move || {
-            let counter = Arc::clone(&counter_clone);
-            async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(allowed_ctrl_c_result())
-            }
-        };
+            let source = TestTextSource::new(vec![
+                "still running...",
+                "Token usage: total=10 input=5 (+ 0 cached) output=5\nTo resume, run: codex resume 123e4567-e89b-12d3-a456-426614174000",
+            ]);
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter_clone = Arc::clone(&counter);
+            let send_ctrl_c = move || {
+                let counter = Arc::clone(&counter_clone);
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(allowed_ctrl_c_result())
+                }
+            };
 
-        let options = CodexExitOptions {
-            grace_timeout_ms: 0,
-            summary_timeout_ms: 0,
-            wait_options: wait_options_single_poll(),
-        };
+            let options = CodexExitOptions {
+                grace_timeout_ms: 0,
+                summary_timeout_ms: 0,
+                wait_options: wait_options_single_poll(),
+            };
 
-        let result = codex_exit_and_wait_for_summary(1, &source, send_ctrl_c, &options)
-            .await
-            .expect("exit should succeed");
+            let result = codex_exit_and_wait_for_summary(1, &source, send_ctrl_c, &options)
+                .await
+                .expect("exit should succeed");
 
-        assert_eq!(result.ctrl_c_count, 2);
-        assert!(result.summary.matched);
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(result.ctrl_c_count, 2);
+            assert!(result.summary.matched);
+            assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
         });
     }
 
     #[test]
     fn codex_exit_errors_when_summary_never_appears() {
         run_async_test(async {
-        let source = TestTextSource::new(vec!["no summary", "still no summary"]);
-        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter_clone = Arc::clone(&counter);
-        let send_ctrl_c = move || {
-            let counter = Arc::clone(&counter_clone);
-            async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(allowed_ctrl_c_result())
-            }
-        };
+            let source = TestTextSource::new(vec!["no summary", "still no summary"]);
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter_clone = Arc::clone(&counter);
+            let send_ctrl_c = move || {
+                let counter = Arc::clone(&counter_clone);
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(allowed_ctrl_c_result())
+                }
+            };
 
-        let options = CodexExitOptions {
-            grace_timeout_ms: 0,
-            summary_timeout_ms: 0,
-            wait_options: wait_options_single_poll(),
-        };
+            let options = CodexExitOptions {
+                grace_timeout_ms: 0,
+                summary_timeout_ms: 0,
+                wait_options: wait_options_single_poll(),
+            };
 
-        let err = codex_exit_and_wait_for_summary(1, &source, send_ctrl_c, &options)
-            .await
-            .expect_err("expected failure");
-        assert!(err.contains("Session summary not found"));
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let err = codex_exit_and_wait_for_summary(1, &source, send_ctrl_c, &options)
+                .await
+                .expect_err("expected failure");
+            assert!(err.contains("Session summary not found"));
+            assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
         });
     }
 
     #[test]
     fn codex_exit_aborts_on_policy_denial() {
         run_async_test(async {
-        let source = TestTextSource::new(vec![
-            "Token usage: total=1 input=1 (+ 0 cached) output=0 codex resume 123e4567-e89b-12d3-a456-426614174000",
-        ]);
-        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter_clone = Arc::clone(&counter);
-        let send_ctrl_c = move || {
-            let counter = Arc::clone(&counter_clone);
-            async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(InjectionResult::Denied {
-                    decision: crate::policy::PolicyDecision::deny("blocked"),
-                    summary: "ctrl-c".to_string(),
-                    pane_id: 1,
-                    action: crate::policy::ActionKind::SendCtrlC,
-                    audit_action_id: None,
-                })
-            }
-        };
+            let source = TestTextSource::new(vec![
+                "Token usage: total=1 input=1 (+ 0 cached) output=0 codex resume 123e4567-e89b-12d3-a456-426614174000",
+            ]);
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter_clone = Arc::clone(&counter);
+            let send_ctrl_c = move || {
+                let counter = Arc::clone(&counter_clone);
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(InjectionResult::Denied {
+                        decision: crate::policy::PolicyDecision::deny("blocked"),
+                        summary: "ctrl-c".to_string(),
+                        pane_id: 1,
+                        action: crate::policy::ActionKind::SendCtrlC,
+                        audit_action_id: None,
+                    })
+                }
+            };
 
-        let options = CodexExitOptions {
-            grace_timeout_ms: 0,
-            summary_timeout_ms: 0,
-            wait_options: wait_options_single_poll(),
-        };
+            let options = CodexExitOptions {
+                grace_timeout_ms: 0,
+                summary_timeout_ms: 0,
+                wait_options: wait_options_single_poll(),
+            };
 
-        let err = codex_exit_and_wait_for_summary(1, &source, send_ctrl_c, &options)
-            .await
-            .expect_err("expected denial");
-        assert!(err.contains("denied"));
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let err = codex_exit_and_wait_for_summary(1, &source, send_ctrl_c, &options)
+                .await
+                .expect_err("expected denial");
+            assert!(err.contains("denied"));
+            assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
         });
     }
 
@@ -7191,138 +7199,138 @@ Try again at 3:00 PM UTC.
     #[test]
     fn handle_session_end_persist_roundtrip() {
         run_async_test(async {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::SeqCst);
-        let db_path =
-            std::env::temp_dir().join(format!("wa_test_session_end_{}_{n}.db", std::process::id()));
-        let db = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
-            .await
-            .expect("temp DB");
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::SeqCst);
+            let db_path = std::env::temp_dir()
+                .join(format!("wa_test_session_end_{}_{n}.db", std::process::id()));
+            let db = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("temp DB");
 
-        // Insert a pane record first (FK constraint)
-        let pane = crate::storage::PaneRecord {
-            pane_id: 77,
-            pane_uuid: None,
-            domain: "local".to_string(),
-            window_id: None,
-            tab_id: None,
-            title: None,
-            cwd: None,
-            tty_name: None,
-            first_seen_at: now_ms(),
-            last_seen_at: now_ms(),
-            observed: true,
-            ignore_reason: None,
-            last_decision_at: None,
-        };
-        db.upsert_pane(pane).await.expect("insert pane");
+            // Insert a pane record first (FK constraint)
+            let pane = crate::storage::PaneRecord {
+                pane_id: 77,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: now_ms(),
+                last_seen_at: now_ms(),
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            db.upsert_pane(pane).await.expect("insert pane");
 
-        let trigger = serde_json::json!({
-            "agent_type": "codex",
-            "event_type": "session.summary",
-            "extracted": {
-                "total": "5000",
-                "input": "3000",
-                "output": "2000",
-                "session_id": "abc-def-123",
-            }
-        });
-        let record = HandleSessionEnd::record_from_detection(77, &trigger);
-        let db_id = db.upsert_agent_session(record).await.expect("upsert");
-        assert!(db_id > 0);
+            let trigger = serde_json::json!({
+                "agent_type": "codex",
+                "event_type": "session.summary",
+                "extracted": {
+                    "total": "5000",
+                    "input": "3000",
+                    "output": "2000",
+                    "session_id": "abc-def-123",
+                }
+            });
+            let record = HandleSessionEnd::record_from_detection(77, &trigger);
+            let db_id = db.upsert_agent_session(record).await.expect("upsert");
+            assert!(db_id > 0);
 
-        // Query back by DB id
-        let session = db
-            .get_agent_session(db_id)
-            .await
-            .expect("query")
-            .expect("session should exist");
-        assert_eq!(session.agent_type, "codex");
-        assert_eq!(session.session_id.as_deref(), Some("abc-def-123"));
-        assert_eq!(session.total_tokens, Some(5000));
-        assert_eq!(session.input_tokens, Some(3000));
-        assert_eq!(session.output_tokens, Some(2000));
-        assert!(session.ended_at.is_some());
-        assert_eq!(session.end_reason.as_deref(), Some("completed"));
+            // Query back by DB id
+            let session = db
+                .get_agent_session(db_id)
+                .await
+                .expect("query")
+                .expect("session should exist");
+            assert_eq!(session.agent_type, "codex");
+            assert_eq!(session.session_id.as_deref(), Some("abc-def-123"));
+            assert_eq!(session.total_tokens, Some(5000));
+            assert_eq!(session.input_tokens, Some(3000));
+            assert_eq!(session.output_tokens, Some(2000));
+            assert!(session.ended_at.is_some());
+            assert_eq!(session.end_reason.as_deref(), Some("completed"));
         });
     }
 
     #[test]
     fn persist_caut_refresh_accounts_records_metrics() {
         run_async_test(async {
-        use std::collections::HashMap;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::SeqCst);
-        let db_path = std::env::temp_dir().join(format!(
-            "wa_test_caut_metrics_{}_{}_{n}.db",
-            std::process::id(),
-            line!()
-        ));
-        let storage = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+            use std::collections::HashMap;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::SeqCst);
+            let db_path = std::env::temp_dir().join(format!(
+                "wa_test_caut_metrics_{}_{}_{n}.db",
+                std::process::id(),
+                line!()
+            ));
+            let storage = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("temp DB");
+
+            let refresh = crate::caut::CautRefresh {
+                service: Some("openai".to_string()),
+                refreshed_at: Some("2026-02-06T00:00:00Z".to_string()),
+                accounts: vec![
+                    crate::caut::CautAccountUsage {
+                        id: Some("acct-1".to_string()),
+                        name: Some("Account 1".to_string()),
+                        percent_remaining: Some(42.0),
+                        limit_hours: None,
+                        reset_at: Some("2026-02-06T01:00:00Z".to_string()),
+                        tokens_used: Some(1000),
+                        tokens_remaining: Some(2000),
+                        tokens_limit: Some(3000),
+                        extra: HashMap::new(),
+                    },
+                    crate::caut::CautAccountUsage {
+                        id: Some("acct-2".to_string()),
+                        name: Some("Account 2".to_string()),
+                        percent_remaining: Some(7.0),
+                        limit_hours: None,
+                        reset_at: None,
+                        tokens_used: Some(10),
+                        tokens_remaining: Some(20),
+                        tokens_limit: Some(30),
+                        extra: HashMap::new(),
+                    },
+                ],
+                extra: HashMap::new(),
+            };
+
+            let now = 10_000_i64;
+            let refreshed = super::persist_caut_refresh_accounts(
+                &storage,
+                crate::caut::CautService::OpenAI,
+                &refresh,
+                now,
+            )
             .await
-            .expect("temp DB");
+            .expect("persist refresh");
+            assert_eq!(refreshed, 2);
 
-        let refresh = crate::caut::CautRefresh {
-            service: Some("openai".to_string()),
-            refreshed_at: Some("2026-02-06T00:00:00Z".to_string()),
-            accounts: vec![
-                crate::caut::CautAccountUsage {
-                    id: Some("acct-1".to_string()),
-                    name: Some("Account 1".to_string()),
-                    percent_remaining: Some(42.0),
-                    limit_hours: None,
-                    reset_at: Some("2026-02-06T01:00:00Z".to_string()),
-                    tokens_used: Some(1000),
-                    tokens_remaining: Some(2000),
-                    tokens_limit: Some(3000),
-                    extra: HashMap::new(),
-                },
-                crate::caut::CautAccountUsage {
-                    id: Some("acct-2".to_string()),
-                    name: Some("Account 2".to_string()),
-                    percent_remaining: Some(7.0),
-                    limit_hours: None,
-                    reset_at: None,
-                    tokens_used: Some(10),
-                    tokens_remaining: Some(20),
-                    tokens_limit: Some(30),
-                    extra: HashMap::new(),
-                },
-            ],
-            extra: HashMap::new(),
-        };
+            // Query by account_id to avoid relying on agent_type filtering (we store agent_type=None here).
+            let acct1 = storage
+                .query_usage_metrics(crate::storage::MetricQuery {
+                    metric_type: Some(crate::storage::MetricType::TokenUsage),
+                    agent_type: None,
+                    account_id: Some("acct-1".to_string()),
+                    since: Some(0),
+                    until: None,
+                    limit: Some(10),
+                })
+                .await
+                .expect("query metrics");
+            assert_eq!(acct1.len(), 1);
+            assert_eq!(acct1[0].tokens, Some(1000));
+            assert_eq!(acct1[0].amount, None);
 
-        let now = 10_000_i64;
-        let refreshed = super::persist_caut_refresh_accounts(
-            &storage,
-            crate::caut::CautService::OpenAI,
-            &refresh,
-            now,
-        )
-        .await
-        .expect("persist refresh");
-        assert_eq!(refreshed, 2);
-
-        // Query by account_id to avoid relying on agent_type filtering (we store agent_type=None here).
-        let acct1 = storage
-            .query_usage_metrics(crate::storage::MetricQuery {
-                metric_type: Some(crate::storage::MetricType::TokenUsage),
-                agent_type: None,
-                account_id: Some("acct-1".to_string()),
-                since: Some(0),
-                until: None,
-                limit: Some(10),
-            })
-            .await
-            .expect("query metrics");
-        assert_eq!(acct1.len(), 1);
-        assert_eq!(acct1[0].tokens, Some(1000));
-        assert_eq!(acct1[0].amount, None);
-
-        storage.shutdown().await.expect("shutdown");
-        let _ = std::fs::remove_file(&db_path);
+            storage.shutdown().await.expect("shutdown");
+            let _ = std::fs::remove_file(&db_path);
         });
     }
 
@@ -7374,137 +7382,137 @@ Try again at 3:00 PM UTC.
     #[test]
     fn handle_process_triage_lifecycle_step0_aborts_on_alt_screen() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("triage_lifecycle_alt_screen.db");
-        let storage = Arc::new(
-            crate::storage::StorageHandle::new(&db_path.to_string_lossy())
-                .await
-                .expect("storage"),
-        );
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir.path().join("triage_lifecycle_alt_screen.db");
+            let storage = Arc::new(
+                crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                    .await
+                    .expect("storage"),
+            );
 
-        let mut caps = PaneCapabilities::default();
-        caps.alt_screen = Some(true);
-        let mut ctx = WorkflowContext::new(storage, 7, caps, "exec-triage-alt");
+            let mut caps = PaneCapabilities::default();
+            caps.alt_screen = Some(true);
+            let mut ctx = WorkflowContext::new(storage, 7, caps, "exec-triage-alt");
 
-        let wf = HandleProcessTriageLifecycle::new();
-        let result = wf.execute_step(&mut ctx, 0).await;
-        match result {
-            StepResult::Abort { reason } => {
-                assert!(reason.contains("alt-screen"), "unexpected reason: {reason}");
+            let wf = HandleProcessTriageLifecycle::new();
+            let result = wf.execute_step(&mut ctx, 0).await;
+            match result {
+                StepResult::Abort { reason } => {
+                    assert!(reason.contains("alt-screen"), "unexpected reason: {reason}");
+                }
+                other => panic!("expected abort, got {other:?}"),
             }
-            other => panic!("expected abort, got {other:?}"),
-        }
         });
     }
 
     #[test]
     fn handle_process_triage_lifecycle_step2_aborts_on_protected_destructive_action() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("triage_lifecycle_protected_abort.db");
-        let storage = Arc::new(
-            crate::storage::StorageHandle::new(&db_path.to_string_lossy())
-                .await
-                .expect("storage"),
-        );
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir.path().join("triage_lifecycle_protected_abort.db");
+            let storage = Arc::new(
+                crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                    .await
+                    .expect("storage"),
+            );
 
-        let trigger = serde_json::json!({
-            "process_triage": {
-                "plan": {
-                    "entries": [
-                        {
-                            "category": "system_process",
-                            "action": { "action": "force_kill" }
-                        }
-                    ],
-                    "auto_safe_count": 0,
-                    "review_count": 0,
-                    "protected_count": 1
+            let trigger = serde_json::json!({
+                "process_triage": {
+                    "plan": {
+                        "entries": [
+                            {
+                                "category": "system_process",
+                                "action": { "action": "force_kill" }
+                            }
+                        ],
+                        "auto_safe_count": 0,
+                        "review_count": 0,
+                        "protected_count": 1
+                    }
                 }
-            }
-        });
+            });
 
-        let mut ctx = WorkflowContext::new(
-            storage,
-            9,
-            PaneCapabilities::default(),
-            "exec-triage-protected",
-        )
-        .with_trigger(trigger);
+            let mut ctx = WorkflowContext::new(
+                storage,
+                9,
+                PaneCapabilities::default(),
+                "exec-triage-protected",
+            )
+            .with_trigger(trigger);
 
-        let wf = HandleProcessTriageLifecycle::new();
-        let result = wf.execute_step(&mut ctx, 2).await;
-        match result {
-            StepResult::Abort { reason } => {
-                assert!(
-                    reason.contains("protected category includes destructive action"),
-                    "unexpected reason: {reason}"
-                );
+            let wf = HandleProcessTriageLifecycle::new();
+            let result = wf.execute_step(&mut ctx, 2).await;
+            match result {
+                StepResult::Abort { reason } => {
+                    assert!(
+                        reason.contains("protected category includes destructive action"),
+                        "unexpected reason: {reason}"
+                    );
+                }
+                other => panic!("expected abort, got {other:?}"),
             }
-            other => panic!("expected abort, got {other:?}"),
-        }
         });
     }
 
     #[test]
     fn handle_process_triage_lifecycle_session_step_emits_all_artifacts() {
         run_async_test(async {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("triage_lifecycle_session.db");
-        let storage = Arc::new(
-            crate::storage::StorageHandle::new(&db_path.to_string_lossy())
-                .await
-                .expect("storage"),
-        );
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir.path().join("triage_lifecycle_session.db");
+            let storage = Arc::new(
+                crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                    .await
+                    .expect("storage"),
+            );
 
-        let trigger = serde_json::json!({
-            "process_triage": {
-                "ft_session_id": "ft-abc",
-                "pt_session_id": "pt-xyz",
-                "provider": "pt_cli",
-                "plan": {
-                    "entries": [
-                        {
-                            "category": "stuck_cli",
-                            "action": { "action": "graceful_kill" }
-                        },
-                        {
-                            "category": "active_agent",
-                            "action": { "action": "protect" }
-                        }
-                    ],
-                    "auto_safe_count": 1,
-                    "review_count": 0,
-                    "protected_count": 1
+            let trigger = serde_json::json!({
+                "process_triage": {
+                    "ft_session_id": "ft-abc",
+                    "pt_session_id": "pt-xyz",
+                    "provider": "pt_cli",
+                    "plan": {
+                        "entries": [
+                            {
+                                "category": "stuck_cli",
+                                "action": { "action": "graceful_kill" }
+                            },
+                            {
+                                "category": "active_agent",
+                                "action": { "action": "protect" }
+                            }
+                        ],
+                        "auto_safe_count": 1,
+                        "review_count": 0,
+                        "protected_count": 1
+                    }
                 }
-            }
-        });
+            });
 
-        let mut ctx = WorkflowContext::new(
-            storage,
-            42,
-            PaneCapabilities::default(),
-            "exec-triage-session",
-        )
-        .with_trigger(trigger);
-        let wf = HandleProcessTriageLifecycle::new();
-        let result = wf.execute_step(&mut ctx, 5).await;
+            let mut ctx = WorkflowContext::new(
+                storage,
+                42,
+                PaneCapabilities::default(),
+                "exec-triage-session",
+            )
+            .with_trigger(trigger);
+            let wf = HandleProcessTriageLifecycle::new();
+            let result = wf.execute_step(&mut ctx, 5).await;
 
-        match result {
-            StepResult::Done { result } => {
-                assert_eq!(result["status"], "completed");
-                assert_eq!(result["workflow"], "handle_process_triage_lifecycle");
-                assert!(result["snapshot"].is_object());
-                assert!(result["plan"].is_object());
-                assert!(result["apply"].is_object());
-                assert!(result["verify"].is_object());
-                assert!(result["diff"].is_object());
-                assert_eq!(result["session"]["ft_session_id"], "ft-abc");
-                assert_eq!(result["session"]["pt_session_id"], "pt-xyz");
-                assert_eq!(result["session"]["provider"], "pt_cli");
+            match result {
+                StepResult::Done { result } => {
+                    assert_eq!(result["status"], "completed");
+                    assert_eq!(result["workflow"], "handle_process_triage_lifecycle");
+                    assert!(result["snapshot"].is_object());
+                    assert!(result["plan"].is_object());
+                    assert!(result["apply"].is_object());
+                    assert!(result["verify"].is_object());
+                    assert!(result["diff"].is_object());
+                    assert_eq!(result["session"]["ft_session_id"], "ft-abc");
+                    assert_eq!(result["session"]["pt_session_id"], "pt-xyz");
+                    assert_eq!(result["session"]["provider"], "pt_cli");
+                }
+                other => panic!("expected done, got {other:?}"),
             }
-            other => panic!("expected done, got {other:?}"),
-        }
         });
     }
 
@@ -7701,134 +7709,134 @@ Try again at 3:00 PM UTC.
     #[test]
     fn handle_auth_required_audit_roundtrip() {
         run_async_test(async {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::SeqCst);
-        let db_path =
-            std::env::temp_dir().join(format!("wa_test_auth_req_{}_{n}.db", std::process::id()));
-        let db = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
-            .await
-            .expect("temp DB");
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::SeqCst);
+            let db_path = std::env::temp_dir()
+                .join(format!("wa_test_auth_req_{}_{n}.db", std::process::id()));
+            let db = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("temp DB");
 
-        // Insert pane record
-        let pane = crate::storage::PaneRecord {
-            pane_id: 88,
-            pane_uuid: None,
-            domain: "local".to_string(),
-            window_id: None,
-            tab_id: None,
-            title: None,
-            cwd: None,
-            tty_name: None,
-            first_seen_at: now_ms(),
-            last_seen_at: now_ms(),
-            observed: true,
-            ignore_reason: None,
-            last_decision_at: None,
-        };
-        db.upsert_pane(pane).await.expect("insert pane");
+            // Insert pane record
+            let pane = crate::storage::PaneRecord {
+                pane_id: 88,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: now_ms(),
+                last_seen_at: now_ms(),
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            db.upsert_pane(pane).await.expect("insert pane");
 
-        // Record an auth event
-        let audit = crate::storage::AuditActionRecord {
-            id: 0,
-            ts: now_ms(),
-            actor_kind: "workflow".to_string(),
-            actor_id: Some("test-exec-1".to_string()),
-            correlation_id: None,
-            pane_id: Some(88),
-            domain: None,
-            action_kind: "auth_required".to_string(),
-            policy_decision: "allow".to_string(),
-            decision_reason: None,
-            rule_id: Some("codex.auth.device_code_prompt".to_string()),
-            input_summary: Some("Auth required for codex: device_code".to_string()),
-            verification_summary: None,
-            decision_context: None,
-            result: "recorded".to_string(),
-        };
-        let audit_id = db.record_audit_action(audit).await.expect("record");
-        assert!(audit_id > 0);
+            // Record an auth event
+            let audit = crate::storage::AuditActionRecord {
+                id: 0,
+                ts: now_ms(),
+                actor_kind: "workflow".to_string(),
+                actor_id: Some("test-exec-1".to_string()),
+                correlation_id: None,
+                pane_id: Some(88),
+                domain: None,
+                action_kind: "auth_required".to_string(),
+                policy_decision: "allow".to_string(),
+                decision_reason: None,
+                rule_id: Some("codex.auth.device_code_prompt".to_string()),
+                input_summary: Some("Auth required for codex: device_code".to_string()),
+                verification_summary: None,
+                decision_context: None,
+                result: "recorded".to_string(),
+            };
+            let audit_id = db.record_audit_action(audit).await.expect("record");
+            assert!(audit_id > 0);
 
-        // Query back
-        let query = crate::storage::AuditQuery {
-            pane_id: Some(88),
-            action_kind: Some("auth_required".to_string()),
-            limit: Some(10),
-            ..Default::default()
-        };
-        let results = db.get_audit_actions(query).await.expect("query");
-        assert!(!results.is_empty());
-        assert_eq!(results[0].action_kind, "auth_required");
-        assert_eq!(results[0].pane_id, Some(88));
+            // Query back
+            let query = crate::storage::AuditQuery {
+                pane_id: Some(88),
+                action_kind: Some("auth_required".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            };
+            let results = db.get_audit_actions(query).await.expect("query");
+            assert!(!results.is_empty());
+            assert_eq!(results[0].action_kind, "auth_required");
+            assert_eq!(results[0].pane_id, Some(88));
         });
     }
 
     #[test]
     fn handle_auth_required_cooldown_blocks_repeat() {
         run_async_test(async {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR2: AtomicU64 = AtomicU64::new(0);
-        let n = CTR2.fetch_add(1, Ordering::SeqCst);
-        let db_path = std::env::temp_dir().join(format!(
-            "wa_test_auth_cooldown_{}_{n}.db",
-            std::process::id()
-        ));
-        let db = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
-            .await
-            .expect("temp DB");
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR2: AtomicU64 = AtomicU64::new(0);
+            let n = CTR2.fetch_add(1, Ordering::SeqCst);
+            let db_path = std::env::temp_dir().join(format!(
+                "wa_test_auth_cooldown_{}_{n}.db",
+                std::process::id()
+            ));
+            let db = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("temp DB");
 
-        // Insert pane
-        let pane = crate::storage::PaneRecord {
-            pane_id: 89,
-            pane_uuid: None,
-            domain: "local".to_string(),
-            window_id: None,
-            tab_id: None,
-            title: None,
-            cwd: None,
-            tty_name: None,
-            first_seen_at: now_ms(),
-            last_seen_at: now_ms(),
-            observed: true,
-            ignore_reason: None,
-            last_decision_at: None,
-        };
-        db.upsert_pane(pane).await.expect("insert pane");
+            // Insert pane
+            let pane = crate::storage::PaneRecord {
+                pane_id: 89,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: now_ms(),
+                last_seen_at: now_ms(),
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            db.upsert_pane(pane).await.expect("insert pane");
 
-        // Insert a recent auth event (within cooldown)
-        let audit = crate::storage::AuditActionRecord {
-            id: 0,
-            ts: now_ms(), // Just now
-            actor_kind: "workflow".to_string(),
-            actor_id: Some("test-exec-2".to_string()),
-            correlation_id: None,
-            pane_id: Some(89),
-            domain: None,
-            action_kind: "auth_required".to_string(),
-            policy_decision: "allow".to_string(),
-            decision_reason: None,
-            rule_id: None,
-            input_summary: None,
-            verification_summary: None,
-            decision_context: None,
-            result: "recorded".to_string(),
-        };
-        db.record_audit_action(audit).await.expect("record");
+            // Insert a recent auth event (within cooldown)
+            let audit = crate::storage::AuditActionRecord {
+                id: 0,
+                ts: now_ms(), // Just now
+                actor_kind: "workflow".to_string(),
+                actor_id: Some("test-exec-2".to_string()),
+                correlation_id: None,
+                pane_id: Some(89),
+                domain: None,
+                action_kind: "auth_required".to_string(),
+                policy_decision: "allow".to_string(),
+                decision_reason: None,
+                rule_id: None,
+                input_summary: None,
+                verification_summary: None,
+                decision_context: None,
+                result: "recorded".to_string(),
+            };
+            db.record_audit_action(audit).await.expect("record");
 
-        // Now check cooldown: query for recent auth events within default window
-        let since = now_ms() - AUTH_COOLDOWN_MS;
-        let query = crate::storage::AuditQuery {
-            pane_id: Some(89),
-            action_kind: Some("auth_required".to_string()),
-            since: Some(since),
-            limit: Some(1),
-            ..Default::default()
-        };
-        let results = db.get_audit_actions(query).await.expect("query");
-        assert!(
-            !results.is_empty(),
-            "Should find recent auth event within cooldown window"
-        );
+            // Now check cooldown: query for recent auth events within default window
+            let since = now_ms() - AUTH_COOLDOWN_MS;
+            let query = crate::storage::AuditQuery {
+                pane_id: Some(89),
+                action_kind: Some("auth_required".to_string()),
+                since: Some(since),
+                limit: Some(1),
+                ..Default::default()
+            };
+            let results = db.get_audit_actions(query).await.expect("query");
+            assert!(
+                !results.is_empty(),
+                "Should find recent auth event within cooldown window"
+            );
         });
     }
 
@@ -8407,267 +8415,269 @@ Try again at 3:00 PM UTC.
     #[test]
     fn regression_session_end_full_execution() {
         run_async_test(async {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::SeqCst);
-        let db_path = std::env::temp_dir().join(format!(
-            "wa_test_reg_exec_{}_{}_{n}.db",
-            std::process::id(),
-            line!()
-        ));
-        let db_path_str = db_path.to_string_lossy().to_string();
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::SeqCst);
+            let db_path = std::env::temp_dir().join(format!(
+                "wa_test_reg_exec_{}_{}_{n}.db",
+                std::process::id(),
+                line!()
+            ));
+            let db_path_str = db_path.to_string_lossy().to_string();
 
-        let (runner, storage, _lock) = create_test_runner(&db_path_str).await;
-        runner.register_workflow(Arc::new(HandleSessionEnd::new()));
+            let (runner, storage, _lock) = create_test_runner(&db_path_str).await;
+            runner.register_workflow(Arc::new(HandleSessionEnd::new()));
 
-        let pane_id = 200u64;
-        create_test_pane(&storage, pane_id).await;
+            let pane_id = 200u64;
+            create_test_pane(&storage, pane_id).await;
 
-        // Create a Codex session.summary detection
-        let det = make_session_detection(
-            "codex.session.token_usage",
-            AgentType::Codex,
-            "session.summary",
-            serde_json::json!({
-                "total": "5000",
-                "input": "3000",
-                "output": "2000",
-            }),
-        );
+            // Create a Codex session.summary detection
+            let det = make_session_detection(
+                "codex.session.token_usage",
+                AgentType::Codex,
+                "session.summary",
+                serde_json::json!({
+                    "total": "5000",
+                    "input": "3000",
+                    "output": "2000",
+                }),
+            );
 
-        // Start the workflow
-        let start = runner.handle_detection(pane_id, &det, None).await;
-        assert!(
-            start.is_started(),
-            "Workflow should start for session.summary"
-        );
-        let execution_id = start.execution_id().unwrap().to_string();
+            // Start the workflow
+            let start = runner.handle_detection(pane_id, &det, None).await;
+            assert!(
+                start.is_started(),
+                "Workflow should start for session.summary"
+            );
+            let execution_id = start.execution_id().unwrap().to_string();
 
-        // Run the workflow
-        let wf = runner.find_workflow_by_name("handle_session_end").unwrap();
-        let result = runner.run_workflow(pane_id, wf, &execution_id, 0).await;
-        assert!(
-            result.is_completed(),
-            "Session end workflow should complete: {result:?}"
-        );
+            // Run the workflow
+            let wf = runner.find_workflow_by_name("handle_session_end").unwrap();
+            let result = runner.run_workflow(pane_id, wf, &execution_id, 0).await;
+            assert!(
+                result.is_completed(),
+                "Session end workflow should complete: {result:?}"
+            );
 
-        // Verify step logs recorded
-        let logs = storage.get_step_logs(&execution_id).await.unwrap();
-        assert_eq!(logs.len(), 2, "Should have 2 step logs (extract + persist)");
-        assert_eq!(logs[0].step_name, "extract_summary");
-        assert_eq!(logs[1].step_name, "persist_record");
+            // Verify step logs recorded
+            let logs = storage.get_step_logs(&execution_id).await.unwrap();
+            assert_eq!(logs.len(), 2, "Should have 2 step logs (extract + persist)");
+            assert_eq!(logs[0].step_name, "extract_summary");
+            assert_eq!(logs[1].step_name, "persist_record");
 
-        // Verify session persisted
-        // (The record was persisted via upsert_agent_session; we verify via step log result data)
-        assert_eq!(logs[1].result_type, "done");
+            // Verify session persisted
+            // (The record was persisted via upsert_agent_session; we verify via step log result data)
+            assert_eq!(logs[1].result_type, "done");
 
-        // Verify usage metrics were recorded (token usage + duration)
-        let metrics = storage
-            .query_usage_metrics(crate::storage::MetricQuery {
-                metric_type: None,
-                agent_type: Some("codex".to_string()),
-                account_id: None,
-                since: Some(0),
-                until: None,
-                limit: Some(50),
-            })
-            .await
-            .expect("query usage metrics");
-        assert!(
-            metrics
-                .iter()
-                .any(|m| m.metric_type == crate::storage::MetricType::TokenUsage),
-            "Expected token usage metric"
-        );
-        assert!(
-            metrics
-                .iter()
-                .any(|m| m.metric_type == crate::storage::MetricType::SessionDuration),
-            "Expected session duration metric"
-        );
+            // Verify usage metrics were recorded (token usage + duration)
+            let metrics = storage
+                .query_usage_metrics(crate::storage::MetricQuery {
+                    metric_type: None,
+                    agent_type: Some("codex".to_string()),
+                    account_id: None,
+                    since: Some(0),
+                    until: None,
+                    limit: Some(50),
+                })
+                .await
+                .expect("query usage metrics");
+            assert!(
+                metrics
+                    .iter()
+                    .any(|m| m.metric_type == crate::storage::MetricType::TokenUsage),
+                "Expected token usage metric"
+            );
+            assert!(
+                metrics
+                    .iter()
+                    .any(|m| m.metric_type == crate::storage::MetricType::SessionDuration),
+                "Expected session duration metric"
+            );
         });
     }
 
     #[test]
     fn regression_auth_required_full_execution() {
         run_async_test(async {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::SeqCst);
-        let db_path = std::env::temp_dir().join(format!(
-            "wa_test_reg_auth_exec_{}_{}_{n}.db",
-            std::process::id(),
-            line!()
-        ));
-        let db_path_str = db_path.to_string_lossy().to_string();
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::SeqCst);
+            let db_path = std::env::temp_dir().join(format!(
+                "wa_test_reg_auth_exec_{}_{}_{n}.db",
+                std::process::id(),
+                line!()
+            ));
+            let db_path_str = db_path.to_string_lossy().to_string();
 
-        let (runner, storage, _lock) = create_test_runner_with_panes(&db_path_str, &[201]).await;
-        runner.register_workflow(Arc::new(HandleAuthRequired::new()));
+            let (runner, storage, _lock) =
+                create_test_runner_with_panes(&db_path_str, &[201]).await;
+            runner.register_workflow(Arc::new(HandleAuthRequired::new()));
 
-        let pane_id = 201u64;
-        create_test_pane(&storage, pane_id).await;
+            let pane_id = 201u64;
+            create_test_pane(&storage, pane_id).await;
 
-        // Create a device code detection
-        let det = make_session_detection(
-            "codex.auth.device_code_prompt",
-            AgentType::Codex,
-            "auth.device_code",
-            serde_json::json!({
-                "code": "ABCD-12345",
-            }),
-        );
+            // Create a device code detection
+            let det = make_session_detection(
+                "codex.auth.device_code_prompt",
+                AgentType::Codex,
+                "auth.device_code",
+                serde_json::json!({
+                    "code": "ABCD-12345",
+                }),
+            );
 
-        // Start the workflow
-        let start = runner.handle_detection(pane_id, &det, None).await;
-        assert!(
-            start.is_started(),
-            "Workflow should start for auth.device_code"
-        );
-        let execution_id = start.execution_id().unwrap().to_string();
+            // Start the workflow
+            let start = runner.handle_detection(pane_id, &det, None).await;
+            assert!(
+                start.is_started(),
+                "Workflow should start for auth.device_code"
+            );
+            let execution_id = start.execution_id().unwrap().to_string();
 
-        // Run the workflow
-        let wf = runner
-            .find_workflow_by_name("handle_auth_required")
-            .unwrap();
-        let result = runner.run_workflow(pane_id, wf, &execution_id, 0).await;
-        assert!(
-            result.is_completed(),
-            "Auth required workflow should complete: {result:?}"
-        );
+            // Run the workflow
+            let wf = runner
+                .find_workflow_by_name("handle_auth_required")
+                .unwrap();
+            let result = runner.run_workflow(pane_id, wf, &execution_id, 0).await;
+            assert!(
+                result.is_completed(),
+                "Auth required workflow should complete: {result:?}"
+            );
 
-        // Verify step logs
-        let logs = storage.get_step_logs(&execution_id).await.unwrap();
-        assert_eq!(
-            logs.len(),
-            3,
-            "Should have 3 step logs (cooldown + classify + record)"
-        );
-        assert_eq!(logs[0].step_name, "check_cooldown");
-        assert_eq!(logs[1].step_name, "classify_auth");
-        assert_eq!(logs[2].step_name, "record_and_plan");
+            // Verify step logs
+            let logs = storage.get_step_logs(&execution_id).await.unwrap();
+            assert_eq!(
+                logs.len(),
+                3,
+                "Should have 3 step logs (cooldown + classify + record)"
+            );
+            assert_eq!(logs[0].step_name, "check_cooldown");
+            assert_eq!(logs[1].step_name, "classify_auth");
+            assert_eq!(logs[2].step_name, "record_and_plan");
 
-        // Verify audit record created
-        let query = crate::storage::AuditQuery {
-            pane_id: Some(pane_id),
-            action_kind: Some("auth_required".to_string()),
-            limit: Some(10),
-            ..Default::default()
-        };
-        let audits = storage.get_audit_actions(query).await.unwrap();
-        assert!(
-            !audits.is_empty(),
-            "Auth event should be recorded in audit log"
-        );
-        assert_eq!(audits[0].action_kind, "auth_required");
-        assert_eq!(audits[0].pane_id, Some(pane_id));
+            // Verify audit record created
+            let query = crate::storage::AuditQuery {
+                pane_id: Some(pane_id),
+                action_kind: Some("auth_required".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            };
+            let audits = storage.get_audit_actions(query).await.unwrap();
+            assert!(
+                !audits.is_empty(),
+                "Auth event should be recorded in audit log"
+            );
+            assert_eq!(audits[0].action_kind, "auth_required");
+            assert_eq!(audits[0].pane_id, Some(pane_id));
         });
     }
 
     #[test]
     fn regression_auth_cooldown_skips_repeat() {
         run_async_test(async {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::SeqCst);
-        let db_path = std::env::temp_dir().join(format!(
-            "wa_test_reg_cooldown_{}_{}_{n}.db",
-            std::process::id(),
-            line!()
-        ));
-        let db_path_str = db_path.to_string_lossy().to_string();
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::SeqCst);
+            let db_path = std::env::temp_dir().join(format!(
+                "wa_test_reg_cooldown_{}_{}_{n}.db",
+                std::process::id(),
+                line!()
+            ));
+            let db_path_str = db_path.to_string_lossy().to_string();
 
-        let (runner, storage, _lock) = create_test_runner_with_panes(&db_path_str, &[202]).await;
-        runner.register_workflow(Arc::new(HandleAuthRequired::new()));
+            let (runner, storage, _lock) =
+                create_test_runner_with_panes(&db_path_str, &[202]).await;
+            runner.register_workflow(Arc::new(HandleAuthRequired::new()));
 
-        let pane_id = 202u64;
-        create_test_pane(&storage, pane_id).await;
+            let pane_id = 202u64;
+            create_test_pane(&storage, pane_id).await;
 
-        let det = make_session_detection(
-            "codex.auth.device_code_prompt",
-            AgentType::Codex,
-            "auth.device_code",
-            serde_json::json!({"code": "ABCD-12345"}),
-        );
+            let det = make_session_detection(
+                "codex.auth.device_code_prompt",
+                AgentType::Codex,
+                "auth.device_code",
+                serde_json::json!({"code": "ABCD-12345"}),
+            );
 
-        // First run: should complete normally
-        let start1 = runner.handle_detection(pane_id, &det, None).await;
-        assert!(start1.is_started());
-        let exec_id1 = start1.execution_id().unwrap().to_string();
-        let wf = runner
-            .find_workflow_by_name("handle_auth_required")
-            .unwrap();
-        let result1 = runner.run_workflow(pane_id, wf.clone(), &exec_id1, 0).await;
-        assert!(result1.is_completed(), "First auth run should complete");
+            // First run: should complete normally
+            let start1 = runner.handle_detection(pane_id, &det, None).await;
+            assert!(start1.is_started());
+            let exec_id1 = start1.execution_id().unwrap().to_string();
+            let wf = runner
+                .find_workflow_by_name("handle_auth_required")
+                .unwrap();
+            let result1 = runner.run_workflow(pane_id, wf.clone(), &exec_id1, 0).await;
+            assert!(result1.is_completed(), "First auth run should complete");
 
-        // Second run: cooldown check should cause early completion (step 0 returns Done)
-        let start2 = runner.handle_detection(pane_id, &det, None).await;
-        assert!(start2.is_started());
-        let exec_id2 = start2.execution_id().unwrap().to_string();
-        let result2 = runner.run_workflow(pane_id, wf, &exec_id2, 0).await;
-        assert!(
-            result2.is_completed(),
-            "Second auth run should complete (via cooldown skip)"
-        );
+            // Second run: cooldown check should cause early completion (step 0 returns Done)
+            let start2 = runner.handle_detection(pane_id, &det, None).await;
+            assert!(start2.is_started());
+            let exec_id2 = start2.execution_id().unwrap().to_string();
+            let result2 = runner.run_workflow(pane_id, wf, &exec_id2, 0).await;
+            assert!(
+                result2.is_completed(),
+                "Second auth run should complete (via cooldown skip)"
+            );
 
-        // Verify second run has fewer step logs (only 1 step: cooldown check → Done)
-        let logs2 = storage.get_step_logs(&exec_id2).await.unwrap();
-        assert_eq!(
-            logs2.len(),
-            1,
-            "Cooldown-skipped run should have only 1 step log, got {}",
-            logs2.len()
-        );
-        assert_eq!(logs2[0].step_name, "check_cooldown");
-        assert_eq!(logs2[0].result_type, "done");
+            // Verify second run has fewer step logs (only 1 step: cooldown check → Done)
+            let logs2 = storage.get_step_logs(&exec_id2).await.unwrap();
+            assert_eq!(
+                logs2.len(),
+                1,
+                "Cooldown-skipped run should have only 1 step log, got {}",
+                logs2.len()
+            );
+            assert_eq!(logs2[0].step_name, "check_cooldown");
+            assert_eq!(logs2[0].result_type, "done");
         });
     }
 
     #[test]
     fn regression_session_end_null_trigger_produces_sparse_record() {
         run_async_test(async {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::SeqCst);
-        let db_path = std::env::temp_dir().join(format!(
-            "wa_test_reg_no_trigger_{}_{}_{n}.db",
-            std::process::id(),
-            line!()
-        ));
-        let db_path_str = db_path.to_string_lossy().to_string();
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::SeqCst);
+            let db_path = std::env::temp_dir().join(format!(
+                "wa_test_reg_no_trigger_{}_{}_{n}.db",
+                std::process::id(),
+                line!()
+            ));
+            let db_path_str = db_path.to_string_lossy().to_string();
 
-        let (runner, storage, _lock) = create_test_runner(&db_path_str).await;
-        runner.register_workflow(Arc::new(HandleSessionEnd::new()));
+            let (runner, storage, _lock) = create_test_runner(&db_path_str).await;
+            runner.register_workflow(Arc::new(HandleSessionEnd::new()));
 
-        let pane_id = 203u64;
-        create_test_pane(&storage, pane_id).await;
+            let pane_id = 203u64;
+            create_test_pane(&storage, pane_id).await;
 
-        // Detection that matches session.summary (runner doesn't populate trigger in context)
-        let det = make_session_detection(
-            "codex.session.token_usage",
-            AgentType::Codex,
-            "session.summary",
-            serde_json::Value::Null,
-        );
+            // Detection that matches session.summary (runner doesn't populate trigger in context)
+            let det = make_session_detection(
+                "codex.session.token_usage",
+                AgentType::Codex,
+                "session.summary",
+                serde_json::Value::Null,
+            );
 
-        let start = runner.handle_detection(pane_id, &det, None).await;
-        assert!(start.is_started());
-        let exec_id = start.execution_id().unwrap().to_string();
-        let wf = runner.find_workflow_by_name("handle_session_end").unwrap();
-        let result = runner.run_workflow(pane_id, wf, &exec_id, 0).await;
+            let start = runner.handle_detection(pane_id, &det, None).await;
+            assert!(start.is_started());
+            let exec_id = start.execution_id().unwrap().to_string();
+            let wf = runner.find_workflow_by_name("handle_session_end").unwrap();
+            let result = runner.run_workflow(pane_id, wf, &exec_id, 0).await;
 
-        // The workflow completes even without trigger data — it produces a sparse record
-        // with agent_type="unknown" and no extracted fields
-        assert!(
-            result.is_completed(),
-            "Session end should complete even without trigger data: {result:?}"
-        );
+            // The workflow completes even without trigger data — it produces a sparse record
+            // with agent_type="unknown" and no extracted fields
+            assert!(
+                result.is_completed(),
+                "Session end should complete even without trigger data: {result:?}"
+            );
 
-        let logs = storage.get_step_logs(&exec_id).await.unwrap();
-        assert_eq!(
-            logs.len(),
-            2,
-            "Should have 2 step logs even with sparse data"
-        );
+            let logs = storage.get_step_logs(&exec_id).await.unwrap();
+            assert_eq!(
+                logs.len(),
+                2,
+                "Should have 2 step logs even with sparse data"
+            );
         });
     }
 

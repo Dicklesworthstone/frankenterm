@@ -90,9 +90,7 @@ pub enum CommandKind {
         append_newline: bool,
     },
     /// Send a control signal to the target pane(s).
-    Interrupt {
-        signal: InterruptSignal,
-    },
+    Interrupt { signal: InterruptSignal },
     /// Capture current output from the target pane(s).
     Capture {
         /// Number of lines from the tail to capture (0 = all available).
@@ -310,8 +308,7 @@ impl CommandResult {
     /// True if all targets were delivered successfully.
     #[must_use]
     pub fn all_delivered(&self) -> bool {
-        !self.deliveries.is_empty()
-            && self.deliveries.iter().all(|d| d.status.is_delivered())
+        !self.deliveries.is_empty() && self.deliveries.iter().all(|d| d.status.is_delivered())
     }
 }
 
@@ -446,10 +443,7 @@ impl CommandRouter {
             deliveries.push(delivery);
         }
 
-        let elapsed_us = start
-            .elapsed()
-            .unwrap_or_default()
-            .as_micros() as u64;
+        let elapsed_us = start.elapsed().unwrap_or_default().as_micros() as u64;
 
         let result = CommandResult {
             command_id: request.command_id.clone(),
@@ -618,8 +612,7 @@ impl CommandRouter {
         match &record.state {
             LifecycleState::Pane(pane_state) => {
                 if !is_pane_commandable(*pane_state, command) {
-                    let state_label =
-                        LifecycleState::Pane(*pane_state).label();
+                    let state_label = LifecycleState::Pane(*pane_state).label();
                     return CommandDelivery {
                         target: target.clone(),
                         status: DeliveryStatus::Skipped {
@@ -636,10 +629,7 @@ impl CommandRouter {
                 return CommandDelivery {
                     target: target.clone(),
                     status: DeliveryStatus::RoutingError {
-                        reason: format!(
-                            "target is {} not pane",
-                            other.kind().as_str()
-                        ),
+                        reason: format!("target is {} not pane", other.kind().as_str()),
                     },
                     captured_text: None,
                 };
@@ -694,9 +684,7 @@ fn command_kind_label(command: &CommandKind) -> &'static str {
 
 fn validate_command_context(context: &CommandContext) -> Result<(), CommandTransportError> {
     if context.component.trim().is_empty() {
-        return Err(CommandTransportError::InvalidContext {
-            field: "component",
-        });
+        return Err(CommandTransportError::InvalidContext { field: "component" });
     }
     if context.correlation_id.trim().is_empty() {
         return Err(CommandTransportError::InvalidContext {
@@ -739,7 +727,8 @@ impl CommandDeduplicator {
     /// Returns `true` if this is a duplicate.
     pub fn is_duplicate(&mut self, command_id: &str, now_ms: u64) -> bool {
         // Evict expired entries
-        self.seen.retain(|_, ts| now_ms.saturating_sub(*ts) < self.ttl_ms);
+        self.seen
+            .retain(|_, ts| now_ms.saturating_sub(*ts) < self.ttl_ms);
 
         if self.seen.contains_key(command_id) {
             true
@@ -785,33 +774,15 @@ mod tests {
     }
 
     fn make_pane_identity(pane_id: u64) -> LifecycleIdentity {
-        LifecycleIdentity::new(
-            LifecycleEntityKind::Pane,
-            "ws1",
-            "local",
-            pane_id,
-            1,
-        )
+        LifecycleIdentity::new(LifecycleEntityKind::Pane, "ws1", "local", pane_id, 1)
     }
 
     fn make_window_identity(window_id: u64) -> LifecycleIdentity {
-        LifecycleIdentity::new(
-            LifecycleEntityKind::Window,
-            "ws1",
-            "local",
-            window_id,
-            1,
-        )
+        LifecycleIdentity::new(LifecycleEntityKind::Window, "ws1", "local", window_id, 1)
     }
 
     fn make_session_identity(session_id: u64) -> LifecycleIdentity {
-        LifecycleIdentity::new(
-            LifecycleEntityKind::Session,
-            "ws1",
-            "local",
-            session_id,
-            1,
-        )
+        LifecycleIdentity::new(LifecycleEntityKind::Session, "ws1", "local", session_id, 1)
     }
 
     fn seed_registry() -> LifecycleRegistry {
@@ -1510,7 +1481,10 @@ mod tests {
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: CommandResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.deliveries[0].captured_text.as_deref(), Some("output here"));
+        assert_eq!(
+            deserialized.deliveries[0].captured_text.as_deref(),
+            Some("output here")
+        );
     }
 
     // =========================================================================
@@ -1547,9 +1521,7 @@ mod tests {
         };
         assert!(err.to_string().contains("scope kind mismatch"));
 
-        let err = CommandTransportError::InvalidContext {
-            field: "component",
-        };
+        let err = CommandTransportError::InvalidContext { field: "component" };
         assert!(err.to_string().contains("component"));
 
         let err = CommandTransportError::EmptyScope {

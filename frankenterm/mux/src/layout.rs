@@ -856,7 +856,10 @@ mod tests {
         };
         let (first, second) = compute_split_sizes(SplitDirection::Horizontal, 0.7, size);
         // 100 - 1 = 99 total; 70% ~= 69, 30% ~= 30
-        assert!(first.cols > second.cols, "70/30 split should give more to first");
+        assert!(
+            first.cols > second.cols,
+            "70/30 split should give more to first"
+        );
         assert_eq!(first.cols + second.cols + 1, 100);
     }
 
@@ -951,10 +954,7 @@ mod tests {
             },
         };
         assert_eq!(layout.name, "my-custom-layout");
-        assert_eq!(
-            layout.description.as_deref(),
-            Some("A custom test layout")
-        );
+        assert_eq!(layout.description.as_deref(), Some("A custom test layout"));
         assert_eq!(layout.arrangement.slot_count(), 2);
         assert!(layout.arrangement.has_main_slot());
     }

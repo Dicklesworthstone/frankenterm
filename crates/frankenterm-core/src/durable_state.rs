@@ -1029,7 +1029,9 @@ mod tests {
         let before_checkpoint_count = mgr.checkpoint_count();
         let before_next_id = mgr.next_id;
 
-        let err = mgr.rollback(cp_id, &mut reg, "corrupt checkpoint").unwrap_err();
+        let err = mgr
+            .rollback(cp_id, &mut reg, "corrupt checkpoint")
+            .unwrap_err();
         assert!(matches!(
             err,
             DurableStateError::InvalidCheckpointRecord { id, .. } if id == cp_id

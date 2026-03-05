@@ -53,9 +53,9 @@ pub mod agent_config_templates;
 pub mod agent_correlator;
 #[cfg(feature = "agent-detection")]
 pub mod agent_detection;
-pub mod agent_pane_state;
 #[cfg(feature = "agent-mail")]
 pub mod agent_mail_bridge;
+pub mod agent_pane_state;
 pub mod agent_provider;
 pub mod alerts;
 pub mod api_schema;
@@ -106,6 +106,12 @@ pub mod cleanup;
 pub mod code_scanner;
 pub mod command_guard;
 pub mod command_transport;
+pub mod compact_bitset;
+pub mod completion_token;
+pub mod concurrent_map;
+pub mod config;
+pub mod config_profiles;
+pub mod conformal;
 pub mod connector_event_model;
 pub mod connector_governor;
 pub mod connector_host_runtime;
@@ -116,12 +122,6 @@ pub mod connector_outbound_bridge;
 pub mod connector_registry;
 pub mod connector_reliability;
 pub mod connector_sdk;
-pub mod compact_bitset;
-pub mod completion_token;
-pub mod concurrent_map;
-pub mod config;
-pub mod config_profiles;
-pub mod conformal;
 pub mod consistent_hash;
 pub mod content_dedup;
 pub mod context_snapshot;
@@ -130,7 +130,6 @@ pub mod cooldown_tracker;
 pub mod cost_tracker;
 pub mod count_min_sketch;
 pub mod cpu_pressure;
-pub mod dashboard;
 pub mod crash;
 pub mod crdt;
 pub mod cross_pane_correlation;
@@ -138,6 +137,7 @@ pub mod cuckoo_filter;
 #[cfg(feature = "asupersync-runtime")]
 pub mod cx;
 pub mod dancing_links;
+pub mod dashboard;
 pub mod dataflow;
 pub mod degradation;
 pub mod desktop_notify;
@@ -153,9 +153,9 @@ pub mod disk_pressure;
 #[cfg(feature = "disk-pressure")]
 pub mod disk_scoring;
 pub mod docs_gen;
-pub mod durable_state;
 pub mod drift;
 pub mod dry_run;
+pub mod durable_state;
 pub mod edit_distance;
 pub mod email_notify;
 pub mod entropy_accounting;
@@ -198,13 +198,13 @@ pub mod logging;
 pub mod lru_cache;
 #[cfg(feature = "mcp")]
 pub mod mcp;
-#[cfg(any(feature = "mcp", feature = "mcp-client"))]
-#[doc(hidden)]
-pub mod mcp_framework;
 #[cfg(feature = "mcp-client")]
 pub mod mcp_client;
 #[cfg(feature = "mcp")]
 pub mod mcp_error;
+#[cfg(any(feature = "mcp", feature = "mcp-client"))]
+#[doc(hidden)]
+pub mod mcp_framework;
 pub mod mdl_extraction;
 pub mod memory_budget;
 pub mod memory_pressure;
@@ -212,9 +212,9 @@ pub mod merkle_tree;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 #[cfg(feature = "subprocess-bridge")]
-pub mod mission_events;
-#[cfg(feature = "subprocess-bridge")]
 pub mod mission_agent_mail;
+#[cfg(feature = "subprocess-bridge")]
+pub mod mission_events;
 #[cfg(feature = "subprocess-bridge")]
 pub mod mission_loop;
 pub mod network_observer;
@@ -356,9 +356,9 @@ pub mod subprocess_bridge;
 pub mod suffix_array;
 pub mod suggestions;
 pub mod survival;
-pub mod swarm_work_queue;
-pub mod swarm_scheduler;
 pub mod swarm_pipeline;
+pub mod swarm_scheduler;
+pub mod swarm_work_queue;
 pub mod tailer;
 #[cfg(feature = "recorder-lexical")]
 pub mod tantivy_ingest;

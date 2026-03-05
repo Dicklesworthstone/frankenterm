@@ -98,7 +98,15 @@ fn arb_step_outcome() -> impl Strategy<Value = StepOutcome> {
         0u32..3,
     )
         .prop_map(
-            |(step_index, step_label, status, attempts, duration_ms, recovery_attempts, compensations_run)| {
+            |(
+                step_index,
+                step_label,
+                status,
+                attempts,
+                duration_ms,
+                recovery_attempts,
+                compensations_run,
+            )| {
                 StepOutcome {
                     step_index,
                     step_label,
@@ -162,10 +170,11 @@ fn arb_pipeline_condition() -> impl Strategy<Value = PipelineCondition> {
         ("[a-z_]{3,8}", "[a-z0-9]{3,8}")
             .prop_map(|(key, value)| PipelineCondition::MetadataEquals { key, value }),
         (1000u64..60_000).prop_map(|ms| PipelineCondition::Timeout { after_ms: ms }),
-        prop::collection::vec("[a-z]{3,8}", 1..=4)
-            .prop_map(|labels| PipelineCondition::AllStepsComplete {
-                step_labels: labels
-            }),
+        prop::collection::vec("[a-z]{3,8}", 1..=4).prop_map(|labels| {
+            PipelineCondition::AllStepsComplete {
+                step_labels: labels,
+            }
+        }),
     ]
 }
 
@@ -204,14 +213,13 @@ fn arb_step_action() -> impl Strategy<Value = StepAction> {
 fn arb_compensation_kind() -> impl Strategy<Value = CompensationKind> {
     prop_oneof![
         "[a-z_ ]{5,20}".prop_map(|command| CompensationKind::SendCommand { command }),
-        "[a-z0-9-]{5,15}".prop_map(|id| CompensationKind::RestoreCheckpoint {
-            checkpoint_id: id
-        }),
-        ("[a-z]{3,8}", "[a-z ]{5,20}")
-            .prop_map(|(agent_name, message)| CompensationKind::NotifyAgent {
+        "[a-z0-9-]{5,15}".prop_map(|id| CompensationKind::RestoreCheckpoint { checkpoint_id: id }),
+        ("[a-z]{3,8}", "[a-z ]{5,20}").prop_map(|(agent_name, message)| {
+            CompensationKind::NotifyAgent {
                 agent_name,
                 message,
-            }),
+            }
+        }),
         "[a-z ]{5,20}".prop_map(|message| CompensationKind::Log { message }),
         (
             "[a-z_]{3,10}",
@@ -238,14 +246,11 @@ fn arb_pipeline_error() -> impl Strategy<Value = PipelineError> {
         Just(PipelineError::DependencyCycle),
         "[a-z_]{3,10}".prop_map(|label| PipelineError::StepNotFound { label }),
         "[a-z ]{5,20}".prop_map(|reason| PipelineError::ExecutionFailed { reason }),
-        "[a-z_]{3,10}".prop_map(|label| PipelineError::CircuitBreakerOpen {
-            step_label: label
+        "[a-z_]{3,10}".prop_map(|label| PipelineError::CircuitBreakerOpen { step_label: label }),
+        ("[a-z_]{3,10}", 1000u64..300_000).prop_map(|(label, elapsed)| PipelineError::Timeout {
+            step_label: label,
+            elapsed_ms: elapsed,
         }),
-        ("[a-z_]{3,10}", 1000u64..300_000)
-            .prop_map(|(label, elapsed)| PipelineError::Timeout {
-                step_label: label,
-                elapsed_ms: elapsed,
-            }),
     ]
 }
 

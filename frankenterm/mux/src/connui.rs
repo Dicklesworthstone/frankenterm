@@ -473,8 +473,7 @@ mod tests {
 
     #[test]
     fn split_multi_line_prompt_three_lines() {
-        let (preamble, prompt) =
-            ConnectionUI::split_multi_line_prompt("Line1\nLine2\nPassword: ");
+        let (preamble, prompt) = ConnectionUI::split_multi_line_prompt("Line1\nLine2\nPassword: ");
         assert!(preamble.is_some());
         let pre = preamble.unwrap();
         assert!(pre.contains("Line1"));

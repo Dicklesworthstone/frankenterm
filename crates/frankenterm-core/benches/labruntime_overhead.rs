@@ -137,10 +137,7 @@ fn bench_oracle_check(c: &mut Criterion) {
                         black_box(i * 2);
                     })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
             let report = runtime.report();
@@ -204,10 +201,7 @@ fn bench_task_spawn(c: &mut Criterion) {
                 .state
                 .create_task(region, Budget::INFINITE, async { black_box(42_u32) })
                 .expect("create task");
-            runtime
-                .scheduler
-                .lock()
-                .schedule(task_id, 0);
+            runtime.scheduler.lock().schedule(task_id, 0);
             black_box(runtime.run_until_quiescent());
         });
     });
@@ -225,10 +219,7 @@ fn bench_task_spawn(c: &mut Criterion) {
                     .state
                     .create_task(region, Budget::INFINITE, async move { black_box(i) })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                    .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
             black_box(runtime.run_until_quiescent());
         });
@@ -313,10 +304,7 @@ fn bench_comparison(c: &mut Criterion) {
                 .state
                 .create_task(region, Budget::INFINITE, async { black_box(42_u32) })
                 .expect("create task");
-            runtime
-                .scheduler
-                .lock()
-                .schedule(task_id, 0);
+            runtime.scheduler.lock().schedule(task_id, 0);
             runtime.run_until_quiescent();
         });
     });

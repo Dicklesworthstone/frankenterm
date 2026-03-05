@@ -367,13 +367,17 @@ impl PriorityClassifier {
                 manual_override: None,
             },
         );
-        self.telemetry.panes_registered.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .panes_registered
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Unregister a pane.
     pub fn unregister_pane(&self, pane_id: u64) {
         self.panes.remove(pane_id);
-        self.telemetry.panes_unregistered.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .panes_unregistered
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record output lines for a pane.
@@ -397,7 +401,9 @@ impl PriorityClassifier {
 
     /// Feed a detection signal into the classifier.
     pub fn observe_signal(&self, pane_id: u64, signal: &PrioritySignal) {
-        self.telemetry.signals_observed.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .signals_observed
+            .fetch_add(1, Ordering::Relaxed);
         self.panes.write_with(pane_id, |state| {
             if signal.severity >= 2
                 || signal.event_type == "error"
@@ -424,7 +430,9 @@ impl PriorityClassifier {
         self.panes.write_with(pane_id, |state| {
             state.manual_override = None;
         });
-        self.telemetry.overrides_cleared.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .overrides_cleared
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Classify a single pane and return its priority.
@@ -518,7 +526,8 @@ impl PriorityClassifier {
     /// Get the telemetry counters.
     #[must_use]
     pub fn telemetry(&self) -> PriorityClassifierTelemetrySnapshot {
-        self.telemetry.snapshot(self.total_classifications.load(Ordering::Relaxed))
+        self.telemetry
+            .snapshot(self.total_classifications.load(Ordering::Relaxed))
     }
 
     // -------------------------------------------------------------------------

@@ -69,8 +69,7 @@ fn tls_handshake_succeeds() {
         config.tls.cert_path = Some(server_cert.path().display().to_string());
         config.tls.key_path = Some(server_key.path().display().to_string());
 
-        let bundle = build_tls_bundle(&config, Some(ca_cert.path()))
-            .expect("tls bundle");
+        let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -123,8 +122,8 @@ fn mtls_handshake_succeeds() {
         srv_cfg.tls.client_ca_path = Some(ca_cert.path().display().to_string());
         srv_cfg.allow_agent_ids = vec!["wa-client".to_string()];
 
-        let server_bundle = build_tls_bundle(&srv_cfg, Some(ca_cert.path()))
-            .expect("server bundle");
+        let server_bundle =
+            build_tls_bundle(&srv_cfg, Some(ca_cert.path())).expect("server bundle");
 
         // Client side: mTLS, client cert/key, CA for server verification
         let mut cli_cfg = DistributedConfig::default();
@@ -134,8 +133,8 @@ fn mtls_handshake_succeeds() {
         cli_cfg.tls.cert_path = Some(client_cert.path().display().to_string());
         cli_cfg.tls.key_path = Some(client_key.path().display().to_string());
 
-        let client_bundle = build_tls_bundle(&cli_cfg, Some(ca_cert.path()))
-            .expect("client bundle");
+        let client_bundle =
+            build_tls_bundle(&cli_cfg, Some(ca_cert.path())).expect("client bundle");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -183,12 +182,12 @@ fn tls_handshake_rejects_untrusted_server() {
         srv_cfg.tls.cert_path = Some(server_cert.path().display().to_string());
         srv_cfg.tls.key_path = Some(server_key.path().display().to_string());
 
-        let server_bundle = build_tls_bundle(&srv_cfg, Some(ca_cert_alt.path()))
-            .expect("server bundle");
+        let server_bundle =
+            build_tls_bundle(&srv_cfg, Some(ca_cert_alt.path())).expect("server bundle");
 
         // Client: uses WRONG CA (alt) — should reject server
-        let client_bundle = build_tls_bundle(&srv_cfg, Some(ca_cert_alt.path()))
-            .expect("client bundle");
+        let client_bundle =
+            build_tls_bundle(&srv_cfg, Some(ca_cert_alt.path())).expect("client bundle");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -244,8 +243,8 @@ fn mtls_handshake_rejects_missing_client_cert() {
         srv_cfg.tls.key_path = Some(server_key.path().display().to_string());
         srv_cfg.tls.client_ca_path = Some(ca_cert.path().display().to_string());
 
-        let server_bundle = build_tls_bundle(&srv_cfg, Some(ca_cert.path()))
-            .expect("server bundle");
+        let server_bundle =
+            build_tls_bundle(&srv_cfg, Some(ca_cert.path())).expect("server bundle");
 
         // Client: Token mode (no client cert) — server requires mTLS
         let mut cli_cfg = DistributedConfig::default();
@@ -254,8 +253,8 @@ fn mtls_handshake_rejects_missing_client_cert() {
         cli_cfg.tls.enabled = true;
         cli_cfg.tls.cert_path = Some(server_cert.path().display().to_string());
 
-        let client_bundle = build_tls_bundle(&cli_cfg, Some(ca_cert.path()))
-            .expect("client bundle");
+        let client_bundle =
+            build_tls_bundle(&cli_cfg, Some(ca_cert.path())).expect("client bundle");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -314,8 +313,8 @@ fn mtls_handshake_rejects_disallowed_client() {
         srv_cfg.tls.client_ca_path = Some(ca_cert.path().display().to_string());
         srv_cfg.allow_agent_ids = vec!["not-allowed".to_string()];
 
-        let server_bundle = build_tls_bundle(&srv_cfg, Some(ca_cert.path()))
-            .expect("server bundle");
+        let server_bundle =
+            build_tls_bundle(&srv_cfg, Some(ca_cert.path())).expect("server bundle");
 
         // Client: mTLS with valid cert but not in server allowlist
         let mut cli_cfg = DistributedConfig::default();
@@ -325,8 +324,8 @@ fn mtls_handshake_rejects_disallowed_client() {
         cli_cfg.tls.cert_path = Some(client_cert.path().display().to_string());
         cli_cfg.tls.key_path = Some(client_key.path().display().to_string());
 
-        let client_bundle = build_tls_bundle(&cli_cfg, Some(ca_cert.path()))
-            .expect("client bundle");
+        let client_bundle =
+            build_tls_bundle(&cli_cfg, Some(ca_cert.path())).expect("client bundle");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -378,8 +377,7 @@ fn tls_rejects_plaintext_client() {
         config.tls.cert_path = Some(server_cert.path().display().to_string());
         config.tls.key_path = Some(server_key.path().display().to_string());
 
-        let bundle = build_tls_bundle(&config, None)
-            .expect("tls bundle");
+        let bundle = build_tls_bundle(&config, None).expect("tls bundle");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");

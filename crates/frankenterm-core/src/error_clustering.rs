@@ -69,7 +69,8 @@ fn minhash_signature(shingles: &[u64], num_hashes: usize) -> Vec<u64> {
         // Force 'a' to be odd so that multiplication modulo 2^64 is a true bijection.
         let a = (i as u64)
             .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1) | 1;
+            .wrapping_add(1)
+            | 1;
         let b = (i as u64)
             .wrapping_mul(1_442_695_040_888_963_407)
             .wrapping_add(7);

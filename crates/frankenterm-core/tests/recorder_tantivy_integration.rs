@@ -320,52 +320,52 @@ impl ChaosScenarioReport {
 #[test]
 fn full_pipeline_cold_start_with_invariant_check() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    // Use deterministic event IDs via SequenceAssigner
-    let assigner = SequenceAssigner::new();
-    let mut events = Vec::new();
-    for i in 0u64..5 {
-        let (seq, _) = assigner.assign(1);
-        let mut e = make_ingress(&format!("placeholder-{i}"), 1, seq, &format!("cmd-{i}"));
-        e.event_id = generate_event_id_v1(&e);
-        events.push(e);
-    }
+        // Use deterministic event IDs via SequenceAssigner
+        let assigner = SequenceAssigner::new();
+        let mut events = Vec::new();
+        for i in 0u64..5 {
+            let (seq, _) = assigner.assign(1);
+            let mut e = make_ingress(&format!("placeholder-{i}"), 1, seq, &format!("cmd-{i}"));
+            e.event_id = generate_event_id_v1(&e);
+            events.push(e);
+        }
 
-    append_events(&storage, "batch-1", events.clone()).await;
+        append_events(&storage, "batch-1", events.clone()).await;
 
-    let icfg = indexer_config(dir.path(), "full-pipeline");
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    let result = indexer.run(&storage).await.unwrap();
+        let icfg = indexer_config(dir.path(), "full-pipeline");
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        let result = indexer.run(&storage).await.unwrap();
 
-    assert_eq!(result.events_indexed, 5);
-    assert!(result.caught_up);
+        assert_eq!(result.events_indexed, 5);
+        assert!(result.caught_up);
 
-    // Verify indexed docs have correct schema versions
-    for doc in &indexer.writer().docs {
-        assert_eq!(doc.schema_version, RECORDER_EVENT_SCHEMA_VERSION_V1);
-        assert_eq!(doc.lexical_schema_version, LEXICAL_SCHEMA_VERSION);
-    }
+        // Verify indexed docs have correct schema versions
+        for doc in &indexer.writer().docs {
+            assert_eq!(doc.schema_version, RECORDER_EVENT_SCHEMA_VERSION_V1);
+            assert_eq!(doc.lexical_schema_version, LEXICAL_SCHEMA_VERSION);
+        }
 
-    // Run original events through InvariantChecker — should pass
-    let mut sorted_events = events.clone();
-    sorted_events
-        .sort_by(|a, b| RecorderMergeKey::from_event(a).cmp(&RecorderMergeKey::from_event(b)));
-    let config = InvariantCheckerConfig {
-        check_merge_order: true,
-        check_causality: false,
-        expected_schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
-        ..Default::default()
-    };
-    let checker = InvariantChecker::with_config(config);
-    let report = checker.check(&sorted_events);
-    assert!(
-        report.passed,
-        "invariant violations: {:?}",
-        report.violations
-    );
+        // Run original events through InvariantChecker — should pass
+        let mut sorted_events = events.clone();
+        sorted_events
+            .sort_by(|a, b| RecorderMergeKey::from_event(a).cmp(&RecorderMergeKey::from_event(b)));
+        let config = InvariantCheckerConfig {
+            check_merge_order: true,
+            check_causality: false,
+            expected_schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let report = checker.check(&sorted_events);
+        assert!(
+            report.passed,
+            "invariant violations: {:?}",
+            report.violations
+        );
     });
 }
 
@@ -376,84 +376,84 @@ fn full_pipeline_cold_start_with_invariant_check() {
 #[test]
 fn multi_run_checkpoint_resume_no_reprocessing() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    // Append 12 events
-    let events: Vec<_> = (0..12)
-        .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("text-{i}")))
-        .collect();
-    append_events(&storage, "b1", events).await;
+        // Append 12 events
+        let events: Vec<_> = (0..12)
+            .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("text-{i}")))
+            .collect();
+        append_events(&storage, "b1", events).await;
 
-    let consumer = "resume-integ";
+        let consumer = "resume-integ";
 
-    // Run 1: batch_size=5, max_batches=1 → index 5 events
-    let icfg1 = IndexerConfig {
-        batch_size: 5,
-        max_batches: 1,
-        ..indexer_config(dir.path(), consumer)
-    };
-    let mut ix1 = IncrementalIndexer::new(icfg1, TrackingWriter::new());
-    let r1 = ix1.run(&storage).await.unwrap();
-    assert_eq!(r1.events_indexed, 5);
-    assert_eq!(r1.final_ordinal, Some(4));
-    assert!(!r1.caught_up);
+        // Run 1: batch_size=5, max_batches=1 → index 5 events
+        let icfg1 = IndexerConfig {
+            batch_size: 5,
+            max_batches: 1,
+            ..indexer_config(dir.path(), consumer)
+        };
+        let mut ix1 = IncrementalIndexer::new(icfg1, TrackingWriter::new());
+        let r1 = ix1.run(&storage).await.unwrap();
+        assert_eq!(r1.events_indexed, 5);
+        assert_eq!(r1.final_ordinal, Some(4));
+        assert!(!r1.caught_up);
 
-    let indexed_ids_run1: Vec<String> = ix1
-        .writer()
-        .docs
-        .iter()
-        .map(|d| d.event_id.clone())
-        .collect();
+        let indexed_ids_run1: Vec<String> = ix1
+            .writer()
+            .docs
+            .iter()
+            .map(|d| d.event_id.clone())
+            .collect();
 
-    // Run 2: index next 5
-    let icfg2 = IndexerConfig {
-        batch_size: 5,
-        max_batches: 1,
-        ..indexer_config(dir.path(), consumer)
-    };
-    let mut ix2 = IncrementalIndexer::new(icfg2, TrackingWriter::new());
-    let r2 = ix2.run(&storage).await.unwrap();
-    assert_eq!(r2.events_indexed, 5);
-    assert_eq!(r2.final_ordinal, Some(9));
+        // Run 2: index next 5
+        let icfg2 = IndexerConfig {
+            batch_size: 5,
+            max_batches: 1,
+            ..indexer_config(dir.path(), consumer)
+        };
+        let mut ix2 = IncrementalIndexer::new(icfg2, TrackingWriter::new());
+        let r2 = ix2.run(&storage).await.unwrap();
+        assert_eq!(r2.events_indexed, 5);
+        assert_eq!(r2.final_ordinal, Some(9));
 
-    let indexed_ids_run2: Vec<String> = ix2
-        .writer()
-        .docs
-        .iter()
-        .map(|d| d.event_id.clone())
-        .collect();
+        let indexed_ids_run2: Vec<String> = ix2
+            .writer()
+            .docs
+            .iter()
+            .map(|d| d.event_id.clone())
+            .collect();
 
-    // Run 3: index remaining 2
-    let icfg3 = indexer_config(dir.path(), consumer);
-    let mut ix3 = IncrementalIndexer::new(icfg3, TrackingWriter::new());
-    let r3 = ix3.run(&storage).await.unwrap();
-    assert_eq!(r3.events_indexed, 2);
-    assert_eq!(r3.final_ordinal, Some(11));
-    assert!(r3.caught_up);
+        // Run 3: index remaining 2
+        let icfg3 = indexer_config(dir.path(), consumer);
+        let mut ix3 = IncrementalIndexer::new(icfg3, TrackingWriter::new());
+        let r3 = ix3.run(&storage).await.unwrap();
+        assert_eq!(r3.events_indexed, 2);
+        assert_eq!(r3.final_ordinal, Some(11));
+        assert!(r3.caught_up);
 
-    let indexed_ids_run3: Vec<String> = ix3
-        .writer()
-        .docs
-        .iter()
-        .map(|d| d.event_id.clone())
-        .collect();
+        let indexed_ids_run3: Vec<String> = ix3
+            .writer()
+            .docs
+            .iter()
+            .map(|d| d.event_id.clone())
+            .collect();
 
-    // Verify no overlap between runs
-    for id in &indexed_ids_run1 {
-        assert!(!indexed_ids_run2.contains(id), "run2 re-indexed {}", id);
-        assert!(!indexed_ids_run3.contains(id), "run3 re-indexed {}", id);
-    }
-    for id in &indexed_ids_run2 {
-        assert!(!indexed_ids_run3.contains(id), "run3 re-indexed {}", id);
-    }
+        // Verify no overlap between runs
+        for id in &indexed_ids_run1 {
+            assert!(!indexed_ids_run2.contains(id), "run2 re-indexed {}", id);
+            assert!(!indexed_ids_run3.contains(id), "run3 re-indexed {}", id);
+        }
+        for id in &indexed_ids_run2 {
+            assert!(!indexed_ids_run3.contains(id), "run3 re-indexed {}", id);
+        }
 
-    // Verify total coverage
-    assert_eq!(
-        indexed_ids_run1.len() + indexed_ids_run2.len() + indexed_ids_run3.len(),
-        12
-    );
+        // Verify total coverage
+        assert_eq!(
+            indexed_ids_run1.len() + indexed_ids_run2.len() + indexed_ids_run3.len(),
+            12
+        );
     });
 }
 
@@ -464,57 +464,57 @@ fn multi_run_checkpoint_resume_no_reprocessing() {
 #[test]
 fn append_between_indexer_runs() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    let consumer = "append-between";
+        let consumer = "append-between";
 
-    // Phase 1: append and index 3 events
-    append_events(
-        &storage,
-        "b1",
-        (0..3)
-            .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("phase1-{i}")))
-            .collect(),
-    )
-    .await;
+        // Phase 1: append and index 3 events
+        append_events(
+            &storage,
+            "b1",
+            (0..3)
+                .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("phase1-{i}")))
+                .collect(),
+        )
+        .await;
 
-    let icfg = indexer_config(dir.path(), consumer);
-    let mut ix1 = IncrementalIndexer::new(icfg.clone(), TrackingWriter::new());
-    let r1 = ix1.run(&storage).await.unwrap();
-    assert_eq!(r1.events_indexed, 3);
-    assert!(r1.caught_up);
+        let icfg = indexer_config(dir.path(), consumer);
+        let mut ix1 = IncrementalIndexer::new(icfg.clone(), TrackingWriter::new());
+        let r1 = ix1.run(&storage).await.unwrap();
+        assert_eq!(r1.events_indexed, 3);
+        assert!(r1.caught_up);
 
-    // Phase 2: append 4 more events
-    append_events(
-        &storage,
-        "b2",
-        (3..7)
-            .map(|i| make_ingress(&format!("e{i}"), 2, i, &format!("phase2-{i}")))
-            .collect(),
-    )
-    .await;
+        // Phase 2: append 4 more events
+        append_events(
+            &storage,
+            "b2",
+            (3..7)
+                .map(|i| make_ingress(&format!("e{i}"), 2, i, &format!("phase2-{i}")))
+                .collect(),
+        )
+        .await;
 
-    // Verify lag before second run
-    let lag = compute_indexer_lag(&storage, consumer).await.unwrap();
-    assert_eq!(lag.records_behind, 4);
-    assert!(!lag.caught_up);
+        // Verify lag before second run
+        let lag = compute_indexer_lag(&storage, consumer).await.unwrap();
+        assert_eq!(lag.records_behind, 4);
+        assert!(!lag.caught_up);
 
-    // Index new events
-    let mut ix2 = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    let r2 = ix2.run(&storage).await.unwrap();
-    assert_eq!(r2.events_indexed, 4);
-    assert!(r2.caught_up);
+        // Index new events
+        let mut ix2 = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        let r2 = ix2.run(&storage).await.unwrap();
+        assert_eq!(r2.events_indexed, 4);
+        assert!(r2.caught_up);
 
-    // Verify only phase 2 events were indexed
-    assert_eq!(ix2.writer().docs[0].event_id, "e3");
-    assert_eq!(ix2.writer().docs[3].event_id, "e6");
+        // Verify only phase 2 events were indexed
+        assert_eq!(ix2.writer().docs[0].event_id, "e3");
+        assert_eq!(ix2.writer().docs[3].event_id, "e6");
 
-    // Verify lag is now zero
-    let lag = compute_indexer_lag(&storage, consumer).await.unwrap();
-    assert_eq!(lag.records_behind, 0);
-    assert!(lag.caught_up);
+        // Verify lag is now zero
+        let lag = compute_indexer_lag(&storage, consumer).await.unwrap();
+        assert_eq!(lag.records_behind, 0);
+        assert!(lag.caught_up);
     });
 }
 
@@ -525,50 +525,50 @@ fn append_between_indexer_runs() {
 #[test]
 fn dedup_delete_before_add_ordering() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    append_events(
-        &storage,
-        "b1",
-        vec![
-            make_ingress("ev-a", 1, 0, "first"),
-            make_ingress("ev-b", 1, 1, "second"),
-        ],
-    )
-    .await;
+        append_events(
+            &storage,
+            "b1",
+            vec![
+                make_ingress("ev-a", 1, 0, "first"),
+                make_ingress("ev-b", 1, 1, "second"),
+            ],
+        )
+        .await;
 
-    let icfg = IndexerConfig {
-        dedup_on_replay: true,
-        ..indexer_config(dir.path(), "dedup-test")
-    };
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    indexer.run(&storage).await.unwrap();
+        let icfg = IndexerConfig {
+            dedup_on_replay: true,
+            ..indexer_config(dir.path(), "dedup-test")
+        };
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        indexer.run(&storage).await.unwrap();
 
-    // Verify operation ordering: for each event, delete must precede add
-    let ops = &indexer.writer().operations;
-    let mut last_delete_id: Option<String> = None;
+        // Verify operation ordering: for each event, delete must precede add
+        let ops = &indexer.writer().operations;
+        let mut last_delete_id: Option<String> = None;
 
-    for op in ops {
-        match op {
-            WriteOp::Delete(id) => {
-                last_delete_id = Some(id.clone());
-            }
-            WriteOp::Add(id) => {
-                // The most recent delete should be for this same event_id
-                assert_eq!(
-                    last_delete_id.as_deref(),
-                    Some(id.as_str()),
-                    "delete for {} must precede its add",
-                    id
-                );
-            }
-            WriteOp::Commit => {
-                last_delete_id = None;
+        for op in ops {
+            match op {
+                WriteOp::Delete(id) => {
+                    last_delete_id = Some(id.clone());
+                }
+                WriteOp::Add(id) => {
+                    // The most recent delete should be for this same event_id
+                    assert_eq!(
+                        last_delete_id.as_deref(),
+                        Some(id.as_str()),
+                        "delete for {} must precede its add",
+                        id
+                    );
+                }
+                WriteOp::Commit => {
+                    last_delete_id = None;
+                }
             }
         }
-    }
     });
 }
 
@@ -579,25 +579,25 @@ fn dedup_delete_before_add_ordering() {
 #[test]
 fn dedup_disabled_no_deletes() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    append_events(&storage, "b1", vec![make_ingress("ev-1", 1, 0, "text")]).await;
+        append_events(&storage, "b1", vec![make_ingress("ev-1", 1, 0, "text")]).await;
 
-    let icfg = IndexerConfig {
-        dedup_on_replay: false,
-        ..indexer_config(dir.path(), "no-dedup")
-    };
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    indexer.run(&storage).await.unwrap();
+        let icfg = IndexerConfig {
+            dedup_on_replay: false,
+            ..indexer_config(dir.path(), "no-dedup")
+        };
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        indexer.run(&storage).await.unwrap();
 
-    // No delete operations should have occurred
-    assert!(
-        indexer.writer().deleted_ids.is_empty(),
-        "expected no deletes when dedup disabled"
-    );
-    assert_eq!(indexer.writer().docs.len(), 1);
+        // No delete operations should have occurred
+        assert!(
+            indexer.writer().deleted_ids.is_empty(),
+            "expected no deletes when dedup disabled"
+        );
+        assert_eq!(indexer.writer().docs.len(), 1);
     });
 }
 
@@ -608,45 +608,45 @@ fn dedup_disabled_no_deletes() {
 #[test]
 fn mixed_event_types_full_pipeline() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    let events = vec![
-        make_ingress("i1", 1, 0, "echo hello"),
-        make_egress("e1", 1, 1, "hello\n"),
-        make_control("c1", 1, 2),
-        make_lifecycle("l1", 1, 3),
-        make_ingress("i2", 2, 0, "ls -la"),
-        make_egress("e2", 2, 1, "total 42\n"),
-    ];
-    append_events(&storage, "mixed", events.clone()).await;
+        let events = vec![
+            make_ingress("i1", 1, 0, "echo hello"),
+            make_egress("e1", 1, 1, "hello\n"),
+            make_control("c1", 1, 2),
+            make_lifecycle("l1", 1, 3),
+            make_ingress("i2", 2, 0, "ls -la"),
+            make_egress("e2", 2, 1, "total 42\n"),
+        ];
+        append_events(&storage, "mixed", events.clone()).await;
 
-    let icfg = indexer_config(dir.path(), "mixed-types");
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    let result = indexer.run(&storage).await.unwrap();
+        let icfg = indexer_config(dir.path(), "mixed-types");
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        let result = indexer.run(&storage).await.unwrap();
 
-    assert_eq!(result.events_indexed, 6);
-    assert!(result.caught_up);
+        assert_eq!(result.events_indexed, 6);
+        assert!(result.caught_up);
 
-    // Verify event types in indexed docs match source events
-    let docs = &indexer.writer().docs;
-    assert_eq!(docs[0].event_type, "ingress_text");
-    assert_eq!(docs[1].event_type, "egress_output");
-    assert_eq!(docs[2].event_type, "control_marker");
-    assert_eq!(docs[3].event_type, "lifecycle_marker");
-    assert_eq!(docs[4].event_type, "ingress_text");
-    assert_eq!(docs[5].event_type, "egress_output");
+        // Verify event types in indexed docs match source events
+        let docs = &indexer.writer().docs;
+        assert_eq!(docs[0].event_type, "ingress_text");
+        assert_eq!(docs[1].event_type, "egress_output");
+        assert_eq!(docs[2].event_type, "control_marker");
+        assert_eq!(docs[3].event_type, "lifecycle_marker");
+        assert_eq!(docs[4].event_type, "ingress_text");
+        assert_eq!(docs[5].event_type, "egress_output");
 
-    // Verify text fields
-    assert_eq!(docs[0].text, "echo hello");
-    assert_eq!(docs[1].text, "hello\n");
-    assert!(docs[2].text.is_empty()); // control markers have no text
-    assert_eq!(docs[3].text, "test"); // lifecycle text = reason field
+        // Verify text fields
+        assert_eq!(docs[0].text, "echo hello");
+        assert_eq!(docs[1].text, "hello\n");
+        assert!(docs[2].text.is_empty()); // control markers have no text
+        assert_eq!(docs[3].text, "test"); // lifecycle text = reason field
 
-    // Verify multi-pane preservation
-    assert_eq!(docs[0].pane_id, 1);
-    assert_eq!(docs[4].pane_id, 2);
+        // Verify multi-pane preservation
+        assert_eq!(docs[0].pane_id, 1);
+        assert_eq!(docs[4].pane_id, 2);
     });
 }
 
@@ -657,37 +657,37 @@ fn mixed_event_types_full_pipeline() {
 #[test]
 fn schema_version_filtering_skips_unknown() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    let v1_event = make_ingress("v1-evt", 1, 0, "valid");
-    let mut v2_event = make_ingress("v2-evt", 1, 1, "future");
-    v2_event.schema_version = "ft.recorder.event.v2-beta".to_string();
-    let v1_event_2 = make_ingress("v1-evt-2", 1, 2, "also valid");
+        let v1_event = make_ingress("v1-evt", 1, 0, "valid");
+        let mut v2_event = make_ingress("v2-evt", 1, 1, "future");
+        v2_event.schema_version = "ft.recorder.event.v2-beta".to_string();
+        let v1_event_2 = make_ingress("v1-evt-2", 1, 2, "also valid");
 
-    append_events(
-        &storage,
-        "mixed-schema",
-        vec![v1_event, v2_event, v1_event_2],
-    )
-    .await;
+        append_events(
+            &storage,
+            "mixed-schema",
+            vec![v1_event, v2_event, v1_event_2],
+        )
+        .await;
 
-    let icfg = indexer_config(dir.path(), "schema-filter");
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    let result = indexer.run(&storage).await.unwrap();
+        let icfg = indexer_config(dir.path(), "schema-filter");
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        let result = indexer.run(&storage).await.unwrap();
 
-    assert_eq!(result.events_read, 3);
-    assert_eq!(result.events_indexed, 2);
-    assert_eq!(result.events_skipped, 1);
+        assert_eq!(result.events_read, 3);
+        assert_eq!(result.events_indexed, 2);
+        assert_eq!(result.events_skipped, 1);
 
-    // Only v1 events should be indexed
-    assert_eq!(indexer.writer().docs.len(), 2);
-    assert_eq!(indexer.writer().docs[0].event_id, "v1-evt");
-    assert_eq!(indexer.writer().docs[1].event_id, "v1-evt-2");
+        // Only v1 events should be indexed
+        assert_eq!(indexer.writer().docs.len(), 2);
+        assert_eq!(indexer.writer().docs[0].event_id, "v1-evt");
+        assert_eq!(indexer.writer().docs[1].event_id, "v1-evt-2");
 
-    // Checkpoint should advance past all 3 (including skipped)
-    assert_eq!(result.final_ordinal, Some(2));
+        // Checkpoint should advance past all 3 (including skipped)
+        assert_eq!(result.final_ordinal, Some(2));
     });
 }
 
@@ -698,55 +698,55 @@ fn schema_version_filtering_skips_unknown() {
 #[test]
 fn lag_monitoring_accuracy_across_runs() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    let consumer = "lag-accuracy";
+        let consumer = "lag-accuracy";
 
-    // Initially empty: lag should report caught up
-    let lag0 = compute_indexer_lag(&storage, consumer).await.unwrap();
-    assert!(lag0.caught_up);
-    assert_eq!(lag0.records_behind, 0);
+        // Initially empty: lag should report caught up
+        let lag0 = compute_indexer_lag(&storage, consumer).await.unwrap();
+        assert!(lag0.caught_up);
+        assert_eq!(lag0.records_behind, 0);
 
-    // Append 10 events
-    append_events(
-        &storage,
-        "b1",
-        (0..10)
-            .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("t{i}")))
-            .collect(),
-    )
-    .await;
+        // Append 10 events
+        append_events(
+            &storage,
+            "b1",
+            (0..10)
+                .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("t{i}")))
+                .collect(),
+        )
+        .await;
 
-    // Lag should show 10 behind
-    let lag1 = compute_indexer_lag(&storage, consumer).await.unwrap();
-    assert_eq!(lag1.records_behind, 10);
-    assert!(!lag1.caught_up);
+        // Lag should show 10 behind
+        let lag1 = compute_indexer_lag(&storage, consumer).await.unwrap();
+        assert_eq!(lag1.records_behind, 10);
+        assert!(!lag1.caught_up);
 
-    // Index first 5
-    let icfg = IndexerConfig {
-        batch_size: 5,
-        max_batches: 1,
-        ..indexer_config(dir.path(), consumer)
-    };
-    let mut ix = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    ix.run(&storage).await.unwrap();
+        // Index first 5
+        let icfg = IndexerConfig {
+            batch_size: 5,
+            max_batches: 1,
+            ..indexer_config(dir.path(), consumer)
+        };
+        let mut ix = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        ix.run(&storage).await.unwrap();
 
-    // Lag should show 5 behind
-    let lag2 = compute_indexer_lag(&storage, consumer).await.unwrap();
-    assert_eq!(lag2.records_behind, 5);
-    assert!(!lag2.caught_up);
+        // Lag should show 5 behind
+        let lag2 = compute_indexer_lag(&storage, consumer).await.unwrap();
+        assert_eq!(lag2.records_behind, 5);
+        assert!(!lag2.caught_up);
 
-    // Index remaining
-    let icfg2 = indexer_config(dir.path(), consumer);
-    let mut ix2 = IncrementalIndexer::new(icfg2, TrackingWriter::new());
-    ix2.run(&storage).await.unwrap();
+        // Index remaining
+        let icfg2 = indexer_config(dir.path(), consumer);
+        let mut ix2 = IncrementalIndexer::new(icfg2, TrackingWriter::new());
+        ix2.run(&storage).await.unwrap();
 
-    // Lag should be zero
-    let lag3 = compute_indexer_lag(&storage, consumer).await.unwrap();
-    assert_eq!(lag3.records_behind, 0);
-    assert!(lag3.caught_up);
+        // Lag should be zero
+        let lag3 = compute_indexer_lag(&storage, consumer).await.unwrap();
+        assert_eq!(lag3.records_behind, 0);
+        assert!(lag3.caught_up);
     });
 }
 
@@ -757,55 +757,55 @@ fn lag_monitoring_accuracy_across_runs() {
 #[test]
 fn multi_consumer_independent_checkpoints() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    // Append 8 events
-    append_events(
-        &storage,
-        "b1",
-        (0..8)
-            .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("t{i}")))
-            .collect(),
-    )
-    .await;
+        // Append 8 events
+        append_events(
+            &storage,
+            "b1",
+            (0..8)
+                .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("t{i}")))
+                .collect(),
+        )
+        .await;
 
-    // Consumer A: index first 3
-    let icfg_a = IndexerConfig {
-        batch_size: 3,
-        max_batches: 1,
-        ..indexer_config(dir.path(), "consumer-a")
-    };
-    let mut ix_a = IncrementalIndexer::new(icfg_a, TrackingWriter::new());
-    ix_a.run(&storage).await.unwrap();
+        // Consumer A: index first 3
+        let icfg_a = IndexerConfig {
+            batch_size: 3,
+            max_batches: 1,
+            ..indexer_config(dir.path(), "consumer-a")
+        };
+        let mut ix_a = IncrementalIndexer::new(icfg_a, TrackingWriter::new());
+        ix_a.run(&storage).await.unwrap();
 
-    // Consumer B: index all 8
-    let icfg_b = indexer_config(dir.path(), "consumer-b");
-    let mut ix_b = IncrementalIndexer::new(icfg_b, TrackingWriter::new());
-    ix_b.run(&storage).await.unwrap();
+        // Consumer B: index all 8
+        let icfg_b = indexer_config(dir.path(), "consumer-b");
+        let mut ix_b = IncrementalIndexer::new(icfg_b, TrackingWriter::new());
+        ix_b.run(&storage).await.unwrap();
 
-    // Verify independent lag
-    let lag_a = compute_indexer_lag(&storage, "consumer-a").await.unwrap();
-    let lag_b = compute_indexer_lag(&storage, "consumer-b").await.unwrap();
+        // Verify independent lag
+        let lag_a = compute_indexer_lag(&storage, "consumer-a").await.unwrap();
+        let lag_b = compute_indexer_lag(&storage, "consumer-b").await.unwrap();
 
-    assert_eq!(lag_a.records_behind, 5, "consumer-a should have 5 behind");
-    assert_eq!(lag_b.records_behind, 0, "consumer-b should be caught up");
+        assert_eq!(lag_a.records_behind, 5, "consumer-a should have 5 behind");
+        assert_eq!(lag_b.records_behind, 0, "consumer-b should be caught up");
 
-    // Verify independent checkpoints
-    let cp_a = storage
-        .read_checkpoint(&CheckpointConsumerId("consumer-a".to_string()))
-        .await
-        .unwrap()
-        .unwrap();
-    let cp_b = storage
-        .read_checkpoint(&CheckpointConsumerId("consumer-b".to_string()))
-        .await
-        .unwrap()
-        .unwrap();
+        // Verify independent checkpoints
+        let cp_a = storage
+            .read_checkpoint(&CheckpointConsumerId("consumer-a".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        let cp_b = storage
+            .read_checkpoint(&CheckpointConsumerId("consumer-b".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
 
-    assert_eq!(cp_a.upto_offset.ordinal, 2);
-    assert_eq!(cp_b.upto_offset.ordinal, 7);
+        assert_eq!(cp_a.upto_offset.ordinal, 2);
+        assert_eq!(cp_b.upto_offset.ordinal, 7);
     });
 }
 
@@ -816,27 +816,27 @@ fn multi_consumer_independent_checkpoints() {
 #[test]
 fn idempotent_batch_replay_no_duplicates() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    let events = vec![
-        make_ingress("e0", 1, 0, "first"),
-        make_ingress("e1", 1, 1, "second"),
-    ];
+        let events = vec![
+            make_ingress("e0", 1, 0, "first"),
+            make_ingress("e1", 1, 1, "second"),
+        ];
 
-    // Append with same batch_id twice
-    append_events(&storage, "idem-batch", events.clone()).await;
-    append_events(&storage, "idem-batch", events.clone()).await;
+        // Append with same batch_id twice
+        append_events(&storage, "idem-batch", events.clone()).await;
+        append_events(&storage, "idem-batch", events.clone()).await;
 
-    // Second append should be idempotent (silently accepted, no new records)
-    let icfg = indexer_config(dir.path(), "idem-test");
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    let result = indexer.run(&storage).await.unwrap();
+        // Second append should be idempotent (silently accepted, no new records)
+        let icfg = indexer_config(dir.path(), "idem-test");
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        let result = indexer.run(&storage).await.unwrap();
 
-    // Should only see 2 events (not 4)
-    assert_eq!(result.events_indexed, 2);
-    assert!(result.caught_up);
+        // Should only see 2 events (not 4)
+        assert_eq!(result.events_indexed, 2);
+        assert!(result.caught_up);
     });
 }
 
@@ -847,36 +847,36 @@ fn idempotent_batch_replay_no_duplicates() {
 #[test]
 fn writer_rejection_skips_but_advances() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    append_events(
-        &storage,
-        "b1",
-        vec![
-            make_ingress("ok-1", 1, 0, "good"),
-            make_ingress("bad-1", 1, 1, "reject me"),
-            make_ingress("ok-2", 1, 2, "also good"),
-        ],
-    )
-    .await;
+        append_events(
+            &storage,
+            "b1",
+            vec![
+                make_ingress("ok-1", 1, 0, "good"),
+                make_ingress("bad-1", 1, 1, "reject me"),
+                make_ingress("ok-2", 1, 2, "also good"),
+            ],
+        )
+        .await;
 
-    let icfg = indexer_config(dir.path(), "reject-test");
-    let writer = TrackingWriter::with_rejections(vec!["bad-1".to_string()]);
-    let mut indexer = IncrementalIndexer::new(icfg, writer);
-    let result = indexer.run(&storage).await.unwrap();
+        let icfg = indexer_config(dir.path(), "reject-test");
+        let writer = TrackingWriter::with_rejections(vec!["bad-1".to_string()]);
+        let mut indexer = IncrementalIndexer::new(icfg, writer);
+        let result = indexer.run(&storage).await.unwrap();
 
-    assert_eq!(result.events_indexed, 2);
-    assert_eq!(result.events_skipped, 1);
-    assert_eq!(result.final_ordinal, Some(2)); // Checkpoint past all 3
+        assert_eq!(result.events_indexed, 2);
+        assert_eq!(result.events_skipped, 1);
+        assert_eq!(result.final_ordinal, Some(2)); // Checkpoint past all 3
 
-    // On second run, nothing should be re-indexed
-    let icfg2 = indexer_config(dir.path(), "reject-test");
-    let mut ix2 = IncrementalIndexer::new(icfg2, TrackingWriter::new());
-    let r2 = ix2.run(&storage).await.unwrap();
-    assert_eq!(r2.events_indexed, 0);
-    assert!(r2.caught_up);
+        // On second run, nothing should be re-indexed
+        let icfg2 = indexer_config(dir.path(), "reject-test");
+        let mut ix2 = IncrementalIndexer::new(icfg2, TrackingWriter::new());
+        let r2 = ix2.run(&storage).await.unwrap();
+        assert_eq!(r2.events_indexed, 0);
+        assert!(r2.caught_up);
     });
 }
 
@@ -887,33 +887,33 @@ fn writer_rejection_skips_but_advances() {
 #[test]
 fn commit_failure_prevents_checkpoint_advance() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    append_events(&storage, "b1", vec![make_ingress("e0", 1, 0, "text")]).await;
+        append_events(&storage, "b1", vec![make_ingress("e0", 1, 0, "text")]).await;
 
-    // First run with fail_commit → should error
-    let icfg = indexer_config(dir.path(), "fail-commit");
-    let mut indexer = IncrementalIndexer::new(icfg.clone(), TrackingWriter::with_fail_commit());
-    let err = indexer.run(&storage).await;
-    assert!(err.is_err());
+        // First run with fail_commit → should error
+        let icfg = indexer_config(dir.path(), "fail-commit");
+        let mut indexer = IncrementalIndexer::new(icfg.clone(), TrackingWriter::with_fail_commit());
+        let err = indexer.run(&storage).await;
+        assert!(err.is_err());
 
-    // Checkpoint should NOT have been committed
-    let cp = storage
-        .read_checkpoint(&CheckpointConsumerId("fail-commit".to_string()))
-        .await
-        .unwrap();
-    assert!(
-        cp.is_none(),
-        "checkpoint should not exist after commit failure"
-    );
+        // Checkpoint should NOT have been committed
+        let cp = storage
+            .read_checkpoint(&CheckpointConsumerId("fail-commit".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            cp.is_none(),
+            "checkpoint should not exist after commit failure"
+        );
 
-    // Retry with working writer should process the same event
-    let mut ix2 = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    let r2 = ix2.run(&storage).await.unwrap();
-    assert_eq!(r2.events_indexed, 1);
-    assert!(r2.caught_up);
+        // Retry with working writer should process the same event
+        let mut ix2 = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        let r2 = ix2.run(&storage).await.unwrap();
+        assert_eq!(r2.events_indexed, 1);
+        assert!(r2.caught_up);
     });
 }
 
@@ -924,47 +924,47 @@ fn commit_failure_prevents_checkpoint_advance() {
 #[test]
 fn torn_tail_recovery_reader_matches_storage() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
-    // Append 5 events
-    append_events(
-        &storage,
-        "b1",
-        (0..5)
-            .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("t{i}")))
-            .collect(),
-    )
-    .await;
+        // Append 5 events
+        append_events(
+            &storage,
+            "b1",
+            (0..5)
+                .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("t{i}")))
+                .collect(),
+        )
+        .await;
 
-    // Get health to verify head ordinal
-    let health = storage.health().await;
-    let _head_offset = health.latest_offset.unwrap();
+        // Get health to verify head ordinal
+        let health = storage.health().await;
+        let _head_offset = health.latest_offset.unwrap();
 
-    // Simulate a torn tail by appending garbage bytes after the valid data
-    let log_path = dir.path().join("events.log");
-    {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&log_path)
-            .unwrap();
-        // Write a length header claiming 1000 bytes but only 3 bytes of payload
-        f.write_all(&(1000u32).to_le_bytes()).unwrap();
-        f.write_all(b"bad").unwrap();
-    }
+        // Simulate a torn tail by appending garbage bytes after the valid data
+        let log_path = dir.path().join("events.log");
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            // Write a length header claiming 1000 bytes but only 3 bytes of payload
+            f.write_all(&(1000u32).to_le_bytes()).unwrap();
+            f.write_all(b"bad").unwrap();
+        }
 
-    // Reader should treat torn tail as EOF
-    let mut reader = AppendLogReader::open(&log_path).unwrap();
-    let records = reader.read_batch(100).unwrap();
-    assert_eq!(records.len(), 5, "reader should recover 5 valid records");
+        // Reader should treat torn tail as EOF
+        let mut reader = AppendLogReader::open(&log_path).unwrap();
+        let records = reader.read_batch(100).unwrap();
+        assert_eq!(records.len(), 5, "reader should recover 5 valid records");
 
-    // Reopen storage and verify it also recovers correctly
-    let storage2 = AppendLogRecorderStorage::open(scfg).unwrap();
-    let health2 = storage2.health().await;
-    // After torn-tail truncation on reopen, storage should have same head
-    assert!(health2.latest_offset.is_some());
+        // Reopen storage and verify it also recovers correctly
+        let storage2 = AppendLogRecorderStorage::open(scfg).unwrap();
+        let health2 = storage2.health().await;
+        // After torn-tail truncation on reopen, storage should have same head
+        assert!(health2.latest_offset.is_some());
     });
 }
 
@@ -1252,40 +1252,40 @@ async fn run_torn_tail_corruption_scenario() -> ChaosScenarioReport {
 #[test]
 fn chaos_failure_matrix_detects_faults_and_recovers_without_silent_loss() {
     run_async_test(async {
-    let reports = vec![
-        run_process_kill_resume_scenario().await,
-        run_commit_failure_recovery_scenario().await,
-        run_transient_io_recovery_scenario().await,
-        run_writer_rejection_scenario().await,
-        run_torn_tail_corruption_scenario().await,
-    ];
+        let reports = vec![
+            run_process_kill_resume_scenario().await,
+            run_commit_failure_recovery_scenario().await,
+            run_transient_io_recovery_scenario().await,
+            run_writer_rejection_scenario().await,
+            run_torn_tail_corruption_scenario().await,
+        ];
 
-    assert_eq!(reports.len(), 5);
-    assert!(
-        reports.iter().all(|r| r.detected),
-        "all injected faults must be detectable"
-    );
-    assert!(
-        reports.iter().all(|r| r.recovery_batches <= 3),
-        "recovery should remain bounded in matrix scenarios: {reports:?}"
-    );
+        assert_eq!(reports.len(), 5);
+        assert!(
+            reports.iter().all(|r| r.detected),
+            "all injected faults must be detectable"
+        );
+        assert!(
+            reports.iter().all(|r| r.recovery_batches <= 3),
+            "recovery should remain bounded in matrix scenarios: {reports:?}"
+        );
 
-    for report in &reports {
-        emit_chaos_artifact(report.name, report.as_artifact());
-    }
+        for report in &reports {
+            emit_chaos_artifact(report.name, report.as_artifact());
+        }
 
-    let recovered_events_total: u64 = reports.iter().map(|r| r.recovered_events).sum();
-    let skipped_events_total: u64 = reports.iter().map(|r| r.skipped_events).sum();
-    emit_chaos_artifact(
-        "matrix_summary",
-        serde_json::json!({
-            "scenario_count": reports.len(),
-            "detected_count": reports.iter().filter(|r| r.detected).count(),
-            "recovered_events_total": recovered_events_total,
-            "skipped_events_total": skipped_events_total,
-            "reports": reports.iter().map(|r| r.as_artifact()).collect::<Vec<_>>(),
-        }),
-    );
+        let recovered_events_total: u64 = reports.iter().map(|r| r.recovered_events).sum();
+        let skipped_events_total: u64 = reports.iter().map(|r| r.skipped_events).sum();
+        emit_chaos_artifact(
+            "matrix_summary",
+            serde_json::json!({
+                "scenario_count": reports.len(),
+                "detected_count": reports.iter().filter(|r| r.detected).count(),
+                "recovered_events_total": recovered_events_total,
+                "skipped_events_total": skipped_events_total,
+                "reports": reports.iter().map(|r| r.as_artifact()).collect::<Vec<_>>(),
+            }),
+        );
     });
 }
 
@@ -1296,30 +1296,30 @@ fn chaos_failure_matrix_detects_faults_and_recovers_without_silent_loss() {
 #[test]
 fn indexed_docs_preserve_merge_key_data() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    let events = vec![
-        make_ingress("e0", 1, 0, "first"),
-        make_ingress("e1", 2, 0, "second-pane"),
-        make_ingress("e2", 1, 1, "third"),
-    ];
-    append_events(&storage, "b1", events.clone()).await;
+        let events = vec![
+            make_ingress("e0", 1, 0, "first"),
+            make_ingress("e1", 2, 0, "second-pane"),
+            make_ingress("e2", 1, 1, "third"),
+        ];
+        append_events(&storage, "b1", events.clone()).await;
 
-    let icfg = indexer_config(dir.path(), "merge-key-test");
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    indexer.run(&storage).await.unwrap();
+        let icfg = indexer_config(dir.path(), "merge-key-test");
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        indexer.run(&storage).await.unwrap();
 
-    // Verify key fields used in merge key are preserved
-    for (i, doc) in indexer.writer().docs.iter().enumerate() {
-        let src = &events[i];
-        assert_eq!(doc.pane_id, src.pane_id);
-        assert_eq!(doc.sequence, src.sequence);
-        assert_eq!(doc.recorded_at_ms, src.recorded_at_ms as i64);
-        assert_eq!(doc.occurred_at_ms, src.occurred_at_ms as i64);
-        assert_eq!(doc.event_id, src.event_id);
-    }
+        // Verify key fields used in merge key are preserved
+        for (i, doc) in indexer.writer().docs.iter().enumerate() {
+            let src = &events[i];
+            assert_eq!(doc.pane_id, src.pane_id);
+            assert_eq!(doc.sequence, src.sequence);
+            assert_eq!(doc.recorded_at_ms, src.recorded_at_ms as i64);
+            assert_eq!(doc.occurred_at_ms, src.occurred_at_ms as i64);
+            assert_eq!(doc.event_id, src.event_id);
+        }
     });
 }
 
@@ -1330,33 +1330,33 @@ fn indexed_docs_preserve_merge_key_data() {
 #[test]
 fn log_offset_monotonically_increasing() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    append_events(
-        &storage,
-        "b1",
-        (0..10)
-            .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("t{i}")))
-            .collect(),
-    )
-    .await;
+        append_events(
+            &storage,
+            "b1",
+            (0..10)
+                .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("t{i}")))
+                .collect(),
+        )
+        .await;
 
-    let icfg = indexer_config(dir.path(), "offset-test");
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    indexer.run(&storage).await.unwrap();
+        let icfg = indexer_config(dir.path(), "offset-test");
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        indexer.run(&storage).await.unwrap();
 
-    // Log offsets should be monotonically increasing
-    let offsets: Vec<u64> = indexer.writer().docs.iter().map(|d| d.log_offset).collect();
-    for w in offsets.windows(2) {
-        assert!(
-            w[1] > w[0],
-            "log offsets must be monotonic: {} > {}",
-            w[1],
-            w[0]
-        );
-    }
+        // Log offsets should be monotonically increasing
+        let offsets: Vec<u64> = indexer.writer().docs.iter().map(|d| d.log_offset).collect();
+        for w in offsets.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "log offsets must be monotonic: {} > {}",
+                w[1],
+                w[0]
+            );
+        }
     });
 }
 
@@ -1367,48 +1367,48 @@ fn log_offset_monotonically_increasing() {
 #[test]
 fn redaction_levels_applied_in_pipeline() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    let mut partial = make_ingress("partial-red", 1, 0, "secret data");
-    if let RecorderEventPayload::IngressText {
-        ref mut redaction, ..
-    } = partial.payload
-    {
-        *redaction = RecorderRedactionLevel::Partial;
-    }
+        let mut partial = make_ingress("partial-red", 1, 0, "secret data");
+        if let RecorderEventPayload::IngressText {
+            ref mut redaction, ..
+        } = partial.payload
+        {
+            *redaction = RecorderRedactionLevel::Partial;
+        }
 
-    let mut full = make_ingress("full-red", 1, 1, "top secret");
-    if let RecorderEventPayload::IngressText {
-        ref mut redaction, ..
-    } = full.payload
-    {
-        *redaction = RecorderRedactionLevel::Full;
-    }
+        let mut full = make_ingress("full-red", 1, 1, "top secret");
+        if let RecorderEventPayload::IngressText {
+            ref mut redaction, ..
+        } = full.payload
+        {
+            *redaction = RecorderRedactionLevel::Full;
+        }
 
-    let none = make_ingress("no-red", 1, 2, "public data");
+        let none = make_ingress("no-red", 1, 2, "public data");
 
-    append_events(&storage, "b1", vec![partial, full, none]).await;
+        append_events(&storage, "b1", vec![partial, full, none]).await;
 
-    let icfg = indexer_config(dir.path(), "redaction-test");
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    indexer.run(&storage).await.unwrap();
+        let icfg = indexer_config(dir.path(), "redaction-test");
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        indexer.run(&storage).await.unwrap();
 
-    let docs = &indexer.writer().docs;
-    assert_eq!(docs.len(), 3);
+        let docs = &indexer.writer().docs;
+        assert_eq!(docs.len(), 3);
 
-    // Partial redaction: text replaced with [REDACTED]
-    assert_eq!(docs[0].redaction, Some("partial".to_string()));
-    assert_eq!(docs[0].text, "[REDACTED]");
+        // Partial redaction: text replaced with [REDACTED]
+        assert_eq!(docs[0].redaction, Some("partial".to_string()));
+        assert_eq!(docs[0].text, "[REDACTED]");
 
-    // Full redaction: text stripped to empty
-    assert_eq!(docs[1].redaction, Some("full".to_string()));
-    assert!(docs[1].text.is_empty(), "full redaction should strip text");
+        // Full redaction: text stripped to empty
+        assert_eq!(docs[1].redaction, Some("full".to_string()));
+        assert!(docs[1].text.is_empty(), "full redaction should strip text");
 
-    // No redaction: original text preserved
-    assert_eq!(docs[2].redaction, Some("none".to_string()));
-    assert_eq!(docs[2].text, "public data");
+        // No redaction: original text preserved
+        assert_eq!(docs[2].redaction, Some("none".to_string()));
+        assert_eq!(docs[2].text, "public data");
     });
 }
 
@@ -1419,87 +1419,88 @@ fn redaction_levels_applied_in_pipeline() {
 #[test]
 fn large_scale_multi_pane_end_to_end() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    let num_panes = 5u64;
-    let events_per_pane = 40usize;
-    let assigner = SequenceAssigner::new();
+        let num_panes = 5u64;
+        let events_per_pane = 40usize;
+        let assigner = SequenceAssigner::new();
 
-    let mut all_events = Vec::new();
-    for round in 0..events_per_pane {
-        for pane_id in 0..num_panes {
-            let (seq, _) = assigner.assign(pane_id);
-            let mut event = make_ingress(
-                "placeholder",
-                pane_id,
-                seq,
-                &format!("p{}-r{}", pane_id, round),
-            );
-            event.event_id = generate_event_id_v1(&event);
-            all_events.push(event);
+        let mut all_events = Vec::new();
+        for round in 0..events_per_pane {
+            for pane_id in 0..num_panes {
+                let (seq, _) = assigner.assign(pane_id);
+                let mut event = make_ingress(
+                    "placeholder",
+                    pane_id,
+                    seq,
+                    &format!("p{}-r{}", pane_id, round),
+                );
+                event.event_id = generate_event_id_v1(&event);
+                all_events.push(event);
+            }
         }
-    }
 
-    // Append in chunks (mimicking real batched writes)
-    for (i, chunk) in all_events.chunks(20).enumerate() {
-        append_events(&storage, &format!("chunk-{i}"), chunk.to_vec()).await;
-    }
+        // Append in chunks (mimicking real batched writes)
+        for (i, chunk) in all_events.chunks(20).enumerate() {
+            append_events(&storage, &format!("chunk-{i}"), chunk.to_vec()).await;
+        }
 
-    // Index all events
-    let icfg = IndexerConfig {
-        batch_size: 50,
-        ..indexer_config(dir.path(), "large-scale")
-    };
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    let result = indexer.run(&storage).await.unwrap();
+        // Index all events
+        let icfg = IndexerConfig {
+            batch_size: 50,
+            ..indexer_config(dir.path(), "large-scale")
+        };
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        let result = indexer.run(&storage).await.unwrap();
 
-    let total_events = num_panes as usize * events_per_pane;
-    assert_eq!(result.events_indexed, total_events as u64);
-    assert!(result.caught_up);
-    assert_eq!(indexer.writer().docs.len(), total_events);
+        let total_events = num_panes as usize * events_per_pane;
+        assert_eq!(result.events_indexed, total_events as u64);
+        assert!(result.caught_up);
+        assert_eq!(indexer.writer().docs.len(), total_events);
 
-    // Verify all panes represented
-    let mut pane_counts = std::collections::HashMap::new();
-    for doc in &indexer.writer().docs {
-        *pane_counts.entry(doc.pane_id).or_insert(0u64) += 1;
-    }
-    for pane_id in 0..num_panes {
-        assert_eq!(
-            pane_counts[&pane_id], events_per_pane as u64,
-            "pane {} should have {} events",
-            pane_id, events_per_pane
-        );
-    }
+        // Verify all panes represented
+        let mut pane_counts = std::collections::HashMap::new();
+        for doc in &indexer.writer().docs {
+            *pane_counts.entry(doc.pane_id).or_insert(0u64) += 1;
+        }
+        for pane_id in 0..num_panes {
+            assert_eq!(
+                pane_counts[&pane_id], events_per_pane as u64,
+                "pane {} should have {} events",
+                pane_id, events_per_pane
+            );
+        }
 
-    // Run source events through InvariantChecker
-    let mut sorted = all_events.clone();
-    sorted.sort_by(|a, b| RecorderMergeKey::from_event(a).cmp(&RecorderMergeKey::from_event(b)));
+        // Run source events through InvariantChecker
+        let mut sorted = all_events.clone();
+        sorted
+            .sort_by(|a, b| RecorderMergeKey::from_event(a).cmp(&RecorderMergeKey::from_event(b)));
 
-    let config = InvariantCheckerConfig {
-        check_merge_order: true,
-        check_causality: false,
-        expected_schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
-        ..Default::default()
-    };
-    let checker = InvariantChecker::with_config(config);
-    let report = checker.check(&sorted);
-    assert!(
-        report.passed,
-        "invariant violations: {:?}",
-        report.violations
-    );
-
-    // Verify event IDs in indexed docs are unique
-    let mut seen_ids = std::collections::HashSet::new();
-    for doc in &indexer.writer().docs {
+        let config = InvariantCheckerConfig {
+            check_merge_order: true,
+            check_causality: false,
+            expected_schema_version: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            ..Default::default()
+        };
+        let checker = InvariantChecker::with_config(config);
+        let report = checker.check(&sorted);
         assert!(
-            seen_ids.insert(&doc.event_id),
-            "duplicate event_id in indexed docs: {}",
-            doc.event_id
+            report.passed,
+            "invariant violations: {:?}",
+            report.violations
         );
-    }
+
+        // Verify event IDs in indexed docs are unique
+        let mut seen_ids = std::collections::HashSet::new();
+        for doc in &indexer.writer().docs {
+            assert!(
+                seen_ids.insert(&doc.event_id),
+                "duplicate event_id in indexed docs: {}",
+                doc.event_id
+            );
+        }
     });
 }
 
@@ -1510,26 +1511,26 @@ fn large_scale_multi_pane_end_to_end() {
 #[test]
 fn storage_flush_modes_with_indexer() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    append_events(&storage, "b1", vec![make_ingress("e0", 1, 0, "hello")]).await;
+        append_events(&storage, "b1", vec![make_ingress("e0", 1, 0, "hello")]).await;
 
-    // Flush in buffered mode
-    let stats = storage.flush(FlushMode::Buffered).await.unwrap();
-    assert!(stats.latest_offset.is_some());
+        // Flush in buffered mode
+        let stats = storage.flush(FlushMode::Buffered).await.unwrap();
+        assert!(stats.latest_offset.is_some());
 
-    // Flush in durable mode
-    let stats2 = storage.flush(FlushMode::Durable).await.unwrap();
-    assert!(stats2.latest_offset.is_some());
+        // Flush in durable mode
+        let stats2 = storage.flush(FlushMode::Durable).await.unwrap();
+        assert!(stats2.latest_offset.is_some());
 
-    // Indexer should still work after flushes
-    let icfg = indexer_config(dir.path(), "flush-test");
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    let result = indexer.run(&storage).await.unwrap();
-    assert_eq!(result.events_indexed, 1);
-    assert!(result.caught_up);
+        // Indexer should still work after flushes
+        let icfg = indexer_config(dir.path(), "flush-test");
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        let result = indexer.run(&storage).await.unwrap();
+        assert_eq!(result.events_indexed, 1);
+        assert!(result.caught_up);
     });
 }
 
@@ -1586,33 +1587,33 @@ fn document_mapper_all_event_types() {
 #[test]
 fn reader_and_storage_agree_on_record_count() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    let event_count = 25u64;
-    for i in 0..event_count {
-        append_events(
-            &storage,
-            &format!("b-{i}"),
-            vec![make_ingress(&format!("e{i}"), 1, i, &format!("t{i}"))],
-        )
-        .await;
-    }
+        let event_count = 25u64;
+        for i in 0..event_count {
+            append_events(
+                &storage,
+                &format!("b-{i}"),
+                vec![make_ingress(&format!("e{i}"), 1, i, &format!("t{i}"))],
+            )
+            .await;
+        }
 
-    // Storage health should report latest ordinal
-    let health = storage.health().await;
-    assert!(health.latest_offset.is_some());
+        // Storage health should report latest ordinal
+        let health = storage.health().await;
+        assert!(health.latest_offset.is_some());
 
-    // Reader should be able to read all records
-    let mut reader = AppendLogReader::open(&dir.path().join("events.log")).unwrap();
-    let all_records = reader.read_batch(1000).unwrap();
-    assert_eq!(all_records.len(), event_count as usize);
+        // Reader should be able to read all records
+        let mut reader = AppendLogReader::open(&dir.path().join("events.log")).unwrap();
+        let all_records = reader.read_batch(1000).unwrap();
+        assert_eq!(all_records.len(), event_count as usize);
 
-    // Ordinals should be sequential
-    for (i, record) in all_records.iter().enumerate() {
-        assert_eq!(record.offset.ordinal, i as u64);
-    }
+        // Ordinals should be sequential
+        for (i, record) in all_records.iter().enumerate() {
+            assert_eq!(record.offset.ordinal, i as u64);
+        }
     });
 }
 
@@ -1623,40 +1624,40 @@ fn reader_and_storage_agree_on_record_count() {
 #[test]
 fn deterministic_ids_unique_after_roundtrip() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    let assigner = SequenceAssigner::new();
-    let mut events = Vec::new();
-    for pane_id in 0..3u64 {
-        for _ in 0..10 {
-            let (seq, _) = assigner.assign(pane_id);
-            events.push(make_event_with_det_id(
-                pane_id,
-                seq,
-                &format!("p{pane_id}-s{seq}"),
-            ));
+        let assigner = SequenceAssigner::new();
+        let mut events = Vec::new();
+        for pane_id in 0..3u64 {
+            for _ in 0..10 {
+                let (seq, _) = assigner.assign(pane_id);
+                events.push(make_event_with_det_id(
+                    pane_id,
+                    seq,
+                    &format!("p{pane_id}-s{seq}"),
+                ));
+            }
         }
-    }
 
-    append_events(&storage, "det-ids", events.clone()).await;
+        append_events(&storage, "det-ids", events.clone()).await;
 
-    // Read back through reader and verify IDs match
-    let mut reader = AppendLogReader::open(&dir.path().join("events.log")).unwrap();
-    let records = reader.read_batch(100).unwrap();
+        // Read back through reader and verify IDs match
+        let mut reader = AppendLogReader::open(&dir.path().join("events.log")).unwrap();
+        let records = reader.read_batch(100).unwrap();
 
-    assert_eq!(records.len(), 30);
+        assert_eq!(records.len(), 30);
 
-    // All IDs should be unique
-    let ids: std::collections::HashSet<&str> =
-        records.iter().map(|r| r.event.event_id.as_str()).collect();
-    assert_eq!(ids.len(), 30, "all 30 event IDs should be unique");
+        // All IDs should be unique
+        let ids: std::collections::HashSet<&str> =
+            records.iter().map(|r| r.event.event_id.as_str()).collect();
+        assert_eq!(ids.len(), 30, "all 30 event IDs should be unique");
 
-    // IDs should match source events
-    for (i, record) in records.iter().enumerate() {
-        assert_eq!(record.event.event_id, events[i].event_id);
-    }
+        // IDs should match source events
+        for (i, record) in records.iter().enumerate() {
+            assert_eq!(record.event.event_id, events[i].event_id);
+        }
     });
 }
 
@@ -1667,33 +1668,33 @@ fn deterministic_ids_unique_after_roundtrip() {
 #[test]
 fn batch_boundary_exact_fit() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    // Append exactly 10 events (matches default batch_size)
-    append_events(
-        &storage,
-        "b1",
-        (0..10)
-            .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("t{i}")))
-            .collect(),
-    )
-    .await;
+        // Append exactly 10 events (matches default batch_size)
+        append_events(
+            &storage,
+            "b1",
+            (0..10)
+                .map(|i| make_ingress(&format!("e{i}"), 1, i, &format!("t{i}")))
+                .collect(),
+        )
+        .await;
 
-    let icfg = IndexerConfig {
-        batch_size: 10,
-        ..indexer_config(dir.path(), "batch-boundary")
-    };
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    let result = indexer.run(&storage).await.unwrap();
+        let icfg = IndexerConfig {
+            batch_size: 10,
+            ..indexer_config(dir.path(), "batch-boundary")
+        };
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        let result = indexer.run(&storage).await.unwrap();
 
-    // When batch_size exactly matches event count, indexer reads a full batch
-    // then reads again and gets empty → caught_up
-    assert_eq!(result.events_indexed, 10);
-    assert!(result.caught_up);
-    // Should take at most 2 batch reads (one full, one empty)
-    assert!(result.batches_committed >= 1);
+        // When batch_size exactly matches event count, indexer reads a full batch
+        // then reads again and gets empty → caught_up
+        assert_eq!(result.events_indexed, 10);
+        assert!(result.caught_up);
+        // Should take at most 2 batch reads (one full, one empty)
+        assert!(result.batches_committed >= 1);
     });
 }
 
@@ -1704,31 +1705,31 @@ fn batch_boundary_exact_fit() {
 #[test]
 fn causality_preserved_through_pipeline() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    let mut event = make_ingress("causal-1", 1, 0, "trigger response");
-    event.causality = RecorderEventCausality {
-        parent_event_id: Some("parent-abc".to_string()),
-        trigger_event_id: Some("trigger-xyz".to_string()),
-        root_event_id: Some("root-001".to_string()),
-    };
-    event.workflow_id = Some("wf-test".to_string());
-    event.correlation_id = Some("corr-test".to_string());
+        let mut event = make_ingress("causal-1", 1, 0, "trigger response");
+        event.causality = RecorderEventCausality {
+            parent_event_id: Some("parent-abc".to_string()),
+            trigger_event_id: Some("trigger-xyz".to_string()),
+            root_event_id: Some("root-001".to_string()),
+        };
+        event.workflow_id = Some("wf-test".to_string());
+        event.correlation_id = Some("corr-test".to_string());
 
-    append_events(&storage, "causal-batch", vec![event]).await;
+        append_events(&storage, "causal-batch", vec![event]).await;
 
-    let icfg = indexer_config(dir.path(), "causal-test");
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    indexer.run(&storage).await.unwrap();
+        let icfg = indexer_config(dir.path(), "causal-test");
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        indexer.run(&storage).await.unwrap();
 
-    let doc = &indexer.writer().docs[0];
-    assert_eq!(doc.parent_event_id, Some("parent-abc".to_string()));
-    assert_eq!(doc.trigger_event_id, Some("trigger-xyz".to_string()));
-    assert_eq!(doc.root_event_id, Some("root-001".to_string()));
-    assert_eq!(doc.workflow_id, Some("wf-test".to_string()));
-    assert_eq!(doc.correlation_id, Some("corr-test".to_string()));
+        let doc = &indexer.writer().docs[0];
+        assert_eq!(doc.parent_event_id, Some("parent-abc".to_string()));
+        assert_eq!(doc.trigger_event_id, Some("trigger-xyz".to_string()));
+        assert_eq!(doc.root_event_id, Some("root-001".to_string()));
+        assert_eq!(doc.workflow_id, Some("wf-test".to_string()));
+        assert_eq!(doc.correlation_id, Some("corr-test".to_string()));
     });
 }
 
@@ -1739,35 +1740,35 @@ fn causality_preserved_through_pipeline() {
 #[test]
 fn empty_run_between_populated_runs() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    let consumer = "empty-between";
+        let consumer = "empty-between";
 
-    // Phase 1: append and index
-    append_events(&storage, "b1", vec![make_ingress("e0", 1, 0, "first")]).await;
+        // Phase 1: append and index
+        append_events(&storage, "b1", vec![make_ingress("e0", 1, 0, "first")]).await;
 
-    let icfg = indexer_config(dir.path(), consumer);
-    let mut ix1 = IncrementalIndexer::new(icfg.clone(), TrackingWriter::new());
-    let r1 = ix1.run(&storage).await.unwrap();
-    assert_eq!(r1.events_indexed, 1);
-    assert!(r1.caught_up);
+        let icfg = indexer_config(dir.path(), consumer);
+        let mut ix1 = IncrementalIndexer::new(icfg.clone(), TrackingWriter::new());
+        let r1 = ix1.run(&storage).await.unwrap();
+        assert_eq!(r1.events_indexed, 1);
+        assert!(r1.caught_up);
 
-    // Phase 2: run again with nothing new → no-op
-    let mut ix2 = IncrementalIndexer::new(icfg.clone(), TrackingWriter::new());
-    let r2 = ix2.run(&storage).await.unwrap();
-    assert_eq!(r2.events_indexed, 0);
-    assert!(r2.caught_up);
+        // Phase 2: run again with nothing new → no-op
+        let mut ix2 = IncrementalIndexer::new(icfg.clone(), TrackingWriter::new());
+        let r2 = ix2.run(&storage).await.unwrap();
+        assert_eq!(r2.events_indexed, 0);
+        assert!(r2.caught_up);
 
-    // Phase 3: append more and index
-    append_events(&storage, "b2", vec![make_ingress("e1", 1, 1, "third")]).await;
+        // Phase 3: append more and index
+        append_events(&storage, "b2", vec![make_ingress("e1", 1, 1, "third")]).await;
 
-    let mut ix3 = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    let r3 = ix3.run(&storage).await.unwrap();
-    assert_eq!(r3.events_indexed, 1);
-    assert!(r3.caught_up);
-    assert_eq!(ix3.writer().docs[0].event_id, "e1");
+        let mut ix3 = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        let r3 = ix3.run(&storage).await.unwrap();
+        assert_eq!(r3.events_indexed, 1);
+        assert!(r3.caught_up);
+        assert_eq!(ix3.writer().docs[0].event_id, "e1");
     });
 }
 
@@ -1778,30 +1779,31 @@ fn empty_run_between_populated_runs() {
 #[test]
 fn indexed_document_serde_roundtrip() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let scfg = storage_config(dir.path());
-    let storage = AppendLogRecorderStorage::open(scfg).unwrap();
+        let dir = tempdir().unwrap();
+        let scfg = storage_config(dir.path());
+        let storage = AppendLogRecorderStorage::open(scfg).unwrap();
 
-    append_events(
-        &storage,
-        "b1",
-        vec![
-            make_ingress("i1", 1, 0, "hello"),
-            make_egress("e1", 2, 1, "world"),
-            make_control("c1", 3, 2),
-        ],
-    )
-    .await;
+        append_events(
+            &storage,
+            "b1",
+            vec![
+                make_ingress("i1", 1, 0, "hello"),
+                make_egress("e1", 2, 1, "world"),
+                make_control("c1", 3, 2),
+            ],
+        )
+        .await;
 
-    let icfg = indexer_config(dir.path(), "serde-test");
-    let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
-    indexer.run(&storage).await.unwrap();
+        let icfg = indexer_config(dir.path(), "serde-test");
+        let mut indexer = IncrementalIndexer::new(icfg, TrackingWriter::new());
+        indexer.run(&storage).await.unwrap();
 
-    // Serialize and deserialize each indexed document
-    for doc in &indexer.writer().docs {
-        let json = serde_json::to_string(doc).expect("serialize");
-        let roundtripped: IndexDocumentFields = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(doc, &roundtripped);
-    }
+        // Serialize and deserialize each indexed document
+        for doc in &indexer.writer().docs {
+            let json = serde_json::to_string(doc).expect("serialize");
+            let roundtripped: IndexDocumentFields =
+                serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(doc, &roundtripped);
+        }
     });
 }

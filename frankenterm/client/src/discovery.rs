@@ -371,16 +371,16 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
     if let Ok(dir) = std::fs::read_dir(&*config::RUNTIME_DIR) {
         for entry in dir.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with("gui-sock-") {
-                        let path = entry.path();
-                        if let Ok(meta) = entry.metadata() {
-                            let age = meta_age(&meta);
-                            if is_sock_dead(&path) && age > Duration::from_secs(1) {
-                                let _ = std::fs::remove_file(&path);
-                            } else {
-                                socks.push(Entry { path, age });
-                            }
+                if name.starts_with("gui-sock-") {
+                    let path = entry.path();
+                    if let Ok(meta) = entry.metadata() {
+                        let age = meta_age(&meta);
+                        if is_sock_dead(&path) && age > Duration::from_secs(1) {
+                            let _ = std::fs::remove_file(&path);
+                        } else {
+                            socks.push(Entry { path, age });
                         }
+                    }
                 }
             }
         }

@@ -28,7 +28,7 @@
 //! - **Multi-node sync**: In distributed mode, nodes reconcile pane state
 //!   without full snapshots.
 
-use crate::merkle_tree::{MerkleHash, MerkleTree, TreeDiff};
+use crate::merkle_tree::{MerkleHash, MerkleTree};
 use serde::{Deserialize, Serialize};
 
 // ── Protocol messages ────────────────────────────────────────────

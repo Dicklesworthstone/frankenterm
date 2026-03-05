@@ -654,7 +654,9 @@ mod tests {
                     undoable: true,
                     undo_strategy: "workflow_abort".to_string(),
                     undo_hint: Some(format!("ft robot workflow abort {execution_id}")),
-                    undo_payload: Some(serde_json::json!({ "execution_id": execution_id }).to_string()),
+                    undo_payload: Some(
+                        serde_json::json!({ "execution_id": execution_id }).to_string(),
+                    ),
                     undone_at: None,
                     undone_by: None,
                 })
@@ -733,7 +735,8 @@ mod tests {
             let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
             let pane_id = 21_u64;
             seed_pane(storage.as_ref(), pane_id).await;
-            let action_id = seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
+            let action_id =
+                seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
             let initial_undone_at = now_ms() - 1_000;
 
             storage
@@ -1135,7 +1138,8 @@ mod tests {
             );
 
             seed_pane(storage.as_ref(), 1).await;
-            let action_id = seed_action(storage.as_ref(), 1, "human", Some("cli"), "send_text").await;
+            let action_id =
+                seed_action(storage.as_ref(), 1, "human", Some("cli"), "send_text").await;
 
             let mock = Arc::new(MockWezterm::new());
             let executor = UndoExecutor::new(Arc::clone(&storage), mock);
@@ -1452,7 +1456,8 @@ mod tests {
             let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
             let pane_id = 55_u64;
             seed_pane(storage.as_ref(), pane_id).await;
-            let action_id = seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
+            let action_id =
+                seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
 
             storage
                 .upsert_action_undo(ActionUndoRecord {

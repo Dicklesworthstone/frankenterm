@@ -14,9 +14,7 @@ mod common;
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::config::{Config, WorkspaceLayout};
 use frankenterm_core::diagnostic::{DiagnosticOptions, generate_bundle};
-use frankenterm_core::storage::{
-    AuditActionRecord, PaneRecord, StorageHandle, SCHEMA_VERSION,
-};
+use frankenterm_core::storage::{AuditActionRecord, PaneRecord, SCHEMA_VERSION, StorageHandle};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ===========================================================================
@@ -72,18 +70,13 @@ fn generate_bundle_creates_all_files() {
 
         let config = Config::default();
         let layout = WorkspaceLayout::new(
-            std::env::temp_dir().join(format!(
-                "wa_labrt_diag_ws_all_{}",
-                std::process::id()
-            )),
+            std::env::temp_dir().join(format!("wa_labrt_diag_ws_all_{}", std::process::id())),
             &config.storage,
             &config.ipc,
         );
 
-        let output_dir = std::env::temp_dir().join(format!(
-            "wa_labrt_diag_output_all_{}",
-            std::process::id()
-        ));
+        let output_dir =
+            std::env::temp_dir().join(format!("wa_labrt_diag_output_all_{}", std::process::id()));
         let opts = DiagnosticOptions {
             output: Some(output_dir.clone()),
             ..Default::default()
@@ -110,27 +103,21 @@ fn generate_bundle_creates_all_files() {
         assert!(output_dir.join("recent_audit.json").exists());
 
         // Verify manifest is valid JSON with expected fields
-        let manifest_content =
-            std::fs::read_to_string(output_dir.join("manifest.json")).unwrap();
-        let manifest: serde_json::Value =
-            serde_json::from_str(&manifest_content).unwrap();
+        let manifest_content = std::fs::read_to_string(output_dir.join("manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
         assert!(manifest["redacted"].as_bool().unwrap());
         assert!(manifest["file_count"].as_u64().unwrap() >= 8);
         assert!(!manifest["wa_version"].as_str().unwrap().is_empty());
 
         // Verify environment.json
-        let env_content =
-            std::fs::read_to_string(output_dir.join("environment.json")).unwrap();
-        let env_info: serde_json::Value =
-            serde_json::from_str(&env_content).unwrap();
+        let env_content = std::fs::read_to_string(output_dir.join("environment.json")).unwrap();
+        let env_info: serde_json::Value = serde_json::from_str(&env_content).unwrap();
         assert!(!env_info["wa_version"].as_str().unwrap().is_empty());
         assert_eq!(env_info["schema_version"], SCHEMA_VERSION);
 
         // Verify db_health.json
-        let health_content =
-            std::fs::read_to_string(output_dir.join("db_health.json")).unwrap();
-        let health: serde_json::Value =
-            serde_json::from_str(&health_content).unwrap();
+        let health_content = std::fs::read_to_string(output_dir.join("db_health.json")).unwrap();
+        let health: serde_json::Value = serde_json::from_str(&health_content).unwrap();
         assert!(health["page_count"].as_i64().unwrap() > 0);
         assert_eq!(health["table_counts"]["panes"], 1);
 
@@ -178,8 +165,7 @@ fn bundle_does_not_contain_secrets() {
             action_kind: "test".to_string(),
             policy_decision: "allow".to_string(),
             decision_reason: Some(
-                "API key sk-abc123def456ghi789jkl012mno345pqr678stu901v found"
-                    .to_string(),
+                "API key sk-abc123def456ghi789jkl012mno345pqr678stu901v found".to_string(),
             ),
             rule_id: None,
             input_summary: None,
@@ -191,10 +177,7 @@ fn bundle_does_not_contain_secrets() {
 
         let config = Config::default();
         let layout = WorkspaceLayout::new(
-            std::env::temp_dir().join(format!(
-                "wa_labrt_diag_secrets_ws_{}",
-                std::process::id()
-            )),
+            std::env::temp_dir().join(format!("wa_labrt_diag_secrets_ws_{}", std::process::id())),
             &config.storage,
             &config.ipc,
         );
@@ -225,8 +208,7 @@ fn bundle_does_not_contain_secrets() {
         }
 
         // Verify the audit file exists and has [REDACTED]
-        let audit_content =
-            std::fs::read_to_string(output_dir.join("recent_audit.json")).unwrap();
+        let audit_content = std::fs::read_to_string(output_dir.join("recent_audit.json")).unwrap();
         assert!(audit_content.contains("[REDACTED]"));
 
         storage.shutdown().await.unwrap();
@@ -245,18 +227,13 @@ fn bundle_manifest_has_stable_metadata() {
 
         let config = Config::default();
         let layout = WorkspaceLayout::new(
-            std::env::temp_dir().join(format!(
-                "wa_labrt_diag_meta_ws_{}",
-                std::process::id()
-            )),
+            std::env::temp_dir().join(format!("wa_labrt_diag_meta_ws_{}", std::process::id())),
             &config.storage,
             &config.ipc,
         );
 
-        let output_dir = std::env::temp_dir().join(format!(
-            "wa_labrt_diag_meta_output_{}",
-            std::process::id()
-        ));
+        let output_dir =
+            std::env::temp_dir().join(format!("wa_labrt_diag_meta_output_{}", std::process::id()));
         let opts = DiagnosticOptions {
             output: Some(output_dir.clone()),
             ..Default::default()
@@ -267,10 +244,8 @@ fn bundle_manifest_has_stable_metadata() {
             .unwrap();
 
         // Verify manifest has all required stable metadata fields
-        let manifest_content =
-            std::fs::read_to_string(output_dir.join("manifest.json")).unwrap();
-        let manifest: serde_json::Value =
-            serde_json::from_str(&manifest_content).unwrap();
+        let manifest_content = std::fs::read_to_string(output_dir.join("manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
 
         // Required fields
         assert!(manifest["wa_version"].is_string());
@@ -284,8 +259,7 @@ fn bundle_manifest_has_stable_metadata() {
         assert!(files.len() >= 8);
 
         // Verify environment.json has stable fields
-        let env_content =
-            std::fs::read_to_string(output_dir.join("environment.json")).unwrap();
+        let env_content = std::fs::read_to_string(output_dir.join("environment.json")).unwrap();
         let env: serde_json::Value = serde_json::from_str(&env_content).unwrap();
         assert!(env["wa_version"].is_string());
         assert!(env["schema_version"].is_number());
@@ -295,8 +269,7 @@ fn bundle_manifest_has_stable_metadata() {
         // Verify config_summary.json has stable fields
         let config_content =
             std::fs::read_to_string(output_dir.join("config_summary.json")).unwrap();
-        let config_json: serde_json::Value =
-            serde_json::from_str(&config_content).unwrap();
+        let config_json: serde_json::Value = serde_json::from_str(&config_content).unwrap();
         assert!(config_json["general_log_level"].is_string());
         assert!(config_json["ingest_poll_interval_ms"].is_number());
         assert!(config_json["metrics_enabled"].is_boolean());
@@ -348,18 +321,13 @@ fn bundle_includes_reservation_snapshot() {
 
         let config = Config::default();
         let layout = WorkspaceLayout::new(
-            std::env::temp_dir().join(format!(
-                "wa_labrt_diag_res_ws_{}",
-                std::process::id()
-            )),
+            std::env::temp_dir().join(format!("wa_labrt_diag_res_ws_{}", std::process::id())),
             &config.storage,
             &config.ipc,
         );
 
-        let output_dir = std::env::temp_dir().join(format!(
-            "wa_labrt_diag_res_output_{}",
-            std::process::id()
-        ));
+        let output_dir =
+            std::env::temp_dir().join(format!("wa_labrt_diag_res_output_{}", std::process::id()));
         let opts = DiagnosticOptions {
             output: Some(output_dir.clone()),
             ..Default::default()
@@ -371,10 +339,8 @@ fn bundle_includes_reservation_snapshot() {
 
         // Verify active_reservations.json contains the reservation
         let res_content =
-            std::fs::read_to_string(output_dir.join("active_reservations.json"))
-                .unwrap();
-        let reservations: serde_json::Value =
-            serde_json::from_str(&res_content).unwrap();
+            std::fs::read_to_string(output_dir.join("active_reservations.json")).unwrap();
+        let reservations: serde_json::Value = serde_json::from_str(&res_content).unwrap();
         let arr = reservations.as_array().unwrap();
         assert!(
             !arr.is_empty(),
@@ -391,10 +357,8 @@ fn bundle_includes_reservation_snapshot() {
 
         // Verify reservation_history.json also has the reservation
         let hist_content =
-            std::fs::read_to_string(output_dir.join("reservation_history.json"))
-                .unwrap();
-        let history: serde_json::Value =
-            serde_json::from_str(&hist_content).unwrap();
+            std::fs::read_to_string(output_dir.join("reservation_history.json")).unwrap();
+        let history: serde_json::Value = serde_json::from_str(&hist_content).unwrap();
         let hist_arr = history.as_array().unwrap();
         assert!(!hist_arr.is_empty());
 
@@ -414,18 +378,13 @@ fn bundle_output_dir_reuse_generates_fresh_bundle() {
 
         let config = Config::default();
         let layout = WorkspaceLayout::new(
-            std::env::temp_dir().join(format!(
-                "wa_labrt_diag_reuse_ws_{}",
-                std::process::id()
-            )),
+            std::env::temp_dir().join(format!("wa_labrt_diag_reuse_ws_{}", std::process::id())),
             &config.storage,
             &config.ipc,
         );
 
-        let output_dir = std::env::temp_dir().join(format!(
-            "wa_labrt_diag_reuse_output_{}",
-            std::process::id()
-        ));
+        let output_dir =
+            std::env::temp_dir().join(format!("wa_labrt_diag_reuse_output_{}", std::process::id()));
 
         // Generate first bundle
         let opts = DiagnosticOptions {
@@ -444,10 +403,8 @@ fn bundle_output_dir_reuse_generates_fresh_bundle() {
         assert!(result2.file_count >= 9);
 
         // The manifest should be from the second run (newer timestamp)
-        let manifest_content =
-            std::fs::read_to_string(output_dir.join("manifest.json")).unwrap();
-        let manifest: serde_json::Value =
-            serde_json::from_str(&manifest_content).unwrap();
+        let manifest_content = std::fs::read_to_string(output_dir.join("manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
         assert!(manifest["generated_at_ms"].as_u64().unwrap() > 0);
 
         storage.shutdown().await.unwrap();

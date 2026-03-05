@@ -20,9 +20,9 @@ use common::fixtures::RuntimeFixture;
 use frankenterm_core::circuit_breaker::{CircuitBreakerStatus, CircuitStateKind};
 use frankenterm_core::error::WeztermError;
 use frankenterm_core::wezterm::{
-    BackendKind, BackendSelection, MockEvent, MockWezterm, MoveDirection, PaneInfo,
-    PaneTextSource, SplitDirection, UnifiedClient, WeztermFuture, WeztermHandle,
-    WeztermHandleSource, WeztermInterface,
+    BackendKind, BackendSelection, MockEvent, MockWezterm, MoveDirection, PaneInfo, PaneTextSource,
+    SplitDirection, UnifiedClient, WeztermFuture, WeztermHandle, WeztermHandleSource,
+    WeztermInterface,
 };
 
 // ===========================================================================
@@ -33,9 +33,7 @@ struct FailingMockWezterm;
 
 impl WeztermInterface for FailingMockWezterm {
     fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo> {
         Box::pin(async move {
@@ -45,49 +43,31 @@ impl WeztermInterface for FailingMockWezterm {
         })
     }
     fn get_text(&self, _: u64, _: bool) -> WeztermFuture<'_, String> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn send_text(&self, _: u64, _: &str) -> WeztermFuture<'_, ()> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn send_text_no_paste(&self, _: u64, _: &str) -> WeztermFuture<'_, ()> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn send_text_with_options(&self, _: u64, _: &str, _: bool, _: bool) -> WeztermFuture<'_, ()> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn send_control(&self, _: u64, _: &str) -> WeztermFuture<'_, ()> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn send_ctrl_c(&self, _: u64) -> WeztermFuture<'_, ()> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn send_ctrl_d(&self, _: u64) -> WeztermFuture<'_, ()> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn spawn(&self, _: Option<&str>, _: Option<&str>) -> WeztermFuture<'_, u64> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn activate_pane(&self, _: u64) -> WeztermFuture<'_, ()> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn split_pane(
         &self,
@@ -96,24 +76,16 @@ impl WeztermInterface for FailingMockWezterm {
         _: Option<&str>,
         _: Option<u8>,
     ) -> WeztermFuture<'_, u64> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn get_pane_direction(&self, _: u64, _: MoveDirection) -> WeztermFuture<'_, Option<u64>> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn kill_pane(&self, _: u64) -> WeztermFuture<'_, ()> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn zoom_pane(&self, _: u64, _: bool) -> WeztermFuture<'_, ()> {
-        Box::pin(async {
-            Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5)))
-        })
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn circuit_status(&self) -> CircuitBreakerStatus {
         CircuitBreakerStatus::default()

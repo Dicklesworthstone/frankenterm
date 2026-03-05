@@ -16,9 +16,7 @@ use std::collections::HashMap;
 
 use proptest::prelude::*;
 
-use frankenterm_core::durable_state::{
-    CheckpointTrigger, DurableStateError, DurableStateManager,
-};
+use frankenterm_core::durable_state::{CheckpointTrigger, DurableStateError, DurableStateManager};
 use frankenterm_core::session_topology::{
     LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
     MuxPaneLifecycleState, SessionLifecycleState, WindowLifecycleState,
@@ -53,11 +51,7 @@ fn make_registry(pane_ids: &[u64]) -> LifecycleRegistry {
     reg
 }
 
-fn make_mixed_registry(
-    sessions: &[u64],
-    windows: &[u64],
-    panes: &[u64],
-) -> LifecycleRegistry {
+fn make_mixed_registry(sessions: &[u64], windows: &[u64], panes: &[u64]) -> LifecycleRegistry {
     let mut reg = LifecycleRegistry::new();
     for &sid in sessions {
         reg.register_entity(
@@ -101,9 +95,7 @@ fn arb_trigger() -> impl Strategy<Value = CheckpointTrigger> {
         Just(CheckpointTrigger::PreShutdown),
         Just(CheckpointTrigger::PostRecovery),
         "[a-z]{3,12}".prop_map(|op| CheckpointTrigger::PreOperation { operation: op }),
-        "[a-z]{3,12}".prop_map(|name| CheckpointTrigger::FleetProvisioning {
-            fleet_name: name,
-        }),
+        "[a-z]{3,12}".prop_map(|name| CheckpointTrigger::FleetProvisioning { fleet_name: name }),
     ]
 }
 
@@ -225,7 +217,12 @@ fn rollback_restores_entities_from_checkpoint() {
 
     // Checkpoint with 3 panes running
     let cp_id = mgr
-        .checkpoint(&reg, "before-change", CheckpointTrigger::Manual, HashMap::new())
+        .checkpoint(
+            &reg,
+            "before-change",
+            CheckpointTrigger::Manual,
+            HashMap::new(),
+        )
         .id;
 
     // Add pane 4, change pane 1 to stopped
@@ -280,7 +277,9 @@ fn rollback_to_already_rolled_back_errors() {
     mgr.rollback(cp1_id, &mut reg, "first rollback").unwrap();
 
     // Attempting to rollback to cp2 (which is now rolled_back) should error
-    let err = mgr.rollback(cp2_id, &mut reg, "second rollback").unwrap_err();
+    let err = mgr
+        .rollback(cp2_id, &mut reg, "second rollback")
+        .unwrap_err();
     assert_eq!(err, DurableStateError::AlreadyRolledBack { id: cp2_id });
 }
 
@@ -336,7 +335,10 @@ fn diff_empty_when_checkpoints_identical() {
         .id;
 
     let diff = mgr.diff(cp1, cp2).unwrap();
-    assert!(diff.is_empty(), "identical snapshots should produce empty diff");
+    assert!(
+        diff.is_empty(),
+        "identical snapshots should produce empty diff"
+    );
     assert_eq!(diff.change_count(), 0);
 }
 
@@ -347,7 +349,12 @@ fn diff_detects_added_entities() {
     let mut mgr = DurableStateManager::new();
 
     let cp1 = mgr
-        .checkpoint(&reg_small, "small", CheckpointTrigger::Manual, HashMap::new())
+        .checkpoint(
+            &reg_small,
+            "small",
+            CheckpointTrigger::Manual,
+            HashMap::new(),
+        )
         .id;
     let cp2 = mgr
         .checkpoint(&reg_big, "big", CheckpointTrigger::Manual, HashMap::new())
@@ -368,7 +375,12 @@ fn diff_detects_removed_entities() {
         .checkpoint(&reg_big, "big", CheckpointTrigger::Manual, HashMap::new())
         .id;
     let cp2 = mgr
-        .checkpoint(&reg_small, "small", CheckpointTrigger::Manual, HashMap::new())
+        .checkpoint(
+            &reg_small,
+            "small",
+            CheckpointTrigger::Manual,
+            HashMap::new(),
+        )
         .id;
 
     let diff = mgr.diff(cp1, cp2).unwrap();
@@ -413,7 +425,12 @@ fn diff_from_current_works() {
     let mut mgr = DurableStateManager::new();
 
     let cp_id = mgr
-        .checkpoint(&reg_before, "base", CheckpointTrigger::Manual, HashMap::new())
+        .checkpoint(
+            &reg_before,
+            "base",
+            CheckpointTrigger::Manual,
+            HashMap::new(),
+        )
         .id;
 
     let reg_after = make_registry(&[1, 2, 3]);
@@ -484,7 +501,9 @@ fn checkpoint_preserves_metadata() {
     meta.insert("fleet".to_string(), "alpha".to_string());
     meta.insert("version".to_string(), "1.2.3".to_string());
 
-    let cp_id = mgr.checkpoint(&reg, "with-meta", CheckpointTrigger::Manual, meta.clone()).id;
+    let cp_id = mgr
+        .checkpoint(&reg, "with-meta", CheckpointTrigger::Manual, meta.clone())
+        .id;
 
     // Verify after retrieval
     let retrieved = mgr.get_checkpoint(cp_id).unwrap();
@@ -512,7 +531,9 @@ fn checkpoint_preserves_trigger_variant() {
     ];
 
     for (i, trigger) in triggers.into_iter().enumerate() {
-        let cp_id = mgr.checkpoint(&reg, format!("t-{i}"), trigger.clone(), HashMap::new()).id;
+        let cp_id = mgr
+            .checkpoint(&reg, format!("t-{i}"), trigger.clone(), HashMap::new())
+            .id;
         let retrieved = mgr.get_checkpoint(cp_id).unwrap();
         assert_eq!(retrieved.trigger, trigger);
     }

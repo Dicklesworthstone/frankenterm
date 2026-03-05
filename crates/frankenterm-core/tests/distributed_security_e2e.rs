@@ -139,403 +139,404 @@ async fn tls_handshake_rejected(
 #[test]
 fn distributed_security_e2e_tls_required_happy_path_with_artifacts() {
     run_async_test(async {
-    let ca_cert = temp_pem(OLD_CA_CERT);
-    let server_cert = temp_pem(OLD_SERVER_CERT);
-    let server_key = temp_pem(OLD_SERVER_KEY);
+        let ca_cert = temp_pem(OLD_CA_CERT);
+        let server_cert = temp_pem(OLD_SERVER_CERT);
+        let server_key = temp_pem(OLD_SERVER_KEY);
 
-    let mut config = DistributedConfig::default();
-    config.enabled = true;
-    config.auth_mode = DistributedAuthMode::Token;
-    config.token = Some("agent-a:token-v1".to_string());
-    config.tls.enabled = true;
-    config.tls.cert_path = Some(server_cert.path().display().to_string());
-    config.tls.key_path = Some(server_key.path().display().to_string());
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("agent-a:token-v1".to_string());
+        config.tls.enabled = true;
+        config.tls.cert_path = Some(server_cert.path().display().to_string());
+        config.tls.key_path = Some(server_key.path().display().to_string());
 
-    let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
-    let payload = b"secure-path";
-    let received = tls_round_trip(
-        Arc::clone(&bundle.server),
-        Arc::clone(&bundle.client),
-        payload,
-    )
-    .await
-    .expect("round trip");
-    assert_eq!(received.as_slice(), payload);
-
-    assert!(
-        validate_token(
-            config.auth_mode,
-            config.token.as_deref(),
-            Some("agent-a:token-v1"),
-            Some("agent-a"),
+        let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
+        let payload = b"secure-path";
+        let received = tls_round_trip(
+            Arc::clone(&bundle.server),
+            Arc::clone(&bundle.client),
+            payload,
         )
-        .is_ok()
-    );
+        .await
+        .expect("round trip");
+        assert_eq!(received.as_slice(), payload);
 
-    emit_e2e_artifact(
-        "aggregator_log",
-        serde_json::json!({
-            "scenario": "tls_required_happy_path",
-            "bind": "127.0.0.1:ephemeral",
-            "tls": "enabled",
-            "payload_bytes": payload.len(),
-            "result": "accepted"
-        }),
-    );
-    emit_e2e_artifact(
-        "agent_log",
-        serde_json::json!({
-            "scenario": "tls_required_happy_path",
-            "tls_connect": "ok",
-            "write": "ok",
-            "read_echo": String::from_utf8_lossy(&received),
-        }),
-    );
-    emit_e2e_artifact(
-        "security_config_summary",
-        serde_json::json!({
-            "auth_mode": "token",
-            "tls_enabled": true,
-            "token_source": "inline",
-            "token_preview": "[REDACTED]",
-        }),
-    );
+        assert!(
+            validate_token(
+                config.auth_mode,
+                config.token.as_deref(),
+                Some("agent-a:token-v1"),
+                Some("agent-a"),
+            )
+            .is_ok()
+        );
 
-    let db_file = tempfile::NamedTempFile::new().expect("db file");
-    let conn = rusqlite::Connection::open(db_file.path()).expect("open db");
-    conn.execute_batch(
-        "CREATE TABLE security_events (
+        emit_e2e_artifact(
+            "aggregator_log",
+            serde_json::json!({
+                "scenario": "tls_required_happy_path",
+                "bind": "127.0.0.1:ephemeral",
+                "tls": "enabled",
+                "payload_bytes": payload.len(),
+                "result": "accepted"
+            }),
+        );
+        emit_e2e_artifact(
+            "agent_log",
+            serde_json::json!({
+                "scenario": "tls_required_happy_path",
+                "tls_connect": "ok",
+                "write": "ok",
+                "read_echo": String::from_utf8_lossy(&received),
+            }),
+        );
+        emit_e2e_artifact(
+            "security_config_summary",
+            serde_json::json!({
+                "auth_mode": "token",
+                "tls_enabled": true,
+                "token_source": "inline",
+                "token_preview": "[REDACTED]",
+            }),
+        );
+
+        let db_file = tempfile::NamedTempFile::new().expect("db file");
+        let conn = rusqlite::Connection::open(db_file.path()).expect("open db");
+        conn.execute_batch(
+            "CREATE TABLE security_events (
             id INTEGER PRIMARY KEY,
             scenario TEXT NOT NULL,
             outcome TEXT NOT NULL
          );
          INSERT INTO security_events (scenario, outcome)
          VALUES ('tls_required_happy_path', 'accepted');",
-    )
-    .expect("seed db");
-    let row_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM security_events", [], |row| row.get(0))
-        .expect("count rows");
-    let file_size = std::fs::metadata(db_file.path())
-        .expect("db metadata")
-        .len();
-    emit_e2e_artifact(
-        "db_snapshot",
-        serde_json::json!({
-            "path": db_file.path().display().to_string(),
-            "rows": row_count,
-            "size_bytes": file_size
-        }),
-    );
+        )
+        .expect("seed db");
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM security_events", [], |row| row.get(0))
+            .expect("count rows");
+        let file_size = std::fs::metadata(db_file.path())
+            .expect("db metadata")
+            .len();
+        emit_e2e_artifact(
+            "db_snapshot",
+            serde_json::json!({
+                "path": db_file.path().display().to_string(),
+                "rows": row_count,
+                "size_bytes": file_size
+            }),
+        );
     });
 }
 
 #[test]
 fn distributed_security_e2e_tls_failures_and_plaintext_rejection() {
     run_async_test(async {
-    let trusted_ca = temp_pem(OLD_CA_CERT);
-    let untrusted_ca = temp_pem(ROTATED_CA_CERT);
-    let server_cert = temp_pem(OLD_SERVER_CERT);
-    let server_key = temp_pem(OLD_SERVER_KEY);
+        let trusted_ca = temp_pem(OLD_CA_CERT);
+        let untrusted_ca = temp_pem(ROTATED_CA_CERT);
+        let server_cert = temp_pem(OLD_SERVER_CERT);
+        let server_key = temp_pem(OLD_SERVER_KEY);
 
-    let mut config = DistributedConfig::default();
-    config.enabled = true;
-    config.auth_mode = DistributedAuthMode::Token;
-    config.tls.enabled = true;
-    config.tls.cert_path = Some(server_cert.path().display().to_string());
-    config.tls.key_path = Some(server_key.path().display().to_string());
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.tls.enabled = true;
+        config.tls.cert_path = Some(server_cert.path().display().to_string());
+        config.tls.key_path = Some(server_key.path().display().to_string());
 
-    let trusted_bundle = build_tls_bundle(&config, Some(trusted_ca.path())).expect("trusted");
-    let untrusted_bundle = build_tls_bundle(&config, Some(untrusted_ca.path())).expect("untrusted");
+        let trusted_bundle = build_tls_bundle(&config, Some(trusted_ca.path())).expect("trusted");
+        let untrusted_bundle =
+            build_tls_bundle(&config, Some(untrusted_ca.path())).expect("untrusted");
 
-    assert!(
-        tls_handshake_rejected(
+        assert!(
+            tls_handshake_rejected(
+                Arc::clone(&trusted_bundle.server),
+                Arc::clone(&untrusted_bundle.client),
+            )
+            .await
+        );
+        let success = tls_round_trip(
             Arc::clone(&trusted_bundle.server),
-            Arc::clone(&untrusted_bundle.client),
+            Arc::clone(&trusted_bundle.client),
+            b"ok",
         )
         .await
-    );
-    let success = tls_round_trip(
-        Arc::clone(&trusted_bundle.server),
-        Arc::clone(&trusted_bundle.client),
-        b"ok",
-    )
-    .await
-    .expect("trusted success");
-    assert_eq!(success.as_slice(), b"ok");
+        .expect("trusted success");
+        assert_eq!(success.as_slice(), b"ok");
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let acceptor = TlsAcceptor::new((*trusted_bundle.server).clone());
-    let server_task = task::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        acceptor.accept(stream).await
-    });
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let acceptor = TlsAcceptor::new((*trusted_bundle.server).clone());
+        let server_task = task::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            acceptor.accept(stream).await
+        });
 
-    let mut plaintext = TcpStream::connect(addr).await.expect("plain connect");
-    plaintext
-        .write_all(b"not tls")
-        .await
-        .expect("write plaintext");
-    let _ = plaintext.shutdown(std::net::Shutdown::Both);
-    let plaintext_rejected = timeout(Duration::from_secs(2), server_task)
-        .await
-        .expect("server timeout")
-        .expect("join")
-        .is_err();
-    assert!(plaintext_rejected);
+        let mut plaintext = TcpStream::connect(addr).await.expect("plain connect");
+        plaintext
+            .write_all(b"not tls")
+            .await
+            .expect("write plaintext");
+        let _ = plaintext.shutdown(std::net::Shutdown::Both);
+        let plaintext_rejected = timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("server timeout")
+            .expect("join")
+            .is_err();
+        assert!(plaintext_rejected);
 
-    emit_e2e_artifact(
-        "aggregator_log",
-        serde_json::json!({
-            "scenario": "tls_failures",
-            "untrusted_ca_rejected": true,
-            "plaintext_rejected": plaintext_rejected
-        }),
-    );
-    emit_e2e_artifact(
-        "agent_log",
-        serde_json::json!({
-            "scenario": "tls_failures",
-            "trusted_client_status": "success",
-            "untrusted_client_status": "rejected",
-            "stable_error_code": DistributedSecurityError::AuthFailed.code()
-        }),
-    );
+        emit_e2e_artifact(
+            "aggregator_log",
+            serde_json::json!({
+                "scenario": "tls_failures",
+                "untrusted_ca_rejected": true,
+                "plaintext_rejected": plaintext_rejected
+            }),
+        );
+        emit_e2e_artifact(
+            "agent_log",
+            serde_json::json!({
+                "scenario": "tls_failures",
+                "trusted_client_status": "success",
+                "untrusted_client_status": "rejected",
+                "stable_error_code": DistributedSecurityError::AuthFailed.code()
+            }),
+        );
     });
 }
 
 #[test]
 fn distributed_security_e2e_auth_replay_and_rotation() {
     run_async_test(async {
-    let mut token_file = tempfile::NamedTempFile::new().expect("token file");
-    std::io::Write::write_all(token_file.as_file_mut(), b"agent-a:token-v1")
-        .expect("write token v1");
+        let mut token_file = tempfile::NamedTempFile::new().expect("token file");
+        std::io::Write::write_all(token_file.as_file_mut(), b"agent-a:token-v1")
+            .expect("write token v1");
 
-    let mut token_config = DistributedConfig::default();
-    token_config.enabled = true;
-    token_config.auth_mode = DistributedAuthMode::TokenAndMtls;
-    token_config.token_path = Some(token_file.path().display().to_string());
+        let mut token_config = DistributedConfig::default();
+        token_config.enabled = true;
+        token_config.auth_mode = DistributedAuthMode::TokenAndMtls;
+        token_config.token_path = Some(token_file.path().display().to_string());
 
-    let token_v1 = resolve_expected_token(&token_config)
-        .expect("resolve token v1")
-        .expect("token required");
-    assert!(
-        validate_token(
+        let token_v1 = resolve_expected_token(&token_config)
+            .expect("resolve token v1")
+            .expect("token required");
+        assert!(
+            validate_token(
+                token_config.auth_mode,
+                Some(&token_v1),
+                Some("agent-a:token-v1"),
+                Some("agent-a"),
+            )
+            .is_ok()
+        );
+        let wrong = validate_token(
             token_config.auth_mode,
             Some(&token_v1),
-            Some("agent-a:token-v1"),
+            Some("agent-a:bad-token"),
             Some("agent-a"),
         )
-        .is_ok()
-    );
-    let wrong = validate_token(
-        token_config.auth_mode,
-        Some(&token_v1),
-        Some("agent-a:bad-token"),
-        Some("agent-a"),
-    )
-    .expect_err("bad token should fail");
-    assert_eq!(wrong, DistributedSecurityError::AuthFailed);
-    let wrong_msg = wrong.to_string();
-    assert!(!wrong_msg.contains("token-v1"));
-    assert!(!wrong_msg.contains("bad-token"));
+        .expect_err("bad token should fail");
+        assert_eq!(wrong, DistributedSecurityError::AuthFailed);
+        let wrong_msg = wrong.to_string();
+        assert!(!wrong_msg.contains("token-v1"));
+        assert!(!wrong_msg.contains("bad-token"));
 
-    token_file.as_file_mut().set_len(0).expect("truncate token");
-    token_file
-        .as_file_mut()
-        .seek(SeekFrom::Start(0))
-        .expect("seek token");
-    std::io::Write::write_all(token_file.as_file_mut(), b"agent-a:token-v2")
-        .expect("write token v2");
+        token_file.as_file_mut().set_len(0).expect("truncate token");
+        token_file
+            .as_file_mut()
+            .seek(SeekFrom::Start(0))
+            .expect("seek token");
+        std::io::Write::write_all(token_file.as_file_mut(), b"agent-a:token-v2")
+            .expect("write token v2");
 
-    let token_v2 = resolve_expected_token(&token_config)
-        .expect("resolve token v2")
-        .expect("token required");
-    assert!(
-        validate_token(
-            token_config.auth_mode,
-            Some(&token_v2),
-            Some("agent-a:token-v2"),
-            Some("agent-a"),
-        )
-        .is_ok()
-    );
-    assert_eq!(
-        validate_token(
-            token_config.auth_mode,
-            Some(&token_v2),
-            Some("agent-a:token-v1"),
-            Some("agent-a"),
-        )
-        .expect_err("old token must fail"),
-        DistributedSecurityError::AuthFailed
-    );
+        let token_v2 = resolve_expected_token(&token_config)
+            .expect("resolve token v2")
+            .expect("token required");
+        assert!(
+            validate_token(
+                token_config.auth_mode,
+                Some(&token_v2),
+                Some("agent-a:token-v2"),
+                Some("agent-a"),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            validate_token(
+                token_config.auth_mode,
+                Some(&token_v2),
+                Some("agent-a:token-v1"),
+                Some("agent-a"),
+            )
+            .expect_err("old token must fail"),
+            DistributedSecurityError::AuthFailed
+        );
 
-    let mut replay_guard = SessionReplayGuard::new(4);
-    assert!(replay_guard.validate("session-1", 1).is_ok());
-    let replay_err = replay_guard
-        .validate("session-1", 1)
-        .expect_err("replay should fail");
-    assert_eq!(replay_err, DistributedSecurityError::ReplayDetected);
-    assert_eq!(replay_err.code(), "dist.replay_detected");
+        let mut replay_guard = SessionReplayGuard::new(4);
+        assert!(replay_guard.validate("session-1", 1).is_ok());
+        let replay_err = replay_guard
+            .validate("session-1", 1)
+            .expect_err("replay should fail");
+        assert_eq!(replay_err, DistributedSecurityError::ReplayDetected);
+        assert_eq!(replay_err.code(), "dist.replay_detected");
 
-    let old_ca = temp_pem(OLD_CA_CERT);
-    let old_server_cert = temp_pem(OLD_SERVER_CERT);
-    let old_server_key = temp_pem(OLD_SERVER_KEY);
-    let new_ca = temp_pem(ROTATED_CA_CERT);
-    let new_server_cert = temp_pem(ROTATED_SERVER_CERT);
-    let new_server_key = temp_pem(ROTATED_SERVER_KEY);
+        let old_ca = temp_pem(OLD_CA_CERT);
+        let old_server_cert = temp_pem(OLD_SERVER_CERT);
+        let old_server_key = temp_pem(OLD_SERVER_KEY);
+        let new_ca = temp_pem(ROTATED_CA_CERT);
+        let new_server_cert = temp_pem(ROTATED_SERVER_CERT);
+        let new_server_key = temp_pem(ROTATED_SERVER_KEY);
 
-    let mut old_config = DistributedConfig::default();
-    old_config.enabled = true;
-    old_config.auth_mode = DistributedAuthMode::Token;
-    old_config.tls.enabled = true;
-    old_config.tls.cert_path = Some(old_server_cert.path().display().to_string());
-    old_config.tls.key_path = Some(old_server_key.path().display().to_string());
+        let mut old_config = DistributedConfig::default();
+        old_config.enabled = true;
+        old_config.auth_mode = DistributedAuthMode::Token;
+        old_config.tls.enabled = true;
+        old_config.tls.cert_path = Some(old_server_cert.path().display().to_string());
+        old_config.tls.key_path = Some(old_server_key.path().display().to_string());
 
-    let mut new_config = DistributedConfig::default();
-    new_config.enabled = true;
-    new_config.auth_mode = DistributedAuthMode::Token;
-    new_config.tls.enabled = true;
-    new_config.tls.cert_path = Some(new_server_cert.path().display().to_string());
-    new_config.tls.key_path = Some(new_server_key.path().display().to_string());
+        let mut new_config = DistributedConfig::default();
+        new_config.enabled = true;
+        new_config.auth_mode = DistributedAuthMode::Token;
+        new_config.tls.enabled = true;
+        new_config.tls.cert_path = Some(new_server_cert.path().display().to_string());
+        new_config.tls.key_path = Some(new_server_key.path().display().to_string());
 
-    let old_bundle = build_tls_bundle(&old_config, Some(old_ca.path())).expect("old bundle");
-    let new_bundle = build_tls_bundle(&new_config, Some(new_ca.path())).expect("new bundle");
+        let old_bundle = build_tls_bundle(&old_config, Some(old_ca.path())).expect("old bundle");
+        let new_bundle = build_tls_bundle(&new_config, Some(new_ca.path())).expect("new bundle");
 
-    let old_exchange = tls_round_trip(
-        Arc::clone(&old_bundle.server),
-        Arc::clone(&old_bundle.client),
-        b"old-cert-ok",
-    )
-    .await
-    .expect("old cert should work");
-    assert_eq!(old_exchange.as_slice(), b"old-cert-ok");
-
-    assert!(
-        tls_handshake_rejected(
-            Arc::clone(&new_bundle.server),
+        let old_exchange = tls_round_trip(
+            Arc::clone(&old_bundle.server),
             Arc::clone(&old_bundle.client),
+            b"old-cert-ok",
         )
-        .await,
-        "old trust material should reject rotated cert"
-    );
+        .await
+        .expect("old cert should work");
+        assert_eq!(old_exchange.as_slice(), b"old-cert-ok");
 
-    let new_exchange = tls_round_trip(
-        Arc::clone(&new_bundle.server),
-        Arc::clone(&new_bundle.client),
-        b"new-cert-ok",
-    )
-    .await
-    .expect("new cert should work");
-    assert_eq!(new_exchange.as_slice(), b"new-cert-ok");
+        assert!(
+            tls_handshake_rejected(
+                Arc::clone(&new_bundle.server),
+                Arc::clone(&old_bundle.client),
+            )
+            .await,
+            "old trust material should reject rotated cert"
+        );
 
-    emit_e2e_artifact(
-        "rotation_log",
-        serde_json::json!({
-            "scenario": "auth_replay_rotation",
-            "token_rotated": true,
-            "replay_rejected": replay_err.code(),
-            "old_cert_rejected_after_rotation": true,
-            "new_cert_accepted_after_rotation": true
-        }),
-    );
+        let new_exchange = tls_round_trip(
+            Arc::clone(&new_bundle.server),
+            Arc::clone(&new_bundle.client),
+            b"new-cert-ok",
+        )
+        .await
+        .expect("new cert should work");
+        assert_eq!(new_exchange.as_slice(), b"new-cert-ok");
+
+        emit_e2e_artifact(
+            "rotation_log",
+            serde_json::json!({
+                "scenario": "auth_replay_rotation",
+                "token_rotated": true,
+                "replay_rejected": replay_err.code(),
+                "old_cert_rejected_after_rotation": true,
+                "new_cert_accepted_after_rotation": true
+            }),
+        );
     });
 }
 
 #[test]
 fn distributed_security_perf_budgets_within_initial_thresholds() {
     run_async_test(async {
-    let ca_cert = temp_pem(OLD_CA_CERT);
-    let server_cert = temp_pem(OLD_SERVER_CERT);
-    let server_key = temp_pem(OLD_SERVER_KEY);
+        let ca_cert = temp_pem(OLD_CA_CERT);
+        let server_cert = temp_pem(OLD_SERVER_CERT);
+        let server_key = temp_pem(OLD_SERVER_KEY);
 
-    let mut config = DistributedConfig::default();
-    config.enabled = true;
-    config.auth_mode = DistributedAuthMode::Token;
-    config.token = Some("agent-a:token-v1".to_string());
-    config.tls.enabled = true;
-    config.tls.cert_path = Some(server_cert.path().display().to_string());
-    config.tls.key_path = Some(server_key.path().display().to_string());
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.auth_mode = DistributedAuthMode::Token;
+        config.token = Some("agent-a:token-v1".to_string());
+        config.tls.enabled = true;
+        config.tls.cert_path = Some(server_cert.path().display().to_string());
+        config.tls.key_path = Some(server_key.path().display().to_string());
 
-    let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
+        let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("tls bundle");
 
-    let mut handshake_samples_ms = Vec::with_capacity(PERF_HANDSHAKE_ROUNDS);
-    for _ in 0..PERF_HANDSHAKE_ROUNDS {
-        let start = Instant::now();
-        let received = tls_round_trip(
-            Arc::clone(&bundle.server),
-            Arc::clone(&bundle.client),
-            b"perf",
-        )
-        .await
-        .expect("tls round trip");
-        assert_eq!(received.as_slice(), b"perf");
-        handshake_samples_ms.push(start.elapsed().as_millis());
-    }
-    let handshake_p95_ms = percentile_u128(&mut handshake_samples_ms, 95);
-    assert!(
-        handshake_p95_ms <= PERF_HANDSHAKE_P95_BUDGET_MS,
-        "TLS connection budget exceeded: p95={}ms > {}ms",
-        handshake_p95_ms,
-        PERF_HANDSHAKE_P95_BUDGET_MS
-    );
+        let mut handshake_samples_ms = Vec::with_capacity(PERF_HANDSHAKE_ROUNDS);
+        for _ in 0..PERF_HANDSHAKE_ROUNDS {
+            let start = Instant::now();
+            let received = tls_round_trip(
+                Arc::clone(&bundle.server),
+                Arc::clone(&bundle.client),
+                b"perf",
+            )
+            .await
+            .expect("tls round trip");
+            assert_eq!(received.as_slice(), b"perf");
+            handshake_samples_ms.push(start.elapsed().as_millis());
+        }
+        let handshake_p95_ms = percentile_u128(&mut handshake_samples_ms, 95);
+        assert!(
+            handshake_p95_ms <= PERF_HANDSHAKE_P95_BUDGET_MS,
+            "TLS connection budget exceeded: p95={}ms > {}ms",
+            handshake_p95_ms,
+            PERF_HANDSHAKE_P95_BUDGET_MS
+        );
 
-    let mut replay_guard = SessionReplayGuard::new(PERF_VERIFY_ITERATIONS + 8);
-    let expected_token = "agent-a:token-v1";
-    let verify_start = Instant::now();
-    let mut verify_samples_us = Vec::with_capacity(PERF_VERIFY_ITERATIONS);
-    for seq in 1..=u64::try_from(PERF_VERIFY_ITERATIONS).expect("iteration count fits u64") {
-        let sample_start = Instant::now();
-        validate_token(
-            DistributedAuthMode::TokenAndMtls,
-            Some(expected_token),
-            Some(expected_token),
-            Some("agent-a"),
-        )
-        .expect("token should validate");
-        replay_guard
-            .validate("perf-session", seq)
-            .expect("replay guard should accept monotonic sequence");
-        verify_samples_us.push(sample_start.elapsed().as_micros());
-    }
-    let verify_elapsed = verify_start.elapsed();
-    let verify_p95_us = percentile_u128(&mut verify_samples_us, 95);
-    let verify_throughput = PERF_VERIFY_ITERATIONS as f64 / verify_elapsed.as_secs_f64();
+        let mut replay_guard = SessionReplayGuard::new(PERF_VERIFY_ITERATIONS + 8);
+        let expected_token = "agent-a:token-v1";
+        let verify_start = Instant::now();
+        let mut verify_samples_us = Vec::with_capacity(PERF_VERIFY_ITERATIONS);
+        for seq in 1..=u64::try_from(PERF_VERIFY_ITERATIONS).expect("iteration count fits u64") {
+            let sample_start = Instant::now();
+            validate_token(
+                DistributedAuthMode::TokenAndMtls,
+                Some(expected_token),
+                Some(expected_token),
+                Some("agent-a"),
+            )
+            .expect("token should validate");
+            replay_guard
+                .validate("perf-session", seq)
+                .expect("replay guard should accept monotonic sequence");
+            verify_samples_us.push(sample_start.elapsed().as_micros());
+        }
+        let verify_elapsed = verify_start.elapsed();
+        let verify_p95_us = percentile_u128(&mut verify_samples_us, 95);
+        let verify_throughput = PERF_VERIFY_ITERATIONS as f64 / verify_elapsed.as_secs_f64();
 
-    assert!(
-        verify_p95_us <= PERF_VERIFY_P95_BUDGET_US,
-        "Message verification budget exceeded: p95={}us > {}us",
-        verify_p95_us,
-        PERF_VERIFY_P95_BUDGET_US
-    );
-    assert!(
-        verify_throughput >= PERF_VERIFY_THROUGHPUT_BUDGET_MSGS_PER_SEC,
-        "Verification throughput budget missed: {:.0} msg/s < {:.0} msg/s",
-        verify_throughput,
-        PERF_VERIFY_THROUGHPUT_BUDGET_MSGS_PER_SEC
-    );
+        assert!(
+            verify_p95_us <= PERF_VERIFY_P95_BUDGET_US,
+            "Message verification budget exceeded: p95={}us > {}us",
+            verify_p95_us,
+            PERF_VERIFY_P95_BUDGET_US
+        );
+        assert!(
+            verify_throughput >= PERF_VERIFY_THROUGHPUT_BUDGET_MSGS_PER_SEC,
+            "Verification throughput budget missed: {:.0} msg/s < {:.0} msg/s",
+            verify_throughput,
+            PERF_VERIFY_THROUGHPUT_BUDGET_MSGS_PER_SEC
+        );
 
-    emit_e2e_artifact(
-        "perf_budget_report",
-        serde_json::json!({
-            "scenario": "perf_budgets",
-            "budgets": {
-                "tls_connection_p95_ms_max": PERF_HANDSHAKE_P95_BUDGET_MS,
-                "verify_p95_us_max": PERF_VERIFY_P95_BUDGET_US,
-                "verify_throughput_msgs_per_sec_min": PERF_VERIFY_THROUGHPUT_BUDGET_MSGS_PER_SEC
-            },
-            "observed": {
-                "tls_connection_p95_ms": handshake_p95_ms,
-                "verify_p95_us": verify_p95_us,
-                "verify_throughput_msgs_per_sec": verify_throughput
-            },
-            "samples": {
-                "tls_connection_rounds": PERF_HANDSHAKE_ROUNDS,
-                "verify_iterations": PERF_VERIFY_ITERATIONS
-            }
-        }),
-    );
+        emit_e2e_artifact(
+            "perf_budget_report",
+            serde_json::json!({
+                "scenario": "perf_budgets",
+                "budgets": {
+                    "tls_connection_p95_ms_max": PERF_HANDSHAKE_P95_BUDGET_MS,
+                    "verify_p95_us_max": PERF_VERIFY_P95_BUDGET_US,
+                    "verify_throughput_msgs_per_sec_min": PERF_VERIFY_THROUGHPUT_BUDGET_MSGS_PER_SEC
+                },
+                "observed": {
+                    "tls_connection_p95_ms": handshake_p95_ms,
+                    "verify_p95_us": verify_p95_us,
+                    "verify_throughput_msgs_per_sec": verify_throughput
+                },
+                "samples": {
+                    "tls_connection_rounds": PERF_HANDSHAKE_ROUNDS,
+                    "verify_iterations": PERF_VERIFY_ITERATIONS
+                }
+            }),
+        );
     });
 }

@@ -13,8 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::session_topology::{
-    LifecycleIdentity, LifecycleRegistry, LifecycleState,
-    MuxPaneLifecycleState, PaneNode,
+    LifecycleIdentity, LifecycleRegistry, LifecycleState, MuxPaneLifecycleState, PaneNode,
 };
 use crate::wezterm::SplitDirection;
 
@@ -53,13 +52,9 @@ pub enum LayoutNode {
         weight: f64,
     },
     /// Horizontal split (children stacked top-to-bottom).
-    HSplit {
-        children: Vec<LayoutNode>,
-    },
+    HSplit { children: Vec<LayoutNode> },
     /// Vertical split (children arranged left-to-right).
-    VSplit {
-        children: Vec<LayoutNode>,
-    },
+    VSplit { children: Vec<LayoutNode> },
 }
 
 fn default_weight() -> f64 {
@@ -100,9 +95,7 @@ pub enum TopologyOp {
         ratio: f64,
     },
     /// Close/remove a pane.
-    Close {
-        target: LifecycleIdentity,
-    },
+    Close { target: LifecycleIdentity },
     /// Swap two panes' positions in the layout tree.
     Swap {
         a: LifecycleIdentity,
@@ -272,10 +265,7 @@ impl std::fmt::Display for TopologyError {
                 state,
                 operation,
             } => {
-                write!(
-                    f,
-                    "cannot {operation} entity {identity} in state {state}"
-                )
+                write!(f, "cannot {operation} entity {identity} in state {state}")
             }
             Self::TemplateNotFound { name } => {
                 write!(f, "layout template not found: {name}")
@@ -624,11 +614,7 @@ impl TopologyOrchestrator {
     // -------------------------------------------------------------------------
 
     /// Validate a single topology operation against the lifecycle registry.
-    pub fn validate_op(
-        &self,
-        op: &TopologyOp,
-        registry: &LifecycleRegistry,
-    ) -> OpCheckResult {
+    pub fn validate_op(&self, op: &TopologyOp, registry: &LifecycleRegistry) -> OpCheckResult {
         match op {
             TopologyOp::Split { target, ratio, .. } => {
                 if *ratio <= 0.0 || *ratio >= 1.0 {
@@ -638,9 +624,7 @@ impl TopologyOrchestrator {
                 }
                 self.check_pane_mutable(target, "split", registry)
             }
-            TopologyOp::Close { target } => {
-                self.check_pane_closeable(target, registry)
-            }
+            TopologyOp::Close { target } => self.check_pane_closeable(target, registry),
             TopologyOp::Swap { a, b } => {
                 let check_a = self.check_pane_exists(a, registry);
                 if check_a != OpCheckResult::Ok {
@@ -648,12 +632,8 @@ impl TopologyOrchestrator {
                 }
                 self.check_pane_exists(b, registry)
             }
-            TopologyOp::Move { target, .. } => {
-                self.check_pane_mutable(target, "move", registry)
-            }
-            TopologyOp::ApplyTemplate {
-                template_name, ..
-            } => {
+            TopologyOp::Move { target, .. } => self.check_pane_mutable(target, "move", registry),
+            TopologyOp::ApplyTemplate { template_name, .. } => {
                 if self.templates.get(template_name).is_none() {
                     return OpCheckResult::InvalidState {
                         identity: template_name.clone(),
@@ -663,9 +643,7 @@ impl TopologyOrchestrator {
                 }
                 OpCheckResult::Ok
             }
-            TopologyOp::Rebalance { scope } => {
-                self.check_entity_exists(scope, registry)
-            }
+            TopologyOp::Rebalance { scope } => self.check_entity_exists(scope, registry),
             TopologyOp::CreateFocusGroup { name, members } => {
                 if self.focus_groups.contains_key(name) {
                     return OpCheckResult::ConstraintViolation {
@@ -790,11 +768,12 @@ impl TopologyOrchestrator {
         template_name: &str,
         pane_ids: &[u64],
     ) -> Result<PaneNode, TopologyError> {
-        let template = self.templates.get(template_name).ok_or_else(|| {
-            TopologyError::TemplateNotFound {
-                name: template_name.into(),
-            }
-        })?;
+        let template =
+            self.templates
+                .get(template_name)
+                .ok_or_else(|| TopologyError::TemplateNotFound {
+                    name: template_name.into(),
+                })?;
 
         let required = template.root.slot_count();
         let available = pane_ids.len() as u32;
@@ -871,13 +850,13 @@ impl TopologyOrchestrator {
                 identity: identity.stable_key(),
             },
             Some(record) => match &record.state {
-                LifecycleState::Pane(MuxPaneLifecycleState::Running | MuxPaneLifecycleState::Ready) => OpCheckResult::Ok,
+                LifecycleState::Pane(
+                    MuxPaneLifecycleState::Running | MuxPaneLifecycleState::Ready,
+                ) => OpCheckResult::Ok,
                 other => OpCheckResult::InvalidState {
                     identity: identity.stable_key(),
                     current_state: format!("{other:?}"),
-                    reason: format!(
-                        "pane must be Running or Ready to {operation}"
-                    ),
+                    reason: format!("pane must be Running or Ready to {operation}"),
                 },
             },
         }
@@ -967,18 +946,14 @@ mod tests {
     fn make_registry_with_panes(pane_ids: &[u64]) -> LifecycleRegistry {
         let mut reg = LifecycleRegistry::new();
         for &pid in pane_ids {
-            let identity = LifecycleIdentity::new(
-                LifecycleEntityKind::Pane,
-                "default",
-                "local",
-                pid,
-                1,
-            );
+            let identity =
+                LifecycleIdentity::new(LifecycleEntityKind::Pane, "default", "local", pid, 1);
             reg.register_entity(
                 identity,
                 LifecycleState::Pane(MuxPaneLifecycleState::Running),
                 0,
-            ).expect("register pane");
+            )
+            .expect("register pane");
         }
         reg
     }
@@ -1010,11 +985,20 @@ mod tests {
             children: vec![
                 LayoutNode::VSplit {
                     children: vec![
-                        LayoutNode::Slot { role: None, weight: 1.0 },
-                        LayoutNode::Slot { role: None, weight: 1.0 },
+                        LayoutNode::Slot {
+                            role: None,
+                            weight: 1.0,
+                        },
+                        LayoutNode::Slot {
+                            role: None,
+                            weight: 1.0,
+                        },
                     ],
                 },
-                LayoutNode::Slot { role: None, weight: 1.0 },
+                LayoutNode::Slot {
+                    role: None,
+                    weight: 1.0,
+                },
             ],
         };
         assert_eq!(node.slot_count(), 3);
@@ -1041,8 +1025,14 @@ mod tests {
     fn layout_node_child_ratios_equal() {
         let node = LayoutNode::VSplit {
             children: vec![
-                LayoutNode::Slot { role: None, weight: 1.0 },
-                LayoutNode::Slot { role: None, weight: 1.0 },
+                LayoutNode::Slot {
+                    role: None,
+                    weight: 1.0,
+                },
+                LayoutNode::Slot {
+                    role: None,
+                    weight: 1.0,
+                },
             ],
         };
         let ratios = node.child_ratios();
@@ -1055,8 +1045,14 @@ mod tests {
     fn layout_node_child_ratios_weighted() {
         let node = LayoutNode::VSplit {
             children: vec![
-                LayoutNode::Slot { role: None, weight: 7.0 },
-                LayoutNode::Slot { role: None, weight: 3.0 },
+                LayoutNode::Slot {
+                    role: None,
+                    weight: 7.0,
+                },
+                LayoutNode::Slot {
+                    role: None,
+                    weight: 3.0,
+                },
             ],
         };
         let ratios = node.child_ratios();
@@ -1068,8 +1064,14 @@ mod tests {
     fn layout_node_to_pane_node() {
         let node = LayoutNode::VSplit {
             children: vec![
-                LayoutNode::Slot { role: None, weight: 1.0 },
-                LayoutNode::Slot { role: None, weight: 1.0 },
+                LayoutNode::Slot {
+                    role: None,
+                    weight: 1.0,
+                },
+                LayoutNode::Slot {
+                    role: None,
+                    weight: 1.0,
+                },
             ],
         };
         let pane_ids = vec![10, 20];
@@ -1096,8 +1098,14 @@ mod tests {
     fn layout_node_to_pane_node_insufficient_ids() {
         let node = LayoutNode::VSplit {
             children: vec![
-                LayoutNode::Slot { role: None, weight: 1.0 },
-                LayoutNode::Slot { role: None, weight: 1.0 },
+                LayoutNode::Slot {
+                    role: None,
+                    weight: 1.0,
+                },
+                LayoutNode::Slot {
+                    role: None,
+                    weight: 1.0,
+                },
             ],
         };
         let pane_ids: Vec<u64> = vec![10]; // Only 1, need 2
@@ -1128,7 +1136,10 @@ mod tests {
         reg.register(LayoutTemplate {
             name: "my-layout".into(),
             description: None,
-            root: LayoutNode::Slot { role: None, weight: 1.0 },
+            root: LayoutNode::Slot {
+                role: None,
+                weight: 1.0,
+            },
             min_panes: 1,
             max_panes: Some(1),
         });
@@ -1141,14 +1152,20 @@ mod tests {
         reg.register(LayoutTemplate {
             name: "x".into(),
             description: Some("v1".into()),
-            root: LayoutNode::Slot { role: None, weight: 1.0 },
+            root: LayoutNode::Slot {
+                role: None,
+                weight: 1.0,
+            },
             min_panes: 1,
             max_panes: None,
         });
         reg.register(LayoutTemplate {
             name: "x".into(),
             description: Some("v2".into()),
-            root: LayoutNode::Slot { role: None, weight: 1.0 },
+            root: LayoutNode::Slot {
+                role: None,
+                weight: 1.0,
+            },
             min_panes: 1,
             max_panes: None,
         });
@@ -1235,7 +1252,8 @@ mod tests {
             identity.clone(),
             LifecycleState::Pane(MuxPaneLifecycleState::Closed),
             0,
-        ).expect("register pane");
+        )
+        .expect("register pane");
 
         let orch = TopologyOrchestrator::new();
         let op = TopologyOp::Split {
@@ -1272,7 +1290,8 @@ mod tests {
             identity,
             LifecycleState::Pane(MuxPaneLifecycleState::Closed),
             0,
-        ).expect("register pane");
+        )
+        .expect("register pane");
 
         let orch = TopologyOrchestrator::new();
         let op = TopologyOp::Close {
@@ -1354,7 +1373,8 @@ mod tests {
             wid.clone(),
             LifecycleState::Window(crate::session_topology::WindowLifecycleState::Active),
             0,
-        ).expect("register window");
+        )
+        .expect("register window");
 
         let op = TopologyOp::Rebalance { scope: wid };
         assert_eq!(orch.validate_op(&op, &reg), OpCheckResult::Ok);
@@ -1405,7 +1425,10 @@ mod tests {
         let plan = orch.validate_plan(ops, &reg);
         assert!(!plan.validated);
         assert_eq!(plan.operations[0].check, OpCheckResult::Ok);
-        assert!(matches!(plan.operations[1].check, OpCheckResult::NotFound { .. }));
+        assert!(matches!(
+            plan.operations[1].check,
+            OpCheckResult::NotFound { .. }
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -1434,7 +1457,8 @@ mod tests {
         let mut orch = TopologyOrchestrator::new();
         let reg = make_registry_with_panes(&[1, 2]);
 
-        orch.create_focus_group("g".into(), vec![pane_identity(1)], &reg).unwrap();
+        orch.create_focus_group("g".into(), vec![pane_identity(1)], &reg)
+            .unwrap();
 
         let result = orch.create_focus_group("g".into(), vec![pane_identity(2)], &reg);
         assert!(matches!(
@@ -1448,15 +1472,9 @@ mod tests {
         let mut orch = TopologyOrchestrator::new();
         let reg = make_registry_with_panes(&[1]);
 
-        let result = orch.create_focus_group(
-            "g".into(),
-            vec![pane_identity(1), pane_identity(99)],
-            &reg,
-        );
-        assert!(matches!(
-            result,
-            Err(TopologyError::EntityNotFound { .. })
-        ));
+        let result =
+            orch.create_focus_group("g".into(), vec![pane_identity(1), pane_identity(99)], &reg);
+        assert!(matches!(result, Err(TopologyError::EntityNotFound { .. })));
     }
 
     #[test]
@@ -1464,7 +1482,8 @@ mod tests {
         let mut orch = TopologyOrchestrator::new();
         let reg = make_registry_with_panes(&[1]);
 
-        orch.create_focus_group("g".into(), vec![pane_identity(1)], &reg).unwrap();
+        orch.create_focus_group("g".into(), vec![pane_identity(1)], &reg)
+            .unwrap();
 
         assert_eq!(orch.toggle_focus_group("g"), Some(true));
         assert_eq!(orch.toggle_focus_group("g"), Some(false));
@@ -1476,7 +1495,8 @@ mod tests {
         let mut orch = TopologyOrchestrator::new();
         let reg = make_registry_with_panes(&[1]);
 
-        orch.create_focus_group("g".into(), vec![pane_identity(1)], &reg).unwrap();
+        orch.create_focus_group("g".into(), vec![pane_identity(1)], &reg)
+            .unwrap();
         assert!(orch.remove_focus_group("g"));
         assert!(!orch.remove_focus_group("g"));
     }
@@ -1488,7 +1508,9 @@ mod tests {
     #[test]
     fn layout_from_template_side_by_side() {
         let orch = TopologyOrchestrator::new();
-        let pane_node = orch.layout_from_template("side-by-side", &[10, 20]).unwrap();
+        let pane_node = orch
+            .layout_from_template("side-by-side", &[10, 20])
+            .unwrap();
 
         match &pane_node {
             PaneNode::VSplit { children } => {
@@ -1501,7 +1523,9 @@ mod tests {
     #[test]
     fn layout_from_template_grid_2x2() {
         let orch = TopologyOrchestrator::new();
-        let pane_node = orch.layout_from_template("grid-2x2", &[1, 2, 3, 4]).unwrap();
+        let pane_node = orch
+            .layout_from_template("grid-2x2", &[1, 2, 3, 4])
+            .unwrap();
 
         match &pane_node {
             PaneNode::HSplit { children } => {
@@ -1557,12 +1581,28 @@ mod tests {
     fn rebalance_tree_vsplit() {
         let tree = PaneNode::VSplit {
             children: vec![
-                (0.7, PaneNode::Leaf {
-                    pane_id: 1, rows: 24, cols: 80, cwd: None, title: None, is_active: false,
-                }),
-                (0.3, PaneNode::Leaf {
-                    pane_id: 2, rows: 24, cols: 80, cwd: None, title: None, is_active: false,
-                }),
+                (
+                    0.7,
+                    PaneNode::Leaf {
+                        pane_id: 1,
+                        rows: 24,
+                        cols: 80,
+                        cwd: None,
+                        title: None,
+                        is_active: false,
+                    },
+                ),
+                (
+                    0.3,
+                    PaneNode::Leaf {
+                        pane_id: 2,
+                        rows: 24,
+                        cols: 80,
+                        cwd: None,
+                        title: None,
+                        is_active: false,
+                    },
+                ),
             ],
         };
 
@@ -1581,19 +1621,46 @@ mod tests {
     fn rebalance_tree_nested() {
         let tree = PaneNode::HSplit {
             children: vec![
-                (0.8, PaneNode::VSplit {
-                    children: vec![
-                        (0.9, PaneNode::Leaf {
-                            pane_id: 1, rows: 24, cols: 80, cwd: None, title: None, is_active: false,
-                        }),
-                        (0.1, PaneNode::Leaf {
-                            pane_id: 2, rows: 24, cols: 80, cwd: None, title: None, is_active: false,
-                        }),
-                    ],
-                }),
-                (0.2, PaneNode::Leaf {
-                    pane_id: 3, rows: 24, cols: 80, cwd: None, title: None, is_active: false,
-                }),
+                (
+                    0.8,
+                    PaneNode::VSplit {
+                        children: vec![
+                            (
+                                0.9,
+                                PaneNode::Leaf {
+                                    pane_id: 1,
+                                    rows: 24,
+                                    cols: 80,
+                                    cwd: None,
+                                    title: None,
+                                    is_active: false,
+                                },
+                            ),
+                            (
+                                0.1,
+                                PaneNode::Leaf {
+                                    pane_id: 2,
+                                    rows: 24,
+                                    cols: 80,
+                                    cwd: None,
+                                    title: None,
+                                    is_active: false,
+                                },
+                            ),
+                        ],
+                    },
+                ),
+                (
+                    0.2,
+                    PaneNode::Leaf {
+                        pane_id: 3,
+                        rows: 24,
+                        cols: 80,
+                        cwd: None,
+                        title: None,
+                        is_active: false,
+                    },
+                ),
             ],
         };
 
@@ -1625,7 +1692,9 @@ mod tests {
         assert!(orch.audit_log().is_empty());
 
         orch.record_audit(
-            TopologyOp::Rebalance { scope: window_identity(1) },
+            TopologyOp::Rebalance {
+                scope: window_identity(1),
+            },
             true,
             None,
             Some("corr-123".into()),
@@ -1646,7 +1715,9 @@ mod tests {
 
         for i in 0..15 {
             orch.record_audit(
-                TopologyOp::Rebalance { scope: window_identity(i) },
+                TopologyOp::Rebalance {
+                    scope: window_identity(i),
+                },
                 true,
                 None,
                 None,
@@ -1666,10 +1737,22 @@ mod tests {
 
     #[test]
     fn split_direction_to_wezterm() {
-        assert_eq!(TopologySplitDirection::Left.to_wezterm(), SplitDirection::Left);
-        assert_eq!(TopologySplitDirection::Right.to_wezterm(), SplitDirection::Right);
-        assert_eq!(TopologySplitDirection::Top.to_wezterm(), SplitDirection::Top);
-        assert_eq!(TopologySplitDirection::Bottom.to_wezterm(), SplitDirection::Bottom);
+        assert_eq!(
+            TopologySplitDirection::Left.to_wezterm(),
+            SplitDirection::Left
+        );
+        assert_eq!(
+            TopologySplitDirection::Right.to_wezterm(),
+            SplitDirection::Right
+        );
+        assert_eq!(
+            TopologySplitDirection::Top.to_wezterm(),
+            SplitDirection::Top
+        );
+        assert_eq!(
+            TopologySplitDirection::Bottom.to_wezterm(),
+            SplitDirection::Bottom
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1821,7 +1904,8 @@ mod tests {
     fn validate_create_focus_group_duplicate() {
         let mut orch = TopologyOrchestrator::new();
         let reg = make_registry_with_panes(&[1]);
-        orch.create_focus_group("g".into(), vec![pane_identity(1)], &reg).unwrap();
+        orch.create_focus_group("g".into(), vec![pane_identity(1)], &reg)
+            .unwrap();
 
         let op = TopologyOp::CreateFocusGroup {
             name: "g".into(),
@@ -1857,7 +1941,8 @@ mod tests {
             identity,
             LifecycleState::Pane(MuxPaneLifecycleState::Draining),
             0,
-        ).expect("register pane");
+        )
+        .expect("register pane");
 
         let orch = TopologyOrchestrator::new();
         let op = TopologyOp::Move {

@@ -1406,7 +1406,6 @@ mod tests {
         }
     }
 
-
     const BASIC_SCENARIO: &str = r#"
 name: basic_test
 description: "A simple test scenario"
@@ -1692,34 +1691,39 @@ events:
     }
 
     #[test]
-    fn setup_creates_panes() { run_async_test(async {
-        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
+    fn setup_creates_panes() {
+        run_async_test(async {
+            let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
 
-        assert_eq!(mock.pane_count().await, 1);
-        let state = mock.pane_state(0).await.unwrap();
-        assert_eq!(state.title, "Main");
-        assert_eq!(state.content, "$ ");
-    }); }
-
-    #[test]
-    fn execute_all_injects_events() { run_async_test(async {
-        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
-
-        let count = scenario.execute_all(&mock).await.unwrap();
-        assert_eq!(count, 2);
-
-        let text = mock.get_text(0, false).await.unwrap();
-        assert!(text.contains("hello world"));
-        assert!(text.contains("done"));
-    }); }
+            assert_eq!(mock.pane_count().await, 1);
+            let state = mock.pane_state(0).await.unwrap();
+            assert_eq!(state.title, "Main");
+            assert_eq!(state.content, "$ ");
+        });
+    }
 
     #[test]
-    fn execute_all_with_resize_timeline_records_stage_probes() { run_async_test(async {
-        let yaml = r#"
+    fn execute_all_injects_events() {
+        run_async_test(async {
+            let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
+
+            let count = scenario.execute_all(&mock).await.unwrap();
+            assert_eq!(count, 2);
+
+            let text = mock.get_text(0, false).await.unwrap();
+            assert!(text.contains("hello world"));
+            assert!(text.contains("done"));
+        });
+    }
+
+    #[test]
+    fn execute_all_with_resize_timeline_records_stage_probes() {
+        run_async_test(async {
+            let yaml = r#"
 name: resize_probe_case
 duration: "10s"
 panes:
@@ -1742,61 +1746,63 @@ events:
     action: generate_scrollback
     content: "4x48"
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
 
-        let (executed, timeline) = scenario
-            .execute_all_with_resize_timeline(&mock)
-            .await
-            .unwrap();
-        assert_eq!(executed, scenario.events.len());
-        assert_eq!(timeline.executed_resize_events, 3);
-        assert_eq!(timeline.events.len(), 3);
+            let (executed, timeline) = scenario
+                .execute_all_with_resize_timeline(&mock)
+                .await
+                .unwrap();
+            assert_eq!(executed, scenario.events.len());
+            assert_eq!(timeline.executed_resize_events, 3);
+            assert_eq!(timeline.events.len(), 3);
 
-        for event in &timeline.events {
-            assert_eq!(event.sequence_no, event.event_index as u64);
-            assert_eq!(event.frame_id, event.sequence_no);
-            assert_eq!(event.scheduler_decision, "dequeue_latest_intent");
-            assert_eq!(event.test_case_id, scenario.name);
-            assert!(event.resize_transaction_id.starts_with(&format!(
-                "{}:{}",
-                timeline.reproducibility_key, event.event_index
-            )));
-            assert_eq!(event.stages.len(), ResizeTimelineStage::ALL.len());
-            for (sample, expected) in event.stages.iter().zip(ResizeTimelineStage::ALL.iter()) {
-                assert_eq!(sample.stage, *expected);
-            }
-            assert_eq!(
-                event.queue_wait_ms,
-                ns_to_ms_u64(event.stages[1].duration_ns)
-            );
-            assert_eq!(event.reflow_ms, ns_to_ms_u64(event.stages[2].duration_ns));
-            assert_eq!(event.render_ms, ns_to_ms_u64(event.stages[3].duration_ns));
-            assert_eq!(event.present_ms, ns_to_ms_u64(event.stages[4].duration_ns));
-            let render_prep_metrics = event.stages[3].render_prep_metrics.as_ref();
-            if event.action == EventAction::SetFontSize {
-                let metrics = render_prep_metrics
-                    .expect("set_font_size events should emit render-prep metrics");
-                assert!(metrics.staged_batches_total >= 1);
-                assert!(metrics.glyphs_rebuilt_now > 0 || metrics.cache_hit_glyphs > 0);
-            } else {
+            for event in &timeline.events {
+                assert_eq!(event.sequence_no, event.event_index as u64);
+                assert_eq!(event.frame_id, event.sequence_no);
+                assert_eq!(event.scheduler_decision, "dequeue_latest_intent");
+                assert_eq!(event.test_case_id, scenario.name);
+                assert!(event.resize_transaction_id.starts_with(&format!(
+                    "{}:{}",
+                    timeline.reproducibility_key, event.event_index
+                )));
+                assert_eq!(event.stages.len(), ResizeTimelineStage::ALL.len());
+                for (sample, expected) in event.stages.iter().zip(ResizeTimelineStage::ALL.iter()) {
+                    assert_eq!(sample.stage, *expected);
+                }
+                assert_eq!(
+                    event.queue_wait_ms,
+                    ns_to_ms_u64(event.stages[1].duration_ns)
+                );
+                assert_eq!(event.reflow_ms, ns_to_ms_u64(event.stages[2].duration_ns));
+                assert_eq!(event.render_ms, ns_to_ms_u64(event.stages[3].duration_ns));
+                assert_eq!(event.present_ms, ns_to_ms_u64(event.stages[4].duration_ns));
+                let render_prep_metrics = event.stages[3].render_prep_metrics.as_ref();
+                if event.action == EventAction::SetFontSize {
+                    let metrics = render_prep_metrics
+                        .expect("set_font_size events should emit render-prep metrics");
+                    assert!(metrics.staged_batches_total >= 1);
+                    assert!(metrics.glyphs_rebuilt_now > 0 || metrics.cache_hit_glyphs > 0);
+                } else {
+                    assert!(
+                        render_prep_metrics.is_none(),
+                        "non-font resize events should not emit font render-prep metrics"
+                    );
+                }
+                let queue = event.stages[1].queue_metrics.as_ref().unwrap();
                 assert!(
-                    render_prep_metrics.is_none(),
-                    "non-font resize events should not emit font render-prep metrics"
+                    queue.depth_before >= queue.depth_after,
+                    "queue depth should be non-increasing for dequeued event"
                 );
             }
-            let queue = event.stages[1].queue_metrics.as_ref().unwrap();
-            assert!(
-                queue.depth_before >= queue.depth_after,
-                "queue depth should be non-increasing for dequeued event"
-            );
-        }
-    }); }
+        });
+    }
 
     #[test]
-    fn resize_timeline_summary_and_flame_samples_cover_all_stages() { run_async_test(async {
-        let yaml = r#"
+    fn resize_timeline_summary_and_flame_samples_cover_all_stages() {
+        run_async_test(async {
+            let yaml = r#"
 name: resize_probe_summary
 duration: "6s"
 panes:
@@ -1815,42 +1821,44 @@ events:
     action: generate_scrollback
     content: "5x60"
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
 
-        let (_executed, timeline) = scenario
-            .execute_all_with_resize_timeline(&mock)
-            .await
-            .unwrap();
-        let summary = timeline.stage_summary();
-        assert_eq!(summary.len(), ResizeTimelineStage::ALL.len());
-        assert!(summary.iter().all(|entry| entry.samples == 3));
-        assert!(summary.iter().all(|entry| {
-            entry.p50_duration_ns <= entry.p95_duration_ns
-                && entry.p95_duration_ns <= entry.p99_duration_ns
-                && entry.p99_duration_ns <= entry.max_duration_ns
-                && entry.total_duration_ns >= entry.max_duration_ns
-        }));
+            let (_executed, timeline) = scenario
+                .execute_all_with_resize_timeline(&mock)
+                .await
+                .unwrap();
+            let summary = timeline.stage_summary();
+            assert_eq!(summary.len(), ResizeTimelineStage::ALL.len());
+            assert!(summary.iter().all(|entry| entry.samples == 3));
+            assert!(summary.iter().all(|entry| {
+                entry.p50_duration_ns <= entry.p95_duration_ns
+                    && entry.p95_duration_ns <= entry.p99_duration_ns
+                    && entry.p99_duration_ns <= entry.max_duration_ns
+                    && entry.total_duration_ns >= entry.max_duration_ns
+            }));
 
-        let flame = timeline.flame_samples();
-        assert_eq!(
-            flame.len(),
-            timeline.events.len() * ResizeTimelineStage::ALL.len()
-        );
-        let mut stage_suffixes = BTreeSet::new();
-        for row in &flame {
-            let suffix = row.stack.rsplit(';').next().unwrap_or_default().to_string();
-            stage_suffixes.insert(suffix);
-        }
-        for stage in ResizeTimelineStage::ALL {
-            assert!(stage_suffixes.contains(stage.as_str()));
-        }
-    }); }
+            let flame = timeline.flame_samples();
+            assert_eq!(
+                flame.len(),
+                timeline.events.len() * ResizeTimelineStage::ALL.len()
+            );
+            let mut stage_suffixes = BTreeSet::new();
+            for row in &flame {
+                let suffix = row.stack.rsplit(';').next().unwrap_or_default().to_string();
+                stage_suffixes.insert(suffix);
+            }
+            for stage in ResizeTimelineStage::ALL {
+                assert!(stage_suffixes.contains(stage.as_str()));
+            }
+        });
+    }
 
     #[test]
-    fn set_font_size_render_prep_uses_staged_atlas_and_shader_warmup_policy() { run_async_test(async {
-        let yaml = r#"
+    fn set_font_size_render_prep_uses_staged_atlas_and_shader_warmup_policy() {
+        run_async_test(async {
+            let yaml = r#"
 name: font_pipeline_policy
 duration: "8s"
 panes:
@@ -1869,65 +1877,69 @@ events:
     action: set_font_size
     content: "1.60"
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
 
-        let (_executed, timeline) = scenario
-            .execute_all_with_resize_timeline(&mock)
-            .await
-            .unwrap();
-        assert_eq!(timeline.events.len(), 3);
+            let (_executed, timeline) = scenario
+                .execute_all_with_resize_timeline(&mock)
+                .await
+                .unwrap();
+            assert_eq!(timeline.events.len(), 3);
 
-        let first = timeline.events[0].stages[3]
-            .render_prep_metrics
-            .as_ref()
-            .unwrap();
-        assert_eq!(first.atlas_cache_policy, FontAtlasCachePolicy::FullRebuild);
-        assert!(first.shader_warmup);
-        assert!(first.staged_batches_total >= 1);
+            let first = timeline.events[0].stages[3]
+                .render_prep_metrics
+                .as_ref()
+                .unwrap();
+            assert_eq!(first.atlas_cache_policy, FontAtlasCachePolicy::FullRebuild);
+            assert!(first.shader_warmup);
+            assert!(first.staged_batches_total >= 1);
 
-        let second = timeline.events[1].stages[3]
-            .render_prep_metrics
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            second.atlas_cache_policy,
-            FontAtlasCachePolicy::ReuseHotAtlas
-        );
-        assert!(!second.shader_warmup);
-        assert!(second.cache_hit_glyphs > 0);
+            let second = timeline.events[1].stages[3]
+                .render_prep_metrics
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                second.atlas_cache_policy,
+                FontAtlasCachePolicy::ReuseHotAtlas
+            );
+            assert!(!second.shader_warmup);
+            assert!(second.cache_hit_glyphs > 0);
 
-        let third = timeline.events[2].stages[3]
-            .render_prep_metrics
-            .as_ref()
-            .unwrap();
-        assert_eq!(third.atlas_cache_policy, FontAtlasCachePolicy::FullRebuild);
-        assert!(third.shader_warmup);
-        assert!(third.deferred_glyphs > 0);
-    }); }
-
-    #[test]
-    fn execute_until_partial() { run_async_test(async {
-        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
-
-        // Only execute events up to 2s (only the first event at 1s fires)
-        let count = scenario
-            .execute_until(&mock, Duration::from_secs(2))
-            .await
-            .unwrap();
-        assert_eq!(count, 1);
-
-        let text = mock.get_text(0, false).await.unwrap();
-        assert!(text.contains("hello world"));
-        assert!(!text.contains("done"));
-    }); }
+            let third = timeline.events[2].stages[3]
+                .render_prep_metrics
+                .as_ref()
+                .unwrap();
+            assert_eq!(third.atlas_cache_policy, FontAtlasCachePolicy::FullRebuild);
+            assert!(third.shader_warmup);
+            assert!(third.deferred_glyphs > 0);
+        });
+    }
 
     #[test]
-    fn scenario_with_clear() { run_async_test(async {
-        let yaml = r#"
+    fn execute_until_partial() {
+        run_async_test(async {
+            let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
+
+            // Only execute events up to 2s (only the first event at 1s fires)
+            let count = scenario
+                .execute_until(&mock, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+
+            let text = mock.get_text(0, false).await.unwrap();
+            assert!(text.contains("hello world"));
+            assert!(!text.contains("done"));
+        });
+    }
+
+    #[test]
+    fn scenario_with_clear() {
+        run_async_test(async {
+            let yaml = r#"
 name: clear_test
 duration: "5s"
 panes:
@@ -1942,19 +1954,21 @@ events:
     action: append
     content: "new content"
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
-        scenario.execute_all(&mock).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
+            scenario.execute_all(&mock).await.unwrap();
 
-        let text = mock.get_text(0, false).await.unwrap();
-        assert!(!text.contains("old content"));
-        assert!(text.contains("new content"));
-    }); }
+            let text = mock.get_text(0, false).await.unwrap();
+            assert!(!text.contains("old content"));
+            assert!(text.contains("new content"));
+        });
+    }
 
     #[test]
-    fn scenario_with_resize_and_title() { run_async_test(async {
-        let yaml = r#"
+    fn scenario_with_resize_and_title() {
+        run_async_test(async {
+            let yaml = r#"
 name: resize_title
 duration: "5s"
 panes:
@@ -1969,16 +1983,17 @@ events:
     action: set_title
     content: "Updated Title"
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
-        scenario.execute_all(&mock).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
+            scenario.execute_all(&mock).await.unwrap();
 
-        let state = mock.pane_state(0).await.unwrap();
-        assert_eq!(state.cols, 120);
-        assert_eq!(state.rows, 40);
-        assert_eq!(state.title, "Updated Title");
-    }); }
+            let state = mock.pane_state(0).await.unwrap();
+            assert_eq!(state.cols, 120);
+            assert_eq!(state.rows, 40);
+            assert_eq!(state.title, "Updated Title");
+        });
+    }
 
     #[test]
     fn parse_duration_values() {
@@ -2103,8 +2118,9 @@ events:
     }
 
     #[test]
-    fn multi_pane_execution() { run_async_test(async {
-        let yaml = r#"
+    fn multi_pane_execution() {
+        run_async_test(async {
+            let yaml = r#"
 name: multi_exec
 duration: "5s"
 panes:
@@ -2126,23 +2142,25 @@ events:
     action: append
     content: " more-a"
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
-        let count = scenario.execute_all(&mock).await.unwrap();
-        assert_eq!(count, 3);
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
+            let count = scenario.execute_all(&mock).await.unwrap();
+            assert_eq!(count, 3);
 
-        let t0 = mock.get_text(0, false).await.unwrap();
-        let t1 = mock.get_text(1, false).await.unwrap();
-        assert!(t0.contains("output-a"));
-        assert!(t0.contains("more-a"));
-        assert!(t1.contains("output-b"));
-        assert!(!t1.contains("output-a"));
-    }); }
+            let t0 = mock.get_text(0, false).await.unwrap();
+            let t1 = mock.get_text(1, false).await.unwrap();
+            assert!(t0.contains("output-a"));
+            assert!(t0.contains("more-a"));
+            assert!(t1.contains("output-b"));
+            assert!(!t1.contains("output-a"));
+        });
+    }
 
     #[test]
-    fn marker_event_injects_marker_text() { run_async_test(async {
-        let yaml = r#"
+    fn marker_event_injects_marker_text() {
+        run_async_test(async {
+            let yaml = r#"
 name: marker_test
 duration: "5s"
 panes:
@@ -2153,32 +2171,35 @@ events:
     action: marker
     name: checkpoint_1
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
-        scenario.execute_all(&mock).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
+            scenario.execute_all(&mock).await.unwrap();
 
-        let text = mock.get_text(0, false).await.unwrap();
-        assert!(text.contains("[MARKER:checkpoint_1]"));
-    }); }
+            let text = mock.get_text(0, false).await.unwrap();
+            assert!(text.contains("[MARKER:checkpoint_1]"));
+        });
+    }
 
     #[test]
-    fn contains_expectation_passes() { run_async_test(async {
-        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
-        scenario.execute_all(&mock).await.unwrap();
+    fn contains_expectation_passes() {
+        run_async_test(async {
+            let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
+            scenario.execute_all(&mock).await.unwrap();
 
-        // Verify the expectation programmatically
-        assert_eq!(scenario.expectations.len(), 1);
-        match &scenario.expectations[0].kind {
-            ExpectationKind::Contains { pane, text } => {
-                let content = mock.get_text(*pane, false).await.unwrap();
-                assert!(content.contains(text));
+            // Verify the expectation programmatically
+            assert_eq!(scenario.expectations.len(), 1);
+            match &scenario.expectations[0].kind {
+                ExpectationKind::Contains { pane, text } => {
+                    let content = mock.get_text(*pane, false).await.unwrap();
+                    assert!(content.contains(text));
+                }
+                _ => panic!("Expected Contains expectation"),
             }
-            _ => panic!("Expected Contains expectation"),
-        }
-    }); }
+        });
+    }
 
     #[test]
     fn comments_are_ignored() {
@@ -2264,20 +2285,22 @@ events:
     }
 
     #[test]
-    fn execute_until_zero_runs_nothing() { run_async_test(async {
-        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
+    fn execute_until_zero_runs_nothing() {
+        run_async_test(async {
+            let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
 
-        let count = scenario
-            .execute_until(&mock, Duration::from_millis(0))
-            .await
-            .unwrap();
-        assert_eq!(count, 0);
+            let count = scenario
+                .execute_until(&mock, Duration::from_millis(0))
+                .await
+                .unwrap();
+            assert_eq!(count, 0);
 
-        let text = mock.get_text(0, false).await.unwrap();
-        assert_eq!(text, "$ ");
-    }); }
+            let text = mock.get_text(0, false).await.unwrap();
+            assert_eq!(text, "$ ");
+        });
+    }
 
     #[test]
     fn scenario_round_trip_yaml() {
@@ -2290,18 +2313,20 @@ events:
     }
 
     #[test]
-    fn scenario_load_from_temp_file() { run_async_test(async {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.yaml");
-        let mut f = std::fs::File::create(&path).unwrap();
-        write!(f, "{}", BASIC_SCENARIO).unwrap();
-        drop(f);
+    fn scenario_load_from_temp_file() {
+        run_async_test(async {
+            use std::io::Write;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.yaml");
+            let mut f = std::fs::File::create(&path).unwrap();
+            write!(f, "{}", BASIC_SCENARIO).unwrap();
+            drop(f);
 
-        let scenario = Scenario::load(&path).unwrap();
-        assert_eq!(scenario.name, "basic_test");
-        assert_eq!(scenario.events.len(), 2);
-    }); }
+            let scenario = Scenario::load(&path).unwrap();
+            assert_eq!(scenario.name, "basic_test");
+            assert_eq!(scenario.events.len(), 2);
+        });
+    }
 
     #[test]
     fn scenario_load_nonexistent_file() {
@@ -2340,95 +2365,112 @@ events: []
     // -----------------------------------------------------------------------
 
     #[test]
-    fn sandbox_creates_default_panes() { run_async_test(async {
-        let sandbox = TutorialSandbox::new().await;
-        assert_eq!(sandbox.mock().pane_count().await, 3);
+    fn sandbox_creates_default_panes() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::new().await;
+            assert_eq!(sandbox.mock().pane_count().await, 3);
 
-        let p0 = sandbox.mock().pane_state(0).await.unwrap();
-        assert_eq!(p0.title, "Local Shell");
-        let p1 = sandbox.mock().pane_state(1).await.unwrap();
-        assert_eq!(p1.title, "Codex Agent");
-        let p2 = sandbox.mock().pane_state(2).await.unwrap();
-        assert_eq!(p2.title, "Claude Code");
-    }); }
-
-    #[test]
-    fn sandbox_initial_content() { run_async_test(async {
-        let sandbox = TutorialSandbox::new().await;
-
-        let t0 = sandbox.mock().get_text(0, false).await.unwrap();
-        assert_eq!(t0, "$ ");
-        let t1 = sandbox.mock().get_text(1, false).await.unwrap();
-        assert!(t1.contains("codex>"));
-    }); }
+            let p0 = sandbox.mock().pane_state(0).await.unwrap();
+            assert_eq!(p0.title, "Local Shell");
+            let p1 = sandbox.mock().pane_state(1).await.unwrap();
+            assert_eq!(p1.title, "Codex Agent");
+            let p2 = sandbox.mock().pane_state(2).await.unwrap();
+            assert_eq!(p2.title, "Claude Code");
+        });
+    }
 
     #[test]
-    fn sandbox_format_output_with_indicator() { run_async_test(async {
-        let sandbox = TutorialSandbox::new().await;
-        assert_eq!(sandbox.format_output("hello"), "[SANDBOX] hello");
-    }); }
+    fn sandbox_initial_content() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::new().await;
+
+            let t0 = sandbox.mock().get_text(0, false).await.unwrap();
+            assert_eq!(t0, "$ ");
+            let t1 = sandbox.mock().get_text(1, false).await.unwrap();
+            assert!(t1.contains("codex>"));
+        });
+    }
 
     #[test]
-    fn sandbox_format_output_without_indicator() { run_async_test(async {
-        let mut sandbox = TutorialSandbox::new().await;
-        sandbox.set_show_indicator(false);
-        assert_eq!(sandbox.format_output("hello"), "hello");
-    }); }
+    fn sandbox_format_output_with_indicator() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::new().await;
+            assert_eq!(sandbox.format_output("hello"), "[SANDBOX] hello");
+        });
+    }
 
     #[test]
-    fn sandbox_command_logging() { run_async_test(async {
-        let mut sandbox = TutorialSandbox::new().await;
-        assert!(sandbox.command_log().is_empty());
-
-        sandbox.log_command("ft status", Some("basics.1"));
-        sandbox.log_command("ft list", None);
-
-        assert_eq!(sandbox.command_log().len(), 2);
-        assert_eq!(sandbox.command_log()[0].command, "ft status");
-        assert_eq!(
-            sandbox.command_log()[0].exercise_id.as_deref(),
-            Some("basics.1")
-        );
-        assert_eq!(sandbox.command_log()[1].command, "ft list");
-        assert!(sandbox.command_log()[1].exercise_id.is_none());
-    }); }
+    fn sandbox_format_output_without_indicator() {
+        run_async_test(async {
+            let mut sandbox = TutorialSandbox::new().await;
+            sandbox.set_show_indicator(false);
+            assert_eq!(sandbox.format_output("hello"), "hello");
+        });
+    }
 
     #[test]
-    fn sandbox_trigger_events() { run_async_test(async {
-        let sandbox = TutorialSandbox::new().await;
-        let count = sandbox.trigger_exercise_events().await.unwrap();
-        assert_eq!(count, 2);
+    fn sandbox_command_logging() {
+        run_async_test(async {
+            let mut sandbox = TutorialSandbox::new().await;
+            assert!(sandbox.command_log().is_empty());
 
-        let t1 = sandbox.mock().get_text(1, false).await.unwrap();
-        assert!(t1.contains("Usage Warning"));
-        let t2 = sandbox.mock().get_text(2, false).await.unwrap();
-        assert!(t2.contains("Context Compaction"));
-    }); }
+            sandbox.log_command("ft status", Some("basics.1"));
+            sandbox.log_command("ft list", None);
 
-    #[test]
-    fn sandbox_check_expectations_after_events() { run_async_test(async {
-        let sandbox = TutorialSandbox::new().await;
-        sandbox.trigger_exercise_events().await.unwrap();
-
-        let (pass, fail, skip) = sandbox.check_all_expectations().await;
-        assert_eq!(pass, 2);
-        assert_eq!(fail, 0);
-        assert_eq!(skip, 0);
-    }); }
+            assert_eq!(sandbox.command_log().len(), 2);
+            assert_eq!(sandbox.command_log()[0].command, "ft status");
+            assert_eq!(
+                sandbox.command_log()[0].exercise_id.as_deref(),
+                Some("basics.1")
+            );
+            assert_eq!(sandbox.command_log()[1].command, "ft list");
+            assert!(sandbox.command_log()[1].exercise_id.is_none());
+        });
+    }
 
     #[test]
-    fn sandbox_check_expectations_before_events() { run_async_test(async {
-        let sandbox = TutorialSandbox::new().await;
-        // Don't trigger events — expectations should fail
-        let (pass, fail, skip) = sandbox.check_all_expectations().await;
-        assert_eq!(pass, 0);
-        assert_eq!(fail, 2);
-        assert_eq!(skip, 0);
-    }); }
+    fn sandbox_trigger_events() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::new().await;
+            let count = sandbox.trigger_exercise_events().await.unwrap();
+            assert_eq!(count, 2);
+
+            let t1 = sandbox.mock().get_text(1, false).await.unwrap();
+            assert!(t1.contains("Usage Warning"));
+            let t2 = sandbox.mock().get_text(2, false).await.unwrap();
+            assert!(t2.contains("Context Compaction"));
+        });
+    }
 
     #[test]
-    fn sandbox_with_custom_scenario() { run_async_test(async {
-        let yaml = r#"
+    fn sandbox_check_expectations_after_events() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::new().await;
+            sandbox.trigger_exercise_events().await.unwrap();
+
+            let (pass, fail, skip) = sandbox.check_all_expectations().await;
+            assert_eq!(pass, 2);
+            assert_eq!(fail, 0);
+            assert_eq!(skip, 0);
+        });
+    }
+
+    #[test]
+    fn sandbox_check_expectations_before_events() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::new().await;
+            // Don't trigger events — expectations should fail
+            let (pass, fail, skip) = sandbox.check_all_expectations().await;
+            assert_eq!(pass, 0);
+            assert_eq!(fail, 2);
+            assert_eq!(skip, 0);
+        });
+    }
+
+    #[test]
+    fn sandbox_with_custom_scenario() {
+        run_async_test(async {
+            let yaml = r#"
 name: custom_sandbox
 duration: "5s"
 panes:
@@ -2437,35 +2479,42 @@ panes:
     initial_content: "custom> "
 events: []
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let sandbox = TutorialSandbox::with_scenario(scenario).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let sandbox = TutorialSandbox::with_scenario(scenario).await.unwrap();
 
-        assert_eq!(sandbox.mock().pane_count().await, 1);
-        let text = sandbox.mock().get_text(0, false).await.unwrap();
-        assert_eq!(text, "custom> ");
-    }); }
-
-    #[test]
-    fn sandbox_empty_has_no_panes() { run_async_test(async {
-        let sandbox = TutorialSandbox::empty();
-        assert_eq!(sandbox.mock().pane_count().await, 0);
-    }); }
+            assert_eq!(sandbox.mock().pane_count().await, 1);
+            let text = sandbox.mock().get_text(0, false).await.unwrap();
+            assert_eq!(text, "custom> ");
+        });
+    }
 
     #[test]
-    fn sandbox_empty_trigger_events_returns_zero() { run_async_test(async {
-        let sandbox = TutorialSandbox::empty();
-        let count = sandbox.trigger_exercise_events().await.unwrap();
-        assert_eq!(count, 0);
-    }); }
+    fn sandbox_empty_has_no_panes() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::empty();
+            assert_eq!(sandbox.mock().pane_count().await, 0);
+        });
+    }
 
     #[test]
-    fn sandbox_empty_check_expectations() { run_async_test(async {
-        let sandbox = TutorialSandbox::empty();
-        let (pass, fail, skip) = sandbox.check_all_expectations().await;
-        assert_eq!(pass, 0);
-        assert_eq!(fail, 0);
-        assert_eq!(skip, 0);
-    }); }
+    fn sandbox_empty_trigger_events_returns_zero() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::empty();
+            let count = sandbox.trigger_exercise_events().await.unwrap();
+            assert_eq!(count, 0);
+        });
+    }
+
+    #[test]
+    fn sandbox_empty_check_expectations() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::empty();
+            let (pass, fail, skip) = sandbox.check_all_expectations().await;
+            assert_eq!(pass, 0);
+            assert_eq!(fail, 0);
+            assert_eq!(skip, 0);
+        });
+    }
 
     // -----------------------------------------------------------------------
     // NEW TESTS: parse_duration edge cases
@@ -3671,49 +3720,56 @@ events: []
     // -----------------------------------------------------------------------
 
     #[test]
-    fn execute_until_exact_boundary() { run_async_test(async {
-        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
+    fn execute_until_exact_boundary() {
+        run_async_test(async {
+            let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
 
-        // Execute exactly at 1s boundary (first event is at 1s)
-        let count = scenario
-            .execute_until(&mock, Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert_eq!(count, 1);
-    }); }
-
-    #[test]
-    fn execute_until_just_before_first_event() { run_async_test(async {
-        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
-
-        let count = scenario
-            .execute_until(&mock, Duration::from_millis(999))
-            .await
-            .unwrap();
-        assert_eq!(count, 0);
-    }); }
+            // Execute exactly at 1s boundary (first event is at 1s)
+            let count = scenario
+                .execute_until(&mock, Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+        });
+    }
 
     #[test]
-    fn execute_until_far_future() { run_async_test(async {
-        let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
+    fn execute_until_just_before_first_event() {
+        run_async_test(async {
+            let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
 
-        // Way past all events
-        let count = scenario
-            .execute_until(&mock, Duration::from_secs(9999))
-            .await
-            .unwrap();
-        assert_eq!(count, 2);
-    }); }
+            let count = scenario
+                .execute_until(&mock, Duration::from_millis(999))
+                .await
+                .unwrap();
+            assert_eq!(count, 0);
+        });
+    }
 
     #[test]
-    fn setup_pane_0_is_active() { run_async_test(async {
-        let yaml = r#"
+    fn execute_until_far_future() {
+        run_async_test(async {
+            let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
+
+            // Way past all events
+            let count = scenario
+                .execute_until(&mock, Duration::from_secs(9999))
+                .await
+                .unwrap();
+            assert_eq!(count, 2);
+        });
+    }
+
+    #[test]
+    fn setup_pane_0_is_active() {
+        run_async_test(async {
+            let yaml = r#"
 name: active_test
 duration: "1s"
 panes:
@@ -3721,40 +3777,44 @@ panes:
   - id: 5
 events: []
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
 
-        let p0 = mock.pane_state(0).await.unwrap();
-        assert!(p0.is_active);
-        let p5 = mock.pane_state(5).await.unwrap();
-        assert!(!p5.is_active);
-    }); }
+            let p0 = mock.pane_state(0).await.unwrap();
+            assert!(p0.is_active);
+            let p5 = mock.pane_state(5).await.unwrap();
+            assert!(!p5.is_active);
+        });
+    }
 
     #[test]
-    fn setup_panes_not_zoomed() { run_async_test(async {
-        let yaml = r#"
+    fn setup_panes_not_zoomed() {
+        run_async_test(async {
+            let yaml = r#"
 name: zoom_test
 duration: "1s"
 panes:
   - id: 0
 events: []
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
 
-        let p0 = mock.pane_state(0).await.unwrap();
-        assert!(!p0.is_zoomed);
-    }); }
+            let p0 = mock.pane_state(0).await.unwrap();
+            assert!(!p0.is_zoomed);
+        });
+    }
 
     // -----------------------------------------------------------------------
     // NEW TESTS: resize timeline with partial execution
     // -----------------------------------------------------------------------
 
     #[test]
-    fn execute_until_with_resize_timeline_partial() { run_async_test(async {
-        let yaml = r#"
+    fn execute_until_with_resize_timeline_partial() {
+        run_async_test(async {
+            let yaml = r#"
 name: partial_resize
 duration: "10s"
 panes:
@@ -3769,24 +3829,26 @@ events:
     action: resize
     content: "120x40"
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
 
-        // Only up to 3s: first resize but not second
-        let (count, timeline) = scenario
-            .execute_until_with_resize_timeline(&mock, Duration::from_secs(3))
-            .await
-            .unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(timeline.executed_resize_events, 1);
-        assert_eq!(timeline.events.len(), 1);
-        assert_eq!(timeline.events[0].action, EventAction::Resize);
-    }); }
+            // Only up to 3s: first resize but not second
+            let (count, timeline) = scenario
+                .execute_until_with_resize_timeline(&mock, Duration::from_secs(3))
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(timeline.executed_resize_events, 1);
+            assert_eq!(timeline.events.len(), 1);
+            assert_eq!(timeline.events[0].action, EventAction::Resize);
+        });
+    }
 
     #[test]
-    fn execute_until_with_resize_timeline_no_resize_events() { run_async_test(async {
-        let yaml = r#"
+    fn execute_until_with_resize_timeline_no_resize_events() {
+        run_async_test(async {
+            let yaml = r#"
 name: no_resize
 duration: "5s"
 panes:
@@ -3800,139 +3862,159 @@ events:
     pane: 0
     action: clear
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
 
-        let (count, timeline) = scenario
-            .execute_all_with_resize_timeline(&mock)
-            .await
-            .unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(timeline.executed_resize_events, 0);
-        assert!(timeline.events.is_empty());
-    }); }
+            let (count, timeline) = scenario
+                .execute_all_with_resize_timeline(&mock)
+                .await
+                .unwrap();
+            assert_eq!(count, 2);
+            assert_eq!(timeline.executed_resize_events, 0);
+            assert!(timeline.events.is_empty());
+        });
+    }
 
     #[test]
-    fn resize_timeline_captured_at_is_recent() { run_async_test(async {
-        let yaml = r#"
+    fn resize_timeline_captured_at_is_recent() {
+        run_async_test(async {
+            let yaml = r#"
 name: ts_check
 duration: "1s"
 panes:
   - id: 0
 events: []
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let mock = MockWezterm::new();
-        scenario.setup(&mock).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let mock = MockWezterm::new();
+            scenario.setup(&mock).await.unwrap();
 
-        let (_count, timeline) = scenario
-            .execute_all_with_resize_timeline(&mock)
-            .await
-            .unwrap();
-        // Should be a recent epoch ms
-        assert!(timeline.captured_at_ms > 1_577_836_800_000);
-    }); }
+            let (_count, timeline) = scenario
+                .execute_all_with_resize_timeline(&mock)
+                .await
+                .unwrap();
+            // Should be a recent epoch ms
+            assert!(timeline.captured_at_ms > 1_577_836_800_000);
+        });
+    }
 
     // -----------------------------------------------------------------------
     // NEW TESTS: TutorialSandbox extended
     // -----------------------------------------------------------------------
 
     #[test]
-    fn sandbox_check_event_expectation_returns_false() { run_async_test(async {
-        let sandbox = TutorialSandbox::new().await;
-        // Event expectations always return false (need runtime)
-        let result = sandbox
-            .check_expectation(&ExpectationKind::Event {
-                event: "test".to_string(),
-                detected_at: None,
-            })
-            .await;
-        assert!(!result);
-    }); }
+    fn sandbox_check_event_expectation_returns_false() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::new().await;
+            // Event expectations always return false (need runtime)
+            let result = sandbox
+                .check_expectation(&ExpectationKind::Event {
+                    event: "test".to_string(),
+                    detected_at: None,
+                })
+                .await;
+            assert!(!result);
+        });
+    }
 
     #[test]
-    fn sandbox_check_workflow_expectation_returns_false() { run_async_test(async {
-        let sandbox = TutorialSandbox::new().await;
-        let result = sandbox
-            .check_expectation(&ExpectationKind::Workflow {
-                workflow: "test".to_string(),
-                started_at: None,
-            })
-            .await;
-        assert!(!result);
-    }); }
+    fn sandbox_check_workflow_expectation_returns_false() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::new().await;
+            let result = sandbox
+                .check_expectation(&ExpectationKind::Workflow {
+                    workflow: "test".to_string(),
+                    started_at: None,
+                })
+                .await;
+            assert!(!result);
+        });
+    }
 
     #[test]
-    fn sandbox_check_contains_nonexistent_pane() { run_async_test(async {
-        let sandbox = TutorialSandbox::new().await;
-        let result = sandbox
-            .check_expectation(&ExpectationKind::Contains {
-                pane: 999,
-                text: "anything".to_string(),
-            })
-            .await;
-        assert!(!result);
-    }); }
+    fn sandbox_check_contains_nonexistent_pane() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::new().await;
+            let result = sandbox
+                .check_expectation(&ExpectationKind::Contains {
+                    pane: 999,
+                    text: "anything".to_string(),
+                })
+                .await;
+            assert!(!result);
+        });
+    }
 
     #[test]
-    fn sandbox_check_contains_missing_text() { run_async_test(async {
-        let sandbox = TutorialSandbox::new().await;
-        let result = sandbox
-            .check_expectation(&ExpectationKind::Contains {
-                pane: 0,
-                text: "this text does not exist".to_string(),
-            })
-            .await;
-        assert!(!result);
-    }); }
+    fn sandbox_check_contains_missing_text() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::new().await;
+            let result = sandbox
+                .check_expectation(&ExpectationKind::Contains {
+                    pane: 0,
+                    text: "this text does not exist".to_string(),
+                })
+                .await;
+            assert!(!result);
+        });
+    }
 
     #[test]
-    fn sandbox_check_contains_present_text() { run_async_test(async {
-        let sandbox = TutorialSandbox::new().await;
-        // Pane 0 has initial content "$ "
-        let result = sandbox
-            .check_expectation(&ExpectationKind::Contains {
-                pane: 0,
-                text: "$ ".to_string(),
-            })
-            .await;
-        assert!(result);
-    }); }
+    fn sandbox_check_contains_present_text() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::new().await;
+            // Pane 0 has initial content "$ "
+            let result = sandbox
+                .check_expectation(&ExpectationKind::Contains {
+                    pane: 0,
+                    text: "$ ".to_string(),
+                })
+                .await;
+            assert!(result);
+        });
+    }
 
     #[test]
-    fn sandbox_indicator_toggle() { run_async_test(async {
-        let mut sandbox = TutorialSandbox::new().await;
-        assert_eq!(sandbox.format_output("x"), "[SANDBOX] x");
-        sandbox.set_show_indicator(false);
-        assert_eq!(sandbox.format_output("x"), "x");
-        sandbox.set_show_indicator(true);
-        assert_eq!(sandbox.format_output("x"), "[SANDBOX] x");
-    }); }
+    fn sandbox_indicator_toggle() {
+        run_async_test(async {
+            let mut sandbox = TutorialSandbox::new().await;
+            assert_eq!(sandbox.format_output("x"), "[SANDBOX] x");
+            sandbox.set_show_indicator(false);
+            assert_eq!(sandbox.format_output("x"), "x");
+            sandbox.set_show_indicator(true);
+            assert_eq!(sandbox.format_output("x"), "[SANDBOX] x");
+        });
+    }
 
     #[test]
-    fn sandbox_command_log_timestamps_are_monotonic() { run_async_test(async {
-        let mut sandbox = TutorialSandbox::new().await;
-        sandbox.log_command("cmd1", None);
-        sandbox.log_command("cmd2", None);
-        sandbox.log_command("cmd3", None);
+    fn sandbox_command_log_timestamps_are_monotonic() {
+        run_async_test(async {
+            let mut sandbox = TutorialSandbox::new().await;
+            sandbox.log_command("cmd1", None);
+            sandbox.log_command("cmd2", None);
+            sandbox.log_command("cmd3", None);
 
-        let log = sandbox.command_log();
-        assert_eq!(log.len(), 3);
-        // Timestamps should be non-decreasing
-        assert!(log[0].timestamp_ms <= log[1].timestamp_ms);
-        assert!(log[1].timestamp_ms <= log[2].timestamp_ms);
-    }); }
-
-    #[test]
-    fn sandbox_format_output_empty_text() { run_async_test(async {
-        let sandbox = TutorialSandbox::new().await;
-        assert_eq!(sandbox.format_output(""), "[SANDBOX] ");
-    }); }
+            let log = sandbox.command_log();
+            assert_eq!(log.len(), 3);
+            // Timestamps should be non-decreasing
+            assert!(log[0].timestamp_ms <= log[1].timestamp_ms);
+            assert!(log[1].timestamp_ms <= log[2].timestamp_ms);
+        });
+    }
 
     #[test]
-    fn sandbox_with_expectations_mixed_types() { run_async_test(async {
-        let yaml = r#"
+    fn sandbox_format_output_empty_text() {
+        run_async_test(async {
+            let sandbox = TutorialSandbox::new().await;
+            assert_eq!(sandbox.format_output(""), "[SANDBOX] ");
+        });
+    }
+
+    #[test]
+    fn sandbox_with_expectations_mixed_types() {
+        run_async_test(async {
+            let yaml = r#"
 name: mixed_exp
 duration: "5s"
 panes:
@@ -3948,14 +4030,15 @@ expectations:
   - workflow:
       workflow: some_workflow
 "#;
-        let scenario = Scenario::from_yaml(yaml).unwrap();
-        let sandbox = TutorialSandbox::with_scenario(scenario).await.unwrap();
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+            let sandbox = TutorialSandbox::with_scenario(scenario).await.unwrap();
 
-        let (pass, fail, skip) = sandbox.check_all_expectations().await;
-        assert_eq!(pass, 1); // contains passes
-        assert_eq!(fail, 0);
-        assert_eq!(skip, 2); // event and workflow are skipped
-    }); }
+            let (pass, fail, skip) = sandbox.check_all_expectations().await;
+            assert_eq!(pass, 1); // contains passes
+            assert_eq!(fail, 0);
+            assert_eq!(skip, 2); // event and workflow are skipped
+        });
+    }
 
     // -----------------------------------------------------------------------
     // NEW TESTS: SandboxCommand serialization

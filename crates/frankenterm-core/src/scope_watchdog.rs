@@ -1209,8 +1209,14 @@ mod tests {
         tree.start(&ScopeId::root(), 1000).unwrap();
 
         let daemon = ScopeId("daemon:zombie".into());
-        tree.register(daemon.clone(), ScopeTier::Daemon, &ScopeId::root(), "zombie", 1000)
-            .unwrap();
+        tree.register(
+            daemon.clone(),
+            ScopeTier::Daemon,
+            &ScopeId::root(),
+            "zombie",
+            1000,
+        )
+        .unwrap();
         tree.start(&daemon, 1100).unwrap();
         tree.request_shutdown(&daemon, 2000).unwrap();
         tree.finalize(&daemon).unwrap();
@@ -1222,7 +1228,9 @@ mod tests {
         // Not zombie yet (only 5s elapsed)
         let alerts = wd.scan(&tree, 7_000);
         assert!(
-            !alerts.iter().any(|a| matches!(a.kind, AlertKind::ZombieFinalizer { .. })),
+            !alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::ZombieFinalizer { .. })),
             "should not be zombie at 5s"
         );
 
@@ -1243,8 +1251,14 @@ mod tests {
         tree.start(&ScopeId::root(), 1000).unwrap();
 
         let daemon = ScopeId("daemon:noshutdown".into());
-        tree.register(daemon.clone(), ScopeTier::Daemon, &ScopeId::root(), "test", 1000)
-            .unwrap();
+        tree.register(
+            daemon.clone(),
+            ScopeTier::Daemon,
+            &ScopeId::root(),
+            "test",
+            1000,
+        )
+        .unwrap();
         tree.start(&daemon, 1100).unwrap();
         tree.request_shutdown(&daemon, 2000).unwrap();
         tree.finalize(&daemon).unwrap();
@@ -1255,7 +1269,11 @@ mod tests {
         let mut wd = ScopeWatchdog::new();
         // Now finalize_start = created_at_ms = 1000, so elapsed at 15000 = 14000 > timeout (10000)
         let alerts = wd.scan(&tree, 15_000);
-        assert!(alerts.iter().any(|a| matches!(a.kind, AlertKind::ZombieFinalizer { .. })));
+        assert!(
+            alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::ZombieFinalizer { .. }))
+        );
     }
 
     // ── Deadlock detection ──────────────────────────────────────────────
@@ -1284,8 +1302,10 @@ mod tests {
         let a = ScopeId("daemon:a".into());
         let b = ScopeId("daemon:b".into());
 
-        tree.register(a.clone(), ScopeTier::Daemon, &ScopeId::root(), "a", 1000).unwrap();
-        tree.register(b.clone(), ScopeTier::Daemon, &ScopeId::root(), "b", 1000).unwrap();
+        tree.register(a.clone(), ScopeTier::Daemon, &ScopeId::root(), "a", 1000)
+            .unwrap();
+        tree.register(b.clone(), ScopeTier::Daemon, &ScopeId::root(), "b", 1000)
+            .unwrap();
         tree.start(&a, 1100).unwrap();
         tree.start(&b, 1100).unwrap();
         tree.request_shutdown(&a, 2000).unwrap();
@@ -1320,8 +1340,10 @@ mod tests {
 
         let a = ScopeId("daemon:a".into());
         let b = ScopeId("daemon:b".into());
-        tree.register(a.clone(), ScopeTier::Daemon, &ScopeId::root(), "a", 1000).unwrap();
-        tree.register(b.clone(), ScopeTier::Daemon, &ScopeId::root(), "b", 1000).unwrap();
+        tree.register(a.clone(), ScopeTier::Daemon, &ScopeId::root(), "a", 1000)
+            .unwrap();
+        tree.register(b.clone(), ScopeTier::Daemon, &ScopeId::root(), "b", 1000)
+            .unwrap();
         tree.start(&a, 1100).unwrap();
         tree.start(&b, 1100).unwrap();
         tree.request_shutdown(&a, 2000).unwrap();
@@ -1334,7 +1356,9 @@ mod tests {
         let mut wd = ScopeWatchdog::with_config(config);
         let alerts = wd.scan(&tree, 3000);
         assert!(
-            !alerts.iter().any(|a| matches!(a.kind, AlertKind::DeadlockRisk { .. })),
+            !alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::DeadlockRisk { .. })),
             "deadlock detection disabled — should find none"
         );
     }
@@ -1343,13 +1367,16 @@ mod tests {
     fn no_deadlock_in_acyclic_graph() {
         let mut tree = setup_tree();
         // Request shutdown on a couple of daemons — they drain but no cycles
-        tree.request_shutdown(&well_known::discovery(), 5000).unwrap();
+        tree.request_shutdown(&well_known::discovery(), 5000)
+            .unwrap();
         tree.request_shutdown(&well_known::capture(), 5000).unwrap();
 
         let mut wd = ScopeWatchdog::new();
         let alerts = wd.scan(&tree, 5100);
         assert!(
-            !alerts.iter().any(|a| matches!(a.kind, AlertKind::DeadlockRisk { .. })),
+            !alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::DeadlockRisk { .. })),
             "acyclic graph should not trigger deadlock"
         );
     }
@@ -1366,8 +1393,14 @@ mod tests {
         let parent = ScopeId("daemon:parent".into());
         let child = ScopeId("worker:child".into());
 
-        tree.register(parent.clone(), ScopeTier::Daemon, &ScopeId::root(), "parent", 1000)
-            .unwrap();
+        tree.register(
+            parent.clone(),
+            ScopeTier::Daemon,
+            &ScopeId::root(),
+            "parent",
+            1000,
+        )
+        .unwrap();
         tree.start(&parent, 1100).unwrap();
         tree.register(child.clone(), ScopeTier::Worker, &parent, "child", 1200)
             .unwrap();
@@ -1411,9 +1444,17 @@ mod tests {
         let parent = ScopeId("daemon:p".into());
         let child = ScopeId("worker:c".into());
 
-        tree.register(parent.clone(), ScopeTier::Daemon, &ScopeId::root(), "p", 1000).unwrap();
+        tree.register(
+            parent.clone(),
+            ScopeTier::Daemon,
+            &ScopeId::root(),
+            "p",
+            1000,
+        )
+        .unwrap();
         tree.start(&parent, 1100).unwrap();
-        tree.register(child.clone(), ScopeTier::Worker, &parent, "c", 1200).unwrap();
+        tree.register(child.clone(), ScopeTier::Worker, &parent, "c", 1200)
+            .unwrap();
         tree.start(&child, 1300).unwrap();
 
         // Close both properly via force
@@ -1431,7 +1472,9 @@ mod tests {
         let mut wd = ScopeWatchdog::new();
         let alerts = wd.scan(&tree, 3000);
         assert!(
-            !alerts.iter().any(|a| matches!(a.kind, AlertKind::OrphanTask { .. })),
+            !alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::OrphanTask { .. })),
             "both closed — no orphan"
         );
     }
@@ -1442,8 +1485,14 @@ mod tests {
         tree.start(&ScopeId::root(), 1000).unwrap();
 
         let parent = ScopeId("daemon:parent".into());
-        tree.register(parent.clone(), ScopeTier::Daemon, &ScopeId::root(), "parent", 1000)
-            .unwrap();
+        tree.register(
+            parent.clone(),
+            ScopeTier::Daemon,
+            &ScopeId::root(),
+            "parent",
+            1000,
+        )
+        .unwrap();
         tree.start(&parent, 1100).unwrap();
 
         // Register 3 workers
@@ -1478,11 +1527,19 @@ mod tests {
         tree.start(&ScopeId::root(), 1000).unwrap();
 
         let daemon = ScopeId("daemon:d".into());
-        tree.register(daemon.clone(), ScopeTier::Daemon, &ScopeId::root(), "d", 1000).unwrap();
+        tree.register(
+            daemon.clone(),
+            ScopeTier::Daemon,
+            &ScopeId::root(),
+            "d",
+            1000,
+        )
+        .unwrap();
         tree.start(&daemon, 1100).unwrap();
 
         let worker = ScopeId("worker:w".into());
-        tree.register(worker.clone(), ScopeTier::Worker, &daemon, "w", 1200).unwrap();
+        tree.register(worker.clone(), ScopeTier::Worker, &daemon, "w", 1200)
+            .unwrap();
         tree.start(&worker, 1300).unwrap();
 
         // Drain both
@@ -1569,14 +1626,18 @@ mod tests {
         // Exactly at threshold (elapsed = 30_000, threshold = 30_000) — not stale (requires >)
         let alerts = wd.scan(&tree, 31_000);
         assert!(
-            !alerts.iter().any(|a| matches!(a.kind, AlertKind::StaleCreated { .. })),
+            !alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::StaleCreated { .. })),
             "exactly at threshold should not trigger"
         );
 
         // 1ms over threshold
         let alerts = wd.scan(&tree, 31_001);
         assert!(
-            alerts.iter().any(|a| matches!(a.kind, AlertKind::StaleCreated { .. })),
+            alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::StaleCreated { .. })),
             "1ms over threshold should trigger"
         );
     }
@@ -1600,15 +1661,27 @@ mod tests {
 
         // 2. Create a scope that will be in Draining past grace period
         let draining = ScopeId("daemon:draining".into());
-        tree.register(draining.clone(), ScopeTier::Daemon, &ScopeId::root(), "draining", 1000)
-            .unwrap();
+        tree.register(
+            draining.clone(),
+            ScopeTier::Daemon,
+            &ScopeId::root(),
+            "draining",
+            1000,
+        )
+        .unwrap();
         tree.start(&draining, 1100).unwrap();
         tree.request_shutdown(&draining, 2000).unwrap();
 
         // 3. Create a zombie finalizer
         let zombie = ScopeId("daemon:zombie".into());
-        tree.register(zombie.clone(), ScopeTier::Daemon, &ScopeId::root(), "zombie", 1000)
-            .unwrap();
+        tree.register(
+            zombie.clone(),
+            ScopeTier::Daemon,
+            &ScopeId::root(),
+            "zombie",
+            1000,
+        )
+        .unwrap();
         tree.start(&zombie, 1100).unwrap();
         tree.request_shutdown(&zombie, 2000).unwrap();
         tree.finalize(&zombie).unwrap();
@@ -1641,16 +1714,28 @@ mod tests {
         // Scan at 50_000ms — stale (49s > 30s), stuck (48s > 15s), zombie (48s > 10s)
         let alerts = wd.scan(&tree, 50_000);
 
-        let has_stale = alerts.iter().any(|a| matches!(a.kind, AlertKind::StaleCreated { .. }));
-        let has_stuck = alerts.iter().any(|a| matches!(a.kind, AlertKind::StuckCancellation { .. }));
-        let has_zombie = alerts.iter().any(|a| matches!(a.kind, AlertKind::ZombieFinalizer { .. }));
-        let has_orphan = alerts.iter().any(|a| matches!(a.kind, AlertKind::OrphanTask { .. }));
+        let has_stale = alerts
+            .iter()
+            .any(|a| matches!(a.kind, AlertKind::StaleCreated { .. }));
+        let has_stuck = alerts
+            .iter()
+            .any(|a| matches!(a.kind, AlertKind::StuckCancellation { .. }));
+        let has_zombie = alerts
+            .iter()
+            .any(|a| matches!(a.kind, AlertKind::ZombieFinalizer { .. }));
+        let has_orphan = alerts
+            .iter()
+            .any(|a| matches!(a.kind, AlertKind::OrphanTask { .. }));
 
         assert!(has_stale, "should detect stale created");
         assert!(has_stuck, "should detect stuck cancellation");
         assert!(has_zombie, "should detect zombie finalizer");
         assert!(has_orphan, "should detect orphan task");
-        assert!(alerts.len() >= 4, "should have at least 4 alerts, got {}", alerts.len());
+        assert!(
+            alerts.len() >= 4,
+            "should have at least 4 alerts, got {}",
+            alerts.len()
+        );
     }
 
     // ── total_alerts accumulation ───────────────────────────────────────
@@ -1658,7 +1743,8 @@ mod tests {
     #[test]
     fn total_alerts_accumulates_across_scans() {
         let mut tree = setup_tree();
-        tree.request_shutdown(&well_known::discovery(), 5000).unwrap();
+        tree.request_shutdown(&well_known::discovery(), 5000)
+            .unwrap();
 
         let mut wd = ScopeWatchdog::new();
         assert_eq!(wd.total_alerts(), 0);
@@ -1809,32 +1895,62 @@ mod tests {
     #[test]
     fn scan_summary_counts_each_category_correctly() {
         let alerts = vec![
-            WatchdogAlert::new(1000, AlertSeverity::Error, AlertKind::OrphanTask {
-                scope_id: ScopeId("a".into()),
-                parent_id: ScopeId("p".into()),
-                scope_state: ScopeState::Running,
-                parent_state: ScopeState::Closed,
-            }, "o1".into(), "fix".into()),
-            WatchdogAlert::new(1000, AlertSeverity::Error, AlertKind::OrphanTask {
-                scope_id: ScopeId("b".into()),
-                parent_id: ScopeId("p".into()),
-                scope_state: ScopeState::Running,
-                parent_state: ScopeState::Closed,
-            }, "o2".into(), "fix".into()),
-            WatchdogAlert::new(1000, AlertSeverity::Warning, AlertKind::StuckCancellation {
-                scope_id: ScopeId("c".into()),
-                draining_since_ms: 0,
-                elapsed_ms: 5000,
-                expected_grace_ms: 1000,
-            }, "s1".into(), "fix".into()),
-            WatchdogAlert::new(1000, AlertSeverity::Critical, AlertKind::DeadlockRisk {
-                cycle: vec![ScopeId("x".into()), ScopeId("y".into())],
-            }, "d1".into(), "fix".into()),
-            WatchdogAlert::new(1000, AlertSeverity::Warning, AlertKind::ExcessiveDepth {
-                scope_id: ScopeId("deep".into()),
-                depth: 10,
-                max_depth: 8,
-            }, "e1".into(), "fix".into()),
+            WatchdogAlert::new(
+                1000,
+                AlertSeverity::Error,
+                AlertKind::OrphanTask {
+                    scope_id: ScopeId("a".into()),
+                    parent_id: ScopeId("p".into()),
+                    scope_state: ScopeState::Running,
+                    parent_state: ScopeState::Closed,
+                },
+                "o1".into(),
+                "fix".into(),
+            ),
+            WatchdogAlert::new(
+                1000,
+                AlertSeverity::Error,
+                AlertKind::OrphanTask {
+                    scope_id: ScopeId("b".into()),
+                    parent_id: ScopeId("p".into()),
+                    scope_state: ScopeState::Running,
+                    parent_state: ScopeState::Closed,
+                },
+                "o2".into(),
+                "fix".into(),
+            ),
+            WatchdogAlert::new(
+                1000,
+                AlertSeverity::Warning,
+                AlertKind::StuckCancellation {
+                    scope_id: ScopeId("c".into()),
+                    draining_since_ms: 0,
+                    elapsed_ms: 5000,
+                    expected_grace_ms: 1000,
+                },
+                "s1".into(),
+                "fix".into(),
+            ),
+            WatchdogAlert::new(
+                1000,
+                AlertSeverity::Critical,
+                AlertKind::DeadlockRisk {
+                    cycle: vec![ScopeId("x".into()), ScopeId("y".into())],
+                },
+                "d1".into(),
+                "fix".into(),
+            ),
+            WatchdogAlert::new(
+                1000,
+                AlertSeverity::Warning,
+                AlertKind::ExcessiveDepth {
+                    scope_id: ScopeId("deep".into()),
+                    depth: 10,
+                    max_depth: 8,
+                },
+                "e1".into(),
+                "fix".into(),
+            ),
         ];
 
         let summary = ScanSummary::from_alerts(&alerts, 1000);
@@ -1892,7 +2008,9 @@ mod tests {
         let mut wd = ScopeWatchdog::with_config(config);
         let alerts = wd.scan(&tree, 2000);
         assert!(
-            !alerts.iter().any(|a| matches!(a.kind, AlertKind::ExcessiveDepth { .. })),
+            !alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::ExcessiveDepth { .. })),
             "depth == max_depth should not trigger alert"
         );
     }
@@ -1904,11 +2022,14 @@ mod tests {
 
         // Build chain: root → d1 → w1 → e1 (depth=3)
         let d1 = ScopeId("daemon:d1".into());
-        tree.register(d1.clone(), ScopeTier::Daemon, &ScopeId::root(), "d1", 1000).unwrap();
+        tree.register(d1.clone(), ScopeTier::Daemon, &ScopeId::root(), "d1", 1000)
+            .unwrap();
         let w1 = ScopeId("watcher:w1".into());
-        tree.register(w1.clone(), ScopeTier::Watcher, &d1, "w1", 1000).unwrap();
+        tree.register(w1.clone(), ScopeTier::Watcher, &d1, "w1", 1000)
+            .unwrap();
         let worker = ScopeId("worker:e1".into());
-        tree.register(worker.clone(), ScopeTier::Worker, &w1, "e1", 1000).unwrap();
+        tree.register(worker.clone(), ScopeTier::Worker, &w1, "e1", 1000)
+            .unwrap();
 
         let mut config = WatchdogConfig::default();
         config.max_depth = 2; // depth 3 > 2 → triggered
@@ -1920,7 +2041,12 @@ mod tests {
             .filter(|a| matches!(a.kind, AlertKind::ExcessiveDepth { .. }))
             .collect();
         assert_eq!(deep.len(), 1);
-        if let AlertKind::ExcessiveDepth { scope_id, depth, max_depth } = &deep[0].kind {
+        if let AlertKind::ExcessiveDepth {
+            scope_id,
+            depth,
+            max_depth,
+        } = &deep[0].kind
+        {
             assert_eq!(scope_id, &worker);
             assert_eq!(*depth, 3);
             assert_eq!(*max_depth, 2);
@@ -1965,7 +2091,11 @@ mod tests {
                 elapsed_ms: 15000,
             },
             AlertKind::DeadlockRisk {
-                cycle: vec![ScopeId("a".into()), ScopeId("b".into()), ScopeId("a".into())],
+                cycle: vec![
+                    ScopeId("a".into()),
+                    ScopeId("b".into()),
+                    ScopeId("a".into()),
+                ],
             },
             AlertKind::ScopeLeak {
                 tier: ScopeTier::Worker,
@@ -2021,7 +2151,9 @@ mod tests {
         // Even at very late time, Running scopes shouldn't trigger stuck cancellation
         let alerts = wd.scan(&tree, 1_000_000);
         assert!(
-            !alerts.iter().any(|a| matches!(a.kind, AlertKind::StuckCancellation { .. })),
+            !alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::StuckCancellation { .. })),
             "Running scopes should never trigger stuck cancellation"
         );
     }
@@ -2032,7 +2164,8 @@ mod tests {
         tree.start(&ScopeId::root(), 1000).unwrap();
 
         let d = ScopeId("daemon:fin".into());
-        tree.register(d.clone(), ScopeTier::Daemon, &ScopeId::root(), "fin", 1000).unwrap();
+        tree.register(d.clone(), ScopeTier::Daemon, &ScopeId::root(), "fin", 1000)
+            .unwrap();
         tree.start(&d, 1100).unwrap();
         tree.request_shutdown(&d, 2000).unwrap();
         tree.finalize(&d).unwrap();
@@ -2041,7 +2174,9 @@ mod tests {
         let mut wd = ScopeWatchdog::new();
         let alerts = wd.scan(&tree, 1_000_000);
         assert!(
-            !alerts.iter().any(|a| matches!(a.kind, AlertKind::StuckCancellation { .. })),
+            !alerts
+                .iter()
+                .any(|a| matches!(a.kind, AlertKind::StuckCancellation { .. })),
             "Finalizing scopes should not trigger stuck cancellation (they trigger zombie instead)"
         );
     }

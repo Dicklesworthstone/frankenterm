@@ -12,16 +12,14 @@
 //!
 //! ft-3681t.5.10 quality support slice.
 
-use proptest::prelude::*;
-use frankenterm_core::connector_host_runtime::{
-    ConnectorCapability, ConnectorHostConfig,
-};
+use frankenterm_core::connector_host_runtime::{ConnectorCapability, ConnectorHostConfig};
 use frankenterm_core::connector_registry::TrustLevel;
 use frankenterm_core::connector_sdk::{
-    compute_sha256_hex, CertificationPipeline, CertificationReport, ConnectorSimulator,
-    LintFinding, LintReport, LintSeverity, ManifestBuilder, ManifestLinter, SimulationEvent,
-    SimulationEventType, TrustPolicyBuilder,
+    CertificationPipeline, CertificationReport, ConnectorSimulator, LintFinding, LintReport,
+    LintSeverity, ManifestBuilder, ManifestLinter, SimulationEvent, SimulationEventType,
+    TrustPolicyBuilder, compute_sha256_hex,
 };
+use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Strategies

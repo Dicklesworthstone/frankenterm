@@ -283,7 +283,10 @@ fn approval_different_policy_surface_prevents_consumption() {
             .consume(&request.allow_once_code, &input)
             .await
             .unwrap();
-        assert!(consumed.is_some(), "Token should work with matching surface");
+        assert!(
+            consumed.is_some(),
+            "Token should work with matching surface"
+        );
 
         cleanup(storage, &db_path).await;
     });

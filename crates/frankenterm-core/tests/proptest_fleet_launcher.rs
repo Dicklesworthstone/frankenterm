@@ -1,11 +1,11 @@
 //! Property-based tests for the fleet launcher module.
 
-use std::collections::HashMap;
 use proptest::prelude::*;
+use std::collections::HashMap;
 
 use frankenterm_core::fleet_launcher::{
-    AgentMixEntry, FleetLaunchError, FleetLaunchStatus, FleetLauncher, FleetSpec,
-    SlotStatus, StartupStrategy,
+    AgentMixEntry, FleetLaunchError, FleetLaunchStatus, FleetLauncher, FleetSpec, SlotStatus,
+    StartupStrategy,
 };
 use frankenterm_core::session_profiles::{ProfileRegistry, ProfileRole};
 use frankenterm_core::session_topology::LifecycleRegistry;

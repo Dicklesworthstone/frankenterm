@@ -2391,8 +2391,7 @@ mod tests {
 
     fn make_test_dashboard_state() -> crate::dashboard::DashboardState {
         use crate::cost_tracker::{
-            AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary,
-            ProviderCostSummary,
+            AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary, ProviderCostSummary,
         };
         use crate::dashboard::DashboardManager;
 
@@ -2448,9 +2447,7 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn list_triage_items(
-            &self,
-        ) -> Result<Vec<crate::tui::query::TriageItemView>, QueryError> {
+        fn list_triage_items(&self) -> Result<Vec<crate::tui::query::TriageItemView>, QueryError> {
             Ok(Vec::new())
         }
 
@@ -2482,9 +2479,7 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn dashboard_state(
-            &self,
-        ) -> Result<Option<crate::dashboard::DashboardState>, QueryError> {
+        fn dashboard_state(&self) -> Result<Option<crate::dashboard::DashboardState>, QueryError> {
             Ok(Some(make_test_dashboard_state()))
         }
     }
@@ -2502,7 +2497,10 @@ mod tests {
             .as_ref()
             .expect("dashboard should be Some after refresh");
         // Warning-level alert (non-blocking) → Yellow overall health
-        assert_eq!(ds.overall_health, crate::dashboard::SystemHealthTier::Yellow);
+        assert_eq!(
+            ds.overall_health,
+            crate::dashboard::SystemHealthTier::Yellow
+        );
         assert!(!ds.costs.providers.is_empty());
         assert_eq!(ds.costs.total_tokens, 50_000);
     }

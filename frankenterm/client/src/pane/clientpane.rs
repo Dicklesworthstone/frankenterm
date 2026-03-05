@@ -652,7 +652,8 @@ impl std::io::Write for PaneWriter {
             pane_id: self.remote_pane_id,
             data: data.to_vec(),
         }))
-        .map_err(|e| std::io::Error::other(format!("{}", e)))?;        Ok(data.len())
+        .map_err(|e| std::io::Error::other(format!("{}", e)))?;
+        Ok(data.len())
     }
 
     fn flush(&mut self) -> Result<(), std::io::Error> {

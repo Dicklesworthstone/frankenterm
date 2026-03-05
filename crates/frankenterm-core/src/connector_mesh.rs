@@ -521,10 +521,7 @@ impl ConnectorMesh {
     }
 
     /// Release a connector slot on a host.
-    pub fn release_connector(
-        &mut self,
-        host_id: &str,
-    ) -> Result<(), ConnectorMeshError> {
+    pub fn release_connector(&mut self, host_id: &str) -> Result<(), ConnectorMeshError> {
         let host = self
             .hosts
             .get_mut(host_id)
@@ -768,7 +765,9 @@ mod tests {
     #[test]
     fn register_host_unknown_zone() {
         let mut mesh = default_mesh();
-        let err = mesh.register_host(make_host("h1", "z-missing")).unwrap_err();
+        let err = mesh
+            .register_host(make_host("h1", "z-missing"))
+            .unwrap_err();
         assert!(matches!(err, ConnectorMeshError::ZoneNotFound { .. }));
     }
 
@@ -859,10 +858,7 @@ mod tests {
         // last heartbeat at 1000, timeout is 30000
         let timed_out = mesh.check_heartbeat_timeouts(50000);
         assert_eq!(timed_out, vec!["h1"]);
-        assert_eq!(
-            mesh.get_host("h1").unwrap().health,
-            HostHealth::Unreachable
-        );
+        assert_eq!(mesh.get_host("h1").unwrap().health, HostHealth::Unreachable);
     }
 
     #[test]

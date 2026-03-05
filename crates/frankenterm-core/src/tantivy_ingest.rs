@@ -1608,9 +1608,12 @@ mod tests {
             let offset_2 = &all[2].offset;
 
             // Open at the byte offset of record 2
-            let mut reader2 =
-                AppendLogReader::open_at_offset(&cfg.data_path, offset_2.byte_offset, offset_2.ordinal)
-                    .unwrap();
+            let mut reader2 = AppendLogReader::open_at_offset(
+                &cfg.data_path,
+                offset_2.byte_offset,
+                offset_2.ordinal,
+            )
+            .unwrap();
             let rec = reader2.next_record().unwrap().unwrap();
             assert_eq!(rec.event.event_id, "e2");
         });
@@ -3171,7 +3174,10 @@ mod tests {
             // Build a writer that returns Transient errors
             struct TransientFailWriter;
             impl IndexWriter for TransientFailWriter {
-                fn add_document(&mut self, _doc: &IndexDocumentFields) -> Result<(), IndexWriteError> {
+                fn add_document(
+                    &mut self,
+                    _doc: &IndexDocumentFields,
+                ) -> Result<(), IndexWriteError> {
                     Err(IndexWriteError::Transient {
                         reason: "overloaded".to_string(),
                     })
@@ -3819,7 +3825,8 @@ mod tests {
                 fn open_cursor(
                     &self,
                     from: RecorderOffset,
-                ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+                ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError>
+                {
                     let start = from.ordinal as usize;
                     let remaining: Vec<_> = self
                         .records

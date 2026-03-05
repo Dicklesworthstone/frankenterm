@@ -17,10 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn schedule_task(runtime: &mut LabRuntime, task_id: TaskId) {
-    runtime
-        .scheduler
-        .lock()
-        .schedule(task_id, 0);
+    runtime.scheduler.lock().schedule(task_id, 0);
 }
 
 fn pane_delta(pane_id: u64, seq: u64, content: String) -> PaneDelta {

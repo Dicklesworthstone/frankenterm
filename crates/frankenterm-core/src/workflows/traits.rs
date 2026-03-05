@@ -700,12 +700,8 @@ mod tests {
         let plans_b = wf.steps_to_plans(2);
         // Payloads should differ due to different pane_id
         if let (
-            crate::plan::StepAction::Custom {
-                payload: pa, ..
-            },
-            crate::plan::StepAction::Custom {
-                payload: pb, ..
-            },
+            crate::plan::StepAction::Custom { payload: pa, .. },
+            crate::plan::StepAction::Custom { payload: pb, .. },
         ) = (&plans_a[0].action, &plans_b[0].action)
         {
             assert_eq!(pa["pane_id"], 1);

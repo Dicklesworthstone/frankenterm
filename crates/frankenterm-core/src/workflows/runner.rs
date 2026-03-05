@@ -1236,7 +1236,8 @@ impl WorkflowRunner {
                             // Workflows do not currently suspend to wait for manual approval of steps.
                             // The approval code may be 'unknown' if not persisted by the injector.
                             let abort_reason = if code == "unknown" {
-                                "Text injection requires human approval (workflow aborted)".to_string()
+                                "Text injection requires human approval (workflow aborted)"
+                                    .to_string()
                             } else {
                                 format!("Text injection requires approval (code: {code})")
                             };

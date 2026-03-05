@@ -14,8 +14,8 @@
 //! If no TOML config is found, returns `None` and the caller falls through
 //! to Lua config or defaults.
 
-use crate::{CONFIG_DIRS, CONFIG_FILE_OVERRIDE, HOME_DIR, LoadedConfig, toml_to_dynamic};
-use anyhow::{Context, anyhow};
+use crate::{toml_to_dynamic, LoadedConfig, CONFIG_DIRS, CONFIG_FILE_OVERRIDE, HOME_DIR};
+use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
 use std::path::{Path, PathBuf};
 

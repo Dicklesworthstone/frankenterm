@@ -8,9 +8,7 @@
 
 mod common;
 
-use frankenterm_core::export::{
-    export_jsonl, ExportKind, ExportOptions,
-};
+use frankenterm_core::export::{ExportKind, ExportOptions, export_jsonl};
 use frankenterm_core::storage::{ExportQuery, StorageHandle};
 
 use common::fixtures::RuntimeFixture;
@@ -68,31 +66,62 @@ async fn teardown(storage: StorageHandle, db_path: &str) {
 
 /// Expected required fields for each exported record type.
 fn expected_segment_fields() -> Vec<&'static str> {
-    vec!["id", "pane_id", "seq", "content", "content_len", "captured_at"]
+    vec![
+        "id",
+        "pane_id",
+        "seq",
+        "content",
+        "content_len",
+        "captured_at",
+    ]
 }
 
 fn expected_gap_fields() -> Vec<&'static str> {
-    vec!["id", "pane_id", "seq_before", "seq_after", "reason", "detected_at"]
+    vec![
+        "id",
+        "pane_id",
+        "seq_before",
+        "seq_after",
+        "reason",
+        "detected_at",
+    ]
 }
 
 fn expected_event_fields() -> Vec<&'static str> {
     vec![
-        "id", "pane_id", "rule_id", "agent_type", "event_type",
-        "severity", "confidence", "detected_at",
+        "id",
+        "pane_id",
+        "rule_id",
+        "agent_type",
+        "event_type",
+        "severity",
+        "confidence",
+        "detected_at",
     ]
 }
 
 fn expected_workflow_fields() -> Vec<&'static str> {
     vec![
-        "id", "workflow_name", "pane_id", "current_step", "status",
-        "started_at", "updated_at",
+        "id",
+        "workflow_name",
+        "pane_id",
+        "current_step",
+        "status",
+        "started_at",
+        "updated_at",
     ]
 }
 
 fn expected_step_log_fields() -> Vec<&'static str> {
     vec![
-        "id", "workflow_id", "step_index", "step_name", "result_type",
-        "started_at", "completed_at", "duration_ms",
+        "id",
+        "workflow_id",
+        "step_index",
+        "step_name",
+        "result_type",
+        "started_at",
+        "completed_at",
+        "duration_ms",
     ]
 }
 
@@ -102,19 +131,34 @@ fn expected_session_fields() -> Vec<&'static str> {
 
 fn expected_reservation_fields() -> Vec<&'static str> {
     vec![
-        "id", "pane_id", "owner_kind", "owner_id", "created_at",
-        "expires_at", "status",
+        "id",
+        "pane_id",
+        "owner_kind",
+        "owner_id",
+        "created_at",
+        "expires_at",
+        "status",
     ]
 }
 
 fn expected_header_fields() -> Vec<&'static str> {
-    vec!["_export", "version", "kind", "redacted", "exported_at_ms", "record_count"]
+    vec![
+        "_export",
+        "version",
+        "kind",
+        "redacted",
+        "exported_at_ms",
+        "record_count",
+    ]
 }
 
 /// Helper: parse JSONL output into header + records
 fn parse_jsonl(output: &str) -> (serde_json::Value, Vec<serde_json::Value>) {
     let lines: Vec<&str> = output.trim().lines().collect();
-    assert!(!lines.is_empty(), "Export output must have at least a header line");
+    assert!(
+        !lines.is_empty(),
+        "Export output must have at least a header line"
+    );
     let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     let records: Vec<serde_json::Value> = lines[1..]
         .iter()
@@ -144,7 +188,10 @@ fn export_segments_to_buffer() {
     rt.block_on(async {
         let (storage, db_path) = test_db_with_pane("seg_buf").await;
 
-        storage.append_segment(1, "test content", None).await.unwrap();
+        storage
+            .append_segment(1, "test content", None)
+            .await
+            .unwrap();
 
         let opts = ExportOptions {
             kind: ExportKind::Segments,
@@ -919,7 +966,10 @@ fn export_segment_schema_validation() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let (storage, db_path) = test_db_with_pane("seg_schema").await;
-        storage.append_segment(1, "schema test content", None).await.unwrap();
+        storage
+            .append_segment(1, "schema test content", None)
+            .await
+            .unwrap();
 
         let opts = ExportOptions {
             kind: ExportKind::Segments,
@@ -1065,7 +1115,10 @@ fn export_header_exported_at_ms_is_recent() {
         let output = String::from_utf8(buf).unwrap();
         let (header, _) = parse_jsonl(&output);
         let exported_at = header["exported_at_ms"].as_i64().unwrap();
-        assert!(exported_at >= before_ms, "exported_at_ms should be >= before");
+        assert!(
+            exported_at >= before_ms,
+            "exported_at_ms should be >= before"
+        );
         assert!(exported_at <= after_ms, "exported_at_ms should be <= after");
 
         teardown(storage, &db_path).await;
@@ -1142,13 +1195,32 @@ fn export_empty_all_kinds_produce_header() {
 
             let mut buf = Vec::new();
             let count = export_jsonl(&storage, &opts, &mut buf).await.unwrap();
-            assert_eq!(count, 0, "Empty DB should have 0 records for kind {}", kind.as_str());
+            assert_eq!(
+                count,
+                0,
+                "Empty DB should have 0 records for kind {}",
+                kind.as_str()
+            );
 
             let output = String::from_utf8(buf).unwrap();
             let (header, records) = parse_jsonl(&output);
-            assert_eq!(header["kind"], kind.as_str(), "Header kind mismatch for {}", kind.as_str());
-            assert_eq!(header["record_count"], 0, "Header record_count should be 0 for {}", kind.as_str());
-            assert!(records.is_empty(), "No data records expected for {}", kind.as_str());
+            assert_eq!(
+                header["kind"],
+                kind.as_str(),
+                "Header kind mismatch for {}",
+                kind.as_str()
+            );
+            assert_eq!(
+                header["record_count"],
+                0,
+                "Header record_count should be 0 for {}",
+                kind.as_str()
+            );
+            assert!(
+                records.is_empty(),
+                "No data records expected for {}",
+                kind.as_str()
+            );
         }
 
         teardown(storage, &db_path).await;

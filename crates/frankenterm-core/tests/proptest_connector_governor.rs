@@ -42,22 +42,18 @@ fn arb_connector_action() -> impl Strategy<Value = ConnectorAction> {
 }
 
 fn arb_token_bucket_config() -> impl Strategy<Value = TokenBucketConfig> {
-    (1u64..1000, 1u64..100, 100u64..10_000).prop_map(|(cap, rate, interval)| {
-        TokenBucketConfig {
-            capacity: cap,
-            refill_rate: rate,
-            refill_interval_ms: interval,
-        }
+    (1u64..1000, 1u64..100, 100u64..10_000).prop_map(|(cap, rate, interval)| TokenBucketConfig {
+        capacity: cap,
+        refill_rate: rate,
+        refill_interval_ms: interval,
     })
 }
 
 fn arb_quota_config() -> impl Strategy<Value = QuotaConfig> {
-    (1u64..10_000, 1000u64..3_600_000, 0.1f64..1.0).prop_map(|(max, window, warn)| {
-        QuotaConfig {
-            max_actions: max,
-            window_ms: window,
-            warning_threshold: warn,
-        }
+    (1u64..10_000, 1000u64..3_600_000, 0.1f64..1.0).prop_map(|(max, window, warn)| QuotaConfig {
+        max_actions: max,
+        window_ms: window,
+        warning_threshold: warn,
     })
 }
 

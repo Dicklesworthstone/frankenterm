@@ -1209,7 +1209,8 @@ mod tests {
 
     #[test]
     fn trigger_is_rate_limit_false() {
-        let trigger = serde_json::json!({"event_type": "session.compaction", "rule_id": "compaction"});
+        let trigger =
+            serde_json::json!({"event_type": "session.compaction", "rule_id": "compaction"});
         assert!(!trigger_is_rate_limit(&trigger));
     }
 

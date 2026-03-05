@@ -341,10 +341,7 @@ mod tests {
                     payload,
                 } => {
                     let expected_names = ["check", "execute"];
-                    assert_eq!(
-                        action_type,
-                        &format!("workflow_step:{}", expected_names[i])
-                    );
+                    assert_eq!(action_type, &format!("workflow_step:{}", expected_names[i]));
                     assert_eq!(payload["pane_id"], 7);
                 }
                 other => panic!("Expected Custom action, got {:?}", other),

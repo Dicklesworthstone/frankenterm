@@ -466,7 +466,7 @@ fn parse_macos_state(s: &str) -> ProcessState {
     // T=stopped, Z=zombie. First char is primary state.
     match s.chars().next() {
         Some('R') => ProcessState::Running,
-        Some('S') | Some('I') => ProcessState::Sleeping,
+        Some('S' | 'I') => ProcessState::Sleeping,
         Some('U') => ProcessState::DiskSleep,
         Some('T') => ProcessState::Stopped,
         Some('Z') => ProcessState::Zombie,

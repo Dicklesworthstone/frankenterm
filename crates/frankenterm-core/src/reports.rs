@@ -901,7 +901,9 @@ mod tests {
                 severity: "critical".to_string(),
                 confidence: 1.0,
                 extracted: None,
-                matched_text: Some("Key: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string()),
+                matched_text: Some(
+                    "Key: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
+                ),
                 segment_id: None,
                 detected_at: 2000,
                 dedupe_key: None,

@@ -25,14 +25,13 @@
 mod common;
 
 use common::fixtures::RuntimeFixture;
-use frankenterm_core::storage::{
-    AgentSessionRecord, Correlation, CorrelationRef, CorrelationType, EventQuery, Gap,
-    MetricQuery, MetricType, PaneInfo, PaneRecord,
-    SearchOptions, Segment, SemanticBudgetConfig, StorageConfig, StorageHandle, StoredEvent,
-    Timeline, TimelineEvent, TimelineQuery, UsageMetricRecord, WorkflowRecord,
-    WorkflowStepLogRecord, now_ms,
-};
 use frankenterm_core::search::{FusionBackend, SearchMode};
+use frankenterm_core::storage::{
+    AgentSessionRecord, Correlation, CorrelationRef, CorrelationType, EventQuery, Gap, MetricQuery,
+    MetricType, PaneInfo, PaneRecord, SearchOptions, Segment, SemanticBudgetConfig, StorageConfig,
+    StorageHandle, StoredEvent, Timeline, TimelineEvent, TimelineQuery, UsageMetricRecord,
+    WorkflowRecord, WorkflowStepLogRecord, now_ms,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ===========================================================================
@@ -44,13 +43,10 @@ static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn temp_db_path() -> String {
     let counter = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir();
-    dir.join(format!(
-        "wa_labrt_test_{counter}_{}.db",
-        std::process::id()
-    ))
-    .to_str()
-    .unwrap()
-    .to_string()
+    dir.join(format!("wa_labrt_test_{counter}_{}.db", std::process::id()))
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 fn test_pane(pane_id: u64) -> PaneRecord {
@@ -258,10 +254,7 @@ fn storage_handle_semantic_search_ranks_and_respects_filters() {
             .append_segment(1, "alpha output", None)
             .await
             .unwrap();
-        let seg_b = handle
-            .append_segment(1, "beta output", None)
-            .await
-            .unwrap();
+        let seg_b = handle.append_segment(1, "beta output", None).await.unwrap();
         let seg_c = handle
             .append_segment(2, "gamma output", None)
             .await
@@ -462,9 +455,7 @@ fn storage_handle_hybrid_search_falls_back_to_lexical_when_semantic_degraded() {
             assert!(hit.semantic_rank.is_none());
             assert!(hit.semantic_contribution.is_none());
             assert!(hit.lexical_contribution.is_some());
-            assert!(
-                (hit.fusion_score - hit.lexical_contribution.unwrap_or_default()).abs() < 1e-6
-            );
+            assert!((hit.fusion_score - hit.lexical_contribution.unwrap_or_default()).abs() < 1e-6);
         }
 
         handle.shutdown().await.unwrap();
@@ -990,10 +981,7 @@ fn storage_handle_gap_recording() {
 
         handle.upsert_pane(test_pane(1)).await.unwrap();
 
-        let _seg: Segment = handle
-            .append_segment(1, "Before gap", None)
-            .await
-            .unwrap();
+        let _seg: Segment = handle.append_segment(1, "Before gap", None).await.unwrap();
 
         let gap: Gap = handle
             .record_gap(1, "connection_lost")
@@ -1004,10 +992,7 @@ fn storage_handle_gap_recording() {
         assert_eq!(gap.pane_id, 1);
         assert_eq!(gap.reason, "connection_lost");
 
-        let _seg2: Segment = handle
-            .append_segment(1, "After gap", None)
-            .await
-            .unwrap();
+        let _seg2: Segment = handle.append_segment(1, "After gap", None).await.unwrap();
 
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);
@@ -1330,10 +1315,7 @@ fn vacuum_still_works() {
         let handle = StorageHandle::new(&db_path).await.unwrap();
 
         handle.upsert_pane(test_pane(1)).await.unwrap();
-        handle
-            .append_segment(1, "vacuum test", None)
-            .await
-            .unwrap();
+        handle.append_segment(1, "vacuum test", None).await.unwrap();
 
         handle.vacuum().await.unwrap();
 
@@ -1430,10 +1412,7 @@ fn indexing_stats_tracks_segments() {
         handle.upsert_pane(test_pane(1)).await.unwrap();
         handle.append_segment(1, "hello", None).await.unwrap();
         handle.append_segment(1, "world!", None).await.unwrap();
-        handle
-            .append_segment(1, "test data", None)
-            .await
-            .unwrap();
+        handle.append_segment(1, "test data", None).await.unwrap();
 
         let stats = handle.get_pane_indexing_stats().await.unwrap();
         assert_eq!(stats.len(), 1);
@@ -1459,18 +1438,12 @@ fn indexing_stats_multiple_panes() {
         handle.upsert_pane(test_pane(1)).await.unwrap();
         handle.upsert_pane(test_pane(2)).await.unwrap();
 
-        handle
-            .append_segment(1, "pane1-data", None)
-            .await
-            .unwrap();
+        handle.append_segment(1, "pane1-data", None).await.unwrap();
         handle
             .append_segment(2, "pane2-data-longer", None)
             .await
             .unwrap();
-        handle
-            .append_segment(2, "pane2-more", None)
-            .await
-            .unwrap();
+        handle.append_segment(2, "pane2-more", None).await.unwrap();
 
         let stats = handle.get_pane_indexing_stats().await.unwrap();
         assert_eq!(stats.len(), 2);
@@ -1544,10 +1517,7 @@ fn indexing_health_report_healthy() {
         let handle = StorageHandle::new(&db_path).await.unwrap();
 
         handle.upsert_pane(test_pane(1)).await.unwrap();
-        handle
-            .append_segment(1, "hello world", None)
-            .await
-            .unwrap();
+        handle.append_segment(1, "hello world", None).await.unwrap();
 
         let report = handle.get_indexing_health().await.unwrap();
         assert!(report.healthy);
@@ -1698,15 +1668,9 @@ fn gap_recording_works_under_backpressure() {
 
         handle.upsert_pane(test_pane(1)).await.unwrap();
 
-        let seg_before = handle
-            .append_segment(1, "before-gap", None)
-            .await
-            .unwrap();
+        let seg_before = handle.append_segment(1, "before-gap", None).await.unwrap();
 
-        let gap = handle
-            .record_gap(1, "backpressure_overflow")
-            .await
-            .unwrap();
+        let gap = handle.record_gap(1, "backpressure_overflow").await.unwrap();
         assert!(
             gap.is_some(),
             "GAP should be recorded after existing segment"
@@ -1717,10 +1681,7 @@ fn gap_recording_works_under_backpressure() {
         assert_eq!(gap.seq_before, seg_before.seq);
         assert_eq!(gap.seq_after, seg_before.seq + 1);
 
-        let seg_after = handle
-            .append_segment(1, "after-gap", None)
-            .await
-            .unwrap();
+        let seg_after = handle.append_segment(1, "after-gap", None).await.unwrap();
 
         let segments = handle.get_segments(1, 100).await.unwrap();
         assert_eq!(segments.len(), 2);
@@ -2305,10 +2266,7 @@ fn timeline_correlation_refs_attached_to_events() {
         };
         let timeline = handle.get_timeline(query).await.unwrap();
 
-        let has_refs = timeline
-            .events
-            .iter()
-            .any(|e| !e.correlations.is_empty());
+        let has_refs = timeline.events.iter().any(|e| !e.correlations.is_empty());
         assert!(
             has_refs,
             "Correlated events should have CorrelationRef attached"

@@ -76,7 +76,14 @@ mod tui_tests {
             0i64..1_000_000_000,
         )
             .prop_map(
-                |(pane_id, agent_type, total_tokens, total_cost_usd, record_count, last_updated_ms)| {
+                |(
+                    pane_id,
+                    agent_type,
+                    total_tokens,
+                    total_cost_usd,
+                    record_count,
+                    last_updated_ms,
+                )| {
                     PaneCostSummary {
                         pane_id,
                         agent_type,
@@ -141,7 +148,14 @@ mod tui_tests {
             0usize..100,
         )
             .prop_map(
-                |(agent_type, status, limited_pane_count, total_pane_count, earliest_clear_secs, total_events)| {
+                |(
+                    agent_type,
+                    status,
+                    limited_pane_count,
+                    total_pane_count,
+                    earliest_clear_secs,
+                    total_events,
+                )| {
                     let total = total_pane_count.max(limited_pane_count);
                     ProviderRateLimitSummary {
                         agent_type,
@@ -168,7 +182,17 @@ mod tui_tests {
             proptest::collection::vec(1u64..1000, 0..20),
         )
             .prop_map(
-                |(tier, timestamp_epoch_ms, capture_depth, capture_capacity, write_depth, write_capacity, duration_in_tier_ms, transitions, paused_panes)| {
+                |(
+                    tier,
+                    timestamp_epoch_ms,
+                    capture_depth,
+                    capture_capacity,
+                    write_depth,
+                    write_capacity,
+                    duration_in_tier_ms,
+                    transitions,
+                    paused_panes,
+                )| {
                     BackpressureSnapshot {
                         tier,
                         timestamp_epoch_ms,

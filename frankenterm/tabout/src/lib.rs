@@ -224,8 +224,7 @@ pub fn tabulate_output_as_string<S: std::string::ToString>(
 ) -> Result<String, std::io::Error> {
     let mut output: Vec<u8> = vec![];
     tabulate_output(columns, rows, &mut output)?;
-    String::from_utf8(output)
-        .map_err(|e| std::io::Error::other(format!("{}", e)))
+    String::from_utf8(output).map_err(|e| std::io::Error::other(format!("{}", e)))
 }
 
 #[cfg(test)]

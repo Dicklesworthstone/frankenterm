@@ -615,8 +615,8 @@ mod tests {
     use crate::ingest::{Osc133State, ShellState};
     use crate::patterns::{AgentType, PatternEngine, PatternPack, RuleDef, Severity};
     use crate::runtime_compat::CompatRuntime;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ========================================================================
     // MockPaneSource (local copy for wait_execution tests)
@@ -855,10 +855,7 @@ mod tests {
         // "%" should NOT match as a prompt when in context like "50%"
         let text = "Downloading: 50%";
         let (is_idle, desc) = heuristic_idle_check(text, 10);
-        assert!(
-            !is_idle,
-            "should not false-positive on percentage: {desc}"
-        );
+        assert!(!is_idle, "should not false-positive on percentage: {desc}");
     }
 
     #[test]
@@ -959,10 +956,7 @@ mod tests {
         let result = result.unwrap();
 
         assert!(result.is_satisfied());
-        if let WaitConditionResult::Satisfied {
-            polls, context, ..
-        } = result
-        {
+        if let WaitConditionResult::Satisfied { polls, context, .. } = result {
             assert_eq!(polls, 0);
             assert_eq!(context.as_deref(), Some("sleep completed"));
         }
@@ -1490,7 +1484,10 @@ mod tests {
             .block_on(executor.execute(&condition, 1, Duration::from_secs(1)))
             .unwrap();
 
-        assert!(result.is_satisfied(), "InputActive is at_prompt: {result:?}");
+        assert!(
+            result.is_satisfied(),
+            "InputActive is at_prompt: {result:?}"
+        );
     }
 
     #[test]

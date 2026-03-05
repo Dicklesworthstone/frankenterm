@@ -21,16 +21,16 @@ use crate::tls::{TlsDomainClient, TlsDomainServer};
 use crate::units::Dimension;
 use crate::unix::UnixDomain;
 use crate::wsl::WslDomain;
-use crate::{
-    CONFIG_DIRS, CellWidth, GpuInfo, IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig,
-    MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop, WebGpuPowerPreference,
-    default_one_point_oh, default_one_point_oh_f64, default_true,
-    default_win32_acrylic_accent_color,
-};
 #[cfg(feature = "lua")]
 use crate::{
-    CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
-    default_config_with_overrides_applied,
+    default_config_with_overrides_applied, CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP,
+    HOME_DIR,
+};
+use crate::{
+    default_one_point_oh, default_one_point_oh_f64, default_true,
+    default_win32_acrylic_accent_color, CellWidth, GpuInfo, IntegratedTitleButtonColor,
+    KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor, SerialDomain, SystemBackdrop,
+    WebGpuPowerPreference, CONFIG_DIRS,
 };
 use anyhow::Context;
 use frankenterm_bidi::ParagraphDirectionHint;
@@ -231,7 +231,6 @@ pub struct Config {
     pub scrollback_warm_max_mb: usize,
 
     // -- Agent pane state detection --
-
     /// Enable agent pane state detection and visual indicators.
     #[dynamic(default = "default_true")]
     pub agent_detection_enabled: bool,
@@ -1080,7 +1079,7 @@ impl Config {
     pub fn update_ulimit(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
-            use nix::sys::resource::{Resource, getrlimit, rlim_t, setrlimit};
+            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
             use std::convert::TryInto;
 
             let (no_file_soft, no_file_hard) = getrlimit(Resource::RLIMIT_NOFILE)?;
@@ -1109,7 +1108,7 @@ impl Config {
 
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            use nix::sys::resource::{Resource, getrlimit, rlim_t, setrlimit};
+            use nix::sys::resource::{getrlimit, rlim_t, setrlimit, Resource};
             use std::convert::TryInto;
 
             let (nproc_soft, nproc_hard) = getrlimit(Resource::RLIMIT_NPROC)?;
@@ -2488,7 +2487,10 @@ mod tests {
 
     #[test]
     fn dropped_file_quoting_none_passthrough() {
-        assert_eq!(DroppedFileQuoting::None.escape("hello world"), "hello world");
+        assert_eq!(
+            DroppedFileQuoting::None.escape("hello world"),
+            "hello world"
+        );
     }
 
     #[test]
@@ -2877,10 +2879,7 @@ mod tests {
 
     #[test]
     fn ime_preedit_rendering_default_is_builtin() {
-        assert_eq!(
-            ImePreeditRendering::default(),
-            ImePreeditRendering::Builtin,
-        );
+        assert_eq!(ImePreeditRendering::default(), ImePreeditRendering::Builtin,);
     }
 
     // ── NotificationHandling ───────────────────────────────────

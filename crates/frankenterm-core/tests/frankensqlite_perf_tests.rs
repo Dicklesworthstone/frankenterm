@@ -109,79 +109,79 @@ fn coefficient_of_variation(values: &[u64]) -> f64 {
 #[test]
 fn test_append_single_batch_latency() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    // Warmup: first append pays file-creation cost, which is not the SLO target
-    storage
-        .append_batch(make_batch("warmup-0", 0, 1))
-        .await
-        .unwrap();
+        // Warmup: first append pays file-creation cost, which is not the SLO target
+        storage
+            .append_batch(make_batch("warmup-0", 0, 1))
+            .await
+            .unwrap();
 
-    let start = Instant::now();
-    storage
-        .append_batch(make_batch("single-1", 1, 1))
-        .await
-        .unwrap();
-    let elapsed_us = start.elapsed().as_micros();
+        let start = Instant::now();
+        storage
+            .append_batch(make_batch("single-1", 1, 1))
+            .await
+            .unwrap();
+        let elapsed_us = start.elapsed().as_micros();
 
-    // Steady-state single append should be well under 2ms SLO;
-    // 50ms ceiling accounts for system load from concurrent agents
-    assert!(
-        elapsed_us < 50_000,
-        "single append took {elapsed_us}us, expected < 50ms"
-    );
+        // Steady-state single append should be well under 2ms SLO;
+        // 50ms ceiling accounts for system load from concurrent agents
+        assert!(
+            elapsed_us < 50_000,
+            "single append took {elapsed_us}us, expected < 50ms"
+        );
     });
 }
 
 #[test]
 fn test_append_batch_128_latency() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let start = Instant::now();
-    storage
-        .append_batch(make_batch("batch128-1", 0, 128))
-        .await
-        .unwrap();
-    let elapsed_us = start.elapsed().as_micros();
+        let start = Instant::now();
+        storage
+            .append_batch(make_batch("batch128-1", 0, 128))
+            .await
+            .unwrap();
+        let elapsed_us = start.elapsed().as_micros();
 
-    // Batch of 128 should be under 50ms SLO
-    assert!(
-        elapsed_us < 50_000,
-        "128-event batch took {elapsed_us}us, expected < 50ms"
-    );
+        // Batch of 128 should be under 50ms SLO
+        assert!(
+            elapsed_us < 50_000,
+            "128-event batch took {elapsed_us}us, expected < 50ms"
+        );
     });
 }
 
 #[test]
 fn test_append_throughput_events_per_sec() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let total_events = 1000u64;
-    let batch_size = 50u64;
-    let start = Instant::now();
+        let total_events = 1000u64;
+        let batch_size = 50u64;
+        let start = Instant::now();
 
-    let mut seq = 0u64;
-    while seq < total_events {
-        storage
-            .append_batch(make_batch(&format!("tput-{seq}"), seq, batch_size))
-            .await
-            .unwrap();
-        seq += batch_size;
-    }
+        let mut seq = 0u64;
+        while seq < total_events {
+            storage
+                .append_batch(make_batch(&format!("tput-{seq}"), seq, batch_size))
+                .await
+                .unwrap();
+            seq += batch_size;
+        }
 
-    let elapsed_secs = start.elapsed().as_secs_f64();
-    let events_per_sec = total_events as f64 / elapsed_secs;
+        let elapsed_secs = start.elapsed().as_secs_f64();
+        let events_per_sec = total_events as f64 / elapsed_secs;
 
-    // Should sustain at least 500 events/sec (very conservative)
-    assert!(
-        events_per_sec > 500.0,
-        "throughput {events_per_sec:.0} events/sec, expected > 500"
-    );
+        // Should sustain at least 500 events/sec (very conservative)
+        assert!(
+            events_per_sec > 500.0,
+            "throughput {events_per_sec:.0} events/sec, expected > 500"
+        );
     });
 }
 
@@ -192,44 +192,44 @@ fn test_append_throughput_events_per_sec() {
 #[test]
 fn test_flush_buffered_latency() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
-    storage
-        .append_batch(make_batch("flush-buf-1", 0, 10))
-        .await
-        .unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        storage
+            .append_batch(make_batch("flush-buf-1", 0, 10))
+            .await
+            .unwrap();
 
-    let start = Instant::now();
-    storage.flush(FlushMode::Buffered).await.unwrap();
-    let elapsed_us = start.elapsed().as_micros();
+        let start = Instant::now();
+        storage.flush(FlushMode::Buffered).await.unwrap();
+        let elapsed_us = start.elapsed().as_micros();
 
-    // Buffered flush should be very fast
-    assert!(
-        elapsed_us < 50_000,
-        "buffered flush took {elapsed_us}us, expected < 50ms"
-    );
+        // Buffered flush should be very fast
+        assert!(
+            elapsed_us < 50_000,
+            "buffered flush took {elapsed_us}us, expected < 50ms"
+        );
     });
 }
 
 #[test]
 fn test_flush_durable_latency() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
-    storage
-        .append_batch(make_batch("flush-dur-1", 0, 50))
-        .await
-        .unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        storage
+            .append_batch(make_batch("flush-dur-1", 0, 50))
+            .await
+            .unwrap();
 
-    let start = Instant::now();
-    storage.flush(FlushMode::Durable).await.unwrap();
-    let elapsed_us = start.elapsed().as_micros();
+        let start = Instant::now();
+        storage.flush(FlushMode::Durable).await.unwrap();
+        let elapsed_us = start.elapsed().as_micros();
 
-    // Durable flush SLO: p95 < 50ms — we allow 100ms headroom in tests
-    assert!(
-        elapsed_us < 100_000,
-        "durable flush took {elapsed_us}us, expected < 100ms"
-    );
+        // Durable flush SLO: p95 < 50ms — we allow 100ms headroom in tests
+        assert!(
+            elapsed_us < 100_000,
+            "durable flush took {elapsed_us}us, expected < 100ms"
+        );
     });
 }
 
@@ -318,68 +318,68 @@ impl RecorderEventReader for PerfMemoryReader {
 #[test]
 fn test_cursor_iteration_1k_events() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    // Populate 1000 events and collect records for MemoryReader
-    let mut all_records = Vec::new();
-    let mut seq = 0u64;
-    while seq < 1000 {
-        let events: Vec<_> = (seq..seq + 100).map(sample_event).collect();
-        let resp = storage
-            .append_batch(AppendRequest {
-                batch_id: format!("cursor-{seq}"),
-                events: events.clone(),
-                required_durability: DurabilityLevel::Appended,
-                producer_ts_ms: 1,
+        // Populate 1000 events and collect records for MemoryReader
+        let mut all_records = Vec::new();
+        let mut seq = 0u64;
+        while seq < 1000 {
+            let events: Vec<_> = (seq..seq + 100).map(sample_event).collect();
+            let resp = storage
+                .append_batch(AppendRequest {
+                    batch_id: format!("cursor-{seq}"),
+                    events: events.clone(),
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+            let first_ord = resp.first_offset.ordinal;
+            for (i, event) in events.into_iter().enumerate() {
+                let ordinal = first_ord + i as u64;
+                all_records.push(CursorRecord {
+                    event,
+                    offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: ordinal * 100,
+                        ordinal,
+                    },
+                });
+            }
+            seq += 100;
+        }
+
+        let reader = PerfMemoryReader {
+            records: all_records,
+        };
+
+        let start = Instant::now();
+        let mut cursor = reader
+            .open_cursor(RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 0,
             })
-            .await
             .unwrap();
-        let first_ord = resp.first_offset.ordinal;
-        for (i, event) in events.into_iter().enumerate() {
-            let ordinal = first_ord + i as u64;
-            all_records.push(CursorRecord {
-                event,
-                offset: RecorderOffset {
-                    segment_id: 0,
-                    byte_offset: ordinal * 100,
-                    ordinal,
-                },
-            });
+
+        let mut total_read = 0;
+        loop {
+            let batch = cursor.next_batch(100).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            total_read += batch.len();
         }
-        seq += 100;
-    }
 
-    let reader = PerfMemoryReader {
-        records: all_records,
-    };
+        let elapsed_us = start.elapsed().as_micros();
 
-    let start = Instant::now();
-    let mut cursor = reader
-        .open_cursor(RecorderOffset {
-            segment_id: 0,
-            byte_offset: 0,
-            ordinal: 0,
-        })
-        .unwrap();
-
-    let mut total_read = 0;
-    loop {
-        let batch = cursor.next_batch(100).unwrap();
-        if batch.is_empty() {
-            break;
-        }
-        total_read += batch.len();
-    }
-
-    let elapsed_us = start.elapsed().as_micros();
-
-    assert_eq!(total_read, 1000);
-    // Cursor scan of 1K events should be very fast
-    assert!(
-        elapsed_us < 100_000,
-        "1K cursor iteration took {elapsed_us}us, expected < 100ms"
-    );
+        assert_eq!(total_read, 1000);
+        // Cursor scan of 1K events should be very fast
+        assert!(
+            elapsed_us < 100_000,
+            "1K cursor iteration took {elapsed_us}us, expected < 100ms"
+        );
     });
 }
 
@@ -390,74 +390,74 @@ fn test_cursor_iteration_1k_events() {
 #[test]
 fn test_slo_append_p50_under_1ms() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let mut latencies = Vec::with_capacity(100);
-    for i in 0u64..100 {
-        let start = Instant::now();
-        storage
-            .append_batch(make_batch(&format!("slo-p50-{i}"), i, 1))
-            .await
-            .unwrap();
-        latencies.push(start.elapsed().as_micros() as u64);
-    }
+        let mut latencies = Vec::with_capacity(100);
+        for i in 0u64..100 {
+            let start = Instant::now();
+            storage
+                .append_batch(make_batch(&format!("slo-p50-{i}"), i, 1))
+                .await
+                .unwrap();
+            latencies.push(start.elapsed().as_micros() as u64);
+        }
 
-    latencies.sort();
-    let p50 = percentile(&latencies, 50.0);
+        latencies.sort();
+        let p50 = percentile(&latencies, 50.0);
 
-    // p50 should be under 1ms (1000us) — allow 5ms test headroom
-    assert!(p50 < 5_000, "append p50 = {p50}us, expected < 5ms");
+        // p50 should be under 1ms (1000us) — allow 5ms test headroom
+        assert!(p50 < 5_000, "append p50 = {p50}us, expected < 5ms");
     });
 }
 
 #[test]
 fn test_slo_append_p99_under_10ms() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let mut latencies = Vec::with_capacity(200);
-    for i in 0u64..200 {
-        let start = Instant::now();
-        storage
-            .append_batch(make_batch(&format!("slo-p99-{i}"), i, 1))
-            .await
-            .unwrap();
-        latencies.push(start.elapsed().as_micros() as u64);
-    }
+        let mut latencies = Vec::with_capacity(200);
+        for i in 0u64..200 {
+            let start = Instant::now();
+            storage
+                .append_batch(make_batch(&format!("slo-p99-{i}"), i, 1))
+                .await
+                .unwrap();
+            latencies.push(start.elapsed().as_micros() as u64);
+        }
 
-    latencies.sort();
-    let p99 = percentile(&latencies, 99.0);
+        latencies.sort();
+        let p99 = percentile(&latencies, 99.0);
 
-    // p99 should be under 10ms — allow 50ms test headroom for CI
-    assert!(p99 < 50_000, "append p99 = {p99}us, expected < 50ms");
+        // p99 should be under 10ms — allow 50ms test headroom for CI
+        assert!(p99 < 50_000, "append p99 = {p99}us, expected < 50ms");
     });
 }
 
 #[test]
 fn test_slo_flush_durable_p50_under_5ms() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let mut latencies = Vec::with_capacity(50);
-    for i in 0u64..50 {
-        storage
-            .append_batch(make_batch(&format!("slo-flush-{i}"), i * 10, 10))
-            .await
-            .unwrap();
+        let mut latencies = Vec::with_capacity(50);
+        for i in 0u64..50 {
+            storage
+                .append_batch(make_batch(&format!("slo-flush-{i}"), i * 10, 10))
+                .await
+                .unwrap();
 
-        let start = Instant::now();
-        storage.flush(FlushMode::Durable).await.unwrap();
-        latencies.push(start.elapsed().as_micros() as u64);
-    }
+            let start = Instant::now();
+            storage.flush(FlushMode::Durable).await.unwrap();
+            latencies.push(start.elapsed().as_micros() as u64);
+        }
 
-    latencies.sort();
-    let p50 = percentile(&latencies, 50.0);
+        latencies.sort();
+        let p50 = percentile(&latencies, 50.0);
 
-    // Durable flush p50 < 5ms — allow 50ms headroom
-    assert!(p50 < 50_000, "flush durable p50 = {p50}us, expected < 50ms");
+        // Durable flush p50 < 5ms — allow 50ms headroom
+        assert!(p50 < 50_000, "flush durable p50 = {p50}us, expected < 50ms");
     });
 }
 
@@ -468,9 +468,9 @@ fn test_slo_flush_durable_p50_under_5ms() {
 #[test]
 fn test_backend_kind_is_append_log() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
-    assert_eq!(storage.backend_kind(), RecorderBackendKind::AppendLog);
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        assert_eq!(storage.backend_kind(), RecorderBackendKind::AppendLog);
     });
 }
 
@@ -481,20 +481,20 @@ fn test_backend_kind_is_append_log() {
 #[test]
 fn test_health_stays_green_under_sustained_append() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    for i in 0u64..100 {
-        storage
-            .append_batch(make_batch(&format!("health-{i}"), i * 10, 10))
-            .await
-            .unwrap();
-    }
+        for i in 0u64..100 {
+            storage
+                .append_batch(make_batch(&format!("health-{i}"), i * 10, 10))
+                .await
+                .unwrap();
+        }
 
-    let health = storage.health().await;
-    assert!(!health.degraded, "storage degraded after 1000 events");
-    assert!(health.latest_offset.is_some());
-    assert_eq!(health.latest_offset.unwrap().ordinal, 999);
+        let health = storage.health().await;
+        assert!(!health.degraded, "storage degraded after 1000 events");
+        assert!(health.latest_offset.is_some());
+        assert_eq!(health.latest_offset.unwrap().ordinal, 999);
     });
 }
 
@@ -505,81 +505,81 @@ fn test_health_stays_green_under_sustained_append() {
 #[test]
 fn test_soak_sustained_ingest_no_degradation() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let total_events = 5000u64;
-    let batch_size = 50u64;
-    let mut seq = 0u64;
-    let mut max_batch_us = 0u64;
+        let total_events = 5000u64;
+        let batch_size = 50u64;
+        let mut seq = 0u64;
+        let mut max_batch_us = 0u64;
 
-    let start = Instant::now();
-    while seq < total_events {
-        let batch_start = Instant::now();
-        storage
-            .append_batch(make_batch(&format!("soak-{seq}"), seq, batch_size))
-            .await
-            .unwrap();
-        let batch_us = batch_start.elapsed().as_micros() as u64;
-        max_batch_us = max_batch_us.max(batch_us);
-        seq += batch_size;
-    }
-    let total_secs = start.elapsed().as_secs_f64();
+        let start = Instant::now();
+        while seq < total_events {
+            let batch_start = Instant::now();
+            storage
+                .append_batch(make_batch(&format!("soak-{seq}"), seq, batch_size))
+                .await
+                .unwrap();
+            let batch_us = batch_start.elapsed().as_micros() as u64;
+            max_batch_us = max_batch_us.max(batch_us);
+            seq += batch_size;
+        }
+        let total_secs = start.elapsed().as_secs_f64();
 
-    let health = storage.health().await;
-    assert!(!health.degraded, "storage degraded during soak");
-    assert_eq!(health.latest_offset.unwrap().ordinal, total_events - 1);
+        let health = storage.health().await;
+        assert!(!health.degraded, "storage degraded during soak");
+        assert_eq!(health.latest_offset.unwrap().ordinal, total_events - 1);
 
-    let throughput = total_events as f64 / total_secs;
-    assert!(
-        throughput > 100.0,
-        "soak throughput {throughput:.0} events/sec, expected > 100"
-    );
+        let throughput = total_events as f64 / total_secs;
+        assert!(
+            throughput > 100.0,
+            "soak throughput {throughput:.0} events/sec, expected > 100"
+        );
 
-    // No single batch should exceed 500ms
-    assert!(
-        max_batch_us < 500_000,
-        "worst batch {max_batch_us}us, expected < 500ms"
-    );
+        // No single batch should exceed 500ms
+        assert!(
+            max_batch_us < 500_000,
+            "worst batch {max_batch_us}us, expected < 500ms"
+        );
     });
 }
 
 #[test]
 fn test_soak_no_latency_drift() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let windows = 10;
-    let events_per_window = 200u64;
-    let batch_size = 50u64;
-    let mut window_latencies = Vec::new();
-    let mut seq = 0u64;
+        let windows = 10;
+        let events_per_window = 200u64;
+        let batch_size = 50u64;
+        let mut window_latencies = Vec::new();
+        let mut seq = 0u64;
 
-    for _w in 0..windows {
-        let window_start = Instant::now();
-        let mut events_in_window = 0u64;
-        while events_in_window < events_per_window {
-            storage
-                .append_batch(make_batch(&format!("drift-{seq}"), seq, batch_size))
-                .await
-                .unwrap();
-            seq += batch_size;
-            events_in_window += batch_size;
+        for _w in 0..windows {
+            let window_start = Instant::now();
+            let mut events_in_window = 0u64;
+            while events_in_window < events_per_window {
+                storage
+                    .append_batch(make_batch(&format!("drift-{seq}"), seq, batch_size))
+                    .await
+                    .unwrap();
+                seq += batch_size;
+                events_in_window += batch_size;
+            }
+            let window_us = window_start.elapsed().as_micros() as u64;
+            window_latencies.push(window_us);
         }
-        let window_us = window_start.elapsed().as_micros() as u64;
-        window_latencies.push(window_us);
-    }
 
-    // Check that the last window isn't more than 5x the first (no drift)
-    let first = window_latencies[0].max(1);
-    let last = *window_latencies.last().unwrap();
-    let ratio = last as f64 / first as f64;
+        // Check that the last window isn't more than 5x the first (no drift)
+        let first = window_latencies[0].max(1);
+        let last = *window_latencies.last().unwrap();
+        let ratio = last as f64 / first as f64;
 
-    assert!(
-        ratio < 5.0,
-        "latency drift ratio {ratio:.2}x (first={first}us, last={last}us), expected < 5x"
-    );
+        assert!(
+            ratio < 5.0,
+            "latency drift ratio {ratio:.2}x (first={first}us, last={last}us), expected < 5x"
+        );
     });
 }
 
@@ -590,58 +590,58 @@ fn test_soak_no_latency_drift() {
 #[test]
 fn test_flake_append_variance_under_threshold() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    // Warm up
-    for i in 0u64..10 {
-        storage
-            .append_batch(make_batch(&format!("warmup-{i}"), i, 10))
-            .await
-            .unwrap();
-    }
+        // Warm up
+        for i in 0u64..10 {
+            storage
+                .append_batch(make_batch(&format!("warmup-{i}"), i, 10))
+                .await
+                .unwrap();
+        }
 
-    let mut latencies = Vec::with_capacity(20);
-    for i in 0u64..20 {
-        let start = Instant::now();
-        storage
-            .append_batch(make_batch(&format!("flake-{i}"), 100 + i * 10, 10))
-            .await
-            .unwrap();
-        latencies.push(start.elapsed().as_micros() as u64);
-    }
+        let mut latencies = Vec::with_capacity(20);
+        for i in 0u64..20 {
+            let start = Instant::now();
+            storage
+                .append_batch(make_batch(&format!("flake-{i}"), 100 + i * 10, 10))
+                .await
+                .unwrap();
+            latencies.push(start.elapsed().as_micros() as u64);
+        }
 
-    let cv = coefficient_of_variation(&latencies);
+        let cv = coefficient_of_variation(&latencies);
 
-    // Coefficient of variation < 2.0 (200%) is acceptable for CI
-    // (filesystem caching makes this highly variable)
-    assert!(
-        cv < 2.0,
-        "append CV = {cv:.3}, expected < 2.0 (latencies: {latencies:?})"
-    );
+        // Coefficient of variation < 2.0 (200%) is acceptable for CI
+        // (filesystem caching makes this highly variable)
+        assert!(
+            cv < 2.0,
+            "append CV = {cv:.3}, expected < 2.0 (latencies: {latencies:?})"
+        );
     });
 }
 
 #[test]
 fn test_flake_flush_variance_under_threshold() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let mut latencies = Vec::with_capacity(10);
-    for i in 0u64..10 {
-        storage
-            .append_batch(make_batch(&format!("flake-flush-{i}"), i * 10, 10))
-            .await
-            .unwrap();
+        let mut latencies = Vec::with_capacity(10);
+        for i in 0u64..10 {
+            storage
+                .append_batch(make_batch(&format!("flake-flush-{i}"), i * 10, 10))
+                .await
+                .unwrap();
 
-        let start = Instant::now();
-        storage.flush(FlushMode::Durable).await.unwrap();
-        latencies.push(start.elapsed().as_micros() as u64);
-    }
+            let start = Instant::now();
+            storage.flush(FlushMode::Durable).await.unwrap();
+            latencies.push(start.elapsed().as_micros() as u64);
+        }
 
-    let cv = coefficient_of_variation(&latencies);
-    assert!(cv < 2.0, "flush CV = {cv:.3}, expected < 2.0");
+        let cv = coefficient_of_variation(&latencies);
+        assert!(cv < 2.0, "flush CV = {cv:.3}, expected < 2.0");
     });
 }
 
@@ -652,34 +652,34 @@ fn test_flake_flush_variance_under_threshold() {
 #[test]
 fn test_multi_pane_append_no_contention_degradation() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    // Simulate 8 panes appending interleaved
-    let panes = 8u64;
-    let events_per_pane = 50u64;
-    let start = Instant::now();
+        // Simulate 8 panes appending interleaved
+        let panes = 8u64;
+        let events_per_pane = 50u64;
+        let start = Instant::now();
 
-    for round in 0..events_per_pane {
-        for pane in 0..panes {
-            let seq = round * panes + pane;
-            storage
-                .append_batch(make_batch(&format!("pane-{pane}-{round}"), seq, 1))
-                .await
-                .unwrap();
+        for round in 0..events_per_pane {
+            for pane in 0..panes {
+                let seq = round * panes + pane;
+                storage
+                    .append_batch(make_batch(&format!("pane-{pane}-{round}"), seq, 1))
+                    .await
+                    .unwrap();
+            }
         }
-    }
 
-    let elapsed_ms = start.elapsed().as_millis();
-    let total = panes * events_per_pane;
+        let elapsed_ms = start.elapsed().as_millis();
+        let total = panes * events_per_pane;
 
-    assert!(
-        elapsed_ms < 10_000,
-        "{total} multi-pane appends took {elapsed_ms}ms, expected < 10s"
-    );
+        assert!(
+            elapsed_ms < 10_000,
+            "{total} multi-pane appends took {elapsed_ms}ms, expected < 10s"
+        );
 
-    let health = storage.health().await;
-    assert!(!health.degraded);
+        let health = storage.health().await;
+        assert!(!health.degraded);
     });
 }
 
@@ -690,43 +690,43 @@ fn test_multi_pane_append_no_contention_degradation() {
 #[test]
 fn test_checkpoint_roundtrip_latency() {
     run_async_test(async {
-    use frankenterm_core::recorder_storage::{CheckpointConsumerId, RecorderCheckpoint};
+        use frankenterm_core::recorder_storage::{CheckpointConsumerId, RecorderCheckpoint};
 
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
-    storage
-        .append_batch(make_batch("cp-seed", 0, 10))
-        .await
-        .unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        storage
+            .append_batch(make_batch("cp-seed", 0, 10))
+            .await
+            .unwrap();
 
-    let consumer = CheckpointConsumerId("perf-consumer".to_string());
+        let consumer = CheckpointConsumerId("perf-consumer".to_string());
 
-    let start = Instant::now();
-    storage
-        .commit_checkpoint(RecorderCheckpoint {
-            consumer: consumer.clone(),
-            upto_offset: RecorderOffset {
-                segment_id: 0,
-                byte_offset: 0,
-                ordinal: 5,
-            },
-            schema_version: "v1".to_string(),
-            committed_at_ms: 1000,
-        })
-        .await
-        .unwrap();
-    let commit_us = start.elapsed().as_micros();
+        let start = Instant::now();
+        storage
+            .commit_checkpoint(RecorderCheckpoint {
+                consumer: consumer.clone(),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 0,
+                    ordinal: 5,
+                },
+                schema_version: "v1".to_string(),
+                committed_at_ms: 1000,
+            })
+            .await
+            .unwrap();
+        let commit_us = start.elapsed().as_micros();
 
-    let start2 = Instant::now();
-    let cp = storage.read_checkpoint(&consumer).await.unwrap();
-    let read_us = start2.elapsed().as_micros();
+        let start2 = Instant::now();
+        let cp = storage.read_checkpoint(&consumer).await.unwrap();
+        let read_us = start2.elapsed().as_micros();
 
-    assert!(cp.is_some());
-    assert_eq!(cp.unwrap().upto_offset.ordinal, 5);
+        assert!(cp.is_some());
+        assert_eq!(cp.unwrap().upto_offset.ordinal, 5);
 
-    // Checkpoint SLO: p95 < 100ms
-    assert!(commit_us < 100_000, "checkpoint commit took {commit_us}us");
-    assert!(read_us < 100_000, "checkpoint read took {read_us}us");
+        // Checkpoint SLO: p95 < 100ms
+        assert!(commit_us < 100_000, "checkpoint commit took {commit_us}us");
+        assert!(read_us < 100_000, "checkpoint read took {read_us}us");
     });
 }
 
@@ -737,22 +737,22 @@ fn test_checkpoint_roundtrip_latency() {
 #[test]
 fn test_idempotent_replay_no_performance_penalty() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let batch = make_batch("idempotent-1", 0, 50);
-    storage.append_batch(batch.clone()).await.unwrap();
+        let batch = make_batch("idempotent-1", 0, 50);
+        storage.append_batch(batch.clone()).await.unwrap();
 
-    // Replay same batch — should be fast
-    let start = Instant::now();
-    let resp = storage.append_batch(batch).await.unwrap();
-    let elapsed_us = start.elapsed().as_micros();
+        // Replay same batch — should be fast
+        let start = Instant::now();
+        let resp = storage.append_batch(batch).await.unwrap();
+        let elapsed_us = start.elapsed().as_micros();
 
-    assert_eq!(resp.accepted_count, 50);
-    assert!(
-        elapsed_us < 50_000,
-        "idempotent replay took {elapsed_us}us, expected < 50ms"
-    );
+        assert_eq!(resp.accepted_count, 50);
+        assert!(
+            elapsed_us < 50_000,
+            "idempotent replay took {elapsed_us}us, expected < 50ms"
+        );
     });
 }
 
@@ -796,21 +796,21 @@ fn test_coefficient_of_variation_varied() {
 #[test]
 fn test_max_batch_256_events_within_slo() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let start = Instant::now();
-    storage
-        .append_batch(make_batch("max-256", 0, 256))
-        .await
-        .unwrap();
-    let elapsed_us = start.elapsed().as_micros();
+        let start = Instant::now();
+        storage
+            .append_batch(make_batch("max-256", 0, 256))
+            .await
+            .unwrap();
+        let elapsed_us = start.elapsed().as_micros();
 
-    // Max batch (256) should still be under 50ms SLO
-    assert!(
-        elapsed_us < 100_000,
-        "256-event batch took {elapsed_us}us, expected < 100ms"
-    );
+        // Max batch (256) should still be under 50ms SLO
+        assert!(
+            elapsed_us < 100_000,
+            "256-event batch took {elapsed_us}us, expected < 100ms"
+        );
     });
 }
 
@@ -821,27 +821,27 @@ fn test_max_batch_256_events_within_slo() {
 #[test]
 fn test_sequential_flush_no_stacking() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    for i in 0u64..5 {
-        storage
-            .append_batch(make_batch(&format!("seq-flush-{i}"), i * 20, 20))
-            .await
-            .unwrap();
+        for i in 0u64..5 {
+            storage
+                .append_batch(make_batch(&format!("seq-flush-{i}"), i * 20, 20))
+                .await
+                .unwrap();
+            storage.flush(FlushMode::Durable).await.unwrap();
+        }
+
+        // Final flush after all data
+        let start = Instant::now();
         storage.flush(FlushMode::Durable).await.unwrap();
-    }
+        let elapsed_us = start.elapsed().as_micros();
 
-    // Final flush after all data
-    let start = Instant::now();
-    storage.flush(FlushMode::Durable).await.unwrap();
-    let elapsed_us = start.elapsed().as_micros();
-
-    // Should be nearly instant since nothing to flush
-    assert!(
-        elapsed_us < 50_000,
-        "noop flush took {elapsed_us}us, expected < 50ms"
-    );
+        // Should be nearly instant since nothing to flush
+        assert!(
+            elapsed_us < 50_000,
+            "noop flush took {elapsed_us}us, expected < 50ms"
+        );
     });
 }
 
@@ -852,22 +852,22 @@ fn test_sequential_flush_no_stacking() {
 #[test]
 fn test_lag_metrics_latency() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
-    storage
-        .append_batch(make_batch("lag-seed", 0, 100))
-        .await
-        .unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        storage
+            .append_batch(make_batch("lag-seed", 0, 100))
+            .await
+            .unwrap();
 
-    let start = Instant::now();
-    let lag = storage.lag_metrics().await.unwrap();
-    let elapsed_us = start.elapsed().as_micros();
+        let start = Instant::now();
+        let lag = storage.lag_metrics().await.unwrap();
+        let elapsed_us = start.elapsed().as_micros();
 
-    assert!(lag.latest_offset.is_some());
-    assert!(
-        elapsed_us < 50_000,
-        "lag_metrics took {elapsed_us}us, expected < 50ms"
-    );
+        assert!(lag.latest_offset.is_some());
+        assert!(
+            elapsed_us < 50_000,
+            "lag_metrics took {elapsed_us}us, expected < 50ms"
+        );
     });
 }
 
@@ -878,167 +878,167 @@ fn test_lag_metrics_latency() {
 #[test]
 fn test_health_latency_under_1ms() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
-    storage
-        .append_batch(make_batch("health-lat", 0, 50))
-        .await
-        .unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        storage
+            .append_batch(make_batch("health-lat", 0, 50))
+            .await
+            .unwrap();
 
-    let start = Instant::now();
-    let health = storage.health().await;
-    let elapsed_us = start.elapsed().as_micros();
+        let start = Instant::now();
+        let health = storage.health().await;
+        let elapsed_us = start.elapsed().as_micros();
 
-    assert!(!health.degraded);
-    assert!(
-        elapsed_us < 10_000,
-        "health() took {elapsed_us}us, expected < 10ms"
-    );
+        assert!(!health.degraded);
+        assert!(
+            elapsed_us < 10_000,
+            "health() took {elapsed_us}us, expected < 10ms"
+        );
     });
 }
 
 #[test]
 fn test_append_monotonic_ordinals_under_load() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let mut last_ordinal = 0u64;
-    for i in 0u64..50 {
-        let resp = storage
-            .append_batch(make_batch(&format!("mono-{i}"), i * 10, 10))
-            .await
-            .unwrap();
-        assert!(
-            resp.first_offset.ordinal >= last_ordinal,
-            "ordinal went backwards at batch {i}"
-        );
-        last_ordinal = resp.last_offset.ordinal + 1;
-    }
-    assert_eq!(last_ordinal, 500);
+        let mut last_ordinal = 0u64;
+        for i in 0u64..50 {
+            let resp = storage
+                .append_batch(make_batch(&format!("mono-{i}"), i * 10, 10))
+                .await
+                .unwrap();
+            assert!(
+                resp.first_offset.ordinal >= last_ordinal,
+                "ordinal went backwards at batch {i}"
+            );
+            last_ordinal = resp.last_offset.ordinal + 1;
+        }
+        assert_eq!(last_ordinal, 500);
     });
 }
 
 #[test]
 fn test_empty_batch_rejection_fast() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let start = Instant::now();
-    let result = storage
-        .append_batch(AppendRequest {
-            batch_id: "empty-1".to_string(),
-            events: vec![],
-            required_durability: DurabilityLevel::Appended,
-            producer_ts_ms: 1,
-        })
-        .await;
-    let elapsed_us = start.elapsed().as_micros();
+        let start = Instant::now();
+        let result = storage
+            .append_batch(AppendRequest {
+                batch_id: "empty-1".to_string(),
+                events: vec![],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 1,
+            })
+            .await;
+        let elapsed_us = start.elapsed().as_micros();
 
-    assert!(result.is_err(), "empty batch should be rejected");
-    assert!(
-        elapsed_us < 10_000,
-        "empty batch rejection took {elapsed_us}us, expected < 10ms"
-    );
+        assert!(result.is_err(), "empty batch should be rejected");
+        assert!(
+            elapsed_us < 10_000,
+            "empty batch rejection took {elapsed_us}us, expected < 10ms"
+        );
     });
 }
 
 #[test]
 fn test_soak_window_p99_stability() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    let windows = 5;
-    let batches_per_window = 20;
-    let mut window_p99s = Vec::new();
+        let windows = 5;
+        let batches_per_window = 20;
+        let mut window_p99s = Vec::new();
 
-    for w in 0..windows {
-        let mut latencies = Vec::with_capacity(batches_per_window);
-        for b in 0..batches_per_window {
-            let seq = (w * batches_per_window + b) as u64 * 10;
-            let start = Instant::now();
-            storage
-                .append_batch(make_batch(&format!("stability-{w}-{b}"), seq, 10))
-                .await
-                .unwrap();
-            latencies.push(start.elapsed().as_micros() as u64);
+        for w in 0..windows {
+            let mut latencies = Vec::with_capacity(batches_per_window);
+            for b in 0..batches_per_window {
+                let seq = (w * batches_per_window + b) as u64 * 10;
+                let start = Instant::now();
+                storage
+                    .append_batch(make_batch(&format!("stability-{w}-{b}"), seq, 10))
+                    .await
+                    .unwrap();
+                latencies.push(start.elapsed().as_micros() as u64);
+            }
+            latencies.sort();
+            window_p99s.push(percentile(&latencies, 99.0));
         }
-        latencies.sort();
-        window_p99s.push(percentile(&latencies, 99.0));
-    }
 
-    // No window p99 should exceed 100ms
-    for (i, p99) in window_p99s.iter().enumerate() {
-        assert!(*p99 < 100_000, "window {i} p99 = {p99}us, expected < 100ms");
-    }
+        // No window p99 should exceed 100ms
+        for (i, p99) in window_p99s.iter().enumerate() {
+            assert!(*p99 < 100_000, "window {i} p99 = {p99}us, expected < 100ms");
+        }
     });
 }
 
 #[test]
 fn test_cursor_partial_range_performance() {
     run_async_test(async {
-    let dir = tempdir().unwrap();
-    let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = AppendLogRecorderStorage::open(perf_config(dir.path())).unwrap();
 
-    // Populate 500 events
-    let mut all_records = Vec::new();
-    let mut seq = 0u64;
-    while seq < 500 {
-        let events: Vec<_> = (seq..seq + 50).map(sample_event).collect();
-        let resp = storage
-            .append_batch(AppendRequest {
-                batch_id: format!("partial-{seq}"),
-                events: events.clone(),
-                required_durability: DurabilityLevel::Appended,
-                producer_ts_ms: 1,
+        // Populate 500 events
+        let mut all_records = Vec::new();
+        let mut seq = 0u64;
+        while seq < 500 {
+            let events: Vec<_> = (seq..seq + 50).map(sample_event).collect();
+            let resp = storage
+                .append_batch(AppendRequest {
+                    batch_id: format!("partial-{seq}"),
+                    events: events.clone(),
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 1,
+                })
+                .await
+                .unwrap();
+            let first_ord = resp.first_offset.ordinal;
+            for (i, event) in events.into_iter().enumerate() {
+                let ordinal = first_ord + i as u64;
+                all_records.push(CursorRecord {
+                    event,
+                    offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: ordinal * 100,
+                        ordinal,
+                    },
+                });
+            }
+            seq += 50;
+        }
+
+        let reader = PerfMemoryReader {
+            records: all_records,
+        };
+
+        // Read only from ordinal 250 onwards
+        let start = Instant::now();
+        let mut cursor = reader
+            .open_cursor(RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 250,
             })
-            .await
             .unwrap();
-        let first_ord = resp.first_offset.ordinal;
-        for (i, event) in events.into_iter().enumerate() {
-            let ordinal = first_ord + i as u64;
-            all_records.push(CursorRecord {
-                event,
-                offset: RecorderOffset {
-                    segment_id: 0,
-                    byte_offset: ordinal * 100,
-                    ordinal,
-                },
-            });
+
+        let mut count = 0;
+        loop {
+            let batch = cursor.next_batch(50).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            count += batch.len();
         }
-        seq += 50;
-    }
+        let elapsed_us = start.elapsed().as_micros();
 
-    let reader = PerfMemoryReader {
-        records: all_records,
-    };
-
-    // Read only from ordinal 250 onwards
-    let start = Instant::now();
-    let mut cursor = reader
-        .open_cursor(RecorderOffset {
-            segment_id: 0,
-            byte_offset: 0,
-            ordinal: 250,
-        })
-        .unwrap();
-
-    let mut count = 0;
-    loop {
-        let batch = cursor.next_batch(50).unwrap();
-        if batch.is_empty() {
-            break;
-        }
-        count += batch.len();
-    }
-    let elapsed_us = start.elapsed().as_micros();
-
-    assert_eq!(count, 250);
-    assert!(
-        elapsed_us < 50_000,
-        "partial cursor took {elapsed_us}us, expected < 50ms"
-    );
+        assert_eq!(count, 250);
+        assert!(
+            elapsed_us < 50_000,
+            "partial cursor took {elapsed_us}us, expected < 50ms"
+        );
     });
 }

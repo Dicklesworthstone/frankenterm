@@ -15,11 +15,11 @@
 mod common;
 
 use common::fixtures::RuntimeFixture;
-use frankenterm_core::storage::StorageHandle;
 use frankenterm_core::policy::PaneCapabilities;
+use frankenterm_core::storage::StorageHandle;
 use frankenterm_core::workflows::{
-    DescriptorWorkflow, HandleCompaction, HandleProcessTriageLifecycle, HandleSessionEnd,
-    StepResult, Workflow, WorkflowContext, WorkflowDescriptor, AUTH_COOLDOWN_MS,
+    AUTH_COOLDOWN_MS, DescriptorWorkflow, HandleCompaction, HandleProcessTriageLifecycle,
+    HandleSessionEnd, StepResult, Workflow, WorkflowContext, WorkflowDescriptor,
 };
 use std::sync::Arc;
 
@@ -907,10 +907,8 @@ fn handle_auth_required_audit_roundtrip() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::SeqCst);
-        let db_path = std::env::temp_dir().join(format!(
-            "wa_labrt_auth_req_{}_{n}.db",
-            std::process::id()
-        ));
+        let db_path =
+            std::env::temp_dir().join(format!("wa_labrt_auth_req_{}_{n}.db", std::process::id()));
         let db = StorageHandle::new(&db_path.to_string_lossy())
             .await
             .expect("temp DB");

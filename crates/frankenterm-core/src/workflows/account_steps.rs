@@ -350,7 +350,8 @@ mod tests {
 
     #[test]
     fn parse_device_code_with_url() {
-        let input = "Visit https://login.example.com/device to authenticate.\nEnter code: ABCD-1234";
+        let input =
+            "Visit https://login.example.com/device to authenticate.\nEnter code: ABCD-1234";
         let result = parse_device_code(input).unwrap();
         assert_eq!(result.code, "ABCD-1234");
         // URL should be extracted if it matches the device URL pattern

@@ -8,10 +8,9 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 
 use frankenterm_core::connector_event_model::{
-    CanonicalConnectorEvent, CanonicalSeverity, CompatibilityReport, EventDirection,
-    IndexingContract, SchemaEvolutionRegistry, SchemaFieldDef, SchemaValidationResult,
-    SchemaVersion, check_compatibility, from_lifecycle_transition,
-    CANONICAL_SCHEMA_VERSION,
+    CANONICAL_SCHEMA_VERSION, CanonicalConnectorEvent, CanonicalSeverity, CompatibilityReport,
+    EventDirection, IndexingContract, SchemaEvolutionRegistry, SchemaFieldDef,
+    SchemaValidationResult, SchemaVersion, check_compatibility, from_lifecycle_transition,
 };
 use frankenterm_core::connector_host_runtime::{
     ConnectorCapability, ConnectorFailureClass, ConnectorLifecyclePhase,

@@ -14,10 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn schedule_task(runtime: &mut LabRuntime, task_id: TaskId) {
-    runtime
-        .scheduler
-        .lock()
-        .schedule(task_id, 0);
+    runtime.scheduler.lock().schedule(task_id, 0);
 }
 
 #[test]

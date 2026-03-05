@@ -1,13 +1,13 @@
 //! GuiWin represents a Gui TermWindow (as opposed to a Mux window) in lua code
 use super::luaerr;
-use crate::termwindow::TermWindowNotif;
 use crate::TermWindow;
+use crate::termwindow::TermWindowNotif;
 use config::keyassignment::{ClipboardCopyDestination, KeyAssignment};
 use luahelper::*;
 use mlua::{UserData, UserDataMethods, UserDataRef};
+use mux::Mux;
 use mux::pane::PaneId;
 use mux::window::WindowId as MuxWindowId;
-use mux::Mux;
 use mux_lua::MuxPane;
 use termwiz_funcs::lines_to_escapes;
 use wezterm_dynamic::{FromDynamic, ToDynamic};

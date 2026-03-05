@@ -673,7 +673,11 @@ fn global_cleared_after_reset() {
     // OnceLock doesn't support removal, so reset only clears faults.
     match FaultInjector::global() {
         None => {} // never initialized in this test run — fine
-        Some(inj) => assert_eq!(inj.total_fired(), 0, "expected cleared injector after reset"),
+        Some(inj) => assert_eq!(
+            inj.total_fired(),
+            0,
+            "expected cleared injector after reset"
+        ),
     }
 }
 

@@ -50,10 +50,7 @@ fn smoke_run_lab_test_with_tasks() {
             .state
             .create_task(region, Budget::INFINITE, async { 42_u32 })
             .expect("create task");
-        runtime
-            .scheduler
-            .lock()
-            .schedule(task_id, 0);
+        runtime.scheduler.lock().schedule(task_id, 0);
         runtime.run_until_quiescent();
     });
     assert!(report.passed());
@@ -71,10 +68,7 @@ fn smoke_run_lab_test_concurrent_tasks() {
                     .state
                     .create_task(region, Budget::INFINITE, async move { i * 2 })
                     .expect("create task");
-                runtime
-                    .scheduler
-                    .lock()
-                            .schedule(task_id, 0);
+                runtime.scheduler.lock().schedule(task_id, 0);
             }
             runtime.run_until_quiescent();
         },
@@ -115,10 +109,7 @@ fn smoke_chaos_test_with_tasks() {
             .state
             .create_task(region, Budget::INFINITE, async { "survived chaos" })
             .expect("create task");
-        runtime
-            .scheduler
-            .lock()
-            .schedule(task_id, 0);
+        runtime.scheduler.lock().schedule(task_id, 0);
         runtime.run_until_quiescent();
     });
     assert!(report.passed());
@@ -153,10 +144,7 @@ fn smoke_exploration_test_with_tasks() {
                 .state
                 .create_task(region, Budget::INFINITE, async { 1_u32 })
                 .expect("create task");
-            runtime
-                .scheduler
-                .lock()
-                    .schedule(task_id, 0);
+            runtime.scheduler.lock().schedule(task_id, 0);
         }
         runtime.run_until_quiescent();
     });

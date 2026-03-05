@@ -10,9 +10,7 @@ mod common;
 
 use common::fixtures::RuntimeFixture;
 
-use frankenterm_core::metrics::{
-    FixedMetricsCollector, MetricsServer, MetricsSnapshot,
-};
+use frankenterm_core::metrics::{FixedMetricsCollector, MetricsServer, MetricsSnapshot};
 use frankenterm_core::runtime_compat::io::{AsyncReadExt, AsyncWriteExt};
 use frankenterm_core::runtime_compat::net::TcpStream;
 
@@ -92,8 +90,7 @@ fn metrics_server_serves_metrics() {
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let collector = Arc::new(FixedMetricsCollector::new(snapshot));
-        let server =
-            MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
+        let server = MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
         let handle = server.start().await.expect("metrics server start");
 
         let mut stream = TcpStream::connect(handle.local_addr())
@@ -148,9 +145,8 @@ fn metrics_server_allows_public_bind_with_opt_in() {
     rt.block_on(async {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
-        let server =
-            MetricsServer::new("0.0.0.0:0", "wa", collector, Arc::clone(&shutdown_flag))
-                .with_dangerous_public_bind();
+        let server = MetricsServer::new("0.0.0.0:0", "wa", collector, Arc::clone(&shutdown_flag))
+            .with_dangerous_public_bind();
 
         let handle = server
             .start()

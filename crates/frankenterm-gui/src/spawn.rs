@@ -1,11 +1,11 @@
-use anyhow::{anyhow, bail, Context};
-use config::keyassignment::SpawnCommand;
+use anyhow::{Context, anyhow, bail};
 use config::TermConfig;
+use config::keyassignment::SpawnCommand;
+use mux::Mux;
 use mux::activity::Activity;
 use mux::domain::SplitSource;
 use mux::tab::{FloatingPaneRect, SplitRequest};
 use mux::window::WindowId as MuxWindowId;
-use mux::Mux;
 use portable_pty::CommandBuilder;
 use std::sync::Arc;
 use wezterm_term::TerminalSize;
@@ -152,7 +152,12 @@ pub async fn spawn_command_internal(
             // Move the pane to floating position on the active tab
             if let Some(tab) = mux.get_active_tab_for_window(src_window_id) {
                 tab.add_floating_pane(Arc::clone(&pane), rect);
-                log::info!("Created floating pane {} at ({}, {})", pane.pane_id(), rect.left, rect.top);
+                log::info!(
+                    "Created floating pane {} at ({}, {})",
+                    pane.pane_id(),
+                    rect.left,
+                    rect.top
+                );
             }
 
             // Remove the orphaned tab from the window so it doesn't

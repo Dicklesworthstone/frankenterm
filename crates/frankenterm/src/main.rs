@@ -8799,12 +8799,9 @@ async fn record_ipc_rpc_audit(
         result: result.to_string(),
     };
 
-    if let Err(e) = storage
-        .lock()
-        .await
-        .record_audit_action_redacted(audit)
-        .await
-    {
+    // Clone handle under the outer mutex, then perform async I/O without holding the lock.
+    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+    if let Err(e) = storage_handle.record_audit_action_redacted(audit).await {
         tracing::warn!("Failed to record IPC RPC audit: {e}");
     }
 }
@@ -9216,6 +9213,25 @@ fn distributed_normalize_identity(value: &str) -> String {
 }
 
 #[cfg(feature = "distributed")]
+const DISTRIBUTED_MESSAGE_TOO_LARGE_IO_ERROR_MARKER: &str = "distributed_message_too_large";
+
+#[cfg(feature = "distributed")]
+fn distributed_message_too_large_io_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        DISTRIBUTED_MESSAGE_TOO_LARGE_IO_ERROR_MARKER,
+    )
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_is_message_too_large_io_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::InvalidData
+        && err
+            .to_string()
+            .contains(DISTRIBUTED_MESSAGE_TOO_LARGE_IO_ERROR_MARKER)
+}
+
+#[cfg(feature = "distributed")]
 fn distributed_sender_hash(sender: &str) -> u64 {
     // Deterministic FNV-1a 64-bit hash for stable remote pane ID mapping.
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -9237,6 +9253,15 @@ fn distributed_remote_pane_id(sender: &str, pane_id: u64) -> u64 {
 #[cfg(feature = "distributed")]
 fn distributed_remote_domain(sender: &str, domain: &str) -> String {
     format!("distributed:{sender}:{domain}")
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_replay_session_key(session_id: &str, sender: &str) -> String {
+    format!(
+        "{}:{session_id}:{}:{sender}",
+        session_id.len(),
+        sender.len()
+    )
 }
 
 #[cfg(feature = "distributed")]
@@ -9347,6 +9372,7 @@ async fn distributed_publish_security_error<S>(
 async fn distributed_read_line<S>(
     reader: &mut asupersync::io::BufReader<S>,
     line: &mut String,
+    max_bytes: usize,
 ) -> std::io::Result<usize>
 where
     S: asupersync::io::AsyncRead + Unpin,
@@ -9376,6 +9402,9 @@ where
                     };
                 bytes.extend_from_slice(&available[..consumed]);
                 Pin::new(&mut *reader).consume(consumed);
+                if bytes.len() > max_bytes {
+                    return Poll::Ready(Err(distributed_message_too_large_io_error()));
+                }
                 Poll::Ready(Ok(Some(found_newline)))
             }
         })
@@ -9651,12 +9680,24 @@ async fn distributed_handle_connection<S>(
 
     let handshake_size = match frankenterm_core::runtime_compat::timeout(
         handshake_timeout,
-        distributed_read_line(&mut reader, &mut handshake_line),
+        distributed_read_line(
+            &mut reader,
+            &mut handshake_line,
+            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+        ),
     )
     .await
     {
         Ok(Ok(size)) => size,
         Ok(Err(err)) => {
+            if distributed_is_message_too_large_io_error(&err) {
+                distributed_publish_security_error(
+                    &mut reader,
+                    frankenterm_core::distributed::DistributedSecurityError::MessageTooLarge,
+                )
+                .await;
+                return;
+            }
             tracing::warn!(peer = %peer_addr, error = %err, "Distributed handshake read failed");
             return;
         }
@@ -9757,12 +9798,24 @@ async fn distributed_handle_connection<S>(
         let mut line = String::new();
         let read_size = match frankenterm_core::runtime_compat::timeout(
             message_timeout,
-            distributed_read_line(&mut reader, &mut line),
+            distributed_read_line(
+                &mut reader,
+                &mut line,
+                frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+            ),
         )
         .await
         {
             Ok(Ok(size)) => size,
             Ok(Err(err)) => {
+                if distributed_is_message_too_large_io_error(&err) {
+                    distributed_publish_security_error(
+                        &mut reader,
+                        frankenterm_core::distributed::DistributedSecurityError::MessageTooLarge,
+                    )
+                    .await;
+                    continue;
+                }
                 tracing::warn!(peer = %peer_addr, error = %err, "Distributed stream read failed");
                 break;
             }
@@ -9816,7 +9869,7 @@ async fn distributed_handle_connection<S>(
         }
 
         let validation_err = {
-            let replay_id = format!("{session_id}:{}", envelope.sender);
+            let replay_id = distributed_replay_session_key(&session_id, &envelope.sender);
             let mut replay_guard = ingest_state.replay_guard.lock().await;
             replay_guard.validate(&replay_id, envelope.seq).err()
         };
@@ -10342,7 +10395,11 @@ async fn distributed_agent_stream_session(
     let mut handshake_response = String::new();
     match frankenterm_core::runtime_compat::timeout(
         Duration::from_millis(250),
-        distributed_read_line(&mut stream, &mut handshake_response),
+        distributed_read_line(
+            &mut stream,
+            &mut handshake_response,
+            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+        ),
     )
     .await
     {
@@ -12117,7 +12174,9 @@ async fn run_single_scheduled_backup(
         anyhow::bail!("Database not found at {}", db_path.display());
     }
 
-    if let Err(err) = storage.lock().await.clone().checkpoint().await {
+    // Never hold the outer storage mutex across checkpoint I/O.
+    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+    if let Err(err) = storage_handle.checkpoint().await {
         tracing::warn!(error = %err, "Backup checkpoint failed");
     }
 
@@ -36053,6 +36112,7 @@ fn format_size_short(bytes: u64) -> String {
 mod tests {
     use super::*;
     use frankenterm_core::approval::hash_allow_once_code;
+    use frankenterm_core::runtime_compat::CompatRuntime;
     use frankenterm_core::storage::{
         ApprovalTokenRecord, PaneRecord, PreparedPlanRecord, StorageHandle,
     };
@@ -36570,9 +36630,11 @@ mod tests {
         assert_eq!(counters.succeeded, 1);
         assert_eq!(counters.unresolved, 1);
 
+        mission.lifecycle_state = frankenterm_core::plan::MissionLifecycleState::AwaitingApproval;
+
         let transitions = mission_available_transitions(mission.lifecycle_state);
         assert!(transitions.iter().any(
-            |(kind, to)| kind.to_string() == "approval_granted" && to.to_string() == "running"
+            |(kind, to)| kind.to_string() == "approve" && to.to_string() == "executing"
         ));
     }
 
@@ -37481,8 +37543,13 @@ recorder_backend = "frankensqlite"
     }
 
     #[cfg(feature = "distributed")]
-    #[tokio::test]
-    async fn distributed_listener_persists_agent_stream_and_surfaces_remote_status_and_query() {
+    #[test]
+    fn distributed_listener_persists_agent_stream_and_surfaces_remote_status_and_query() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
         use asupersync::io::AsyncWriteExt;
         use asupersync::net::TcpStream;
         use frankenterm_core::wire_protocol::{PaneDelta, PaneMeta, WireEnvelope, WirePayload};
@@ -37618,102 +37685,117 @@ recorder_backend = "frankensqlite"
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
+            });
     }
 
     #[cfg(feature = "distributed")]
-    #[tokio::test]
-    async fn distributed_listener_rejects_invalid_token_and_does_not_persist_remote_panes() {
-        use asupersync::io::AsyncWriteExt;
-        use asupersync::net::TcpStream;
-        use std::sync::atomic::Ordering;
+    #[test]
+    fn distributed_listener_rejects_invalid_token_and_does_not_persist_remote_panes() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use asupersync::io::AsyncWriteExt;
+                use asupersync::net::TcpStream;
+                use std::sync::atomic::Ordering;
 
-        let (storage_handle, db_path) =
-            setup_storage("distributed_listener_invalid_token_rejected").await;
-        let storage =
-            std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
-        let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-        let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_listener_invalid_token_rejected").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                    storage_handle,
+                ));
+                let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let bind_probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
-        let bind_addr = bind_probe.local_addr().expect("probe listener addr");
-        drop(bind_probe);
+                let bind_probe =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
+                drop(bind_probe);
 
-        let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
-        distributed_config.enabled = true;
-        distributed_config.bind_addr = bind_addr.to_string();
-        distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
-        distributed_config.token = Some("expected-token".to_string());
+                let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
+                distributed_config.enabled = true;
+                distributed_config.bind_addr = bind_addr.to_string();
+                distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
+                distributed_config.token = Some("expected-token".to_string());
 
-        let listener_handle = spawn_distributed_listener(
-            distributed_config.clone(),
-            std::sync::Arc::clone(&storage),
-            std::sync::Arc::clone(&event_bus),
-            std::sync::Arc::clone(&shutdown_flag),
-        )
-        .await
-        .expect("spawn distributed listener");
+                let listener_handle = spawn_distributed_listener(
+                    distributed_config.clone(),
+                    std::sync::Arc::clone(&storage),
+                    std::sync::Arc::clone(&event_bus),
+                    std::sync::Arc::clone(&shutdown_flag),
+                )
+                .await
+                .expect("spawn distributed listener");
 
-        let mut stream = TcpStream::connect(distributed_config.bind_addr.clone())
-            .await
-            .expect("connect distributed listener");
+                let mut stream = TcpStream::connect(distributed_config.bind_addr.clone())
+                    .await
+                    .expect("connect distributed listener");
 
-        let handshake = DistributedHandshake {
-            token: Some("wrong-token".to_string()),
-            agent_id: Some("agent-invalid".to_string()),
-            session_id: Some("session-invalid".to_string()),
-        };
-        let handshake_json = serde_json::to_string(&handshake).expect("serialize handshake");
-        stream
-            .write_all(handshake_json.as_bytes())
-            .await
-            .expect("write handshake");
-        stream
-            .write_all(b"\n")
-            .await
-            .expect("write handshake newline");
-        stream.flush().await.expect("flush handshake");
+                let handshake = DistributedHandshake {
+                    token: Some("wrong-token".to_string()),
+                    agent_id: Some("agent-invalid".to_string()),
+                    session_id: Some("session-invalid".to_string()),
+                };
+                let handshake_json =
+                    serde_json::to_string(&handshake).expect("serialize handshake");
+                stream
+                    .write_all(handshake_json.as_bytes())
+                    .await
+                    .expect("write handshake");
+                stream
+                    .write_all(b"\n")
+                    .await
+                    .expect("write handshake newline");
+                stream.flush().await.expect("flush handshake");
 
-        let mut reader = asupersync::io::BufReader::new(stream);
-        let mut line = String::new();
-        let read_size = frankenterm_core::runtime_compat::timeout(
-            std::time::Duration::from_secs(1),
-            distributed_read_line(&mut reader, &mut line),
-        )
-        .await
-        .expect("read security response within timeout")
-        .expect("read security response");
-        assert!(
-            read_size > 0,
-            "listener should emit security error response"
-        );
+                let mut reader = asupersync::io::BufReader::new(stream);
+                let mut line = String::new();
+                let read_size = frankenterm_core::runtime_compat::timeout(
+                    std::time::Duration::from_secs(1),
+                    distributed_read_line(
+                        &mut reader,
+                        &mut line,
+                        frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                    ),
+                )
+                .await
+                .expect("read security response within timeout")
+                .expect("read security response");
+                assert!(
+                    read_size > 0,
+                    "listener should emit security error response"
+                );
 
-        let payload: serde_json::Value =
-            serde_json::from_str(line.trim()).expect("parse security response json");
-        assert_eq!(payload["ok"], serde_json::Value::Bool(false));
-        assert_eq!(payload["error"]["code"], "dist.auth_failed");
+                let payload: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse security response json");
+                assert_eq!(payload["ok"], serde_json::Value::Bool(false));
+                assert_eq!(payload["error"]["code"], "dist.auth_failed");
 
-        drop(reader);
-        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(100)).await;
+                drop(reader);
+                frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(100))
+                    .await;
 
-        let remote_records = load_distributed_remote_panes(std::path::Path::new(&db_path))
-            .await
-            .expect("load distributed remote panes");
-        assert!(
-            remote_records.is_empty(),
-            "invalid-token session must not persist remote pane metadata"
-        );
+                let remote_records = load_distributed_remote_panes(std::path::Path::new(&db_path))
+                    .await
+                    .expect("load distributed remote panes");
+                assert!(
+                    remote_records.is_empty(),
+                    "invalid-token session must not persist remote pane metadata"
+                );
 
-        shutdown_flag.store(true, Ordering::SeqCst);
-        let _ = listener_handle.await;
+                shutdown_flag.store(true, Ordering::SeqCst);
+                let _ = listener_handle.await;
 
-        {
-            let storage_handle = storage.lock().await.clone(); // ubs:ignore
-            storage_handle.shutdown().await.expect("shutdown storage");
-        }
-        drop(storage);
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{db_path}-wal"));
-        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+                {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    storage_handle.shutdown().await.expect("shutdown storage");
+                }
+                drop(storage);
+                let _ = std::fs::remove_file(&db_path);
+                let _ = std::fs::remove_file(format!("{db_path}-wal"));
+                let _ = std::fs::remove_file(format!("{db_path}-shm"));
+            });
     }
 
     #[cfg(feature = "distributed")]
@@ -37726,6 +37808,14 @@ recorder_backend = "frankensqlite"
         assert_eq!(a1, a2);
         assert_ne!(a1, b1);
         assert!(a1 >= (1_u64 << 62));
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_replay_session_key_avoids_delimiter_collisions() {
+        let a = distributed_replay_session_key("session:a", "sender-b");
+        let b = distributed_replay_session_key("session", "a:sender-b");
+        assert_ne!(a, b);
     }
 
     async fn setup_storage(label: &str) -> (StorageHandle, String) {
@@ -43139,6 +43229,49 @@ log_level = "debug"
         );
     }
 
+    #[tokio::test]
+    async fn read_search_policy_all_actor_variants_preserve_mux_surface() {
+        let config = frankenterm_core::config::Config::default();
+        let actions = [
+            frankenterm_core::policy::ActionKind::ReadOutput,
+            frankenterm_core::policy::ActionKind::SearchOutput,
+        ];
+        let actors = [
+            frankenterm_core::policy::ActorKind::Robot,
+            frankenterm_core::policy::ActorKind::Human,
+            frankenterm_core::policy::ActorKind::Mcp,
+            frankenterm_core::policy::ActorKind::Workflow,
+        ];
+
+        for action in actions {
+            for actor in actors {
+                let summary = format!(
+                    "surface contract test: {} / {}",
+                    action.as_str(),
+                    actor.as_str()
+                );
+                let (decision, _domain) = authorize_read_or_search_policy(
+                    &config, None, None, action, actor, None, &summary,
+                )
+                .await;
+                let context = decision.context().unwrap_or_else(|| {
+                    panic!(
+                        "decision context missing for action {} actor {}",
+                        action.as_str(),
+                        actor.as_str()
+                    )
+                });
+                assert_eq!(
+                    context.surface,
+                    frankenterm_core::policy::PolicySurface::Mux,
+                    "expected mux surface for action {} actor {}",
+                    action.as_str(),
+                    actor.as_str()
+                );
+            }
+        }
+    }
+
     #[test]
     fn workflow_run_policy_input_uses_workflow_surface_contract() {
         let input = workflow_run_policy_input(42, "handle_usage_limits");
@@ -43459,228 +43592,251 @@ log_level = "debug"
         }
     }
 
-    #[tokio::test]
-    async fn saved_search_scheduler_emits_alert_and_redacts_snippet() {
-        use frankenterm_core::events::Event;
-        use frankenterm_core::storage::{
-            PaneRecord, SAVED_SEARCH_DEFAULT_LIMIT, SAVED_SEARCH_SINCE_MODE_LAST_RUN,
-            SavedSearchRecord,
-        };
-
-        let (storage, db_path) = setup_storage("saved_search_scheduler_alert").await;
-        let bus = Arc::new(frankenterm_core::events::EventBus::new(256));
-        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Register pane 1 so the foreign key constraint is satisfied.
-        let now = now_ms();
-        storage
-            .upsert_pane(PaneRecord {
-                pane_id: 1,
-                pane_uuid: None,
-                domain: "local".to_string(),
-                window_id: None,
-                tab_id: None,
-                title: None,
-                cwd: None,
-                tty_name: None,
-                first_seen_at: now,
-                last_seen_at: now,
-                observed: true,
-                ignore_reason: None,
-                last_decision_at: None,
-            })
-            .await
-            .unwrap();
-
-        // Ensure there is content to match (and to redact).
-        let content = format!("error: something happened {}", secret_token());
-        storage.append_segment(1, &content, None).await.unwrap();
-
-        let mut record = SavedSearchRecord::new(
-            "errors".to_string(),
-            "error".to_string(),
-            None,
-            SAVED_SEARCH_DEFAULT_LIMIT,
-            SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
-            None,
-        );
-        record.enabled = true;
-        record.schedule_interval_ms = Some(1_000);
-        storage.insert_saved_search(record.clone()).await.unwrap();
-
-        let scheduler_handle =
-            frankenterm_core::runtime_compat::task::spawn(run_saved_search_scheduler(
-                storage.clone(),
-                Arc::clone(&bus),
-                Arc::clone(&shutdown_flag),
-            ));
-
-        let mut sub = bus.subscribe_detections();
-        let event = frankenterm_core::runtime_compat::timeout(
-            std::time::Duration::from_secs(5),
-            sub.recv(),
-        )
-        .await
-        .expect("timeout waiting for saved_search.alert")
-        .unwrap();
-
-        let Event::PatternDetected { detection, .. } = event else {
-            panic!("unexpected event variant");
-        };
-
-        assert_eq!(detection.rule_id, "wezterm.saved_search.alert");
-        assert_eq!(detection.event_type, "saved_search.alert");
-
-        let extracted = detection.extracted.as_object().unwrap();
-        assert_eq!(
-            extracted.get("search_name").and_then(|v| v.as_str()),
-            Some("errors")
-        );
-        assert!(
-            extracted
-                .get("match_count")
-                .and_then(|v| v.as_i64())
-                .is_some_and(|n| n >= 1)
-        );
-
-        let snippet = extracted
-            .get("snippet")
-            .and_then(|v| v.as_str())
-            .expect("expected snippet in extracted payload");
-        assert!(snippet.contains("[REDACTED]"));
-        assert!(!snippet.contains("sk-"));
-
-        // Drain any queued events (avoid confusing the cooldown test below).
-        while sub.try_recv().is_some() {}
-
-        // Force the search to be due again quickly; the scheduler should run,
-        // but the alert should be suppressed by per-search cooldown.
-        let now = now_ms();
-        let force_due_at = now - 10_000;
-        storage
-            .update_saved_search_run(&record.id, force_due_at, Some(1), None)
-            .await
-            .unwrap();
-
-        // Give the scheduler a chance to tick and update last_run_at.
-        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(600)).await;
-        let updated = storage
-            .get_saved_search_by_name("errors")
-            .await
+    #[test]
+    fn saved_search_scheduler_emits_alert_and_redacts_snippet() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
             .unwrap()
-            .unwrap();
-        assert!(updated.last_run_at.is_some_and(|v| v >= force_due_at));
+            .block_on(async {
+                use frankenterm_core::events::Event;
+                use frankenterm_core::storage::{
+                    PaneRecord, SAVED_SEARCH_DEFAULT_LIMIT, SAVED_SEARCH_SINCE_MODE_LAST_RUN,
+                    SavedSearchRecord,
+                };
 
-        // No second alert within the cooldown window.
-        let second = frankenterm_core::runtime_compat::timeout(
-            std::time::Duration::from_secs(1),
-            sub.recv(),
-        )
-        .await;
-        assert!(
-            second.is_err(),
-            "expected cooldown to suppress second alert"
-        );
+                let (storage, db_path) = setup_storage("saved_search_scheduler_alert").await;
+                let bus = Arc::new(frankenterm_core::events::EventBus::new(256));
+                let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = scheduler_handle.await;
-        cleanup_storage(storage, &db_path).await;
-    }
+                // Register pane 1 so the foreign key constraint is satisfied.
+                let now = now_ms();
+                storage
+                    .upsert_pane(PaneRecord {
+                        pane_id: 1,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: None,
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: now,
+                        last_seen_at: now,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .unwrap();
 
-    #[tokio::test]
-    async fn saved_search_scheduler_invalid_query_sets_last_error_and_backs_off() {
-        use frankenterm_core::storage::{
-            SAVED_SEARCH_DEFAULT_LIMIT, SAVED_SEARCH_SINCE_MODE_LAST_RUN, SavedSearchRecord,
-        };
+                // Ensure there is content to match (and to redact).
+                let content = format!("error: something happened {}", secret_token());
+                storage.append_segment(1, &content, None).await.unwrap();
 
-        let (storage, db_path) = setup_storage("saved_search_scheduler_invalid").await;
-        let bus = Arc::new(frankenterm_core::events::EventBus::new(16));
-        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut record = SavedSearchRecord::new(
+                    "errors".to_string(),
+                    "error".to_string(),
+                    None,
+                    SAVED_SEARCH_DEFAULT_LIMIT,
+                    SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
+                    None,
+                );
+                record.enabled = true;
+                record.schedule_interval_ms = Some(1_000);
+                storage.insert_saved_search(record.clone()).await.unwrap();
 
-        let mut record = SavedSearchRecord::new(
-            "invalid".to_string(),
-            "\"unterminated".to_string(),
-            None,
-            SAVED_SEARCH_DEFAULT_LIMIT,
-            SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
-            None,
-        );
-        record.enabled = true;
-        record.schedule_interval_ms = Some(1_000);
-        storage.insert_saved_search(record.clone()).await.unwrap();
+                let scheduler_handle =
+                    frankenterm_core::runtime_compat::task::spawn(run_saved_search_scheduler(
+                        storage.clone(),
+                        Arc::clone(&bus),
+                        Arc::clone(&shutdown_flag),
+                    ));
 
-        let scheduler_handle =
-            frankenterm_core::runtime_compat::task::spawn(run_saved_search_scheduler(
-                storage.clone(),
-                Arc::clone(&bus),
-                Arc::clone(&shutdown_flag),
-            ));
+                let mut sub = bus.subscribe_detections();
+                let event = frankenterm_core::runtime_compat::timeout(
+                    std::time::Duration::from_secs(5),
+                    sub.recv(),
+                )
+                .await
+                .expect("timeout waiting for saved_search.alert")
+                .unwrap();
 
-        let first =
-            wait_for_saved_search_error(&storage, "invalid", std::time::Duration::from_secs(3))
+                let Event::PatternDetected { detection, .. } = event else {
+                    panic!("unexpected event variant");
+                };
+
+                assert_eq!(detection.rule_id, "wezterm.saved_search.alert");
+                assert_eq!(detection.event_type, "saved_search.alert");
+
+                let extracted = detection.extracted.as_object().unwrap();
+                assert_eq!(
+                    extracted.get("search_name").and_then(|v| v.as_str()),
+                    Some("errors")
+                );
+                assert!(
+                    extracted
+                        .get("match_count")
+                        .and_then(|v| v.as_i64())
+                        .is_some_and(|n| n >= 1)
+                );
+
+                let snippet = extracted
+                    .get("snippet")
+                    .and_then(|v| v.as_str())
+                    .expect("expected snippet in extracted payload");
+                assert!(snippet.contains("[REDACTED]"));
+                assert!(!snippet.contains("sk-"));
+
+                // Drain any queued events (avoid confusing the cooldown test below).
+                while sub.try_recv().is_some() {}
+
+                // Force the search to be due again quickly; the scheduler should run,
+                // but the alert should be suppressed by per-search cooldown.
+                let now = now_ms();
+                let force_due_at = now - 10_000;
+                storage
+                    .update_saved_search_run(&record.id, force_due_at, Some(1), None)
+                    .await
+                    .unwrap();
+
+                // Give the scheduler a chance to tick and update last_run_at.
+                frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(600))
+                    .await;
+                let updated = storage
+                    .get_saved_search_by_name("errors")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(updated.last_run_at.is_some_and(|v| v >= force_due_at));
+
+                // No second alert within the cooldown window.
+                let second = frankenterm_core::runtime_compat::timeout(
+                    std::time::Duration::from_secs(1),
+                    sub.recv(),
+                )
                 .await;
-        let first_run_at = first
-            .last_run_at
-            .expect("expected last_run_at set on error");
+                assert!(
+                    second.is_err(),
+                    "expected cooldown to suppress second alert"
+                );
 
-        // Interval would make it due again quickly, but backoff should prevent
-        // repeated executions for a short window.
-        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_secs(2)).await;
-        let second = storage
-            .get_saved_search_by_name("invalid")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(second.last_run_at, Some(first_run_at));
-        assert!(second.last_error.is_some());
-
-        shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = scheduler_handle.await;
-        cleanup_storage(storage, &db_path).await;
+                shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = scheduler_handle.await;
+                cleanup_storage(storage, &db_path).await;
+            });
     }
 
-    #[tokio::test]
-    async fn saved_search_scheduler_respects_interval_when_not_due() {
-        use frankenterm_core::storage::{
-            SAVED_SEARCH_DEFAULT_LIMIT, SAVED_SEARCH_SINCE_MODE_LAST_RUN, SavedSearchRecord,
-        };
-
-        let (storage, db_path) = setup_storage("saved_search_scheduler_interval").await;
-        let bus = Arc::new(frankenterm_core::events::EventBus::new(16));
-        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let now = now_ms();
-        let mut record = SavedSearchRecord::new(
-            "not_due".to_string(),
-            "error".to_string(),
-            None,
-            SAVED_SEARCH_DEFAULT_LIMIT,
-            SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
-            None,
-        );
-        record.enabled = true;
-        record.schedule_interval_ms = Some(60_000);
-        record.last_run_at = Some(now);
-        storage.insert_saved_search(record.clone()).await.unwrap();
-
-        let scheduler_handle =
-            frankenterm_core::runtime_compat::task::spawn(run_saved_search_scheduler(
-                storage.clone(),
-                Arc::clone(&bus),
-                Arc::clone(&shutdown_flag),
-            ));
-
-        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(600)).await;
-        let fetched = storage
-            .get_saved_search_by_name("not_due")
-            .await
+    #[test]
+    fn saved_search_scheduler_invalid_query_sets_last_error_and_backs_off() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
             .unwrap()
-            .unwrap();
-        assert_eq!(fetched.last_run_at, Some(now));
+            .block_on(async {
+                use frankenterm_core::storage::{
+                    SAVED_SEARCH_DEFAULT_LIMIT, SAVED_SEARCH_SINCE_MODE_LAST_RUN, SavedSearchRecord,
+                };
 
-        shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = scheduler_handle.await;
-        cleanup_storage(storage, &db_path).await;
+                let (storage, db_path) = setup_storage("saved_search_scheduler_invalid").await;
+                let bus = Arc::new(frankenterm_core::events::EventBus::new(16));
+                let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                let mut record = SavedSearchRecord::new(
+                    "invalid".to_string(),
+                    "\"unterminated".to_string(),
+                    None,
+                    SAVED_SEARCH_DEFAULT_LIMIT,
+                    SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
+                    None,
+                );
+                record.enabled = true;
+                record.schedule_interval_ms = Some(1_000);
+                storage.insert_saved_search(record.clone()).await.unwrap();
+
+                let scheduler_handle =
+                    frankenterm_core::runtime_compat::task::spawn(run_saved_search_scheduler(
+                        storage.clone(),
+                        Arc::clone(&bus),
+                        Arc::clone(&shutdown_flag),
+                    ));
+
+                let first = wait_for_saved_search_error(
+                    &storage,
+                    "invalid",
+                    std::time::Duration::from_secs(3),
+                )
+                .await;
+                let first_run_at = first
+                    .last_run_at
+                    .expect("expected last_run_at set on error");
+
+                // Interval would make it due again quickly, but backoff should prevent
+                // repeated executions for a short window.
+                frankenterm_core::runtime_compat::sleep(std::time::Duration::from_secs(2)).await;
+                let second = storage
+                    .get_saved_search_by_name("invalid")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(second.last_run_at, Some(first_run_at));
+                assert!(second.last_error.is_some());
+
+                shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = scheduler_handle.await;
+                cleanup_storage(storage, &db_path).await;
+            });
+    }
+
+    #[test]
+    fn saved_search_scheduler_respects_interval_when_not_due() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use frankenterm_core::storage::{
+                    SAVED_SEARCH_DEFAULT_LIMIT, SAVED_SEARCH_SINCE_MODE_LAST_RUN, SavedSearchRecord,
+                };
+
+                let (storage, db_path) = setup_storage("saved_search_scheduler_interval").await;
+                let bus = Arc::new(frankenterm_core::events::EventBus::new(16));
+                let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                let now = now_ms();
+                let mut record = SavedSearchRecord::new(
+                    "not_due".to_string(),
+                    "error".to_string(),
+                    None,
+                    SAVED_SEARCH_DEFAULT_LIMIT,
+                    SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
+                    None,
+                );
+                record.enabled = true;
+                record.schedule_interval_ms = Some(60_000);
+                record.last_run_at = Some(now);
+                storage.insert_saved_search(record.clone()).await.unwrap();
+
+                let scheduler_handle =
+                    frankenterm_core::runtime_compat::task::spawn(run_saved_search_scheduler(
+                        storage.clone(),
+                        Arc::clone(&bus),
+                        Arc::clone(&shutdown_flag),
+                    ));
+
+                frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(600))
+                    .await;
+                let fetched = storage
+                    .get_saved_search_by_name("not_due")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(fetched.last_run_at, Some(now));
+
+                shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = scheduler_handle.await;
+                cleanup_storage(storage, &db_path).await;
+            });
     }
 
     // ── parse_duration_to_ms tests ────────────────────────────────────────

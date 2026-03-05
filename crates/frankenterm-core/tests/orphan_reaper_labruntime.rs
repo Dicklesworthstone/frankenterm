@@ -16,11 +16,11 @@ mod common;
 use common::fixtures::RuntimeFixture;
 
 use frankenterm_core::config::CliConfig;
-use frankenterm_core::orphan_reaper::{reap_orphans, run_orphan_reaper, ReapReport};
+use frankenterm_core::orphan_reaper::{ReapReport, reap_orphans, run_orphan_reaper};
 use frankenterm_core::runtime_compat;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -77,8 +77,7 @@ fn run_orphan_reaper_responds_to_shutdown() {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
 
-        let handle =
-            runtime_compat::task::spawn(run_orphan_reaper(config, shutdown_clone));
+        let handle = runtime_compat::task::spawn(run_orphan_reaper(config, shutdown_clone));
 
         // Signal shutdown after a short delay
         runtime_compat::sleep(Duration::from_millis(50)).await;

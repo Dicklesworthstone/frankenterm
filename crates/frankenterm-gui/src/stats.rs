@@ -5,10 +5,10 @@ use hdrhistogram::Histogram;
 use metrics::{Counter, Gauge, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tabout::{tabulate_output, Alignment, Column};
+use tabout::{Alignment, Column, tabulate_output};
 
 static ENABLE_STAT_PRINT: AtomicBool = AtomicBool::new(true);
 lazy_static::lazy_static! {

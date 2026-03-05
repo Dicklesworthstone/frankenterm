@@ -130,32 +130,62 @@ fn undo_workflow_abort_succeeds_and_marks_action_undone() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-wf-success.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
         let pane_id = 42_u64;
         let execution_id = "wf-undo-success-1";
 
         seed_pane(storage.as_ref(), pane_id).await;
-        let action_id = seed_action(storage.as_ref(), pane_id, "workflow", Some(execution_id), "workflow_start").await;
+        let action_id = seed_action(
+            storage.as_ref(),
+            pane_id,
+            "workflow",
+            Some(execution_id),
+            "workflow_start",
+        )
+        .await;
         seed_workflow(storage.as_ref(), execution_id, pane_id, "running").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "workflow_abort", true,
-            Some(&format!("ft robot workflow abort {execution_id}")),
-            Some(&serde_json::json!({ "execution_id": execution_id, "pane_id": pane_id }).to_string()),
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "workflow_abort",
+                true,
+                Some(&format!("ft robot workflow abort {execution_id}")),
+                Some(
+                    &serde_json::json!({ "execution_id": execution_id, "pane_id": pane_id })
+                        .to_string(),
+                ),
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id).with_actor("test-user")).await.expect("undo result");
+        let result = executor
+            .execute(UndoRequest::new(action_id).with_actor("test-user"))
+            .await
+            .expect("undo result");
 
         assert_eq!(result.outcome, UndoOutcome::Success);
         assert_eq!(result.strategy, "workflow_abort");
         assert_eq!(result.target_workflow_id.as_deref(), Some(execution_id));
 
-        let workflow = storage.get_workflow(execution_id).await.expect("wf query").expect("wf exists");
+        let workflow = storage
+            .get_workflow(execution_id)
+            .await
+            .expect("wf query")
+            .expect("wf exists");
         assert_eq!(workflow.status, "aborted");
 
-        let undo = storage.get_action_undo(action_id).await.expect("undo query").expect("undo exists");
+        let undo = storage
+            .get_action_undo(action_id)
+            .await
+            .expect("undo query")
+            .expect("undo exists");
         assert!(undo.undone_at.is_some());
         assert_eq!(undo.undone_by.as_deref(), Some("test-user"));
 
@@ -169,28 +199,51 @@ fn undo_workflow_abort_not_applicable_when_completed() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-wf-completed.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
         let pane_id = 7_u64;
         let execution_id = "wf-undo-completed-1";
 
         seed_pane(storage.as_ref(), pane_id).await;
-        let action_id = seed_action(storage.as_ref(), pane_id, "workflow", Some(execution_id), "workflow_start").await;
+        let action_id = seed_action(
+            storage.as_ref(),
+            pane_id,
+            "workflow",
+            Some(execution_id),
+            "workflow_start",
+        )
+        .await;
         seed_workflow(storage.as_ref(), execution_id, pane_id, "completed").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "workflow_abort", true,
-            Some(&format!("ft robot workflow abort {execution_id}")),
-            Some(&serde_json::json!({ "execution_id": execution_id }).to_string()),
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "workflow_abort",
+                true,
+                Some(&format!("ft robot workflow abort {execution_id}")),
+                Some(&serde_json::json!({ "execution_id": execution_id }).to_string()),
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("undo result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("undo result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("already_completed"));
 
-        let undo = storage.get_action_undo(action_id).await.expect("undo query").expect("undo exists");
+        let undo = storage
+            .get_action_undo(action_id)
+            .await
+            .expect("undo query")
+            .expect("undo exists");
         assert!(undo.undone_at.is_none());
 
         storage.shutdown().await.expect("shutdown");
@@ -203,22 +256,38 @@ fn undo_manual_strategy_returns_guidance() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-manual-guidance.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 11).await;
         let action_id = seed_action(storage.as_ref(), 11, "human", Some("cli"), "send_text").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "manual", false,
-            Some("Inspect pane state and reverse command manually."), None,
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "manual",
+                false,
+                Some("Inspect pane state and reverse command manually."),
+                None,
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("undo result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("undo result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
-        assert_eq!(result.guidance.as_deref(), Some("Inspect pane state and reverse command manually."));
+        assert_eq!(
+            result.guidance.as_deref(),
+            Some("Inspect pane state and reverse command manually.")
+        );
 
         storage.shutdown().await.expect("shutdown");
     });
@@ -230,19 +299,35 @@ fn undo_already_undone_returns_not_applicable() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-already-undone.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 21).await;
         let action_id = seed_action(storage.as_ref(), 21, "human", Some("cli"), "spawn").await;
 
-        let mut undo_rec = make_undo(action_id, "pane_close", true, Some("Pane was already closed."), Some(&serde_json::json!({ "pane_id": 21 }).to_string()));
+        let mut undo_rec = make_undo(
+            action_id,
+            "pane_close",
+            true,
+            Some("Pane was already closed."),
+            Some(&serde_json::json!({ "pane_id": 21 }).to_string()),
+        );
         undo_rec.undone_at = Some(now_ms() - 1_000);
         undo_rec.undone_by = Some("first-operator".to_string());
-        storage.upsert_action_undo(undo_rec).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(undo_rec)
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id).with_actor("second-operator")).await.expect("undo result");
+        let result = executor
+            .execute(UndoRequest::new(action_id).with_actor("second-operator"))
+            .await
+            .expect("undo result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("already been undone"));
@@ -257,11 +342,18 @@ fn undo_action_not_found_returns_not_applicable() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-not-found.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(99999)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(99999))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("not found"));
@@ -277,14 +369,21 @@ fn undo_no_metadata_returns_not_applicable() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-no-metadata.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", Some("cli"), "send_text").await;
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("No undo metadata"));
@@ -299,18 +398,32 @@ fn undo_not_undoable_returns_not_applicable() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-not-undoable.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "none", false, Some("Cannot undo text"), None,
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "none",
+                false,
+                Some("Cannot undo text"),
+                None,
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("not currently undoable"));
@@ -325,16 +438,26 @@ fn undo_unknown_strategy_returns_failed() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-unknown-strategy.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
 
-        storage.upsert_action_undo(make_undo(action_id, "teleport", true, None, None)).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(action_id, "teleport", true, None, None))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::Failed);
         assert!(result.message.contains("Unknown undo strategy"));
@@ -350,18 +473,32 @@ fn undo_custom_strategy_returns_not_applicable() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-custom-strategy.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "custom", true, Some("Use external tool"), None,
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "custom",
+                true,
+                Some("Use external tool"),
+                None,
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("not supported"));
@@ -377,18 +514,32 @@ fn undo_pane_close_nonexistent_pane_returns_not_applicable() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-pane-gone.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "spawn").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "pane_close", true, None, Some(r#"{"pane_id": 999}"#),
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "pane_close",
+                true,
+                None,
+                Some(r#"{"pane_id": 999}"#),
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
 
@@ -402,19 +553,33 @@ fn undo_pane_close_no_pane_id_returns_not_applicable() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-no-pane-id.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "spawn").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "pane_close", true, None, Some(r#"{"reason": "test"}"#),
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "pane_close",
+                true,
+                None,
+                Some(r#"{"reason": "test"}"#),
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         // No pane added to mock — and action has pane_id=1 but no default pane in mock
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         // Falls back to action's pane_id, but mock has no pane 1 → not applicable
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
@@ -429,18 +594,32 @@ fn undo_workflow_abort_no_execution_id_returns_not_applicable() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-no-exec-id.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "workflow", None, "workflow_start").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "workflow_abort", true, None, Some(r#"{"no_exec_id": true}"#),
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "workflow_abort",
+                true,
+                None,
+                Some(r#"{"no_exec_id": true}"#),
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
 
@@ -454,21 +633,34 @@ fn undo_pane_close_closes_existing_pane() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-pane-close.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
         let pane_id = 55_u64;
 
         seed_pane(storage.as_ref(), pane_id).await;
         let action_id = seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "pane_close", true, None,
-            Some(&serde_json::json!({ "pane_id": pane_id }).to_string()),
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "pane_close",
+                true,
+                None,
+                Some(&serde_json::json!({ "pane_id": pane_id }).to_string()),
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         mock.add_default_pane(pane_id).await;
         let executor = UndoExecutor::new(Arc::clone(&storage), mock.clone());
-        let result = executor.execute(UndoRequest::new(action_id).with_actor("test")).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id).with_actor("test"))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::Success);
         assert_eq!(result.target_pane_id, Some(pane_id));
@@ -483,18 +675,32 @@ fn undo_none_strategy_returns_not_applicable() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-none-strategy.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "none", true, Some("No undo available"), None,
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "none",
+                true,
+                Some("No undo available"),
+                None,
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("not supported"));
@@ -510,7 +716,11 @@ fn undo_executor_clone() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("clone-test.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
         let _cloned = executor.clone();
@@ -524,21 +734,35 @@ fn undo_pane_close_falls_back_to_action_pane_id() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-fallback.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
         let pane_id = 77_u64;
 
         seed_pane(storage.as_ref(), pane_id).await;
         let action_id = seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
 
         // Payload has no pane_id key
-        storage.upsert_action_undo(make_undo(
-            action_id, "pane_close", true, None, Some(r#"{"reason": "test"}"#),
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "pane_close",
+                true,
+                None,
+                Some(r#"{"reason": "test"}"#),
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         mock.add_default_pane(pane_id).await;
         let executor = UndoExecutor::new(Arc::clone(&storage), mock.clone());
-        let result = executor.execute(UndoRequest::new(action_id).with_actor("fallback-test")).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id).with_actor("fallback-test"))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::Success);
         assert_eq!(result.target_pane_id, Some(pane_id));
@@ -553,27 +777,51 @@ fn undo_workflow_abort_waiting_succeeds() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-wf-waiting.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
         let pane_id = 88_u64;
         let execution_id = "wf-waiting-1";
 
         seed_pane(storage.as_ref(), pane_id).await;
-        let action_id = seed_action(storage.as_ref(), pane_id, "workflow", Some(execution_id), "workflow_start").await;
+        let action_id = seed_action(
+            storage.as_ref(),
+            pane_id,
+            "workflow",
+            Some(execution_id),
+            "workflow_start",
+        )
+        .await;
         seed_workflow(storage.as_ref(), execution_id, pane_id, "waiting").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "workflow_abort", true, None,
-            Some(&serde_json::json!({ "execution_id": execution_id }).to_string()),
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "workflow_abort",
+                true,
+                None,
+                Some(&serde_json::json!({ "execution_id": execution_id }).to_string()),
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id).with_actor("test")).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id).with_actor("test"))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::Success);
         assert_eq!(result.strategy, "workflow_abort");
 
-        let wf = storage.get_workflow(execution_id).await.expect("wf query").expect("wf exists");
+        let wf = storage
+            .get_workflow(execution_id)
+            .await
+            .expect("wf query")
+            .expect("wf exists");
         assert_eq!(wf.status, "aborted");
 
         storage.shutdown().await.expect("shutdown");
@@ -586,7 +834,11 @@ fn undo_undoable_false_hint_falls_back() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-fallback-hint.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let now = now_ms();
@@ -612,11 +864,17 @@ fn undo_undoable_false_hint_falls_back() {
             .expect("seed action");
 
         // Undo record with no hint, undoable=false
-        storage.upsert_action_undo(make_undo(action_id, "manual", false, None, None)).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(action_id, "manual", false, None, None))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("not currently undoable"));
@@ -631,11 +889,18 @@ fn undo_action_not_found_guidance_suggests_ft_history() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-guidance-msg.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(12345)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(12345))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert_eq!(result.strategy, "none");
@@ -651,11 +916,18 @@ fn undo_action_not_found_message_includes_action_id() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-notfound-id.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(54321)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(54321))
+            .await
+            .expect("result");
 
         assert!(result.message.contains("54321"));
 
@@ -669,14 +941,21 @@ fn undo_no_metadata_guidance_mentions_non_undoable() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-no-meta-guide.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         let guidance = result.guidance.as_deref().unwrap();
@@ -692,18 +971,32 @@ fn undo_unknown_strategy_returns_hint_from_record() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-unknown-hint.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "quantum_revert", true, Some("Contact quantum support"), None,
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "quantum_revert",
+                true,
+                Some("Contact quantum support"),
+                None,
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::Failed);
         assert_eq!(result.strategy, "quantum_revert");
@@ -719,21 +1012,34 @@ fn undo_pane_close_success_message_contains_pane_id() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-pane-msg.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
         let pane_id = 123_u64;
 
         seed_pane(storage.as_ref(), pane_id).await;
         let action_id = seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "pane_close", true, None,
-            Some(&serde_json::json!({ "pane_id": pane_id }).to_string()),
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "pane_close",
+                true,
+                None,
+                Some(&serde_json::json!({ "pane_id": pane_id }).to_string()),
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         mock.add_default_pane(pane_id).await;
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::Success);
         assert!(result.message.contains("123"));
@@ -748,22 +1054,42 @@ fn undo_workflow_abort_success_message_contains_execution_id() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-wf-msg.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
         let pane_id = 50_u64;
         let execution_id = "wf-msg-test-1";
 
         seed_pane(storage.as_ref(), pane_id).await;
-        let action_id = seed_action(storage.as_ref(), pane_id, "workflow", Some(execution_id), "workflow_start").await;
+        let action_id = seed_action(
+            storage.as_ref(),
+            pane_id,
+            "workflow",
+            Some(execution_id),
+            "workflow_start",
+        )
+        .await;
         seed_workflow(storage.as_ref(), execution_id, pane_id, "running").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "workflow_abort", true, None,
-            Some(&serde_json::json!({ "execution_id": execution_id }).to_string()),
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "workflow_abort",
+                true,
+                None,
+                Some(&serde_json::json!({ "execution_id": execution_id }).to_string()),
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::Success);
         assert!(result.message.contains(execution_id));
@@ -778,27 +1104,53 @@ fn undo_request_with_reason_propagates() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-reason-prop.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
         let pane_id = 60_u64;
         let execution_id = "wf-reason-prop-1";
 
         seed_pane(storage.as_ref(), pane_id).await;
-        let action_id = seed_action(storage.as_ref(), pane_id, "workflow", Some(execution_id), "workflow_start").await;
+        let action_id = seed_action(
+            storage.as_ref(),
+            pane_id,
+            "workflow",
+            Some(execution_id),
+            "workflow_start",
+        )
+        .await;
         seed_workflow(storage.as_ref(), execution_id, pane_id, "running").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "workflow_abort", true, None,
-            Some(&serde_json::json!({ "execution_id": execution_id }).to_string()),
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "workflow_abort",
+                true,
+                None,
+                Some(&serde_json::json!({ "execution_id": execution_id }).to_string()),
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(
-            UndoRequest::new(action_id).with_actor("reason-test").with_reason("emergency rollback"),
-        ).await.expect("result");
+        let result = executor
+            .execute(
+                UndoRequest::new(action_id)
+                    .with_actor("reason-test")
+                    .with_reason("emergency rollback"),
+            )
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::Success);
-        let wf = storage.get_workflow(execution_id).await.expect("wf query").expect("wf exists");
+        let wf = storage
+            .get_workflow(execution_id)
+            .await
+            .expect("wf query")
+            .expect("wf exists");
         assert_eq!(wf.status, "aborted");
 
         storage.shutdown().await.expect("shutdown");
@@ -811,24 +1163,44 @@ fn undo_already_undone_preserves_original_undone_by() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-preserve-by.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
         let pane_id = 30_u64;
 
         seed_pane(storage.as_ref(), pane_id).await;
         let action_id = seed_action(storage.as_ref(), pane_id, "human", None, "spawn").await;
 
-        let mut undo_rec = make_undo(action_id, "pane_close", true, None, Some(&serde_json::json!({ "pane_id": pane_id }).to_string()));
+        let mut undo_rec = make_undo(
+            action_id,
+            "pane_close",
+            true,
+            None,
+            Some(&serde_json::json!({ "pane_id": pane_id }).to_string()),
+        );
         undo_rec.undone_at = Some(1_000_000);
         undo_rec.undone_by = Some("original-actor".to_string());
-        storage.upsert_action_undo(undo_rec).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(undo_rec)
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id).with_actor("new-actor")).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id).with_actor("new-actor"))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
 
-        let undo = storage.get_action_undo(action_id).await.expect("undo query").expect("undo exists");
+        let undo = storage
+            .get_action_undo(action_id)
+            .await
+            .expect("undo query")
+            .expect("undo exists");
         assert_eq!(undo.undone_by.as_deref(), Some("original-actor"));
 
         storage.shutdown().await.expect("shutdown");
@@ -841,18 +1213,32 @@ fn undo_manual_strategy_undoable_true_still_not_applicable() {
     rt.block_on(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("undo-manual-true.db");
-        let storage = Arc::new(StorageHandle::new(&db_path.to_string_lossy()).await.expect("storage"));
+        let storage = Arc::new(
+            StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage"),
+        );
 
         seed_pane(storage.as_ref(), 1).await;
         let action_id = seed_action(storage.as_ref(), 1, "human", None, "send_text").await;
 
-        storage.upsert_action_undo(make_undo(
-            action_id, "manual", true, Some("manual steps needed"), None,
-        )).await.expect("undo metadata");
+        storage
+            .upsert_action_undo(make_undo(
+                action_id,
+                "manual",
+                true,
+                Some("manual steps needed"),
+                None,
+            ))
+            .await
+            .expect("undo metadata");
 
         let mock = Arc::new(MockWezterm::new());
         let executor = UndoExecutor::new(Arc::clone(&storage), mock);
-        let result = executor.execute(UndoRequest::new(action_id)).await.expect("result");
+        let result = executor
+            .execute(UndoRequest::new(action_id))
+            .await
+            .expect("result");
 
         assert_eq!(result.outcome, UndoOutcome::NotApplicable);
         assert!(result.message.contains("not supported"));

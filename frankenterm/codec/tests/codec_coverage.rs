@@ -6,9 +6,9 @@ use codec::{
     SelectStackPane, SetClipboard, SetLayoutCycle, SetPalette, SetPaneZoomed, SwapToLayout,
     ToggleFloatingPane, UnitResponse, UpdatePaneConstraints,
 };
-use mux::tab::FloatingPaneRect;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::ClipboardSelection;
+use mux::tab::FloatingPaneRect;
 
 enum ReadStep {
     Data(Vec<u8>),
@@ -176,7 +176,10 @@ fn stream_decode_create_floating_pane() {
     let decoded = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
     assert_eq!(decoded.serial, 500);
     assert_eq!(decoded.pdu, pdu);
-    assert!(buffer.is_empty(), "stream_decode should consume entire frame");
+    assert!(
+        buffer.is_empty(),
+        "stream_decode should consume entire frame"
+    );
 }
 
 #[test]

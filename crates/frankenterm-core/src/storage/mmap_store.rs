@@ -480,8 +480,8 @@ mod tests {
     }
 
     fn hybrid_store(dir: &Path, db_path: &Path) -> MmapScrollbackStore {
-        let config = MmapStoreConfig::new(dir.to_path_buf())
-            .with_sqlite_fallback(db_path.to_path_buf());
+        let config =
+            MmapStoreConfig::new(dir.to_path_buf()).with_sqlite_fallback(db_path.to_path_buf());
         MmapScrollbackStore::new(config).expect("create hybrid store")
     }
 
@@ -527,10 +527,7 @@ mod tests {
     #[test]
     fn build_offsets_multiple() {
         let offsets = build_offsets_from_lengths(&[5, 10, 3]);
-        assert_eq!(
-            offsets,
-            vec![LineOffset(0), LineOffset(5), LineOffset(15)]
-        );
+        assert_eq!(offsets, vec![LineOffset(0), LineOffset(5), LineOffset(15)]);
     }
 
     #[test]
@@ -580,10 +577,7 @@ mod tests {
             offset: 100,
             len: 50,
         };
-        assert_eq!(
-            format!("{err}"),
-            "offset 100 exceeds file length 50"
-        );
+        assert_eq!(format!("{err}"), "offset 100 exceeds file length 50");
     }
 
     #[test]
@@ -979,10 +973,7 @@ mod tests {
 
         let (offsets, len) = PaneFile::scan_offsets(&path).unwrap();
         // "ab\n" at 0, "cde\n" at 3, "f\n" at 7
-        assert_eq!(
-            offsets,
-            vec![LineOffset(0), LineOffset(3), LineOffset(7)]
-        );
+        assert_eq!(offsets, vec![LineOffset(0), LineOffset(3), LineOffset(7)]);
         assert_eq!(len, 9);
     }
 

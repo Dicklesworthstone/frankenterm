@@ -731,8 +731,7 @@ mod tests {
     fn dispatcher_skips_non_matching_endpoints() {
         run_async_test(async {
             let transport = MockTransport::success();
-            let mut ep =
-                test_endpoint("gemini-only", "http://localhost", WebhookTemplate::Generic);
+            let mut ep = test_endpoint("gemini-only", "http://localhost", WebhookTemplate::Generic);
             ep.events = vec!["gemini.*".to_string()];
             let dispatcher = WebhookDispatcher::new(vec![ep], Box::new(transport.clone()));
 
@@ -1072,10 +1071,8 @@ url = "http://localhost:8080/hook"
             );
             gemini_only.events = vec!["core.gemini:*".to_string()];
 
-            let dispatcher = WebhookDispatcher::new(
-                vec![codex_only, gemini_only],
-                Box::new(transport.clone()),
-            );
+            let dispatcher =
+                WebhookDispatcher::new(vec![codex_only, gemini_only], Box::new(transport.clone()));
 
             // Codex event → only codex-hook receives it
             let records = dispatcher

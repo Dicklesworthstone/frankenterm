@@ -7,7 +7,7 @@ mod web_tests {
     use frankenterm_core::events::{Event, EventBus};
     use frankenterm_core::patterns::{AgentType, Detection, Severity};
     use frankenterm_core::runtime_compat::{
-        io::{read, AsyncReadExt, AsyncWriteExt},
+        io::{AsyncReadExt, AsyncWriteExt, read},
         net::{TcpListener, TcpStream},
         sleep, task, timeout,
     };
@@ -164,7 +164,9 @@ mod web_tests {
     #[test]
     fn web_health_ephemeral_port() {
         run_async_test(async {
-            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
             let addr = server.bound_addr();
 
             assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -227,7 +229,9 @@ mod web_tests {
     #[test]
     fn panes_returns_503_without_storage() {
         run_async_test(async {
-            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
             let addr = server.bound_addr();
 
             let req = b"GET /panes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
@@ -251,7 +255,9 @@ mod web_tests {
     #[test]
     fn search_requires_query_param() {
         run_async_test(async {
-            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
             let addr = server.bound_addr();
 
             // Request /search without ?q= parameter
@@ -277,7 +283,9 @@ mod web_tests {
     #[test]
     fn health_schema_parseable() {
         run_async_test(async {
-            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
             let addr = server.bound_addr();
 
             let response = fetch_health(addr).await;
@@ -300,7 +308,9 @@ mod web_tests {
     #[test]
     fn events_returns_503_without_storage() {
         run_async_test(async {
-            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
             let addr = server.bound_addr();
 
             let req = b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
@@ -323,7 +333,9 @@ mod web_tests {
     #[test]
     fn panes_503_has_json_envelope() {
         run_async_test(async {
-            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
             let addr = server.bound_addr();
 
             let req = b"GET /panes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
@@ -347,7 +359,9 @@ mod web_tests {
     #[test]
     fn unknown_route_returns_404() {
         run_async_test(async {
-            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
             let addr = server.bound_addr();
 
             let req = b"GET /not-a-route HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
@@ -367,7 +381,9 @@ mod web_tests {
     #[test]
     fn post_method_not_allowed() {
         run_async_test(async {
-            let server = start_web_server(WebServerConfig::default().with_port(0)).await.unwrap();
+            let server = start_web_server(WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
             let addr = server.bound_addr();
 
             let req = b"POST /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -405,7 +421,9 @@ mod web_tests {
 
             let req = b"GET /stream/events?channel=detections&max_hz=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
             let start = Instant::now();
-            let response = fetch_stream_prefix(addr, req, Duration::from_millis(120), 256).await.unwrap();
+            let response = fetch_stream_prefix(addr, req, Duration::from_millis(120), 256)
+                .await
+                .unwrap();
             let elapsed = start.elapsed();
 
             assert!(

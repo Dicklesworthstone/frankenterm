@@ -80,13 +80,16 @@ fn arb_profile_policy() -> impl Strategy<Value = ProfilePolicy> {
 }
 
 fn arb_spawn_command() -> impl Strategy<Value = SpawnCommand> {
-    ("[a-z]{3,10}", prop::collection::vec("[a-z]{1,8}", 0..3), any::<bool>()).prop_map(
-        |(command, args, use_shell)| SpawnCommand {
+    (
+        "[a-z]{3,10}",
+        prop::collection::vec("[a-z]{1,8}", 0..3),
+        any::<bool>(),
+    )
+        .prop_map(|(command, args, use_shell)| SpawnCommand {
             command,
             args,
             use_shell,
-        },
-    )
+        })
 }
 
 fn arb_agent_identity() -> impl Strategy<Value = AgentIdentitySpec> {
@@ -102,8 +105,9 @@ fn arb_agent_identity() -> impl Strategy<Value = AgentIdentitySpec> {
         })
 }
 
-fn arb_session_profile(name: impl Strategy<Value = String>) -> impl Strategy<Value = SessionProfile>
-{
+fn arb_session_profile(
+    name: impl Strategy<Value = String>,
+) -> impl Strategy<Value = SessionProfile> {
     (
         name,
         prop::option::of("[a-z ]{5,20}"),
@@ -576,7 +580,11 @@ fn resolve_fleet_slot_env_override() {
     let fleet = reg.resolve_fleet("env-test").unwrap();
     assert_eq!(fleet.panes.len(), 1);
     assert_eq!(
-        fleet.panes[0].resolved.environment.get("SLOT_VAR").map(|s| s.as_str()),
+        fleet.panes[0]
+            .resolved
+            .environment
+            .get("SLOT_VAR")
+            .map(|s| s.as_str()),
         Some("slot_value")
     );
 }
@@ -676,7 +684,10 @@ fn validation_defaults_clean() {
     let mut reg = ProfileRegistry::new();
     reg.register_defaults();
     let errors = reg.validate();
-    assert!(errors.is_empty(), "default profiles should validate clean: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "default profiles should validate clean: {errors:?}"
+    );
 }
 
 #[test]
@@ -697,7 +708,10 @@ fn validation_catches_empty_profile_name() {
         updated_at: 0,
     });
     let errors = reg.validate();
-    assert!(errors.iter().any(|e| matches!(e, frankenterm_core::session_profiles::ProfileValidationError::EmptyName)));
+    assert!(errors.iter().any(|e| matches!(
+        e,
+        frankenterm_core::session_profiles::ProfileValidationError::EmptyName
+    )));
 }
 
 #[test]
@@ -711,7 +725,10 @@ fn validation_catches_orphan_persona() {
         description: None,
     });
     let errors = reg.validate();
-    assert!(errors.iter().any(|e| matches!(e, frankenterm_core::session_profiles::ProfileValidationError::ProfileNotFound { .. })));
+    assert!(errors.iter().any(|e| matches!(
+        e,
+        frankenterm_core::session_profiles::ProfileValidationError::ProfileNotFound { .. }
+    )));
 }
 
 #[test]
@@ -727,7 +744,10 @@ fn validation_catches_empty_fleet() {
         program_mix_targets: vec![],
     });
     let errors = reg.validate();
-    assert!(errors.iter().any(|e| matches!(e, frankenterm_core::session_profiles::ProfileValidationError::EmptyFleet { .. })));
+    assert!(errors.iter().any(|e| matches!(
+        e,
+        frankenterm_core::session_profiles::ProfileValidationError::EmptyFleet { .. }
+    )));
 }
 
 #[test]
@@ -761,7 +781,10 @@ fn validation_catches_duplicate_slot_labels() {
         program_mix_targets: vec![],
     });
     let errors = reg.validate();
-    assert!(errors.iter().any(|e| matches!(e, frankenterm_core::session_profiles::ProfileValidationError::DuplicateSlotLabel { .. })));
+    assert!(errors.iter().any(|e| matches!(
+        e,
+        frankenterm_core::session_profiles::ProfileValidationError::DuplicateSlotLabel { .. }
+    )));
 }
 
 #[test]
@@ -782,7 +805,10 @@ fn validation_catches_empty_bootstrap_command() {
         updated_at: 0,
     });
     let errors = reg.validate();
-    assert!(errors.iter().any(|e| matches!(e, frankenterm_core::session_profiles::ProfileValidationError::EmptyBootstrapCommand { .. })));
+    assert!(errors.iter().any(|e| matches!(
+        e,
+        frankenterm_core::session_profiles::ProfileValidationError::EmptyBootstrapCommand { .. }
+    )));
 }
 
 // ---------------------------------------------------------------------------

@@ -16,8 +16,8 @@
 //! If no WASM config is found, returns `None` and the caller falls through
 //! to the next config format.
 
-use crate::{CONFIG_DIRS, CONFIG_FILE_OVERRIDE, LoadedConfig};
-use anyhow::{Context, anyhow};
+use crate::{LoadedConfig, CONFIG_DIRS, CONFIG_FILE_OVERRIDE};
+use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
 use std::path::{Path, PathBuf};
 

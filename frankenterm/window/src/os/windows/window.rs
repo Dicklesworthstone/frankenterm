@@ -7,7 +7,7 @@ use crate::{
     RequestedWindowGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, ULength, WindowDecorations,
     WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop};
 use lazy_static::lazy_static;
@@ -49,8 +49,8 @@ use winapi::um::winnt::OSVERSIONINFOW;
 use winapi::um::winuser::*;
 use windows::UI::Color as WUIColor;
 use windows::UI::ViewManagement::{UIColorType, UISettings};
-use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
+use winreg::RegKey;
 
 const GCS_RESULTSTR: DWORD = 0x800;
 const GCS_COMPSTR: DWORD = 0x8;
@@ -862,7 +862,7 @@ impl WindowOps for Window {
     }
 
     fn invalidate(&self) {
-        let hwnd = self.0.0;
+        let hwnd = self.0 .0;
         log::trace!("WindowOps::invalidate calling InvalidateRect");
         unsafe {
             InvalidateRect(hwnd, null(), 0);
@@ -982,7 +982,7 @@ impl WindowOps for Window {
         config: &ConfigHandle,
         window_state: WindowState,
     ) -> anyhow::Result<Option<Parameters>> {
-        let hwnd = self.0.0;
+        let hwnd = self.0 .0;
         anyhow::ensure!(!hwnd.is_null(), "HWND is null");
 
         let has_focus = unsafe { GetFocus() } == hwnd;
@@ -1068,7 +1068,11 @@ unsafe fn get_title_log_font(hwnd: HWND, hdc: HDC) -> Option<LOGFONTW> {
         CloseThemeData(theme);
     }
 
-    if res == S_OK { Some(log_font) } else { None }
+    if res == S_OK {
+        Some(log_font)
+    } else {
+        None
+    }
 }
 
 unsafe fn update_title_font(hwnd: HWND) {

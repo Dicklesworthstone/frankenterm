@@ -20,13 +20,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::connector_host_runtime::{
-    ConnectorCapability, ConnectorCapabilityEnvelope,
-    ConnectorHostConfig, ConnectorHostRuntime, ConnectorLifecyclePhase,
-    ConnectorSandboxZone,
+    ConnectorCapability, ConnectorCapabilityEnvelope, ConnectorHostConfig, ConnectorHostRuntime,
+    ConnectorLifecyclePhase, ConnectorSandboxZone,
 };
 use crate::connector_registry::{
-    ConnectorManifest, ConnectorRegistryClient, ConnectorRegistryConfig,
-    TrustLevel, TrustPolicy,
+    ConnectorManifest, ConnectorRegistryClient, ConnectorRegistryConfig, TrustLevel, TrustPolicy,
 };
 
 // ---------------------------------------------------------------------------
@@ -190,9 +188,11 @@ impl ManifestBuilder {
             self.package_id
         };
 
-        let version = self.version.ok_or_else(|| ConnectorSdkError::ManifestBuilder {
-            reason: "version is required".to_string(),
-        })?;
+        let version = self
+            .version
+            .ok_or_else(|| ConnectorSdkError::ManifestBuilder {
+                reason: "version is required".to_string(),
+            })?;
 
         let display_name = self.display_name.unwrap_or_else(|| package_id.clone());
         let author = self.author.unwrap_or_default();
@@ -229,9 +229,11 @@ impl ManifestBuilder {
             self.package_id
         };
 
-        let version = self.version.ok_or_else(|| ConnectorSdkError::ManifestBuilder {
-            reason: "version is required".to_string(),
-        })?;
+        let version = self
+            .version
+            .ok_or_else(|| ConnectorSdkError::ManifestBuilder {
+                reason: "version is required".to_string(),
+            })?;
 
         let display_name = self.display_name.unwrap_or_else(|| package_id.clone());
         let author = self.author.unwrap_or_default();
@@ -649,10 +651,7 @@ impl ManifestLinter {
             findings.push(LintFinding {
                 rule_id: "sdk.lint.display_name_too_long".to_string(),
                 severity: LintSeverity::Warning,
-                message: format!(
-                    "display_name exceeds {} characters",
-                    MAX_DISPLAY_NAME_LEN
-                ),
+                message: format!("display_name exceeds {} characters", MAX_DISPLAY_NAME_LEN),
                 remediation: Some("Shorten display_name for readability".to_string()),
             });
         }
@@ -662,10 +661,7 @@ impl ManifestLinter {
             findings.push(LintFinding {
                 rule_id: "sdk.lint.description_too_long".to_string(),
                 severity: LintSeverity::Warning,
-                message: format!(
-                    "description exceeds {} characters",
-                    MAX_DESCRIPTION_LEN
-                ),
+                message: format!("description exceeds {} characters", MAX_DESCRIPTION_LEN),
                 remediation: Some("Shorten description; move details to docs".to_string()),
             });
         }
@@ -689,9 +685,15 @@ impl ManifestLinter {
                     "sha256_digest should be 64 hex chars, got {}",
                     manifest.sha256_digest.len()
                 ),
-                remediation: Some("Use ManifestBuilder::build_with_digest to auto-compute".to_string()),
+                remediation: Some(
+                    "Use ManifestBuilder::build_with_digest to auto-compute".to_string(),
+                ),
             });
-        } else if !manifest.sha256_digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        } else if !manifest
+            .sha256_digest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+        {
             findings.push(LintFinding {
                 rule_id: "sdk.lint.invalid_digest_chars".to_string(),
                 severity: LintSeverity::Error,
@@ -929,7 +931,9 @@ fn is_basic_semver(v: &str) -> bool {
     let parts: Vec<&str> = v.split('.').collect();
     parts.len() >= 2
         && parts.len() <= 3
-        && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,11 +1099,7 @@ impl CertificationPipeline {
     }
 
     /// Run the full certification pipeline on a manifest + payload.
-    pub fn certify(
-        &mut self,
-        manifest: &ConnectorManifest,
-        payload: &[u8],
-    ) -> CertificationReport {
+    pub fn certify(&mut self, manifest: &ConnectorManifest, payload: &[u8]) -> CertificationReport {
         let start = std::time::Instant::now();
         let mut phases = Vec::new();
         let mut any_failure = false;
@@ -1421,8 +1421,7 @@ impl ConnectorSimulator {
                 reason: format!("runtime creation failed: {e}"),
             }
         })?;
-        self.runtimes
-            .insert(manifest.package_id.clone(), runtime);
+        self.runtimes.insert(manifest.package_id.clone(), runtime);
 
         self.log_event(
             &manifest.package_id,
@@ -1436,16 +1435,17 @@ impl ConnectorSimulator {
     /// Start a registered connector's runtime.
     pub fn start(&mut self, connector_id: &str) -> Result<(), ConnectorSdkError> {
         let clock = self.clock_ms;
-        let runtime = self
-            .runtimes
-            .get_mut(connector_id)
-            .ok_or_else(|| ConnectorSdkError::SimulationError {
+        let runtime = self.runtimes.get_mut(connector_id).ok_or_else(|| {
+            ConnectorSdkError::SimulationError {
                 reason: format!("connector '{connector_id}' not registered"),
-            })?;
-
-        runtime.start(clock).map_err(|e| ConnectorSdkError::SimulationError {
-            reason: format!("start failed: {e}"),
+            }
         })?;
+
+        runtime
+            .start(clock)
+            .map_err(|e| ConnectorSdkError::SimulationError {
+                reason: format!("start failed: {e}"),
+            })?;
 
         self.log_event(
             connector_id,
@@ -1459,16 +1459,17 @@ impl ConnectorSimulator {
     /// Stop a running connector's runtime.
     pub fn stop(&mut self, connector_id: &str) -> Result<(), ConnectorSdkError> {
         let clock = self.clock_ms;
-        let runtime = self
-            .runtimes
-            .get_mut(connector_id)
-            .ok_or_else(|| ConnectorSdkError::SimulationError {
+        let runtime = self.runtimes.get_mut(connector_id).ok_or_else(|| {
+            ConnectorSdkError::SimulationError {
                 reason: format!("connector '{connector_id}' not registered"),
-            })?;
-
-        runtime.stop(clock).map_err(|e| ConnectorSdkError::SimulationError {
-            reason: format!("stop failed: {e}"),
+            }
         })?;
+
+        runtime
+            .stop(clock)
+            .map_err(|e| ConnectorSdkError::SimulationError {
+                reason: format!("stop failed: {e}"),
+            })?;
 
         self.log_event(
             connector_id,
@@ -1482,12 +1483,11 @@ impl ConnectorSimulator {
     /// Record a heartbeat for a connector.
     pub fn heartbeat(&mut self, connector_id: &str) -> Result<(), ConnectorSdkError> {
         let clock = self.clock_ms;
-        let runtime = self
-            .runtimes
-            .get_mut(connector_id)
-            .ok_or_else(|| ConnectorSdkError::SimulationError {
+        let runtime = self.runtimes.get_mut(connector_id).ok_or_else(|| {
+            ConnectorSdkError::SimulationError {
                 reason: format!("connector '{connector_id}' not registered"),
-            })?;
+            }
+        })?;
 
         runtime
             .record_heartbeat(clock)
@@ -1506,12 +1506,12 @@ impl ConnectorSimulator {
 
     /// Get the lifecycle phase of a connector.
     pub fn phase(&self, connector_id: &str) -> Result<ConnectorLifecyclePhase, ConnectorSdkError> {
-        let runtime = self
-            .runtimes
-            .get(connector_id)
-            .ok_or_else(|| ConnectorSdkError::SimulationError {
-                reason: format!("connector '{connector_id}' not registered"),
-            })?;
+        let runtime =
+            self.runtimes
+                .get(connector_id)
+                .ok_or_else(|| ConnectorSdkError::SimulationError {
+                    reason: format!("connector '{connector_id}' not registered"),
+                })?;
 
         Ok(runtime.state().phase())
     }
@@ -1620,7 +1620,12 @@ mod tests {
         assert_eq!(manifest.author, "alice@example.com");
         assert_eq!(manifest.required_capabilities.len(), 2);
         assert_eq!(manifest.sha256_digest.len(), 64);
-        assert!(manifest.sha256_digest.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            manifest
+                .sha256_digest
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
     }
 
     #[test]
@@ -1784,7 +1789,12 @@ mod tests {
         };
         let report = linter.lint(&manifest);
         assert!(!report.passed());
-        assert!(report.findings.iter().any(|f| f.rule_id == "sdk.lint.empty_package_id"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "sdk.lint.empty_package_id")
+        );
     }
 
     #[test]
@@ -1796,10 +1806,12 @@ mod tests {
             .unwrap();
         let report = linter.lint(&manifest);
         assert!(!report.passed());
-        assert!(report
-            .findings
-            .iter()
-            .any(|f| f.rule_id == "sdk.lint.invalid_digest_length"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "sdk.lint.invalid_digest_length")
+        );
     }
 
     #[test]
@@ -1810,10 +1822,12 @@ mod tests {
             .build_with_digest(&test_payload())
             .unwrap();
         let report = linter.lint(&manifest);
-        assert!(report
-            .findings
-            .iter()
-            .any(|f| f.rule_id == "sdk.lint.non_semver_version"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "sdk.lint.non_semver_version")
+        );
     }
 
     #[test]
@@ -1832,10 +1846,12 @@ mod tests {
             .build_with_digest(&test_payload())
             .unwrap();
         let report = linter.lint(&manifest);
-        assert!(report
-            .findings
-            .iter()
-            .any(|f| f.rule_id == "sdk.lint.excessive_capabilities"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "sdk.lint.excessive_capabilities")
+        );
     }
 
     #[test]
@@ -1848,10 +1864,12 @@ mod tests {
             .build_with_digest(&test_payload())
             .unwrap();
         let report = linter.lint(&manifest);
-        assert!(report
-            .findings
-            .iter()
-            .any(|f| f.rule_id == "sdk.lint.risky_fs_write_plus_network"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "sdk.lint.risky_fs_write_plus_network")
+        );
     }
 
     #[test]
@@ -1868,10 +1886,12 @@ mod tests {
             .unwrap();
         let report = linter.lint(&manifest);
         assert!(!report.passed());
-        assert!(report
-            .findings
-            .iter()
-            .any(|f| f.rule_id == "sdk.lint.capability_not_in_policy"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "sdk.lint.capability_not_in_policy")
+        );
     }
 
     #[test]
@@ -1881,10 +1901,12 @@ mod tests {
         let manifest = minimal_manifest();
         let report = linter.lint(&manifest);
         assert!(!report.passed());
-        assert!(report
-            .findings
-            .iter()
-            .any(|f| f.rule_id == "sdk.lint.missing_required_signature"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "sdk.lint.missing_required_signature")
+        );
     }
 
     #[test]
@@ -1905,10 +1927,12 @@ mod tests {
             .unwrap();
         let report = linter.lint(&manifest);
         assert!(!report.passed());
-        assert!(report
-            .findings
-            .iter()
-            .any(|f| f.rule_id == "sdk.lint.package_id_invalid_chars"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "sdk.lint.package_id_invalid_chars")
+        );
     }
 
     // ---- CertificationPipeline tests ----
@@ -1944,11 +1968,12 @@ mod tests {
         let report = pipeline.certify(&manifest, &payload);
         assert!(!report.passed());
         assert_eq!(report.verdict, CertificationVerdict::Rejected);
-        assert!(report
-            .phases
-            .iter()
-            .any(|p| p.phase == CertificationPhase::DigestVerification
-                && !p.verdict.is_pass()));
+        assert!(
+            report
+                .phases
+                .iter()
+                .any(|p| p.phase == CertificationPhase::DigestVerification && !p.verdict.is_pass())
+        );
     }
 
     #[test]
@@ -2037,13 +2062,18 @@ mod tests {
             .build_with_digest(&payload)
             .unwrap();
 
-        let report = sim.register(&manifest, &payload, default_host_config()).unwrap();
+        let report = sim
+            .register(&manifest, &payload, default_host_config())
+            .unwrap();
         assert!(report.passed());
         assert_eq!(sim.connector_count(), 1);
 
         sim.tick(100);
         sim.start("sim-connector").unwrap();
-        assert_eq!(sim.phase("sim-connector").unwrap(), ConnectorLifecyclePhase::Running);
+        assert_eq!(
+            sim.phase("sim-connector").unwrap(),
+            ConnectorLifecyclePhase::Running
+        );
     }
 
     #[test]
@@ -2057,17 +2087,24 @@ mod tests {
             .build_with_digest(&payload)
             .unwrap();
 
-        sim.register(&manifest, &payload, default_host_config()).unwrap();
+        sim.register(&manifest, &payload, default_host_config())
+            .unwrap();
         sim.tick(50);
         sim.start("lifecycle").unwrap();
-        assert_eq!(sim.phase("lifecycle").unwrap(), ConnectorLifecyclePhase::Running);
+        assert_eq!(
+            sim.phase("lifecycle").unwrap(),
+            ConnectorLifecyclePhase::Running
+        );
 
         sim.tick(1000);
         sim.heartbeat("lifecycle").unwrap();
 
         sim.tick(500);
         sim.stop("lifecycle").unwrap();
-        assert_eq!(sim.phase("lifecycle").unwrap(), ConnectorLifecyclePhase::Stopped);
+        assert_eq!(
+            sim.phase("lifecycle").unwrap(),
+            ConnectorLifecyclePhase::Stopped
+        );
     }
 
     #[test]
@@ -2083,7 +2120,9 @@ mod tests {
             .build_with_digest(&payload)
             .unwrap();
 
-        let report = sim.register(&manifest, &payload, default_host_config()).unwrap();
+        let report = sim
+            .register(&manifest, &payload, default_host_config())
+            .unwrap();
         assert!(!report.passed());
         assert_eq!(sim.connector_count(), 0);
     }
@@ -2099,15 +2138,28 @@ mod tests {
             .build_with_digest(&payload)
             .unwrap();
 
-        sim.register(&manifest, &payload, default_host_config()).unwrap();
+        sim.register(&manifest, &payload, default_host_config())
+            .unwrap();
         sim.start("logged").unwrap();
         sim.heartbeat("logged").unwrap();
 
         let events = sim.event_log();
         assert!(events.len() >= 3);
-        assert!(events.iter().any(|e| e.event_type == SimulationEventType::Registered));
-        assert!(events.iter().any(|e| e.event_type == SimulationEventType::Started));
-        assert!(events.iter().any(|e| e.event_type == SimulationEventType::Heartbeat));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == SimulationEventType::Registered)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == SimulationEventType::Started)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == SimulationEventType::Heartbeat)
+        );
     }
 
     #[test]
@@ -2129,7 +2181,8 @@ mod tests {
             .build_with_digest(&payload)
             .unwrap();
 
-        sim.register(&manifest, &payload, default_host_config()).unwrap();
+        sim.register(&manifest, &payload, default_host_config())
+            .unwrap();
 
         let telem = sim.certification_telemetry();
         assert_eq!(telem.total_runs, 1);

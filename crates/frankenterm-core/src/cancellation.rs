@@ -334,7 +334,11 @@ impl CancellationToken {
     /// Propagate cancellation to all registered children.
     fn propagate_to_children(&self) {
         let children = {
-            self.inner.children.lock().expect("lock not poisoned").clone()
+            self.inner
+                .children
+                .lock()
+                .expect("lock not poisoned")
+                .clone()
         };
         for child in &children {
             Self::propagate_inner(child, &self.inner.scope_id);
@@ -352,9 +356,7 @@ impl CancellationToken {
                     parent_id: parent_id.clone(),
                 });
             inner.generation.fetch_add(1, Ordering::Relaxed);
-            let children = {
-                inner.children.lock().expect("lock not poisoned").clone()
-            };
+            let children = { inner.children.lock().expect("lock not poisoned").clone() };
             for child in &children {
                 Self::propagate_inner(child, &inner.scope_id);
             }

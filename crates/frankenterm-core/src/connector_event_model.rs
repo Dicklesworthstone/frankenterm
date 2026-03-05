@@ -15,7 +15,9 @@ use crate::connector_host_runtime::{
     ConnectorCapability, ConnectorFailureClass, ConnectorLifecyclePhase,
 };
 use crate::connector_inbound_bridge::ConnectorSignalKind;
-use crate::connector_outbound_bridge::{ConnectorActionKind, OutboundEventSource, OutboundSeverity};
+use crate::connector_outbound_bridge::{
+    ConnectorActionKind, OutboundEventSource, OutboundSeverity,
+};
 
 // =============================================================================
 // Schema version
@@ -243,11 +245,7 @@ impl CanonicalConnectorEvent {
 
     /// Set inbound signal fields.
     #[must_use]
-    pub fn with_signal(
-        mut self,
-        kind: ConnectorSignalKind,
-        sub_type: Option<String>,
-    ) -> Self {
+    pub fn with_signal(mut self, kind: ConnectorSignalKind, sub_type: Option<String>) -> Self {
         self.signal_kind = Some(kind);
         self.signal_sub_type = sub_type;
         self
@@ -255,11 +253,7 @@ impl CanonicalConnectorEvent {
 
     /// Set outbound action fields.
     #[must_use]
-    pub fn with_action(
-        mut self,
-        source: OutboundEventSource,
-        kind: ConnectorActionKind,
-    ) -> Self {
+    pub fn with_action(mut self, source: OutboundEventSource, kind: ConnectorActionKind) -> Self {
         self.event_source = Some(source);
         self.action_kind = Some(kind);
         self
@@ -344,7 +338,10 @@ impl CanonicalConnectorEvent {
 /// Generate a unique event ID based on timestamp and random suffix.
 fn generate_event_id(timestamp_ms: u64) -> String {
     // Simple deterministic-ish ID for reproducibility in tests
-    format!("evt-{timestamp_ms}-{:04x}", timestamp_ms.wrapping_mul(2654435761) as u16)
+    format!(
+        "evt-{timestamp_ms}-{:04x}",
+        timestamp_ms.wrapping_mul(2654435761) as u16
+    )
 }
 
 // =============================================================================
@@ -553,12 +550,10 @@ impl SchemaEvolutionRegistry {
                 f.required
                     && f.introduced_in.major <= version.major
                     && f.introduced_in.minor <= version.minor
-                    && f.deprecated_in
-                        .as_ref()
-                        .map_or(true, |d| {
-                            d.major > version.major
-                                || (d.major == version.major && d.minor > version.minor)
-                        })
+                    && f.deprecated_in.as_ref().map_or(true, |d| {
+                        d.major > version.major
+                            || (d.major == version.major && d.minor > version.minor)
+                    })
             })
             .collect()
     }
@@ -569,8 +564,7 @@ impl SchemaEvolutionRegistry {
         self.fields
             .iter()
             .filter(|f| {
-                f.introduced_in.major <= version.major
-                    && f.introduced_in.minor <= version.minor
+                f.introduced_in.major <= version.major && f.introduced_in.minor <= version.minor
             })
             .collect()
     }
@@ -761,10 +755,7 @@ impl IndexingContract {
                 "capability".to_string(),
                 "connector_id".to_string(),
             ],
-            sortable_fields: vec![
-                "timestamp_ms".to_string(),
-                "severity".to_string(),
-            ],
+            sortable_fields: vec!["timestamp_ms".to_string(), "severity".to_string()],
             facet_fields: vec![
                 "direction".to_string(),
                 "severity".to_string(),
@@ -975,7 +966,10 @@ mod tests {
         assert_eq!(event.severity, CanonicalSeverity::Warning);
         assert_eq!(event.signal_kind, Some(ConnectorSignalKind::Webhook));
         assert_eq!(event.signal_sub_type.as_deref(), Some("push"));
-        assert_eq!(event.metadata.get("repo").map(|s| s.as_str()), Some("frankenterm"));
+        assert_eq!(
+            event.metadata.get("repo").map(|s| s.as_str()),
+            Some("frankenterm")
+        );
     }
 
     #[test]
@@ -1031,7 +1025,10 @@ mod tests {
             "outbound.notify",
             serde_json::json!({"channel": "#alerts"}),
         )
-        .with_action(OutboundEventSource::PatternDetected, ConnectorActionKind::Notify)
+        .with_action(
+            OutboundEventSource::PatternDetected,
+            ConnectorActionKind::Notify,
+        )
         .with_severity(CanonicalSeverity::Warning)
         .with_event_id("evt-test")
         .with_correlation_id("corr-test")
@@ -1252,8 +1249,7 @@ mod tests {
         );
         assert_eq!(event.event_type, "lifecycle.running");
 
-        let failed =
-            from_lifecycle_transition("bad-conn", ConnectorLifecyclePhase::Failed, 8000);
+        let failed = from_lifecycle_transition("bad-conn", ConnectorLifecyclePhase::Failed, 8000);
         assert_eq!(failed.severity, CanonicalSeverity::Critical);
         assert!(failed.is_failure());
     }
@@ -1318,6 +1314,9 @@ mod tests {
         )
         .with_connector_name("GitHub Events Connector");
 
-        assert_eq!(event.connector_name.as_deref(), Some("GitHub Events Connector"));
+        assert_eq!(
+            event.connector_name.as_deref(),
+            Some("GitHub Events Connector")
+        );
     }
 }

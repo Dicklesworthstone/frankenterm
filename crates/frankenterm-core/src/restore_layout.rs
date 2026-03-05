@@ -675,10 +675,7 @@ mod tests {
                         TabSnapshot {
                             tab_id: 1,
                             title: None,
-                            pane_tree: vsplit(vec![
-                                (0.5, leaf(2, None)),
-                                (0.5, leaf(3, None)),
-                            ]),
+                            pane_tree: vsplit(vec![(0.5, leaf(2, None)), (0.5, leaf(3, None))]),
                             active_pane_id: Some(3),
                         },
                     ],
@@ -759,10 +756,7 @@ mod tests {
                     tabs: vec![TabSnapshot {
                         tab_id: 0,
                         title: None,
-                        pane_tree: vsplit(vec![
-                            (0.5, leaf(1, None)),
-                            (0.5, active_leaf(2)),
-                        ]),
+                        pane_tree: vsplit(vec![(0.5, leaf(1, None)), (0.5, active_leaf(2))]),
                         active_pane_id: Some(2),
                     }],
                     active_tab_index: None,

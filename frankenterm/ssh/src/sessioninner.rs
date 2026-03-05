@@ -3,17 +3,17 @@ use crate::config::ConfigMap;
 use crate::dirwrap::DirWrap;
 use crate::filewrap::FileWrap;
 use crate::pty::*;
-use crate::runtime::channel::{Receiver, Sender, TryRecvError, bounded};
+use crate::runtime::channel::{bounded, Receiver, Sender, TryRecvError};
 use crate::session::{Exec, ExecResult, SessionEvent, SessionRequest, SignalChannel};
 use crate::sessionwrap::SessionWrap;
 use crate::sftp::dir::{Dir, DirId, DirRequest};
 use crate::sftp::file::{File, FileId, FileRequest};
 use crate::sftp::{OpenWithMode, SftpChannelResult, SftpRequest};
 use crate::sftpwrap::SftpWrap;
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use camino::Utf8PathBuf;
 use filedescriptor::{
-    AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT, poll, pollfd, socketpair,
+    poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT,
 };
 use portable_pty::ExitStatus;
 use socket2::{Domain, Socket, Type};

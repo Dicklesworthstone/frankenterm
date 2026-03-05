@@ -462,14 +462,15 @@ fn retry_with_circuit_breaker_skips_when_open() {
         let attempt_count = Arc::new(AtomicU32::new(0));
         let ac = attempt_count.clone();
 
-        let result: frankenterm_core::Result<i32> = with_retry_and_circuit(&policy, &mut cb, || {
-            let ac = ac.clone();
-            async move {
-                ac.fetch_add(1, Ordering::SeqCst);
-                Ok(42)
-            }
-        })
-        .await;
+        let result: frankenterm_core::Result<i32> =
+            with_retry_and_circuit(&policy, &mut cb, || {
+                let ac = ac.clone();
+                async move {
+                    ac.fetch_add(1, Ordering::SeqCst);
+                    Ok(42)
+                }
+            })
+            .await;
 
         // Should fail without executing the operation
         assert!(result.is_err());

@@ -335,9 +335,9 @@ impl<T: Ord + Clone + Hash> OrSet<T> {
     /// Check if element is in the set (has at least one tag not in tombstones).
     #[must_use]
     pub fn contains(&self, item: &T) -> bool {
-        self.entries.get(item).is_some_and(|tags| {
-            tags.iter().any(|tag| !self.tombstones.contains(tag))
-        })
+        self.entries
+            .get(item)
+            .is_some_and(|tags| tags.iter().any(|tag| !self.tombstones.contains(tag)))
     }
 
     /// Number of distinct elements.
@@ -378,7 +378,7 @@ impl<T: Ord + Clone + Hash> OrSet<T> {
                 local_tags.insert(tag.clone());
             }
         }
-        
+
         // Remove tombstoned tags from entries to keep maps small
         for tags in self.entries.values_mut() {
             tags.retain(|tag| !self.tombstones.contains(tag));

@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::io::Seek;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, LazyLock, MutexGuard};
 use std::time::{Duration, Instant};
 use termwiz::color::RgbColor;
@@ -308,14 +308,13 @@ impl FrameDecoder {
             }
         };
 
-        let frame = frames
-            .next()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Unable to decode image data. Either it is corrupt, or \
+        let frame = frames.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unable to decode image data. Either it is corrupt, or \
                     the Image format is not fully supported by \
-                    https://github.com/image-rs/image/blob/master/README.md#supported-image-formats")
-            })?;
+                    https://github.com/image-rs/image/blob/master/README.md#supported-image-formats"
+            )
+        })?;
         let frame = frame.context("first frame result")?;
 
         let mut decoded_frames = vec![];
@@ -1051,7 +1050,10 @@ impl GlyphCache {
                         // a mismatched size is a panic in a layer where we
                         // cannot handle the error case.
                         if data.len() != expected_byte_size {
-                            report_frame_error(format!("frame data is corrupted: expected size {expected_byte_size} but have {}", data.len()));
+                            report_frame_error(format!(
+                                "frame data is corrupted: expected size {expected_byte_size} but have {}",
+                                data.len()
+                            ));
                             vec![0u8; expected_byte_size]
                         } else {
                             data

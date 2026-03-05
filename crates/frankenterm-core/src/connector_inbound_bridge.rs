@@ -545,7 +545,10 @@ impl ConnectorInboundBridge {
     fn map_to_detection(signal: &ConnectorSignal, rule_id: &str) -> Detection {
         let event_type = format!(
             "connector.{}",
-            signal.sub_type.as_deref().unwrap_or(signal.signal_kind.as_str())
+            signal
+                .sub_type
+                .as_deref()
+                .unwrap_or(signal.signal_kind.as_str())
         );
 
         // Build extracted data with standard fields
@@ -638,8 +641,7 @@ mod tests {
 
     #[test]
     fn signal_rule_id_with_sub_type() {
-        let sig =
-            test_signal("github", ConnectorSignalKind::Webhook).with_sub_type("push");
+        let sig = test_signal("github", ConnectorSignalKind::Webhook).with_sub_type("push");
         assert_eq!(sig.rule_id(), "connector.github:webhook.push");
     }
 
@@ -810,8 +812,7 @@ mod tests {
         let _sub = bus.subscribe_detections();
         let mut bridge = default_bridge(bus);
 
-        let sig = test_signal("github", ConnectorSignalKind::Webhook)
-            .with_timestamp_ms(1000);
+        let sig = test_signal("github", ConnectorSignalKind::Webhook).with_timestamp_ms(1000);
 
         let r1 = bridge.route_signal(&sig).unwrap();
         assert!(!r1.deduplicated);
@@ -854,18 +855,14 @@ mod tests {
         let bus = make_bus();
         let _sub = bus.subscribe_detections();
         let mut overrides = HashMap::new();
-        overrides.insert(
-            "github.webhook".to_string(),
-            "custom.gh_event".to_string(),
-        );
+        overrides.insert("github.webhook".to_string(), "custom.gh_event".to_string());
         let config = ConnectorInboundBridgeConfig {
             rule_id_overrides: overrides,
             ..Default::default()
         };
         let mut bridge = ConnectorInboundBridge::new(bus, config);
 
-        let sig = test_signal("github", ConnectorSignalKind::Webhook)
-            .with_sub_type("push");
+        let sig = test_signal("github", ConnectorSignalKind::Webhook).with_sub_type("push");
 
         let result = bridge.route_signal(&sig).unwrap();
         assert_eq!(result.rule_id, "custom.gh_event.push");
@@ -877,8 +874,7 @@ mod tests {
         let mut sub = bus.subscribe_detections();
         let mut bridge = default_bridge(bus);
 
-        let sig = test_signal("x", ConnectorSignalKind::Webhook)
-            .with_timestamp_ms(1000);
+        let sig = test_signal("x", ConnectorSignalKind::Webhook).with_timestamp_ms(1000);
         bridge.route_signal(&sig).unwrap();
 
         let event = sub.try_recv().unwrap().unwrap();
@@ -1122,12 +1118,8 @@ mod tests {
         let _sub = bus.subscribe_detections();
         let mut bridge = default_bridge(bus);
 
-        let sig = ConnectorSignal::new(
-            "x",
-            ConnectorSignalKind::Poll,
-            serde_json::json!({}),
-        )
-        .with_timestamp_ms(1000);
+        let sig = ConnectorSignal::new("x", ConnectorSignalKind::Poll, serde_json::json!({}))
+            .with_timestamp_ms(1000);
 
         let result = bridge.route_signal(&sig).unwrap();
         assert!(!result.deduplicated);

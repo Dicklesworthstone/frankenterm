@@ -459,8 +459,11 @@ mod tests {
     fn pipeline_sends_when_gate_allows() {
         run_async_test(async {
             let filter = EventFilter::allow_all();
-            let gate =
-                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let gate = NotificationGate::from_config(
+                filter,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
             let sent = Arc::new(Mutex::new(Vec::new()));
             let sender = MockSender::new("mock", Arc::clone(&sent));
             let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
@@ -482,8 +485,11 @@ mod tests {
             let exclude = vec!["core.*".to_string()];
             let agent_types: Vec<String> = Vec::new();
             let filter = EventFilter::from_config(&include, &exclude, None, &agent_types);
-            let gate =
-                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let gate = NotificationGate::from_config(
+                filter,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
             let sent = Arc::new(Mutex::new(Vec::new()));
             let sender = MockSender::new("mock", Arc::clone(&sent));
             let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(sender)]);
@@ -757,8 +763,11 @@ mod tests {
     fn pipeline_fans_out_to_multiple_senders() {
         run_async_test(async {
             let filter = EventFilter::allow_all();
-            let gate =
-                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let gate = NotificationGate::from_config(
+                filter,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
 
             let sent_a = Arc::new(Mutex::new(Vec::new()));
             let sent_b = Arc::new(Mutex::new(Vec::new()));
@@ -800,8 +809,11 @@ mod tests {
     fn pipeline_empty_senders_still_returns_outcome() {
         run_async_test(async {
             let filter = EventFilter::allow_all();
-            let gate =
-                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let gate = NotificationGate::from_config(
+                filter,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
             let mut pipeline = NotificationPipeline::new(gate, vec![]);
 
             let outcome = pipeline
@@ -852,8 +864,11 @@ mod tests {
                 .unwrap();
 
             let filter = EventFilter::allow_all();
-            let gate =
-                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let gate = NotificationGate::from_config(
+                filter,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
             let sent = Arc::new(Mutex::new(Vec::new()));
             let sender = MockSender::new("mock", Arc::clone(&sent));
             let storage_arc = Arc::new(crate::runtime_compat::RwLock::new(storage));
@@ -906,8 +921,11 @@ mod tests {
     fn pipeline_handles_sender_failure_gracefully() {
         run_async_test(async {
             let filter = EventFilter::allow_all();
-            let gate =
-                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let gate = NotificationGate::from_config(
+                filter,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
             let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(FailingSender)]);
 
             let outcome = pipeline
@@ -928,12 +946,17 @@ mod tests {
     fn pipeline_partial_failure_still_delivers_to_healthy_senders() {
         run_async_test(async {
             let filter = EventFilter::allow_all();
-            let gate =
-                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let gate = NotificationGate::from_config(
+                filter,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
             let sent = Arc::new(Mutex::new(Vec::new()));
             let good_sender = MockSender::new("good", Arc::clone(&sent));
-            let mut pipeline =
-                NotificationPipeline::new(gate, vec![Box::new(FailingSender), Box::new(good_sender)]);
+            let mut pipeline = NotificationPipeline::new(
+                gate,
+                vec![Box::new(FailingSender), Box::new(good_sender)],
+            );
 
             let outcome = pipeline
                 .handle_detection(&test_detection(), 1, None, None)
@@ -957,8 +980,11 @@ mod tests {
     fn failed_delivery_error_does_not_contain_payload() {
         run_async_test(async {
             let filter = EventFilter::allow_all();
-            let gate =
-                NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
+            let gate = NotificationGate::from_config(
+                filter,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
             let mut pipeline = NotificationPipeline::new(gate, vec![Box::new(FailingSender)]);
 
             let outcome = pipeline

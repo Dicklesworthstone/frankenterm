@@ -1,4 +1,4 @@
-use config::{configuration, ConfigHandle};
+use config::{ConfigHandle, configuration};
 use governor::clock::{Clock, DefaultClock};
 use governor::{NegativeMultiDecision, Quota, RateLimiter as Limiter};
 use std::num::NonZeroU32;

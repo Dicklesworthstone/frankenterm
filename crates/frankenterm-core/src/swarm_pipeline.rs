@@ -985,28 +985,27 @@ impl PipelineExecutor {
                     execution.step_outcomes.insert(step_idx, outcome);
                     completed_labels.insert(step.label.clone());
                     continue;
-                } else {
-                    execution.total_failures += 1;
-                    let outcome = StepOutcome {
-                        step_index: step_idx,
-                        step_label: step.label.clone(),
-                        status: StepStatus::Failed {
-                            error: format!("missing required precondition: {missing_key}"),
-                        },
-                        attempts: 1,
-                        duration_ms: 0,
-                        recovery_attempts: 0,
-                        compensations_run: 0,
-                    };
-                    execution.step_outcomes.insert(step_idx, outcome);
-                    execution.status = PipelineStatus::Failed {
-                        reason: format!(
-                            "step '{}' failed: missing precondition '{}'",
-                            step.label, missing_key
-                        ),
-                    };
-                    break;
                 }
+                execution.total_failures += 1;
+                let outcome = StepOutcome {
+                    step_index: step_idx,
+                    step_label: step.label.clone(),
+                    status: StepStatus::Failed {
+                        error: format!("missing required precondition: {missing_key}"),
+                    },
+                    attempts: 1,
+                    duration_ms: 0,
+                    recovery_attempts: 0,
+                    compensations_run: 0,
+                };
+                execution.step_outcomes.insert(step_idx, outcome);
+                execution.status = PipelineStatus::Failed {
+                    reason: format!(
+                        "step '{}' failed: missing precondition '{}'",
+                        step.label, missing_key
+                    ),
+                };
+                break;
             }
 
             // Fire PreStep hooks.

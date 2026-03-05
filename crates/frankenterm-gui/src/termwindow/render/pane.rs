@@ -239,12 +239,7 @@ impl crate::TermWindow {
                         background_rect.size.height,
                     );
                     // Top edge
-                    self.filled_rectangle(
-                        layers,
-                        2,
-                        euclid::rect(bx, by, bw, border_w),
-                        color,
-                    )?;
+                    self.filled_rectangle(layers, 2, euclid::rect(bx, by, bw, border_w), color)?;
                     // Bottom edge
                     self.filled_rectangle(
                         layers,
@@ -253,12 +248,7 @@ impl crate::TermWindow {
                         color,
                     )?;
                     // Left edge
-                    self.filled_rectangle(
-                        layers,
-                        2,
-                        euclid::rect(bx, by, border_w, bh),
-                        color,
-                    )?;
+                    self.filled_rectangle(layers, 2, euclid::rect(bx, by, border_w, bh), color)?;
                     // Right edge
                     self.filled_rectangle(
                         layers,

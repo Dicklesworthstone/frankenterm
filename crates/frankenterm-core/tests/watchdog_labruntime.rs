@@ -11,13 +11,10 @@
 
 mod common;
 
-use frankenterm_core::watchdog::{
-    HealthStatus, MuxWatchdog, MuxWatchdogConfig,
-};
 use frankenterm_core::circuit_breaker::CircuitBreakerStatus;
+use frankenterm_core::watchdog::{HealthStatus, MuxWatchdog, MuxWatchdogConfig};
 use frankenterm_core::wezterm::{
-    MoveDirection, PaneInfo, SplitDirection,
-    WeztermFuture, WeztermHandle, WeztermInterface,
+    MoveDirection, PaneInfo, SplitDirection, WeztermFuture, WeztermHandle, WeztermInterface,
 };
 
 use common::fixtures::RuntimeFixture;

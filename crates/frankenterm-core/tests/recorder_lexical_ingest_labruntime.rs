@@ -17,9 +17,9 @@ use frankenterm_core::recorder_storage::{
     RecorderSourceDescriptor, RecorderStorage,
 };
 use frankenterm_core::recording::{
-    RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
-    RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
-    RECORDER_EVENT_SCHEMA_VERSION_V1,
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
+    RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind,
+    RecorderTextEncoding,
 };
 use frankenterm_core::tantivy_ingest::{
     IncrementalIndexer, IndexerConfig, LEXICAL_INDEXER_CONSUMER,

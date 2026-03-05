@@ -12,11 +12,9 @@ use frankenterm_core::connector_host_runtime::{
     ConnectorCapability, ConnectorCapabilityEnvelope, ConnectorSandboxZone,
 };
 use frankenterm_core::connector_outbound_bridge::{
-    ConnectorActionKind, ConnectorOutboundBridge,
-    ConnectorOutboundBridgeConfig,
-    OutboundDeduplicator, OutboundEvent, OutboundEventSource,
-    OutboundRoutingRule, OutboundSandboxChecker, OutboundSeverity,
-    OutboundBridgeTelemetrySnapshot, SandboxCheckResult,
+    ConnectorActionKind, ConnectorOutboundBridge, ConnectorOutboundBridgeConfig,
+    OutboundBridgeTelemetrySnapshot, OutboundDeduplicator, OutboundEvent, OutboundEventSource,
+    OutboundRoutingRule, OutboundSandboxChecker, OutboundSeverity, SandboxCheckResult,
 };
 
 // =============================================================================

@@ -1796,10 +1796,7 @@ mod tests {
         ];
         for input in &garbage_inputs {
             let result = serde_json::from_str::<WireEvent>(input);
-            assert!(
-                result.is_err(),
-                "expected error for input: {input}"
-            );
+            assert!(result.is_err(), "expected error for input: {input}");
         }
     }
 
@@ -1864,9 +1861,7 @@ mod tests {
                     Ok(Some(_)) => received += 1,
                     Ok(None) => break,
                     Err(_) => {
-                        panic!(
-                            "timeout: received {received}/{event_count} events"
-                        );
+                        panic!("timeout: received {received}/{event_count} events");
                     }
                 }
             }
