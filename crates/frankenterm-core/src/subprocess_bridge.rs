@@ -94,6 +94,12 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
             cmd.env(k, v);
         }
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
         let mut child = cmd.spawn().map_err(|err| self.map_spawn_error(err))?;
         let started = Instant::now();
 
@@ -103,14 +109,14 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
         let (tx, rx) = std::sync::mpsc::channel();
         let tx_err = tx.clone();
 
-        std::thread::spawn(move || {
+        let stdout_handle = std::thread::spawn(move || {
             use std::io::Read;
             let mut buf = Vec::new();
             let _ = stdout_stream.read_to_end(&mut buf);
             let _ = tx.send((true, buf));
         });
 
-        std::thread::spawn(move || {
+        let stderr_handle = std::thread::spawn(move || {
             use std::io::Read;
             let mut buf = Vec::new();
             let _ = stderr_stream.read_to_end(&mut buf);
@@ -119,16 +125,57 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
 
         let mut stdout_data = Vec::new();
         let mut stderr_data = Vec::new();
+        let mut pipes_closed = 0;
 
         loop {
+            if started.elapsed() >= self.timeout {
+                #[cfg(unix)]
+                {
+                    let _ = Command::new("kill").arg("-9").arg(format!("-{}", child.id())).status();
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                let err = BridgeError::Timeout(self.timeout);
+                warn!(bridge = %self.binary_name, error = %err, "subprocess bridge timeout");
+                return Err(err);
+            }
+
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    for _ in 0..2 {
-                        if let Ok((is_stdout, data)) = rx.recv() {
-                            if is_stdout {
-                                stdout_data = data;
-                            } else {
-                                stderr_data = data;
+                    while pipes_closed < 2 {
+                        let remaining = self.timeout.saturating_sub(started.elapsed());
+                        if remaining.is_zero() {
+                            #[cfg(unix)]
+                            {
+                                let _ = Command::new("kill").arg("-9").arg(format!("-{}", child.id())).status();
+                            }
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let err = BridgeError::Timeout(self.timeout);
+                            warn!(bridge = %self.binary_name, error = %err, "subprocess bridge timeout waiting for pipe close");
+                            return Err(err);
+                        }
+                        match rx.recv_timeout(remaining) {
+                            Ok((is_stdout, data)) => {
+                                if is_stdout {
+                                    stdout_data = data;
+                                } else {
+                                    stderr_data = data;
+                                }
+                                pipes_closed += 1;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                #[cfg(unix)]
+                                {
+                                    let _ = Command::new("kill").arg("-9").arg(format!("-{}", child.id())).status();
+                                }
+                                let _ = child.kill(); // Kill any lingering daemon descendants in same process group
+                                let err = BridgeError::Timeout(self.timeout);
+                                warn!(bridge = %self.binary_name, error = %err, "subprocess bridge timeout waiting for pipe close");
+                                return Err(err);
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                pipes_closed += 1;
                             }
                         }
                     }
@@ -144,11 +191,13 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
                         };
                         let err = BridgeError::ExitCode(code, truncate_for_error(&detail));
                         warn!(bridge = %self.binary_name, error = %err, "subprocess bridge command failed");
+                        let _ = stdout_handle.join();
+                        let _ = stderr_handle.join();
                         return Err(err);
                     }
 
                     let stdout = String::from_utf8_lossy(&stdout_data).to_string();
-                    return serde_json::from_str(&stdout).map_err(|err| {
+                    let res = serde_json::from_str(&stdout).map_err(|err| {
                         let parse_err = BridgeError::ParseError(format!(
                             "{} (stdout preview: {})",
                             err,
@@ -157,15 +206,11 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
                         warn!(bridge = %self.binary_name, error = %parse_err, "subprocess bridge parse failure");
                         parse_err
                     });
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
+                    return res;
                 }
                 Ok(None) => {
-                    if started.elapsed() >= self.timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let err = BridgeError::Timeout(self.timeout);
-                        warn!(bridge = %self.binary_name, error = %err, "subprocess bridge timeout");
-                        return Err(err);
-                    }
                     std::thread::sleep(POLL_INTERVAL);
                 }
                 Err(err) => {
