@@ -104,6 +104,12 @@ fn build_list_panes_response(config: MockServerConfig) -> ListPanesResponse {
     }
 }
 
+fn approx_list_payload_bytes(config: MockServerConfig) -> usize {
+    // Rough proxy used only for benchmark throughput labels.
+    // Includes title bytes plus a small per-entry overhead for map framing.
+    config.list_window_titles * (config.list_title_len + 16)
+}
+
 fn build_render_changes_response(pane_id: usize, seqno: usize) -> GetPaneRenderChangesResponse {
     GetPaneRenderChangesResponse {
         pane_id,
@@ -431,24 +437,24 @@ fn bench_pdu_read_decode(c: &mut Criterion) {
 
     let cases = [
         (
-            "small",
+            "approx_64B",
             MockServerConfig {
                 list_window_titles: 1,
                 list_title_len: 16,
             },
         ),
         (
-            "medium",
+            "approx_1KB",
             MockServerConfig {
-                list_window_titles: 64,
+                list_window_titles: 16,
                 list_title_len: 32,
             },
         ),
         (
-            "large",
+            "approx_64KB",
             MockServerConfig {
                 list_window_titles: 512,
-                list_title_len: 64,
+                list_title_len: 112,
             },
         ),
     ];
@@ -459,7 +465,7 @@ fn bench_pdu_read_decode(c: &mut Criterion) {
         let direct_client = Arc::new(Mutex::new(rt.block_on(connect_client(&socket))));
         let tokio_baseline = Arc::new(Mutex::new(rt.block_on(connect_tokio_baseline(&socket))));
 
-        group.throughput(Throughput::Elements(cfg.list_window_titles as u64));
+        group.throughput(Throughput::Bytes(approx_list_payload_bytes(cfg) as u64));
         group.bench_with_input(
             BenchmarkId::new("direct_client_list_panes", label),
             &label,

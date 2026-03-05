@@ -901,7 +901,7 @@ pub struct ObservationRuntime {
     /// WezTerm interface handle (real or mock)
     wezterm_handle: WeztermHandle,
     /// Storage handle for persistence (wrapped for async sharing)
-    storage: Arc<Mutex<StorageHandle>>,
+    storage: StorageHandle,
     /// Pattern detection engine
     pattern_engine: Arc<RwLock<PatternEngine>>,
     /// Pane registry for discovery and tracking
@@ -970,7 +970,7 @@ impl ObservationRuntime {
         Self {
             config,
             wezterm_handle: wezterm_handle_with_timeout(5),
-            storage: Arc::new(Mutex::new(storage)),
+            storage: storage,
             pattern_engine,
             registry: Arc::new(RwLock::new(registry)),
             cursors: Arc::new(RwLock::new(HashMap::new())),
@@ -1098,12 +1098,7 @@ impl ObservationRuntime {
             if let Some(ref snap_config) = self.snapshot_config {
                 if snap_config.enabled {
                     let db_path = {
-                        let (storage_guard, lock_held_since) =
-                            lock_storage_with_profile(&self.storage, &self.metrics).await;
-                        let db_path = Arc::new(storage_guard.db_path().to_string());
-                        drop(storage_guard);
-                        self.metrics
-                            .record_storage_lock_hold(lock_held_since.elapsed());
+                                                let db_path = Arc::new(self.storage.db_path().to_string());
                         db_path
                     };
                     let engine = Arc::new(crate::snapshot_engine::SnapshotEngine::new(
@@ -1164,7 +1159,7 @@ impl ObservationRuntime {
             snapshot_triggers,
             snapshot_shutdown: snapshot_shutdown_tx,
             shutdown_flag: Arc::clone(&self.shutdown_flag),
-            storage: Arc::clone(&self.storage),
+            storage: self.storage.clone(),
             metrics: Arc::clone(&self.metrics),
             registry: Arc::clone(&self.registry),
             cursors: Arc::clone(&self.cursors),
@@ -1368,19 +1363,16 @@ impl ObservationRuntime {
                         let cutoff_window_ms = cutoff_days.saturating_mul(24 * 60 * 60 * 1000);
                         let cutoff_ms = epoch_ms()
                             .saturating_sub(i64::try_from(cutoff_window_ms).unwrap_or(i64::MAX));
-                        let (storage_guard, lock_held_since) =
-                            lock_storage_with_profile(&storage, &metrics).await;
-                        if let Err(e) = storage_guard.retention_cleanup(cutoff_ms).await {
+                                                if let Err(e) = storage.retention_cleanup(cutoff_ms).await {
                             error!(error = %e, "Retention cleanup failed");
                         } else {
                             debug!("Retention cleanup completed");
                         }
                         // Also purge old audit actions
-                        if let Err(e) = storage_guard.purge_audit_actions_before(cutoff_ms).await {
+                        if let Err(e) = storage.purge_audit_actions_before(cutoff_ms).await {
                             error!(error = %e, "Audit purge failed");
                         }
-                        drop(storage_guard);
-                        metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                        
                     }
                     last_retention_check = now;
                 }
@@ -1390,9 +1382,7 @@ impl ObservationRuntime {
                     && now.duration_since(last_checkpoint)
                         >= Duration::from_secs(u64::from(checkpoint_secs))
                 {
-                    let (storage_guard, lock_held_since) =
-                        lock_storage_with_profile(&storage, &metrics).await;
-                    match storage_guard.checkpoint().await {
+                                        match storage.checkpoint().await {
                         Ok(result) => {
                             debug!(
                                 wal_pages = result.wal_pages,
@@ -1404,8 +1394,7 @@ impl ObservationRuntime {
                             error!(error = %e, "WAL checkpoint failed");
                         }
                     }
-                    drop(storage_guard);
-                    metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                    
                     last_checkpoint = now;
                 }
 
@@ -1435,9 +1424,7 @@ impl ObservationRuntime {
                     let mut vacuumed = false;
                     let mut vacuum_error = None::<String>;
 
-                    let (storage_guard, lock_held_since) =
-                        lock_storage_with_profile(&storage, &metrics).await;
-                    match storage_guard.database_page_stats().await {
+                                        match storage.database_page_stats().await {
                         Ok(stats) => {
                             page_count = stats.page_count;
                             free_pages = stats.free_pages;
@@ -1448,7 +1435,7 @@ impl ObservationRuntime {
                                 stats.free_pages,
                                 cache_gc_settings.vacuum_threshold,
                             ) {
-                                match storage_guard.vacuum().await {
+                                match storage.vacuum().await {
                                     Ok(()) => {
                                         vacuumed = true;
                                     }
@@ -1478,7 +1465,7 @@ impl ObservationRuntime {
                         "vacuum_threshold": cache_gc_settings.vacuum_threshold,
                         "vacuum_error": vacuum_error,
                     });
-                    let _ = storage_guard
+                    let _ = storage
                         .record_maintenance(MaintenanceRecord {
                             id: 0,
                             event_type: "cache_gc".to_string(),
@@ -1488,8 +1475,7 @@ impl ObservationRuntime {
                         })
                         .await;
 
-                    drop(storage_guard);
-                    metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                    
 
                     info!(
                         active_panes = active_panes.len(),
@@ -1540,13 +1526,10 @@ impl ObservationRuntime {
                     let capture_depth = capture_cap.saturating_sub(capture_tx.capacity());
 
                     let (write_depth, write_cap, db_writable) = {
-                        let (storage_guard, lock_held_since) =
-                            lock_storage_with_profile(&storage, &metrics).await;
-                        let wd = storage_guard.write_queue_depth();
-                        let wc = storage_guard.write_queue_capacity();
-                        let writable = storage_guard.is_writable().await;
-                        drop(storage_guard);
-                        metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                                                let wd = storage.write_queue_depth();
+                        let wc = storage.write_queue_capacity();
+                        let writable = self.storage.is_writable().await;
+                        
                         (wd, wc, writable)
                     };
 
@@ -1748,15 +1731,12 @@ impl ObservationRuntime {
 
                             // Check if pane exists in storage to recover stable UUID
                             let stable_uuid = {
-                                let (storage_guard, lock_held_since) =
-                                    lock_storage_with_profile(&storage, &metrics).await;
-                                let result =
-                                    storage_guard.get_pane(pane_id).await.unwrap_or_else(|e| {
+                                                                let result =
+                                    storage.get_pane(pane_id).await.unwrap_or_else(|e| {
                                         warn!(pane_id, error = %e, "Failed to check storage for existing pane");
                                         None
                                     });
-                                drop(storage_guard);
-                                metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                                
                                 result.and_then(|r| r.pane_uuid)
                             };
 
@@ -1777,23 +1757,17 @@ impl ObservationRuntime {
 
                             // Upsert pane in storage
                             let record = entry.to_pane_record();
-                            let (storage_guard, lock_held_since) =
-                                lock_storage_with_profile(&storage, &metrics).await;
-                            if let Err(e) = storage_guard.upsert_pane(record).await {
+                                                        if let Err(e) = storage.upsert_pane(record).await {
                                 error!(pane_id = pane_id, error = %e, "Failed to upsert pane");
                             }
-                            drop(storage_guard);
-                            metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                            
 
                             // Create cursor if observed
                             if entry.should_observe() {
                                 // Initialize cursor from storage to resume capture
-                                let (storage_guard, lock_held_since) =
-                                    lock_storage_with_profile(&storage, &metrics).await;
-                                let max_seq =
-                                    storage_guard.get_max_seq(pane_id).await.unwrap_or(None);
-                                drop(storage_guard);
-                                metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                                                                let max_seq =
+                                    storage.get_max_seq(pane_id).await.unwrap_or(None);
+                                
 
                                 let next_seq = max_seq.map_or(0, |s| s + 1);
 
@@ -2347,9 +2321,7 @@ impl ObservationRuntime {
                 let captured_seq = bounded_segment.seq;
 
                 // Persist the segment
-                let (storage_guard, lock_held_since) =
-                    lock_storage_with_profile(&storage, &metrics).await;
-                match persist_captured_segment(&storage_guard, &bounded_segment).await {
+                                match persist_captured_segment(&storage, &bounded_segment).await {
                     Ok(persisted) => {
                         // Check for sequence discontinuity and resync cursor if needed
                         if persisted.segment.seq != captured_seq {
@@ -2478,7 +2450,7 @@ impl ObservationRuntime {
                                     Some(persisted.segment.id),
                                 );
 
-                                match storage_guard.record_event(stored_event).await {
+                                match storage.record_event(stored_event).await {
                                     Ok(event_id) => {
                                         metrics.events_recorded.increment();
 
@@ -2516,8 +2488,7 @@ impl ObservationRuntime {
                         error!(pane_id = pane_id, error = %e, "Failed to persist segment");
                     }
                 }
-                drop(storage_guard);
-                metrics.record_storage_lock_hold(lock_held_since.elapsed());
+                
             }
         })
     }
@@ -2627,12 +2598,10 @@ async fn handle_native_event(
                 last_decision_at: Some(timestamp_ms),
             };
 
-            let storage_guard = storage.lock().await;
-            if let Err(err) = storage_guard.upsert_pane(record).await {
+            if let Err(err) = storage.upsert_pane(record).await {
                 warn!(pane_id, error = %err, "Failed to upsert pane from native event");
             }
-            let max_seq = storage_guard.get_max_seq(pane_id).await.unwrap_or(None);
-            drop(storage_guard);
+            let max_seq = storage.get_max_seq(pane_id).await.unwrap_or(None);
 
             if observed {
                 let next_seq = max_seq.map_or(0, |seq| seq + 1);
@@ -2720,7 +2689,7 @@ pub struct RuntimeHandle {
     /// Shutdown flag for signaling tasks
     pub shutdown_flag: Arc<AtomicBool>,
     /// Storage handle for external access
-    pub storage: Arc<Mutex<StorageHandle>>,
+    pub storage: StorageHandle,
     /// Runtime metrics
     pub metrics: Arc<RuntimeMetrics>,
     /// Pane registry
@@ -2830,12 +2799,8 @@ impl RuntimeHandle {
 
     /// Current write queue depth (pending commands for the storage writer thread).
     pub async fn write_queue_depth(&self) -> usize {
-        let (storage_guard, lock_held_since) =
-            lock_storage_with_profile(&self.storage, &self.metrics).await;
-        let depth = storage_guard.write_queue_depth();
-        drop(storage_guard);
-        self.metrics
-            .record_storage_lock_hold(lock_held_since.elapsed());
+                let depth = self.storage.write_queue_depth();
+        
         depth
     }
 
@@ -2918,14 +2883,10 @@ impl RuntimeHandle {
 
         // Flush storage
         {
-            let (storage_guard, lock_held_since) =
-                lock_storage_with_profile(&self.storage, &self.metrics).await;
-            if let Err(e) = storage_guard.shutdown().await {
+                        if let Err(e) = self.storage.shutdown().await {
                 warnings.push(format!("Storage shutdown error: {e}"));
             }
-            drop(storage_guard);
-            self.metrics
-                .record_storage_lock_hold(lock_held_since.elapsed());
+            
         }
 
         ShutdownSummary {
@@ -2999,14 +2960,10 @@ impl RuntimeHandle {
         let capture_cap = self.capture_queue_capacity();
 
         let (write_depth, write_cap, db_writable) = {
-            let (storage_guard, lock_held_since) =
-                lock_storage_with_profile(&self.storage, &self.metrics).await;
-            let wd = storage_guard.write_queue_depth();
-            let wc = storage_guard.write_queue_capacity();
-            let writable = storage_guard.is_writable().await;
-            drop(storage_guard);
-            self.metrics
-                .record_storage_lock_hold(lock_held_since.elapsed());
+                        let wd = storage.write_queue_depth();
+            let wc = storage.write_queue_capacity();
+            let writable = self.storage.is_writable().await;
+            
             (wd, wc, writable)
         };
 
@@ -3151,15 +3108,7 @@ impl RuntimeHandle {
     }
 }
 
-async fn lock_storage_with_profile<'a>(
-    storage: &'a Arc<Mutex<StorageHandle>>,
-    metrics: &RuntimeMetrics,
-) -> (MutexGuard<'a, StorageHandle>, Instant) {
-    let wait_started = Instant::now();
-    let guard = storage.lock().await;
-    metrics.record_storage_lock_wait(wait_started.elapsed());
-    (guard, Instant::now())
-}
+
 
 #[allow(clippy::cast_precision_loss)]
 fn bytes_to_mib(bytes: u64) -> f64 {
