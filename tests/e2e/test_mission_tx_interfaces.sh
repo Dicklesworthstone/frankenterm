@@ -8,13 +8,14 @@ mkdir -p "${LOG_DIR}"
 RUN_ID="$(date +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="mission_tx_interfaces"
 CORRELATION_ID="ft-1i2ge.8.8-${RUN_ID}"
-TARGET_DIR="target-rch-mission-tx-interfaces-${RUN_ID}"
-REMOTE_TMPDIR="${TARGET_DIR}"
+TARGET_DIR="${MISSION_TX_RCH_TARGET_DIR:-target-rch-mission-tx-interfaces}"
+REMOTE_TMPDIR="${MISSION_TX_RCH_REMOTE_TMPDIR:-/tmp/rch-mission-tx-interfaces}"
 LOG_FILE="${LOG_DIR}/mission_tx_interfaces_${RUN_ID}.jsonl"
 STDOUT_BASENAME="mission_tx_interfaces_${RUN_ID}"
 export TMPDIR="/tmp"
 export RCH_DAEMON_TIMEOUT_MS="${RCH_DAEMON_TIMEOUT_MS:-120000}"
 WORKSPACE_DIR="${ROOT_DIR}/tests/e2e/tmp/${SCENARIO_ID}_${RUN_ID}"
+WORKSPACE_REL_DIR="tests/e2e/tmp/${SCENARIO_ID}_${RUN_ID}"
 CONTRACT_PATH="${WORKSPACE_DIR}/.ft/mission/tx-active.json"
 RCH_CHECK_LOG="${LOG_DIR}/${STDOUT_BASENAME}.rch_check.log"
 RCH_STATUS_JSON="${LOG_DIR}/${STDOUT_BASENAME}.rch_status.json"
@@ -166,6 +167,26 @@ set +e
 smoke_rc=$?
 set -e
 if grep -Fq "[RCH] local" "${RCH_SMOKE_STDOUT}" "${RCH_SMOKE_STDERR}"; then
+  if grep -Eq "Project sync failed: rsync failed|rsync: \\[receiver\\].*\\.beads\\.?db" "${RCH_SMOKE_STDOUT}" "${RCH_SMOKE_STDERR}"; then
+    emit_log \
+      "failed" \
+      "preflight_rch_smoke" \
+      "rch_sync_churn_artifacts" \
+      "RCH-E106" \
+      "$(basename "${RCH_SMOKE_STDERR}")" \
+      "remote smoke command fell back local after rsync churn on volatile local artifacts"
+    exit 1
+  fi
+  if grep -Fq "Failed to connect to" "${RCH_SMOKE_STDOUT}" "${RCH_SMOKE_STDERR}"; then
+    emit_log \
+      "failed" \
+      "preflight_rch_smoke" \
+      "rch_worker_connect_failed" \
+      "RCH-E100" \
+      "$(basename "${RCH_SMOKE_STDERR}")" \
+      "remote smoke command fell back local after SSH connectivity failure"
+    exit 1
+  fi
   emit_log \
     "failed" \
     "preflight_rch_smoke" \
@@ -390,7 +411,7 @@ run_robot_json() {
       cd "${ROOT_DIR}"
       rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" TMPDIR="${REMOTE_TMPDIR}" \
         cargo run -q -p frankenterm --bin ft -- \
-        --workspace "${WORKSPACE_DIR}" \
+        --workspace "${WORKSPACE_REL_DIR}" \
         robot \
         --format json \
         "$@"
@@ -418,7 +439,19 @@ run_robot_json() {
       local fallback_reason_code="rch_local_fallback_detected"
       local fallback_error_code="remote_exec_failed_local_fallback"
       local fallback_summary="rch emitted local fallback marker"
-      if grep -Fq "no workers with Rust installed" "${stdout_file}" "${stderr_file}"; then
+      if grep -Eq "Project sync failed: rsync failed|rsync: \\[receiver\\].*\\.beads\\.?db" "${stdout_file}" "${stderr_file}"; then
+        fallback_reason_code="rch_sync_churn_artifacts"
+        fallback_error_code="RCH-E106"
+        fallback_summary="rch local fallback: rsync churn on volatile local artifacts"
+      elif grep -Fq "Failed to connect to" "${stdout_file}" "${stderr_file}"; then
+        fallback_reason_code="rch_worker_connect_failed"
+        fallback_error_code="RCH-E100"
+        fallback_summary="rch local fallback: SSH connectivity failure to selected worker"
+      elif grep -Fq "Command timed out after" "${stdout_file}" "${stderr_file}"; then
+        fallback_reason_code="rch_remote_timeout"
+        fallback_error_code="RCH-E107"
+        fallback_summary="rch local fallback: remote command timed out"
+      elif grep -Fq "no workers with Rust installed" "${stdout_file}" "${stderr_file}"; then
         fallback_reason_code="rch_workers_missing_rust"
         fallback_error_code="RCH-E103"
         fallback_summary="rch local fallback: no workers with Rust installed"
@@ -428,7 +461,7 @@ run_robot_json() {
         fallback_summary="rch local fallback: daemon query failed"
       fi
 
-      if [[ "${attempt}" -eq 1 ]] && { [[ "${fallback_error_code}" == "RCH-E103" ]] || [[ "${fallback_error_code}" == "RCH-E104" ]]; }; then
+      if [[ "${attempt}" -eq 1 ]] && { [[ "${fallback_error_code}" == "RCH-E100" ]] || [[ "${fallback_error_code}" == "RCH-E103" ]] || [[ "${fallback_error_code}" == "RCH-E104" ]] || [[ "${fallback_error_code}" == "RCH-E106" ]] || [[ "${fallback_error_code}" == "RCH-E107" ]]; }; then
         local retry_status_json="${LOG_DIR}/${STDOUT_BASENAME}.${label}.retry_preflight.rch_status.json"
         local retry_status_err="${LOG_DIR}/${STDOUT_BASENAME}.${label}.retry_preflight.rch_status.stderr.log"
         local retry_probe_json="${LOG_DIR}/${STDOUT_BASENAME}.${label}.retry_preflight.rch_probe.json"
@@ -491,6 +524,15 @@ run_robot_json() {
           "$(basename "${stderr_file}")" \
           "robot tx command failed due to remote disk exhaustion (TMPDIR/CARGO target path)"
         echo "Remote worker disk exhaustion detected for ${label}" >&2
+        echo "Stdout: ${stdout_file}" >&2
+        echo "Stderr: ${stderr_file}" >&2
+        exit 1
+      fi
+      if grep -Fq "Workspace path not writable" "${stdout_file}" "${stderr_file}"; then
+        emit_log "failed" "${decision_path}" "workspace_path_unwritable" "FT-7010" \
+          "$(basename "${stderr_file}")" \
+          "robot tx command rejected non-writable workspace path on remote execution"
+        echo "Workspace path not writable for ${label}" >&2
         echo "Stdout: ${stdout_file}" >&2
         echo "Stderr: ${stderr_file}" >&2
         exit 1

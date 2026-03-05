@@ -502,7 +502,7 @@ fn bench_pdu_roundtrip(c: &mut Criterion) {
     let rt = runtime();
     let mut group = c.benchmark_group("mux_client_ops/pdu_roundtrip");
 
-    for &payload_size in &[64usize, 1024, 16 * 1024] {
+    for &payload_size in &[64usize, 1024, 64 * 1024] {
         let socket = socket_path("roundtrip");
         let _server = rt.block_on(spawn_mock_mux_server(
             socket.clone(),

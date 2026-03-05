@@ -289,17 +289,30 @@ pub(super) fn compute_next_step(step_logs: &[crate::storage::WorkflowStepLogReco
         return 0;
     }
 
-    // Find the highest step index with a terminal result (continue or done)
-    // Steps with retry or wait_for should be re-executed
-    let mut max_completed = None;
-    for log in step_logs {
-        if log.result_type == "continue" || log.result_type == "done" {
-            max_completed =
-                Some(max_completed.map_or(log.step_index, |m: usize| m.max(log.step_index)));
-        }
-    }
+    // Find the log with the highest ID (most recent chronologically)
+    let last_log = step_logs.iter().max_by_key(|log| log.id);
 
-    max_completed.map_or(0, |idx| idx + 1)
+    match last_log {
+        Some(log) => match log.result_type.as_str() {
+            "continue" | "done" => log.step_index + 1,
+            "jump_to" => {
+                if let Some(data) = &log.result_data {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(step) = json
+                            .pointer("/step_result/JumpTo/step")
+                            .and_then(|v| v.as_u64())
+                        {
+                            return step as usize;
+                        }
+                    }
+                }
+                log.step_index // Fallback if data is missing or malformed
+            }
+            // For retry, wait_for, send_text, abort, we re-execute or stay on the same step
+            _ => log.step_index,
+        },
+        None => 0,
+    }
 }
 
 /// Generate a unique workflow execution ID
@@ -845,8 +858,9 @@ mod tests {
         step_index: usize,
         result_type: &str,
     ) -> crate::storage::WorkflowStepLogRecord {
+        static NEXT_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
         crate::storage::WorkflowStepLogRecord {
-            id: 0,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             workflow_id: "wf-1".to_string(),
             audit_action_id: None,
             step_index,
@@ -923,12 +937,31 @@ mod tests {
     fn compute_next_step_mixed_terminal_and_nonterminal() {
         let logs = vec![
             make_step_log(0, "continue"),
-            make_step_log(1, "retry"),
             make_step_log(1, "continue"),
-            make_step_log(2, "wait_for"),
+            make_step_log(2, "retry"),
         ];
-        // Step 0 and 1 have "continue", max completed = 1, next = 2
+        // Highest completed is step_index 1, but most recent is retry at 2, so next is 2
         assert_eq!(compute_next_step(&logs), 2);
+    }
+
+    #[test]
+    fn compute_next_step_jump_to() {
+        let mut jump_log = make_step_log(2, "jump_to");
+        jump_log.result_data = Some(serde_json::json!({
+            "step_result": {
+                "JumpTo": {
+                    "step": 5
+                }
+            }
+        }).to_string());
+        
+        let logs = vec![
+            make_step_log(0, "continue"),
+            make_step_log(1, "continue"),
+            jump_log,
+        ];
+        // After jumping to 5, the next step should be 5
+        assert_eq!(compute_next_step(&logs), 5);
     }
 
     // ========================================================================

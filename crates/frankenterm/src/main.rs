@@ -6601,6 +6601,10 @@ fn build_send_dry_run_report(
     }
     eval.add_check(decision_check);
     if let Some(context) = decision.context() {
+        eval.add_check(PolicyCheck::passed(
+            "policy_surface",
+            format!("Policy surface: {}", context.surface.as_str()),
+        ));
         if let Some(rule) = context
             .rules_evaluated
             .iter()
@@ -6642,6 +6646,10 @@ fn build_send_dry_run_report(
             ));
         }
     } else {
+        eval.add_check(PolicyCheck::passed(
+            "policy_surface",
+            "Policy surface: unknown (context unavailable)",
+        ));
         eval.add_check(PolicyCheck::passed(
             "command_safety",
             "Command gate context unavailable",
@@ -22743,8 +22751,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let client = frankenterm_core::ipc::IpcClient::new(&layout.ipc_socket_path);
 
                 // Handle user-var event
-                let name = name.expect("name required for --from-uservar");
-                let value = value.expect("value required for --from-uservar");
+                let name = name.unwrap_or_else(|| {
+                    eprintln!("Error: --name is required when using --from-uservar.");
+                    std::process::exit(1);
+                });
+                let value = value.unwrap_or_else(|| {
+                    eprintln!("Error: --value is required when using --from-uservar.");
+                    std::process::exit(1);
+                });
                 let name_for_log = name.clone();
                 let value_len = value.len();
 
@@ -38660,6 +38674,36 @@ log_level = "debug"
     }
 
     #[test]
+    fn send_dry_run_report_includes_mux_policy_surface_check() {
+        let config = frankenterm_core::config::Config::default();
+        let command_ctx =
+            frankenterm_core::dry_run::CommandContext::new("ft robot send 0 \"echo hi\"", true);
+        let report = build_send_dry_run_report(
+            &command_ctx,
+            0,
+            None,
+            None,
+            "echo hi",
+            false,
+            None,
+            10,
+            &config,
+            frankenterm_core::policy::ActorKind::Robot,
+        );
+
+        let eval = report
+            .policy_evaluation
+            .expect("policy evaluation must be present");
+        let surface_check = eval
+            .checks
+            .iter()
+            .find(|check| check.name == "policy_surface")
+            .expect("policy_surface check must be present");
+        assert!(surface_check.passed);
+        assert_eq!(surface_check.message, "Policy surface: mux");
+    }
+
+    #[test]
     fn send_dry_run_report_without_wait_for_has_no_wait_action() {
         let config = frankenterm_core::config::Config::default();
         let command_ctx =
@@ -42893,6 +42937,99 @@ log_level = "debug"
         .await;
         assert!(decision.is_denied(), "rule should deny robot search");
         assert_eq!(decision.reason(), Some("robot search blocked for test"));
+        let context = decision
+            .context()
+            .expect("read/search decisions should include decision context");
+        assert_eq!(
+            context.surface,
+            frankenterm_core::policy::PolicySurface::Mux
+        );
+    }
+
+    #[tokio::test]
+    async fn read_search_policy_mcp_actor_uses_mux_surface_override() {
+        let mut config = frankenterm_core::config::Config::default();
+        config.safety.rules.enabled = true;
+        config
+            .safety
+            .rules
+            .rules
+            .push(frankenterm_core::config::PolicyRule {
+                id: "test.deny.mcp.surface.mcp".to_string(),
+                description: Some("deny mcp read only when surface is mcp".to_string()),
+                priority: 1,
+                match_on: frankenterm_core::config::PolicyRuleMatch {
+                    actions: vec!["read_output".to_string()],
+                    actors: vec!["mcp".to_string()],
+                    surfaces: vec!["mcp".to_string()],
+                    ..Default::default()
+                },
+                decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                message: Some("should not match when helper sets mux surface".to_string()),
+            });
+
+        let (decision, _domain) = authorize_read_or_search_policy(
+            &config,
+            None,
+            None,
+            frankenterm_core::policy::ActionKind::ReadOutput,
+            frankenterm_core::policy::ActorKind::Mcp,
+            None,
+            "mcp read test",
+        )
+        .await;
+
+        assert!(
+            decision.is_allowed(),
+            "mcp-surface-only deny rule should not match when helper sets mux surface"
+        );
+        let context = decision
+            .context()
+            .expect("read/search decisions should include decision context");
+        assert_eq!(
+            context.surface,
+            frankenterm_core::policy::PolicySurface::Mux
+        );
+    }
+
+    #[tokio::test]
+    async fn read_search_policy_mcp_actor_matches_mux_surface_rule() {
+        let mut config = frankenterm_core::config::Config::default();
+        config.safety.rules.enabled = true;
+        config
+            .safety
+            .rules
+            .rules
+            .push(frankenterm_core::config::PolicyRule {
+                id: "test.deny.mcp.surface.mux".to_string(),
+                description: Some("deny mcp read when helper surface is mux".to_string()),
+                priority: 1,
+                match_on: frankenterm_core::config::PolicyRuleMatch {
+                    actions: vec!["read_output".to_string()],
+                    actors: vec!["mcp".to_string()],
+                    surfaces: vec!["mux".to_string()],
+                    ..Default::default()
+                },
+                decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                message: Some("mcp read blocked on mux surface".to_string()),
+            });
+
+        let (decision, _domain) = authorize_read_or_search_policy(
+            &config,
+            None,
+            None,
+            frankenterm_core::policy::ActionKind::ReadOutput,
+            frankenterm_core::policy::ActorKind::Mcp,
+            None,
+            "mcp read test",
+        )
+        .await;
+
+        assert!(
+            decision.is_denied(),
+            "mux-surface deny rule should match for mcp actor read/search helper"
+        );
+        assert_eq!(decision.reason(), Some("mcp read blocked on mux surface"));
         let context = decision
             .context()
             .expect("read/search decisions should include decision context");

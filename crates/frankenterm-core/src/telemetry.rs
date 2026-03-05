@@ -207,8 +207,17 @@ fn collect_system_memory() -> (u64, u64) {
             if o.status.success() {
                 let text = String::from_utf8_lossy(&o.stdout);
                 let mut free_pages: u64 = 0;
-                let page_size: u64 = 16384; // Apple Silicon default
+                let mut page_size: u64 = 16384; // Apple Silicon default fallback
                 for line in text.lines() {
+                    if line.starts_with("Mach Virtual Memory") {
+                        if let Some(ps_str) = line.split("page size of ").nth(1) {
+                            if let Some(ps_num_str) = ps_str.split(' ').next() {
+                                if let Ok(ps) = ps_num_str.parse::<u64>() {
+                                    page_size = ps;
+                                }
+                            }
+                        }
+                    }
                     if line.starts_with("Pages free:") || line.starts_with("Pages inactive:") {
                         if let Some(val) = line.split(':').nth(1) {
                             if let Ok(n) = val.trim().trim_end_matches('.').parse::<u64>() {
