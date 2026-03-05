@@ -281,9 +281,7 @@ fn normalize_absolute_path(path: &str) -> Option<Vec<String>> {
             Component::CurDir => {}
             Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
             Component::ParentDir => {
-                if parts.pop().is_none() {
-                    return None;
-                }
+                parts.pop()?;
             }
             Component::Prefix(_) => return None,
         }

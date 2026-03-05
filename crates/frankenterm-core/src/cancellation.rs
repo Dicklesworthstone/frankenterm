@@ -336,7 +336,7 @@ impl CancellationToken {
         let children = {
             self.inner.children.lock().expect("lock not poisoned").clone()
         };
-        for child in children.iter() {
+        for child in &children {
             Self::propagate_inner(child, &self.inner.scope_id);
         }
     }
@@ -355,7 +355,7 @@ impl CancellationToken {
             let children = {
                 inner.children.lock().expect("lock not poisoned").clone()
             };
-            for child in children.iter() {
+            for child in &children {
                 Self::propagate_inner(child, &inner.scope_id);
             }
         }

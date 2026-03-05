@@ -871,8 +871,7 @@ impl TopologyOrchestrator {
                 identity: identity.stable_key(),
             },
             Some(record) => match &record.state {
-                LifecycleState::Pane(MuxPaneLifecycleState::Running)
-                | LifecycleState::Pane(MuxPaneLifecycleState::Ready) => OpCheckResult::Ok,
+                LifecycleState::Pane(MuxPaneLifecycleState::Running | MuxPaneLifecycleState::Ready) => OpCheckResult::Ok,
                 other => OpCheckResult::InvalidState {
                     identity: identity.stable_key(),
                     current_state: format!("{other:?}"),

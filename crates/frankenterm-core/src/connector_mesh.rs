@@ -601,7 +601,8 @@ impl ConnectorMesh {
     // ---- Private routing helpers ----
 
     fn find_candidates(&self, request: &RoutingRequest) -> Vec<String> {
-        self.hosts
+        let mut candidates: Vec<String> = self
+            .hosts
             .values()
             .filter(|h| {
                 h.can_accept()
@@ -611,7 +612,9 @@ impl ConnectorMesh {
                         .all(|cap| h.supports(cap))
             })
             .map(|h| h.host_id.clone())
-            .collect()
+            .collect();
+        candidates.sort_unstable();
+        candidates
     }
 
     fn select_least_loaded(&self, candidates: &[String]) -> Option<String> {

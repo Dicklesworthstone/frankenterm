@@ -9398,7 +9398,7 @@ fn writer_loop(
         let mut txn_open = false;
         if use_txn {
             match conn.execute_batch("BEGIN IMMEDIATE") {
-                Ok(_) => txn_open = true,
+                Ok(()) => txn_open = true,
                 Err(err) => {
                     tracing::warn!(%err, "Failed to start batch transaction, falling back to individual statements");
                 }

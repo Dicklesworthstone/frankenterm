@@ -72,7 +72,7 @@ fn config_update_pending(rx: &watch::Receiver<HotReloadableConfig>) -> bool {
     }
 }
 
-fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
+fn config_take_update(rx: &watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
     #[cfg(feature = "asupersync-runtime")]
     {
         rx.borrow_and_clone()

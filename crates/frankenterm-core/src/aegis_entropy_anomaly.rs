@@ -216,9 +216,9 @@ impl EProcess {
             self.collapse_streak = 0;
             // Decay toward 1.0 when entropy is normal
             if self.e_value > 1.0 {
-                self.e_value = (1.0 + (self.e_value - 1.0) * self.decay).max(1.0);
+                self.e_value = (self.e_value - 1.0).mul_add(self.decay, 1.0).max(1.0);
             } else if self.e_value < 1.0 {
-                self.e_value = (1.0 - (1.0 - self.e_value) * self.decay).min(1.0);
+                self.e_value = (1.0 - self.e_value).mul_add(-self.decay, 1.0).min(1.0);
             }
         }
 

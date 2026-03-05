@@ -2127,7 +2127,7 @@ impl PatternEngine {
         }
 
         // Get all potential detections first
-        let all_detections = self.detect(text);
+        let all_detections = self.detect(&input_text);
 
         // Filter by agent type, span (overlap), and dedup
         let mut result = Vec::new();
@@ -2204,7 +2204,7 @@ impl PatternEngine {
             context.tail_buffer = input_text.to_string();
         }
 
-        self.detect_with_context_and_trace_inner(text, overlap_len, context, opts)
+        self.detect_with_context_and_trace_inner(&input_text, overlap_len, context, opts)
     }
 
     fn detect_with_context_and_trace_inner(

@@ -564,7 +564,7 @@ impl SwarmScheduler {
                                 agent_id: snap.agent_id.clone(),
                             });
                         }
-                        Err(_) => continue,
+                        Err(_) => {}
                     }
                 }
             }
@@ -799,8 +799,8 @@ impl SwarmScheduler {
             })
             .collect();
 
-        let max_load = loads.iter().cloned().fold(0.0_f64, f64::max);
-        let min_load = loads.iter().cloned().fold(1.0_f64, f64::min);
+        let max_load = loads.iter().copied().fold(0.0_f64, f64::max);
+        let min_load = loads.iter().copied().fold(1.0_f64, f64::min);
         let imbalance = max_load - min_load;
 
         if imbalance < self.config.rebalance_imbalance_threshold {
