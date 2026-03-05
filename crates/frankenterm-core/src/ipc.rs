@@ -913,8 +913,13 @@ async fn handle_client_with_context(
     let start = Instant::now();
     let (reader, mut writer) = stream.into_split();
 
+    // Prevent OOM from unbounded line reading by wrapping with `take`.
+    // We allow MAX_MESSAGE_SIZE + 1 so we can detect if it was truncated by the limit.
+    use crate::runtime_compat::unix::AsyncReadExt;
+    let bounded_reader = reader.take((MAX_MESSAGE_SIZE + 1) as u64);
+
     // Read one request per connection (simple request-response)
-    let mut lines = compat_unix::lines(compat_unix::buffered(reader));
+    let mut lines = compat_unix::lines(compat_unix::buffered(bounded_reader));
     let Some(line) = compat_unix::next_line(&mut lines).await? else {
         return Ok(()); // Client disconnected
     };

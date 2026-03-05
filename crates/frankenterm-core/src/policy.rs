@@ -7480,4 +7480,28 @@ mod tests {
         assert!(glob_match("a?c", "abc"));
         assert!(!glob_match("a?c", "abbc"));
     }
+
+    #[test]
+    fn is_command_candidate_handles_env_assignments() {
+        assert!(is_command_candidate("FOO=bar rm -rf /"));
+        assert!(is_command_candidate("FOO='bar' rm -rf /"));
+        assert!(is_command_candidate("FOO=\"bar\" rm -rf /"));
+        assert!(is_command_candidate("FOO=bar /bin/rm -rf /"));
+        assert!(!is_command_candidate("FOO=bar"));
+        assert!(!is_command_candidate("FOO='bar'"));
+        assert!(!is_command_candidate("FOO=\"bar\""));
+    }
+
+    #[test]
+    fn is_command_candidate_catches_subshell_in_assignment() {
+        // THIS TEST WILL FAIL IF THE BUG EXISTS
+        assert!(is_command_candidate("FOO=$(rm -rf /)"));
+        assert!(is_command_candidate("FOO=`rm -rf /`"));
+    }
+
+    #[test]
+    fn is_command_candidate_bypasses_simple_text() {
+        assert!(!is_command_candidate("Please check the logs"));
+        assert!(!is_command_candidate("# commented command"));
+    }
 }
