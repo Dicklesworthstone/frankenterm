@@ -1059,38 +1059,36 @@ pub fn match_rule_glob(pattern: &str, value: &str) -> bool {
         return value == pattern;
     }
 
-    // Convert glob → regex
-    let mut re = String::from("^");
-    for ch in pattern.chars() {
-        match ch {
-            '*' => re.push_str(".*"),
-            '?' => re.push('.'),
-            '.' | '+' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' | ':' => {
-                re.push('\\');
-                re.push(ch);
-            }
-            _ => re.push(ch),
+    let p_bytes = pattern.as_bytes();
+    let v_bytes = value.as_bytes();
+
+    let mut p_idx = 0;
+    let mut v_idx = 0;
+    let mut p_star = None;
+    let mut v_star = 0;
+
+    while v_idx < v_bytes.len() {
+        if p_idx < p_bytes.len() && (p_bytes[p_idx] == b'?' || p_bytes[p_idx] == v_bytes[v_idx]) {
+            p_idx += 1;
+            v_idx += 1;
+        } else if p_idx < p_bytes.len() && p_bytes[p_idx] == b'*' {
+            p_star = Some(p_idx);
+            v_star = v_idx;
+            p_idx += 1;
+        } else if let Some(star_idx) = p_star {
+            p_idx = star_idx + 1;
+            v_star += 1;
+            v_idx = v_star;
+        } else {
+            return false;
         }
     }
-    re.push('$');
 
-    thread_local! {
-        static REGEX_CACHE: std::cell::RefCell<crate::lru_cache::LruCache<String, fancy_regex::Regex>> =
-            std::cell::RefCell::new(crate::lru_cache::LruCache::new(256));
+    while p_idx < p_bytes.len() && p_bytes[p_idx] == b'*' {
+        p_idx += 1;
     }
 
-    REGEX_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(r) = cache.get(&re) {
-            return r.is_match(value).unwrap_or(false);
-        }
-        if let Ok(r) = fancy_regex::Regex::new(&re) {
-            let is_match = r.is_match(value).unwrap_or(false);
-            cache.put(re, r);
-            return is_match;
-        }
-        false
-    })
+    p_idx == p_bytes.len()
 }
 
 /// Event notification filter.

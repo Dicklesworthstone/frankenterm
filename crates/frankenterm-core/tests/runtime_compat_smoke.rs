@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use frankenterm_core::runtime_compat::{self, CompatRuntime, RuntimeBuilder, mpsc, watch};
@@ -19,16 +18,89 @@ fn runtime_builder_multi_thread_runs_detached_tasks() {
         .worker_threads(1)
         .build()
         .expect("runtime should build");
-    let ran = Arc::new(AtomicBool::new(false));
-    let ran_task = Arc::clone(&ran);
+    let (tx, rx) = std_mpsc::channel();
     runtime.spawn_detached(async move {
-        ran_task.store(true, Ordering::SeqCst);
+        tx.send("ran")
+            .expect("detached task should signal completion");
     });
 
-    std::thread::sleep(Duration::from_millis(25));
+    let signal = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("detached task should run on active runtime");
+    assert_eq!(signal, "ran");
+}
+
+#[test]
+fn runtime_helpers_support_mpsc_round_trip() {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime should build");
+    let values = runtime.block_on(async {
+        let (tx, mut rx) = mpsc::channel::<u8>(4);
+        runtime_compat::mpsc_send(&tx, 7)
+            .await
+            .expect("first send should succeed");
+        runtime_compat::mpsc_send(&tx, 9)
+            .await
+            .expect("second send should succeed");
+
+        let first = runtime_compat::mpsc_recv_option(&mut rx)
+            .await
+            .expect("first value should arrive");
+        let second = runtime_compat::mpsc_recv_option(&mut rx)
+            .await
+            .expect("second value should arrive");
+        (first, second)
+    });
+
+    assert_eq!(values, (7, 9));
+}
+
+#[test]
+fn runtime_helpers_support_watch_change_consumption() {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime should build");
+    let values = runtime.block_on(async {
+        let (tx, mut rx) = watch::channel(0usize);
+        assert!(!runtime_compat::watch_has_changed(&rx));
+
+        tx.send(1).expect("first watch send should succeed");
+        runtime_compat::watch_changed(&mut rx)
+            .await
+            .expect("receiver should observe first change");
+        let first = runtime_compat::watch_borrow_and_update_clone(&mut rx);
+
+        tx.send(2).expect("second watch send should succeed");
+        runtime_compat::watch_changed(&mut rx)
+            .await
+            .expect("receiver should observe second change");
+        let second = runtime_compat::watch_borrow_and_update_clone(&mut rx);
+
+        (first, second)
+    });
+
+    assert_eq!(values, (1, 2));
+}
+
+#[test]
+fn timeout_reports_elapsed_for_slow_future() {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime should build");
+    let err = runtime
+        .block_on(async {
+            runtime_compat::timeout(
+                Duration::from_millis(5),
+                runtime_compat::sleep(Duration::from_secs(60)),
+            )
+            .await
+        })
+        .expect_err("slow future should time out");
+
     assert!(
-        ran.load(Ordering::SeqCst),
-        "detached task should run on active runtime"
+        err.contains("elapsed") || err.contains("timeout") || err.contains("time"),
+        "timeout error should mention time, got: {err}"
     );
 }
 

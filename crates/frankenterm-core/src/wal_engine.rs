@@ -763,7 +763,7 @@ impl<T: Clone + Serialize + for<'de> Deserialize<'de>> DiskWal<T> {
                         }
                     }
                 }
-                Ok(None) => break, // clean EOF
+                Ok(None) => break, // clean EOF (or partially read len prefix)
                 Err(_) => {
                     corrupt_tail += 1;
                     break;
@@ -771,12 +771,17 @@ impl<T: Clone + Serialize + for<'de> Deserialize<'de>> DiskWal<T> {
             }
         }
 
-        // Truncate file at last good entry to recover from partial writes
-        if corrupt_tail > 0 {
+        let actual_size = std::fs::metadata(&path)?.len();
+
+        // Truncate file at last good entry to recover from partial writes or dangling tail bytes
+        if corrupt_tail > 0 || actual_size > good_offset {
             let file = std::fs::OpenOptions::new().write(true).open(&path)?;
             file.set_len(good_offset)?;
             if config.fsync_on_write {
                 file.sync_all()?;
+            }
+            if corrupt_tail == 0 {
+                corrupt_tail = 1; // Count dangling tail bytes as a corrupt tail
             }
         }
 
@@ -1431,10 +1436,10 @@ mod tests {
     fn wal_compact_updates_compacted_through() {
         let mut wal = small_wal();
         for i in 0..4 {
-            wal.append(format!("e{}", i), i as u64);
+            wal.append(format!("e{}", i), i as u64 * 100).unwrap();
         }
-        wal.checkpoint(400);
-        wal.append("after".to_string(), 500);
+        wal.checkpoint(400).unwrap();
+        wal.append("after".to_string(), 500).unwrap();
         assert_eq!(wal.compacted_through(), 0);
         let removed = wal.compact();
         if removed > 0 {

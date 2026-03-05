@@ -4462,26 +4462,41 @@ mod tests {
     #[test]
     fn injector_policy_context_marks_mux_surface() {
         run_async_test(async {
-            let mut injector = PolicyGatedInjector::new(
-                PolicyEngine::strict(),
-                crate::wezterm::default_wezterm_handle(),
-            );
+            let actors = [
+                ActorKind::Human,
+                ActorKind::Robot,
+                ActorKind::Mcp,
+                ActorKind::Workflow,
+            ];
 
-            let mut caps = PaneCapabilities::prompt();
-            caps.alt_screen = Some(true);
+            for actor in actors {
+                let mut injector = PolicyGatedInjector::new(
+                    PolicyEngine::strict(),
+                    crate::wezterm::default_wezterm_handle(),
+                );
 
-            let result = injector
-                .send_text(1, "echo hi", ActorKind::Robot, &caps, None)
-                .await;
+                let mut caps = PaneCapabilities::prompt();
+                caps.alt_screen = Some(true);
 
-            match result {
-                InjectionResult::Denied { decision, .. } => {
-                    let context = decision
-                        .context()
-                        .expect("injector deny decision should include context");
-                    assert_eq!(context.surface, PolicySurface::Mux);
+                let result = injector.send_text(1, "echo hi", actor, &caps, None).await;
+
+                match result {
+                    InjectionResult::Denied { decision, .. } => {
+                        let context = decision
+                            .context()
+                            .expect("injector deny decision should include context");
+                        assert_eq!(
+                            context.surface,
+                            PolicySurface::Mux,
+                            "expected mux surface for actor {}",
+                            actor.as_str()
+                        );
+                    }
+                    other => panic!(
+                        "expected denied result for actor {}, got {other:?}",
+                        actor.as_str()
+                    ),
                 }
-                other => panic!("expected denied result, got {other:?}"),
             }
         });
     }
