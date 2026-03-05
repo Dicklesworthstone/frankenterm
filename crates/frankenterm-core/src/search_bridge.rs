@@ -442,6 +442,8 @@ fn update_best_results(best_results: &mut Vec<ScoredResult>, phase: &SearchPhase
     }
 }
 
+const BRIDGE_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 fn spawn_cancellation_thread(
     cx: Cx,
     cancellation: BridgeCancellationToken,
@@ -459,7 +461,8 @@ fn spawn_cancellation_thread(
                 cx.set_cancel_requested(true);
                 break;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            // Avoid busy-waiting: this loop is best-effort cancellation plumbing.
+            std::thread::park_timeout(BRIDGE_WATCH_POLL_INTERVAL);
         }
     });
 
@@ -486,12 +489,14 @@ fn spawn_timeout_thread(
     let handle = std::thread::spawn(move || {
         let started_at = Instant::now();
         while !done_for_thread.load(Ordering::Acquire) {
-            if started_at.elapsed() >= timeout_duration {
+            let elapsed = started_at.elapsed();
+            if elapsed >= timeout_duration {
                 fired_for_thread.store(true, Ordering::Release);
                 cancellation.cancel();
                 break;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            let remaining = timeout_duration.saturating_sub(elapsed);
+            std::thread::park_timeout(remaining.min(BRIDGE_WATCH_POLL_INTERVAL));
         }
     });
 

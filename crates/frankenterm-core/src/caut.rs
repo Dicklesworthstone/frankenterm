@@ -319,7 +319,12 @@ impl CautClient {
 
         if !output.status.success() {
             let status = output.status.code().unwrap_or(-1);
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr_bytes = if output.stderr.len() > self.max_error_bytes {
+                &output.stderr[..self.max_error_bytes]
+            } else {
+                &output.stderr
+            };
+            let stderr = String::from_utf8_lossy(stderr_bytes).to_string();
             let stderr_preview = redact_and_truncate(&stderr, self.max_error_bytes);
             return Err(CautError::NonZeroExit {
                 status,
@@ -327,14 +332,16 @@ impl CautClient {
             });
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let bytes = stdout.len();
-        if bytes > self.max_output_bytes {
+        // Check raw byte length BEFORE allocating string to prevent OOM on huge outputs
+        let raw_bytes = output.stdout.len();
+        if raw_bytes > self.max_output_bytes {
             return Err(CautError::OutputTooLarge {
-                bytes,
+                bytes: raw_bytes,
                 max_bytes: self.max_output_bytes,
             });
         }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
         Ok(stdout)
     }

@@ -356,7 +356,7 @@ fn read_process_info(pid: u32) -> Option<RawProcessInfo> {
 fn parse_linux_state(s: &str) -> ProcessState {
     match s {
         "R" => ProcessState::Running,
-        "S" => ProcessState::Sleeping,
+        "S" | "I" => ProcessState::Sleeping,
         "D" => ProcessState::DiskSleep,
         "T" | "t" => ProcessState::Stopped,
         "Z" => ProcessState::Zombie,
@@ -462,11 +462,11 @@ fn read_process_info(pid: u32) -> Option<RawProcessInfo> {
 
 #[cfg(target_os = "macos")]
 fn parse_macos_state(s: &str) -> ProcessState {
-    // macOS ps state codes: R=running, S=sleeping, U=uninterruptible,
+    // macOS ps state codes: R=running, S=sleeping, I=idle, U=uninterruptible,
     // T=stopped, Z=zombie. First char is primary state.
     match s.chars().next() {
         Some('R') => ProcessState::Running,
-        Some('S') => ProcessState::Sleeping,
+        Some('S') | Some('I') => ProcessState::Sleeping,
         Some('U') => ProcessState::DiskSleep,
         Some('T') => ProcessState::Stopped,
         Some('Z') => ProcessState::Zombie,

@@ -11300,7 +11300,7 @@ fn record_usage_metrics_batch_sync(
     }
 
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| StorageError::Database(format!("Failed to start metrics batch tx: {e}")))?;
 
     {
@@ -12289,7 +12289,7 @@ fn consume_prepared_plan_sync(
     now_ms: i64,
 ) -> Result<Option<PreparedPlanRecord>> {
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| StorageError::Database(format!("Failed to start transaction: {e}")))?;
 
     let record = {
@@ -12369,7 +12369,7 @@ fn consume_approval_token_sync(
 ) -> Result<Option<ApprovalTokenRecord>> {
     let now = now_ms();
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| StorageError::Database(format!("Failed to start transaction: {e}")))?;
 
     let mut sql = String::from(
@@ -12505,7 +12505,7 @@ fn consume_approval_token_by_code_sync(
 ) -> Result<Option<ApprovalTokenRecord>> {
     let now = now_ms();
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| StorageError::Database(format!("Failed to start transaction: {e}")))?;
 
     let sql = "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,

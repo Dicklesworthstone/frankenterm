@@ -148,7 +148,9 @@ fn maybe_push_pane_changes(
     sender: PduSender,
     per_pane: Arc<Mutex<PerPane>>,
 ) -> anyhow::Result<()> {
-    let mut per_pane = per_pane.lock().unwrap();
+    let mut per_pane = per_pane
+        .lock()
+        .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
     if let Some(resp) = per_pane.compute_changes(pane, None) {
         sender.send(DecodedPdu {
             pdu: Pdu::GetPaneRenderChangesResponse(resp),
@@ -394,7 +396,13 @@ impl SessionHandler {
                             let mut tab_titles = vec![];
                             let mut window_titles = HashMap::new();
                             for window_id in mux.iter_windows().into_iter() {
-                                let window = mux.get_window(window_id).unwrap();
+                                let Some(window) = mux.get_window(window_id) else {
+                                    log::warn!(
+                                        "ListPanes skipped stale window id {} from iter_windows",
+                                        window_id
+                                    );
+                                    continue;
+                                };
                                 window_titles.insert(window_id, window.get_title().to_string());
                                 for tab in window.iter() {
                                     tabs.push(tab.codec_pane_tree());
@@ -674,7 +682,9 @@ impl SessionHandler {
                             // For a key press, we want to always send back the
                             // cursor position so that the predictive echo doesn't
                             // leave the cursor in the wrong place
-                            let mut per_pane = per_pane.lock().unwrap();
+                            let mut per_pane = per_pane
+                                .lock()
+                                .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
                             if let Some(resp) = per_pane.compute_changes(&pane, Some(input_serial))
                             {
                                 sender.send(DecodedPdu {
@@ -1037,7 +1047,9 @@ impl SessionHandler {
                                     layouts.push(layout);
                                 }
                                 if layouts.is_empty() {
-                                    return Err(anyhow!("layout cycle must have at least one layout"));
+                                    return Err(anyhow!(
+                                        "layout cycle must have at least one layout"
+                                    ));
                                 }
                                 tab.set_layout_cycle(mux::layout::LayoutCycle::new(layouts));
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
@@ -1117,9 +1129,7 @@ impl SessionHandler {
             }
             // Catch-all for newly added PDU variants (floating panes, etc.)
             // that this server implementation doesn't handle yet.
-            _ => {
-                send_response(Err(anyhow!("unhandled PDU: {:?}", decoded.pdu)))
-            }
+            _ => send_response(Err(anyhow!("unhandled PDU: {:?}", decoded.pdu))),
         }
     }
 }
@@ -1591,7 +1601,10 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(codec_vers, CODEC_VERSION);
-                assert!(!version_string.is_empty(), "version string should not be empty");
+                assert!(
+                    !version_string.is_empty(),
+                    "version string should not be empty"
+                );
                 assert!(
                     executable_path.to_string_lossy().len() > 0,
                     "executable path should be non-empty"

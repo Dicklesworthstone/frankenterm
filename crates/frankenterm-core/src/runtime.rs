@@ -46,7 +46,7 @@ use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 use crate::runtime_compat::{
-    Mutex, MutexGuard, RwLock, mpsc, sleep,
+    RwLock, mpsc, sleep,
     task::{self, JoinHandle},
     timeout, watch,
 };
@@ -72,7 +72,7 @@ fn config_update_pending(rx: &watch::Receiver<HotReloadableConfig>) -> bool {
     }
 }
 
-fn config_take_update(rx: &watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
+fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
     #[cfg(feature = "asupersync-runtime")]
     {
         rx.borrow_and_clone()
@@ -1098,7 +1098,7 @@ impl ObservationRuntime {
             if let Some(ref snap_config) = self.snapshot_config {
                 if snap_config.enabled {
                     let db_path = {
-                                                let db_path = Arc::new(self.storage.db_path().to_string());
+                        let db_path = Arc::new(self.storage.db_path().to_string());
                         db_path
                     };
                     let engine = Arc::new(crate::snapshot_engine::SnapshotEngine::new(
@@ -1291,7 +1291,7 @@ impl ObservationRuntime {
 
     /// Spawn the maintenance task.
     fn spawn_maintenance_task(&self, capture_tx: mpsc::Sender<CaptureEvent>) -> JoinHandle<()> {
-        let storage = Arc::clone(&self.storage);
+        let storage = self.storage.clone();
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let wezterm_handle = self.wezterm_handle.clone();
         let mut config_rx = self.config_rx.clone();
@@ -1363,7 +1363,7 @@ impl ObservationRuntime {
                         let cutoff_window_ms = cutoff_days.saturating_mul(24 * 60 * 60 * 1000);
                         let cutoff_ms = epoch_ms()
                             .saturating_sub(i64::try_from(cutoff_window_ms).unwrap_or(i64::MAX));
-                                                if let Err(e) = storage.retention_cleanup(cutoff_ms).await {
+                        if let Err(e) = storage.retention_cleanup(cutoff_ms).await {
                             error!(error = %e, "Retention cleanup failed");
                         } else {
                             debug!("Retention cleanup completed");
@@ -1372,7 +1372,6 @@ impl ObservationRuntime {
                         if let Err(e) = storage.purge_audit_actions_before(cutoff_ms).await {
                             error!(error = %e, "Audit purge failed");
                         }
-                        
                     }
                     last_retention_check = now;
                 }
@@ -1382,7 +1381,7 @@ impl ObservationRuntime {
                     && now.duration_since(last_checkpoint)
                         >= Duration::from_secs(u64::from(checkpoint_secs))
                 {
-                                        match storage.checkpoint().await {
+                    match storage.checkpoint().await {
                         Ok(result) => {
                             debug!(
                                 wal_pages = result.wal_pages,
@@ -1394,7 +1393,7 @@ impl ObservationRuntime {
                             error!(error = %e, "WAL checkpoint failed");
                         }
                     }
-                    
+
                     last_checkpoint = now;
                 }
 
@@ -1424,7 +1423,7 @@ impl ObservationRuntime {
                     let mut vacuumed = false;
                     let mut vacuum_error = None::<String>;
 
-                                        match storage.database_page_stats().await {
+                    match storage.database_page_stats().await {
                         Ok(stats) => {
                             page_count = stats.page_count;
                             free_pages = stats.free_pages;
@@ -1475,8 +1474,6 @@ impl ObservationRuntime {
                         })
                         .await;
 
-                    
-
                     info!(
                         active_panes = active_panes.len(),
                         cursor_removed = cursor_gc.removed_entries,
@@ -1526,10 +1523,9 @@ impl ObservationRuntime {
                     let capture_depth = capture_cap.saturating_sub(capture_tx.capacity());
 
                     let (write_depth, write_cap, db_writable) = {
-                                                let wd = storage.write_queue_depth();
+                        let wd = storage.write_queue_depth();
                         let wc = storage.write_queue_capacity();
-                        let writable = self.storage.is_writable().await;
-                        
+                        let writable = storage.is_writable().await;
                         (wd, wc, writable)
                     };
 
@@ -1650,8 +1646,7 @@ impl ObservationRuntime {
         let registry = Arc::clone(&self.registry);
         let cursors = Arc::clone(&self.cursors);
         let detection_contexts = Arc::clone(&self.detection_contexts);
-        let storage = Arc::clone(&self.storage);
-        let metrics = Arc::clone(&self.metrics);
+        let storage = self.storage.clone();
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let initial_interval = self.config.discovery_interval;
         let mut config_rx = self.config_rx.clone();
@@ -1731,12 +1726,12 @@ impl ObservationRuntime {
 
                             // Check if pane exists in storage to recover stable UUID
                             let stable_uuid = {
-                                                                let result =
+                                let result =
                                     storage.get_pane(pane_id).await.unwrap_or_else(|e| {
                                         warn!(pane_id, error = %e, "Failed to check storage for existing pane");
                                         None
                                     });
-                                
+
                                 result.and_then(|r| r.pane_uuid)
                             };
 
@@ -1757,17 +1752,14 @@ impl ObservationRuntime {
 
                             // Upsert pane in storage
                             let record = entry.to_pane_record();
-                                                        if let Err(e) = storage.upsert_pane(record).await {
+                            if let Err(e) = storage.upsert_pane(record).await {
                                 error!(pane_id = pane_id, error = %e, "Failed to upsert pane");
                             }
-                            
 
                             // Create cursor if observed
                             if entry.should_observe() {
                                 // Initialize cursor from storage to resume capture
-                                                                let max_seq =
-                                    storage.get_max_seq(pane_id).await.unwrap_or(None);
-                                
+                                let max_seq = storage.get_max_seq(pane_id).await.unwrap_or(None);
 
                                 let next_seq = max_seq.map_or(0, |s| s + 1);
 
@@ -2053,7 +2045,7 @@ impl ObservationRuntime {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let cursors = Arc::clone(&self.cursors);
         let detection_contexts = Arc::clone(&self.detection_contexts);
-        let storage = Arc::clone(&self.storage);
+        let storage = self.storage.clone();
         let metrics = Arc::clone(&self.metrics);
         let event_bus = self.event_bus.clone();
         let pane_filter = self.config.pane_filter.clone();
@@ -2269,7 +2261,7 @@ impl ObservationRuntime {
         cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
         registry: Arc<RwLock<PaneRegistry>>,
     ) -> JoinHandle<()> {
-        let storage = Arc::clone(&self.storage);
+        let storage = self.storage.clone();
         let pattern_engine = Arc::clone(&self.pattern_engine);
         let detection_contexts = Arc::clone(&self.detection_contexts);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
@@ -2321,7 +2313,7 @@ impl ObservationRuntime {
                 let captured_seq = bounded_segment.seq;
 
                 // Persist the segment
-                                match persist_captured_segment(&storage, &bounded_segment).await {
+                match persist_captured_segment(&storage, &bounded_segment).await {
                     Ok(persisted) => {
                         // Check for sequence discontinuity and resync cursor if needed
                         if persisted.segment.seq != captured_seq {
@@ -2488,7 +2480,6 @@ impl ObservationRuntime {
                         error!(pane_id = pane_id, error = %e, "Failed to persist segment");
                     }
                 }
-                
             }
         })
     }
@@ -2500,10 +2491,10 @@ impl ObservationRuntime {
 
     /// Take ownership of the storage handle for external shutdown.
     ///
-    /// Returns the storage handle wrapped in `Arc<Mutex>`. The caller is
-    /// responsible for shutdown. This invalidates the runtime.
+    /// Returns the storage handle. The caller is responsible for shutdown.
+    /// This invalidates the runtime.
     #[must_use]
-    pub fn take_storage(self) -> Arc<Mutex<StorageHandle>> {
+    pub fn take_storage(self) -> StorageHandle {
         self.storage
     }
 }
@@ -2514,7 +2505,7 @@ async fn handle_native_event(
     capture_tx: &mpsc::Sender<CaptureEvent>,
     cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
     detection_contexts: &Arc<RwLock<HashMap<u64, DetectionContext>>>,
-    storage: &Arc<Mutex<StorageHandle>>,
+    storage: &StorageHandle,
     event_bus: Option<&Arc<EventBus>>,
     pane_filter: &PaneFilterConfig,
 ) {
@@ -2799,8 +2790,8 @@ impl RuntimeHandle {
 
     /// Current write queue depth (pending commands for the storage writer thread).
     pub async fn write_queue_depth(&self) -> usize {
-                let depth = self.storage.write_queue_depth();
-        
+        let depth = self.storage.write_queue_depth();
+
         depth
     }
 
@@ -2883,10 +2874,9 @@ impl RuntimeHandle {
 
         // Flush storage
         {
-                        if let Err(e) = self.storage.shutdown().await {
+            if let Err(e) = self.storage.shutdown().await {
                 warnings.push(format!("Storage shutdown error: {e}"));
             }
-            
         }
 
         ShutdownSummary {
@@ -2960,10 +2950,10 @@ impl RuntimeHandle {
         let capture_cap = self.capture_queue_capacity();
 
         let (write_depth, write_cap, db_writable) = {
-                        let wd = storage.write_queue_depth();
-            let wc = storage.write_queue_capacity();
+            let wd = self.storage.write_queue_depth();
+            let wc = self.storage.write_queue_capacity();
             let writable = self.storage.is_writable().await;
-            
+
             (wd, wc, writable)
         };
 
@@ -3081,7 +3071,7 @@ impl RuntimeHandle {
     ///
     /// The caller is responsible for shutdown. This invalidates the runtime.
     #[must_use]
-    pub fn take_storage(self) -> Arc<Mutex<StorageHandle>> {
+    pub fn take_storage(self) -> StorageHandle {
         self.storage
     }
 
@@ -3107,8 +3097,6 @@ impl RuntimeHandle {
         self.config_tx.borrow().clone()
     }
 }
-
-
 
 #[allow(clippy::cast_precision_loss)]
 fn bytes_to_mib(bytes: u64) -> f64 {

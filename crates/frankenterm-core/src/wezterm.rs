@@ -1186,7 +1186,13 @@ impl WeztermClient {
         };
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            const MAX_ERROR_BYTES: usize = 8 * 1024;
+            let stderr_bytes = if output.stderr.len() > MAX_ERROR_BYTES {
+                &output.stderr[..MAX_ERROR_BYTES]
+            } else {
+                &output.stderr
+            };
+            let stderr = String::from_utf8_lossy(stderr_bytes);
             let stderr_str = stderr.to_string();
 
             // Categorize common error patterns

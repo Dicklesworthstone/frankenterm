@@ -230,6 +230,15 @@ impl<T> SpscConsumer<T> {
     }
 }
 
+impl<T> Drop for SpscConsumer<T> {
+    fn drop(&mut self) {
+        if !self.shared.closed.swap(true, Ordering::AcqRel) {
+            self.shared.not_empty.notify_waiters();
+            self.shared.not_full.notify_waiters();
+        }
+    }
+}
+
 /// Producer side of the SPMC broadcast channel.
 pub struct SpmcProducer<T> {
     shared: Arc<SpmcShared<T>>,
@@ -399,8 +408,21 @@ impl<T> SpmcConsumer<T> {
 
     /// Index of this consumer in the channel.
     #[must_use]
-    pub const fn consumer_index(&self) -> usize {
+    pub fn id(&self) -> usize {
         self.consumer_idx
+    }
+}
+
+impl<T> Drop for SpmcConsumer<T> {
+    fn drop(&mut self) {
+        if !self.shared.closed.swap(true, Ordering::AcqRel) {
+            for notify in &self.shared.not_empty {
+                notify.notify_waiters();
+            }
+            for notify in &self.shared.not_full {
+                notify.notify_waiters();
+            }
+        }
     }
 }
 

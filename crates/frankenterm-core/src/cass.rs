@@ -587,7 +587,12 @@ impl CassClient {
 
         if !output.status.success() {
             let status = output.status.code().unwrap_or(-1);
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr_bytes = if output.stderr.len() > self.max_error_bytes {
+                &output.stderr[..self.max_error_bytes]
+            } else {
+                &output.stderr
+            };
+            let stderr = String::from_utf8_lossy(stderr_bytes).to_string();
             let stderr_preview = redact_and_truncate(&stderr, self.max_error_bytes);
             return Err(CassError::NonZeroExit {
                 status,
