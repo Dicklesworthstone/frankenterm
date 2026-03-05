@@ -1126,47 +1126,15 @@ impl TerminalState {
     /// If the cursor is at the bottom margin, the page scrolls up.
     fn c1_index(&mut self) {
         if self.left_and_right_margins.contains(&self.cursor.x) {
-            if self.cursor.y == self.top_and_bottom_margins.end - 1 {
-                self.scroll_up(1);
+            if self.cursor.y == self.top_and_bottom_margins.start {
+                self.scroll_down(1);
             } else {
                 self.set_cursor_pos(&Position::Relative(0), &Position::Relative(1));
             }
         }
     }
 
-    /// Moves the cursor to the first position on the next line.
-    /// If the cursor is at the bottom margin, the page scrolls up.
-    fn c1_nel(&mut self) {
-        let y_clamp = if self.top_and_bottom_margins.contains(&self.cursor.y) {
-            self.top_and_bottom_margins.end - 1
-        } else {
-            self.screen().physical_rows as VisibleRowIndex - 1
-        };
-
-        if self.left_and_right_margins.contains(&self.cursor.x) {
-            if self.cursor.y == self.top_and_bottom_margins.end - 1 {
-                self.scroll_up(1);
-                self.set_cursor_position_absolute(self.left_and_right_margins.start, self.cursor.y);
-            } else {
-                self.set_cursor_position_absolute(
-                    self.left_and_right_margins.start,
-                    (self.cursor.y + 1).min(y_clamp),
-                );
-            }
-        } else {
-            // When outside left/right margins, NEL moves but does not scroll
-            self.set_cursor_position_absolute(
-                if self.cursor.x < self.left_and_right_margins.start {
-                    self.cursor.x
-                } else {
-                    self.left_and_right_margins.start
-                },
-                (self.cursor.y + 1).min(y_clamp),
-            );
-        }
-    }
-
-    /// Sets a horizontal tab stop at the column where the cursor is.
+    /// Sets a horizontal tab stop at the current cursor position.
     fn c1_hts(&mut self) {
         self.tabs.set_tab_stop(self.cursor.x);
     }
@@ -1194,6 +1162,10 @@ impl TerminalState {
                 self.set_cursor_pos(&Position::Relative(0), &Position::Relative(-1));
             }
         }
+    }
+
+    fn c1_nel(&mut self) {
+        self.new_line(true);
     }
 
     fn set_hyperlink(&mut self, link: Option<Hyperlink>) {
@@ -1406,7 +1378,9 @@ impl TerminalState {
             Mode::QueryDecPrivateMode(DecPrivateMode::Code(code)) => (true, code.to_u16().unwrap()),
             Mode::QueryDecPrivateMode(DecPrivateMode::Unspecified(code)) => (true, *code),
             Mode::QueryMode(TerminalMode::Code(code)) => (false, code.to_u16().unwrap()),
-            Mode::QueryMode(TerminalMode::Unspecified(code)) => (false, *code),
+            Mode::QueryMode(TerminalMode::Unspecified(code)) => {
+                unreachable!("unhandled {:?}", mode);
+            }
             _ => unreachable!(),
         };
 
@@ -2187,10 +2161,10 @@ impl TerminalState {
                 if self.top_and_bottom_margins.contains(&self.cursor.y)
                     && self.left_and_right_margins.contains(&self.cursor.x)
                 {
+                    let bidi_mode = self.get_bidi_mode();
                     let top_and_bottom_margins = self.cursor.y..self.top_and_bottom_margins.end;
                     let left_and_right_margins = self.left_and_right_margins.clone();
                     let blank_attr = self.pen.clone_sgr_only();
-                    let bidi_mode = self.get_bidi_mode();
                     self.screen_mut().scroll_up_within_margins(
                         &top_and_bottom_margins,
                         &left_and_right_margins,
@@ -2247,10 +2221,10 @@ impl TerminalState {
                 if self.top_and_bottom_margins.contains(&y)
                     && self.left_and_right_margins.contains(&x)
                 {
-                    let margin = self.left_and_right_margins.end;
+                    let right_margin = self.left_and_right_margins.end;
                     let screen = self.screen_mut();
                     for _ in 0..n as usize {
-                        screen.insert_cell(x, y, margin, seqno);
+                        screen.insert_cell(x, y, right_margin, seqno);
                     }
                 }
             }
@@ -2360,6 +2334,11 @@ impl TerminalState {
 
             // DECSLRM moves the cursor to column 1, line 1 of the page.
             self.set_cursor_pos(&Position::Absolute(0), &Position::Absolute(0));
+            log::debug!(
+                "SetLeftAndRightMargins {:?} (and move cursor to top left: {:?})",
+                self.left_and_right_margins,
+                self.cursor
+            );
         }
     }
 

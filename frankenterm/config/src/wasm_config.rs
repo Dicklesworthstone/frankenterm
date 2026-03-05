@@ -348,6 +348,11 @@ mod tests {
 
     #[test]
     fn try_load_returns_none_when_no_wasm_exists() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", dir.path());
+        let _xdg_guard = EnvVarGuard::set("XDG_CONFIG_HOME", dir.path());
+
         let evaluator: Box<WasmEvaluatorFn> = Box::new(|_| panic!("should not be called"));
         let result = try_load_wasm_config(&Value::default(), &*evaluator);
         // Unless someone has a frankenterm.wasm in their config dir, should be None

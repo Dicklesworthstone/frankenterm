@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use frankenterm_core::connector_host_runtime::{ConnectorCapability, ConnectorLifecyclePhase};
 use frankenterm_core::connector_lifecycle::*;
-use frankenterm_core::connector_registry::{ConnectorManifest, TrustPolicy};
+use frankenterm_core::connector_registry::ConnectorManifest;
 use proptest::prelude::*;
 
 // =============================================================================
@@ -62,9 +62,8 @@ fn arb_connector_id() -> impl Strategy<Value = String> {
 }
 
 fn arb_version() -> impl Strategy<Value = String> {
-    (1u32..10, 0u32..20, 0u32..50).prop_map(|(major, minor, patch)| {
-        format!("{major}.{minor}.{patch}")
-    })
+    (1u32..10, 0u32..20, 0u32..50)
+        .prop_map(|(major, minor, patch)| format!("{major}.{minor}.{patch}"))
 }
 
 fn test_manifest(id: &str, version: &str) -> ConnectorManifest {

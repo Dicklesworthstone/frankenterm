@@ -10616,6 +10616,9 @@ async fn run_distributed_agent(
         .with_wezterm_handle(wezterm_handle);
     let handle = Arc::new(runtime.start().await?);
     tracing::info!("Distributed agent observation runtime started");
+    let shared_storage = Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+        handle.storage.clone(),
+    ));
 
     let connect_addr = connect.unwrap_or_else(|| config.distributed.bind_addr.clone());
     let agent_id = explicit_agent_id
@@ -10630,7 +10633,7 @@ async fn run_distributed_agent(
         frankenterm_core::runtime_compat::task::spawn(distributed_agent_stream_forever(
             connect_addr.clone(),
             config.distributed.clone(),
-            Arc::clone(&handle.storage),
+            Arc::clone(&shared_storage),
             Arc::clone(&event_bus),
             Arc::clone(&handle.shutdown_flag),
             agent_id.clone(),
@@ -11228,13 +11231,16 @@ async fn run_watcher(
         .with_wezterm_handle(wezterm_handle.clone());
     let handle = Arc::new(runtime.start().await?);
     tracing::info!("Observation runtime started");
+    let shared_storage = Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+        handle.storage.clone(),
+    ));
 
     #[cfg(feature = "distributed")]
     let distributed_listener_handle = if config.distributed.enabled {
         Some(
             spawn_distributed_listener(
                 config.distributed.clone(),
-                Arc::clone(&handle.storage),
+                Arc::clone(&shared_storage),
                 Arc::clone(&event_bus),
                 Arc::clone(&handle.shutdown_flag),
             )
@@ -11324,7 +11330,7 @@ async fn run_watcher(
             let rpc_handler = Some(build_ipc_rpc_handler(
                 layout.root.clone(),
                 config_path_buf.clone(),
-                Arc::clone(&handle.storage),
+                Arc::clone(&shared_storage),
             ));
             match frankenterm_core::ipc::IpcServer::bind_with_permissions(
                 &layout.ipc_socket_path,
@@ -11376,7 +11382,7 @@ async fn run_watcher(
         let backup_config = config.backup.scheduled.clone();
         let workspace_root = layout.root.clone();
         let db_path = layout.db_path.clone();
-        let storage = Arc::clone(&handle.storage);
+        let storage = Arc::clone(&shared_storage);
         let shutdown_flag = Arc::clone(&handle.shutdown_flag);
         let notify_config = config.notifications.desktop.clone();
         Some(frankenterm_core::runtime_compat::task::spawn(async move {

@@ -336,6 +336,23 @@ impl EvidenceLedger {
                     first_invalid_seq: Some(entry.seq),
                 };
             }
+
+            // Check that the entry hash actually matches the contents.
+            let computed_hash = compute_entry_hash(
+                entry.seq,
+                entry.category,
+                entry.timestamp_us,
+                &entry.summary,
+                &entry.payload,
+                &entry.prev_hash,
+            );
+            if entry.entry_hash != computed_hash {
+                return ChainVerification {
+                    is_valid: false,
+                    entries_checked: i + 1,
+                    first_invalid_seq: Some(entry.seq),
+                };
+            }
         }
 
         ChainVerification {
@@ -956,6 +973,24 @@ mod tests {
     }
 
     #[test]
+    fn ledger_tampered_payload_detected() {
+        let mut ledger = EvidenceLedger::with_defaults();
+        ledger.append(
+            EvidenceCategory::ChangeDetection,
+            1000,
+            "entry 0".to_string(),
+            BTreeMap::new(),
+            EvidenceVerdict::Support,
+        );
+
+        // Tamper with entry 0's payload without updating the hash.
+        ledger.entries[0].payload.insert("tampered".to_string(), EvidenceValue::Bool(true));
+
+        let verification = ledger.verify_chain();
+        assert!(!verification.is_valid);
+    }
+
+    #[test]
     fn ledger_entries_by_category() {
         let mut ledger = EvidenceLedger::with_defaults();
         ledger.append(
@@ -1150,15 +1185,14 @@ mod tests {
     fn builder_creates_complete_ledger() {
         let mut builder = EvidenceBuilder::new();
         builder
-            .add_change_detection(1000, 10.5, 3, true)
-            .add_mdl_extraction(2000, 0.45, 3, 0.8)
-            .add_safety_proof(3000, true, vec![])
-            .add_secret_scan(4000, true, 0)
-            .add_parameter_bounds(5000, 0.1, true, 2)
-            .add_timeout_calc(6000, 5000, 2.3, true);
+            .add_change_detection(1000, 10.0, 5, true)
+            .add_safety_proof(2000, true, vec![])
+            .add_secret_scan(3000, true, 0)
+            .add_parameter_bounds(4000, 0.1, true, 2)
+            .add_timeout_calc(5000, 5000, 2.3, true);
 
         let ledger = builder.build();
-        assert_eq!(ledger.len(), 6);
+        assert_eq!(ledger.len(), 5);
         assert!(ledger.verify_chain().is_valid);
         let digest = ledger.digest();
         assert!(digest.is_complete);

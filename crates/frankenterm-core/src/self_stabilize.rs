@@ -43,9 +43,7 @@ pub enum ReconcileMessage {
         depth: usize,
         hashes: Vec<MerkleHash>,
     },
-    /// Phase 3: Send full diff of divergent entries.
-    Diff(TreeDiff),
-    /// Phase 4: Send authoritative entries for reconciliation.
+    /// Phase 3: Send authoritative entries for reconciliation.
     Patch(Vec<(Vec<u8>, Option<Vec<u8>>)>),
     /// Protocol complete — states match.
     Converged,
@@ -60,8 +58,6 @@ pub enum RoundResult {
     SendMessage(ReconcileMessage),
     /// Apply these patches to converge.
     ApplyPatch(Vec<(Vec<u8>, Option<Vec<u8>>)>),
-    /// Remove these keys to converge.
-    RemoveKeys(Vec<Vec<u8>>),
     /// Reconciliation complete after applying changes.
     Done,
 }
@@ -176,7 +172,6 @@ impl ReconcileSession {
             ReconcileMessage::LevelHashes { depth, hashes } => {
                 self.handle_level_hashes(*depth, hashes)
             }
-            ReconcileMessage::Diff(diff) => self.handle_diff(diff),
             ReconcileMessage::Patch(entries) => self.handle_patch(entries),
             ReconcileMessage::Converged => {
                 self.phase = Phase::Converged;
@@ -253,20 +248,6 @@ impl ReconcileSession {
                 .map(|(k, v)| (k.to_vec(), Some(v.to_vec())))
                 .collect();
             RoundResult::SendMessage(ReconcileMessage::Patch(entries))
-        }
-    }
-
-    fn handle_diff(&mut self, diff: &TreeDiff) -> RoundResult {
-        if !self.is_authority {
-            // We received a diff telling us what changed.
-            // Apply: remove our removed keys, note added/changed keys.
-            let mut remove_keys = diff.removed.clone();
-            remove_keys.extend(diff.changed.iter().cloned());
-            self.phase = Phase::Patching;
-            RoundResult::RemoveKeys(remove_keys)
-        } else {
-            self.phase = Phase::Patching;
-            RoundResult::Done
         }
     }
 
@@ -708,7 +689,6 @@ mod tests {
                 depth: 2,
                 hashes: vec![MerkleHash::from_bytes([0x22; 32])],
             },
-            ReconcileMessage::Diff(MerkleTree::new().diff(&MerkleTree::new())),
             ReconcileMessage::Patch(vec![(b"key".to_vec(), Some(b"val".to_vec()))]),
             ReconcileMessage::Converged,
         ];
@@ -727,7 +707,6 @@ mod tests {
             RoundResult::AlreadyConverged,
             RoundResult::Done,
             RoundResult::ApplyPatch(vec![]),
-            RoundResult::RemoveKeys(vec![]),
         ];
         for r in &results {
             let dbg = format!("{:?}", r);

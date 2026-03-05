@@ -260,10 +260,12 @@ impl SearchBridge {
 
         cancel_done.store(true, Ordering::Release);
         if let Some(handle) = cancel_thread {
+            handle.thread().unpark();
             let _ = handle.join();
         }
         timeout_done.store(true, Ordering::Release);
         if let Some(handle) = timeout_thread {
+            handle.thread().unpark();
             let _ = handle.join();
         }
 
@@ -353,6 +355,7 @@ impl SearchBridge {
 
                 cancel_done.store(true, Ordering::Release);
                 if let Some(handle) = cancel_thread {
+                    handle.thread().unpark();
                     let _ = handle.join();
                 }
 
@@ -400,6 +403,7 @@ impl SearchBridge {
 
         timeout_done.store(true, Ordering::Release);
         if let Some(handle) = timeout_thread {
+            handle.thread().unpark();
             let _ = handle.join();
         }
 

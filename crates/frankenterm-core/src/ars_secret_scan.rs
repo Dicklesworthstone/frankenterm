@@ -242,7 +242,18 @@ impl ArsSecretScanner {
             // Extract surrounding context (up to 10 chars before, 20 after).
             let ctx_start = mat.start().saturating_sub(10);
             let ctx_end = (mat.end() + 20).min(text.len());
-            let context = &text[ctx_start..ctx_end];
+            
+            let mut safe_start = ctx_start;
+            while safe_start > 0 && !text.is_char_boundary(safe_start) {
+                safe_start -= 1;
+            }
+            
+            let mut safe_end = ctx_end;
+            while safe_end < text.len() && !text.is_char_boundary(safe_end) {
+                safe_end += 1;
+            }
+            
+            let context = &text[safe_start..safe_end];
 
             findings.push(ScanFinding {
                 pattern_name: pattern_name.to_string(),
@@ -494,12 +505,13 @@ fn is_trivially_low_entropy(token: &str) -> bool {
 
 /// Redact the middle of a context string, keeping only the edges.
 fn redact_context(context: &str) -> String {
-    if context.len() <= 8 {
+    let chars: Vec<char> = context.chars().collect();
+    if chars.len() <= 8 {
         return "[REDACTED]".to_string();
     }
-    let prefix = &context[..4];
-    let suffix_start = context.len().saturating_sub(4);
-    let suffix = &context[suffix_start..];
+    let prefix: String = chars[..4].iter().collect();
+    let suffix_start = chars.len().saturating_sub(4);
+    let suffix: String = chars[suffix_start..].iter().collect();
     format!("{}...{}", prefix, suffix)
 }
 
@@ -662,6 +674,14 @@ mod tests {
         let result = redact_context("hello world, this is a test");
         assert!(result.starts_with("hell"));
         assert!(result.ends_with("test"));
+        assert!(result.contains("..."));
+    }
+
+    #[test]
+    fn redact_multibyte_context() {
+        let result = redact_context("🦀🦀🦀🦀...secret...🦀🦀🦀🦀");
+        assert!(result.starts_with("🦀🦀🦀🦀"));
+        assert!(result.ends_with("🦀🦀🦀🦀"));
         assert!(result.contains("..."));
     }
 
@@ -1140,5 +1160,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn context_slice_multibyte_safety() {
+        let scanner = default_scanner();
+        // 🦀 is 4 bytes. `sk-` will be matched. mat.start() will be 12.
+        // ctx_start = 12 - 10 = 2, which is inside the first 🦀.
+        // It must not panic!
+        let cmds = vec![make_cmd(0, "🦀🦀🦀sk-live-123", Some(0))];
+        let verdict = scanner.scan_commands(&cmds);
+        assert!(verdict.is_contaminated());
     }
 }

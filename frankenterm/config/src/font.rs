@@ -365,7 +365,9 @@ pub struct FontAttributes {
     /// Whether the font should be an italic variant
     #[dynamic(default)]
     pub style: FontStyle,
+    #[dynamic(default)]
     pub is_fallback: bool,
+    #[dynamic(default)]
     pub is_synthetic: bool,
 
     #[dynamic(default)]

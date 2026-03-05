@@ -1596,10 +1596,6 @@ const COMMAND_TOKENS: &[&str] = &[
     "mke2fs",
 ];
 
-fn first_nonempty_line(text: &str) -> Option<&str> {
-    text.lines().find(|line| !line.trim().is_empty())
-}
-
 const TRAUMA_BYPASS_ENV: &str = "FT_BYPASS_TRAUMA";
 const TRAUMA_LOOP_BLOCK_RULE_ID: &str = "policy.trauma_guard.loop_block";
 const TRAUMA_FEEDBACK_PREFIX: &str = "[ft::TraumaGuard]";
@@ -1607,88 +1603,86 @@ const TRAUMA_FEEDBACK_PREFIX: &str = "[ft::TraumaGuard]";
 /// Determine whether the text looks like a shell command
 #[must_use]
 pub fn is_command_candidate(text: &str) -> bool {
-    let Some(line) = first_nonempty_line(text) else {
-        return false;
-    };
-
-    let mut trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        return false;
-    }
-
-    if let Some(stripped) = trimmed.strip_prefix('$') {
-        trimmed = stripped.trim_start();
-    }
-
-    // Also strip leading parens (subshells) and braces (blocks)
-    loop {
-        if let Some(stripped) = trimmed.strip_prefix('(') {
-            trimmed = stripped.trim_start();
+    for line in text.lines() {
+        let mut trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if let Some(stripped) = trimmed.strip_prefix('{') {
+
+        if let Some(stripped) = trimmed.strip_prefix('$') {
             trimmed = stripped.trim_start();
-            continue;
-        }
-        break;
-    }
-
-    // Check for special shell characters before stripping variable assignments
-    // because variable assignments might contain subshells (e.g. FOO=$(rm -rf /))
-    // which should be treated as command candidates.
-    if trimmed.contains("&&")
-        || trimmed.contains("||")
-        || trimmed.contains('|')
-        || trimmed.contains('>')
-        || trimmed.contains(';')
-        || trimmed.contains("$(")
-        || trimmed.contains('`')
-    {
-        return true;
-    }
-
-    // Strip leading variable assignments (e.g. FOO=bar, FOO="a b")
-    while let Some(mat) = VAR_ASSIGN.find(trimmed) {
-        trimmed = &trimmed[mat.end()..];
-    }
-
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    // Helper to check if a token matches any known command, handling paths
-    let is_match = |token: &str| {
-        let clean_token = token.replace(['"', '\''], "");
-        let lower = clean_token.to_ascii_lowercase();
-
-        // Always treat path-like tokens as candidates (e.g. ./script.sh, /bin/destroy)
-        // We defer to DCG to determine if the script/binary is actually dangerous.
-        if lower.contains('/') || lower.contains('\\') {
-            return true;
         }
 
-        // For bare commands, check the known token list
-        if COMMAND_TOKENS.contains(&lower.as_str()) {
-            return true;
-        }
-
-        // Prefix match for things like mkfs.ext4, docker-compose, etc.
-        COMMAND_TOKENS.iter().any(|&cmd| {
-            if let Some(rest) = lower.strip_prefix(cmd) {
-                // If it starts with the command, the next character must be non-alphanumeric
-                // (e.g., . in mkfs.ext4, - in docker-compose) to prevent matching "good" with "go"
-                rest.starts_with(|c: char| !c.is_alphanumeric())
-            } else {
-                false
+        // Also strip leading parens (subshells) and braces (blocks)
+        loop {
+            if let Some(stripped) = trimmed.strip_prefix('(') {
+                trimmed = stripped.trim_start();
+                continue;
             }
-        })
-    };
+            if let Some(stripped) = trimmed.strip_prefix('{') {
+                trimmed = stripped.trim_start();
+                continue;
+            }
+            break;
+        }
 
-    let mut parts = trimmed.split_whitespace();
-    let token = parts.next().unwrap_or("");
+        // Check for special shell characters before stripping variable assignments
+        // because variable assignments might contain subshells (e.g. FOO=$(rm -rf /))
+        // which should be treated as command candidates.
+        if trimmed.contains("&&")
+            || trimmed.contains("||")
+            || trimmed.contains('|')
+            || trimmed.contains('>')
+            || trimmed.contains(';')
+            || trimmed.contains("$(")
+            || trimmed.contains('`')
+        {
+            return true;
+        }
 
-    if is_match(token) {
-        return true;
+        // Strip leading variable assignments (e.g. FOO=bar, FOO="a b")
+        while let Some(mat) = VAR_ASSIGN.find(trimmed) {
+            trimmed = &trimmed[mat.end()..];
+        }
+
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Helper to check if a token matches any known command, handling paths
+        let is_match = |token: &str| {
+            let clean_token = token.replace(['"', '\''], "");
+            let lower = clean_token.to_ascii_lowercase();
+
+            // Always treat path-like tokens as candidates (e.g. ./script.sh, /bin/destroy)
+            // We defer to DCG to determine if the script/binary is actually dangerous.
+            if lower.contains('/') || lower.contains('\\') {
+                return true;
+            }
+
+            // For bare commands, check the known token list
+            if COMMAND_TOKENS.contains(&lower.as_str()) {
+                return true;
+            }
+
+            // Prefix match for things like mkfs.ext4, docker-compose, etc.
+            COMMAND_TOKENS.iter().any(|&cmd| {
+                if let Some(rest) = lower.strip_prefix(cmd) {
+                    // If it starts with the command, the next character must be non-alphanumeric
+                    // (e.g., . in mkfs.ext4, - in docker-compose) to prevent matching "good" with "go"
+                    rest.starts_with(|c: char| !c.is_alphanumeric())
+                } else {
+                    false
+                }
+            })
+        };
+
+        let mut parts = trimmed.split_whitespace();
+        let token = parts.next().unwrap_or("");
+
+        if is_match(token) {
+            return true;
+        }
     }
 
     false
@@ -1696,29 +1690,29 @@ pub fn is_command_candidate(text: &str) -> bool {
 
 #[must_use]
 fn has_trauma_bypass_prefix(text: &str) -> bool {
-    let Some(line) = first_nonempty_line(text) else {
-        return false;
-    };
-
-    let mut trimmed = line.trim_start();
-    if let Some(stripped) = trimmed.strip_prefix('$') {
-        trimmed = stripped.trim_start();
-    }
-
-    let mut found_bypass = false;
-
-    while let Some(mat) = VAR_ASSIGN.find(trimmed) {
-        let assignment = &trimmed[..mat.end()];
-        if assignment.contains("FT_BYPASS_TRAUMA=1") 
-            || assignment.contains("FT_BYPASS_TRAUMA=\"1\"") 
-            || assignment.contains("FT_BYPASS_TRAUMA='1'") 
-        {
-            found_bypass = true;
+    for line in text.lines() {
+        let mut trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
         }
-        trimmed = &trimmed[mat.end()..];
+
+        if let Some(stripped) = trimmed.strip_prefix('$') {
+            trimmed = stripped.trim_start();
+        }
+
+        while let Some(mat) = VAR_ASSIGN.find(trimmed) {
+            let assignment = &trimmed[..mat.end()];
+            if assignment.contains("FT_BYPASS_TRAUMA=1") 
+                || assignment.contains("FT_BYPASS_TRAUMA=\"1\"") 
+                || assignment.contains("FT_BYPASS_TRAUMA='1'") 
+            {
+                return true;
+            }
+            trimmed = &trimmed[mat.end()..];
+        }
     }
 
-    found_bypass
+    false
 }
 
 #[must_use]
@@ -1735,18 +1729,6 @@ fn trauma_feedback_comment(decision: &PolicyDecision) -> Option<String> {
     Some(format!(
         "# {TRAUMA_FEEDBACK_PREFIX} EXECUTION BLOCKED: {normalized_reason}. Next: fix-forward (edit code/tests) or prefix with {TRAUMA_BYPASS_ENV}=1 once."
     ))
-}
-
-#[must_use]
-fn is_shell_identifier(key: &str) -> bool {
-    let mut chars = key.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 #[derive(Debug)]

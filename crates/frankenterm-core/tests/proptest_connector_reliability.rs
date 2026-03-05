@@ -33,28 +33,6 @@ fn arb_error_kind() -> impl Strategy<Value = ConnectorErrorKind> {
     ]
 }
 
-fn arb_action_kind() -> impl Strategy<Value = ConnectorActionKind> {
-    prop_oneof![
-        Just(ConnectorActionKind::Notify),
-        Just(ConnectorActionKind::Ticket),
-        Just(ConnectorActionKind::TriggerWorkflow),
-        Just(ConnectorActionKind::AuditLog),
-        Just(ConnectorActionKind::Invoke),
-        Just(ConnectorActionKind::CredentialAction),
-    ]
-}
-
-fn arb_action(connector: &str) -> impl Strategy<Value = ConnectorAction> {
-    let conn = connector.to_string();
-    arb_action_kind().prop_map(move |kind| ConnectorAction {
-        target_connector: conn.clone(),
-        action_kind: kind,
-        correlation_id: format!("corr-test"),
-        params: serde_json::json!({"test": true}),
-        created_at_ms: 1000,
-    })
-}
-
 fn arb_non_empty_string() -> impl Strategy<Value = String> {
     "[a-z][a-z0-9_]{1,15}".prop_map(String::from)
 }

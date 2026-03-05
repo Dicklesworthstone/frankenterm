@@ -233,7 +233,7 @@ impl<T> RingBuffer<T> {
     /// Total items that were overwritten.
     #[must_use]
     pub fn total_evicted(&self) -> u64 {
-        self.total.saturating_sub(self.capacity as u64)
+        self.telemetry.overwrites
     }
 
     /// Clear all items.

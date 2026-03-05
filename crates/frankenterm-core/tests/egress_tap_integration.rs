@@ -129,7 +129,7 @@ where
 #[test]
 fn egress_tap_fires_on_delta_capture() {
     run_async_test(async {
-        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
+        let (tx, rx) = mpsc::channel::<CaptureEvent>(16);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -193,7 +193,7 @@ fn egress_tap_fires_on_delta_capture() {
 #[test]
 fn egress_tap_captures_gap_segments() {
     run_async_test(async {
-        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
+        let (tx, rx) = mpsc::channel::<CaptureEvent>(16);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -251,7 +251,7 @@ fn egress_noop_tap_compiles_as_shared() {
 #[test]
 fn egress_tap_multi_pane() {
     run_async_test(async {
-        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
+        let (tx, rx) = mpsc::channel::<CaptureEvent>(16);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -293,7 +293,7 @@ fn egress_tap_multi_pane() {
 #[test]
 fn egress_tap_not_set_still_works() {
     run_async_test(async {
-        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
+        let (tx, rx) = mpsc::channel::<CaptureEvent>(16);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -333,7 +333,7 @@ fn egress_tap_not_set_still_works() {
 #[test]
 fn egress_monotonic_sequence() {
     run_async_test(async {
-        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(16);
+        let (tx, rx) = mpsc::channel::<CaptureEvent>(16);
         let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
         let registry = Arc::new(RwLock::new(PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));

@@ -62,20 +62,21 @@ impl Default for ClusteringConfig {
 /// hash of all shingles. Hash functions are of the form `h(x) = (a*x + b) mod p`
 /// where `p` is a large prime and `(a, b)` are per-function coefficients.
 fn minhash_signature(shingles: &[u64], num_hashes: usize) -> Vec<u64> {
-    const PRIME: u64 = 0xFFFF_FFFF_FFFF_FFC5; // large prime near u64::MAX
     let mut signature = vec![u64::MAX; num_hashes];
 
     for (i, sig) in signature.iter_mut().enumerate() {
-        // Coefficients derived deterministically from hash index
+        // Coefficients derived deterministically from hash index.
+        // Force 'a' to be odd so that multiplication modulo 2^64 is a true bijection.
         let a = (i as u64)
             .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1);
+            .wrapping_add(1) | 1;
         let b = (i as u64)
             .wrapping_mul(1_442_695_040_888_963_407)
             .wrapping_add(7);
 
         for &shingle in shingles {
-            let h = a.wrapping_mul(shingle).wrapping_add(b) % PRIME;
+            // Permute the shingle hash using the affine transformation modulo 2^64.
+            let h = a.wrapping_mul(shingle).wrapping_add(b);
             if h < *sig {
                 *sig = h;
             }
