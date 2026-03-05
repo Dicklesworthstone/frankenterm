@@ -8,7 +8,9 @@
 //! - Beads bridge: JSONL roundtrip integrity, status mapping completeness
 //! - Snapshot/restore: queue state survives serialization roundtrips
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::thread::sleep;
+use std::time::Duration;
 
 use proptest::prelude::*;
 
@@ -63,6 +65,15 @@ fn work_item_no_deps() -> impl Strategy<Value = WorkItem> {
     (work_item_id(), priority()).prop_map(|(id, prio)| make_item(&id, prio))
 }
 
+fn bead_status() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("open".to_string()),
+        Just("in_progress".to_string()),
+        Just("closed".to_string()),
+        Just("cancelled".to_string()),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // DAG invariant: blocked items never become ready while deps are incomplete
 // ---------------------------------------------------------------------------
@@ -98,6 +109,39 @@ proptest! {
         prop_assert_eq!(q.item_status(&"leaf".into()), Some(WorkItemStatus::Ready));
     }
 
+    #[test]
+    fn dag_fanin_requires_all_dependencies_before_ready(
+        left_prio in priority(),
+        right_prio in priority(),
+        sink_prio in priority(),
+        complete_left_first in any::<bool>(),
+    ) {
+        let mut q = SwarmWorkQueue::with_defaults();
+        q.enqueue(make_item("left", left_prio)).unwrap();
+        q.enqueue(make_item("right", right_prio)).unwrap();
+        q.enqueue(make_dep_item("sink", sink_prio, vec!["left", "right"])).unwrap();
+
+        prop_assert_eq!(q.item_status(&"sink".into()), Some(WorkItemStatus::Blocked));
+
+        let (first, second) = if complete_left_first {
+            ("left", "right")
+        } else {
+            ("right", "left")
+        };
+
+        q.assign(&first.into(), &"agent".into()).unwrap();
+        q.complete(&first.into(), &"agent".into(), None).unwrap();
+        prop_assert_eq!(
+            q.item_status(&"sink".into()),
+            Some(WorkItemStatus::Blocked),
+            "sink must remain blocked until both deps complete"
+        );
+
+        q.assign(&second.into(), &"agent".into()).unwrap();
+        q.complete(&second.into(), &"agent".into(), None).unwrap();
+        prop_assert_eq!(q.item_status(&"sink".into()), Some(WorkItemStatus::Ready));
+    }
+
     // -----------------------------------------------------------------------
     // Cycle rejection: adding deps that would create a cycle always fails
     // -----------------------------------------------------------------------
@@ -107,6 +151,44 @@ proptest! {
         let q = SwarmWorkQueue::with_defaults();
         let has_cycle = q.would_create_cycle(&id, &[id.clone()]);
         prop_assert!(has_cycle, "self-loop must be detected as cycle");
+    }
+
+    #[test]
+    fn cycle_detection_rejects_back_edges_in_linear_chain(
+        chain_len in 2usize..8,
+        back_edge_to in 1usize..8,
+    ) {
+        prop_assume!(back_edge_to < chain_len);
+        let mut q = SwarmWorkQueue::with_defaults();
+
+        // Build n-0 <- n-1 <- ... <- n-(len-1)
+        for i in 0..chain_len {
+            let id = format!("n-{i}");
+            let deps = if i == 0 {
+                vec![]
+            } else {
+                vec![format!("n-{}", i - 1)]
+            };
+            q.enqueue(WorkItem {
+                id: id.clone(),
+                title: id,
+                priority: i as u32,
+                depends_on: deps,
+                effort: 1,
+                labels: Vec::new(),
+                preferred_program: None,
+                metadata: HashMap::new(),
+            })
+            .unwrap();
+        }
+
+        // Adding dependency n-(k-1) -> n-k creates cycle because n-k already depends on n-(k-1).
+        let from = format!("n-{}", back_edge_to - 1);
+        let to = format!("n-{back_edge_to}");
+        prop_assert!(
+            q.would_create_cycle(&from, &[to]),
+            "back-edge must be rejected as cycle"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -147,6 +229,37 @@ proptest! {
         prop_assert_eq!(pulled_item.priority, min_priority);
     }
 
+    #[test]
+    fn anti_starvation_enabled_without_elapsed_wait_still_respects_priority(
+        items in prop::collection::vec(work_item_no_deps(), 2..8)
+    ) {
+        let config = WorkQueueConfig {
+            anti_starvation: true,
+            starvation_threshold_ms: u64::MAX,
+            ..Default::default()
+        };
+        let mut q = SwarmWorkQueue::new(config);
+
+        let mut seen = HashSet::new();
+        let unique_items: Vec<WorkItem> = items
+            .into_iter()
+            .filter(|item| seen.insert(item.id.clone()))
+            .collect();
+
+        if unique_items.len() < 2 {
+            return Ok(());
+        }
+
+        for item in &unique_items {
+            q.enqueue(item.clone()).unwrap();
+        }
+
+        let min_priority = unique_items.iter().map(|i| i.priority).min().unwrap();
+        let assignment = q.pull(&"agent".into()).unwrap();
+        let pulled_item = unique_items.iter().find(|i| i.id == assignment.work_item_id).unwrap();
+        prop_assert_eq!(pulled_item.priority, min_priority);
+    }
+
     // -----------------------------------------------------------------------
     // Batch enqueue: items referencing each other resolve internally
     // -----------------------------------------------------------------------
@@ -167,6 +280,84 @@ proptest! {
         prop_assert!(results[1].is_ok());
         prop_assert_eq!(q.item_status(&"batch-root".into()), Some(WorkItemStatus::Ready));
         prop_assert_eq!(q.item_status(&"batch-child".into()), Some(WorkItemStatus::Blocked));
+    }
+
+    #[test]
+    fn batch_enqueue_topological_chain_keeps_only_head_ready(
+        chain_len in 2usize..8,
+        prios in prop::collection::vec(priority(), 8),
+    ) {
+        prop_assume!(chain_len <= prios.len());
+        let mut q = SwarmWorkQueue::with_defaults();
+        let mut batch = Vec::new();
+
+        for i in 0..chain_len {
+            let id = format!("chain-{i}");
+            let deps = if i == 0 {
+                vec![]
+            } else {
+                vec![format!("chain-{}", i - 1)]
+            };
+            batch.push(WorkItem {
+                id: id.clone(),
+                title: id,
+                priority: prios[i],
+                depends_on: deps,
+                effort: 1,
+                labels: Vec::new(),
+                preferred_program: None,
+                metadata: HashMap::new(),
+            });
+        }
+
+        let results = q.enqueue_batch(batch);
+        prop_assert!(results.iter().all(Result::is_ok));
+        prop_assert_eq!(q.item_status(&"chain-0".into()), Some(WorkItemStatus::Ready));
+        for i in 1..chain_len {
+            prop_assert_eq!(
+                q.item_status(&format!("chain-{i}")),
+                Some(WorkItemStatus::Blocked),
+                "only the chain head should be ready"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_enqueue_reverse_order_reports_dependency_errors(
+        chain_len in 2usize..8,
+        prios in prop::collection::vec(priority(), 8),
+    ) {
+        prop_assume!(chain_len <= prios.len());
+        let mut q = SwarmWorkQueue::with_defaults();
+        let mut batch = Vec::new();
+
+        for i in 0..chain_len {
+            let id = format!("rev-{i}");
+            let deps = if i == 0 {
+                vec![]
+            } else {
+                vec![format!("rev-{}", i - 1)]
+            };
+            batch.push(WorkItem {
+                id: id.clone(),
+                title: id,
+                priority: prios[i],
+                depends_on: deps,
+                effort: 1,
+                labels: Vec::new(),
+                preferred_program: None,
+                metadata: HashMap::new(),
+            });
+        }
+        batch.reverse();
+
+        let results = q.enqueue_batch(batch);
+        prop_assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, Err(WorkQueueError::DependencyNotFound { .. }))),
+            "reverse order must surface dependency ordering errors"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -253,6 +444,54 @@ proptest! {
         prop_assert_eq!(report.skipped, 0u32);
     }
 
+    #[test]
+    fn beads_importer_roundtrip_preserves_actionable_membership(
+        records in prop::collection::vec((work_item_id(), bead_status(), priority()), 1..10)
+    ) {
+        let mut seen = HashSet::new();
+        let deduped: Vec<(String, String, u32)> = records
+            .into_iter()
+            .filter(|(id, _, _)| seen.insert(id.clone()))
+            .collect();
+
+        if deduped.is_empty() {
+            return Ok(());
+        }
+
+        let jsonl = deduped
+            .iter()
+            .map(|(id, status, prio)| {
+                format!(
+                    r#"{{"id":"{id}","title":"{id} title","status":"{status}","priority":{prio},"issue_type":"task","labels":[]}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let importer = BeadsImporter::from_jsonl(&jsonl).unwrap();
+        let mut q = SwarmWorkQueue::with_defaults();
+        let report = importer.sync_to_queue(&mut q);
+
+        let actionable: Vec<String> = deduped
+            .iter()
+            .filter(|(_, status, _)| status == "open" || status == "in_progress")
+            .map(|(id, _, _)| id.clone())
+            .collect();
+        let terminal: Vec<String> = deduped
+            .iter()
+            .filter(|(_, status, _)| status == "closed" || status == "cancelled")
+            .map(|(id, _, _)| id.clone())
+            .collect();
+
+        prop_assert_eq!(report.imported as usize, actionable.len());
+        for id in actionable {
+            prop_assert_eq!(q.item_status(&id), Some(WorkItemStatus::Ready));
+        }
+        for id in terminal {
+            prop_assert_eq!(q.item_status(&id), None);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Beads bridge: closed beads are not imported
     // -----------------------------------------------------------------------
@@ -332,4 +571,24 @@ proptest! {
         let result = q.complete(&id, &"agent".into(), None);
         prop_assert!(result.is_ok(), "complete on InProgress item should succeed");
     }
+}
+
+#[test]
+fn anti_starvation_boosts_long_waiting_item_over_newer_higher_priority_item() {
+    let mut q = SwarmWorkQueue::new(WorkQueueConfig {
+        anti_starvation: true,
+        starvation_threshold_ms: 50,
+        ..Default::default()
+    });
+
+    // Lower priority value means more urgent; this older item should still win once starved.
+    q.enqueue(make_item("older-low-priority", 9)).unwrap();
+    sleep(Duration::from_millis(80));
+    q.enqueue(make_item("newer-high-priority", 0)).unwrap();
+
+    let assignment = q.pull(&"agent".into()).unwrap();
+    assert_eq!(
+        assignment.work_item_id, "older-low-priority",
+        "starved item should be selected before newer non-starved item"
+    );
 }

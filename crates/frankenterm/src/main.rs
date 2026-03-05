@@ -43039,6 +43039,99 @@ log_level = "debug"
         );
     }
 
+    #[tokio::test]
+    async fn search_policy_mcp_actor_uses_mux_surface_override() {
+        let mut config = frankenterm_core::config::Config::default();
+        config.safety.rules.enabled = true;
+        config
+            .safety
+            .rules
+            .rules
+            .push(frankenterm_core::config::PolicyRule {
+                id: "test.deny.mcp.search.surface.mcp".to_string(),
+                description: Some("deny mcp search only when surface is mcp".to_string()),
+                priority: 1,
+                match_on: frankenterm_core::config::PolicyRuleMatch {
+                    actions: vec!["search_output".to_string()],
+                    actors: vec!["mcp".to_string()],
+                    surfaces: vec!["mcp".to_string()],
+                    ..Default::default()
+                },
+                decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                message: Some("should not match when helper sets mux surface".to_string()),
+            });
+
+        let (decision, _domain) = authorize_read_or_search_policy(
+            &config,
+            None,
+            None,
+            frankenterm_core::policy::ActionKind::SearchOutput,
+            frankenterm_core::policy::ActorKind::Mcp,
+            None,
+            "mcp search test",
+        )
+        .await;
+
+        assert!(
+            decision.is_allowed(),
+            "mcp-surface-only deny rule should not match when helper sets mux surface"
+        );
+        let context = decision
+            .context()
+            .expect("read/search decisions should include decision context");
+        assert_eq!(
+            context.surface,
+            frankenterm_core::policy::PolicySurface::Mux
+        );
+    }
+
+    #[tokio::test]
+    async fn search_policy_mcp_actor_matches_mux_surface_rule() {
+        let mut config = frankenterm_core::config::Config::default();
+        config.safety.rules.enabled = true;
+        config
+            .safety
+            .rules
+            .rules
+            .push(frankenterm_core::config::PolicyRule {
+                id: "test.deny.mcp.search.surface.mux".to_string(),
+                description: Some("deny mcp search when helper surface is mux".to_string()),
+                priority: 1,
+                match_on: frankenterm_core::config::PolicyRuleMatch {
+                    actions: vec!["search_output".to_string()],
+                    actors: vec!["mcp".to_string()],
+                    surfaces: vec!["mux".to_string()],
+                    ..Default::default()
+                },
+                decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                message: Some("mcp search blocked on mux surface".to_string()),
+            });
+
+        let (decision, _domain) = authorize_read_or_search_policy(
+            &config,
+            None,
+            None,
+            frankenterm_core::policy::ActionKind::SearchOutput,
+            frankenterm_core::policy::ActorKind::Mcp,
+            None,
+            "mcp search test",
+        )
+        .await;
+
+        assert!(
+            decision.is_denied(),
+            "mux-surface deny rule should match for mcp actor read/search helper"
+        );
+        assert_eq!(decision.reason(), Some("mcp search blocked on mux surface"));
+        let context = decision
+            .context()
+            .expect("read/search decisions should include decision context");
+        assert_eq!(
+            context.surface,
+            frankenterm_core::policy::PolicySurface::Mux
+        );
+    }
+
     #[test]
     fn redact_search_results_redacts_sensitive_fields() {
         let mut results = vec![frankenterm_core::storage::SearchResult {

@@ -11,14 +11,16 @@
 use std::collections::HashMap;
 
 use frankenterm_core::fleet_launcher::{
-    AgentMixEntry, FleetLauncher, FleetLaunchStatus, FleetSpec, StartupStrategy,
+    AgentMixEntry, FleetLaunchStatus, FleetLauncher, FleetSpec, StartupStrategy,
 };
 use frankenterm_core::session_profiles::{
     ProfilePolicy, ProfileRegistry, ProfileRole, ResourceHints, SessionProfile, SpawnCommand,
 };
 use frankenterm_core::session_topology::LifecycleRegistry;
 use frankenterm_core::swarm_scheduler::{SchedulerConfig, SchedulerDecision, SwarmScheduler};
-use frankenterm_core::swarm_work_queue::{SwarmWorkQueue, WorkItem, WorkItemStatus, WorkQueueConfig};
+use frankenterm_core::swarm_work_queue::{
+    SwarmWorkQueue, WorkItem, WorkItemStatus, WorkQueueConfig, WorkQueueError,
+};
 
 // =============================================================================
 // Test helpers
@@ -225,7 +227,9 @@ fn work_queue_full_dag_completion_flow() {
     queue.enqueue(work_item("root", 0, &[])).unwrap();
     queue.enqueue(work_item("left", 1, &["root"])).unwrap();
     queue.enqueue(work_item("right", 1, &["root"])).unwrap();
-    queue.enqueue(work_item("sink", 2, &["left", "right"])).unwrap();
+    queue
+        .enqueue(work_item("sink", 2, &["left", "right"]))
+        .unwrap();
 
     // Complete entire DAG
     queue.assign(&s("root"), &s("agent-1")).unwrap();
@@ -252,6 +256,68 @@ fn work_queue_full_dag_completion_flow() {
     assert_eq!(stats.in_progress, 0);
 }
 
+#[test]
+fn work_queue_rejects_completion_from_non_owner_agent() {
+    let mut queue = SwarmWorkQueue::new(test_queue_config());
+    queue.enqueue(work_item("owned", 0, &[])).unwrap();
+    queue.assign(&s("owned"), &s("agent-1")).unwrap();
+
+    let err = queue
+        .complete(&s("owned"), &s("agent-2"), None)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        WorkQueueError::InvalidState {
+            id: s("owned"),
+            current: WorkItemStatus::InProgress,
+            expected: "assigned to this agent",
+        }
+    );
+    assert_eq!(
+        queue.item_status(&s("owned")),
+        Some(WorkItemStatus::InProgress),
+        "ownership violation must not mutate item state"
+    );
+    assert_eq!(
+        queue
+            .get_assignment(&s("owned"))
+            .map(|a| a.agent_slot.as_str()),
+        Some("agent-1"),
+        "ownership violation must preserve original assignment"
+    );
+}
+
+#[test]
+fn work_queue_rejects_failure_from_non_owner_agent() {
+    let mut queue = SwarmWorkQueue::new(test_queue_config());
+    queue.enqueue(work_item("owned-fail", 0, &[])).unwrap();
+    queue.assign(&s("owned-fail"), &s("agent-1")).unwrap();
+
+    let err = queue
+        .fail(&s("owned-fail"), &s("agent-2"), None)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        WorkQueueError::InvalidState {
+            id: s("owned-fail"),
+            current: WorkItemStatus::InProgress,
+            expected: "assigned to this agent",
+        }
+    );
+    assert_eq!(
+        queue.item_status(&s("owned-fail")),
+        Some(WorkItemStatus::InProgress),
+        "ownership violation must not mutate item state"
+    );
+    assert_eq!(
+        queue
+            .get_assignment(&s("owned-fail"))
+            .map(|a| a.agent_slot.as_str()),
+        Some("agent-1"),
+        "ownership violation must preserve original assignment"
+    );
+}
+
 // =============================================================================
 // Scheduler + queue integration
 // =============================================================================
@@ -268,12 +334,16 @@ fn scheduler_recommends_action_on_ready_work() {
 
     // Add 20 ready items
     for i in 0..20 {
-        queue.enqueue(work_item(&format!("t-{i}"), i % 3, &[])).unwrap();
+        queue
+            .enqueue(work_item(&format!("t-{i}"), i % 3, &[]))
+            .unwrap();
     }
 
     // Assign 9 items (3 agents * 3 max = saturated)
     for i in 0..9 {
-        queue.assign(&format!("t-{i}"), &format!("agent-{}", i % 3)).unwrap();
+        queue
+            .assign(&format!("t-{i}"), &format!("agent-{}", i % 3))
+            .unwrap();
     }
 
     let decision = scheduler.evaluate(&mut queue, 10_000);
@@ -319,7 +389,7 @@ fn scheduler_does_not_crash_on_empty_queue() {
 fn scheduler_circuit_breaker_limits_consecutive_operations() {
     let config = SchedulerConfig {
         max_consecutive_scale_ops: 2,
-        scale_up_cooldown_ms: 0, // No cooldown for test
+        scale_up_cooldown_ms: 0,             // No cooldown for test
         circuit_breaker_reset_ms: 1_000_000, // Very long reset
         ..test_scheduler_config()
     };
@@ -337,7 +407,9 @@ fn scheduler_circuit_breaker_limits_consecutive_operations() {
 
     // Assign to fill 2 agents at capacity
     for i in 0..4 {
-        queue.assign(&format!("t-{i}"), &format!("agent-{}", i % 2)).unwrap();
+        queue
+            .assign(&format!("t-{i}"), &format!("agent-{}", i % 2))
+            .unwrap();
     }
 
     // Evaluate multiple times — circuit breaker should trip after max_consecutive_scale_ops
@@ -413,12 +485,16 @@ fn e2e_scheduler_evaluates_queue_state() {
     // 1. Set up work queue with varying load
     let mut queue = SwarmWorkQueue::new(test_queue_config());
     for i in 0..15 {
-        queue.enqueue(work_item(&format!("t-{i}"), i % 3, &[])).unwrap();
+        queue
+            .enqueue(work_item(&format!("t-{i}"), i % 3, &[]))
+            .unwrap();
     }
 
     // 2. Assign some work
     for i in 0..6 {
-        queue.assign(&format!("t-{i}"), &format!("agent-{}", i % 3)).unwrap();
+        queue
+            .assign(&format!("t-{i}"), &format!("agent-{}", i % 3))
+            .unwrap();
     }
 
     // 3. Evaluate with scheduler — should produce a valid decision
@@ -485,8 +561,7 @@ fn fleet_launch_with_durable_state_creates_checkpoint() {
         HashMap::new(),
     );
 
-    let outcome =
-        launcher.execute_with_subsystems(&plan, &mut registry, Some(&mut durable), None);
+    let outcome = launcher.execute_with_subsystems(&plan, &mut registry, Some(&mut durable), None);
 
     assert_eq!(outcome.status, FleetLaunchStatus::Complete);
     // Pre-launch checkpoint should be recorded when durable state is available
