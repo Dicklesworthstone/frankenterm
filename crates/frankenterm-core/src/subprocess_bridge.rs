@@ -97,17 +97,46 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
         let mut child = cmd.spawn().map_err(|err| self.map_spawn_error(err))?;
         let started = Instant::now();
 
+        let mut stdout_stream = child.stdout.take().unwrap();
+        let mut stderr_stream = child.stderr.take().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx_err = tx.clone();
+
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = stdout_stream.read_to_end(&mut buf);
+            let _ = tx.send((true, buf));
+        });
+
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = stderr_stream.read_to_end(&mut buf);
+            let _ = tx_err.send((false, buf));
+        });
+
+        let mut stdout_data = Vec::new();
+        let mut stderr_data = Vec::new();
+
         loop {
             match child.try_wait() {
-                Ok(Some(_status)) => {
-                    let output = child
-                        .wait_with_output()
-                        .map_err(|err| BridgeError::ExitCode(-1, err.to_string()))?;
+                Ok(Some(status)) => {
+                    for _ in 0..2 {
+                        if let Ok((is_stdout, data)) = rx.recv() {
+                            if is_stdout {
+                                stdout_data = data;
+                            } else {
+                                stderr_data = data;
+                            }
+                        }
+                    }
 
-                    if !output.status.success() {
-                        let code = output.status.code().unwrap_or(-1);
-                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    if !status.success() {
+                        let code = status.code().unwrap_or(-1);
+                        let stderr = String::from_utf8_lossy(&stderr_data).to_string();
+                        let stdout = String::from_utf8_lossy(&stdout_data).to_string();
                         let detail = if stderr.trim().is_empty() {
                             stdout
                         } else {
@@ -118,7 +147,7 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
                         return Err(err);
                     }
 
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stdout = String::from_utf8_lossy(&stdout_data).to_string();
                     return serde_json::from_str(&stdout).map_err(|err| {
                         let parse_err = BridgeError::ParseError(format!(
                             "{} (stdout preview: {})",

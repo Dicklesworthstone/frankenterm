@@ -128,6 +128,11 @@ storage.sqlite3.bak
 *.orig
 *.patch
 *.bak
+/test_*
+.write_probe
+**/test_bug.rs
+**/test_deadlock.rs
+/frankenredis/
 
 # Agent tool MCP config backups (timestamped .bak files)
 .claude/*.bak
