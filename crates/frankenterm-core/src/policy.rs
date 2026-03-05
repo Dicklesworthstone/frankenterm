@@ -1392,10 +1392,29 @@ struct CommandRule {
 }
 
 static RM_RF_ROOT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\brm\s+-(rf|fr)\s+(/|~/?)\*?(\s|$)").expect("rm -rf root regex")
+    Regex::new(r"(?ix)
+        \brm\s+
+        (?:.*?\s)?
+        (?:
+            (?:-[a-zA-Z]*(?:r[a-zA-Z]*f|f[a-zA-Z]*r)[a-zA-Z]*\b|(?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b)\s+(?:.*?\s)?(?:-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)|(?:-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)\s+(?:.*?\s)?(?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b))\s+(?:/|~/?)\*?(?:\s|$)
+            |
+            (?:/|~/?)\*?(?:\s+.*?)?\s+(?:-[a-zA-Z]*(?:r[a-zA-Z]*f|f[a-zA-Z]*r)[a-zA-Z]*\b|(?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b)\s+(?:.*?\s)?(?:-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)|(?:-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)\s+(?:.*?\s)?(?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b))(?:\s|$)
+        )
+    ").expect("rm -rf root regex")
 });
-static RM_RF_GENERIC: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\brm\s+-(rf|fr)\s+").expect("rm -rf regex"));
+static RM_RF_GENERIC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?ix)
+        \brm\s+
+        (?:.*?\s)?
+        (?:
+            -[a-zA-Z]*(?:r[a-zA-Z]*f|f[a-zA-Z]*r)[a-zA-Z]*\b
+            |
+            (?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b)\s+(?:.*?\s)?(?:-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)
+            |
+            (?:-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)\s+(?:.*?\s)?(?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b)
+        )
+    ").expect("rm -rf regex")
+});
 static GIT_RESET_HARD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bgit\s+reset\b.*\s--hard\b").expect("git reset --hard"));
 static GIT_CLEAN_FD: LazyLock<Regex> = LazyLock::new(|| {
@@ -1466,6 +1485,16 @@ const COMMAND_TOKENS: &[&str] = &[
     "git",
     "rm",
     "sudo",
+    "doas",
+    "su",
+    "env",
+    "time",
+    "nohup",
+    "xargs",
+    "watch",
+    "timeout",
+    "exec",
+    "command",
     "docker",
     "kubectl",
     "aws",

@@ -2968,6 +2968,121 @@ mod tests {
     }
 
     #[test]
+    fn list_panes_rejects_oversized_response_frame() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("oversized-frame.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let max_frame_bytes = 128usize;
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for oversized-frame test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "oversized-frame-test".to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                        });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    let mut out = Vec::new();
+                                    Pdu::UnitResponse(UnitResponse {})
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::ListPanes(_) => {
+                                    let mut window_titles = HashMap::new();
+                                    for window_id in 0..24usize {
+                                        window_titles.insert(
+                                            window_id + 1,
+                                            format!(
+                                                "oversized-window-{window_id:02}-{}",
+                                                "x".repeat(32)
+                                            ),
+                                        );
+                                    }
+                                    let response = Pdu::ListPanesResponse(ListPanesResponse {
+                                        tabs: Vec::new(),
+                                        tab_titles: Vec::new(),
+                                        window_titles,
+                                    });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    assert!(
+                                        out.len() > max_frame_bytes + 1,
+                                        "encoded frame must exceed the configured max"
+                                    );
+
+                                    let prefix = &out[..=max_frame_bytes];
+                                    let chunk_size = (max_frame_bytes / 2).max(1);
+                                    for chunk in prefix.chunks(chunk_size) {
+                                        stream.write_all(chunk).await.expect("write frame chunk");
+                                        sleep(Duration::from_millis(5)).await;
+                                    }
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should be ready before client connects");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.max_frame_bytes = max_frame_bytes;
+            config.read_timeout = Duration::from_millis(200);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+
+            let err = client
+                .list_panes()
+                .await
+                .expect_err("list_panes should reject oversized response frames");
+            assert!(matches!(
+                err,
+                DirectMuxError::FrameTooLarge { max_bytes } if max_bytes == max_frame_bytes
+            ));
+            assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable);
+
+            drop(client);
+            server.join().expect("server thread");
+        });
+    }
+
+    #[test]
     fn decode_garbage_frame_returns_error_or_none() {
         // Intentionally invalid RPC frame: random bytes that don't form a valid PDU.
         let mut buf = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x10, 0xFF, 0xFF];

@@ -115,7 +115,7 @@ static BUNDLE_CHECK: LazyLock<bool> = LazyLock::new(|| {
 });
 
 fn get_center() -> Retained<UNUserNotificationCenter> {
-    unsafe { UNUserNotificationCenter::currentNotificationCenter() }
+    UNUserNotificationCenter::currentNotificationCenter()
 }
 
 pub fn initialize() {
@@ -189,7 +189,7 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
 
         if let Some(url) = &toast.url {
             let info =
-                NSDictionary::from_slices(&[ns_string!("url")], &[&*NSString::from_str(&url)]);
+                NSDictionary::from_slices(&[ns_string!("url")], &[&*NSString::from_str(url)]);
             notif.setUserInfo(
                 info.downcast_ref::<NSDictionary>()
                     .expect("is NSDictionary"),
@@ -200,7 +200,7 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
         let identifier = uuid::Uuid::new_v4().to_string();
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
             &NSString::from_str(&identifier),
-            &*notif,
+            &notif,
             None,
         );
 

@@ -2772,14 +2772,18 @@ impl PatternEngine {
         // a first-byte matched. This is O(m*k) where m = match count, k = anchor lengths.
         if let Some(ref bloom) = index.bloom {
             for &start in &byte_match_positions {
+                // Ensure we start at a valid UTF-8 boundary
+                if !text.is_char_boundary(start) {
+                    continue;
+                }
                 for &anchor_len in &index.anchor_lengths {
                     let end = start + anchor_len;
                     // Skip if this substring extends past the text
                     if end > text_len {
                         continue;
                     }
-                    // Ensure we're at valid UTF-8 boundaries
-                    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+                    // Ensure we end at a valid UTF-8 boundary
+                    if !text.is_char_boundary(end) {
                         continue;
                     }
                     let window = &text[start..end];

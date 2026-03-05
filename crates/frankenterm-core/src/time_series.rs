@@ -247,7 +247,7 @@ impl TimeSeries {
         }
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let p = p.clamp(0.0, 1.0);
-        let idx = ((values.len() - 1) as f64 * p) as usize;
+        let idx = ((values.len() - 1) as f64 * p).round() as usize;
         Some(values[idx])
     }
 
@@ -274,8 +274,11 @@ impl TimeSeries {
 
         for i in 0..target_points {
             let start = (i as f64 * step) as usize;
-            let end = ((i + 1) as f64 * step).round() as usize;
-            let end = end.min(n);
+            let mut end = ((i + 1) as f64 * step).round() as usize;
+            end = end.max(start + 1).min(n); // ensure we make progress and don't panic
+            if start >= end {
+                continue;
+            }
             let chunk = &points[start..end];
             if chunk.is_empty() {
                 continue;

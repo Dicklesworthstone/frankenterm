@@ -767,4 +767,15 @@ mod tests {
             .unwrap();
         assert_eq!(out["a"]["b"]["c"], 1);
     }
+
+    #[test]
+    fn invoke_daemon_holds_stdout_times_out() {
+        let b = bridge("sh").with_timeout(Duration::from_millis(500));
+        let start = Instant::now();
+        // The main 'sh' process exits immediately, but the background 'sleep' process
+        // inherits stdout and holds it open.
+        let err = b.invoke(&["-c", "sleep 10 >&1 &"]).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(matches!(err, BridgeError::Timeout(_)));
+    }
 }

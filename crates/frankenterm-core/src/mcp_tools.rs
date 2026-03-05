@@ -4,6 +4,77 @@
 use super::*;
 use crate::policy::PolicySurface;
 
+fn mcp_get_text_policy_input(
+    pane_id: u64,
+    domain: impl Into<String>,
+    capabilities: PaneCapabilities,
+    summary: &str,
+) -> PolicyInput {
+    PolicyInput::new(ActionKind::ReadOutput, ActorKind::Mcp)
+        .with_surface(PolicySurface::Mux)
+        .with_pane(pane_id)
+        .with_domain(domain.into())
+        .with_capabilities(capabilities)
+        .with_text_summary(summary.to_string())
+}
+
+fn mcp_search_output_policy_input(summary: &str) -> PolicyInput {
+    PolicyInput::new(ActionKind::SearchOutput, ActorKind::Mcp)
+        .with_surface(PolicySurface::Mux)
+        .with_text_summary(summary.to_string())
+}
+
+fn mcp_send_text_policy_input(
+    pane_id: u64,
+    domain: impl Into<String>,
+    capabilities: PaneCapabilities,
+    summary: &str,
+    command_text: &str,
+) -> PolicyInput {
+    PolicyInput::new(ActionKind::SendText, ActorKind::Mcp)
+        .with_surface(PolicySurface::Mux)
+        .with_pane(pane_id)
+        .with_domain(domain.into())
+        .with_capabilities(capabilities)
+        .with_text_summary(summary.to_string())
+        .with_command_text(command_text.to_string())
+}
+
+fn mcp_workflow_run_policy_input(
+    pane_id: u64,
+    domain: impl Into<String>,
+    capabilities: PaneCapabilities,
+    summary: &str,
+) -> PolicyInput {
+    PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Mcp)
+        .with_surface(PolicySurface::Workflow)
+        .with_pane(pane_id)
+        .with_domain(domain.into())
+        .with_capabilities(capabilities)
+        .with_text_summary(summary.to_string())
+}
+
+fn mcp_reserve_pane_policy_input(pane_id: u64, summary: &str) -> PolicyInput {
+    PolicyInput::new(ActionKind::ReservePane, ActorKind::Mcp)
+        .with_surface(PolicySurface::Swarm)
+        .with_pane(pane_id)
+        .with_capabilities(PaneCapabilities::unknown())
+        .with_text_summary(summary.to_string())
+        .with_command_text("reserve_pane".to_string())
+}
+
+fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyInput {
+    let mut input = PolicyInput::new(ActionKind::ReleasePane, ActorKind::Mcp)
+        .with_surface(PolicySurface::Swarm)
+        .with_capabilities(PaneCapabilities::unknown())
+        .with_text_summary(summary.to_string())
+        .with_command_text("release_reservation".to_string());
+    if let Some(pane_id) = pane_id {
+        input = input.with_pane(pane_id);
+    }
+    input
+}
+
 // wa.rules_list tool
 pub(super) struct WaRulesListTool;
 
@@ -648,12 +719,8 @@ impl ToolHandler for WaGetTextTool {
 
                 let mut engine = build_policy_engine(&config, false);
                 let summary = format!("wa.get_text pane_id={}", params.pane_id);
-                let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Mcp)
-                    .with_surface(PolicySurface::Mux)
-                    .with_pane(params.pane_id)
-                    .with_domain(domain)
-                    .with_capabilities(capabilities)
-                    .with_text_summary(summary.clone());
+                let mut input =
+                    mcp_get_text_policy_input(params.pane_id, domain, capabilities, &summary);
                 if let Some(title) = &pane_info.title {
                     input = input.with_pane_title(title.clone());
                 }
@@ -1007,9 +1074,7 @@ impl ToolHandler for WaSearchTool {
 
                 let mut engine = build_policy_engine(&config, false);
                 let summary = engine.redact_secrets(&query_for_storage);
-                let mut input = PolicyInput::new(ActionKind::SearchOutput, ActorKind::Mcp)
-                    .with_surface(PolicySurface::Mux)
-                    .with_text_summary(summary.clone());
+                let mut input = mcp_search_output_policy_input(&summary);
 
                 if let Some(pane_id) = search_options.pane_id {
                     let wezterm = default_wezterm_handle();
@@ -1436,13 +1501,13 @@ impl ToolHandler for WaSendTool {
             let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
             let summary = engine.redact_secrets(&params.text);
 
-            let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Mcp)
-                .with_surface(PolicySurface::Mux)
-                .with_pane(params.pane_id)
-                .with_domain(domain)
-                .with_capabilities(capabilities.clone())
-                .with_text_summary(summary.clone())
-                .with_command_text(&params.text);
+            let mut input = mcp_send_text_policy_input(
+                params.pane_id,
+                domain,
+                capabilities.clone(),
+                &summary,
+                &params.text,
+            );
 
             if let Some(title) = &pane_info.title {
                 input = input.with_pane_title(title.clone());
@@ -1669,12 +1734,12 @@ impl ToolHandler for WaWorkflowRunTool {
                     build_policy_engine(&config, config.safety.require_prompt_active);
                 let summary = format!("workflow run {}", params.name);
 
-                let mut input = PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Mcp)
-                    .with_surface(PolicySurface::Workflow)
-                    .with_pane(params.pane_id)
-                    .with_domain(domain)
-                    .with_capabilities(capabilities.clone())
-                    .with_text_summary(summary.clone());
+                let mut input = mcp_workflow_run_policy_input(
+                    params.pane_id,
+                    domain,
+                    capabilities.clone(),
+                    &summary,
+                );
 
                 if let Some(title) = &pane_info.title {
                     input = input.with_pane_title(title.clone());
@@ -2511,12 +2576,8 @@ impl ToolHandler for WaReserveTool {
                     .map_err(McpToolError::from_error)?;
 
                 let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
-                let mut input = PolicyInput::new(ActionKind::ReservePane, ActorKind::Mcp)
-                    .with_surface(PolicySurface::Swarm)
-                    .with_pane(params.pane_id)
-                    .with_capabilities(PaneCapabilities::unknown())
-                    .with_text_summary(format!("reserve pane {}", params.pane_id));
-                input = input.with_command_text("reserve_pane");
+                let summary = format!("reserve pane {}", params.pane_id);
+                let input = mcp_reserve_pane_policy_input(params.pane_id, &summary);
 
                 let decision = engine.authorize(&input);
                 if decision.is_denied() {
@@ -2652,14 +2713,8 @@ impl ToolHandler for WaReleaseTool {
                     .map(|r| r.pane_id);
 
                 let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
-                let mut input = PolicyInput::new(ActionKind::ReleasePane, ActorKind::Mcp)
-                    .with_surface(PolicySurface::Swarm)
-                    .with_capabilities(PaneCapabilities::unknown())
-                    .with_text_summary(format!("release reservation {}", params.reservation_id));
-                if let Some(pane_id) = pane_id {
-                    input = input.with_pane(pane_id);
-                }
-                input = input.with_command_text("release_reservation");
+                let summary = format!("release reservation {}", params.reservation_id);
+                let input = mcp_release_pane_policy_input(&summary, pane_id);
 
                 let decision = engine.authorize(&input);
                 if decision.is_denied() {
@@ -4157,6 +4212,67 @@ mod tests {
         assert_eq!(input.surface, PolicySurface::Mcp);
         assert_eq!(input.text_summary.as_deref(), Some(summary));
         assert_eq!(input.command_text.as_deref(), Some(summary));
+    }
+
+    #[test]
+    fn mcp_tool_policy_input_helpers_use_expected_action_actor_and_surface() {
+        let summary = "helper summary";
+
+        let get_text = mcp_get_text_policy_input(7, "local", PaneCapabilities::unknown(), summary);
+        assert_eq!(get_text.action, ActionKind::ReadOutput);
+        assert_eq!(get_text.actor, ActorKind::Mcp);
+        assert_eq!(get_text.surface, PolicySurface::Mux);
+        assert_eq!(get_text.pane_id, Some(7));
+        assert_eq!(get_text.text_summary.as_deref(), Some(summary));
+
+        let search = mcp_search_output_policy_input(summary);
+        assert_eq!(search.action, ActionKind::SearchOutput);
+        assert_eq!(search.actor, ActorKind::Mcp);
+        assert_eq!(search.surface, PolicySurface::Mux);
+        assert_eq!(search.text_summary.as_deref(), Some(summary));
+
+        let send = mcp_send_text_policy_input(
+            11,
+            "local",
+            PaneCapabilities::unknown(),
+            summary,
+            "echo hi",
+        );
+        assert_eq!(send.action, ActionKind::SendText);
+        assert_eq!(send.actor, ActorKind::Mcp);
+        assert_eq!(send.surface, PolicySurface::Mux);
+        assert_eq!(send.pane_id, Some(11));
+        assert_eq!(send.command_text.as_deref(), Some("echo hi"));
+
+        let workflow =
+            mcp_workflow_run_policy_input(13, "local", PaneCapabilities::unknown(), summary);
+        assert_eq!(workflow.action, ActionKind::WorkflowRun);
+        assert_eq!(workflow.actor, ActorKind::Mcp);
+        assert_eq!(workflow.surface, PolicySurface::Workflow);
+        assert_eq!(workflow.pane_id, Some(13));
+
+        let reserve = mcp_reserve_pane_policy_input(17, summary);
+        assert_eq!(reserve.action, ActionKind::ReservePane);
+        assert_eq!(reserve.actor, ActorKind::Mcp);
+        assert_eq!(reserve.surface, PolicySurface::Swarm);
+        assert_eq!(reserve.pane_id, Some(17));
+        assert_eq!(reserve.command_text.as_deref(), Some("reserve_pane"));
+
+        let release_with_pane = mcp_release_pane_policy_input(summary, Some(19));
+        assert_eq!(release_with_pane.action, ActionKind::ReleasePane);
+        assert_eq!(release_with_pane.actor, ActorKind::Mcp);
+        assert_eq!(release_with_pane.surface, PolicySurface::Swarm);
+        assert_eq!(release_with_pane.pane_id, Some(19));
+        assert_eq!(
+            release_with_pane.command_text.as_deref(),
+            Some("release_reservation")
+        );
+
+        let release_without_pane = mcp_release_pane_policy_input(summary, None);
+        assert_eq!(release_without_pane.action, ActionKind::ReleasePane);
+        assert_eq!(release_without_pane.actor, ActorKind::Mcp);
+        assert_eq!(release_without_pane.surface, PolicySurface::Swarm);
+        assert_eq!(release_without_pane.pane_id, None);
     }
 
     // ========================================================================

@@ -238,7 +238,9 @@ pub fn validate_token(
         if presented_norm.as_deref() != Some(expected_norm.as_str()) {
             return Err(DistributedSecurityError::AuthFailed);
         }
-        let Some(client_identity) = client_identity.map(str::trim).filter(|value| !value.is_empty())
+        let Some(client_identity) = client_identity
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
         else {
             return Err(DistributedSecurityError::AuthFailed);
         };
