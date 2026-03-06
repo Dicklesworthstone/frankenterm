@@ -1057,36 +1057,50 @@ pub fn match_rule_glob(pattern: &str, value: &str) -> bool {
         return value == pattern;
     }
 
-    let p_bytes = pattern.as_bytes();
-    let v_bytes = value.as_bytes();
+    let mut p_rem = pattern;
+    let mut v_rem = value;
 
-    let mut p_idx = 0;
-    let mut v_idx = 0;
     let mut p_star = None;
-    let mut v_star = 0;
+    let mut v_star = None;
 
-    while v_idx < v_bytes.len() {
-        if p_idx < p_bytes.len() && (p_bytes[p_idx] == b'?' || p_bytes[p_idx] == v_bytes[v_idx]) {
-            p_idx += 1;
-            v_idx += 1;
-        } else if p_idx < p_bytes.len() && p_bytes[p_idx] == b'*' {
-            p_star = Some(p_idx);
-            v_star = v_idx;
-            p_idx += 1;
-        } else if let Some(star_idx) = p_star {
-            p_idx = star_idx + 1;
-            v_star += 1;
-            v_idx = v_star;
-        } else {
-            return false;
+    while !v_rem.is_empty() {
+        let mut p_chars = p_rem.chars();
+        let mut v_chars = v_rem.chars();
+        let p_ch = p_chars.next();
+        let v_ch = v_chars.next().unwrap();
+
+        if let Some(pc) = p_ch {
+            if pc == '?' || pc == v_ch {
+                p_rem = p_chars.as_str();
+                v_rem = v_chars.as_str();
+                continue;
+            } else if pc == '*' {
+                p_star = Some(p_chars.as_str());
+                v_star = Some(v_rem); 
+                p_rem = p_chars.as_str();
+                continue;
+            }
         }
+        
+        if let Some(ps) = p_star {
+            if let Some(vs) = v_star {
+                p_rem = ps;
+                let mut vs_chars = vs.chars();
+                vs_chars.next(); 
+                v_star = Some(vs_chars.as_str());
+                v_rem = vs_chars.as_str();
+                continue;
+            }
+        }
+        
+        return false;
     }
 
-    while p_idx < p_bytes.len() && p_bytes[p_idx] == b'*' {
-        p_idx += 1;
+    while p_rem.starts_with('*') {
+        p_rem = &p_rem[1..];
     }
 
-    p_idx == p_bytes.len()
+    p_rem.is_empty()
 }
 
 /// Event notification filter.

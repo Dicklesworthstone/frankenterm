@@ -1738,7 +1738,7 @@ where
                 let full_rule = if is_hard_deny {
                     "command.rm_rf_root".to_string()
                 } else {
-                    format!("dcg.{} ", rule_id).trim().to_string()
+                    format!("dcg.{}", rule_id)
                 };
                 
                 let policy = if is_hard_deny {
@@ -2380,41 +2380,9 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
 ///
 /// Supports `*` (any characters) and `?` (single character)
 ///
-/// Uses a thread-local LRU cache to avoid recompiling the same glob-derived
-/// regex on every policy evaluation.
+/// Uses the fast O(n) byte-level matching algorithm from `crate::events::match_rule_glob`.
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let mut regex_pattern = String::with_capacity(pattern.len() + 4);
-    regex_pattern.push('^');
-    for ch in pattern.chars() {
-        match ch {
-            '*' => regex_pattern.push_str(".*"),
-            '?' => regex_pattern.push('.'),
-            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' => {
-                regex_pattern.push('\\');
-                regex_pattern.push(ch);
-            }
-            c => regex_pattern.push(c),
-        }
-    }
-    regex_pattern.push('$');
-
-    thread_local! {
-        static GLOB_REGEX_CACHE: std::cell::RefCell<crate::lru_cache::LruCache<String, Regex>> =
-            std::cell::RefCell::new(crate::lru_cache::LruCache::new(128));
-    }
-
-    GLOB_REGEX_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(re) = cache.get(&regex_pattern) {
-            return re.is_match(text);
-        }
-        if let Ok(re) = Regex::new(&regex_pattern) {
-            let is_match = re.is_match(text);
-            cache.put(regex_pattern, re);
-            return is_match;
-        }
-        false
-    })
+    crate::events::match_rule_glob(pattern, text)
 }
 
 // ============================================================================

@@ -992,63 +992,6 @@ fn matches_safety_regex(value: &str, pattern: &str) -> bool {
     }
 }
 
-/// Parsed character set from a regex pattern.
-struct ParsedCharset {
-    allow_empty: bool,
-    chars: Vec<(u8, u8)>, // ranges
-    exact_chars: Vec<u8>, // individual chars
-}
-
-/// Parse `[a-zA-Z0-9_./-]+` or similar simple charset patterns.
-fn parse_simple_charset(pattern: &str) -> Option<ParsedCharset> {
-    if !pattern.starts_with('[') {
-        return None;
-    }
-
-    let bracket_end = pattern.find(']')?;
-    let charset_str = &pattern[1..bracket_end];
-    let quantifier = &pattern[bracket_end + 1..];
-
-    let allow_empty = quantifier.starts_with('*');
-    // Must end with + or * (possibly followed by optional group)
-    if !quantifier.starts_with('+') && !quantifier.starts_with('*') {
-        return None;
-    }
-
-    let mut chars = Vec::new();
-    let mut exact_chars = Vec::new();
-    let bytes = charset_str.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if i + 2 < bytes.len() && bytes[i + 1] == b'-' {
-            chars.push((bytes[i], bytes[i + 2]));
-            i += 3;
-        } else {
-            exact_chars.push(bytes[i]);
-            i += 1;
-        }
-    }
-
-    Some(ParsedCharset {
-        allow_empty,
-        chars,
-        exact_chars,
-    })
-}
-
-/// Validate a value against a parsed charset.
-fn validate_against_charset(value: &str, charset: &ParsedCharset) -> bool {
-    if value.is_empty() {
-        return charset.allow_empty;
-    }
-
-    value.bytes().all(|b| {
-        charset.chars.iter().any(|(lo, hi)| b >= *lo && b <= *hi)
-            || charset.exact_chars.contains(&b)
-    })
-}
-
 // =============================================================================
 // Generalization statistics
 // =============================================================================
@@ -2038,36 +1981,4 @@ mod tests {
         assert!(detections.is_empty());
     }
 
-    // =========================================================================
-    // Charset parsing tests
-    // =========================================================================
-
-    #[test]
-    fn parse_simple_charset_basic() {
-        let cs = parse_simple_charset("[a-z]+");
-        assert!(cs.is_some());
-        let cs = cs.unwrap();
-        assert!(!cs.allow_empty);
-        assert_eq!(cs.chars.len(), 1);
-        assert_eq!(cs.chars[0], (b'a', b'z'));
-    }
-
-    #[test]
-    fn parse_simple_charset_star() {
-        let cs = parse_simple_charset("[0-9]*");
-        assert!(cs.is_some());
-        assert!(cs.unwrap().allow_empty);
-    }
-
-    #[test]
-    fn validate_charset_accepts_valid() {
-        let cs = parse_simple_charset("[a-zA-Z0-9]+").unwrap();
-        assert!(validate_against_charset("Hello123", &cs));
-    }
-
-    #[test]
-    fn validate_charset_rejects_invalid() {
-        let cs = parse_simple_charset("[a-z]+").unwrap();
-        assert!(!validate_against_charset("Hello", &cs)); // uppercase
-    }
 }
