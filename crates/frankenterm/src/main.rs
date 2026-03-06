@@ -6234,6 +6234,109 @@ fn build_approval_decision_context(
     serde_json::to_string(&context).ok()
 }
 
+fn build_event_mutation_decision_context(
+    actor_kind: &str,
+    interface: &str,
+    action_kind: &str,
+    event_id: i64,
+    operation: &str,
+    actor_id: Option<&str>,
+    input_summary: &str,
+    changed: Option<bool>,
+    state: Option<&str>,
+    label: Option<&str>,
+    timestamp_ms: i64,
+) -> Option<String> {
+    let actor = approval_actor_kind(actor_kind);
+    let surface = frankenterm_core::policy::PolicySurface::default_for_actor(actor);
+    let mut context = frankenterm_core::policy::DecisionContext {
+        timestamp_ms,
+        action: frankenterm_core::policy::ActionKind::ExecCommand,
+        actor,
+        surface,
+        pane_id: None,
+        domain: None,
+        capabilities: frankenterm_core::policy::PaneCapabilities::default(),
+        text_summary: Some(input_summary.to_string()),
+        workflow_id: None,
+        rules_evaluated: Vec::new(),
+        determining_rule: None,
+        evidence: Vec::new(),
+        rate_limit: None,
+        risk: None,
+    };
+    let determining_rule = format!("audit.{action_kind}");
+    context.record_rule(
+        &determining_rule,
+        true,
+        Some("allow"),
+        Some("event metadata mutation recorded".to_string()),
+    );
+    context.set_determining_rule(&determining_rule);
+    context.add_evidence("stage", "event_mutation");
+    context.add_evidence("interface", interface);
+    context.add_evidence("event_action_kind", action_kind);
+    context.add_evidence("event_id", event_id.to_string());
+    context.add_evidence("operation", operation);
+    context.add_evidence("event_surface", surface.as_str());
+    if let Some(actor_id) = actor_id {
+        context.add_evidence("actor_id", actor_id);
+    }
+    if let Some(changed) = changed {
+        context.add_evidence("changed", changed.to_string());
+    }
+    if let Some(state) = state {
+        context.add_evidence("state", state);
+    }
+    if let Some(label) = label {
+        context.add_evidence("label", label);
+    }
+    serde_json::to_string(&context).ok()
+}
+
+fn build_ipc_rpc_decision_context(
+    actor_kind: &str,
+    summary: &str,
+    result: &str,
+    request_id: Option<&str>,
+    timestamp_ms: i64,
+) -> Option<String> {
+    let actor = approval_actor_kind(actor_kind);
+    let mut context = frankenterm_core::policy::DecisionContext {
+        timestamp_ms,
+        action: frankenterm_core::policy::ActionKind::ExecCommand,
+        actor,
+        surface: frankenterm_core::policy::PolicySurface::Ipc,
+        pane_id: None,
+        domain: None,
+        capabilities: frankenterm_core::policy::PaneCapabilities::default(),
+        text_summary: Some(summary.to_string()),
+        workflow_id: None,
+        rules_evaluated: Vec::new(),
+        determining_rule: None,
+        evidence: Vec::new(),
+        rate_limit: None,
+        risk: None,
+    };
+    context.record_rule(
+        "audit.ipc.rpc",
+        true,
+        Some("allow"),
+        Some("ipc rpc request recorded in audit trail".to_string()),
+    );
+    context.set_determining_rule("audit.ipc.rpc");
+    context.add_evidence("stage", "ipc_rpc");
+    context.add_evidence("interface", "ft.ipc.rpc");
+    context.add_evidence("ipc_action_kind", "ipc.rpc");
+    context.add_evidence("ipc_surface", "ipc");
+    context.add_evidence("ipc_actor_kind", actor.as_str());
+    context.add_evidence("ipc_result", result);
+    if let Some(request_id) = request_id {
+        context.add_evidence("request_id", request_id);
+    }
+    serde_json::to_string(&context).ok()
+}
+
 async fn evaluate_approve(
     storage: &frankenterm_core::storage::StorageHandle,
     workspace_id: &str,
@@ -8844,21 +8947,30 @@ async fn record_ipc_rpc_audit(
     summary: String,
     result: &str,
 ) {
+    let timestamp_ms = now_ms_i64();
+    let input_summary = Some(summary);
+    let decision_context = build_ipc_rpc_decision_context(
+        "robot",
+        input_summary.as_deref().unwrap_or_default(),
+        result,
+        request_id.as_deref(),
+        timestamp_ms,
+    );
     let audit = frankenterm_core::storage::AuditActionRecord {
         id: 0,
-        ts: now_ms_i64(),
+        ts: timestamp_ms,
         actor_kind: "robot".to_string(),
         actor_id: None,
-        correlation_id: request_id,
+        correlation_id: request_id.clone(),
         pane_id: None,
         domain: None,
         action_kind: "ipc.rpc".to_string(),
         policy_decision: "allow".to_string(),
         decision_reason: None,
         rule_id: None,
-        input_summary: Some(summary),
+        input_summary,
         verification_summary: None,
-        decision_context: None,
+        decision_context,
         result: result.to_string(),
     };
 
@@ -14492,6 +14604,27 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             return Ok(());
                                         }
 
+                                        let input_summary = if clear {
+                                            format!("ft robot events annotate {event_id} --clear")
+                                        } else {
+                                            format!(
+                                                "ft robot events annotate {event_id} --note <redacted>"
+                                            )
+                                        };
+                                        let decision_context =
+                                            build_event_mutation_decision_context(
+                                                "robot",
+                                                "ft.robot.events",
+                                                "event.annotate",
+                                                event_id,
+                                                if clear { "clear_note" } else { "set_note" },
+                                                by.as_deref(),
+                                                &input_summary,
+                                                None,
+                                                None,
+                                                None,
+                                                now,
+                                            );
                                         let audit = AuditActionRecord {
                                             id: 0,
                                             ts: now,
@@ -14506,17 +14639,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 "Robot updated event note".to_string(),
                                             ),
                                             rule_id: None,
-                                            input_summary: Some(if clear {
-                                                format!(
-                                                    "ft robot events annotate {event_id} --clear"
-                                                )
-                                            } else {
-                                                format!(
-                                                    "ft robot events annotate {event_id} --note <redacted>"
-                                                )
-                                            }),
+                                            input_summary: Some(input_summary),
                                             verification_summary: None,
-                                            decision_context: None,
+                                            decision_context,
                                             result: "success".to_string(),
                                         };
                                         if let Err(e) =
@@ -14569,6 +14694,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             }
                                         };
 
+                                        let input_summary = if clear {
+                                            format!("ft robot events triage {event_id} --clear")
+                                        } else {
+                                            format!(
+                                                "ft robot events triage {event_id} --state {}",
+                                                state.as_deref().unwrap_or_default()
+                                            )
+                                        };
+                                        let decision_context =
+                                            build_event_mutation_decision_context(
+                                                "robot",
+                                                "ft.robot.events",
+                                                "event.triage",
+                                                event_id,
+                                                if clear {
+                                                    "clear_triage_state"
+                                                } else {
+                                                    "set_triage_state"
+                                                },
+                                                by.as_deref(),
+                                                &input_summary,
+                                                Some(changed),
+                                                state.as_deref(),
+                                                None,
+                                                now,
+                                            );
                                         let audit = AuditActionRecord {
                                             id: 0,
                                             ts: now,
@@ -14583,16 +14734,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 "Robot updated event triage state".to_string(),
                                             ),
                                             rule_id: None,
-                                            input_summary: Some(if clear {
-                                                format!("ft robot events triage {event_id} --clear")
-                                            } else {
-                                                format!(
-                                                    "ft robot events triage {event_id} --state {}",
-                                                    state.unwrap_or_default()
-                                                )
-                                            }),
+                                            input_summary: Some(input_summary),
                                             verification_summary: None,
-                                            decision_context: None,
+                                            decision_context,
                                             result: if changed {
                                                 "success".to_string()
                                             } else {
@@ -14661,6 +14805,23 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 }
                                             };
 
+                                            let input_summary = format!(
+                                                "ft robot events label {event_id} --add {label}"
+                                            );
+                                            let decision_context =
+                                                build_event_mutation_decision_context(
+                                                    "robot",
+                                                    "ft.robot.events",
+                                                    "event.label.add",
+                                                    event_id,
+                                                    "add_label",
+                                                    by.as_deref(),
+                                                    &input_summary,
+                                                    Some(inserted),
+                                                    None,
+                                                    Some(label.as_str()),
+                                                    now,
+                                                );
                                             let audit = AuditActionRecord {
                                                 id: 0,
                                                 ts: now,
@@ -14675,11 +14836,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     "Robot added event label".to_string(),
                                                 ),
                                                 rule_id: None,
-                                                input_summary: Some(format!(
-                                                    "ft robot events label {event_id} --add {label}"
-                                                )),
+                                                input_summary: Some(input_summary),
                                                 verification_summary: None,
-                                                decision_context: None,
+                                                decision_context,
                                                 result: if inserted {
                                                     "success".to_string()
                                                 } else {
@@ -14715,6 +14874,23 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 }
                                             };
 
+                                            let input_summary = format!(
+                                                "ft robot events label {event_id} --remove {label}"
+                                            );
+                                            let decision_context =
+                                                build_event_mutation_decision_context(
+                                                    "robot",
+                                                    "ft.robot.events",
+                                                    "event.label.remove",
+                                                    event_id,
+                                                    "remove_label",
+                                                    by.as_deref(),
+                                                    &input_summary,
+                                                    Some(removed),
+                                                    None,
+                                                    Some(label.as_str()),
+                                                    now,
+                                                );
                                             let audit = AuditActionRecord {
                                                 id: 0,
                                                 ts: now,
@@ -14729,11 +14905,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     "Robot removed event label".to_string(),
                                                 ),
                                                 rule_id: None,
-                                                input_summary: Some(format!(
-                                                    "ft robot events label {event_id} --remove {label}"
-                                                )),
+                                                input_summary: Some(input_summary),
                                                 verification_summary: None,
-                                                decision_context: None,
+                                                decision_context,
                                                 result: if removed {
                                                     "success".to_string()
                                                 } else {
@@ -20777,6 +20951,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             die(&format!("Failed to update note: {e}"), None);
                         }
 
+                        let input_summary = if clear {
+                            format!("ft events annotate {event_id} --clear")
+                        } else {
+                            format!("ft events annotate {event_id} --note <redacted>")
+                        };
+                        let decision_context = build_event_mutation_decision_context(
+                            "human",
+                            "ft.events",
+                            "event.annotate",
+                            event_id,
+                            if clear { "clear_note" } else { "set_note" },
+                            by.as_deref(),
+                            &input_summary,
+                            None,
+                            None,
+                            None,
+                            now,
+                        );
                         let audit = AuditActionRecord {
                             id: 0,
                             ts: now,
@@ -20789,13 +20981,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             policy_decision: "allow".to_string(),
                             decision_reason: Some("Human updated event note".to_string()),
                             rule_id: None,
-                            input_summary: Some(if clear {
-                                format!("ft events annotate {event_id} --clear")
-                            } else {
-                                format!("ft events annotate {event_id} --note <redacted>")
-                            }),
+                            input_summary: Some(input_summary),
                             verification_summary: None,
-                            decision_context: None,
+                            decision_context,
                             result: "success".to_string(),
                         };
                         if let Err(e) = storage.record_audit_action_redacted(audit).await {
@@ -20825,6 +21013,31 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             Err(e) => die(&format!("Failed to update triage state: {e}"), None),
                         };
 
+                        let input_summary = if clear {
+                            format!("ft events triage {event_id} --clear")
+                        } else {
+                            format!(
+                                "ft events triage {event_id} --state {}",
+                                state.as_deref().unwrap_or_default()
+                            )
+                        };
+                        let decision_context = build_event_mutation_decision_context(
+                            "human",
+                            "ft.events",
+                            "event.triage",
+                            event_id,
+                            if clear {
+                                "clear_triage_state"
+                            } else {
+                                "set_triage_state"
+                            },
+                            by.as_deref(),
+                            &input_summary,
+                            Some(changed),
+                            state.as_deref(),
+                            None,
+                            now,
+                        );
                         let audit = AuditActionRecord {
                             id: 0,
                             ts: now,
@@ -20837,16 +21050,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             policy_decision: "allow".to_string(),
                             decision_reason: Some("Human updated event triage state".to_string()),
                             rule_id: None,
-                            input_summary: Some(if clear {
-                                format!("ft events triage {event_id} --clear")
-                            } else {
-                                format!(
-                                    "ft events triage {event_id} --state {}",
-                                    state.unwrap_or_default()
-                                )
-                            }),
+                            input_summary: Some(input_summary),
                             verification_summary: None,
-                            decision_context: None,
+                            decision_context,
                             result: if changed {
                                 "success".to_string()
                             } else {
@@ -20892,6 +21098,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 Err(e) => die(&format!("Failed to add label: {e}"), None),
                             };
 
+                            let input_summary = format!("ft events label {event_id} --add {label}");
+                            let decision_context = build_event_mutation_decision_context(
+                                "human",
+                                "ft.events",
+                                "event.label.add",
+                                event_id,
+                                "add_label",
+                                by.as_deref(),
+                                &input_summary,
+                                Some(inserted),
+                                None,
+                                Some(label.as_str()),
+                                now,
+                            );
                             let audit = AuditActionRecord {
                                 id: 0,
                                 ts: now,
@@ -20904,11 +21124,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 policy_decision: "allow".to_string(),
                                 decision_reason: Some("Human added event label".to_string()),
                                 rule_id: None,
-                                input_summary: Some(format!(
-                                    "ft events label {event_id} --add {label}"
-                                )),
+                                input_summary: Some(input_summary),
                                 verification_summary: None,
-                                decision_context: None,
+                                decision_context,
                                 result: if inserted {
                                     "success".to_string()
                                 } else {
@@ -20927,6 +21145,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     Err(e) => die(&format!("Failed to remove label: {e}"), None),
                                 };
 
+                            let input_summary =
+                                format!("ft events label {event_id} --remove {label}");
+                            let decision_context = build_event_mutation_decision_context(
+                                "human",
+                                "ft.events",
+                                "event.label.remove",
+                                event_id,
+                                "remove_label",
+                                by.as_deref(),
+                                &input_summary,
+                                Some(removed),
+                                None,
+                                Some(label.as_str()),
+                                now,
+                            );
                             let audit = AuditActionRecord {
                                 id: 0,
                                 ts: now,
@@ -20939,11 +21172,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 policy_decision: "allow".to_string(),
                                 decision_reason: Some("Human removed event label".to_string()),
                                 rule_id: None,
-                                input_summary: Some(format!(
-                                    "ft events label {event_id} --remove {label}"
-                                )),
+                                input_summary: Some(input_summary),
                                 verification_summary: None,
-                                decision_context: None,
+                                decision_context,
                                 result: if removed {
                                     "success".to_string()
                                 } else {
@@ -39509,6 +39740,182 @@ log_level = "debug"
 
             cleanup_storage(storage, &db_path).await;
         }
+    }
+
+    #[test]
+    fn event_mutation_decision_context_tracks_human_cli_surface_and_triage_state() {
+        let input_summary = "ft events triage 42 --state investigating";
+        let ctx_json = build_event_mutation_decision_context(
+            "human",
+            "ft.events",
+            "event.triage",
+            42,
+            "set_triage_state",
+            Some("ops"),
+            input_summary,
+            Some(true),
+            Some("investigating"),
+            None,
+            1_234,
+        )
+        .expect("decision context should serialize");
+        let ctx: frankenterm_core::policy::DecisionContext =
+            serde_json::from_str(&ctx_json).expect("decision context should parse");
+        let evidence = |key: &str| {
+            ctx.evidence
+                .iter()
+                .find(|entry| entry.key == key)
+                .map(|entry| entry.value.as_str())
+        };
+
+        assert_eq!(ctx.actor, frankenterm_core::policy::ActorKind::Human);
+        assert_eq!(
+            ctx.surface,
+            frankenterm_core::policy::PolicySurface::Unknown
+        );
+        assert_eq!(
+            ctx.action,
+            frankenterm_core::policy::ActionKind::ExecCommand
+        );
+        assert_eq!(ctx.text_summary.as_deref(), Some(input_summary));
+        assert_eq!(ctx.determining_rule.as_deref(), Some("audit.event.triage"));
+        assert_eq!(evidence("stage"), Some("event_mutation"));
+        assert_eq!(evidence("interface"), Some("ft.events"));
+        assert_eq!(evidence("event_action_kind"), Some("event.triage"));
+        assert_eq!(evidence("event_id"), Some("42"));
+        assert_eq!(evidence("operation"), Some("set_triage_state"));
+        assert_eq!(evidence("event_surface"), Some("unknown"));
+        assert_eq!(evidence("actor_id"), Some("ops"));
+        assert_eq!(evidence("changed"), Some("true"));
+        assert_eq!(evidence("state"), Some("investigating"));
+    }
+
+    #[test]
+    fn event_mutation_decision_context_tracks_robot_surface_and_label_evidence() {
+        let input_summary = "ft robot events label 77 --add urgent";
+        let ctx_json = build_event_mutation_decision_context(
+            "robot",
+            "ft.robot.events",
+            "event.label.add",
+            77,
+            "add_label",
+            Some("agent-7"),
+            input_summary,
+            Some(false),
+            None,
+            Some("urgent"),
+            9_999,
+        )
+        .expect("decision context should serialize");
+        let ctx: frankenterm_core::policy::DecisionContext =
+            serde_json::from_str(&ctx_json).expect("decision context should parse");
+        let evidence = |key: &str| {
+            ctx.evidence
+                .iter()
+                .find(|entry| entry.key == key)
+                .map(|entry| entry.value.as_str())
+        };
+
+        assert_eq!(ctx.actor, frankenterm_core::policy::ActorKind::Robot);
+        assert_eq!(ctx.surface, frankenterm_core::policy::PolicySurface::Robot);
+        assert_eq!(
+            ctx.action,
+            frankenterm_core::policy::ActionKind::ExecCommand
+        );
+        assert_eq!(ctx.text_summary.as_deref(), Some(input_summary));
+        assert_eq!(
+            ctx.determining_rule.as_deref(),
+            Some("audit.event.label.add")
+        );
+        assert_eq!(evidence("interface"), Some("ft.robot.events"));
+        assert_eq!(evidence("event_action_kind"), Some("event.label.add"));
+        assert_eq!(evidence("event_id"), Some("77"));
+        assert_eq!(evidence("operation"), Some("add_label"));
+        assert_eq!(evidence("event_surface"), Some("robot"));
+        assert_eq!(evidence("actor_id"), Some("agent-7"));
+        assert_eq!(evidence("changed"), Some("false"));
+        assert_eq!(evidence("label"), Some("urgent"));
+    }
+
+    #[test]
+    fn ipc_rpc_decision_context_tracks_ipc_surface_and_request_metadata() {
+        let input_summary = "ft robot state";
+        let ctx_json = build_ipc_rpc_decision_context(
+            "robot",
+            input_summary,
+            "success",
+            Some("req-123"),
+            4_321,
+        )
+        .expect("decision context should serialize");
+        let ctx: frankenterm_core::policy::DecisionContext =
+            serde_json::from_str(&ctx_json).expect("decision context should parse");
+        let evidence = |key: &str| {
+            ctx.evidence
+                .iter()
+                .find(|entry| entry.key == key)
+                .map(|entry| entry.value.as_str())
+        };
+
+        assert_eq!(ctx.actor, frankenterm_core::policy::ActorKind::Robot);
+        assert_eq!(ctx.surface, frankenterm_core::policy::PolicySurface::Ipc);
+        assert_eq!(
+            ctx.action,
+            frankenterm_core::policy::ActionKind::ExecCommand
+        );
+        assert_eq!(ctx.text_summary.as_deref(), Some(input_summary));
+        assert_eq!(ctx.determining_rule.as_deref(), Some("audit.ipc.rpc"));
+        assert_eq!(evidence("stage"), Some("ipc_rpc"));
+        assert_eq!(evidence("interface"), Some("ft.ipc.rpc"));
+        assert_eq!(evidence("ipc_action_kind"), Some("ipc.rpc"));
+        assert_eq!(evidence("ipc_surface"), Some("ipc"));
+        assert_eq!(evidence("ipc_actor_kind"), Some("robot"));
+        assert_eq!(evidence("ipc_result"), Some("success"));
+        assert_eq!(evidence("request_id"), Some("req-123"));
+    }
+
+    #[tokio::test]
+    async fn record_ipc_rpc_audit_persists_structured_decision_context() {
+        let (storage, db_path) = setup_storage("ipc_rpc_audit_ctx").await;
+        let shared_storage = Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage));
+
+        record_ipc_rpc_audit(
+            &shared_storage,
+            Some("req-456".to_string()),
+            "ft robot state".to_string(),
+            "success",
+        )
+        .await;
+
+        let storage_handle = shared_storage.lock().await.clone();
+        let audits = storage_handle
+            .get_audit_actions(frankenterm_core::storage::AuditQuery {
+                action_kind: Some("ipc.rpc".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].actor_kind, "robot");
+        assert_eq!(audits[0].correlation_id.as_deref(), Some("req-456"));
+
+        let ctx_json = audits[0]
+            .decision_context
+            .as_deref()
+            .expect("ipc rpc audit should retain decision_context");
+        let ctx: frankenterm_core::policy::DecisionContext =
+            serde_json::from_str(ctx_json).expect("decision context should parse");
+        assert_eq!(ctx.actor, frankenterm_core::policy::ActorKind::Robot);
+        assert_eq!(ctx.surface, frankenterm_core::policy::PolicySurface::Ipc);
+        assert_eq!(ctx.determining_rule.as_deref(), Some("audit.ipc.rpc"));
+        assert_eq!(ctx.text_summary.as_deref(), Some("ft robot state"));
+        assert!(
+            ctx.evidence
+                .iter()
+                .any(|entry| entry.key == "request_id" && entry.value == "req-456")
+        );
+
+        cleanup_storage(storage_handle, &db_path).await;
     }
 
     // ---- Triage scoring / ordering tests ----

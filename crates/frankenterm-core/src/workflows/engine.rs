@@ -527,14 +527,25 @@ async fn record_workflow_action(
     action_kind: &str,
     execution_id: &str,
     pane_id: u64,
-    _workflow_name: &str,
+    workflow_name: &str,
     input_summary: Option<String>,
     result: &str,
     decision_reason: Option<String>,
 ) -> Option<i64> {
+    let timestamp_ms = now_ms();
+    let decision_context = build_workflow_audit_decision_context(
+        action_kind,
+        execution_id,
+        pane_id,
+        workflow_name,
+        input_summary.as_deref(),
+        result,
+        decision_reason.as_deref(),
+        timestamp_ms,
+    );
     let action = crate::storage::AuditActionRecord {
         id: 0,
-        ts: now_ms(),
+        ts: timestamp_ms,
         actor_kind: "workflow".to_string(),
         actor_id: Some(execution_id.to_string()),
         correlation_id: None,
@@ -546,7 +557,7 @@ async fn record_workflow_action(
         rule_id: None,
         input_summary,
         verification_summary: None,
-        decision_context: None,
+        decision_context,
         result: result.to_string(),
     };
 
@@ -562,6 +573,55 @@ async fn record_workflow_action(
             None
         }
     }
+}
+
+fn build_workflow_audit_decision_context(
+    action_kind: &str,
+    execution_id: &str,
+    pane_id: u64,
+    workflow_name: &str,
+    input_summary: Option<&str>,
+    result: &str,
+    decision_reason: Option<&str>,
+    timestamp_ms: i64,
+) -> Option<String> {
+    let mut context = crate::policy::DecisionContext {
+        timestamp_ms,
+        action: crate::policy::ActionKind::WorkflowRun,
+        actor: crate::policy::ActorKind::Workflow,
+        surface: crate::policy::PolicySurface::Workflow,
+        pane_id: Some(pane_id),
+        domain: None,
+        capabilities: crate::policy::PaneCapabilities::default(),
+        text_summary: input_summary.map(str::to_string),
+        workflow_id: Some(execution_id.to_string()),
+        rules_evaluated: Vec::new(),
+        determining_rule: None,
+        evidence: Vec::new(),
+        rate_limit: None,
+        risk: None,
+    };
+    let determining_rule = format!("audit.{action_kind}");
+    context.record_rule(
+        &determining_rule,
+        true,
+        Some("allow"),
+        Some("workflow audit action recorded".to_string()),
+    );
+    context.set_determining_rule(&determining_rule);
+    context.add_evidence("stage", "workflow_audit");
+    context.add_evidence("workflow_action_kind", action_kind);
+    context.add_evidence(
+        "workflow_surface",
+        crate::policy::PolicySurface::Workflow.as_str(),
+    );
+    context.add_evidence("workflow_name", workflow_name);
+    context.add_evidence("execution_id", execution_id);
+    context.add_evidence("workflow_result", result);
+    if let Some(decision_reason) = decision_reason {
+        context.add_evidence("decision_reason", decision_reason);
+    }
+    serde_json::to_string(&context).ok()
 }
 
 pub(super) async fn record_workflow_start_action(
@@ -736,6 +796,35 @@ pub(super) async fn record_workflow_terminal_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    fn temp_db_path() -> (TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("workflow-engine-audit.db");
+        (dir, db_path)
+    }
+
+    fn latest_audit_action(db_path: &Path, action_kind: &str) -> crate::storage::AuditActionRecord {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            let rows = storage
+                .get_audit_actions(crate::storage::AuditQuery {
+                    limit: Some(1),
+                    action_kind: Some(action_kind.to_string()),
+                    ..crate::storage::AuditQuery::default()
+                })
+                .await
+                .unwrap();
+            rows.into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("missing audit row for {action_kind}"))
+        })
+    }
 
     // ========================================================================
     // ExecutionStatus serde + equality
@@ -845,6 +934,110 @@ mod tests {
     fn workflow_engine_zero_concurrency() {
         let engine = WorkflowEngine::new(0);
         assert_eq!(engine.max_concurrent(), 0);
+    }
+
+    #[test]
+    fn workflow_audit_decision_context_tracks_workflow_surface_and_metadata() {
+        let input_summary = Some("{\"workflow_name\":\"handle_compaction\",\"step_index\":1}");
+        let ctx_json = build_workflow_audit_decision_context(
+            "workflow_step",
+            "wf-123",
+            7,
+            "handle_compaction",
+            input_summary,
+            "continue",
+            Some("waiting for verification"),
+            1_234,
+        )
+        .expect("decision context should serialize");
+        let ctx: crate::policy::DecisionContext =
+            serde_json::from_str(&ctx_json).expect("decision context should parse");
+        let evidence = |key: &str| {
+            ctx.evidence
+                .iter()
+                .find(|entry| entry.key == key)
+                .map(|entry| entry.value.as_str())
+        };
+
+        assert_eq!(ctx.actor, crate::policy::ActorKind::Workflow);
+        assert_eq!(ctx.surface, crate::policy::PolicySurface::Workflow);
+        assert_eq!(ctx.action, crate::policy::ActionKind::WorkflowRun);
+        assert_eq!(ctx.pane_id, Some(7));
+        assert_eq!(ctx.workflow_id.as_deref(), Some("wf-123"));
+        assert_eq!(ctx.text_summary, input_summary.map(str::to_string));
+        assert_eq!(ctx.determining_rule.as_deref(), Some("audit.workflow_step"));
+        assert_eq!(evidence("stage"), Some("workflow_audit"));
+        assert_eq!(evidence("workflow_action_kind"), Some("workflow_step"));
+        assert_eq!(evidence("workflow_surface"), Some("workflow"));
+        assert_eq!(evidence("workflow_name"), Some("handle_compaction"));
+        assert_eq!(evidence("execution_id"), Some("wf-123"));
+        assert_eq!(evidence("workflow_result"), Some("continue"));
+        assert_eq!(
+            evidence("decision_reason"),
+            Some("waiting for verification")
+        );
+    }
+
+    #[test]
+    fn record_workflow_step_action_persists_structured_decision_context() {
+        let (_dir, db_path) = temp_db_path();
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage should initialize");
+            record_workflow_step_action(
+                &storage,
+                "handle_compaction",
+                "wf-456",
+                9,
+                2,
+                "verify_output",
+                Some("step-verify".to_string()),
+                Some("verification".to_string()),
+                "continue",
+                Some(41),
+            )
+            .await;
+        });
+
+        let audit = latest_audit_action(&db_path, "workflow_step");
+        assert_eq!(audit.actor_kind, "workflow");
+        assert_eq!(audit.actor_id.as_deref(), Some("wf-456"));
+        assert_eq!(audit.pane_id, Some(9));
+        assert_eq!(audit.result, "continue");
+
+        let ctx: crate::policy::DecisionContext = serde_json::from_str(
+            audit
+                .decision_context
+                .as_deref()
+                .expect("decision context should be recorded"),
+        )
+        .expect("decision context should parse");
+        assert_eq!(ctx.actor, crate::policy::ActorKind::Workflow);
+        assert_eq!(ctx.surface, crate::policy::PolicySurface::Workflow);
+        assert_eq!(ctx.action, crate::policy::ActionKind::WorkflowRun);
+        assert_eq!(ctx.workflow_id.as_deref(), Some("wf-456"));
+        assert_eq!(ctx.determining_rule.as_deref(), Some("audit.workflow_step"));
+        assert!(
+            ctx.evidence
+                .iter()
+                .any(|entry| entry.key == "workflow_name" && entry.value == "handle_compaction")
+        );
+        let summary = ctx
+            .text_summary
+            .as_deref()
+            .expect("workflow summary should be recorded");
+        let summary_json: serde_json::Value =
+            serde_json::from_str(summary).expect("workflow summary should be json");
+        assert_eq!(summary_json["workflow_name"], "handle_compaction");
+        assert_eq!(summary_json["execution_id"], "wf-456");
+        assert_eq!(summary_json["step_index"], 2);
+        assert_eq!(summary_json["step_name"], "verify_output");
+        assert_eq!(summary_json["step_id"], "step-verify");
+        assert_eq!(summary_json["step_kind"], "verification");
+        assert_eq!(summary_json["result_type"], "continue");
+        assert_eq!(summary_json["parent_action_id"], 41);
     }
 
     // ========================================================================
