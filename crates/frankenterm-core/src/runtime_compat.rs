@@ -666,9 +666,17 @@ pub mod task {
             if self.handles.is_empty() {
                 return None;
             }
-            // Simple approach: await the last handle (LIFO)
-            let handle = self.handles.pop().unwrap();
-            Some(handle.await)
+            
+            std::future::poll_fn(|cx| {
+                for i in 0..self.handles.len() {
+                    let mut pinned = std::pin::Pin::new(&mut self.handles[i]);
+                    if let std::task::Poll::Ready(result) = pinned.as_mut().poll(cx) {
+                        self.handles.swap_remove(i);
+                        return std::task::Poll::Ready(Some(result));
+                    }
+                }
+                std::task::Poll::Pending
+            }).await
         }
 
         /// Non-blocking poll for the next completed task.

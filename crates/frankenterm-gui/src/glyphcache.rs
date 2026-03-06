@@ -244,7 +244,7 @@ impl FrameDecoder {
             .format()
             .ok_or_else(|| anyhow::anyhow!("cannot determine image format"))?;
 
-        std::thread::spawn(move || {
+        let _decoder_handle = std::thread::spawn(move || {
             if let Err(err) = Self::run_decoder_thread(reader, format, tx) {
                 if err
                     .downcast_ref::<std::sync::mpsc::SendError<DecodedFrame>>()

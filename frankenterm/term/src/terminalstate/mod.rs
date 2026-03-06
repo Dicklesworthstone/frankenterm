@@ -1126,8 +1126,8 @@ impl TerminalState {
     /// If the cursor is at the bottom margin, the page scrolls up.
     fn c1_index(&mut self) {
         if self.left_and_right_margins.contains(&self.cursor.x) {
-            if self.cursor.y == self.top_and_bottom_margins.start {
-                self.scroll_down(1);
+            if self.cursor.y == self.top_and_bottom_margins.end - 1 {
+                self.scroll_up(1);
             } else {
                 self.set_cursor_pos(&Position::Relative(0), &Position::Relative(1));
             }

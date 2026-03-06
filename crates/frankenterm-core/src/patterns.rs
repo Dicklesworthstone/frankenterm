@@ -2780,7 +2780,7 @@ impl PatternEngine {
                     let end = start + anchor_len;
                     // Skip if this substring extends past the text
                     if end > text_len {
-                        continue;
+                        break;
                     }
                     // Ensure we end at a valid UTF-8 boundary
                     if !text.is_char_boundary(end) {
