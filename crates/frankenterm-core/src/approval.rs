@@ -273,7 +273,7 @@ impl<'a> ApprovalStore<'a> {
         let audit = AuditActionRecord {
             id: 0,
             ts: now_ms(),
-            actor_kind: "human".to_string(),
+            actor_kind: input.actor.as_str().to_string(),
             actor_id: None,
             correlation_id: audit_context.and_then(|ctx| ctx.correlation_id.clone()),
             pane_id: input.pane_id,
@@ -1290,6 +1290,7 @@ mod tests {
             };
             let audits = storage.get_audit_actions(query).await.unwrap();
             assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0].actor_kind, "robot");
             assert_eq!(audits[0].correlation_id.as_deref(), Some("sha256:testcorr"));
             assert_eq!(
                 audits[0].decision_context.as_deref(),
@@ -1731,6 +1732,46 @@ mod tests {
                 .await
                 .unwrap();
             assert!(consumed.is_some());
+
+            cleanup_storage(storage, &db_path).await;
+        });
+    }
+
+    #[test]
+    fn consume_with_context_preserves_non_human_actor_kind_in_audit() {
+        run_async_test(async {
+            let (storage, db_path) = setup_test_storage("actor_kind_parity").await;
+            let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+
+            for actor in [ActorKind::Robot, ActorKind::Mcp, ActorKind::Workflow] {
+                let input = PolicyInput::new(ActionKind::SendText, actor)
+                    .with_pane(1)
+                    .with_domain("local")
+                    .with_text_summary(format!("echo {}", actor.as_str()))
+                    .with_capabilities(PaneCapabilities::prompt());
+                let request = store.issue(&input, None).await.unwrap();
+                let correlation_id = format!("sha256:actor-{}", actor.as_str());
+                let audit_context = ApprovalAuditContext {
+                    correlation_id: Some(correlation_id.clone()),
+                    decision_context: None,
+                };
+
+                let consumed = store
+                    .consume_with_context(&request.allow_once_code, &input, Some(audit_context))
+                    .await
+                    .unwrap();
+                assert!(consumed.is_some());
+
+                let audits = storage
+                    .get_audit_actions(AuditQuery {
+                        correlation_id: Some(correlation_id),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(audits.len(), 1);
+                assert_eq!(audits[0].actor_kind, actor.as_str());
+            }
 
             cleanup_storage(storage, &db_path).await;
         });

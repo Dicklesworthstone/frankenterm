@@ -473,73 +473,21 @@ impl ArsCompiler {
 // Safety regex matching (shared with ars_generalize)
 // =============================================================================
 
-/// Check if a value matches a safety regex character class.
-///
-/// Supports simple patterns like `^[a-zA-Z0-9_./-]+$` without needing
-/// a full regex engine. Falls back to `true` for complex patterns.
+/// Check if a value matches a safety regex pattern.
 fn matches_safety_regex(value: &str, pattern: &str) -> bool {
     if value.is_empty() {
         return false;
     }
 
-    // Strip anchors.
-    let inner = pattern
-        .strip_prefix('^')
-        .unwrap_or(pattern)
-        .strip_suffix('$')
-        .unwrap_or(pattern);
-
-    // Handle `[charset]+(optional)?` patterns.
-    let chars_part = if let Some(rest) = inner.strip_prefix('[') {
-        if let Some(end) = rest.find("]+") {
-            let charset = &rest[..end];
-            // Verify no remaining required parts after the `]+`.
-            let after = &rest[end + 2..];
-            let after_stripped = after.replace("(\\.[0-9]+)?", "");
-            if !after_stripped.is_empty() {
-                return true; // Complex pattern, allow.
-            }
-            charset
-        } else {
-            return true; // Unrecognized pattern.
-        }
-    } else {
-        return true; // Not a bracket pattern.
-    };
-
-    // Validate each character against the charset.
-    value.chars().all(|ch| char_in_class(ch, chars_part))
-}
-
-/// Check if a character is in a character class like `a-zA-Z0-9_./`.
-fn char_in_class(ch: char, class: &str) -> bool {
-    let bytes = class.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 2 < bytes.len() && bytes[i + 1] == b'-' {
-            let lo = bytes[i] as char;
-            let hi = bytes[i + 2] as char;
-            if ch >= lo && ch <= hi {
-                return true;
-            }
-            i += 3;
-        } else {
-            // Literal character (handle backslash escapes).
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                let escaped = bytes[i + 1] as char;
-                if ch == escaped {
-                    return true;
-                }
-                i += 2;
-            } else {
-                if ch == bytes[i] as char {
-                    return true;
-                }
-                i += 1;
-            }
+    // Compile the regex. If the agent provided an invalid regex,
+    // we fail closed (deny the binding) rather than failing open.
+    match regex::Regex::new(pattern) {
+        Ok(re) => re.is_match(value),
+        Err(e) => {
+            tracing::warn!("Invalid safety regex provided: '{}' ({})", pattern, e);
+            false
         }
     }
-    false
 }
 
 // =============================================================================
@@ -1279,9 +1227,10 @@ mod tests {
     }
 
     #[test]
-    fn safety_complex_pattern_allows_all() {
-        // Complex patterns we can't parse → allow (conservative for good values).
-        assert!(matches_safety_regex("anything", "^(?:foo|bar)$"));
+    fn safety_complex_pattern_rejects_non_matching() {
+        // Complex patterns now use a real regex engine, so they correctly reject bad values.
+        assert!(!matches_safety_regex("anything", "^(?:foo|bar)$"));
+        assert!(matches_safety_regex("foo", "^(?:foo|bar)$"));
     }
 
     // ---- Newline appending ----

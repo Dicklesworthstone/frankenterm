@@ -297,12 +297,16 @@ impl ArsSecretScanner {
 
             let entropy = shannon_entropy(token);
             if entropy >= self.config.entropy_threshold {
-                // Check if this token was already caught by pattern matching.
+                let token_start = token.as_ptr() as usize - text.as_ptr() as usize;
+                let token_end = token_start + len;
+
+                // Check if this token overlaps with an already found pattern match.
                 let already_found = findings.iter().any(|f| {
                     f.block_index == block_index
                         && f.source == source
                         && f.detection_method == DetectionMethod::PatternMatch
-                        && text[f.byte_offset..f.byte_offset + f.match_len].contains(token)
+                        && token_start < (f.byte_offset + f.match_len)
+                        && f.byte_offset < token_end
                 });
 
                 if !already_found {

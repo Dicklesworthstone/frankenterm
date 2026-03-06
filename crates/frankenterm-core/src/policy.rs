@@ -1378,108 +1378,12 @@ enum CommandGateOutcome {
     RequireApproval { reason: String, rule_id: String },
 }
 
-#[derive(Debug, Clone, Copy)]
-enum CommandGateDecision {
-    Deny,
-    RequireApproval,
-}
-
-struct CommandRule {
-    id: &'static str,
-    regex: &'static LazyLock<Regex>,
-    decision: CommandGateDecision,
-    reason: &'static str,
-}
-
-static RM_RF_ROOT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?ix)
-        \brm\s+
-        (?:.*?\s)?
-        (?:
-            (?:-[a-zA-Z]*(?:r[a-zA-Z]*f|f[a-zA-Z]*r)[a-zA-Z]*\b|(?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b)\s+(?:.*?\s)?(?:-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)|(?:-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)\s+(?:.*?\s)?(?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b))\s+(?:/|~/?)\*?(?:\s|$)
-            |
-            (?:/|~/?)\*?(?:\s+.*?)?\s+(?:-[a-zA-Z]*(?:r[a-zA-Z]*f|f[a-zA-Z]*r)[a-zA-Z]*\b|(?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b)\s+(?:.*?\s)?(?:-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)|(?:-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)\s+(?:.*?\s)?(?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b))(?:\s|$)
-        )
-    ").expect("rm -rf root regex")
-});
-static RM_RF_GENERIC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?ix)
-        \brm\s+
-        (?:.*?\s)?
-        (?:
-            -[a-zA-Z]*(?:r[a-zA-Z]*f|f[a-zA-Z]*r)[a-zA-Z]*\b
-            |
-            (?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b)\s+(?:.*?\s)?(?:-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)
-            |
-            (?:-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)\s+(?:.*?\s)?(?:-[a-zA-Z]*[rR][a-zA-Z]*\b|--recursive\b)
-        )
-    ").expect("rm -rf regex")
-});
-static GIT_RESET_HARD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+reset\b.*\s--hard\b").expect("git reset --hard"));
-static GIT_CLEAN_FD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\s+clean\b.*\s-[-a-z]*f[-a-z]*d").expect("git clean -fd")
-});
-static GIT_PUSH_FORCE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\s+push\b.*\s(--force|-f)\b").expect("git push --force")
-});
-static GIT_BRANCH_DELETE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+branch\b.*\s-D\b").expect("git branch -D"));
-static SQL_DESTRUCTIVE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(drop\s+database|drop\s+table|truncate\s+table)\b").expect("sql destructive")
-});
-
 static VAR_ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"^[a-zA-Z_][a-zA-Z0-9_]*=(?:'[^']*'|"[^"]*"|\$\([^)]*\)|`[^`]*`|\\.|[^\s;&|<>])*(\s+|$)"#,
     )
     .expect("var assign regex")
 });
-
-static COMMAND_RULES: &[CommandRule] = &[
-    CommandRule {
-        id: "command.rm_rf_root",
-        regex: &RM_RF_ROOT,
-        decision: CommandGateDecision::Deny,
-        reason: "Blocking rm -rf on root/home paths",
-    },
-    CommandRule {
-        id: "command.rm_rf",
-        regex: &RM_RF_GENERIC,
-        decision: CommandGateDecision::RequireApproval,
-        reason: "rm -rf is destructive and requires approval",
-    },
-    CommandRule {
-        id: "command.git_reset_hard",
-        regex: &GIT_RESET_HARD,
-        decision: CommandGateDecision::RequireApproval,
-        reason: "git reset --hard discards uncommitted changes",
-    },
-    CommandRule {
-        id: "command.git_clean_fd",
-        regex: &GIT_CLEAN_FD,
-        decision: CommandGateDecision::RequireApproval,
-        reason: "git clean -fd removes untracked files",
-    },
-    CommandRule {
-        id: "command.git_push_force",
-        regex: &GIT_PUSH_FORCE,
-        decision: CommandGateDecision::RequireApproval,
-        reason: "git push --force rewrites remote history",
-    },
-    CommandRule {
-        id: "command.git_branch_delete",
-        regex: &GIT_BRANCH_DELETE,
-        decision: CommandGateDecision::RequireApproval,
-        reason: "git branch -D deletes branches permanently",
-    },
-    CommandRule {
-        id: "command.sql_destructive",
-        regex: &SQL_DESTRUCTIVE,
-        decision: CommandGateDecision::RequireApproval,
-        reason: "Destructive SQL command requires approval",
-    },
-];
 
 const COMMAND_TOKENS: &[&str] = &[
     "git",
@@ -1786,22 +1690,6 @@ struct DcgResponse {
     hook_specific_output: DcgHookOutput,
 }
 
-fn evaluate_builtin_rules(command: &str) -> Option<CommandGateOutcome> {
-    for rule in COMMAND_RULES {
-        if rule.regex.is_match(command) {
-            let rule_id = rule.id.to_string();
-            let reason = rule.reason.to_string();
-            return Some(match rule.decision {
-                CommandGateDecision::Deny => CommandGateOutcome::Deny { reason, rule_id },
-                CommandGateDecision::RequireApproval => {
-                    CommandGateOutcome::RequireApproval { reason, rule_id }
-                }
-            });
-        }
-    }
-    None
-}
-
 fn evaluate_command_gate_with_runner<F>(
     text: &str,
     config: &CommandGateConfig,
@@ -1844,7 +1732,36 @@ where
             continue;
         }
 
-        if let Some(result) = evaluate_builtin_rules(line) {
+        let builtin_result = match crate::command_guard::evaluate_stateless(line) {
+            Some((rule_id, _pack, reason, _suggestions)) => {
+                let is_hard_deny = rule_id == "core.filesystem:rm-rf-root";
+                let full_rule = if is_hard_deny {
+                    "command.rm_rf_root".to_string()
+                } else {
+                    format!("dcg.{} ", rule_id).trim().to_string()
+                };
+                
+                let policy = if is_hard_deny {
+                    DcgDenyPolicy::Deny
+                } else {
+                    config.dcg_deny_policy
+                };
+
+                Some(match policy {
+                    DcgDenyPolicy::Deny => CommandGateOutcome::Deny {
+                        reason,
+                        rule_id: full_rule,
+                    },
+                    DcgDenyPolicy::RequireApproval => CommandGateOutcome::RequireApproval {
+                        reason,
+                        rule_id: full_rule,
+                    },
+                })
+            }
+            None => None,
+        };
+
+        if let Some(result) = builtin_result {
             match result {
                 CommandGateOutcome::Deny { .. } => return result,
                 CommandGateOutcome::RequireApproval { .. } => {
@@ -1857,29 +1774,13 @@ where
         }
 
         let dcg_result = match config.dcg_mode {
-            DcgMode::Disabled => CommandGateOutcome::Allow,
-            DcgMode::Native => match crate::command_guard::evaluate_stateless(line) {
-                Some((rule_id, _pack, reason, _suggestions)) => {
-                    let full_rule = format!("dcg.{rule_id}");
-                    match config.dcg_deny_policy {
-                        DcgDenyPolicy::Deny => CommandGateOutcome::Deny {
-                            reason,
-                            rule_id: full_rule,
-                        },
-                        DcgDenyPolicy::RequireApproval => CommandGateOutcome::RequireApproval {
-                            reason,
-                            rule_id: full_rule,
-                        },
-                    }
-                }
-                None => CommandGateOutcome::Allow,
-            },
+            DcgMode::Disabled | DcgMode::Native => CommandGateOutcome::Allow,
             DcgMode::Opportunistic | DcgMode::Required => match dcg_runner(line) {
                 Ok(DcgDecision::Allow) => CommandGateOutcome::Allow,
                 Ok(DcgDecision::Deny { rule_id }) => {
                     let rule = rule_id.unwrap_or_else(|| "unknown".to_string());
-                    let rule_id = format!("dcg.{rule}");
-                    let reason = format!("Command safety gate blocked by dcg (rule {rule})");
+                    let rule_id = format!("dcg.{}", rule);
+                    let reason = format!("Command safety gate blocked by dcg (rule {})", rule);
                     match config.dcg_deny_policy {
                         DcgDenyPolicy::Deny => CommandGateOutcome::Deny { reason, rule_id },
                         DcgDenyPolicy::RequireApproval => {
@@ -1891,11 +1792,11 @@ where
                     DcgMode::Required => {
                         let detail = match err {
                             DcgError::NotAvailable => "dcg not available".to_string(),
-                            DcgError::Failed(detail) => format!("dcg error: {detail}"),
+                            DcgError::Failed(detail) => format!("dcg error: {}", detail),
                         };
                         CommandGateOutcome::RequireApproval {
                             reason: format!(
-                                "Command safety gate requires dcg but it is unavailable ({detail})"
+                                "Command safety gate requires dcg but it is unavailable ({})", detail
                             ),
                             rule_id: "command_gate.dcg_unavailable".to_string(),
                         }
@@ -1918,7 +1819,6 @@ where
 
     worst_outcome.unwrap_or(CommandGateOutcome::Allow)
 }
-
 fn evaluate_command_gate(text: &str, config: &CommandGateConfig) -> CommandGateOutcome {
     evaluate_command_gate_with_runner(text, config, run_dcg)
 }
@@ -7692,6 +7592,7 @@ mod tests {
             matching_rule: None,
             decision: None,
             rules_checked: vec!["rule.1".into(), "rule.2".into()],
+            matched_rule_ids: Vec::new(),
         };
         let cloned = r.clone();
         assert_eq!(cloned.rules_checked.len(), 2);

@@ -386,6 +386,8 @@ pub struct ParsedCommand {
     pub piped: bool,
     /// Subcommand substitutions found (need recursive analysis).
     pub substitutions: Vec<String>,
+    /// Redirect operations found (operator, target).
+    pub redirects: Vec<(String, String)>,
 }
 
 /// Parse tokens into a sequence of commands (handling pipes and separators).
@@ -394,36 +396,62 @@ pub fn parse_commands(tokens: &[ShellToken]) -> Vec<ParsedCommand> {
     let mut commands = Vec::new();
     let mut current_words = Vec::new();
     let mut current_subs = Vec::new();
+    let mut current_redirects = Vec::new();
     let mut is_piped = false;
+    let mut expect_redirect_target = None;
 
     for token in tokens {
+        if let Some(op) = expect_redirect_target.take() {
+            if let ShellToken::Word(w) = token {
+                current_redirects.push((op, w.clone()));
+                continue;
+            }
+            // If the next token isn't a word, just record the redirect without a target for now
+            // (it's invalid syntax, but we'll conservatively capture whatever we can)
+            current_redirects.push((op, String::new()));
+            // Re-evaluate this token below
+        }
+
+        if let ShellToken::Redirect(op) = token {
+            expect_redirect_target = Some(op.clone());
+            continue;
+        }
+
         match token {
             ShellToken::Word(w) => current_words.push(w.clone()),
             ShellToken::Substitution(s) => current_subs.push(s.clone()),
             ShellToken::Pipe => {
-                if let Some(cmd) = build_command(&current_words, &current_subs, true) {
+                if let Some(cmd) =
+                    build_command(&current_words, &current_subs, &current_redirects, true)
+                {
                     commands.push(cmd);
                 }
                 current_words.clear();
                 current_subs.clear();
+                current_redirects.clear();
                 is_piped = true;
             }
             ShellToken::Separator => {
-                if let Some(cmd) = build_command(&current_words, &current_subs, false) {
+                if let Some(cmd) =
+                    build_command(&current_words, &current_subs, &current_redirects, false)
+                {
                     commands.push(cmd);
                 }
                 current_words.clear();
                 current_subs.clear();
+                current_redirects.clear();
                 is_piped = false;
             }
-            ShellToken::Redirect(_) => {
-                // Skip the redirect operator; next word is the target.
-            }
+            ShellToken::Redirect(_) => unreachable!(),
         }
     }
 
+    if let Some(op) = expect_redirect_target {
+        current_redirects.push((op, String::new()));
+    }
+
     // Final command.
-    if let Some(cmd) = build_command(&current_words, &current_subs, false) {
+    if let Some(cmd) = build_command(&current_words, &current_subs, &current_redirects, false) {
         commands.push(cmd);
     }
 
@@ -431,8 +459,13 @@ pub fn parse_commands(tokens: &[ShellToken]) -> Vec<ParsedCommand> {
     commands
 }
 
-fn build_command(words: &[String], subs: &[String], piped: bool) -> Option<ParsedCommand> {
-    if words.is_empty() {
+fn build_command(
+    words: &[String],
+    subs: &[String],
+    redirects: &[(String, String)],
+    piped: bool,
+) -> Option<ParsedCommand> {
+    if words.is_empty() && redirects.is_empty() {
         return None;
     }
 
@@ -446,19 +479,24 @@ fn build_command(words: &[String], subs: &[String], piped: bool) -> Option<Parse
         }
     }
 
-    if cmd_start >= words.len() {
-        // All words are assignments — no actual command.
-        return None;
-    }
+    let binary = if cmd_start < words.len() {
+        extract_binary_name(&words[cmd_start])
+    } else {
+        String::new()
+    };
 
-    let binary = extract_binary_name(&words[cmd_start]);
-    let args = words[cmd_start + 1..].to_vec();
+    let args = if cmd_start < words.len() {
+        words[cmd_start + 1..].to_vec()
+    } else {
+        Vec::new()
+    };
 
     Some(ParsedCommand {
         binary,
         args,
         piped,
         substitutions: subs.to_vec(),
+        redirects: redirects.to_vec(),
     })
 }
 
@@ -726,6 +764,42 @@ impl SymbolicExecutor {
             // Check path arguments for traversal.
             if !self.safe_set.contains(&parsed_cmd.binary) {
                 self.check_path_args(cmd.index, parsed_cmd, violations);
+            }
+
+            // Always check redirects for out-of-bounds writes
+            self.check_redirects(cmd.index, parsed_cmd, violations);
+        }
+    }
+
+    /// Check redirects for dangerous path traversal.
+    fn check_redirects(
+        &self,
+        block_index: u32,
+        cmd: &ParsedCommand,
+        violations: &mut Vec<SafetyViolation>,
+    ) {
+        let boundary = Path::new(&self.config.cwd);
+
+        for (op, target) in &cmd.redirects {
+            if target.is_empty() {
+                continue;
+            }
+
+            let resolved = resolve_path(&self.config.cwd, target);
+
+            // If we are writing/appending outside the boundary, that's a traversal violation
+            if op.contains('>') && !path_within_boundary(&resolved, boundary) {
+                violations.push(SafetyViolation {
+                    block_index,
+                    category: ViolationCategory::PathTraversal,
+                    description: format!(
+                        "Redirect operator '{}' writes outside CWD: {} → {}",
+                        op,
+                        target,
+                        resolved.display()
+                    ),
+                    evidence: format!("{} {}", op, target),
+                });
             }
         }
     }
@@ -1145,6 +1219,22 @@ mod tests {
         let exec = cwd_executor("/home/user/project");
         let cmds = vec![make_cmd(0, "echo 'hello world'")];
         assert!(exec.analyze(&cmds).is_safe());
+    }
+
+    #[test]
+    fn unsafe_redirect_outside_cwd() {
+        let exec = cwd_executor("/home/user/project");
+        // even though echo is safe, writing to /etc/passwd is a violation
+        let cmds = vec![make_cmd(0, "echo evil > /etc/passwd")];
+        let verdict = exec.analyze(&cmds);
+        assert!(verdict.is_unsafe());
+        if let SafetyVerdict::Unsafe(v) = &verdict {
+            assert!(
+                v.violations
+                    .iter()
+                    .any(|v| v.category == ViolationCategory::PathTraversal)
+            );
+        }
     }
 
     // -------------------------------------------------------------------------

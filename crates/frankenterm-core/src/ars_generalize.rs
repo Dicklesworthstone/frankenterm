@@ -980,46 +980,15 @@ fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) ->
 /// - `^[charset]+$` — entire string matches charset
 /// - `^[charset]*$` — same but allows empty
 fn matches_safety_regex(value: &str, pattern: &str) -> bool {
-    // Parse simple patterns of form ^[...]+(...)$ or ^[...]*$
-    if !pattern.starts_with('^') || !pattern.ends_with('$') {
-        // If we can't parse, be conservative and reject.
+    if value.is_empty() {
         return false;
     }
-
-    let inner = &pattern[1..pattern.len() - 1];
-
-    // Handle `[charset]+` or `[charset]*` or `[charset]+(\.[charset]+)?`
-    // For now, just validate character-by-character.
-    if let Some(charset) = parse_simple_charset(inner) {
-        return validate_against_charset(value, &charset);
-    }
-
-    // Fallback: if pattern is exactly one of our known safety patterns,
-    // do specific validation.
-    match pattern {
-        r"^[a-zA-Z0-9_./-]+$" => {
-            !value.is_empty()
-                && value.bytes().all(|b| {
-                    b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'/' || b == b'-'
-                })
+    match regex::Regex::new(pattern) {
+        Ok(re) => re.is_match(value),
+        Err(e) => {
+            tracing::warn!("Invalid safety regex provided: '{}' ({})", pattern, e);
+            false
         }
-        r"^[0-9]+$" => !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
-        r"^[a-zA-Z_][a-zA-Z0-9_]*$" => {
-            !value.is_empty()
-                && (value.as_bytes()[0].is_ascii_alphabetic() || value.as_bytes()[0] == b'_')
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        }
-        r"^[0-9]+(\.[0-9]+)?$" => {
-            !value.is_empty()
-                && value.bytes().all(|b| b.is_ascii_digit() || b == b'.')
-                && value.matches('.').count() <= 1
-                && !value.starts_with('.')
-                && !value.ends_with('.')
-        }
-        r"^[a-zA-Z0-9]+$" => !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric()),
-        _ => false,
     }
 }
 
