@@ -3804,6 +3804,7 @@ dependencies = [
 name = "ftui-runtime"
 version = "0.2.1"
 dependencies = [
+ "arc-swap",
  "ftui-backend 0.2.1",
  "ftui-core 0.2.1",
  "ftui-i18n 0.2.1",
@@ -3900,6 +3901,7 @@ dependencies = [
  "ftui-core 0.2.1",
  "ftui-layout 0.2.1",
  "ftui-render 0.2.1",
+ "ftui-runtime 0.2.1",
  "ftui-style 0.2.1",
  "ftui-text 0.2.1",
  "unicode-segmentation",
