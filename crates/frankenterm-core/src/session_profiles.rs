@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 // =============================================================================
 
 /// A declarative profile for spawning sessions/panes with consistent configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionProfile {
     /// Unique profile name (e.g., "agent-worker", "monitor", "dev-shell").
     pub name: String,
@@ -182,7 +182,7 @@ impl Default for ProfilePolicy {
 // =============================================================================
 
 /// A persona bundles a profile with additional identity/context for agent roles.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Persona {
     /// Persona name (e.g., "builder-agent", "monitor-fleet-alpha").
     pub name: String,
@@ -217,7 +217,7 @@ pub struct AgentIdentitySpec {
 // =============================================================================
 
 /// A fleet template describes a complete multi-pane setup with assigned personas.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FleetTemplate {
     /// Template name (e.g., "dev-swarm-4", "monitoring-grid").
     pub name: String,

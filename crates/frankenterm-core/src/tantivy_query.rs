@@ -443,16 +443,15 @@ pub fn extract_snippets(
             let raw_fragment = &text[start..end];
 
             // Insert highlight markers
-            let highlighted = raw_fragment.replacen(
-                &text[pos..pos + term.len()],
-                &format!(
-                    "{}{}{}",
-                    config.highlight_pre,
-                    &text[pos..pos + term.len()],
-                    config.highlight_post
-                ),
-                1,
+            let relative_pos = pos - start;
+            let mut highlighted = String::with_capacity(
+                raw_fragment.len() + config.highlight_pre.len() + config.highlight_post.len(),
             );
+            highlighted.push_str(&raw_fragment[..relative_pos]);
+            highlighted.push_str(&config.highlight_pre);
+            highlighted.push_str(&raw_fragment[relative_pos..relative_pos + term.len()]);
+            highlighted.push_str(&config.highlight_post);
+            highlighted.push_str(&raw_fragment[relative_pos + term.len()..]);
 
             fragments.push(Snippet {
                 fragment: highlighted,

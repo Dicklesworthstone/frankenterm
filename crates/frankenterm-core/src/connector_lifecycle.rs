@@ -169,7 +169,7 @@ impl fmt::Display for AdminState {
 }
 
 /// Full state of a managed connector installation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedConnector {
     /// Package ID (unique key).
     pub connector_id: String,
@@ -334,7 +334,7 @@ pub struct LifecycleResult {
 // =============================================================================
 
 /// Configuration for the lifecycle manager.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleManagerConfig {
     pub trust_policy: TrustPolicy,
     pub restart_policy: RestartPolicy,

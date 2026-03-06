@@ -354,7 +354,7 @@ impl CaptureScheduler {
 
         // Reserve 20% for low priority to prevent starvation (at least 1 if limit >= 2)
         let target_low_count = if effective_limit >= 2 {
-            1.max((effective_limit * 2) / 10)
+            1.max(effective_limit / 5)
         } else {
             0
         };

@@ -578,8 +578,8 @@ fn percent_decode(s: &str) -> String {
 /// Escape a path for use in a shell command.
 fn shell_escape(path: &Path) -> String {
     let s = path.to_string_lossy();
-    if s.contains(|c: char| c.is_whitespace() || "\"'$`!#&|;(){}[]<>?*~".contains(c)) {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    if s.contains(|c: char| c.is_whitespace() || "\"'$`!#&|;(){}[]<>?*~\\".contains(c)) {
+        format!("'{}'", s.replace('\'', "'\\''"))
     } else {
         s.into_owned()
     }
@@ -987,7 +987,7 @@ mod tests {
     fn shell_escape_spaces() {
         assert_eq!(
             shell_escape(&PathBuf::from("/foo/my project")),
-            "\"/foo/my project\""
+            "'/foo/my project'"
         );
     }
 
@@ -1471,58 +1471,58 @@ mod tests {
     #[test]
     fn shell_escape_dollar() {
         let result = shell_escape(&PathBuf::from("/home/$USER"));
-        assert!(result.starts_with('"'));
+        assert!(result.starts_with('\''));
         assert!(result.contains("$USER"));
     }
 
     #[test]
     fn shell_escape_backtick() {
         let result = shell_escape(&PathBuf::from("/foo/`bar`"));
-        assert!(result.starts_with('"'));
+        assert!(result.starts_with('\''));
     }
 
     #[test]
     fn shell_escape_exclamation() {
         let result = shell_escape(&PathBuf::from("/foo/bar!"));
-        assert!(result.starts_with('"'));
+        assert!(result.starts_with('\''));
     }
 
     #[test]
     fn shell_escape_ampersand() {
         let result = shell_escape(&PathBuf::from("/foo&bar"));
-        assert!(result.starts_with('"'));
+        assert!(result.starts_with('\''));
     }
 
     #[test]
     fn shell_escape_hash() {
         let result = shell_escape(&PathBuf::from("/foo#bar"));
-        assert!(result.starts_with('"'));
+        assert!(result.starts_with('\''));
     }
 
     #[test]
     fn shell_escape_quotes_in_path() {
         let result = shell_escape(&PathBuf::from("/foo/it's"));
-        assert!(result.starts_with('"'));
+        assert!(result.starts_with('\''));
     }
 
     #[test]
     fn shell_escape_double_quote_escaped() {
         let path = PathBuf::from("/foo/\"bar\"");
         let result = shell_escape(&path);
-        // Double quotes should be escaped as \"
-        assert!(result.contains("\\\""));
+        // Double quotes inside single quotes do not need escaping
+        assert!(result.contains("\"bar\""));
     }
 
     #[test]
     fn shell_escape_parentheses() {
         let result = shell_escape(&PathBuf::from("/foo/(copy)"));
-        assert!(result.starts_with('"'));
+        assert!(result.starts_with('\''));
     }
 
     #[test]
     fn shell_escape_tilde() {
         let result = shell_escape(&PathBuf::from("/foo/~backup"));
-        assert!(result.starts_with('"'));
+        assert!(result.starts_with('\''));
     }
 
     // =========================================================================

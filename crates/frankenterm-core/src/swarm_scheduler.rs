@@ -174,7 +174,7 @@ pub struct RebalanceMove {
 // =============================================================================
 
 /// A recorded scale event for audit and debugging.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScaleEvent {
     pub event_type: ScaleEventType,
     pub timestamp_ms: u64,

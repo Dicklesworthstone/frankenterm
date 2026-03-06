@@ -32,7 +32,7 @@ use crate::session_topology::{
 /// A `FleetSpec` describes the desired fleet composition using weighted model/program
 /// mix entries and optional role constraints. The launcher resolves this into a
 /// concrete `LaunchPlan` with deterministic slot assignments.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FleetSpec {
     /// Fleet name for identification and logging.
     pub name: String,

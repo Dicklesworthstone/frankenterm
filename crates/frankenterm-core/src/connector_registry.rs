@@ -463,7 +463,7 @@ impl RegistryTelemetry {
 // =============================================================================
 
 /// Configuration for the connector registry client.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectorRegistryConfig {
     /// Maximum installed packages before eviction of retired entries.
     pub max_packages: usize,
