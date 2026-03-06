@@ -233,7 +233,7 @@ impl ManagedConnector {
 }
 
 /// Auditable lifecycle event record.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleAuditEntry {
     pub at_ms: u64,
     pub operation: String,
@@ -318,7 +318,7 @@ impl Default for UpgradeStrategy {
 // =============================================================================
 
 /// Result of executing a lifecycle intent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleResult {
     pub connector_id: String,
     pub operation: String,

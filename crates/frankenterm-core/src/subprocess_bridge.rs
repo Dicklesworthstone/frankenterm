@@ -127,12 +127,19 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
         let mut stderr_data = Vec::new();
         let mut pipes_closed = 0;
 
+        let kill_process_group = |child_id: u32| {
+            #[cfg(unix)]
+            {
+                let _ = Command::new("kill")
+                    .arg("-9")
+                    .arg(format!("-{}", child_id))
+                    .status();
+            }
+        };
+
         loop {
             if started.elapsed() >= self.timeout {
-                #[cfg(unix)]
-                {
-                    let _ = Command::new("kill").arg("-9").arg(format!("-{}", child.id())).status();
-                }
+                kill_process_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 let err = BridgeError::Timeout(self.timeout);
@@ -145,12 +152,7 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
                     while pipes_closed < 2 {
                         let remaining = self.timeout.saturating_sub(started.elapsed());
                         if remaining.is_zero() {
-                            #[cfg(unix)]
-                            {
-                                let _ = Command::new("kill").arg("-9").arg(format!("-{}", child.id())).status();
-                            }
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            kill_process_group(child.id());
                             let err = BridgeError::Timeout(self.timeout);
                             warn!(bridge = %self.binary_name, error = %err, "subprocess bridge timeout waiting for pipe close");
                             return Err(err);
@@ -165,11 +167,7 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
                                 pipes_closed += 1;
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                #[cfg(unix)]
-                                {
-                                    let _ = Command::new("kill").arg("-9").arg(format!("-{}", child.id())).status();
-                                }
-                                let _ = child.kill(); // Kill any lingering daemon descendants in same process group
+                                kill_process_group(child.id());
                                 let err = BridgeError::Timeout(self.timeout);
                                 warn!(bridge = %self.binary_name, error = %err, "subprocess bridge timeout waiting for pipe close");
                                 return Err(err);

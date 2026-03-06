@@ -88,7 +88,7 @@ impl fmt::Display for HostHealth {
 }
 
 /// A registered mesh host.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MeshHost {
     /// Unique host identifier.
     pub host_id: String,
@@ -130,7 +130,7 @@ impl MeshHost {
 }
 
 /// A mesh zone (failure domain / availability region).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MeshZone {
     /// Unique zone identifier.
     pub zone_id: String,
@@ -207,7 +207,7 @@ pub struct RoutingRequest {
 }
 
 /// A routing decision.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoutingDecision {
     pub connector_id: String,
     pub host_id: String,
@@ -221,7 +221,7 @@ pub struct RoutingDecision {
 // =============================================================================
 
 /// A mesh failure event for audit/observability.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MeshFailureEvent {
     pub host_id: String,
     pub zone_id: String,
@@ -283,7 +283,7 @@ impl MeshTelemetry {
 // =============================================================================
 
 /// Configuration for the connector mesh.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectorMeshConfig {
     /// Default routing strategy.
     pub default_strategy: RoutingStrategy,

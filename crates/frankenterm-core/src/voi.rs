@@ -415,7 +415,8 @@ impl VoiScheduler {
 
     /// Produce a full scheduling round: compute VOI for all panes, sort by
     /// descending VOI, return ordered polling schedule.
-    pub fn schedule(&self, now_ms: u64) -> ScheduleResult {
+    pub fn schedule(&mut self, now_ms: u64) -> ScheduleResult {
+        self.telemetry.schedules_computed += 1;
         let mut decisions: Vec<SchedulingDecision> = Vec::with_capacity(self.beliefs.len());
         let mut total_entropy = 0.0;
 
@@ -459,7 +460,7 @@ impl VoiScheduler {
     }
 
     /// Select the single best pane to poll next.
-    pub fn next_pane(&self, now_ms: u64) -> Option<SchedulingDecision> {
+    pub fn next_pane(&mut self, now_ms: u64) -> Option<SchedulingDecision> {
         let result = self.schedule(now_ms);
         result
             .schedule
@@ -1075,7 +1076,7 @@ mod tests {
 
     #[test]
     fn empty_scheduler_schedule() {
-        let sched = VoiScheduler::new(VoiConfig::default());
+        let mut sched = VoiScheduler::new(VoiConfig::default());
         let result = sched.schedule(1000);
         assert!(result.schedule.is_empty());
         assert_eq!(result.above_threshold, 0);

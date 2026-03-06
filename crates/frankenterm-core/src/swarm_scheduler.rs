@@ -131,7 +131,7 @@ pub struct AgentLoadSnapshot {
 // =============================================================================
 
 /// A scheduling decision produced by `SwarmScheduler::evaluate()`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SchedulerDecision {
     /// No action needed — fleet is healthy and balanced.
     Noop { reason: String },

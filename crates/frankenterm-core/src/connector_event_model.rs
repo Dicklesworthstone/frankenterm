@@ -550,7 +550,7 @@ impl SchemaEvolutionRegistry {
                 f.required
                     && f.introduced_in.major <= version.major
                     && f.introduced_in.minor <= version.minor
-                    && f.deprecated_in.as_ref().map_or(true, |d| {
+                    && f.deprecated_in.as_ref().is_none_or(|d| {
                         d.major > version.major
                             || (d.major == version.major && d.minor > version.minor)
                     })
@@ -692,7 +692,7 @@ pub fn check_compatibility(
         .fields
         .iter()
         .filter(|f| {
-            f.deprecated_in.as_ref().map_or(false, |d| {
+            f.deprecated_in.as_ref().is_some_and(|d| {
                 d.major <= target.major
                     && (d.major < target.major || d.minor <= target.minor)
                     && f.introduced_in.major <= source.major

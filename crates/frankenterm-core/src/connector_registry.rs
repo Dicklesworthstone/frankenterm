@@ -180,7 +180,7 @@ impl fmt::Display for TrustLevel {
 }
 
 /// Trust policy configuration controlling what is allowed.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrustPolicy {
     /// Minimum trust level required for install.
     pub min_install_level: TrustLevel,
@@ -324,7 +324,7 @@ impl fmt::Display for PackageStatus {
 }
 
 /// A registered connector package (post-verification).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackageEntry {
     pub manifest: ConnectorManifest,
     pub status: PackageStatus,
@@ -495,7 +495,7 @@ pub struct ConnectorRegistryClient {
 }
 
 /// A record of a verification event.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerificationRecord {
     pub package_id: String,
     pub version: String,

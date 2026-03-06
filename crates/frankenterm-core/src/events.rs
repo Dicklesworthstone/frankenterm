@@ -313,12 +313,10 @@ fn truncate_to_char_boundary(value: &mut String, max_len: usize) {
     if value.len() <= max_len {
         return;
     }
-    let boundary = value
-        .char_indices()
-        .map(|(idx, _)| idx)
-        .take_while(|idx| *idx <= max_len)
-        .last()
-        .unwrap_or(0);
+    let mut boundary = max_len;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
     value.truncate(boundary);
 }
 

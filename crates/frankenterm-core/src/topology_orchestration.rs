@@ -66,7 +66,7 @@ fn default_weight() -> f64 {
 // =============================================================================
 
 /// A named group of panes that can be focused/unfocused together.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FocusGroup {
     /// Group name.
     pub name: String,

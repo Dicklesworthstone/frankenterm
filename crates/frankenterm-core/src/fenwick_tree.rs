@@ -23,6 +23,7 @@
 //! Bead: ft-283h4.26
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Configuration for a Fenwick Tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,7 +72,7 @@ pub struct FenwickStats {
 /// assert_eq!(ft.prefix_sum(1), 10);
 /// assert_eq!(ft.range_sum(1, 3), 9);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FenwickTree {
     /// Internal BIT array (1-indexed, element 0 unused).
     tree: Vec<i64>,
@@ -80,7 +81,18 @@ pub struct FenwickTree {
     /// Count of update operations.
     update_ops: u64,
     /// Count of query operations.
-    query_ops: u64,
+    query_ops: AtomicU64,
+}
+
+impl Clone for FenwickTree {
+    fn clone(&self) -> Self {
+        Self {
+            tree: self.tree.clone(),
+            n: self.n,
+            update_ops: self.update_ops,
+            query_ops: AtomicU64::new(self.query_ops.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl FenwickTree {
@@ -91,7 +103,7 @@ impl FenwickTree {
             tree: vec![0i64; n + 1],
             n,
             update_ops: 0,
-            query_ops: 0,
+            query_ops: AtomicU64::new(0),
         }
     }
 
@@ -121,7 +133,7 @@ impl FenwickTree {
             tree,
             n,
             update_ops: 0,
-            query_ops: 0,
+            query_ops: AtomicU64::new(0),
         }
     }
 
@@ -189,6 +201,7 @@ impl FenwickTree {
             "index {index} out of bounds for len {}",
             self.n
         );
+        self.query_ops.fetch_add(1, Ordering::Relaxed);
         self.prefix_sum_internal(index + 1)
     }
 
@@ -215,6 +228,7 @@ impl FenwickTree {
             "right {right} out of bounds for len {}",
             self.n
         );
+        self.query_ops.fetch_add(1, Ordering::Relaxed);
         // Increment query count (interior mutability not needed for stats).
         let right_sum = self.prefix_sum_internal(right + 1);
         if left == 0 {
@@ -238,6 +252,7 @@ impl FenwickTree {
             "index {index} out of bounds for len {}",
             self.n
         );
+        self.query_ops.fetch_add(1, Ordering::Relaxed);
         if index == 0 {
             self.prefix_sum_internal(1)
         } else {
@@ -257,6 +272,7 @@ impl FenwickTree {
     /// Runs in O(log² n) using binary search over prefix sums.
     #[must_use]
     pub fn find_kth(&self, target: i64) -> Option<usize> {
+        self.query_ops.fetch_add(1, Ordering::Relaxed);
         if self.n == 0 {
             return None;
         }
@@ -305,7 +321,7 @@ impl FenwickTree {
             element_count: self.n,
             total_sum: self.total_sum(),
             update_count: self.update_ops,
-            query_count: self.query_ops,
+            query_count: self.query_ops.load(Ordering::Relaxed),
             memory_bytes: self.memory_bytes(),
         }
     }

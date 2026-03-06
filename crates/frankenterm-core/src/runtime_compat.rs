@@ -666,7 +666,7 @@ pub mod task {
             if self.handles.is_empty() {
                 return None;
             }
-            
+
             std::future::poll_fn(|cx| {
                 for i in 0..self.handles.len() {
                     let mut pinned = std::pin::Pin::new(&mut self.handles[i]);
@@ -676,7 +676,8 @@ pub mod task {
                     }
                 }
                 std::task::Poll::Pending
-            }).await
+            })
+            .await
         }
 
         /// Non-blocking poll for the next completed task.

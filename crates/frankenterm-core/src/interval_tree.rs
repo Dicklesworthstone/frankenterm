@@ -109,6 +109,7 @@ pub struct IntervalTree<T, V> {
     nodes: Vec<Node<T, V>>,
     root: Option<usize>,
     len: usize,
+    free: Vec<usize>,
 }
 
 impl<T: Ord + Clone, V> Default for IntervalTree<T, V> {
@@ -125,6 +126,7 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
             nodes: Vec::new(),
             root: None,
             len: 0,
+            free: Vec::new(),
         }
     }
 
@@ -142,16 +144,23 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
 
     /// Insert an interval with an associated value.
     pub fn insert(&mut self, interval: Interval<T>, value: V) {
-        let idx = self.nodes.len();
         let max_high = interval.high.clone();
-        self.nodes.push(Node {
+        let new_node = Node {
             interval,
             value,
             max_high,
             left: None,
             right: None,
             height: 1,
-        });
+        };
+        let idx = if let Some(free_idx) = self.free.pop() {
+            self.nodes[free_idx] = new_node;
+            free_idx
+        } else {
+            let next_idx = self.nodes.len();
+            self.nodes.push(new_node);
+            next_idx
+        };
         self.root = Some(self.insert_at(self.root, idx));
         self.len += 1;
     }
@@ -344,12 +353,16 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
         V: Clone,
     {
         let value = self.nodes[target].value.clone();
-        self.root = self.remove_at(self.root, target);
+        let mut unlinked = Vec::new();
+        self.root = self.remove_at(self.root, target, &mut unlinked);
+        for u in unlinked {
+            self.free.push(u);
+        }
         self.len -= 1;
         Some(value)
     }
 
-    fn remove_at(&mut self, node: Option<usize>, target: usize) -> Option<usize>
+    fn remove_at(&mut self, node: Option<usize>, target: usize, unlinked: &mut Vec<usize>) -> Option<usize>
     where
         V: Clone,
     {
@@ -358,13 +371,19 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
         if idx == target {
             // Node to remove found
             match (self.nodes[idx].left, self.nodes[idx].right) {
-                (None, None) => None,
-                (Some(child), None) | (None, Some(child)) => Some(child),
+                (None, None) => {
+                    unlinked.push(idx);
+                    None
+                }
+                (Some(child), None) | (None, Some(child)) => {
+                    unlinked.push(idx);
+                    Some(child)
+                }
                 (Some(_left), Some(right)) => {
                     // Find in-order successor (leftmost in right subtree)
                     let succ = self.find_min(right);
                     // Remove successor from right subtree
-                    let new_right = self.remove_at(Some(right), succ);
+                    let new_right = self.remove_at(Some(right), succ, unlinked);
                     // Replace current node data with successor data
                     let succ_interval = self.nodes[succ].interval.clone();
                     let succ_value = self.nodes[succ].value.clone();
@@ -380,7 +399,7 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
         {
             // Strictly less — must be in left subtree
             let left = self.nodes[idx].left;
-            self.nodes[idx].left = self.remove_at(left, target);
+            self.nodes[idx].left = self.remove_at(left, target, unlinked);
             self.update_augment(idx);
             Some(self.balance(idx))
         } else if target < self.nodes.len()
@@ -390,16 +409,16 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
             // Check left first (insertion uses <= for left), fall back to right.
             if self.subtree_contains(self.nodes[idx].left, target) {
                 let left = self.nodes[idx].left;
-                self.nodes[idx].left = self.remove_at(left, target);
+                self.nodes[idx].left = self.remove_at(left, target, unlinked);
             } else {
                 let right = self.nodes[idx].right;
-                self.nodes[idx].right = self.remove_at(right, target);
+                self.nodes[idx].right = self.remove_at(right, target, unlinked);
             }
             self.update_augment(idx);
             Some(self.balance(idx))
         } else {
             let right = self.nodes[idx].right;
-            self.nodes[idx].right = self.remove_at(right, target);
+            self.nodes[idx].right = self.remove_at(right, target, unlinked);
             self.update_augment(idx);
             Some(self.balance(idx))
         }

@@ -41,7 +41,7 @@ pub type AgentSlotId = String;
 pub type Priority = u32;
 
 /// A unit of work in the dependency-aware queue.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkItem {
     /// Unique identifier (typically maps to a Beads issue ID).
     pub id: WorkItemId,
@@ -95,7 +95,7 @@ impl WorkItemStatus {
 }
 
 /// An assignment record linking a work item to an agent.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Assignment {
     /// The work item being worked on.
     pub work_item_id: WorkItemId,
@@ -110,7 +110,7 @@ pub struct Assignment {
 }
 
 /// Record of a completed work item.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompletionRecord {
     pub work_item_id: WorkItemId,
     pub agent_slot: AgentSlotId,
@@ -1057,7 +1057,7 @@ impl BeadRecord {
 }
 
 /// Result of importing beads into a work queue.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BeadsSyncReport {
     /// Number of beads imported as new work items.
     pub imported: u32,
@@ -1218,7 +1218,7 @@ pub fn work_status_to_bead_status(status: WorkItemStatus) -> &'static str {
 }
 
 /// Errors during beads import.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BeadsImportError {
     /// Failed to parse a JSONL line.
     ParseError { line: usize, message: String },

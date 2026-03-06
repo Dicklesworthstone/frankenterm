@@ -75,7 +75,7 @@ pub enum ProfileRole {
 }
 
 /// Command specification for spawning panes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpawnCommand {
     /// The command to execute (shell-expanded).
     pub command: String,
@@ -92,7 +92,7 @@ fn default_true() -> bool {
 }
 
 /// Resource budget hints for pane provisioning.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceHints {
     /// Minimum rows for pane sizing.
     #[serde(default = "default_min_rows")]
@@ -200,7 +200,7 @@ pub struct Persona {
 }
 
 /// Agent identity specification for a persona.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentIdentitySpec {
     /// Agent program name (e.g., "claude-code", "codex-cli").
     pub program: String,
@@ -263,7 +263,7 @@ pub struct FleetProgramTarget {
 }
 
 /// A single slot in a fleet template.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FleetSlot {
     /// Slot label for identification.
     pub label: String,
@@ -852,7 +852,7 @@ impl FleetLaunchPlan {
         }
 
         let mut by_order = self.slot_metadata.iter().collect::<Vec<_>>();
-        by_order.sort_by(|a, b| a.launch_order.cmp(&b.launch_order));
+        by_order.sort_by_key(|a| a.launch_order);
         for (expected_order, slot) in by_order.iter().enumerate() {
             if slot.launch_order != expected_order {
                 violations.push(FleetLaunchInvariantViolation {

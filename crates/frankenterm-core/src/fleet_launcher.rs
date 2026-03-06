@@ -78,7 +78,7 @@ fn default_generation() -> u64 {
 ///
 /// Each entry specifies a program/model combination with a weight that
 /// determines how many panes of this type are allocated relative to others.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentMixEntry {
     /// Agent program (e.g., "claude-code", "codex-cli", "gemini-cli").
     pub program: String,

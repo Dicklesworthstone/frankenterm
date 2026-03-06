@@ -271,7 +271,7 @@ impl TDigest {
         }
 
         let total = self.weight_sum();
-        if total == 0.0 {
+        if total <= f64::EPSILON {
             return 0.0;
         }
 
@@ -313,7 +313,7 @@ impl TDigest {
 
     /// Whether the digest is empty.
     pub fn is_empty(&self) -> bool {
-        self.total_weight == 0.0
+        self.total_weight <= f64::EPSILON
     }
 
     /// Minimum value seen.

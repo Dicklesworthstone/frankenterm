@@ -1436,10 +1436,10 @@ mod tests {
     fn wal_compact_updates_compacted_through() {
         let mut wal = small_wal();
         for i in 0..4 {
-            wal.append(format!("e{}", i), i as u64 * 100).unwrap();
+            wal.append(format!("e{}", i), i as u64 * 100);
         }
-        wal.checkpoint(400).unwrap();
-        wal.append("after".to_string(), 500).unwrap();
+        wal.checkpoint(400);
+        wal.append("after".to_string(), 500);
         assert_eq!(wal.compacted_through(), 0);
         let removed = wal.compact();
         if removed > 0 {
