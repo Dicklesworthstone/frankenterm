@@ -2263,6 +2263,8 @@ pub struct RuleEvaluationResult {
     pub decision: Option<PolicyRuleDecision>,
     /// All rules that were evaluated (for audit)
     pub rules_checked: Vec<String>,
+    /// All rules that matched before priority/specificity tie-breaking.
+    pub matched_rule_ids: Vec<String>,
 }
 
 /// Evaluate policy rules against input
@@ -2279,16 +2281,19 @@ pub fn evaluate_policy_rules(
             matching_rule: None,
             decision: None,
             rules_checked: Vec::new(),
+            matched_rule_ids: Vec::new(),
         };
     }
 
     let mut rules_checked = Vec::new();
+    let mut matched_rule_ids = Vec::new();
     let mut candidates: Vec<&PolicyRule> = Vec::new();
 
     for rule in &rules_config.rules {
         rules_checked.push(rule.id.clone());
 
         if matches_rule(&rule.match_on, input) {
+            matched_rule_ids.push(rule.id.clone());
             candidates.push(rule);
         }
     }
@@ -2298,6 +2303,7 @@ pub fn evaluate_policy_rules(
             matching_rule: None,
             decision: None,
             rules_checked,
+            matched_rule_ids,
         };
     }
 
@@ -2324,7 +2330,25 @@ pub fn evaluate_policy_rules(
         matching_rule: Some(best.clone()),
         decision: Some(best.decision),
         rules_checked,
+        matched_rule_ids,
     }
+}
+
+fn config_rule_trace_reason(
+    rule: &PolicyRule,
+    selected: bool,
+    selected_rule_id: Option<&str>,
+) -> String {
+    let prefix = if selected {
+        "rule matched and selected".to_string()
+    } else {
+        let winner = selected_rule_id.unwrap_or("unknown");
+        format!("rule matched but '{winner}' won tie-breaking")
+    };
+
+    rule.message
+        .as_deref()
+        .map_or(prefix.clone(), |message| format!("{prefix}: {message}"))
 }
 
 /// Check if a rule matches the given input
@@ -3164,14 +3188,33 @@ impl PolicyEngine {
 
         // Evaluate custom policy rules (after builtin safety gates, before defaults)
         let rule_result = evaluate_policy_rules(&self.policy_rules, input);
-        for rule_id in &rule_result.rules_checked {
-            // Record that we checked this rule (matched rules will be recorded below)
-            context.record_rule(
-                format!("config.rule.{rule_id}"),
-                false,
-                None,
-                Some("rule checked".to_string()),
-            );
+        let selected_rule_id = rule_result
+            .matching_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str());
+        for rule in &self.policy_rules.rules {
+            let matched = rule_result
+                .matched_rule_ids
+                .iter()
+                .any(|matched_id| matched_id == &rule.id);
+
+            let qualified_rule_id = format!("config.rule.{}", rule.id);
+            if matched {
+                let selected = selected_rule_id == Some(rule.id.as_str());
+                context.record_rule(
+                    qualified_rule_id,
+                    true,
+                    Some(rule.decision.as_str()),
+                    Some(config_rule_trace_reason(rule, selected, selected_rule_id)),
+                );
+            } else {
+                context.record_rule(
+                    qualified_rule_id,
+                    false,
+                    None,
+                    Some("rule checked".to_string()),
+                );
+            }
         }
 
         if let (Some(rule), Some(decision)) = (rule_result.matching_rule, rule_result.decision) {
@@ -3183,24 +3226,16 @@ impl PolicyEngine {
 
             match decision {
                 PolicyRuleDecision::Deny => {
-                    context.record_rule(&rule_id, true, Some("deny"), Some(reason.clone()));
                     context.set_determining_rule(&rule_id);
                     return PolicyDecision::deny_with_rule(reason, rule_id).with_context(context);
                 }
                 PolicyRuleDecision::RequireApproval => {
-                    context.record_rule(
-                        &rule_id,
-                        true,
-                        Some("require_approval"),
-                        Some(reason.clone()),
-                    );
                     context.set_determining_rule(&rule_id);
                     return PolicyDecision::require_approval_with_rule(reason, rule_id)
                         .with_context(context);
                 }
                 PolicyRuleDecision::Allow => {
                     // Allow rules short-circuit to allow (skipping default checks)
-                    context.record_rule(&rule_id, true, Some("allow"), Some(reason));
                     context.set_determining_rule(&rule_id);
                     return PolicyDecision::allow_with_rule(rule_id).with_context(context);
                 }
@@ -6049,6 +6084,176 @@ mod tests {
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
         assert_eq!(decision.rule_id(), Some("config.rule.approval-for-mcp"));
+    }
+
+    #[test]
+    fn evaluate_policy_rules_reports_all_matches_before_tie_breaking() {
+        let rules = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![
+                PolicyRule {
+                    id: "allow-robot-mux".to_string(),
+                    description: None,
+                    priority: 100,
+                    match_on: PolicyRuleMatch {
+                        actors: vec!["robot".to_string()],
+                        surfaces: vec!["mux".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Allow,
+                    message: Some("robot mux reads allowed".to_string()),
+                },
+                PolicyRule {
+                    id: "deny-robot".to_string(),
+                    description: None,
+                    priority: 10,
+                    match_on: PolicyRuleMatch {
+                        actors: vec!["robot".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Deny,
+                    message: Some("robot actions denied".to_string()),
+                },
+                PolicyRule {
+                    id: "require-mcp".to_string(),
+                    description: None,
+                    priority: 1,
+                    match_on: PolicyRuleMatch {
+                        actors: vec!["mcp".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::RequireApproval,
+                    message: Some("mcp approval required".to_string()),
+                },
+            ],
+        };
+
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_surface(PolicySurface::Mux)
+            .with_pane(9);
+
+        let result = evaluate_policy_rules(&rules, &input);
+        assert_eq!(
+            result.rules_checked,
+            vec![
+                "allow-robot-mux".to_string(),
+                "deny-robot".to_string(),
+                "require-mcp".to_string(),
+            ]
+        );
+        assert_eq!(
+            result.matched_rule_ids,
+            vec!["allow-robot-mux".to_string(), "deny-robot".to_string()]
+        );
+        assert_eq!(
+            result.matching_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("deny-robot")
+        );
+        assert_eq!(result.decision, Some(PolicyRuleDecision::Deny));
+    }
+
+    #[test]
+    fn policy_rules_trace_distinguishes_checked_from_matched_candidates() {
+        let rules = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![
+                PolicyRule {
+                    id: "allow-robot-mux".to_string(),
+                    description: None,
+                    priority: 100,
+                    match_on: PolicyRuleMatch {
+                        actors: vec!["robot".to_string()],
+                        surfaces: vec!["mux".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Allow,
+                    message: Some("robot mux reads allowed".to_string()),
+                },
+                PolicyRule {
+                    id: "deny-robot".to_string(),
+                    description: None,
+                    priority: 10,
+                    match_on: PolicyRuleMatch {
+                        actors: vec!["robot".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Deny,
+                    message: Some("robot actions denied".to_string()),
+                },
+                PolicyRule {
+                    id: "require-mcp".to_string(),
+                    description: None,
+                    priority: 1,
+                    match_on: PolicyRuleMatch {
+                        actors: vec!["mcp".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::RequireApproval,
+                    message: Some("mcp approval required".to_string()),
+                },
+            ],
+        };
+
+        let mut engine = PolicyEngine::permissive().with_policy_rules(rules);
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_surface(PolicySurface::Mux)
+            .with_pane(9);
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("config.rule.deny-robot"));
+
+        let context = decision
+            .context()
+            .expect("decision context should be present");
+        let config_rules: Vec<_> = context
+            .rules_evaluated
+            .iter()
+            .filter(|rule| rule.rule_id.starts_with("config.rule."))
+            .collect();
+        assert_eq!(
+            config_rules.len(),
+            3,
+            "each config rule should be recorded once"
+        );
+        assert_eq!(
+            context.determining_rule.as_deref(),
+            Some("config.rule.deny-robot")
+        );
+
+        let allow_rule = config_rules
+            .iter()
+            .find(|rule| rule.rule_id == "config.rule.allow-robot-mux")
+            .expect("allow rule trace should be present");
+        assert!(allow_rule.matched);
+        assert_eq!(allow_rule.decision.as_deref(), Some("allow"));
+        assert!(
+            allow_rule
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("won tie-breaking"))
+        );
+
+        let deny_rule = config_rules
+            .iter()
+            .find(|rule| rule.rule_id == "config.rule.deny-robot")
+            .expect("deny rule trace should be present");
+        assert!(deny_rule.matched);
+        assert_eq!(deny_rule.decision.as_deref(), Some("deny"));
+        assert!(
+            deny_rule
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("matched and selected"))
+        );
+
+        let require_rule = config_rules
+            .iter()
+            .find(|rule| rule.rule_id == "config.rule.require-mcp")
+            .expect("non-matching rule trace should be present");
+        assert!(!require_rule.matched);
+        assert_eq!(require_rule.decision, None);
+        assert_eq!(require_rule.reason.as_deref(), Some("rule checked"));
     }
 
     #[test]

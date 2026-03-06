@@ -6177,6 +6177,63 @@ async fn evaluate_robot_approve(
     .await
 }
 
+fn approval_actor_kind(actor_kind: &str) -> frankenterm_core::policy::ActorKind {
+    match actor_kind {
+        "robot" => frankenterm_core::policy::ActorKind::Robot,
+        "mcp" => frankenterm_core::policy::ActorKind::Mcp,
+        "workflow" => frankenterm_core::policy::ActorKind::Workflow,
+        _ => frankenterm_core::policy::ActorKind::Human,
+    }
+}
+
+fn approval_target_action_kind(action_kind: &str) -> frankenterm_core::policy::ActionKind {
+    serde_json::from_str(&format!("\"{action_kind}\""))
+        .unwrap_or(frankenterm_core::policy::ActionKind::ExecCommand)
+}
+
+fn build_approval_decision_context(
+    actor_kind: &str,
+    workspace_id: &str,
+    action_kind: &str,
+    pane_id: Option<u64>,
+    timestamp_ms: i64,
+) -> Option<String> {
+    let actor = approval_actor_kind(actor_kind);
+    let surface = frankenterm_core::policy::PolicySurface::default_for_actor(actor);
+    let mut context = frankenterm_core::policy::DecisionContext {
+        timestamp_ms,
+        action: approval_target_action_kind(action_kind),
+        actor,
+        surface,
+        pane_id,
+        domain: None,
+        capabilities: frankenterm_core::policy::PaneCapabilities::default(),
+        text_summary: Some(format!("approval consume for {action_kind}")),
+        workflow_id: None,
+        rules_evaluated: Vec::new(),
+        determining_rule: None,
+        evidence: Vec::new(),
+        rate_limit: None,
+        risk: None,
+    };
+    context.record_rule(
+        "approval.allow_once.consume",
+        true,
+        Some("allow"),
+        Some("approval code validated and consumed".to_string()),
+    );
+    context.set_determining_rule("approval.allow_once.consume");
+    context.add_evidence("stage", "approval");
+    context.add_evidence("workspace_id", workspace_id);
+    context.add_evidence("approval_actor", actor_kind);
+    context.add_evidence("approval_surface", surface.as_str());
+    context.add_evidence("approval_action_kind", action_kind);
+    if let Some(pane_id) = pane_id {
+        context.add_evidence("approval_pane_id", pane_id.to_string());
+    }
+    serde_json::to_string(&context).ok()
+}
+
 async fn evaluate_approve(
     storage: &frankenterm_core::storage::StorageHandle,
     workspace_id: &str,
@@ -6345,7 +6402,13 @@ async fn evaluate_approve(
             "code_hash={}, fingerprint={}",
             code_hash, consumed_token.action_fingerprint
         )),
-        decision_context: None,
+        decision_context: build_approval_decision_context(
+            actor_kind,
+            workspace_id,
+            &consumed_token.action_kind,
+            consumed_token.pane_id,
+            consumed_at,
+        ),
         result: "success".to_string(),
     };
 
@@ -36633,9 +36696,11 @@ mod tests {
         mission.lifecycle_state = frankenterm_core::plan::MissionLifecycleState::AwaitingApproval;
 
         let transitions = mission_available_transitions(mission.lifecycle_state);
-        assert!(transitions.iter().any(
-            |(kind, to)| kind.to_string() == "approve" && to.to_string() == "executing"
-        ));
+        assert!(
+            transitions
+                .iter()
+                .any(|(kind, to)| kind.to_string() == "approve" && to.to_string() == "executing")
+        );
     }
 
     #[test]
@@ -39351,6 +39416,99 @@ log_level = "debug"
         assert_eq!(err.code, "E_FINGERPRINT_MISMATCH");
 
         cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn approve_records_surface_aware_decision_context_in_audit() {
+        let cases = [
+            (
+                "human",
+                frankenterm_core::policy::ActorKind::Human,
+                frankenterm_core::policy::PolicySurface::Unknown,
+            ),
+            (
+                "robot",
+                frankenterm_core::policy::ActorKind::Robot,
+                frankenterm_core::policy::PolicySurface::Robot,
+            ),
+        ];
+
+        for (actor_kind, expected_actor, expected_surface) in cases {
+            let label = format!("approve_audit_ctx_{actor_kind}");
+            let (storage, db_path) = setup_storage(&label).await;
+            let workspace_id = format!("ws-{actor_kind}");
+            let code = if actor_kind == "human" {
+                "HUM12345"
+            } else {
+                "ROB12345"
+            };
+            let fingerprint = format!("sha256:{actor_kind}");
+
+            insert_token(
+                &storage,
+                &workspace_id,
+                code,
+                Some(12),
+                now_ms() + 60_000,
+                None,
+                &fingerprint,
+            )
+            .await;
+
+            let data = evaluate_approve(
+                &storage,
+                &workspace_id,
+                code,
+                Some(12),
+                Some(&fingerprint),
+                false,
+                actor_kind,
+            )
+            .await
+            .unwrap();
+            assert!(data.valid);
+            assert!(data.consumed_at.is_some());
+
+            let audits = storage
+                .get_audit_actions(frankenterm_core::storage::AuditQuery {
+                    action_kind: Some("approve_allow_once".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(audits.len(), 1);
+
+            let ctx_json = audits[0]
+                .decision_context
+                .as_deref()
+                .expect("approval audit should retain decision_context");
+            let ctx: frankenterm_core::policy::DecisionContext =
+                serde_json::from_str(ctx_json).expect("decision_context should parse");
+
+            assert_eq!(ctx.actor, expected_actor);
+            assert_eq!(ctx.surface, expected_surface);
+            assert_eq!(ctx.action, frankenterm_core::policy::ActionKind::SendText);
+            assert_eq!(ctx.pane_id, Some(12));
+            assert_eq!(
+                ctx.determining_rule.as_deref(),
+                Some("approval.allow_once.consume")
+            );
+            assert!(
+                ctx.evidence
+                    .iter()
+                    .any(|ev| ev.key == "stage" && ev.value == "approval")
+            );
+            assert!(ctx.evidence.iter().any(|ev| {
+                ev.key == "approval_surface" && ev.value == expected_surface.as_str()
+            }));
+            assert!(
+                ctx.evidence
+                    .iter()
+                    .any(|ev| { ev.key == "workspace_id" && ev.value == workspace_id })
+            );
+
+            cleanup_storage(storage, &db_path).await;
+        }
     }
 
     // ---- Triage scoring / ordering tests ----
