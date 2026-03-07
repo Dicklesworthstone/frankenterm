@@ -7643,4 +7643,348 @@ mod tests {
         assert!(!is_command_candidate("Please check the logs"));
         assert!(!is_command_candidate("# commented command"));
     }
+
+    // ========================================================================
+    // config_rule_trace_reason regression tests (ft-13l5b)
+    // Validates the fix: `rule.message` instead of former `self.message`
+    // ========================================================================
+
+    #[test]
+    fn trace_reason_selected_with_message() {
+        let rule = PolicyRule {
+            id: "r1".to_string(),
+            description: None,
+            priority: 100,
+            match_on: PolicyRuleMatch::default(),
+            decision: PolicyRuleDecision::Allow,
+            message: Some("custom reason".to_string()),
+        };
+        let reason = config_rule_trace_reason(&rule, true, None);
+        assert_eq!(reason, "rule matched and selected: custom reason");
+    }
+
+    #[test]
+    fn trace_reason_selected_without_message() {
+        let rule = PolicyRule {
+            id: "r2".to_string(),
+            description: None,
+            priority: 100,
+            match_on: PolicyRuleMatch::default(),
+            decision: PolicyRuleDecision::Deny,
+            message: None,
+        };
+        let reason = config_rule_trace_reason(&rule, true, None);
+        assert_eq!(reason, "rule matched and selected");
+    }
+
+    #[test]
+    fn trace_reason_not_selected_with_message() {
+        let rule = PolicyRule {
+            id: "r3".to_string(),
+            description: None,
+            priority: 100,
+            match_on: PolicyRuleMatch::default(),
+            decision: PolicyRuleDecision::Allow,
+            message: Some("low priority".to_string()),
+        };
+        let reason = config_rule_trace_reason(&rule, false, Some("winner-rule"));
+        assert_eq!(
+            reason,
+            "rule matched but 'winner-rule' won tie-breaking: low priority"
+        );
+    }
+
+    #[test]
+    fn trace_reason_not_selected_without_message() {
+        let rule = PolicyRule {
+            id: "r4".to_string(),
+            description: None,
+            priority: 100,
+            match_on: PolicyRuleMatch::default(),
+            decision: PolicyRuleDecision::Allow,
+            message: None,
+        };
+        let reason = config_rule_trace_reason(&rule, false, Some("other"));
+        assert_eq!(reason, "rule matched but 'other' won tie-breaking");
+    }
+
+    #[test]
+    fn trace_reason_not_selected_no_winner_id() {
+        let rule = PolicyRule {
+            id: "r5".to_string(),
+            description: None,
+            priority: 100,
+            match_on: PolicyRuleMatch::default(),
+            decision: PolicyRuleDecision::Deny,
+            message: None,
+        };
+        let reason = config_rule_trace_reason(&rule, false, None);
+        assert_eq!(reason, "rule matched but 'unknown' won tie-breaking");
+    }
+
+    // ========================================================================
+    // matches_rule unit tests (ft-13l5b)
+    // Direct tests for the core policy rule matching logic
+    // ========================================================================
+
+    #[test]
+    fn matches_rule_catch_all() {
+        let match_on = PolicyRuleMatch::default();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_action_match() {
+        let match_on = PolicyRuleMatch {
+            actions: vec!["send_text".to_string()],
+            ..Default::default()
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_action_mismatch() {
+        let match_on = PolicyRuleMatch {
+            actions: vec!["close".to_string()],
+            ..Default::default()
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_actor_match() {
+        let match_on = PolicyRuleMatch {
+            actors: vec!["robot".to_string()],
+            ..Default::default()
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_actor_mismatch() {
+        let match_on = PolicyRuleMatch {
+            actors: vec!["human".to_string()],
+            ..Default::default()
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_surface_case_insensitive() {
+        let match_on = PolicyRuleMatch {
+            surfaces: vec!["ROBOT".to_string()],
+            ..Default::default()
+        };
+        let input =
+            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_surface(PolicySurface::Robot);
+        assert!(matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_pane_id_match() {
+        let match_on = PolicyRuleMatch {
+            pane_ids: vec![42],
+            ..Default::default()
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(42);
+        assert!(matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_pane_id_mismatch() {
+        let match_on = PolicyRuleMatch {
+            pane_ids: vec![42],
+            ..Default::default()
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(99);
+        assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_pane_id_none_input() {
+        let match_on = PolicyRuleMatch {
+            pane_ids: vec![42],
+            ..Default::default()
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_domain_match() {
+        let match_on = PolicyRuleMatch {
+            pane_domains: vec!["local".to_string()],
+            ..Default::default()
+        };
+        let input =
+            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_domain("local");
+        assert!(matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_domain_none_input() {
+        let match_on = PolicyRuleMatch {
+            pane_domains: vec!["local".to_string()],
+            ..Default::default()
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_title_glob() {
+        let match_on = PolicyRuleMatch {
+            pane_titles: vec!["*agent*".to_string()],
+            ..Default::default()
+        };
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.pane_title = Some("my-agent-pane".to_string());
+        assert!(matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_title_glob_no_match() {
+        let match_on = PolicyRuleMatch {
+            pane_titles: vec!["*agent*".to_string()],
+            ..Default::default()
+        };
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.pane_title = Some("my-shell-pane".to_string());
+        assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_title_none_input() {
+        let match_on = PolicyRuleMatch {
+            pane_titles: vec!["*".to_string()],
+            ..Default::default()
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_cwd_glob() {
+        let match_on = PolicyRuleMatch {
+            pane_cwds: vec!["/home/*/projects/*".to_string()],
+            ..Default::default()
+        };
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.pane_cwd = Some("/home/user/projects/frankenterm".to_string());
+        assert!(matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_cwd_none_input() {
+        let match_on = PolicyRuleMatch {
+            pane_cwds: vec!["/tmp/*".to_string()],
+            ..Default::default()
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_command_regex() {
+        let match_on = PolicyRuleMatch {
+            command_patterns: vec!["^rm\\s+-rf".to_string()],
+            ..Default::default()
+        };
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.command_text = Some("rm -rf /tmp/junk".to_string());
+        assert!(matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_command_regex_no_match() {
+        let match_on = PolicyRuleMatch {
+            command_patterns: vec!["^rm\\s+-rf".to_string()],
+            ..Default::default()
+        };
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.command_text = Some("ls -la".to_string());
+        assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_command_none_input() {
+        let match_on = PolicyRuleMatch {
+            command_patterns: vec![".*".to_string()],
+            ..Default::default()
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_agent_type_case_insensitive() {
+        let match_on = PolicyRuleMatch {
+            agent_types: vec!["Claude".to_string()],
+            ..Default::default()
+        };
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.agent_type = Some("claude".to_string());
+        assert!(matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_agent_type_none_input() {
+        let match_on = PolicyRuleMatch {
+            agent_types: vec!["claude".to_string()],
+            ..Default::default()
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_multiple_criteria_all_must_match() {
+        let match_on = PolicyRuleMatch {
+            actions: vec!["send_text".to_string()],
+            actors: vec!["robot".to_string()],
+            pane_ids: vec![10],
+            ..Default::default()
+        };
+        // All criteria match
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(10);
+        assert!(matches_rule(&match_on, &input));
+
+        // Action matches but pane_id doesn't
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(99);
+        assert!(!matches_rule(&match_on, &input));
+
+        // Pane matches but action doesn't
+        let input = PolicyInput::new(ActionKind::Close, ActorKind::Robot).with_pane(10);
+        assert!(!matches_rule(&match_on, &input));
+    }
+
+    #[test]
+    fn matches_rule_multiple_values_in_list_are_ored() {
+        let match_on = PolicyRuleMatch {
+            actions: vec!["send_text".to_string(), "close".to_string()],
+            ..Default::default()
+        };
+        let input1 = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let input2 = PolicyInput::new(ActionKind::Close, ActorKind::Robot);
+        let input3 = PolicyInput::new(ActionKind::Spawn, ActorKind::Robot);
+        assert!(matches_rule(&match_on, &input1));
+        assert!(matches_rule(&match_on, &input2));
+        assert!(!matches_rule(&match_on, &input3));
+    }
+
+    #[test]
+    fn matches_rule_invalid_regex_does_not_match() {
+        let match_on = PolicyRuleMatch {
+            command_patterns: vec!["[invalid".to_string()],
+            ..Default::default()
+        };
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.command_text = Some("anything".to_string());
+        assert!(!matches_rule(&match_on, &input));
+    }
 }
