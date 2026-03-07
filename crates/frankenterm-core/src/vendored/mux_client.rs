@@ -2105,7 +2105,8 @@ mod tests {
                 .await
                 .expect("get lines with cx");
             assert_eq!(lines.pane_id, 34);
-            assert!(lines.lines.iter().next().is_none());
+            let (extracted, _images) = lines.lines.extract_data();
+            assert!(extracted.is_empty());
 
             client
                 .write_to_pane_with_cx(&cx, 56, b"hello".to_vec())
