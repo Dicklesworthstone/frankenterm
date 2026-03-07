@@ -210,7 +210,110 @@ impl DirectMuxClient {
         cx: &Cx,
         config: DirectMuxClientConfig,
     ) -> Result<Self, DirectMuxError> {
-        cx::with_cx_async(cx, |_| Self::connect(config)).await
+        let socket_path = resolve_socket_path(&config)?;
+        if !socket_path.exists() {
+            return Err(DirectMuxError::SocketNotFound(socket_path));
+        }
+
+        let preferred_mode = resolve_compression_mode(config.compression_mode, &socket_path);
+        tracing::debug!(
+            socket_path = %socket_path.display(),
+            configured_compression_mode = ?config.compression_mode,
+            preferred_compression_mode = ?preferred_mode,
+            explicit_cx = true,
+            "connecting direct mux client"
+        );
+        match Self::connect_with_mode_with_cx(
+            cx,
+            socket_path.clone(),
+            config.clone(),
+            preferred_mode,
+        )
+        .await
+        {
+            Ok(client) => Ok(client),
+            Err(err)
+                if should_auto_fallback_to_always(
+                    config.compression_mode,
+                    preferred_mode,
+                    &err,
+                ) =>
+            {
+                tracing::warn!(
+                    socket_path = %socket_path.display(),
+                    preferred_compression_mode = ?preferred_mode,
+                    fallback_compression_mode = ?CompressionMode::Always,
+                    error_kind = ?err.protocol_error_kind(),
+                    error = %err,
+                    explicit_cx = true,
+                    "retrying direct mux connection with compression fallback"
+                );
+                Self::connect_with_mode_with_cx(cx, socket_path, config, CompressionMode::Always)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    async fn connect_with_mode_with_cx(
+        cx: &Cx,
+        socket_path: PathBuf,
+        config: DirectMuxClientConfig,
+        compression_mode: CompressionMode,
+    ) -> Result<Self, DirectMuxError> {
+        let connection_id = next_connection_id();
+        let stream = timeout(config.connect_timeout, compat_unix::connect(&socket_path))
+            .await
+            .map_err(|_| DirectMuxError::ConnectTimeout(socket_path.clone()))??;
+
+        let mut client = Self {
+            connection_id,
+            stream,
+            compression_mode,
+            socket_path,
+            read_buf: Vec::new(),
+            serial: 0,
+            pending_responses: HashMap::new(),
+            config,
+        };
+
+        if let Err(err) = client.verify_codec_version_with_cx(cx).await {
+            tracing::warn!(
+                connection_id = client.connection_id,
+                socket_path = %client.socket_path.display(),
+                phase = "codec_version_handshake",
+                error_kind = ?err.protocol_error_kind(),
+                error = %err,
+                explicit_cx = true,
+                "direct mux codec verification failed"
+            );
+            return Err(err);
+        }
+        if let Err(err) = client.register_client_with_cx(cx).await {
+            tracing::warn!(
+                connection_id = client.connection_id,
+                socket_path = %client.socket_path.display(),
+                phase = "register_client",
+                error_kind = ?err.protocol_error_kind(),
+                error = %err,
+                explicit_cx = true,
+                "direct mux client registration failed"
+            );
+            return Err(err);
+        }
+        tracing::debug!(
+            connection_id = client.connection_id,
+            socket_path = %client.socket_path.display(),
+            compression_mode = ?client.compression_mode,
+            connect_timeout_ms = duration_to_ms_u64(client.config.connect_timeout),
+            read_timeout_ms = duration_to_ms_u64(client.config.read_timeout),
+            write_timeout_ms = duration_to_ms_u64(client.config.write_timeout),
+            phase = "connected",
+            explicit_cx = true,
+            "direct mux client connected"
+        );
+        Ok(client)
     }
 
     async fn connect_with_mode(
@@ -290,7 +393,16 @@ impl DirectMuxClient {
         &mut self,
         cx: &Cx,
     ) -> Result<ListPanesResponse, DirectMuxError> {
-        cx::with_cx_async(cx, |_| self.list_panes()).await
+        let response = self
+            .send_request_with_cx(cx, Pdu::ListPanes(ListPanes {}))
+            .await?;
+        match response {
+            Pdu::ListPanesResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "ListPanesResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
     }
 
     /// Poll the mux server for render changes since the last check for a pane.
@@ -319,7 +431,21 @@ impl DirectMuxClient {
         cx: &Cx,
         pane_id: u64,
     ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
-        cx::with_cx_async(cx, |_| self.get_pane_render_changes(pane_id)).await
+        let response = self
+            .send_request_with_cx(
+                cx,
+                Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                    pane_id: pane_id as usize,
+                }),
+            )
+            .await?;
+        match response {
+            Pdu::GetPaneRenderChangesResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "GetPaneRenderChangesResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
     }
 
     /// Fetch specific lines from a pane's scrollback.
@@ -351,7 +477,22 @@ impl DirectMuxClient {
         pane_id: u64,
         lines: Vec<std::ops::Range<isize>>,
     ) -> Result<GetLinesResponse, DirectMuxError> {
-        cx::with_cx_async(cx, |_| self.get_lines(pane_id, lines)).await
+        let response = self
+            .send_request_with_cx(
+                cx,
+                Pdu::GetLines(GetLines {
+                    pane_id: pane_id as usize,
+                    lines,
+                }),
+            )
+            .await?;
+        match response {
+            Pdu::GetLinesResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "GetLinesResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
     }
 
     /// Write raw bytes to a pane (no-paste mode, character-by-character).
@@ -383,7 +524,22 @@ impl DirectMuxClient {
         pane_id: u64,
         data: Vec<u8>,
     ) -> Result<UnitResponse, DirectMuxError> {
-        cx::with_cx_async(cx, |_| self.write_to_pane(pane_id, data)).await
+        let response = self
+            .send_request_with_cx(
+                cx,
+                Pdu::WriteToPane(WriteToPane {
+                    pane_id: pane_id as usize,
+                    data,
+                }),
+            )
+            .await?;
+        match response {
+            Pdu::UnitResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "UnitResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
     }
 
     /// Send text via paste mode (efficient for multi-character input).
@@ -415,12 +571,53 @@ impl DirectMuxClient {
         pane_id: u64,
         data: String,
     ) -> Result<UnitResponse, DirectMuxError> {
-        cx::with_cx_async(cx, |_| self.send_paste(pane_id, data)).await
+        let response = self
+            .send_request_with_cx(
+                cx,
+                Pdu::SendPaste(SendPaste {
+                    pane_id: pane_id as usize,
+                    data,
+                }),
+            )
+            .await?;
+        match response {
+            Pdu::UnitResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "UnitResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
     }
 
     async fn verify_codec_version(&mut self) -> Result<GetCodecVersionResponse, DirectMuxError> {
         let response = self
             .send_request(Pdu::GetCodecVersion(GetCodecVersion {}))
+            .await?;
+        match response {
+            Pdu::GetCodecVersionResponse(payload) => {
+                if payload.codec_vers != CODEC_VERSION {
+                    return Err(DirectMuxError::IncompatibleCodec {
+                        local: CODEC_VERSION,
+                        remote: payload.codec_vers,
+                        remote_version: payload.version_string.clone(),
+                    });
+                }
+                Ok(payload)
+            }
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "GetCodecVersionResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    async fn verify_codec_version_with_cx(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<GetCodecVersionResponse, DirectMuxError> {
+        let response = self
+            .send_request_with_cx(cx, Pdu::GetCodecVersion(GetCodecVersion {}))
             .await?;
         match response {
             Pdu::GetCodecVersionResponse(payload) => {
@@ -447,6 +644,27 @@ impl DirectMuxClient {
                 client_id,
                 is_proxy: false,
             }))
+            .await?;
+        match response {
+            Pdu::UnitResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "UnitResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    async fn register_client_with_cx(&mut self, cx: &Cx) -> Result<UnitResponse, DirectMuxError> {
+        let client_id = ClientId::new();
+        let response = self
+            .send_request_with_cx(
+                cx,
+                Pdu::SetClientId(SetClientId {
+                    client_id,
+                    is_proxy: false,
+                }),
+            )
             .await?;
         match response {
             Pdu::UnitResponse(payload) => Ok(payload),
@@ -506,10 +724,35 @@ impl DirectMuxClient {
         max_pipeline_depth: usize,
         pipeline_timeout: Duration,
     ) -> Result<Vec<GetPaneRenderChangesResponse>, DirectMuxError> {
-        cx::with_cx_async(cx, |_| {
-            self.get_pane_render_changes_batch(pane_ids, max_pipeline_depth, pipeline_timeout)
-        })
-        .await
+        if pane_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requests = pane_ids
+            .iter()
+            .map(|pane_id| {
+                Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
+                    pane_id: *pane_id as usize,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let responses = self
+            .batch_with_cx(cx, requests, max_pipeline_depth, pipeline_timeout)
+            .await?;
+        let mut out = Vec::with_capacity(responses.len());
+        for response in responses {
+            match response {
+                Pdu::GetPaneRenderChangesResponse(payload) => out.push(payload),
+                other => {
+                    return Err(DirectMuxError::UnexpectedResponse {
+                        expected: "GetPaneRenderChangesResponse".to_string(),
+                        got: other.pdu_name().to_string(),
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Send a batch of requests using depth-limited pipelining.
@@ -528,6 +771,23 @@ impl DirectMuxClient {
             pipeline_timeout,
             self.batch_inner(requests, max_pipeline_depth.max(1)),
         ))
+        .await
+        .map_err(|_| DirectMuxError::BatchTimeout { timeout_ms })?
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    async fn batch_with_cx(
+        &mut self,
+        cx: &Cx,
+        requests: Vec<Pdu>,
+        max_pipeline_depth: usize,
+        pipeline_timeout: Duration,
+    ) -> Result<Vec<Pdu>, DirectMuxError> {
+        let timeout_ms = duration_to_ms_u64(pipeline_timeout);
+        timeout(
+            pipeline_timeout,
+            self.batch_inner_with_cx(cx, requests, max_pipeline_depth.max(1)),
+        )
         .await
         .map_err(|_| DirectMuxError::BatchTimeout { timeout_ms })?
     }
@@ -599,9 +859,86 @@ impl DirectMuxClient {
         Ok(ordered)
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    async fn batch_inner_with_cx(
+        &mut self,
+        cx: &Cx,
+        requests: Vec<Pdu>,
+        max_pipeline_depth: usize,
+    ) -> Result<Vec<Pdu>, DirectMuxError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        tracing::trace!(
+            connection_id = self.connection_id,
+            request_count = requests.len(),
+            max_pipeline_depth,
+            explicit_cx = true,
+            phase = "batch_start",
+            "starting mux request batch"
+        );
+
+        if max_pipeline_depth <= 1 {
+            let mut responses = Vec::with_capacity(requests.len());
+            for request in requests {
+                responses.push(self.send_request_with_cx(cx, request).await?);
+            }
+            return Ok(responses);
+        }
+
+        let total = requests.len();
+        let mut requests = requests.into_iter().enumerate();
+        let mut in_flight: VecDeque<(usize, u64)> = VecDeque::with_capacity(max_pipeline_depth);
+        let mut responses: Vec<Option<Pdu>> = std::iter::repeat_with(|| None).take(total).collect();
+
+        while in_flight.len() < max_pipeline_depth {
+            let Some((request_idx, request)) = requests.next() else {
+                break;
+            };
+            let serial = self.send_request_only_with_cx(cx, request).await?;
+            in_flight.push_back((request_idx, serial));
+        }
+
+        while !in_flight.is_empty() {
+            let decoded = self.read_next_pdu_with_cx(cx).await?;
+            if let Some(response_idx) = take_in_flight_slot(&mut in_flight, decoded.serial) {
+                responses[response_idx] = Some(Self::response_from_pdu(decoded.pdu)?);
+                if let Some((request_idx, request)) = requests.next() {
+                    let serial = self.send_request_only_with_cx(cx, request).await?;
+                    in_flight.push_back((request_idx, serial));
+                }
+            } else {
+                self.stash_pending_response(decoded.serial, decoded.pdu)?;
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(total);
+        for response in responses {
+            ordered.push(response.ok_or_else(|| {
+                DirectMuxError::Codec("pipeline batch completed with missing response".to_string())
+            })?);
+        }
+        tracing::trace!(
+            connection_id = self.connection_id,
+            response_count = ordered.len(),
+            max_pipeline_depth,
+            explicit_cx = true,
+            phase = "batch_complete",
+            "mux request batch completed"
+        );
+        Ok(ordered)
+    }
+
     async fn send_request(&mut self, pdu: Pdu) -> Result<Pdu, DirectMuxError> {
         let serial = self.send_request_only(pdu).await?;
         self.await_response(serial).await
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    async fn send_request_with_cx(&mut self, cx: &Cx, pdu: Pdu) -> Result<Pdu, DirectMuxError> {
+        let serial = self.send_request_only_with_cx(cx, pdu).await?;
+        self.await_response_with_cx(cx, serial).await
     }
 
     async fn send_request_only(&mut self, pdu: Pdu) -> Result<u64, DirectMuxError> {
@@ -658,6 +995,15 @@ impl DirectMuxClient {
         Ok(serial)
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    async fn send_request_only_with_cx(
+        &mut self,
+        _cx: &Cx,
+        pdu: Pdu,
+    ) -> Result<u64, DirectMuxError> {
+        self.send_request_only(pdu).await
+    }
+
     async fn await_response(&mut self, serial: u64) -> Result<Pdu, DirectMuxError> {
         if let Some(pending) = self.pending_responses.remove(&serial) {
             tracing::trace!(
@@ -677,6 +1023,39 @@ impl DirectMuxClient {
                 connection_id = self.connection_id,
                 request_serial = serial,
                 response_serial = decoded.serial,
+                phase = "response_out_of_order",
+                "stashing out-of-order mux response"
+            );
+            self.stash_pending_response(decoded.serial, decoded.pdu)?;
+        }
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    async fn await_response_with_cx(
+        &mut self,
+        cx: &Cx,
+        serial: u64,
+    ) -> Result<Pdu, DirectMuxError> {
+        if let Some(pending) = self.pending_responses.remove(&serial) {
+            tracing::trace!(
+                connection_id = self.connection_id,
+                request_serial = serial,
+                explicit_cx = true,
+                phase = "response_pending_hit",
+                "served mux response from pending map"
+            );
+            return Self::response_from_pdu(pending);
+        }
+        loop {
+            let decoded = self.read_next_pdu_with_cx(cx).await?;
+            if decoded.serial == serial {
+                return Self::response_from_pdu(decoded.pdu);
+            }
+            tracing::trace!(
+                connection_id = self.connection_id,
+                request_serial = serial,
+                response_serial = decoded.serial,
+                explicit_cx = true,
                 phase = "response_out_of_order",
                 "stashing out-of-order mux response"
             );
@@ -771,6 +1150,11 @@ impl DirectMuxClient {
                 });
             }
         }
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    async fn read_next_pdu_with_cx(&mut self, _cx: &Cx) -> Result<DecodedPdu, DirectMuxError> {
+        self.read_next_pdu().await
     }
 }
 
@@ -952,9 +1336,19 @@ impl Default for SubscriptionConfig {
 /// A handle to a running pane output subscription.
 ///
 /// Dropping this handle cancels the subscription.
+#[cfg(feature = "asupersync-runtime")]
+enum SubscriptionTask {
+    Ambient(task::JoinHandle<()>),
+    Scoped(cx::JoinHandle<()>),
+}
+
 pub struct PaneOutputSubscription {
     receiver: mpsc::Receiver<PaneDelta>,
     cancel: watch::Sender<bool>,
+    #[cfg(feature = "asupersync-runtime")]
+    task: Option<SubscriptionTask>,
+    #[cfg(not(feature = "asupersync-runtime"))]
+    task: Option<task::JoinHandle<()>>,
 }
 
 #[cfg(feature = "asupersync-runtime")]
@@ -965,6 +1359,12 @@ async fn pane_delta_recv_with_cx(cx: &Cx, rx: &mut mpsc::Receiver<PaneDelta>) ->
 #[cfg(not(feature = "asupersync-runtime"))]
 async fn pane_delta_recv(rx: &mut mpsc::Receiver<PaneDelta>) -> Option<PaneDelta> {
     rx.recv().await
+}
+
+#[cfg(all(test, feature = "asupersync-runtime"))]
+async fn pane_delta_recv(rx: &mut mpsc::Receiver<PaneDelta>) -> Option<PaneDelta> {
+    let cx = crate::cx::for_testing();
+    rx.recv(&cx).await.ok()
 }
 
 #[cfg(test)]
@@ -988,6 +1388,23 @@ fn pane_delta_try_emit_ended(
             reason: reason.into(),
         },
     );
+}
+
+#[cfg(feature = "asupersync-runtime")]
+async fn join_subscription_task(task: SubscriptionTask) {
+    match task {
+        SubscriptionTask::Ambient(handle) => {
+            let _ = handle.await;
+        }
+        SubscriptionTask::Scoped(handle) => {
+            handle.await;
+        }
+    }
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+async fn join_subscription_task(task: task::JoinHandle<()>) {
+    let _ = task.await;
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)] // mut needed for tokio borrow_and_update path
@@ -1225,6 +1642,17 @@ impl PaneOutputSubscription {
     pub fn cancel(&self) {
         let _ = self.cancel.send(true);
     }
+
+    /// Cancel the subscription and wait for the background poller to exit.
+    ///
+    /// This gives callers a deterministic shutdown path instead of relying on
+    /// detached task teardown after `Drop`.
+    pub async fn shutdown(mut self) {
+        self.cancel();
+        if let Some(task) = self.task.take() {
+            join_subscription_task(task).await;
+        }
+    }
 }
 
 fn subscription_poll_delay(config: &SubscriptionConfig, saw_dirty_output: bool) -> Duration {
@@ -1261,13 +1689,14 @@ pub fn subscribe_pane_output_with_cx(
     let (tx, rx) = mpsc::channel(config.channel_capacity);
     let (cancel_tx, cancel_rx) = watch::channel(false);
 
-    std::mem::drop(cx::spawn_with_cx(handle, cx, move |cx| async move {
+    let task = cx::spawn_with_cx(handle, cx, move |cx| async move {
         run_subscription_loop(&cx, client, pane_id, config, tx, cancel_rx).await;
-    }));
+    });
 
     PaneOutputSubscription {
         receiver: rx,
         cancel: cancel_tx,
+        task: Some(SubscriptionTask::Scoped(task)),
     }
 }
 
@@ -1284,19 +1713,20 @@ pub fn subscribe_pane_output(
     let (cancel_tx, cancel_rx) = watch::channel(false);
 
     #[cfg(feature = "asupersync-runtime")]
-    task::spawn(async move {
+    let task = SubscriptionTask::Ambient(task::spawn(async move {
         let cx = crate::cx::for_testing();
         run_subscription_loop(&cx, client, pane_id, config, tx, cancel_rx).await;
-    });
+    }));
 
     #[cfg(not(feature = "asupersync-runtime"))]
-    task::spawn(async move {
+    let task = task::spawn(async move {
         run_subscription_loop(client, pane_id, config, tx, cancel_rx).await;
     });
 
     PaneOutputSubscription {
         receiver: rx,
         cancel: cancel_tx,
+        task: Some(task),
     }
 }
 
@@ -1468,6 +1898,233 @@ mod tests {
             let mut client = DirectMuxClient::connect(config).await.expect("connect");
             let panes = client.list_panes().await.expect("list panes");
             assert!(panes.tabs.is_empty());
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn list_panes_with_cx_roundtrip() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("mux-with-cx.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut responses: HashMap<u64, Pdu> = HashMap::new();
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let payload = GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "wezterm-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                };
+                                Pdu::GetCodecVersionResponse(payload)
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::ListPanes(_) => {
+                                let payload = ListPanesResponse {
+                                    tabs: Vec::new(),
+                                    tab_titles: Vec::new(),
+                                    window_titles: HashMap::new(),
+                                };
+                                Pdu::ListPanesResponse(payload)
+                            }
+                            _ => continue,
+                        };
+                        responses.insert(decoded.serial, response);
+                    }
+
+                    for (serial, pdu) in responses.drain() {
+                        let mut out = Vec::new();
+                        pdu.encode(&mut out, serial).expect("encode response");
+                        stream.write_all(&out).await.expect("write response");
+                    }
+                }
+            });
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect with cx");
+            let panes = client
+                .list_panes_with_cx(&cx)
+                .await
+                .expect("list panes with cx");
+            assert!(panes.tabs.is_empty());
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn request_methods_with_cx_roundtrip() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("request-methods-with-cx.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut saw_render = None;
+                let mut saw_lines = None;
+                let mut saw_write = None;
+                let mut saw_paste = None;
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let payload = GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "wezterm-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                };
+                                Pdu::GetCodecVersionResponse(payload)
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(request) => {
+                                saw_render = Some(request.pane_id);
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: request.pane_id,
+                                    mouse_grabbed: false,
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    dirty_lines: Vec::new(),
+                                    title: format!("pane-{}", request.pane_id),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno: 7,
+                                })
+                            }
+                            Pdu::GetLines(request) => {
+                                saw_lines = Some((request.pane_id, request.lines.clone()));
+                                Pdu::GetLinesResponse(GetLinesResponse {
+                                    pane_id: request.pane_id,
+                                    lines: Vec::new().into(),
+                                })
+                            }
+                            Pdu::WriteToPane(request) => {
+                                saw_write = Some((request.pane_id, request.data.to_vec()));
+                                Pdu::UnitResponse(UnitResponse {})
+                            }
+                            Pdu::SendPaste(request) => {
+                                saw_paste = Some((request.pane_id, request.data.clone()));
+                                Pdu::UnitResponse(UnitResponse {})
+                            }
+                            _ => continue,
+                        };
+
+                        let mut out = Vec::new();
+                        response
+                            .encode(&mut out, decoded.serial)
+                            .expect("encode response");
+                        stream.write_all(&out).await.expect("write response");
+
+                        if saw_render.is_some()
+                            && saw_lines.is_some()
+                            && saw_write.is_some()
+                            && saw_paste.is_some()
+                        {
+                            break;
+                        }
+                    }
+
+                    if saw_render.is_some()
+                        && saw_lines.is_some()
+                        && saw_write.is_some()
+                        && saw_paste.is_some()
+                    {
+                        break;
+                    }
+                }
+
+                (
+                    saw_render.expect("saw render request"),
+                    saw_lines.expect("saw get_lines request"),
+                    saw_write.expect("saw write request"),
+                    saw_paste.expect("saw paste request"),
+                )
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect with cx");
+
+            let render = client
+                .get_pane_render_changes_with_cx(&cx, 12)
+                .await
+                .expect("render changes with cx");
+            assert_eq!(render.pane_id, 12);
+            assert_eq!(render.seqno, 7);
+
+            let requested_ranges = vec![0..3, 5..6];
+            let lines = client
+                .get_lines_with_cx(&cx, 34, requested_ranges.clone())
+                .await
+                .expect("get lines with cx");
+            assert_eq!(lines.pane_id, 34);
+            assert!(lines.lines.iter().next().is_none());
+
+            client
+                .write_to_pane_with_cx(&cx, 56, b"hello".to_vec())
+                .await
+                .expect("write to pane with cx");
+            client
+                .send_paste_with_cx(&cx, 78, "paste me".to_string())
+                .await
+                .expect("send paste with cx");
+
+            drop(client);
+            let (saw_render, saw_lines, saw_write, saw_paste) = server.await.expect("server task");
+            assert_eq!(saw_render, 12);
+            assert_eq!(saw_lines.0, 34);
+            assert_eq!(saw_lines.1, requested_ranges);
+            assert_eq!(saw_write.0, 56);
+            assert_eq!(saw_write.1, b"hello".to_vec());
+            assert_eq!(saw_paste.0, 78);
+            assert_eq!(saw_paste.1, "paste me");
         });
     }
 
@@ -1668,6 +2325,125 @@ mod tests {
                 .get_pane_render_changes_batch(&[10, 20, 30], 3, Duration::from_secs(1))
                 .await
                 .expect("batch request");
+
+            assert_eq!(responses.len(), 3);
+            assert_eq!(responses[0].pane_id, 10);
+            assert_eq!(responses[1].pane_id, 20);
+            assert_eq!(responses[2].pane_id, 30);
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn batch_render_changes_with_cx_preserves_request_order_with_out_of_order_responses() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("batch-order-with-cx.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut batch_requests: Vec<(u64, usize)> = Vec::new();
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let response =
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "wezterm-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    });
+                                let mut out = Vec::new();
+                                response
+                                    .encode(&mut out, decoded.serial)
+                                    .expect("encode response");
+                                stream.write_all(&out).await.expect("write response");
+                            }
+                            Pdu::SetClientId(_) => {
+                                let mut out = Vec::new();
+                                Pdu::UnitResponse(UnitResponse {})
+                                    .encode(&mut out, decoded.serial)
+                                    .expect("encode response");
+                                stream.write_all(&out).await.expect("write response");
+                            }
+                            Pdu::GetPaneRenderChanges(request) => {
+                                batch_requests.push((decoded.serial, request.pane_id));
+                                if batch_requests.len() == 3 {
+                                    for (idx, (serial, pane_id)) in
+                                        batch_requests.iter().rev().enumerate()
+                                    {
+                                        let response = Pdu::GetPaneRenderChangesResponse(
+                                            GetPaneRenderChangesResponse {
+                                                pane_id: *pane_id,
+                                                mouse_grabbed: false,
+                                                cursor_position:
+                                                    mux::renderable::StableCursorPosition::default(),
+                                                dimensions: mux::renderable::RenderableDimensions {
+                                                    cols: 80,
+                                                    viewport_rows: 24,
+                                                    scrollback_rows: 0,
+                                                    physical_top: 0,
+                                                    scrollback_top: 0,
+                                                    dpi: 96,
+                                                    pixel_width: 0,
+                                                    pixel_height: 0,
+                                                    reverse_video: false,
+                                                },
+                                                dirty_lines: Vec::new(),
+                                                title: format!("pane-{pane_id}"),
+                                                working_dir: None,
+                                                bonus_lines: Vec::new().into(),
+                                                input_serial: None,
+                                                seqno: idx + 1,
+                                            },
+                                        );
+                                        let mut out = Vec::new();
+                                        response
+                                            .encode(&mut out, *serial)
+                                            .expect("encode response");
+                                        stream.write_all(&out).await.expect("write response");
+                                    }
+                                    return;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect with cx");
+            let responses = client
+                .get_pane_render_changes_batch_with_cx(
+                    &cx,
+                    &[10, 20, 30],
+                    3,
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect("batch request with cx");
 
             assert_eq!(responses.len(), 3);
             assert_eq!(responses[0].pane_id, 10);
@@ -3838,6 +4614,134 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn subscription_with_cx_shutdown_waits_for_poller_exit() {
+        let runtime = crate::cx::CxRuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cx = crate::cx::for_testing();
+        let handle = runtime.handle();
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("subscription-with-cx-shutdown.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+            let render_request_count = Arc::new(AtomicUsize::new(0));
+            let server_request_count = Arc::clone(&render_request_count);
+            let (closed_tx, closed_rx) = crate::runtime_compat::oneshot::channel::<()>();
+
+            std::mem::drop(crate::cx::spawn_with_cx(
+                &handle,
+                &cx,
+                |_child_cx| async move {
+                    let mut closed_tx = Some(closed_tx);
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = match unix_stream_read(&mut stream, &mut temp).await {
+                            Ok(0) => {
+                                if let Some(tx) = closed_tx.take() {
+                                    let _ = tx.send(());
+                                }
+                                break;
+                            }
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            let response = match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    })
+                                }
+                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                                Pdu::GetPaneRenderChanges(_) => {
+                                    server_request_count.fetch_add(1, Ordering::SeqCst);
+                                    Pdu::GetPaneRenderChangesResponse(
+                                        GetPaneRenderChangesResponse {
+                                            pane_id: 31,
+                                            mouse_grabbed: false,
+                                            cursor_position:
+                                                mux::renderable::StableCursorPosition::default(),
+                                            dimensions: mux::renderable::RenderableDimensions {
+                                                cols: 80,
+                                                viewport_rows: 24,
+                                                scrollback_rows: 0,
+                                                physical_top: 0,
+                                                scrollback_top: 0,
+                                                dpi: 96,
+                                                pixel_width: 0,
+                                                pixel_height: 0,
+                                                reverse_video: false,
+                                            },
+                                            dirty_lines: Vec::new(),
+                                            title: "with-cx-shutdown".to_string(),
+                                            working_dir: None,
+                                            bonus_lines: Vec::new().into(),
+                                            input_serial: None,
+                                            seqno: 1,
+                                        },
+                                    )
+                                }
+                                _ => continue,
+                            };
+                            let mut out = Vec::new();
+                            response.encode(&mut out, decoded.serial).expect("encode");
+                            if stream.write_all(&out).await.is_err() {
+                                if let Some(tx) = closed_tx.take() {
+                                    let _ = tx.send(());
+                                }
+                                return;
+                            }
+                        }
+                    }
+                },
+            ));
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect");
+            let sub = subscribe_pane_output_with_cx(
+                &handle,
+                &cx,
+                client,
+                31,
+                SubscriptionConfig {
+                    poll_interval: Duration::from_millis(10),
+                    min_poll_interval: Duration::from_millis(5),
+                    channel_capacity: 8,
+                },
+            );
+
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if render_request_count.load(Ordering::SeqCst) >= 1 {
+                        break;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("subscription should issue a render request");
+
+            sub.shutdown().await;
+
+            let closed = timeout(Duration::from_millis(500), closed_rx)
+                .await
+                .expect("shutdown should await server-observed socket close");
+            closed.expect("server close signal should complete");
+        });
+    }
+
     #[test]
     fn concurrent_subscriptions_do_not_cross_talk() {
         run_async_test(async {
@@ -4461,6 +5365,118 @@ mod tests {
             let closed = timeout(Duration::from_millis(500), closed_rx)
                 .await
                 .expect("server should observe connection close after cancellation");
+            closed.expect("server close signal should complete");
+        });
+    }
+
+    #[test]
+    fn subscription_shutdown_waits_for_background_task_exit() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("shutdown-waits.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+
+            let render_request_count = Arc::new(AtomicUsize::new(0));
+            let server_request_count = Arc::clone(&render_request_count);
+            let (closed_tx, closed_rx) = crate::runtime_compat::oneshot::channel::<()>();
+
+            task::spawn(async move {
+                let mut closed_tx = Some(closed_tx);
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) => {
+                            if let Some(tx) = closed_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            break;
+                        }
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(_) => {
+                                server_request_count.fetch_add(1, Ordering::SeqCst);
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: 13,
+                                    mouse_grabbed: false,
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    dirty_lines: Vec::new(),
+                                    title: "shutdown-waits".to_string(),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno: 1,
+                                })
+                            }
+                            _ => continue,
+                        };
+                        let mut out = Vec::new();
+                        response.encode(&mut out, decoded.serial).expect("encode");
+                        if stream.write_all(&out).await.is_err() {
+                            if let Some(tx) = closed_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let client = DirectMuxClient::connect(config).await.expect("connect");
+            let sub = subscribe_pane_output(
+                client,
+                13,
+                SubscriptionConfig {
+                    poll_interval: Duration::from_millis(10),
+                    min_poll_interval: Duration::from_millis(5),
+                    channel_capacity: 8,
+                },
+            );
+
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if render_request_count.load(Ordering::SeqCst) >= 1 {
+                        break;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("subscription should issue a render request");
+
+            sub.shutdown().await;
+
+            let closed = timeout(Duration::from_millis(500), closed_rx)
+                .await
+                .expect("shutdown should await server-observed socket close");
             closed.expect("server close signal should complete");
         });
     }

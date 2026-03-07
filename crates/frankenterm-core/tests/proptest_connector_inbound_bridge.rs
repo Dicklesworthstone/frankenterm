@@ -9,12 +9,13 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 
+use frankenterm_core::connector_data_classification::IngestionDecision;
 use frankenterm_core::connector_host_runtime::{ConnectorFailureClass, ConnectorLifecyclePhase};
 use frankenterm_core::connector_inbound_bridge::{
     ConnectorBridgeTelemetrySnapshot, ConnectorInboundBridge, ConnectorInboundBridgeConfig,
     ConnectorSignal, ConnectorSignalKind, SignalDeduplicator,
 };
-use frankenterm_core::events::EventBus;
+use frankenterm_core::events::{Event, EventBus};
 use frankenterm_core::patterns::Severity;
 
 // =============================================================================
@@ -461,5 +462,80 @@ proptest! {
 
         let snap = bridge.telemetry_snapshot();
         prop_assert_eq!(snap.signals_received, num as u64);
+    }
+
+    #[test]
+    fn bridge_rejects_password_payloads_without_publishing(
+        source in arb_connector_name(),
+        password in ".{1,64}",
+    ) {
+        let bus = Arc::new(EventBus::new(64));
+        let mut sub = bus.subscribe_detections();
+        let mut bridge = ConnectorInboundBridge::new(bus, ConnectorInboundBridgeConfig::default());
+        let sig = ConnectorSignal::new(
+            source,
+            ConnectorSignalKind::Webhook,
+            serde_json::json!({
+                "password": password,
+                "status": "ok"
+            }),
+        )
+        .with_timestamp_ms(1000);
+
+        let result = bridge.route_signal(&sig);
+        prop_assert!(result.is_err());
+        prop_assert!(sub.try_recv().is_none());
+        prop_assert_eq!(bridge.telemetry_snapshot().signals_rejected, 1);
+        let audit = bridge.classification_audit_log().back().unwrap();
+        let is_reject = matches!(audit.decision, IngestionDecision::Reject { .. });
+        prop_assert!(is_reject);
+    }
+
+    #[test]
+    fn bridge_redacts_email_payloads_before_publish(
+        source in arb_connector_name(),
+        local in "[a-z0-9]{1,12}",
+        domain in "[a-z]{1,10}",
+    ) {
+        let bus = Arc::new(EventBus::new(64));
+        let mut sub = bus.subscribe_detections();
+        let mut bridge = ConnectorInboundBridge::new(bus, ConnectorInboundBridgeConfig::default());
+        let email = format!("{local}@{domain}.com");
+        let sig = ConnectorSignal::new(
+            source,
+            ConnectorSignalKind::Webhook,
+            serde_json::json!({
+                "email": email.clone(),
+                "status": "ok"
+            }),
+        )
+        .with_timestamp_ms(1000);
+
+        let result = bridge.route_signal(&sig);
+        prop_assert!(result.is_ok());
+
+        let event = sub.try_recv().unwrap();
+        if let Ok(Event::PatternDetected { detection, .. }) = event {
+            let map = detection.extracted.as_object().unwrap();
+            prop_assert_ne!(
+                map.get("email").and_then(|value| value.as_str()),
+                Some(email.as_str())
+            );
+            let classification = map
+                .get("classification")
+                .and_then(|value| value.as_object())
+                .unwrap();
+            prop_assert_eq!(
+                classification
+                    .get("ingestion_decision")
+                    .and_then(|value| value.as_str()),
+                Some("accept_redacted")
+            );
+        } else {
+            prop_assert!(false, "expected PatternDetected event");
+        }
+
+        let audit = bridge.classification_audit_log().back().unwrap();
+        prop_assert_eq!(audit.decision.clone(), IngestionDecision::AcceptRedacted);
     }
 }

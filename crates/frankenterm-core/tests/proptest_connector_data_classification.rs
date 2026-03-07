@@ -9,8 +9,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::connector_data_classification::{
     ClassificationError, ClassificationPolicy, ClassificationRule, ClassificationTelemetry,
-    ClassifiedEvent, ClassifierConfig, ConnectorDataClassifier, DataSensitivity, FieldClassification,
-    IngestionDecision, RedactionStrategy,
+    ClassifiedEvent, ClassifierConfig, ConnectorDataClassifier, DataSensitivity,
+    FieldClassification, IngestionDecision, RedactionStrategy,
 };
 
 // =============================================================================
@@ -33,7 +33,9 @@ fn arb_redaction_strategy() -> impl Strategy<Value = RedactionStrategy> {
         Just(RedactionStrategy::Hash),
         (1usize..=256).prop_map(|max_len| RedactionStrategy::Truncate { max_len }),
         Just(RedactionStrategy::Remove),
-        "[a-z]{2,6}-".prop_map(|prefix| RedactionStrategy::Tokenize { token_prefix: prefix }),
+        "[a-z]{2,6}-".prop_map(|prefix| RedactionStrategy::Tokenize {
+            token_prefix: prefix
+        }),
         Just(RedactionStrategy::Passthrough),
     ]
 }
@@ -80,8 +82,8 @@ fn arb_telemetry() -> impl Strategy<Value = ClassificationTelemetry> {
         0u64..=500,
         0u64..=100,
     )
-        .prop_map(
-            |(ec, ea, ear, er, eq, fc, fr, fre, sd, pt, pl, pm)| ClassificationTelemetry {
+        .prop_map(|(ec, ea, ear, er, eq, fc, fr, fre, sd, pt, pl, pm)| {
+            ClassificationTelemetry {
                 events_classified: ec,
                 events_accepted: ea,
                 events_accepted_redacted: ear,
@@ -94,19 +96,22 @@ fn arb_telemetry() -> impl Strategy<Value = ClassificationTelemetry> {
                 payload_truncations: pt,
                 policy_lookups: pl,
                 policy_misses: pm,
-            },
-        )
+            }
+        })
 }
 
 fn arb_field_classification() -> impl Strategy<Value = FieldClassification> {
-    (arb_field_name(), arb_sensitivity(), arb_redaction_strategy()).prop_map(
-        |(path, sensitivity, strategy)| FieldClassification {
+    (
+        arb_field_name(),
+        arb_sensitivity(),
+        arb_redaction_strategy(),
+    )
+        .prop_map(|(path, sensitivity, strategy)| FieldClassification {
             field_path: path,
             sensitivity,
             matched_rule: "test-rule".to_string(),
             strategy,
-        },
-    )
+        })
 }
 
 // =============================================================================

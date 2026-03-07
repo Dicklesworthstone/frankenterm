@@ -83,10 +83,9 @@ fn arb_operations() -> impl Strategy<Value = Vec<String>> {
 }
 
 fn arb_scope() -> impl Strategy<Value = CredentialScope> {
-    (arb_provider_name(), arb_resource(), arb_operations())
-        .prop_map(|(provider, resource, operations)| {
-            CredentialScope::new(provider, resource, operations)
-        })
+    (arb_provider_name(), arb_resource(), arb_operations()).prop_map(
+        |(provider, resource, operations)| CredentialScope::new(provider, resource, operations),
+    )
 }
 
 fn arb_connector_id() -> impl Strategy<Value = String> {
@@ -128,15 +127,22 @@ fn arb_telemetry() -> impl Strategy<Value = CredentialBrokerTelemetry> {
 }
 
 fn arb_telemetry_snapshot() -> impl Strategy<Value = CredentialBrokerTelemetrySnapshot> {
-    (arb_telemetry(), 0u64..=u64::MAX, 0u32..=100, 0u32..=100, 0u32..=20).prop_map(
-        |(counters, ts, leases, creds, provs)| CredentialBrokerTelemetrySnapshot {
-            captured_at_ms: ts,
-            counters,
-            active_leases: leases,
-            active_credentials: creds,
-            active_providers: provs,
-        },
+    (
+        arb_telemetry(),
+        0u64..=u64::MAX,
+        0u32..=100,
+        0u32..=100,
+        0u32..=20,
     )
+        .prop_map(
+            |(counters, ts, leases, creds, provs)| CredentialBrokerTelemetrySnapshot {
+                captured_at_ms: ts,
+                counters,
+                active_leases: leases,
+                active_credentials: creds,
+                active_providers: provs,
+            },
+        )
 }
 
 // Helper: set up a broker with a provider and credential ready for lease tests.
@@ -168,11 +174,7 @@ fn setup_broker_for_leasing(
                 kind: CredentialKind::ApiKey,
                 sensitivity: cred_sensitivity,
                 state: CredentialState::Active,
-                permitted_scopes: vec![CredentialScope::new(
-                    "github",
-                    "*",
-                    vec!["*".to_string()],
-                )],
+                permitted_scopes: vec![CredentialScope::new("github", "*", vec!["*".to_string()])],
                 version: 1,
                 created_at_ms: 1000,
                 expires_at_ms: 0,

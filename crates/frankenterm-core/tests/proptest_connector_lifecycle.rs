@@ -90,6 +90,16 @@ fn trusted_manager() -> ConnectorLifecycleManager {
         .trust_policy
         .trusted_publishers
         .push("test-publisher".to_string());
+    config.trust_policy.max_allowed_capabilities = vec![
+        ConnectorCapability::Invoke,
+        ConnectorCapability::ReadState,
+        ConnectorCapability::StreamEvents,
+        ConnectorCapability::FilesystemRead,
+        ConnectorCapability::FilesystemWrite,
+        ConnectorCapability::NetworkEgress,
+        ConnectorCapability::SecretBroker,
+        ConnectorCapability::ProcessExec,
+    ];
     ConnectorLifecycleManager::new(config)
 }
 

@@ -20,6 +20,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use crate::connector_data_classification::{
+    ClassificationAuditEntry, ClassificationPolicy, ClassificationTelemetry,
+    ConnectorDataClassifier, IngestionDecision, RedactedEvent,
+};
+use crate::connector_event_model;
 use crate::connector_host_runtime::{ConnectorFailureClass, ConnectorLifecyclePhase};
 use crate::events::{Event, EventBus};
 use crate::patterns::{AgentType, Detection, Severity};
@@ -287,6 +292,12 @@ pub enum ConnectorBridgeError {
     MissingPaneId,
     #[error("signal mapping failed: {0}")]
     MappingFailed(String),
+    #[error("connector signal rejected by privacy policy: {reason}")]
+    PrivacyRejected { reason: String },
+    #[error("connector signal quarantined by privacy policy: {reason}")]
+    PrivacyQuarantined { reason: String },
+    #[error("connector signal classification failed: {0}")]
+    ClassificationFailed(String),
 }
 
 // =============================================================================
@@ -424,6 +435,7 @@ pub struct ConnectorInboundBridge {
     deduplicator: SignalDeduplicator,
     config: ConnectorInboundBridgeConfig,
     telemetry: ConnectorBridgeTelemetry,
+    classifier: ConnectorDataClassifier,
 }
 
 impl ConnectorInboundBridge {
@@ -431,12 +443,20 @@ impl ConnectorInboundBridge {
     #[must_use]
     pub fn new(event_bus: Arc<EventBus>, config: ConnectorInboundBridgeConfig) -> Self {
         let dedup_ttl = Duration::from_secs(config.dedup_ttl_secs);
+        let mut classifier = ConnectorDataClassifier::new(Default::default());
+        classifier.register_policy(ClassificationPolicy::default());
         Self {
             event_bus,
             deduplicator: SignalDeduplicator::new(config.dedup_capacity, dedup_ttl),
             config,
             telemetry: ConnectorBridgeTelemetry::default(),
+            classifier,
         }
+    }
+
+    /// Register an explicit classification policy for connector ingress.
+    pub fn register_classification_policy(&mut self, policy: ClassificationPolicy) {
+        self.classifier.register_policy(policy);
     }
 
     /// Route a connector signal through the bridge.
@@ -487,7 +507,67 @@ impl ConnectorInboundBridge {
 
         // 3. Map to Detection
         let rule_id = self.resolve_rule_id(signal);
-        let detection = Self::map_to_detection(signal, &rule_id);
+        let canonical_event = connector_event_model::from_inbound_signal(signal);
+        let classified = self
+            .classifier
+            .classify_event(&canonical_event)
+            .map_err(|err| ConnectorBridgeError::ClassificationFailed(err.to_string()))?;
+        let policy = self
+            .classifier
+            .find_policy(&canonical_event.connector_id)
+            .cloned()
+            .ok_or_else(|| {
+                ConnectorBridgeError::ClassificationFailed(format!(
+                    "no classification policy for connector '{}'",
+                    canonical_event.connector_id
+                ))
+            })?;
+        let decision = self.classifier.ingestion_decision(&classified, &policy);
+        let redacted = self.classifier.redact_event_with_decision(
+            &canonical_event,
+            &classified,
+            decision.clone(),
+        );
+
+        match &decision {
+            IngestionDecision::Reject { reason } => {
+                self.telemetry.signals_rejected += 1;
+                warn!(
+                    rule_id = %rule_id,
+                    source = %signal.source_connector,
+                    kind = %signal.signal_kind,
+                    reason = %reason,
+                    overall_sensitivity = %redacted.classification.overall_sensitivity,
+                    fields_redacted = redacted.fields_redacted(),
+                    fields_removed = redacted.fields_removed(),
+                    secrets_detected = redacted.classification.secrets_detected,
+                    "connector signal rejected by privacy policy"
+                );
+                return Err(ConnectorBridgeError::PrivacyRejected {
+                    reason: reason.clone(),
+                });
+            }
+            IngestionDecision::Quarantine { reason } => {
+                self.telemetry.signals_rejected += 1;
+                warn!(
+                    rule_id = %rule_id,
+                    source = %signal.source_connector,
+                    kind = %signal.signal_kind,
+                    reason = %reason,
+                    overall_sensitivity = %redacted.classification.overall_sensitivity,
+                    fields_redacted = redacted.fields_redacted(),
+                    fields_removed = redacted.fields_removed(),
+                    secrets_detected = redacted.classification.secrets_detected,
+                    "connector signal quarantined by privacy policy"
+                );
+                return Err(ConnectorBridgeError::PrivacyQuarantined {
+                    reason: reason.clone(),
+                });
+            }
+            IngestionDecision::Accept | IngestionDecision::AcceptRedacted => {}
+        }
+
+        let detection = Self::map_to_detection(&redacted, signal, &rule_id, &decision);
 
         // 4. Determine pane_id (default to 0 for system-level signals)
         let pane_id = signal.pane_id.unwrap_or(0);
@@ -511,6 +591,11 @@ impl ConnectorInboundBridge {
             pane_id = pane_id,
             delivered = delivered,
             correlation_id = ?signal.correlation_id,
+            ingestion_decision = %decision,
+            overall_sensitivity = %redacted.classification.overall_sensitivity,
+            fields_redacted = redacted.fields_redacted(),
+            fields_removed = redacted.fields_removed(),
+            secrets_detected = redacted.classification.secrets_detected,
             "connector signal routed to event bus"
         );
 
@@ -541,8 +626,13 @@ impl ConnectorInboundBridge {
         }
     }
 
-    /// Map a connector signal to a Detection.
-    fn map_to_detection(signal: &ConnectorSignal, rule_id: &str) -> Detection {
+    /// Map a redacted connector event to a Detection.
+    fn map_to_detection(
+        redacted: &RedactedEvent,
+        signal: &ConnectorSignal,
+        rule_id: &str,
+        decision: &IngestionDecision,
+    ) -> Detection {
         let event_type = format!(
             "connector.{}",
             signal
@@ -551,8 +641,20 @@ impl ConnectorInboundBridge {
                 .unwrap_or(signal.signal_kind.as_str())
         );
 
-        // Build extracted data with standard fields
-        let mut extracted = signal.payload.clone();
+        let classification = serde_json::json!({
+            "overall_sensitivity": redacted.classification.overall_sensitivity.as_str(),
+            "policy_id": redacted.classification.policy_id.clone(),
+            "ingestion_decision": decision,
+            "secrets_detected": redacted.classification.secrets_detected,
+            "fields_redacted": redacted.fields_redacted(),
+            "fields_removed": redacted.fields_removed()
+        });
+
+        let mut extracted = match redacted.event.payload.clone() {
+            serde_json::Value::Object(map) => serde_json::Value::Object(map),
+            payload => serde_json::json!({ "payload": payload }),
+        };
+
         if let serde_json::Value::Object(ref mut map) = extracted {
             map.insert(
                 "source_connector".into(),
@@ -562,6 +664,7 @@ impl ConnectorInboundBridge {
                 "signal_kind".into(),
                 serde_json::Value::String(signal.signal_kind.as_str().to_string()),
             );
+            map.insert("classification".into(), classification);
             if let Some(ref cid) = signal.correlation_id {
                 map.insert(
                     "correlation_id".into(),
@@ -602,6 +705,24 @@ impl ConnectorInboundBridge {
     #[must_use]
     pub fn telemetry_snapshot(&self) -> ConnectorBridgeTelemetrySnapshot {
         self.telemetry.snapshot()
+    }
+
+    /// Get a snapshot of classification/redaction telemetry.
+    #[must_use]
+    pub fn classification_telemetry_snapshot(&self) -> ClassificationTelemetry {
+        self.classifier.telemetry().clone()
+    }
+
+    /// Access the bounded classification audit log.
+    #[must_use]
+    pub fn classification_audit_log(&self) -> &VecDeque<ClassificationAuditEntry> {
+        self.classifier.audit_log()
+    }
+
+    /// Number of registered classification policies.
+    #[must_use]
+    pub fn classification_policy_count(&self) -> usize {
+        self.classifier.policy_count()
     }
 
     /// Get the dedup cache size.
@@ -781,6 +902,7 @@ mod tests {
         assert_eq!(snap.signals_received, 1);
         assert_eq!(snap.signals_routed, 1);
         assert_eq!(snap.events_published, 1);
+        assert_eq!(bridge.classification_policy_count(), 1);
     }
 
     #[test]
@@ -932,9 +1054,153 @@ mod tests {
                 map.get("signal_kind").and_then(|v| v.as_str()),
                 Some("stream")
             );
+            let classification = map
+                .get("classification")
+                .and_then(|v| v.as_object())
+                .unwrap();
+            assert_eq!(
+                classification
+                    .get("ingestion_decision")
+                    .and_then(|v| v.as_str()),
+                Some("accept")
+            );
         } else {
             panic!("expected PatternDetected event");
         }
+    }
+
+    #[test]
+    fn bridge_redacts_sensitive_payload_before_publish() {
+        let bus = make_bus();
+        let mut sub = bus.subscribe_detections();
+        let mut bridge = default_bridge(bus);
+        let original_message =
+            "this connector payload contains sensitive freeform content that must be truncated";
+        let sig = ConnectorSignal::new(
+            "slack",
+            ConnectorSignalKind::Webhook,
+            serde_json::json!({
+                "message": original_message,
+                "email": "user@example.com",
+                "status": "ok"
+            }),
+        )
+        .with_timestamp_ms(1000);
+
+        bridge.route_signal(&sig).unwrap();
+
+        let event = sub.try_recv().unwrap();
+        if let Ok(Event::PatternDetected { detection, .. }) = event {
+            let map = detection.extracted.as_object().unwrap();
+            assert_eq!(
+                map.get("email").and_then(|v| v.as_str()),
+                Some("[CLASSIFIED]")
+            );
+            let message = map.get("message").and_then(|v| v.as_str()).unwrap();
+            assert_ne!(message, original_message);
+            assert!(message.ends_with("[...]"));
+            let classification = map
+                .get("classification")
+                .and_then(|v| v.as_object())
+                .unwrap();
+            assert_eq!(
+                classification
+                    .get("overall_sensitivity")
+                    .and_then(|v| v.as_str()),
+                Some("restricted")
+            );
+            assert_eq!(
+                classification
+                    .get("ingestion_decision")
+                    .and_then(|v| v.as_str()),
+                Some("accept_redacted")
+            );
+        } else {
+            panic!("expected PatternDetected event");
+        }
+
+        let audit = bridge.classification_audit_log().back().unwrap();
+        assert_eq!(audit.fields_redacted, 2);
+        assert_eq!(
+            bridge
+                .classification_telemetry_snapshot()
+                .events_accepted_redacted,
+            1
+        );
+    }
+
+    #[test]
+    fn bridge_rejects_prohibited_payload_before_publish() {
+        let bus = make_bus();
+        let mut sub = bus.subscribe_detections();
+        let mut bridge = default_bridge(bus);
+        let sig = ConnectorSignal::new(
+            "github",
+            ConnectorSignalKind::Webhook,
+            serde_json::json!({
+                "password": "super-secret",
+                "status": "ok"
+            }),
+        )
+        .with_timestamp_ms(1000);
+
+        let err = bridge.route_signal(&sig).unwrap_err();
+        assert!(matches!(err, ConnectorBridgeError::PrivacyRejected { .. }));
+        assert!(sub.try_recv().is_none());
+        let audit = bridge.classification_audit_log().back().unwrap();
+        assert!(matches!(audit.decision, IngestionDecision::Reject { .. }));
+        assert_eq!(bridge.telemetry_snapshot().signals_rejected, 1);
+        assert_eq!(
+            bridge.classification_telemetry_snapshot().events_rejected,
+            1
+        );
+    }
+
+    #[test]
+    fn bridge_explicit_policy_can_allow_prohibited_after_redaction() {
+        let bus = make_bus();
+        let mut sub = bus.subscribe_detections();
+        let mut bridge = default_bridge(bus);
+        let mut policy = ClassificationPolicy::default();
+        policy.policy_id = "github-emergency".to_string();
+        policy.connector_pattern = "github".to_string();
+        policy.allow_prohibited = true;
+        bridge.register_classification_policy(policy);
+
+        let sig = ConnectorSignal::new(
+            "github",
+            ConnectorSignalKind::Webhook,
+            serde_json::json!({
+                "password": "super-secret",
+                "status": "ok"
+            }),
+        )
+        .with_timestamp_ms(1000);
+
+        bridge.route_signal(&sig).unwrap();
+
+        let event = sub.try_recv().unwrap();
+        if let Ok(Event::PatternDetected { detection, .. }) = event {
+            let map = detection.extracted.as_object().unwrap();
+            assert!(map.get("password").is_none());
+            assert_eq!(map.get("status").and_then(|v| v.as_str()), Some("ok"));
+            let classification = map
+                .get("classification")
+                .and_then(|v| v.as_object())
+                .unwrap();
+            assert_eq!(
+                classification
+                    .get("ingestion_decision")
+                    .and_then(|v| v.as_str()),
+                Some("accept_redacted")
+            );
+        } else {
+            panic!("expected PatternDetected event");
+        }
+
+        let audit = bridge.classification_audit_log().back().unwrap();
+        assert_eq!(audit.policy_id, "github-emergency");
+        assert_eq!(audit.decision, IngestionDecision::AcceptRedacted);
     }
 
     #[test]
@@ -1108,6 +1374,11 @@ mod tests {
 
         let e = ConnectorBridgeError::MissingPaneId;
         assert!(e.to_string().contains("pane_id"));
+
+        let e = ConnectorBridgeError::PrivacyRejected {
+            reason: "policy".into(),
+        };
+        assert!(e.to_string().contains("policy"));
     }
 
     // ── Edge cases ──────────────────────────────────────────────────────
