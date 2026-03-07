@@ -9,15 +9,20 @@ set -euo pipefail
 # No dependency on a pre-installed WezTerm.app.
 #
 # Usage:
-#   ./scripts/create-macos-bundle.sh              # build everything + bundle
-#   ./scripts/create-macos-bundle.sh --skip-build  # bundle only (uses existing binaries)
+#   ./scripts/create-macos-bundle.sh               # build everything + bundle
+#   ./scripts/create-macos-bundle.sh --skip-build # bundle only (uses existing binaries)
 #   ./scripts/create-macos-bundle.sh --output /path/to/dir  # custom output directory
+#
+# Safety:
+#   Refuses to overwrite an existing FrankenTerm.app bundle. Use a fresh
+#   output directory or remove the prior bundle manually.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 APP_NAME="FrankenTerm"
 BUNDLE_ID="com.dicklesworthstone.frankenterm"
+RCH_BIN="${RCH_BIN:-rch}"
 
 SKIP_BUILD=false
 OUTPUT_DIR="$PROJECT_ROOT"
@@ -30,6 +35,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [--skip-build] [--output DIR]"
             echo "  --skip-build  Skip cargo build, use existing binaries"
             echo "  --output DIR  Output directory for .app bundle (default: project root)"
+            echo "                Existing FrankenTerm.app bundles are not overwritten."
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -38,10 +44,44 @@ done
 
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
 
+require_rch() {
+    command -v "$RCH_BIN" >/dev/null 2>&1
+}
+
+probe_rch_workers() {
+    local probe_json
+    probe_json="$("$RCH_BIN" workers probe --json --all)"
+    python3 - "$probe_json" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+for worker in payload.get("data", []):
+    status = str(worker.get("status", "")).strip().lower()
+    if status and not status.endswith("_failed") and status not in {
+        "connection_failed",
+        "error",
+        "failed",
+        "unreachable",
+    }:
+        sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
 # --- Build from source ---
 if [ "$SKIP_BUILD" = false ]; then
-    echo "Building frankenterm-gui and ft (release)..."
-    cargo build --release \
+    if ! require_rch; then
+        echo "Error: rch not found at '$RCH_BIN'"
+        exit 1
+    fi
+    if ! probe_rch_workers; then
+        echo "Error: no reachable RCH workers detected; refusing local cargo fallback"
+        exit 1
+    fi
+    echo "Building frankenterm-gui and ft via rch (release)..."
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo build --release \
         --bin frankenterm-gui \
         --bin ft \
         --manifest-path "$PROJECT_ROOT/Cargo.toml"
@@ -70,7 +110,11 @@ echo "Packaging $APP_NAME.app v$VERSION (build $BUILD_STRING)..."
 
 # --- Bundle structure ---
 APP_BUNDLE="$OUTPUT_DIR/$APP_NAME.app"
-rm -rf "$APP_BUNDLE"
+if [ -e "$APP_BUNDLE" ]; then
+    echo "Error: app bundle already exists at $APP_BUNDLE"
+    echo "Choose a fresh --output directory or remove the existing bundle manually."
+    exit 1
+fi
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 

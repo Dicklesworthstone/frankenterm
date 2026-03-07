@@ -15,9 +15,10 @@ GUI_TARGET_DIR="${GUI_TARGET_DIR:-$PROJECT_ROOT/target/e2e-gui-bootstrap}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
 GUI_BIN="$GUI_TARGET_DIR/$BUILD_PROFILE/frankenterm-gui"
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/target/e2e/gui-bootstrap}"
-BUNDLE_OUTPUT_DIR="${BUNDLE_OUTPUT_DIR:-$LOG_DIR/bundle}"
+BUNDLE_OUTPUT_DIR="${BUNDLE_OUTPUT_DIR:-$LOG_DIR/bundle-${BUILD_PROFILE}-$$}"
 LAUNCH_TIMEOUT_SECS="${LAUNCH_TIMEOUT_SECS:-3}"
 RUN_GUI_LAUNCH="${RUN_GUI_LAUNCH:-0}"
+RCH_PROBE_LOG="${RCH_PROBE_LOG:-$LOG_DIR/rch-workers-probe.json}"
 DRY_RUN=0
 SKIP_BUILD=0
 SKIP_BUNDLE=0
@@ -131,13 +132,49 @@ require_rch() {
   command -v "$RCH_BIN" >/dev/null 2>&1
 }
 
+probe_rch_workers() {
+  local probe_json
+  probe_json="$("$RCH_BIN" workers probe --json --all)"
+  printf '%s\n' "$probe_json" > "$RCH_PROBE_LOG"
+
+  python3 - <<'PY' "$RCH_PROBE_LOG"
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+for worker in payload.get("data", []):
+    status = str(worker.get("status", "")).strip().lower()
+    if status and not status.endswith("_failed") and status not in {
+        "connection_failed",
+        "error",
+        "failed",
+        "unreachable",
+    }:
+        sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
 build_gui() {
   if [[ "$SKIP_BUILD" -eq 1 ]]; then
     mark_skip "--skip-build set"
     return 125
   fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    run_cmd "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$GUI_TARGET_DIR" \
+      cargo build --profile "$BUILD_PROFILE" --bin frankenterm-gui --manifest-path "$PROJECT_ROOT/Cargo.toml"
+    return 0
+  fi
   if ! require_rch; then
     log "rch not found at '$RCH_BIN'"
+    return 1
+  fi
+  if ! probe_rch_workers; then
+    log "No reachable RCH workers detected; refusing local cargo fallback."
+    log "See $RCH_PROBE_LOG for probe details."
     return 1
   fi
   run_cmd "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$GUI_TARGET_DIR" \
