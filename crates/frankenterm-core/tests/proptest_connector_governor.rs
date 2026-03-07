@@ -139,15 +139,18 @@ proptest! {
         let config = QuotaConfig { max_actions, window_ms, warning_threshold: 0.8 };
         let mut qt = QuotaTracker::new(config);
 
-        // Fill quota
-        for i in 0..max_actions {
-            qt.record(i * 100);
+        // Record all actions at the SAME timestamp so they all fall in one window
+        let now = 10_000u64;
+        for _ in 0..max_actions {
+            qt.record(now);
         }
-        prop_assert!(qt.is_exhausted(max_actions * 100));
+        prop_assert!(qt.is_exhausted(now),
+            "Should be exhausted after recording max_actions at same timestamp");
 
         // After window passes, should have capacity again
-        let future = max_actions * 100 + window_ms + 1;
-        prop_assert!(!qt.is_exhausted(future));
+        let future = now + window_ms + 1;
+        prop_assert!(!qt.is_exhausted(future),
+            "Should have capacity after window expires");
         prop_assert_eq!(qt.remaining(future), max_actions);
     }
 
