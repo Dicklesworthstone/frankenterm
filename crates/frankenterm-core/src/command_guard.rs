@@ -789,7 +789,7 @@ impl CommandGuard {
         }
 
         // Quick-reject: check if command contains any pack keywords.
-        let relevant_packs = self.keyword_filter(command);
+        let relevant_packs = self.keyword_filter(command, &pane_config);
         if relevant_packs.is_empty() {
             let elapsed = start.elapsed().as_micros() as u64;
             self.record(pane_id, command, "allow", None, None, elapsed);
@@ -841,7 +841,7 @@ impl CommandGuard {
             return GuardDecision::Allow;
         }
 
-        let relevant_packs = self.keyword_filter(command);
+        let relevant_packs = self.keyword_filter(command, &pane_config);
         if relevant_packs.is_empty() {
             return GuardDecision::Allow;
         }
@@ -929,9 +929,9 @@ impl CommandGuard {
         patterns.iter().any(|r| r.is_match(command))
     }
 
-    fn keyword_filter(&self, command: &str) -> Vec<&'static str> {
+    fn keyword_filter(&self, command: &str, pane_config: &PaneGuardConfig) -> Vec<&'static str> {
         let mut pack_ids: Vec<&'static str> = Vec::new();
-        let enabled = &self.policy.enabled_packs;
+        let enabled = pane_config.enabled_packs.as_ref().unwrap_or(&self.policy.enabled_packs);
         let disabled = &self.policy.disabled_packs;
 
         for mat in KEYWORD_AUTOMATON.find_iter(command) {
@@ -1934,6 +1934,28 @@ mod tests {
         let (rule_id, pack, _reason, _suggestions) = result.unwrap();
         assert!(!rule_id.is_empty());
         assert!(!pack.is_empty());
+    }
+
+    #[test]
+    fn per_pane_enabled_packs_override() {
+        let mut guard = strict_guard();
+        guard.set_pane_config(
+            42,
+            PaneGuardConfig {
+                trust_level: TrustLevel::Strict,
+                enabled_packs: Some(vec!["core.git".to_string()]),
+                ..PaneGuardConfig::default()
+            },
+        );
+        // Global policy has core.filesystem enabled.
+        // Pane 42 ONLY has core.git enabled.
+        // So rm -rf should be ALLOWED for pane 42!
+        let d = guard.evaluate("rm -rf /tmp/data", 42);
+        assert!(d.is_allowed());
+
+        // But core.git commands should still be blocked.
+        let d2 = guard.evaluate("git push --force origin main", 42);
+        assert!(d2.is_blocked());
     }
 
     // ── Telemetry tests ──────────────────────────────────────────────────

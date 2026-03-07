@@ -579,7 +579,7 @@ impl super::TermWindow {
                 Some(
                     current_viewport
                         .unwrap_or(dims.physical_top)
-                        .saturating_sub(self.terminal_size.rows.try_into().unwrap()),
+                        .saturating_sub(self.terminal_size.rows.try_into().unwrap_or(isize::MAX)),
                 ),
                 dims,
             );
@@ -604,7 +604,7 @@ impl super::TermWindow {
                 Some(
                     current_viewport
                         .unwrap_or(dims.physical_top)
-                        .saturating_add(self.terminal_size.rows.try_into().unwrap()),
+                        .saturating_add(self.terminal_size.rows.try_into().unwrap_or(isize::MAX)),
                 ),
                 dims,
             );

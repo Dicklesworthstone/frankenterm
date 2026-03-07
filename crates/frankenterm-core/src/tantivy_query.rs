@@ -413,16 +413,23 @@ pub fn extract_snippets(
         return Vec::new();
     }
 
-    let text_lower = text.to_lowercase();
     let mut fragments = Vec::new();
 
     for term in query_terms {
-        let term_lower = term.to_lowercase();
-        if let Some(pos) = text_lower.find(&term_lower) {
+        let Ok(re) = regex::RegexBuilder::new(&regex::escape(term))
+            .case_insensitive(true)
+            .build()
+        else {
+            continue;
+        };
+
+        if let Some(m) = re.find(text) {
+            let pos = m.start();
+            let match_len = m.end() - m.start();
             let half_window = config.max_fragment_len / 2;
             let start = pos.saturating_sub(half_window);
             // Find the end, clamped to text length
-            let end = (pos + term.len() + half_window).min(text.len());
+            let end = (m.end() + half_window).min(text.len());
 
             // Ensure we're at valid char boundaries
             let start = {
@@ -449,9 +456,9 @@ pub fn extract_snippets(
             );
             highlighted.push_str(&raw_fragment[..relative_pos]);
             highlighted.push_str(&config.highlight_pre);
-            highlighted.push_str(&raw_fragment[relative_pos..relative_pos + term.len()]);
+            highlighted.push_str(&raw_fragment[relative_pos..relative_pos + match_len]);
             highlighted.push_str(&config.highlight_post);
-            highlighted.push_str(&raw_fragment[relative_pos + term.len()..]);
+            highlighted.push_str(&raw_fragment[relative_pos + match_len..]);
 
             fragments.push(Snippet {
                 fragment: highlighted,
