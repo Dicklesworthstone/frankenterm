@@ -1703,8 +1703,611 @@ mod tests {
     use crate::connector_event_model::EventDirection;
     use crate::policy::ActorKind;
     use crate::recorder_audit::{
-        ActorIdentity, AuditEventBuilder, AuditLog, AuditLogConfig, AUDIT_SCHEMA_VERSION,
+        AUDIT_SCHEMA_VERSION, ActorIdentity, AuditEventBuilder, AuditLog, AuditLogConfig,
     };
+    use proptest::prelude::*;
+    use proptest::string::string_regex;
+    use std::collections::HashMap;
+
+    fn arb_health_tier() -> impl Strategy<Value = HealthTier> {
+        prop_oneof![
+            Just(HealthTier::Green),
+            Just(HealthTier::Yellow),
+            Just(HealthTier::Red),
+            Just(HealthTier::Black),
+        ]
+    }
+
+    fn arb_runtime_phase() -> impl Strategy<Value = RuntimePhase> {
+        prop_oneof![
+            Just(RuntimePhase::Init),
+            Just(RuntimePhase::Startup),
+            Just(RuntimePhase::Running),
+            Just(RuntimePhase::Draining),
+            Just(RuntimePhase::Finalizing),
+            Just(RuntimePhase::Shutdown),
+            Just(RuntimePhase::Cancelling),
+            Just(RuntimePhase::Recovering),
+            Just(RuntimePhase::Maintenance),
+        ]
+    }
+
+    fn arb_runtime_kind() -> impl Strategy<Value = RuntimeTelemetryKind> {
+        prop_oneof![
+            Just(RuntimeTelemetryKind::ScopeCreated),
+            Just(RuntimeTelemetryKind::ScopeStarted),
+            Just(RuntimeTelemetryKind::ScopeDraining),
+            Just(RuntimeTelemetryKind::ScopeFinalizing),
+            Just(RuntimeTelemetryKind::ScopeClosed),
+            Just(RuntimeTelemetryKind::CancellationRequested),
+            Just(RuntimeTelemetryKind::CancellationPropagated),
+            Just(RuntimeTelemetryKind::GracePeriodExpired),
+            Just(RuntimeTelemetryKind::FinalizerCompleted),
+            Just(RuntimeTelemetryKind::TierTransition),
+            Just(RuntimeTelemetryKind::ThrottleApplied),
+            Just(RuntimeTelemetryKind::ThrottleReleased),
+            Just(RuntimeTelemetryKind::LoadShedding),
+            Just(RuntimeTelemetryKind::QueueDepthObserved),
+            Just(RuntimeTelemetryKind::ChannelClosed),
+            Just(RuntimeTelemetryKind::PermitExhausted),
+            Just(RuntimeTelemetryKind::TransientError),
+            Just(RuntimeTelemetryKind::PermanentError),
+            Just(RuntimeTelemetryKind::PanicCaptured),
+            Just(RuntimeTelemetryKind::InvariantViolation),
+            Just(RuntimeTelemetryKind::SafetyPolicyTriggered),
+            Just(RuntimeTelemetryKind::ResourceObserved),
+            Just(RuntimeTelemetryKind::ResourceExhausted),
+            Just(RuntimeTelemetryKind::SloMeasurement),
+            Just(RuntimeTelemetryKind::ConfigApplied),
+            Just(RuntimeTelemetryKind::DiagnosticExported),
+            Just(RuntimeTelemetryKind::Heartbeat),
+        ]
+    }
+
+    fn arb_failure_class() -> impl Strategy<Value = FailureClass> {
+        prop_oneof![
+            Just(FailureClass::Transient),
+            Just(FailureClass::Permanent),
+            Just(FailureClass::Degraded),
+            Just(FailureClass::Overload),
+            Just(FailureClass::Corruption),
+            Just(FailureClass::Timeout),
+            Just(FailureClass::Panic),
+            Just(FailureClass::Deadlock),
+            Just(FailureClass::Safety),
+            Just(FailureClass::Configuration),
+        ]
+    }
+
+    fn ident_string() -> impl Strategy<Value = String> {
+        string_regex("[a-z][a-z0-9_]{0,8}").expect("valid identifier regex")
+    }
+
+    fn component_string() -> impl Strategy<Value = String> {
+        (ident_string(), ident_string()).prop_map(|(a, b)| format!("rt.{a}.{b}"))
+    }
+
+    fn reason_code_string() -> impl Strategy<Value = String> {
+        (ident_string(), ident_string(), ident_string())
+            .prop_map(|(a, b, c)| format!("{a}.{b}.{c}"))
+    }
+
+    fn scope_id_string() -> impl Strategy<Value = String> {
+        (ident_string(), ident_string()).prop_map(|(a, b)| format!("{a}:{b}"))
+    }
+
+    fn nonempty_text_string() -> impl Strategy<Value = String> {
+        string_regex("[A-Za-z0-9 _:-]{1,24}").expect("valid text regex")
+    }
+
+    fn maybe_text_string() -> impl Strategy<Value = String> {
+        string_regex("[A-Za-z0-9 _:-]{0,24}").expect("valid optional text regex")
+    }
+
+    fn correlation_string() -> impl Strategy<Value = String> {
+        string_regex("[A-Za-z0-9_-]{1,24}").expect("valid correlation regex")
+    }
+
+    fn maybe_correlation_string() -> impl Strategy<Value = String> {
+        proptest::option::of(correlation_string()).prop_map(|value| value.unwrap_or_default())
+    }
+
+    fn arb_sensitive_key() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("error_message"),
+            Just("token"),
+            Just("secret"),
+            Just("password"),
+            Just("api_key"),
+        ]
+    }
+
+    fn arb_unknown_complex_value() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            nonempty_text_string().prop_map(serde_json::Value::String),
+            proptest::collection::vec(any::<u16>(), 0..5)
+                .prop_map(|values| serde_json::json!(values)),
+            (ident_string(), any::<u16>())
+                .prop_map(|(key, value)| serde_json::json!({ key: value })),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn proptest_health_tier_from_ratio_thresholds(ratio in -1.0f64..2.0) {
+            let expected = if ratio < 0.50 {
+                HealthTier::Green
+            } else if ratio < 0.80 {
+                HealthTier::Yellow
+            } else if ratio < 0.95 {
+                HealthTier::Red
+            } else {
+                HealthTier::Black
+            };
+            prop_assert_eq!(HealthTier::from_ratio(ratio), expected);
+        }
+
+        #[test]
+        fn proptest_health_tier_from_ratio_monotonic(a in -1.0f64..2.0, b in -1.0f64..2.0) {
+            let (low, high) = if a <= b { (a, b) } else { (b, a) };
+            prop_assert!(
+                HealthTier::from_ratio(low).severity() <= HealthTier::from_ratio(high).severity()
+            );
+        }
+
+        #[test]
+        fn proptest_health_tier_serde_roundtrip(tier in arb_health_tier()) {
+            let json = serde_json::to_string(&tier).unwrap();
+            let roundtrip: HealthTier = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(roundtrip, tier);
+        }
+
+        #[test]
+        fn proptest_runtime_phase_terminal_and_shutdown_flags(phase in arb_runtime_phase()) {
+            prop_assert_eq!(phase.is_terminal(), phase == RuntimePhase::Shutdown);
+            prop_assert_eq!(
+                phase.is_shutting_down(),
+                matches!(
+                    phase,
+                    RuntimePhase::Draining | RuntimePhase::Finalizing | RuntimePhase::Cancelling
+                )
+            );
+        }
+
+        #[test]
+        fn proptest_runtime_phase_serde_roundtrip(phase in arb_runtime_phase()) {
+            let json = serde_json::to_string(&phase).unwrap();
+            let roundtrip: RuntimePhase = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(roundtrip, phase);
+        }
+
+        #[test]
+        fn proptest_runtime_telemetry_kind_display_matches_serde(kind in arb_runtime_kind()) {
+            let expected = serde_json::to_value(kind)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            prop_assert_eq!(kind.to_string(), expected);
+        }
+
+        #[test]
+        fn proptest_runtime_telemetry_kind_categories_are_known(kind in arb_runtime_kind()) {
+            let category = kind.category();
+            prop_assert!(matches!(
+                category,
+                "scope" | "cancellation" | "backpressure" | "queue" | "error" | "resource" | "operational"
+            ));
+        }
+
+        #[test]
+        fn proptest_failure_class_retryable_matches_expected_set(class in arb_failure_class()) {
+            let expected = matches!(
+                class,
+                FailureClass::Transient | FailureClass::Degraded | FailureClass::Timeout
+            );
+            prop_assert_eq!(class.is_retryable(), expected);
+        }
+
+        #[test]
+        fn proptest_failure_class_suggested_tier_matches_expected_mapping(class in arb_failure_class()) {
+            let expected = match class {
+                FailureClass::Transient | FailureClass::Timeout => HealthTier::Yellow,
+                FailureClass::Degraded | FailureClass::Overload => HealthTier::Red,
+                FailureClass::Corruption
+                | FailureClass::Panic
+                | FailureClass::Deadlock
+                | FailureClass::Safety => HealthTier::Black,
+                FailureClass::Permanent | FailureClass::Configuration => HealthTier::Red,
+            };
+            prop_assert_eq!(class.suggested_tier(), expected);
+        }
+
+        #[test]
+        fn proptest_failure_class_serde_roundtrip(class in arb_failure_class()) {
+            let json = serde_json::to_string(&class).unwrap();
+            let roundtrip: FailureClass = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(roundtrip, class);
+        }
+
+        #[test]
+        fn proptest_builder_preserves_explicit_fields(
+            component in component_string(),
+            scope_id in scope_id_string(),
+            kind in arb_runtime_kind(),
+            tier in arb_health_tier(),
+            phase in arb_runtime_phase(),
+            reason_code in reason_code_string(),
+            correlation_id in correlation_string(),
+            failure_class in arb_failure_class(),
+            timestamp_ms in 1u64..u64::MAX,
+            detail_text in nonempty_text_string(),
+            detail_count in any::<u16>(),
+            detail_flag in any::<bool>(),
+        ) {
+            let event = RuntimeTelemetryEventBuilder::new(&component, kind)
+                .scope_id(&scope_id)
+                .tier(tier)
+                .phase(phase)
+                .reason(&reason_code)
+                .correlation(&correlation_id)
+                .failure(failure_class)
+                .timestamp_ms(timestamp_ms)
+                .detail_str("scope_tier", &detail_text)
+                .detail_u64("child_count", u64::from(detail_count))
+                .detail_bool("active", detail_flag)
+                .build();
+
+            prop_assert_eq!(event.component, component);
+            prop_assert_eq!(event.scope_id.as_deref(), Some(scope_id.as_str()));
+            prop_assert_eq!(event.event_kind, kind);
+            prop_assert_eq!(event.health_tier, tier);
+            prop_assert_eq!(event.phase, phase);
+            prop_assert_eq!(event.reason_code, reason_code);
+            prop_assert_eq!(event.correlation_id, correlation_id);
+            prop_assert_eq!(event.failure_class, Some(failure_class));
+            prop_assert_eq!(event.timestamp_ms, timestamp_ms);
+            prop_assert_eq!(event.details.get("scope_tier"), Some(&serde_json::json!(detail_text)));
+            prop_assert_eq!(event.details.get("child_count"), Some(&serde_json::json!(u64::from(detail_count))));
+            prop_assert_eq!(event.details.get("active"), Some(&serde_json::json!(detail_flag)));
+        }
+
+        #[test]
+        fn proptest_builder_last_detail_write_wins(
+            first in any::<u32>(),
+            second in any::<u32>(),
+        ) {
+            let event = RuntimeTelemetryEventBuilder::new("rt.builder", RuntimeTelemetryKind::Heartbeat)
+                .detail_u64("count", u64::from(first))
+                .detail_u64("count", u64::from(second))
+                .build();
+
+            prop_assert_eq!(event.details.len(), 1);
+            prop_assert_eq!(event.details.get("count"), Some(&serde_json::json!(u64::from(second))));
+        }
+
+        #[test]
+        fn proptest_event_json_roundtrip_preserves_scalar_details(
+            component in component_string(),
+            reason_code in reason_code_string(),
+            correlation_id in correlation_string(),
+            detail_text in nonempty_text_string(),
+            detail_count in any::<u16>(),
+            detail_flag in any::<bool>(),
+            detail_ratio in 0.0f64..10.0,
+        ) {
+            let event = RuntimeTelemetryEventBuilder::new(&component, RuntimeTelemetryKind::Heartbeat)
+                .reason(&reason_code)
+                .correlation(&correlation_id)
+                .detail_str("scope_tier", &detail_text)
+                .detail_u64("count", u64::from(detail_count))
+                .detail_bool("active", detail_flag)
+                .detail_f64("ratio", detail_ratio)
+                .build();
+
+            let json = serde_json::to_string(&event).unwrap();
+            let roundtrip: RuntimeTelemetryEvent = serde_json::from_str(&json).unwrap();
+
+            prop_assert_eq!(roundtrip.component, event.component);
+            prop_assert_eq!(roundtrip.reason_code, event.reason_code);
+            prop_assert_eq!(roundtrip.correlation_id, event.correlation_id);
+            prop_assert_eq!(roundtrip.details, event.details);
+        }
+
+        #[test]
+        fn proptest_non_empty_string_behavior(text in maybe_text_string()) {
+            let expected = if text.is_empty() {
+                None
+            } else {
+                Some(text.clone())
+            };
+            prop_assert_eq!(non_empty_string(&text), expected);
+        }
+
+        #[test]
+        fn proptest_runtime_reason_code_fallbacks_only_on_empty(
+            kind in arb_runtime_kind(),
+            component in component_string(),
+            correlation_id in maybe_correlation_string(),
+            use_fallback in any::<bool>(),
+            explicit_reason in reason_code_string(),
+        ) {
+            let reason_code = if use_fallback { String::new() } else { explicit_reason.clone() };
+            let event = RuntimeTelemetryEvent {
+                timestamp_ms: 7,
+                component,
+                scope_id: None,
+                event_kind: kind,
+                health_tier: HealthTier::Green,
+                phase: RuntimePhase::Running,
+                reason_code,
+                correlation_id,
+                failure_class: None,
+                details: HashMap::new(),
+            };
+
+            let expected = if use_fallback {
+                enum_string(&kind)
+            } else {
+                explicit_reason
+            };
+            prop_assert_eq!(runtime_reason_code(&event), expected);
+        }
+
+        #[test]
+        fn proptest_runtime_record_id_includes_correlation_only_when_present(
+            timestamp_ms in 1u64..u64::MAX,
+            component in component_string(),
+            reason_code in reason_code_string(),
+            correlation_id in maybe_correlation_string(),
+            kind in arb_runtime_kind(),
+        ) {
+            let event = RuntimeTelemetryEvent {
+                timestamp_ms,
+                component: component.clone(),
+                scope_id: None,
+                event_kind: kind,
+                health_tier: HealthTier::Green,
+                phase: RuntimePhase::Running,
+                reason_code: reason_code.clone(),
+                correlation_id: correlation_id.clone(),
+                failure_class: None,
+                details: HashMap::new(),
+            };
+
+            let expected = if correlation_id.is_empty() {
+                format!("rt:{timestamp_ms}:{component}:{reason_code}")
+            } else {
+                format!("rt:{timestamp_ms}:{component}:{correlation_id}:{reason_code}")
+            };
+            prop_assert_eq!(runtime_record_id(&event), expected);
+        }
+
+        #[test]
+        fn proptest_stable_hash_is_deterministic_hex(text in maybe_text_string()) {
+            let hash = stable_hash(&text);
+            prop_assert_eq!(hash.clone(), stable_hash(&text));
+            prop_assert_eq!(hash.len(), 64);
+            prop_assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+        }
+
+        #[test]
+        fn proptest_sanitize_runtime_details_preserves_safe_scalar_fields(
+            queue_depth in any::<u32>(),
+            active in any::<bool>(),
+            scope_tier in nonempty_text_string(),
+        ) {
+            let details = HashMap::from([
+                ("queue_depth".to_string(), serde_json::json!(queue_depth)),
+                ("active".to_string(), serde_json::json!(active)),
+                ("scope_tier".to_string(), serde_json::json!(scope_tier)),
+            ]);
+
+            let (attributes, sensitivity, redaction_strategy, redacted_fields) =
+                sanitize_runtime_details(&details);
+
+            prop_assert_eq!(attributes.get("queue_depth"), Some(&serde_json::json!(queue_depth)));
+            prop_assert_eq!(attributes.get("active"), Some(&serde_json::json!(active)));
+            prop_assert_eq!(attributes.get("scope_tier"), Some(&serde_json::json!(scope_tier)));
+            prop_assert_eq!(sensitivity, DataSensitivity::Internal);
+            prop_assert_eq!(redaction_strategy, RedactionStrategy::Passthrough);
+            prop_assert_eq!(redacted_fields, 0);
+        }
+
+        #[test]
+        fn proptest_sanitize_runtime_details_masks_unknown_complex_fields(
+            payload in arb_unknown_complex_value(),
+        ) {
+            let details = HashMap::from([
+                ("custom_payload".to_string(), payload),
+                ("queue_depth".to_string(), serde_json::json!(7)),
+            ]);
+
+            let (attributes, sensitivity, redaction_strategy, redacted_fields) =
+                sanitize_runtime_details(&details);
+
+            prop_assert_eq!(attributes.get("custom_payload"), Some(&serde_json::json!("[REDACTED]")));
+            prop_assert_eq!(attributes.get("queue_depth"), Some(&serde_json::json!(7)));
+            prop_assert_eq!(sensitivity, DataSensitivity::Confidential);
+            prop_assert_eq!(redaction_strategy, RedactionStrategy::Mask);
+            prop_assert_eq!(redacted_fields, 1);
+        }
+
+        #[test]
+        fn proptest_sanitize_runtime_details_always_redacts_sensitive_keys(
+            key in arb_sensitive_key(),
+            value in nonempty_text_string(),
+        ) {
+            let details = HashMap::from([(key.to_string(), serde_json::json!(value))]);
+            let (attributes, sensitivity, redaction_strategy, redacted_fields) =
+                sanitize_runtime_details(&details);
+
+            prop_assert_eq!(attributes.get(key), Some(&serde_json::json!("[REDACTED]")));
+            prop_assert_eq!(sensitivity, DataSensitivity::Restricted);
+            prop_assert_eq!(redaction_strategy, RedactionStrategy::Mask);
+            prop_assert_eq!(redacted_fields, 1);
+        }
+
+        #[test]
+        fn proptest_log_append_sequence_and_counts(kinds in proptest::collection::vec(arb_runtime_kind(), 0..40)) {
+            let mut log = RuntimeTelemetryLog::with_defaults();
+            let mut last_sequence = 0u64;
+
+            for (idx, kind) in kinds.iter().enumerate() {
+                let sequence = log.emit(
+                    RuntimeTelemetryEventBuilder::new("rt.log", *kind)
+                        .reason(&format!("ops.running.event_{idx}"))
+                );
+                prop_assert!(sequence > last_sequence);
+                last_sequence = sequence;
+            }
+
+            prop_assert_eq!(log.total_emitted(), kinds.len() as u64);
+            prop_assert_eq!(log.sequence(), kinds.len() as u64);
+            prop_assert_eq!(log.len(), kinds.len());
+            prop_assert_eq!(log.total_evicted(), 0);
+        }
+
+        #[test]
+        fn proptest_log_capacity_bound_and_eviction_count(
+            max_events in 1usize..12usize,
+            kinds in proptest::collection::vec(arb_runtime_kind(), 0..40),
+        ) {
+            let mut log = RuntimeTelemetryLog::new(RuntimeTelemetryLogConfig {
+                max_events,
+                enabled: true,
+            });
+
+            for (idx, kind) in kinds.iter().enumerate() {
+                log.emit(
+                    RuntimeTelemetryEventBuilder::new("rt.log", *kind)
+                        .reason(&format!("ops.running.event_{idx}"))
+                );
+            }
+
+            let expected_len = kinds.len().min(max_events);
+            let expected_evicted = kinds.len().saturating_sub(max_events) as u64;
+
+            prop_assert_eq!(log.len(), expected_len);
+            prop_assert_eq!(log.total_emitted(), kinds.len() as u64);
+            prop_assert_eq!(log.total_evicted(), expected_evicted);
+            prop_assert_eq!(log.sequence(), kinds.len() as u64);
+        }
+
+        #[test]
+        fn proptest_log_snapshot_counts_match_events(
+            entries in proptest::collection::vec((arb_runtime_kind(), arb_health_tier()), 0..40),
+        ) {
+            let mut log = RuntimeTelemetryLog::with_defaults();
+            let mut expected_tiers = [0u64; 4];
+            let mut expected_categories: HashMap<String, u64> = HashMap::new();
+
+            for (idx, (kind, tier)) in entries.iter().enumerate() {
+                log.emit(
+                    RuntimeTelemetryEventBuilder::new("rt.snapshot", *kind)
+                        .tier(*tier)
+                        .reason(&format!("ops.running.snapshot_{idx}"))
+                );
+                expected_tiers[tier.severity() as usize] += 1;
+                *expected_categories.entry(kind.category().to_string()).or_default() += 1;
+            }
+
+            let snapshot = log.snapshot();
+            prop_assert_eq!(snapshot.buffered_events, entries.len() as u64);
+            prop_assert_eq!(snapshot.total_emitted, entries.len() as u64);
+            prop_assert_eq!(snapshot.total_evicted, 0);
+            prop_assert_eq!(snapshot.sequence, entries.len() as u64);
+            prop_assert_eq!(snapshot.tier_counts, expected_tiers);
+            prop_assert_eq!(snapshot.category_counts, expected_categories);
+        }
+
+        #[test]
+        fn proptest_export_jsonl_line_count_matches_buffer(
+            entries in proptest::collection::vec((arb_runtime_kind(), arb_health_tier()), 0..20),
+        ) {
+            let mut log = RuntimeTelemetryLog::with_defaults();
+
+            for (idx, (kind, tier)) in entries.iter().enumerate() {
+                log.emit(
+                    RuntimeTelemetryEventBuilder::new("rt.export", *kind)
+                        .tier(*tier)
+                        .reason(&format!("ops.running.export_{idx}"))
+                );
+            }
+
+            let exported = log.export_jsonl();
+            if entries.is_empty() {
+                prop_assert!(exported.is_empty());
+            } else {
+                let lines = exported.lines().collect::<Vec<_>>();
+                prop_assert_eq!(lines.len(), entries.len());
+                for line in lines {
+                    let parsed: RuntimeTelemetryEvent = serde_json::from_str(line).unwrap();
+                    prop_assert!(parsed.component.starts_with("rt.export"));
+                }
+            }
+        }
+
+        #[test]
+        fn proptest_tier_transition_flags_match_direction(
+            from in arb_health_tier(),
+            to in arb_health_tier(),
+            timestamp_ms in 0u64..u64::MAX,
+            duration_in_previous_ms in 0u64..u64::MAX,
+            component in component_string(),
+            reason_code in reason_code_string(),
+        ) {
+            let record = TierTransitionRecord {
+                timestamp_ms,
+                component,
+                from,
+                to,
+                reason_code,
+                duration_in_previous_ms,
+            };
+
+            prop_assert_eq!(record.is_escalation(), to > from);
+            prop_assert_eq!(record.is_recovery(), to < from);
+        }
+
+        #[test]
+        fn proptest_tier_transition_to_event_preserves_context(
+            from in arb_health_tier(),
+            to in arb_health_tier(),
+            timestamp_ms in 0u64..u64::MAX,
+            duration_in_previous_ms in 0u64..u64::MAX,
+            component in component_string(),
+            reason_code in reason_code_string(),
+            correlation_id in correlation_string(),
+        ) {
+            let record = TierTransitionRecord {
+                timestamp_ms,
+                component: component.clone(),
+                from,
+                to,
+                reason_code: reason_code.clone(),
+                duration_in_previous_ms,
+            };
+
+            let event = record.to_event(&correlation_id);
+
+            prop_assert_eq!(event.timestamp_ms, timestamp_ms);
+            prop_assert_eq!(event.component, component);
+            prop_assert_eq!(event.event_kind, RuntimeTelemetryKind::TierTransition);
+            prop_assert_eq!(event.health_tier, to);
+            prop_assert_eq!(event.phase, RuntimePhase::Running);
+            prop_assert_eq!(event.reason_code, reason_code);
+            prop_assert_eq!(event.correlation_id, correlation_id);
+            prop_assert_eq!(event.details.get("tier_from"), Some(&serde_json::json!(from.to_string())));
+            prop_assert_eq!(event.details.get("tier_to"), Some(&serde_json::json!(to.to_string())));
+            prop_assert_eq!(
+                event.details.get("duration_in_previous_ms"),
+                Some(&serde_json::json!(duration_in_previous_ms))
+            );
+        }
+    }
 
     // ── HealthTier ──
 
