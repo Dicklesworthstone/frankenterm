@@ -183,6 +183,7 @@ pub mod gc;
 pub mod graph_scoring;
 pub mod headless_mux_server;
 pub mod hyperloglog;
+pub mod identity_graph;
 pub mod incident_bundle;
 pub mod ingest;
 pub mod input_reserve;
@@ -207,6 +208,7 @@ pub mod mcp_error;
 #[cfg(any(feature = "mcp", feature = "mcp-client"))]
 #[doc(hidden)]
 pub mod mcp_framework;
+pub mod ntm_parity;
 pub mod mdl_extraction;
 pub mod memory_budget;
 pub mod memory_pressure;
