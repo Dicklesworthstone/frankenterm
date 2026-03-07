@@ -58,16 +58,18 @@ The machine-readable source of truth is `SURFACE_CONTRACT_V1` in that module.
 - Command:
   - `tests/e2e/test_ft_e34d9_10_2_3_runtime_compat_contraction.sh`
 - Latest run:
-  - `tests/e2e/logs/ft_e34d9_10_2_3_20260304_064346.jsonl`
+  - `tests/e2e/logs/ft_e34d9_10_2_3_20260307_075932.jsonl`
 - Outcome:
-  - Preflight failed fast because `rch workers probe --all` reported zero reachable workers.
-  - Harness emitted `reason_code=rch_health_probe_mismatch` (`RCH-E101`) after `rch check` passed but probe showed no reachable workers.
+  - Static contraction guardrails passed before remote-worker preflight.
+  - `rch check` reported ready, but `rch workers probe --all --json` reported `connection_failed` for all 8 configured workers.
+  - Harness emitted `reason_code=rch_health_probe_mismatch` (`RCH-E101`) after the readiness/probe disagreement.
   - Offload-only policy correctly prevented cargo-test execution when no remote worker was reachable.
-  - Contract guardrails now run before remote-worker preflight, so helper/allowlist regression checks still execute and emit artifacts even when remote offload is unavailable.
+  - Contract guardrails run before remote-worker preflight, so helper/allowlist regression checks still execute and emit artifacts even when remote offload is unavailable.
 - Slice-level static checks (non-compile, no local cargo fallback):
   - `rg -n "\b(runtime_compat::)?(mpsc_recv_option|mpsc_send|watch_has_changed|watch_borrow_and_update_clone|watch_changed)\b" crates/frankenterm-core/src --glob '!runtime_compat.rs'` -> no matches
   - `rustfmt --edition 2024 --check crates/frankenterm-core/src/vendored/mux_client.rs` -> pass
   - `bash -n tests/e2e/test_ft_e34d9_10_2_3_runtime_compat_contraction.sh` -> pass
 - Notes:
+  - `crates/frankenterm-core/src/vendored/mux_client.rs` now uses explicit backend-aware local receive/watch semantics instead of external transitional helper calls.
   - `CARGO_TARGET_DIR` is run-unique (`...-<RUN_ID>`) to avoid cross-run artifact lock contention.
   - Harness now captures both `rch check` and `workers probe` artifacts and emits explicit `rch_health_probe_mismatch` diagnostics to improve infra triage.

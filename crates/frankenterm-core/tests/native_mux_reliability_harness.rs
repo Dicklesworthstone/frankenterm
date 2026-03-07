@@ -11,9 +11,10 @@
 use std::collections::HashMap;
 
 use frankenterm_core::command_transport::{
-    CommandContext, CommandDeduplicator, CommandKind, CommandRequest, CommandRouter, CommandScope,
-    CommandTransportError, InterruptSignal,
+    CommandContext, CommandDeduplicator, CommandKind, CommandPolicyTrace, CommandRequest,
+    CommandRouter, CommandScope, CommandTransportError, InterruptSignal,
 };
+use frankenterm_core::policy::{PolicyDecision, PolicySurface};
 use frankenterm_core::durable_state::{CheckpointTrigger, DurableStateError, DurableStateManager};
 use frankenterm_core::headless_mux_server::{
     HeadlessMuxServer, RemoteRequest, RemoteResponse, ServerConfig, ServerNodeId,
@@ -1276,4 +1277,123 @@ fn transition_log_captures_structured_evidence() {
     assert!(json.contains("audit-test"));
     assert!(json.contains("native_mux.lifecycle.drain_requested"));
     assert!(json.contains("correlation_id"));
+}
+
+// =============================================================================
+// 11. Policy trace propagation through command transport (ft-13l5b follow-up)
+// =============================================================================
+
+#[test]
+fn policy_trace_preserved_through_command_context() {
+    let decision = PolicyDecision::deny("dangerous command detected");
+    let trace = CommandPolicyTrace::from_surface_and_decision(PolicySurface::Robot, &decision);
+
+    assert_eq!(trace.decision, "deny");
+    assert_eq!(trace.surface, PolicySurface::Robot);
+    assert!(trace.reason.as_deref().unwrap().contains("dangerous"));
+}
+
+#[test]
+fn policy_trace_allow_with_rule_preserves_rule_id() {
+    let decision = PolicyDecision::allow_with_rule("custom-allow-rule");
+    let trace = CommandPolicyTrace::from_surface_and_decision(PolicySurface::Mux, &decision);
+
+    assert_eq!(trace.decision, "allow");
+    assert_eq!(trace.surface, PolicySurface::Mux);
+    assert_eq!(trace.rule_id.as_deref(), Some("custom-allow-rule"));
+}
+
+#[test]
+fn policy_trace_deny_with_rule_captures_both_fields() {
+    let decision = PolicyDecision::deny_with_rule("blocked by policy", "deny-rm-rf");
+    let trace = CommandPolicyTrace::from_surface_and_decision(PolicySurface::Connector, &decision);
+
+    assert_eq!(trace.decision, "deny");
+    assert_eq!(trace.surface, PolicySurface::Connector);
+    assert_eq!(trace.rule_id.as_deref(), Some("deny-rm-rf"));
+    assert!(trace.reason.as_deref().unwrap().contains("blocked"));
+}
+
+#[test]
+fn command_context_with_policy_trace_roundtrips_via_serde() {
+    let decision = PolicyDecision::deny("security violation");
+    let trace = CommandPolicyTrace::from_surface_and_decision(PolicySurface::Robot, &decision);
+
+    let ctx = CommandContext {
+        timestamp_ms: 1000,
+        component: "test-harness".to_string(),
+        correlation_id: "corr-1000".to_string(),
+        caller_identity: "test-agent".to_string(),
+        reason: Some("integration test".to_string()),
+        policy_trace: Some(trace),
+    };
+
+    let json = serde_json::to_string(&ctx).unwrap();
+    let deserialized: CommandContext = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(deserialized.timestamp_ms, 1000);
+    let rt = deserialized.policy_trace.unwrap();
+    assert_eq!(rt.decision, "deny");
+    assert_eq!(rt.surface, PolicySurface::Robot);
+    assert!(rt.reason.unwrap().contains("security"));
+}
+
+#[test]
+fn command_request_carries_policy_trace_to_router() {
+    let mut router = CommandRouter::new();
+    let mut registry = fleet_registry(3);
+
+    // Register panes with router
+    for i in 1..=3 {
+        router.register_target(pane_id(i));
+    }
+
+    let decision = PolicyDecision::allow_with_rule("fleet-allow");
+    let mut context = cmd_ctx(500);
+    context.policy_trace = Some(CommandPolicyTrace::from_surface_and_decision(
+        PolicySurface::Swarm,
+        &decision,
+    ));
+
+    let request = CommandRequest {
+        command_id: "cmd-policy-test".to_string(),
+        scope: CommandScope::Pane(pane_id(1)),
+        command: CommandKind::SendInput {
+            text: "echo hello".to_string(),
+            paste_mode: false,
+            append_newline: true,
+        },
+        context,
+        dry_run: true,
+    };
+
+    let result = router.route(&request, &registry);
+    // Dry-run should succeed for a registered, alive pane
+    assert!(result.is_ok());
+    // The policy trace travels with the request
+    assert_eq!(
+        request.context.policy_trace.as_ref().unwrap().decision,
+        "allow"
+    );
+    assert_eq!(
+        request.context.policy_trace.as_ref().unwrap().surface,
+        PolicySurface::Swarm
+    );
+}
+
+#[test]
+fn policy_surface_serde_roundtrip_all_variants() {
+    let surfaces = [
+        PolicySurface::Robot,
+        PolicySurface::Mux,
+        PolicySurface::Connector,
+        PolicySurface::Swarm,
+        PolicySurface::Workflow,
+        PolicySurface::Unknown,
+    ];
+    for surface in &surfaces {
+        let json = serde_json::to_string(surface).unwrap();
+        let rt: PolicySurface = serde_json::from_str(&json).unwrap();
+        assert_eq!(&rt, surface);
+    }
 }

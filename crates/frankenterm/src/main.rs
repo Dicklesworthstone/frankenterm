@@ -2023,6 +2023,39 @@ enum ReplayCommands {
         json: bool,
     },
 
+    /// Execute the NTM parity corpus and emit cutover gate artifacts
+    #[command(after_help = r#"EXAMPLES:
+    ft replay parity
+    ft replay parity --pane-id 3
+    ft replay parity --run-id shadow-window-20260307
+    ft replay parity --intentional-delta NTM-PARITY-012=TOON stats wording differs
+"#)]
+    Parity {
+        /// Override the parity corpus fixture path
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+
+        /// Override the acceptance matrix fixture path
+        #[arg(long)]
+        matrix: Option<PathBuf>,
+
+        /// Override the output artifact directory
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+
+        /// Explicit run identifier (otherwise timestamped)
+        #[arg(long)]
+        run_id: Option<String>,
+
+        /// Explicit pane to substitute for <pane_id> placeholders
+        #[arg(long)]
+        pane_id: Option<u64>,
+
+        /// Document an intentional delta as SCENARIO_ID=reason
+        #[arg(long = "intentional-delta")]
+        intentional_deltas: Vec<String>,
+    },
+
     /// Manage replay artifact registry (list/inspect/add/retire/prune)
     #[command(
         subcommand,
@@ -6215,10 +6248,34 @@ fn build_approval_decision_context(
     timestamp_ms: i64,
 ) -> Option<String> {
     let actor = approval_actor_kind(actor_kind);
-    let surface = frankenterm_core::policy::PolicySurface::default_for_actor(actor);
+    let action = audit_target_action_kind(action_kind);
+    let surface = match action {
+        frankenterm_core::policy::ActionKind::SendText
+        | frankenterm_core::policy::ActionKind::SendCtrlC
+        | frankenterm_core::policy::ActionKind::SendCtrlD
+        | frankenterm_core::policy::ActionKind::SendCtrlZ
+        | frankenterm_core::policy::ActionKind::SendControl
+        | frankenterm_core::policy::ActionKind::Spawn
+        | frankenterm_core::policy::ActionKind::Split
+        | frankenterm_core::policy::ActionKind::Activate
+        | frankenterm_core::policy::ActionKind::Close
+        | frankenterm_core::policy::ActionKind::BrowserAuth
+        | frankenterm_core::policy::ActionKind::ReadOutput
+        | frankenterm_core::policy::ActionKind::SearchOutput => {
+            frankenterm_core::policy::PolicySurface::Mux
+        }
+        frankenterm_core::policy::ActionKind::WorkflowRun => {
+            frankenterm_core::policy::PolicySurface::Workflow
+        }
+        frankenterm_core::policy::ActionKind::ReservePane
+        | frankenterm_core::policy::ActionKind::ReleasePane => {
+            frankenterm_core::policy::PolicySurface::Swarm
+        }
+        _ => frankenterm_core::policy::PolicySurface::default_for_actor(actor),
+    };
     let mut context = frankenterm_core::policy::DecisionContext {
         timestamp_ms,
-        action: audit_target_action_kind(action_kind),
+        action,
         actor,
         surface,
         pane_id,
@@ -7761,6 +7818,7 @@ fn build_workflow_dry_run_report(
     };
 
     let mut ctx = command_ctx.dry_run_context();
+    let policy_input = workflow_run_policy_input(pane, name);
 
     // Target resolution
     if let Some(info) = pane_info {
@@ -7840,6 +7898,13 @@ fn build_workflow_dry_run_report(
     eval.add_check(
         PolicyCheck::passed("pane_state", "Pane state not inspected during dry-run")
             .with_details("Verify prompt/alt-screen state before execution."),
+    );
+    eval.add_check(
+        PolicyCheck::passed(
+            "policy_surface",
+            format!("Policy surface: {}", policy_input.surface.as_str()),
+        )
+        .with_details(format!("action: {}", policy_input.action.as_str())),
     );
     eval.add_check(
         PolicyCheck::passed("policy", "Policy checks deferred to execution")
@@ -9009,6 +9074,389 @@ async fn run_robot_rpc_via_cli(
 
     serde_json::from_str::<frankenterm_core::ipc::IpcResponse>(payload)
         .map_err(|e| format!("invalid ft robot response: {e}"))
+}
+
+#[derive(Debug)]
+struct NtmParityCliCapture {
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    stdout: String,
+    stderr: String,
+    execution_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct NtmParityRunOutcome {
+    output_dir: PathBuf,
+    resolved_pane_id: Option<u64>,
+    summary: frankenterm_core::ntm_parity::NtmParityRunSummary,
+}
+
+fn tokenize_cli_words(input: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars();
+    let mut quote: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(delimiter) => match ch {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    } else {
+                        current.push('\\');
+                    }
+                }
+                value if value == delimiter => {
+                    quote = None;
+                }
+                _ => current.push(ch),
+            },
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                }
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    } else {
+                        current.push('\\');
+                    }
+                }
+                value if value.is_whitespace() => {
+                    if !current.is_empty() {
+                        words.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if let Some(delimiter) = quote {
+        return Err(format!("unterminated {delimiter} quote in command"));
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    Ok(words)
+}
+
+fn resolve_path_from_workspace(workspace_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    }
+}
+
+fn default_ntm_parity_run_id() -> String {
+    format!("ntm-parity-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"))
+}
+
+fn default_ntm_parity_output_dir(
+    workspace_root: &Path,
+    matrix: &frankenterm_core::ntm_parity::NtmParityAcceptanceMatrix,
+    run_id: &str,
+) -> PathBuf {
+    let root = matrix
+        .artifacts_contract
+        .artifact_root
+        .replace("<run_id>", run_id);
+    let root_path = PathBuf::from(root);
+    resolve_path_from_workspace(workspace_root, &root_path)
+}
+
+fn parse_intentional_deltas(entries: &[String]) -> anyhow::Result<HashMap<String, String>> {
+    let mut deltas = HashMap::new();
+
+    for entry in entries {
+        let (scenario_id, reason) = entry.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("invalid intentional delta '{entry}'; expected SCENARIO_ID=reason")
+        })?;
+        let scenario_id = scenario_id.trim();
+        let reason = reason.trim();
+        if scenario_id.is_empty() || reason.is_empty() {
+            return Err(anyhow::anyhow!(
+                "invalid intentional delta '{entry}'; scenario id and reason are required"
+            ));
+        }
+        deltas.insert(scenario_id.to_string(), reason.to_string());
+    }
+
+    Ok(deltas)
+}
+
+async fn run_ft_cli_capture(
+    exe: &Path,
+    args: &[String],
+    config_path: Option<&Path>,
+    workspace_root: &Path,
+) -> NtmParityCliCapture {
+    use frankenterm_core::runtime_compat::process::Command;
+    use std::process::Stdio;
+
+    let mut cmd = Command::new(exe);
+    if let Some(path) = config_path {
+        cmd.arg("--config").arg(path);
+    }
+    cmd.arg("--workspace").arg(workspace_root);
+    cmd.args(args);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let started_at = Instant::now();
+    match cmd.output().await {
+        Ok(output) => NtmParityCliCapture {
+            exit_code: output.status.code(),
+            duration_ms: started_at.elapsed().as_millis() as u64,
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            execution_error: None,
+        },
+        Err(err) => NtmParityCliCapture {
+            exit_code: None,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+            stdout: String::new(),
+            stderr: String::new(),
+            execution_error: Some(format!("failed to execute '{}': {err}", exe.display())),
+        },
+    }
+}
+
+async fn resolve_ntm_parity_pane_id(
+    exe: &Path,
+    config_path: Option<&Path>,
+    workspace_root: &Path,
+) -> anyhow::Result<u64> {
+    let args = vec![
+        "robot".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        "state".to_string(),
+    ];
+    let capture = run_ft_cli_capture(exe, &args, config_path, workspace_root).await;
+    if let Some(error) = capture.execution_error {
+        return Err(anyhow::anyhow!(
+            "failed to auto-resolve pane id for parity run: {error}"
+        ));
+    }
+
+    let payload = capture.stdout.trim();
+    if payload.is_empty() {
+        return Err(anyhow::anyhow!(
+            "failed to auto-resolve pane id for parity run: `ft robot state` returned empty output"
+        ));
+    }
+
+    let value: serde_json::Value = serde_json::from_str(payload).map_err(|err| {
+        anyhow::anyhow!("failed to parse `ft robot state` while resolving pane id: {err}")
+    })?;
+    let panes = value
+        .get("data")
+        .and_then(|data| data.get("panes"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to auto-resolve pane id for parity run: missing `data.panes` array"
+            )
+        })?;
+    let pane_id = panes
+        .first()
+        .and_then(|pane| pane.get("pane_id"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to auto-resolve pane id for parity run: no live panes available; pass --pane-id explicitly"
+            )
+        })?;
+
+    Ok(pane_id)
+}
+
+fn write_json_pretty<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            anyhow::anyhow!("failed to create directory '{}': {err}", parent.display())
+        })?;
+    }
+    let payload = serde_json::to_string_pretty(value)
+        .map_err(|err| anyhow::anyhow!("failed to serialize JSON '{}': {err}", path.display()))?;
+    fs::write(path, payload)
+        .map_err(|err| anyhow::anyhow!("failed to write '{}': {err}", path.display()))?;
+    Ok(())
+}
+
+fn write_jsonl<T: serde::Serialize>(path: &Path, rows: &[T]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            anyhow::anyhow!("failed to create directory '{}': {err}", parent.display())
+        })?;
+    }
+
+    let mut payload = String::new();
+    for row in rows {
+        let line = serde_json::to_string(row).map_err(|err| {
+            anyhow::anyhow!(
+                "failed to serialize JSONL row for '{}': {err}",
+                path.display()
+            )
+        })?;
+        payload.push_str(&line);
+        payload.push('\n');
+    }
+
+    fs::write(path, payload)
+        .map_err(|err| anyhow::anyhow!("failed to write '{}': {err}", path.display()))?;
+    Ok(())
+}
+
+async fn run_ntm_parity_shadow(
+    workspace_root: &Path,
+    config_path: Option<&Path>,
+    corpus_path: Option<&Path>,
+    matrix_path: Option<&Path>,
+    output_dir: Option<&Path>,
+    run_id: Option<&str>,
+    pane_id: Option<u64>,
+    intentional_deltas: &[String],
+) -> anyhow::Result<NtmParityRunOutcome> {
+    use frankenterm_core::ntm_parity::{
+        NtmParityAcceptanceMatrix, NtmParityCommandOutput, NtmParityCorpus,
+        build_divergence_report, build_run_summary, evaluate_scenario,
+    };
+
+    let corpus_path = corpus_path
+        .map(|path| resolve_path_from_workspace(workspace_root, path))
+        .unwrap_or_else(|| workspace_root.join("fixtures/e2e/ntm_parity/corpus.v1.json"));
+    let matrix_path = matrix_path
+        .map(|path| resolve_path_from_workspace(workspace_root, path))
+        .unwrap_or_else(|| {
+            workspace_root.join("fixtures/e2e/ntm_parity/acceptance_matrix.v1.json")
+        });
+
+    let corpus =
+        NtmParityCorpus::from_json_str(&fs::read_to_string(&corpus_path).map_err(|err| {
+            anyhow::anyhow!("failed to read corpus '{}': {err}", corpus_path.display())
+        })?)
+        .map_err(|err| {
+            anyhow::anyhow!("failed to parse corpus '{}': {err}", corpus_path.display())
+        })?;
+    let matrix = NtmParityAcceptanceMatrix::from_json_str(
+        &fs::read_to_string(&matrix_path).map_err(|err| {
+            anyhow::anyhow!(
+                "failed to read acceptance matrix '{}': {err}",
+                matrix_path.display()
+            )
+        })?,
+    )
+    .map_err(|err| anyhow::anyhow!("failed to parse matrix '{}': {err}", matrix_path.display()))?;
+
+    let run_id = run_id
+        .map(std::borrow::ToOwned::to_owned)
+        .unwrap_or_else(default_ntm_parity_run_id);
+    let output_dir = output_dir
+        .map(|path| resolve_path_from_workspace(workspace_root, path))
+        .unwrap_or_else(|| default_ntm_parity_output_dir(workspace_root, &matrix, &run_id));
+    fs::create_dir_all(output_dir.join("scenarios")).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to create parity artifact directory '{}': {err}",
+            output_dir.display()
+        )
+    })?;
+
+    let intentional_delta_map = parse_intentional_deltas(intentional_deltas)?;
+    let exe = std::env::current_exe()
+        .map_err(|err| anyhow::anyhow!("failed to resolve current ft executable: {err}"))?;
+    let resolved_pane_id = if corpus
+        .scenarios
+        .iter()
+        .any(|scenario| scenario.ft_command.contains("<pane_id>"))
+    {
+        Some(match pane_id {
+            Some(id) => id,
+            None => resolve_ntm_parity_pane_id(&exe, config_path, workspace_root).await?,
+        })
+    } else {
+        pane_id
+    };
+
+    let mut outputs = Vec::with_capacity(corpus.scenarios.len());
+    let mut results = Vec::with_capacity(corpus.scenarios.len());
+
+    for scenario in &corpus.scenarios {
+        let expanded_command = match resolved_pane_id {
+            Some(id) => scenario.ft_command.replace("<pane_id>", &id.to_string()),
+            None => scenario.ft_command.clone(),
+        };
+        let mut tokens = tokenize_cli_words(&expanded_command).map_err(|err| {
+            anyhow::anyhow!("failed to parse command '{expanded_command}': {err}")
+        })?;
+        if matches!(tokens.first().map(String::as_str), Some("ft")) {
+            tokens.remove(0);
+        }
+        if tokens.is_empty() {
+            return Err(anyhow::anyhow!(
+                "parity scenario '{}' expanded to an empty command",
+                scenario.id
+            ));
+        }
+
+        let capture = run_ft_cli_capture(&exe, &tokens, config_path, workspace_root).await;
+        let output = NtmParityCommandOutput {
+            scenario_id: scenario.id.clone(),
+            command: scenario.ft_command.clone(),
+            expanded_command: expanded_command.clone(),
+            exit_code: capture.exit_code,
+            duration_ms: capture.duration_ms,
+            stdout: capture.stdout,
+            stderr: capture.stderr,
+            execution_error: capture.execution_error,
+        };
+
+        let scenario_artifact_rel =
+            PathBuf::from("scenarios").join(format!("{}.json", scenario.id));
+        let scenario_artifact = scenario_artifact_rel.to_string_lossy().to_string();
+        let result = evaluate_scenario(
+            scenario,
+            &output,
+            vec![scenario_artifact.clone()],
+            intentional_delta_map.get(&scenario.id).map(String::as_str),
+        );
+
+        write_json_pretty(
+            &output_dir.join(&scenario_artifact_rel),
+            &serde_json::json!({
+                "run_id": run_id.as_str(),
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "scenario": scenario,
+                "command_output": &output,
+                "result": &result,
+            }),
+        )?;
+
+        outputs.push(output);
+        results.push(result);
+    }
+
+    let summary = build_run_summary(&run_id, &matrix, &results);
+    let divergence = build_divergence_report(&run_id, &matrix, &results);
+
+    write_json_pretty(&output_dir.join("summary.json"), &summary)?;
+    write_jsonl(&output_dir.join("raw_command_outputs.jsonl"), &outputs)?;
+    write_json_pretty(&output_dir.join("assertion_results.json"), &results)?;
+    write_json_pretty(
+        &output_dir.join("shadow_divergence_report.json"),
+        &divergence,
+    )?;
+
+    Ok(NtmParityRunOutcome {
+        output_dir,
+        resolved_pane_id,
+        summary,
+    })
 }
 
 async fn record_ipc_rpc_audit(
@@ -25511,6 +25959,64 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::Replay {
+            command:
+                Some(ReplayCommands::Parity {
+                    corpus,
+                    matrix,
+                    output_dir,
+                    run_id,
+                    pane_id,
+                    intentional_deltas,
+                }),
+            ..
+        }) => {
+            let outcome = run_ntm_parity_shadow(
+                &workspace_root,
+                resolved_config_path.as_deref(),
+                corpus.as_deref(),
+                matrix.as_deref(),
+                output_dir.as_deref(),
+                run_id.as_deref(),
+                pane_id,
+                &intentional_deltas,
+            )
+            .await?;
+
+            println!("NTM parity shadow run complete.");
+            println!("  Run ID:    {}", outcome.summary.run_id);
+            println!("  Output:    {}", outcome.output_dir.display());
+            if let Some(id) = outcome.resolved_pane_id {
+                println!("  Pane:      {id}");
+            }
+            println!(
+                "  Status:    {}",
+                if outcome.summary.overall_passed {
+                    "pass"
+                } else {
+                    "fail"
+                }
+            );
+            println!(
+                "  Scenarios: {} total, {} pass, {} fail, {} intentional delta, {} untested",
+                outcome.summary.scenario_count,
+                outcome.summary.pass_count,
+                outcome.summary.fail_count,
+                outcome.summary.intentional_delta_count,
+                outcome.summary.untested_count
+            );
+            println!(
+                "  Divergence: {} (blocking failures: {}, high-priority failures: {})",
+                outcome.summary.divergence_count,
+                outcome.summary.blocking_failures.len(),
+                outcome.summary.high_priority_failures.len()
+            );
+
+            if !outcome.summary.overall_passed {
+                std::process::exit(2);
+            }
+        }
+
+        Some(Commands::Replay {
             command: Some(ReplayCommands::Artifact(artifact_cmd)),
             ..
         }) => {
@@ -36893,6 +37399,65 @@ mod tests {
     }
 
     #[test]
+    fn replay_parity_command_parses_with_artifact_options() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "replay",
+            "parity",
+            "--corpus",
+            "fixtures/e2e/ntm_parity/corpus.v1.json",
+            "--matrix",
+            "fixtures/e2e/ntm_parity/acceptance_matrix.v1.json",
+            "--output-dir",
+            "artifacts/e2e/ntm_parity/test-run",
+            "--run-id",
+            "shadow-window-20260307",
+            "--pane-id",
+            "17",
+            "--intentional-delta",
+            "NTM-PARITY-012=TOON stats wording differs",
+        ])
+        .expect("replay parity should parse");
+
+        match cli.command.map(|cmd| *cmd) {
+            Some(Commands::Replay {
+                command:
+                    Some(ReplayCommands::Parity {
+                        corpus,
+                        matrix,
+                        output_dir,
+                        run_id,
+                        pane_id,
+                        intentional_deltas,
+                    }),
+                ..
+            }) => {
+                assert_eq!(
+                    corpus,
+                    Some(PathBuf::from("fixtures/e2e/ntm_parity/corpus.v1.json"))
+                );
+                assert_eq!(
+                    matrix,
+                    Some(PathBuf::from(
+                        "fixtures/e2e/ntm_parity/acceptance_matrix.v1.json"
+                    ))
+                );
+                assert_eq!(
+                    output_dir,
+                    Some(PathBuf::from("artifacts/e2e/ntm_parity/test-run"))
+                );
+                assert_eq!(run_id.as_deref(), Some("shadow-window-20260307"));
+                assert_eq!(pane_id, Some(17));
+                assert_eq!(
+                    intentional_deltas,
+                    vec!["NTM-PARITY-012=TOON stats wording differs".to_string()]
+                );
+            }
+            _ => panic!("unexpected replay parity parse result"),
+        }
+    }
+
+    #[test]
     fn mission_cli_run_transition_plan_matches_contract() {
         use frankenterm_core::plan::MissionLifecycleState as State;
         use frankenterm_core::plan::MissionLifecycleTransitionKind as Kind;
@@ -38506,6 +39071,29 @@ log_level = "debug"
     }
 
     #[test]
+    fn workflow_dry_run_report_includes_workflow_policy_surface_check() {
+        let command_ctx = frankenterm_core::dry_run::CommandContext::new("workflow run", true);
+        let config = frankenterm_core::config::Config::default();
+        let report =
+            build_workflow_dry_run_report(&command_ctx, "handle_compaction", 42, None, &config);
+
+        let eval = report
+            .policy_evaluation
+            .expect("policy evaluation must be present");
+        let surface_check = eval
+            .checks
+            .iter()
+            .find(|check| check.name == "policy_surface")
+            .expect("policy_surface check must be present");
+        assert!(surface_check.passed);
+        assert_eq!(surface_check.message, "Policy surface: workflow");
+        assert_eq!(
+            surface_check.details.as_deref(),
+            Some("action: workflow_run")
+        );
+    }
+
+    #[test]
     fn workflow_dry_run_report_step_metadata_includes_step_id() {
         let command_ctx = frankenterm_core::dry_run::CommandContext::new("workflow run", true);
         let config = frankenterm_core::config::Config::default();
@@ -39773,12 +40361,12 @@ log_level = "debug"
             (
                 "human",
                 frankenterm_core::policy::ActorKind::Human,
-                frankenterm_core::policy::PolicySurface::Unknown,
+                frankenterm_core::policy::PolicySurface::Mux,
             ),
             (
                 "robot",
                 frankenterm_core::policy::ActorKind::Robot,
-                frankenterm_core::policy::PolicySurface::Robot,
+                frankenterm_core::policy::PolicySurface::Mux,
             ),
         ];
 
@@ -39858,6 +40446,65 @@ log_level = "debug"
 
             cleanup_storage(storage, &db_path).await;
         }
+    }
+
+    #[test]
+    fn approval_decision_context_tracks_workflow_surface_for_workflow_actions() {
+        let ctx_json = build_approval_decision_context(
+            "human",
+            "ws-workflow",
+            frankenterm_core::policy::ActionKind::WorkflowRun.as_str(),
+            Some(19),
+            5_432,
+        )
+        .expect("decision context should serialize");
+        let ctx: frankenterm_core::policy::DecisionContext =
+            serde_json::from_str(&ctx_json).expect("decision context should parse");
+
+        assert_eq!(ctx.actor, frankenterm_core::policy::ActorKind::Human);
+        assert_eq!(
+            ctx.action,
+            frankenterm_core::policy::ActionKind::WorkflowRun
+        );
+        assert_eq!(
+            ctx.surface,
+            frankenterm_core::policy::PolicySurface::Workflow
+        );
+        assert_eq!(ctx.pane_id, Some(19));
+        assert!(
+            ctx.evidence
+                .iter()
+                .any(|entry| { entry.key == "approval_surface" && entry.value == "workflow" }),
+            "approval audit evidence should record the workflow surface"
+        );
+    }
+
+    #[test]
+    fn approval_decision_context_tracks_swarm_surface_for_reservation_actions() {
+        let ctx_json = build_approval_decision_context(
+            "robot",
+            "ws-swarm",
+            frankenterm_core::policy::ActionKind::ReservePane.as_str(),
+            Some(23),
+            7_654,
+        )
+        .expect("decision context should serialize");
+        let ctx: frankenterm_core::policy::DecisionContext =
+            serde_json::from_str(&ctx_json).expect("decision context should parse");
+
+        assert_eq!(ctx.actor, frankenterm_core::policy::ActorKind::Robot);
+        assert_eq!(
+            ctx.action,
+            frankenterm_core::policy::ActionKind::ReservePane
+        );
+        assert_eq!(ctx.surface, frankenterm_core::policy::PolicySurface::Swarm);
+        assert_eq!(ctx.pane_id, Some(23));
+        assert!(
+            ctx.evidence
+                .iter()
+                .any(|entry| entry.key == "approval_surface" && entry.value == "swarm"),
+            "approval audit evidence should record the swarm surface"
+        );
     }
 
     #[test]
