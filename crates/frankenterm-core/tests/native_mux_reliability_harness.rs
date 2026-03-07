@@ -1341,12 +1341,7 @@ fn command_context_with_policy_trace_roundtrips_via_serde() {
 #[test]
 fn command_request_carries_policy_trace_to_router() {
     let mut router = CommandRouter::new();
-    let mut registry = fleet_registry(3);
-
-    // Register panes with router
-    for i in 1..=3 {
-        router.register_target(pane_id(i));
-    }
+    let registry = fleet_registry(3);
 
     let decision = PolicyDecision::allow_with_rule("fleet-allow");
     let mut context = cmd_ctx(500);
@@ -1357,7 +1352,7 @@ fn command_request_carries_policy_trace_to_router() {
 
     let request = CommandRequest {
         command_id: "cmd-policy-test".to_string(),
-        scope: CommandScope::Pane(pane_id(1)),
+        scope: CommandScope::pane(pane_id(1)),
         command: CommandKind::SendInput {
             text: "echo hello".to_string(),
             paste_mode: false,
@@ -1368,7 +1363,7 @@ fn command_request_carries_policy_trace_to_router() {
     };
 
     let result = router.route(&request, &registry);
-    // Dry-run should succeed for a registered, alive pane
+    // Routing should succeed for a pane in Running state
     assert!(result.is_ok());
     // The policy trace travels with the request
     assert_eq!(
@@ -1379,6 +1374,8 @@ fn command_request_carries_policy_trace_to_router() {
         request.context.policy_trace.as_ref().unwrap().surface,
         PolicySurface::Swarm
     );
+    // Audit log captures the routed command
+    assert!(!router.audit_log().is_empty());
 }
 
 #[test]

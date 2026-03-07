@@ -26,22 +26,43 @@ fn collect_rust_files(root: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    files.sort();
+    files
+}
+
+fn collect_surface_files(crate_root: &Path, surfaces: &[&str]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for surface in surfaces {
+        let path = crate_root.join(surface);
+        if path.exists() {
+            files.extend(collect_rust_files(&path));
+        }
+    }
     files
 }
 
 #[test]
-fn framework_imports_are_centralized_to_seam_modules() {
-    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let src_dir = crate_root.join("src");
-    let allowed: BTreeSet<&str> = BTreeSet::from(["mcp_framework.rs", "web_framework.rs"]);
+fn framework_imports_are_centralized_to_seam_modules_across_core_and_cli_surfaces() {
+    let core_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = core_root
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| panic!("expected core crate to live under <workspace>/crates/"));
+    let cli_root = workspace_root.join("crates/frankenterm");
+    let allowed: BTreeSet<PathBuf> = BTreeSet::from([
+        workspace_root.join("crates/frankenterm-core/src/mcp_framework.rs"),
+        workspace_root.join("crates/frankenterm-core/src/web_framework.rs"),
+        workspace_root.join("crates/frankenterm-core/tests/framework_seam_guard.rs"),
+    ]);
     let mut violations = Vec::new();
+    let mut files = collect_surface_files(&core_root, &["src", "tests", "benches"]);
+    files.extend(collect_surface_files(
+        &cli_root,
+        &["src", "tests", "benches"],
+    ));
 
-    for file in collect_rust_files(&src_dir) {
-        let file_name = file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        if allowed.contains(file_name) {
+    for file in files {
+        if allowed.contains(&file) {
             continue;
         }
 
@@ -51,7 +72,7 @@ fn framework_imports_are_centralized_to_seam_modules() {
         for (line_index, line) in content.lines().enumerate() {
             if line.contains("fastmcp::") || line.contains("fastapi::") {
                 let rel_path = file
-                    .strip_prefix(&crate_root)
+                    .strip_prefix(workspace_root)
                     .unwrap_or(&file)
                     .display()
                     .to_string();
@@ -62,7 +83,7 @@ fn framework_imports_are_centralized_to_seam_modules() {
 
     assert!(
         violations.is_empty(),
-        "direct fastmcp/fastapi imports must stay in mcp_framework.rs/web_framework.rs:\n{}",
+        "direct fastmcp/fastapi imports must stay in frankenterm-core seam modules:\n{}",
         violations.join("\n")
     );
 }
