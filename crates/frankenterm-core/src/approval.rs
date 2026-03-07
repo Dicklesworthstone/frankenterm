@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ApprovalConfig;
 use crate::error::{Error, Result};
-use crate::policy::{ApprovalRequest, PolicyDecision, PolicyInput};
+use crate::policy::{ApprovalRequest, DecisionContext, PolicyDecision, PolicyInput};
 use crate::storage::{ApprovalTokenRecord, AuditActionRecord, StorageHandle};
 
 const DEFAULT_CODE_LEN: usize = 8;
@@ -265,14 +265,18 @@ impl<'a> ApprovalStore<'a> {
         fingerprint: &str,
         audit_context: Option<&ApprovalAuditContext>,
     ) -> Result<()> {
+        let ts = now_ms();
         let verification = format!(
             "workspace={}, fingerprint={}, hash={}",
             self.workspace_id, fingerprint, code_hash
         );
+        let decision_context = audit_context
+            .and_then(|ctx| ctx.decision_context.clone())
+            .or_else(|| build_approval_grant_decision_context(&self.workspace_id, input, ts));
 
         let audit = AuditActionRecord {
             id: 0,
-            ts: now_ms(),
+            ts,
             actor_kind: input.actor.as_str().to_string(),
             actor_id: None,
             correlation_id: audit_context.and_then(|ctx| ctx.correlation_id.clone()),
@@ -284,13 +288,58 @@ impl<'a> ApprovalStore<'a> {
             rule_id: None,
             input_summary: Some(format!("allow_once approval for {}", input.action.as_str())),
             verification_summary: Some(verification),
-            decision_context: audit_context.and_then(|ctx| ctx.decision_context.clone()),
+            decision_context,
             result: "success".to_string(),
         };
 
         self.storage.record_audit_action_redacted(audit).await?;
         Ok(())
     }
+}
+
+fn build_approval_grant_decision_context(
+    workspace_id: &str,
+    input: &PolicyInput,
+    timestamp_ms: i64,
+) -> Option<String> {
+    let mut context = DecisionContext {
+        timestamp_ms,
+        action: input.action,
+        actor: input.actor,
+        surface: input.surface,
+        pane_id: input.pane_id,
+        domain: input.domain.clone(),
+        capabilities: input.capabilities.clone(),
+        text_summary: input
+            .text_summary
+            .clone()
+            .or_else(|| Some(format!("approval consume for {}", input.action.as_str()))),
+        workflow_id: input.workflow_id.clone(),
+        rules_evaluated: Vec::new(),
+        determining_rule: None,
+        evidence: Vec::new(),
+        rate_limit: None,
+        risk: None,
+    };
+    context.record_rule(
+        "approval.allow_once.consume",
+        true,
+        Some("allow"),
+        Some("approval code validated and consumed".to_string()),
+    );
+    context.set_determining_rule("approval.allow_once.consume");
+    context.add_evidence("stage", "approval");
+    context.add_evidence("workspace_id", workspace_id);
+    context.add_evidence("approval_actor", input.actor.as_str());
+    context.add_evidence("approval_surface", input.surface.as_str());
+    context.add_evidence("approval_action_kind", input.action.as_str());
+    if let Some(pane_id) = input.pane_id {
+        context.add_evidence("approval_pane_id", pane_id.to_string());
+    }
+    if let Some(domain) = input.domain.as_deref() {
+        context.add_evidence("approval_domain", domain);
+    }
+    serde_json::to_string(&context).ok()
 }
 
 /// Compute a stable fingerprint for a policy input
@@ -438,6 +487,19 @@ mod tests {
             .with_domain("local")
             .with_text_summary("echo hi")
             .with_capabilities(PaneCapabilities::prompt())
+    }
+
+    fn parse_decision_context(serialized: Option<&str>) -> crate::policy::DecisionContext {
+        serde_json::from_str(serialized.expect("decision context should be present"))
+            .expect("decision context should parse")
+    }
+
+    fn evidence<'a>(context: &'a crate::policy::DecisionContext, key: &str) -> Option<&'a str> {
+        context
+            .evidence
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.value.as_str())
     }
 
     // -----------------------------------------------------------------------
@@ -1695,7 +1757,7 @@ mod tests {
         run_async_test(async {
             let (storage, db_path) = setup_test_storage("no_ctx").await;
             let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
-            let input = base_input();
+            let input = base_input().with_surface(PolicySurface::Mux);
 
             let request = store.issue(&input, None).await.unwrap();
             let consumed = store
@@ -1714,6 +1776,17 @@ mod tests {
             // The audit from consume (no context) should have no correlation_id
             let last = audits.last().unwrap();
             assert!(last.correlation_id.is_none());
+            let context = parse_decision_context(last.decision_context.as_deref());
+            assert_eq!(context.action, ActionKind::SendText);
+            assert_eq!(context.actor, ActorKind::Robot);
+            assert_eq!(context.surface, PolicySurface::Mux);
+            assert_eq!(
+                context.determining_rule.as_deref(),
+                Some("approval.allow_once.consume")
+            );
+            assert_eq!(evidence(&context, "stage"), Some("approval"));
+            assert_eq!(evidence(&context, "workspace_id"), Some("ws"));
+            assert_eq!(evidence(&context, "approval_surface"), Some("mux"));
 
             cleanup_storage(storage, &db_path).await;
         });
@@ -1771,6 +1844,10 @@ mod tests {
                     .unwrap();
                 assert_eq!(audits.len(), 1);
                 assert_eq!(audits[0].actor_kind, actor.as_str());
+                let context = parse_decision_context(audits[0].decision_context.as_deref());
+                assert_eq!(context.actor, actor);
+                assert_eq!(context.surface, PolicySurface::default_for_actor(actor));
+                assert_eq!(evidence(&context, "approval_actor"), Some(actor.as_str()));
             }
 
             cleanup_storage(storage, &db_path).await;
@@ -2116,6 +2193,20 @@ mod tests {
             );
             assert_eq!(audit.pane_id, Some(1));
             assert_eq!(audit.domain.as_deref(), Some("local"));
+            let context = parse_decision_context(audit.decision_context.as_deref());
+            assert_eq!(context.action, ActionKind::SendText);
+            assert_eq!(context.actor, ActorKind::Robot);
+            assert_eq!(context.surface, PolicySurface::Robot);
+            assert_eq!(
+                context.determining_rule.as_deref(),
+                Some("approval.allow_once.consume")
+            );
+            assert_eq!(evidence(&context, "workspace_id"), Some("ws"));
+            assert_eq!(
+                evidence(&context, "approval_action_kind"),
+                Some("send_text")
+            );
+            assert_eq!(evidence(&context, "approval_domain"), Some("local"));
 
             cleanup_storage(storage, &db_path).await;
         });

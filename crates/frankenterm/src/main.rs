@@ -6186,9 +6186,25 @@ fn approval_actor_kind(actor_kind: &str) -> frankenterm_core::policy::ActorKind 
     }
 }
 
-fn approval_target_action_kind(action_kind: &str) -> frankenterm_core::policy::ActionKind {
+fn audit_target_action_kind(action_kind: &str) -> frankenterm_core::policy::ActionKind {
     serde_json::from_str(&format!("\"{action_kind}\""))
         .unwrap_or(frankenterm_core::policy::ActionKind::ExecCommand)
+}
+
+fn plan_audit_surface(
+    action: frankenterm_core::policy::ActionKind,
+) -> frankenterm_core::policy::PolicySurface {
+    match action {
+        frankenterm_core::policy::ActionKind::SendText => {
+            frankenterm_core::policy::PolicySurface::Mux
+        }
+        frankenterm_core::policy::ActionKind::WorkflowRun => {
+            frankenterm_core::policy::PolicySurface::Workflow
+        }
+        _ => frankenterm_core::policy::PolicySurface::default_for_actor(
+            frankenterm_core::policy::ActorKind::Human,
+        ),
+    }
 }
 
 fn build_approval_decision_context(
@@ -6202,7 +6218,7 @@ fn build_approval_decision_context(
     let surface = frankenterm_core::policy::PolicySurface::default_for_actor(actor);
     let mut context = frankenterm_core::policy::DecisionContext {
         timestamp_ms,
-        action: approval_target_action_kind(action_kind),
+        action: audit_target_action_kind(action_kind),
         actor,
         surface,
         pane_id,
@@ -6959,16 +6975,45 @@ fn build_plan_audit_context(
     stage: &str,
     action_kind: &str,
     pane_id: Option<u64>,
-) -> String {
-    serde_json::json!({
-        "correlation_id": plan_hash,
-        "plan_id": plan_id,
-        "plan_hash": plan_hash,
-        "stage": stage,
-        "action_kind": action_kind,
-        "pane_id": pane_id,
-    })
-    .to_string()
+    timestamp_ms: i64,
+) -> Option<String> {
+    let action = audit_target_action_kind(action_kind);
+    let surface = plan_audit_surface(action);
+    let mut context = frankenterm_core::policy::DecisionContext {
+        timestamp_ms,
+        action,
+        actor: frankenterm_core::policy::ActorKind::Human,
+        surface,
+        pane_id,
+        domain: None,
+        capabilities: frankenterm_core::policy::PaneCapabilities::default(),
+        text_summary: Some(format!("{stage} plan for {action_kind}")),
+        workflow_id: None,
+        rules_evaluated: Vec::new(),
+        determining_rule: None,
+        evidence: Vec::new(),
+        rate_limit: None,
+        risk: None,
+    };
+    let determining_rule = format!("audit.plan.{stage}.{action_kind}");
+    context.record_rule(
+        &determining_rule,
+        true,
+        Some("allow"),
+        Some("plan audit action recorded".to_string()),
+    );
+    context.set_determining_rule(&determining_rule);
+    context.add_evidence("stage", "plan_audit");
+    context.add_evidence("plan_stage", stage);
+    context.add_evidence("plan_action_kind", action_kind);
+    context.add_evidence("plan_surface", surface.as_str());
+    context.add_evidence("correlation_id", plan_hash);
+    context.add_evidence("plan_id", plan_id);
+    context.add_evidence("plan_hash", plan_hash);
+    if let Some(pane_id) = pane_id {
+        context.add_evidence("plan_pane_id", pane_id.to_string());
+    }
+    serde_json::to_string(&context).ok()
 }
 
 fn redact_payload_field(
@@ -22120,6 +22165,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     "prepare",
                     frankenterm_core::policy::ActionKind::SendText.as_str(),
                     Some(pane_id),
+                    now,
                 );
                 let prepare_audit = frankenterm_core::storage::AuditActionRecord {
                     id: 0,
@@ -22137,7 +22183,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     rule_id: decision.rule_id().map(String::from),
                     input_summary: Some(summary.clone()),
                     verification_summary: None,
-                    decision_context: Some(prepare_context),
+                    decision_context: prepare_context,
                     result: "success".to_string(),
                 };
                 if let Err(e) = storage.record_audit_action_redacted(prepare_audit).await {
@@ -22327,6 +22373,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         "prepare",
                         frankenterm_core::policy::ActionKind::WorkflowRun.as_str(),
                         Some(pane_id),
+                        now,
                     );
                     let prepare_audit = frankenterm_core::storage::AuditActionRecord {
                         id: 0,
@@ -22344,7 +22391,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         rule_id: decision.rule_id().map(String::from),
                         input_summary: Some(format!("workflow={name}")),
                         verification_summary: None,
-                        decision_context: Some(prepare_context),
+                        decision_context: prepare_context,
                         result: "success".to_string(),
                     };
                     if let Err(e) = storage.record_audit_action_redacted(prepare_audit).await {
@@ -22519,6 +22566,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         "commit",
                         frankenterm_core::policy::ActionKind::SendText.as_str(),
                         Some(pane_id),
+                        now,
                     );
                     if let Err(err) = ensure_plan_hash(&record.plan_hash, &plan_hash) {
                         exit_on_commit_validation_error(err, &plan_id);
@@ -22582,13 +22630,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         );
                         let approval_context = frankenterm_core::approval::ApprovalAuditContext {
                             correlation_id: Some(correlation_id.clone()),
-                            decision_context: Some(build_plan_audit_context(
+                            decision_context: build_plan_audit_context(
                                 &plan_id,
                                 &plan_hash,
                                 "approval",
                                 frankenterm_core::policy::ActionKind::SendText.as_str(),
                                 Some(pane_id),
-                            )),
+                                now,
+                            ),
                         };
                         match store
                             .consume_with_context(code, &input, Some(approval_context))
@@ -22742,7 +22791,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         rule_id: decision_for_audit.rule_id().map(String::from),
                         input_summary: Some(summary.clone()),
                         verification_summary: commit_verification,
-                        decision_context: Some(commit_context),
+                        decision_context: commit_context,
                         result: commit_result.to_string(),
                     };
                     if let Err(e) = storage.record_audit_action_redacted(commit_audit).await {
@@ -22796,6 +22845,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         "commit",
                         frankenterm_core::policy::ActionKind::WorkflowRun.as_str(),
                         Some(pane_id),
+                        now,
                     );
                     if let Err(err) = ensure_plan_hash(&record.plan_hash, &plan_hash) {
                         exit_on_commit_validation_error(err, &plan_id);
@@ -22825,13 +22875,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         );
                         let approval_context = frankenterm_core::approval::ApprovalAuditContext {
                             correlation_id: Some(correlation_id.clone()),
-                            decision_context: Some(build_plan_audit_context(
+                            decision_context: build_plan_audit_context(
                                 &plan_id,
                                 &plan_hash,
                                 "approval",
                                 frankenterm_core::policy::ActionKind::WorkflowRun.as_str(),
                                 Some(pane_id),
-                            )),
+                                now,
+                            ),
                         };
                         match store
                             .consume_with_context(code, &input, Some(approval_context))
@@ -23008,7 +23059,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         rule_id: decision.rule_id().map(String::from),
                         input_summary: Some(format!("workflow={workflow_name}")),
                         verification_summary: commit_verification,
-                        decision_context: Some(commit_context),
+                        decision_context: commit_context,
                         result: commit_result.to_string(),
                     };
                     if let Err(e) = storage.record_audit_action_redacted(commit_audit).await {
@@ -39931,6 +39982,96 @@ log_level = "debug"
             frankenterm_core::policy::PolicySurface::Unknown
         );
         assert_eq!(event_surface, Some("unknown"));
+    }
+
+    #[test]
+    fn plan_audit_decision_context_tracks_mux_prepare_metadata() {
+        let ctx_json = build_plan_audit_context(
+            "plan-123",
+            "hash-123",
+            "prepare",
+            frankenterm_core::policy::ActionKind::SendText.as_str(),
+            Some(42),
+            1_234,
+        )
+        .expect("decision context should serialize");
+        let ctx: frankenterm_core::policy::DecisionContext =
+            serde_json::from_str(&ctx_json).expect("decision context should parse");
+        let evidence = |key: &str| {
+            ctx.evidence
+                .iter()
+                .find(|entry| entry.key == key)
+                .map(|entry| entry.value.as_str())
+        };
+
+        assert_eq!(ctx.actor, frankenterm_core::policy::ActorKind::Human);
+        assert_eq!(ctx.surface, frankenterm_core::policy::PolicySurface::Mux);
+        assert_eq!(ctx.action, frankenterm_core::policy::ActionKind::SendText);
+        assert_eq!(ctx.pane_id, Some(42));
+        assert_eq!(
+            ctx.text_summary.as_deref(),
+            Some("prepare plan for send_text")
+        );
+        assert_eq!(
+            ctx.determining_rule.as_deref(),
+            Some("audit.plan.prepare.send_text")
+        );
+        assert_eq!(evidence("stage"), Some("plan_audit"));
+        assert_eq!(evidence("plan_stage"), Some("prepare"));
+        assert_eq!(evidence("plan_action_kind"), Some("send_text"));
+        assert_eq!(evidence("plan_surface"), Some("mux"));
+        assert_eq!(evidence("correlation_id"), Some("hash-123"));
+        assert_eq!(evidence("plan_id"), Some("plan-123"));
+        assert_eq!(evidence("plan_hash"), Some("hash-123"));
+        assert_eq!(evidence("plan_pane_id"), Some("42"));
+    }
+
+    #[test]
+    fn plan_audit_decision_context_tracks_workflow_surface_for_workflow_runs() {
+        let ctx_json = build_plan_audit_context(
+            "plan-456",
+            "hash-456",
+            "approval",
+            frankenterm_core::policy::ActionKind::WorkflowRun.as_str(),
+            Some(7),
+            9_876,
+        )
+        .expect("decision context should serialize");
+        let ctx: frankenterm_core::policy::DecisionContext =
+            serde_json::from_str(&ctx_json).expect("decision context should parse");
+        let evidence = |key: &str| {
+            ctx.evidence
+                .iter()
+                .find(|entry| entry.key == key)
+                .map(|entry| entry.value.as_str())
+        };
+
+        assert_eq!(ctx.actor, frankenterm_core::policy::ActorKind::Human);
+        assert_eq!(
+            ctx.surface,
+            frankenterm_core::policy::PolicySurface::Workflow
+        );
+        assert_eq!(
+            ctx.action,
+            frankenterm_core::policy::ActionKind::WorkflowRun
+        );
+        assert_eq!(ctx.pane_id, Some(7));
+        assert_eq!(
+            ctx.text_summary.as_deref(),
+            Some("approval plan for workflow_run")
+        );
+        assert_eq!(
+            ctx.determining_rule.as_deref(),
+            Some("audit.plan.approval.workflow_run")
+        );
+        assert_eq!(evidence("stage"), Some("plan_audit"));
+        assert_eq!(evidence("plan_stage"), Some("approval"));
+        assert_eq!(evidence("plan_action_kind"), Some("workflow_run"));
+        assert_eq!(evidence("plan_surface"), Some("workflow"));
+        assert_eq!(evidence("correlation_id"), Some("hash-456"));
+        assert_eq!(evidence("plan_id"), Some("plan-456"));
+        assert_eq!(evidence("plan_hash"), Some("hash-456"));
+        assert_eq!(evidence("plan_pane_id"), Some("7"));
     }
 
     #[test]

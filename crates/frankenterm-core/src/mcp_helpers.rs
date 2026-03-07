@@ -391,6 +391,52 @@ pub(super) fn redact_mcp_args(tool_name: &str, args: &serde_json::Value) -> Stri
     }
 }
 
+/// Build structured `DecisionContext` metadata for MCP audit entries.
+fn mcp_audit_decision_context(
+    tool_name: &str,
+    action_kind: &str,
+    decision: &str,
+    result: &str,
+    error_code: Option<&str>,
+    elapsed_ms: u64,
+) -> Option<String> {
+    let mut context = DecisionContext {
+        timestamp_ms: i64::try_from(now_ms()).unwrap_or(0),
+        action: ActionKind::ExecCommand,
+        actor: ActorKind::Mcp,
+        surface: PolicySurface::Mcp,
+        pane_id: None,
+        domain: None,
+        capabilities: PaneCapabilities::default(),
+        text_summary: Some(format!("mcp audit for {tool_name}")),
+        workflow_id: None,
+        rules_evaluated: Vec::new(),
+        determining_rule: None,
+        evidence: Vec::new(),
+        rate_limit: None,
+        risk: None,
+    };
+    let determining_rule = format!("audit.{action_kind}");
+    context.record_rule(
+        &determining_rule,
+        true,
+        Some(decision),
+        Some(format!("MCP tool audit recorded with result={result}")),
+    );
+    context.set_determining_rule(&determining_rule);
+    context.add_evidence("stage", "mcp_audit");
+    context.add_evidence("tool", tool_name);
+    context.add_evidence("mcp_action_kind", action_kind);
+    context.add_evidence("mcp_surface", PolicySurface::Mcp.as_str());
+    context.add_evidence("policy_decision", decision);
+    context.add_evidence("result", result);
+    context.add_evidence("elapsed_ms", elapsed_ms.to_string());
+    if let Some(error_code) = error_code {
+        context.add_evidence("error_code", error_code);
+    }
+    serde_json::to_string(&context).ok()
+}
+
 /// Record an MCP tool call audit entry.
 ///
 /// This is fire-and-forget: failures are logged but never propagated to the caller.
@@ -404,6 +450,7 @@ pub(super) async fn record_mcp_audit(
     elapsed_ms: u64,
 ) {
     let ts = i64::try_from(now_ms()).unwrap_or(0);
+    let action_kind = format!("mcp.{tool_name}");
     let audit = crate::storage::AuditActionRecord {
         id: 0,
         ts,
@@ -412,13 +459,20 @@ pub(super) async fn record_mcp_audit(
         correlation_id: None,
         pane_id: None,
         domain: None,
-        action_kind: format!("mcp.{tool_name}"),
+        action_kind: action_kind.clone(),
         policy_decision: decision.to_string(),
         decision_reason: error_code.map(|c| format!("error_code={c}")),
         rule_id: None,
         input_summary: Some(format!("{input_summary} elapsed_ms={elapsed_ms}")),
         verification_summary: None,
-        decision_context: None,
+        decision_context: mcp_audit_decision_context(
+            tool_name,
+            &action_kind,
+            decision,
+            result,
+            error_code,
+            elapsed_ms,
+        ),
         result: result.to_string(),
     };
     if let Err(e) = storage.record_audit_action_redacted(audit).await {
@@ -474,6 +528,8 @@ pub(super) fn record_mcp_audit_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
 
     // ========================================================================
     // check_refresh_cooldown Tests
@@ -800,5 +856,118 @@ mod tests {
     fn constants_have_expected_values() {
         assert_eq!(SEND_OSC_SEGMENT_LIMIT, 200);
         assert_eq!(MCP_REFRESH_COOLDOWN_MS, 30_000);
+    }
+
+    fn temp_db_path() -> (TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mcp-helpers-audit.db");
+        (dir, db_path)
+    }
+
+    fn latest_audit_action(db_path: &Path, action_kind: &str) -> crate::storage::AuditActionRecord {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            let mut rows = storage
+                .get_audit_actions(crate::storage::AuditQuery {
+                    limit: Some(1),
+                    action_kind: Some(action_kind.to_string()),
+                    ..crate::storage::AuditQuery::default()
+                })
+                .await
+                .unwrap();
+            assert!(!rows.is_empty(), "missing audit row for {action_kind}");
+            rows.remove(0)
+        })
+    }
+
+    fn evidence<'a>(context: &'a DecisionContext, key: &str) -> Option<&'a str> {
+        context
+            .evidence
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.value.as_str())
+    }
+
+    #[test]
+    fn mcp_helpers_audit_decision_context_tracks_surface_and_error_code() {
+        let ctx_json = mcp_audit_decision_context(
+            "wa.accounts_refresh",
+            "mcp.wa.accounts_refresh",
+            "deny",
+            "error",
+            Some("MCP_TIMEOUT"),
+            77,
+        )
+        .expect("decision context should serialize");
+        let ctx: DecisionContext =
+            serde_json::from_str(&ctx_json).expect("decision context should parse");
+
+        assert_eq!(ctx.action, ActionKind::ExecCommand);
+        assert_eq!(ctx.actor, ActorKind::Mcp);
+        assert_eq!(ctx.surface, PolicySurface::Mcp);
+        assert_eq!(
+            ctx.determining_rule.as_deref(),
+            Some("audit.mcp.wa.accounts_refresh")
+        );
+        assert_eq!(evidence(&ctx, "stage"), Some("mcp_audit"));
+        assert_eq!(evidence(&ctx, "tool"), Some("wa.accounts_refresh"));
+        assert_eq!(
+            evidence(&ctx, "mcp_action_kind"),
+            Some("mcp.wa.accounts_refresh")
+        );
+        assert_eq!(evidence(&ctx, "policy_decision"), Some("deny"));
+        assert_eq!(evidence(&ctx, "result"), Some("error"));
+        assert_eq!(evidence(&ctx, "elapsed_ms"), Some("77"));
+        assert_eq!(evidence(&ctx, "error_code"), Some("MCP_TIMEOUT"));
+    }
+
+    #[test]
+    fn mcp_helpers_record_mcp_audit_persists_structured_decision_context() {
+        let (_dir, db_path) = temp_db_path();
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage should initialize");
+            record_mcp_audit(
+                &storage,
+                "wa.rules_list",
+                "mcp:wa.rules_list".to_string(),
+                "allow",
+                "success",
+                None,
+                12,
+            )
+            .await;
+        });
+
+        let audit = latest_audit_action(&db_path, "mcp.wa.rules_list");
+        assert_eq!(audit.actor_kind, "mcp");
+        let context: DecisionContext = serde_json::from_str(
+            audit
+                .decision_context
+                .as_deref()
+                .expect("decision context should be recorded"),
+        )
+        .expect("decision context should parse");
+        assert_eq!(context.action, ActionKind::ExecCommand);
+        assert_eq!(context.actor, ActorKind::Mcp);
+        assert_eq!(context.surface, PolicySurface::Mcp);
+        assert_eq!(
+            context.determining_rule.as_deref(),
+            Some("audit.mcp.wa.rules_list")
+        );
+        assert_eq!(evidence(&context, "stage"), Some("mcp_audit"));
+        assert_eq!(evidence(&context, "tool"), Some("wa.rules_list"));
+        assert_eq!(
+            evidence(&context, "mcp_action_kind"),
+            Some("mcp.wa.rules_list")
+        );
+        assert_eq!(evidence(&context, "policy_decision"), Some("allow"));
+        assert_eq!(evidence(&context, "result"), Some("success"));
+        assert_eq!(evidence(&context, "elapsed_ms"), Some("12"));
     }
 }
