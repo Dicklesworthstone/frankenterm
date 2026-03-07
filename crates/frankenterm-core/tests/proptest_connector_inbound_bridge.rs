@@ -538,4 +538,176 @@ proptest! {
         let audit = bridge.classification_audit_log().back().unwrap();
         prop_assert_eq!(audit.decision.clone(), IngestionDecision::AcceptRedacted);
     }
+
+    // ---- Clean signals pass classification without redaction ----
+
+    #[test]
+    fn bridge_accepts_clean_payloads_without_redaction(
+        source in arb_connector_name(),
+        kind in arb_signal_kind(),
+        status in "[a-z_]{3,10}",
+    ) {
+        let bus = Arc::new(EventBus::new(64));
+        let _sub = bus.subscribe_detections();
+        let config = ConnectorInboundBridgeConfig {
+            reject_unknown_kinds: false,
+            ..Default::default()
+        };
+        let mut bridge = ConnectorInboundBridge::new(bus, config);
+        let sig = ConnectorSignal::new(
+            source,
+            kind,
+            serde_json::json!({"status": status}),
+        )
+        .with_timestamp_ms(1000);
+
+        let result = bridge.route_signal(&sig);
+        prop_assert!(result.is_ok());
+
+        let snap = bridge.telemetry_snapshot();
+        prop_assert_eq!(snap.signals_rejected, 0);
+        prop_assert_eq!(snap.signals_routed, 1);
+    }
+
+    // ---- Classification telemetry tracks rejection counts ----
+
+    #[test]
+    fn bridge_classification_telemetry_tracks_rejections(
+        n in 1usize..5usize,
+        password in "[a-z]{4,16}",
+    ) {
+        let bus = Arc::new(EventBus::new(64));
+        let _sub = bus.subscribe_detections();
+        let mut bridge = ConnectorInboundBridge::new(bus, ConnectorInboundBridgeConfig::default());
+
+        for i in 0..n {
+            let sig = ConnectorSignal::new(
+                "test-conn",
+                ConnectorSignalKind::Webhook,
+                serde_json::json!({"password": password.clone(), "seq": i}),
+            )
+            .with_timestamp_ms(1000 + i as u64 * 100);
+            let _ = bridge.route_signal(&sig);
+        }
+
+        let snap = bridge.telemetry_snapshot();
+        prop_assert_eq!(snap.signals_rejected, n as u64);
+        prop_assert_eq!(snap.signals_routed, 0);
+    }
+
+    // ---- Classification audit log accumulates entries ----
+
+    #[test]
+    fn bridge_audit_log_grows_with_routed_signals(
+        n in 1usize..10usize,
+    ) {
+        let bus = Arc::new(EventBus::new(64));
+        let _sub = bus.subscribe_detections();
+        let config = ConnectorInboundBridgeConfig {
+            reject_unknown_kinds: false,
+            ..Default::default()
+        };
+        let mut bridge = ConnectorInboundBridge::new(bus, config);
+
+        for i in 0..n {
+            let sig = ConnectorSignal::new(
+                "test-conn",
+                ConnectorSignalKind::Webhook,
+                serde_json::json!({"status": "ok", "seq": i}),
+            )
+            .with_timestamp_ms(1000 + i as u64 * 100);
+            let _ = bridge.route_signal(&sig);
+        }
+
+        let audit_len = bridge.classification_audit_log().len();
+        prop_assert!(audit_len >= n, "audit log should have at least {} entries, got {}", n, audit_len);
+    }
+
+    // ---- Classification policy count tracks registered policies ----
+
+    #[test]
+    fn bridge_default_has_at_least_one_classification_policy(
+        source in arb_connector_name(),
+    ) {
+        let bus = Arc::new(EventBus::new(64));
+        let bridge = ConnectorInboundBridge::new(bus, ConnectorInboundBridgeConfig::default());
+        // Default constructor registers a default policy
+        prop_assert!(bridge.classification_policy_count() >= 1,
+            "bridge should have at least 1 default classification policy, got {}",
+            bridge.classification_policy_count());
+        let _ = source; // used to vary the test input
+    }
+
+    // ---- Mixed clean and rejected signals both track correctly ----
+
+    #[test]
+    fn bridge_mixed_signals_telemetry_sums_correctly(
+        n_clean in 1usize..5usize,
+        n_reject in 1usize..5usize,
+    ) {
+        let bus = Arc::new(EventBus::new(64));
+        let _sub = bus.subscribe_detections();
+        let mut bridge = ConnectorInboundBridge::new(bus, ConnectorInboundBridgeConfig::default());
+
+        for i in 0..n_clean {
+            let sig = ConnectorSignal::new(
+                "test-conn",
+                ConnectorSignalKind::Webhook,
+                serde_json::json!({"status": "clean", "seq": i}),
+            )
+            .with_timestamp_ms(1000 + i as u64 * 100);
+            let _ = bridge.route_signal(&sig);
+        }
+
+        for i in 0..n_reject {
+            let sig = ConnectorSignal::new(
+                "test-conn",
+                ConnectorSignalKind::Webhook,
+                serde_json::json!({"password": "secret", "seq": i}),
+            )
+            .with_timestamp_ms(2000 + i as u64 * 100);
+            let _ = bridge.route_signal(&sig);
+        }
+
+        let snap = bridge.telemetry_snapshot();
+        prop_assert_eq!(snap.signals_received, (n_clean + n_reject) as u64);
+        prop_assert_eq!(snap.signals_routed, n_clean as u64);
+        prop_assert_eq!(snap.signals_rejected, n_reject as u64);
+    }
+
+    // ---- Detection extraction includes classification metadata ----
+
+    #[test]
+    fn bridge_routed_signal_detection_includes_classification(
+        source in arb_connector_name(),
+    ) {
+        let bus = Arc::new(EventBus::new(64));
+        let mut sub = bus.subscribe_detections();
+        let mut bridge = ConnectorInboundBridge::new(bus, ConnectorInboundBridgeConfig::default());
+        let sig = ConnectorSignal::new(
+            source.clone(),
+            ConnectorSignalKind::Webhook,
+            serde_json::json!({"status": "ok"}),
+        )
+        .with_timestamp_ms(1000);
+
+        bridge.route_signal(&sig).unwrap();
+
+        let event = sub.try_recv().unwrap();
+        if let Ok(Event::PatternDetected { detection, .. }) = event {
+            let map = detection.extracted.as_object().unwrap();
+            prop_assert!(map.contains_key("classification"),
+                "detection should include classification metadata");
+            let cls = map.get("classification").unwrap().as_object().unwrap();
+            prop_assert!(cls.contains_key("overall_sensitivity"));
+            prop_assert!(cls.contains_key("ingestion_decision"));
+            prop_assert!(map.contains_key("source_connector"));
+            prop_assert_eq!(
+                map.get("source_connector").and_then(|v| v.as_str()),
+                Some(source.as_str())
+            );
+        } else {
+            prop_assert!(false, "expected PatternDetected event");
+        }
+    }
 }
