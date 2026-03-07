@@ -812,6 +812,33 @@ pub fn extract_ft_block(content: &str) -> Option<String> {
     }
 }
 
+fn validated_wezterm_ft_block_bounds(content: &str) -> Result<Option<(usize, usize)>> {
+    let begin_idx = content.find(FT_BEGIN_MARKER);
+    let end_marker_start = content.find(FT_END_MARKER);
+
+    match (begin_idx, end_marker_start) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(Error::SetupError(
+            "WezTerm config contains FT begin marker without FT end marker".to_string(),
+        )),
+        (None, Some(_)) => Err(Error::SetupError(
+            "WezTerm config contains FT end marker without FT begin marker".to_string(),
+        )),
+        (Some(begin_idx), Some(end_marker_start)) => {
+            if end_marker_start <= begin_idx {
+                return Err(Error::SetupError(
+                    "WezTerm config contains FT markers out of order".to_string(),
+                ));
+            }
+
+            let end_idx = content[end_marker_start..]
+                .find('\n')
+                .map_or(content.len(), |i| end_marker_start + i + 1);
+            Ok(Some((begin_idx, end_idx)))
+        }
+    }
+}
+
 fn find_return_line_start(content: &str) -> Option<usize> {
     let mut offset = 0usize;
     let mut last_match = None;
@@ -1088,24 +1115,17 @@ pub fn unpatch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
         Error::SetupError(format!("Failed to read {}: {}", config_path.display(), e))
     })?;
 
-    if !has_ft_block(&content) {
+    let Some((begin_idx, end_idx)) = validated_wezterm_ft_block_bounds(&content)? else {
         return Ok(PatchResult {
             config_path: config_path.to_path_buf(),
             backup_path: None,
             modified: false,
             message: "WezTerm config does not contain wa block. No changes needed.".to_string(),
         });
-    }
+    };
 
-    // Create backup before modifying
+    // Create backup only after marker structure is known to be valid.
     let backup_path = create_backup(config_path)?;
-
-    // Remove the wa block
-    let begin_idx = content.find(FT_BEGIN_MARKER).unwrap(); // ubs:ignore
-    let end_marker_start = content.find(FT_END_MARKER).unwrap(); // ubs:ignore
-    let end_idx = content[end_marker_start..]
-        .find('\n')
-        .map_or(content.len(), |i| end_marker_start + i + 1);
 
     // Also remove any leading newlines before the block
     let mut start = begin_idx;
@@ -1803,6 +1823,67 @@ return config
 
         assert!(!result.modified);
         assert!(result.backup_path.is_none());
+    }
+
+    #[test]
+    fn test_unpatch_errors_on_partial_begin_marker() {
+        let content = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- FT-BEGIN (do not edit this block)
+-- some wa code
+
+return config
+";
+        let file = create_temp_config(content);
+
+        let err = unpatch_wezterm_config_at(file.path()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("begin marker without FT end marker")
+        );
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn test_unpatch_errors_on_partial_end_marker() {
+        let content = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- some wa code
+-- FT-END
+
+return config
+";
+        let file = create_temp_config(content);
+
+        let err = unpatch_wezterm_config_at(file.path()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("end marker without FT begin marker")
+        );
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
+    }
+
+    #[test]
+    fn test_unpatch_errors_on_reversed_markers() {
+        let content = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- FT-END
+-- some wa code
+-- FT-BEGIN (do not edit this block)
+
+return config
+";
+        let file = create_temp_config(content);
+
+        let err = unpatch_wezterm_config_at(file.path()).unwrap_err();
+
+        assert!(err.to_string().contains("markers out of order"));
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), content);
     }
 
     #[test]

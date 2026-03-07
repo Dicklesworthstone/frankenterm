@@ -377,7 +377,15 @@ impl FdBudget {
         let current = count_open_fds();
         let now = Instant::now();
 
-        let mut history = self.audit_history.write().expect("lock poisoned");
+        let mut history = match self.audit_history.write() {
+            Ok(history) => history,
+            Err(poisoned) => {
+                warn!("FD audit history lock poisoned; resetting leak-detection window");
+                let mut history = poisoned.into_inner();
+                history.clear();
+                history
+            }
+        };
         history.push((now, current));
 
         // Keep only recent history (2x the detection window)
@@ -657,6 +665,21 @@ mod tests {
         let budget = FdBudget::with_limit(test_config(), 100_000);
         let result = budget.audit();
         assert!(result.current_fds > 0);
+        assert!(!result.leak_detected);
+    }
+
+    #[test]
+    fn audit_recovers_from_poisoned_history_lock() {
+        let budget = FdBudget::with_limit(test_config(), 100_000);
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = budget.audit_history.write().unwrap();
+            panic!("poison audit history");
+        }));
+
+        let result = budget.audit();
+        assert!(result.current_fds > 0);
+        assert_eq!(result.audit_count, 1);
         assert!(!result.leak_detected);
     }
 
