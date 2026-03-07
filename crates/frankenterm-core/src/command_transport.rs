@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::policy::{PolicyDecision, PolicySurface};
+use crate::policy::{ActionKind, ActorKind, PolicyDecision, PolicySurface};
 use crate::session_topology::{
     LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
     MuxPaneLifecycleState,
@@ -266,21 +266,30 @@ pub struct CommandPolicyTrace {
     pub decision: String,
     pub surface: PolicySurface,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<ActorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ActionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub determining_rule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
 }
 
 impl CommandPolicyTrace {
     /// Preserve the explicit surface unless a non-unknown decision context surface exists.
     #[must_use]
     pub fn from_surface_and_decision(surface: PolicySurface, decision: &PolicyDecision) -> Self {
-        let context_surface = decision.context().map(|ctx| ctx.surface);
-        let determining_rule = decision
-            .context()
-            .and_then(|ctx| ctx.determining_rule.clone());
+        let context = decision.context();
+        let context_surface = context.map(|ctx| ctx.surface);
+        let determining_rule = context.and_then(|ctx| ctx.determining_rule.clone());
         let surface = match context_surface {
             Some(PolicySurface::Unknown) | None => surface,
             Some(explicit) => explicit,
@@ -289,9 +298,14 @@ impl CommandPolicyTrace {
         Self {
             decision: decision.as_str().to_string(),
             surface,
+            actor: context.map(|ctx| ctx.actor),
+            action: context.map(|ctx| ctx.action),
             reason: decision.reason().map(ToString::to_string),
             rule_id: decision.rule_id().map(ToString::to_string),
             determining_rule,
+            pane_id: context.and_then(|ctx| ctx.pane_id),
+            domain: context.and_then(|ctx| ctx.domain.clone()),
+            workflow_id: context.and_then(|ctx| ctx.workflow_id.clone()),
         }
     }
 }
@@ -588,8 +602,14 @@ impl CommandRouter {
             policy_denied = result.policy_denied_count(),
             routing_errors = result.routing_error_count(),
             policy_surface = request.context.policy_trace.as_ref().map(|trace| trace.surface.as_str()),
+            policy_actor = request.context.policy_trace.as_ref().and_then(|trace| trace.actor.map(|actor| actor.as_str())),
+            policy_action = request.context.policy_trace.as_ref().and_then(|trace| trace.action.map(|action| action.as_str())),
             policy_decision = request.context.policy_trace.as_ref().map(|trace| trace.decision.as_str()),
             policy_rule_id = request.context.policy_trace.as_ref().and_then(|trace| trace.rule_id.as_deref()),
+            policy_determining_rule = request.context.policy_trace.as_ref().and_then(|trace| trace.determining_rule.as_deref()),
+            policy_pane_id = request.context.policy_trace.as_ref().and_then(|trace| trace.pane_id),
+            policy_domain = request.context.policy_trace.as_ref().and_then(|trace| trace.domain.as_deref()),
+            policy_workflow_id = request.context.policy_trace.as_ref().and_then(|trace| trace.workflow_id.as_deref()),
             dry_run = request.dry_run,
             elapsed_us,
             "command routed"
@@ -1440,9 +1460,14 @@ mod tests {
 
         assert_eq!(trace.decision, "deny");
         assert_eq!(trace.surface, PolicySurface::Swarm);
+        assert_eq!(trace.actor, Some(ActorKind::Robot));
+        assert_eq!(trace.action, Some(ActionKind::SendText));
         assert_eq!(trace.reason.as_deref(), Some("blocked"));
         assert_eq!(trace.rule_id.as_deref(), Some("policy.route.test"));
         assert_eq!(trace.determining_rule.as_deref(), Some("policy.route.test"));
+        assert_eq!(trace.pane_id, Some(1));
+        assert_eq!(trace.domain, None);
+        assert_eq!(trace.workflow_id, None);
     }
 
     #[test]
@@ -1456,14 +1481,37 @@ mod tests {
         assert_eq!(trace.decision, "allow");
         assert_eq!(trace.surface, PolicySurface::Mux);
         assert_eq!(trace.rule_id.as_deref(), Some("policy.route.allow"));
+        assert!(trace.actor.is_none());
+        assert!(trace.action.is_none());
         assert!(trace.reason.is_none());
         assert!(trace.determining_rule.is_none());
+        assert!(trace.pane_id.is_none());
+        assert!(trace.domain.is_none());
+        assert!(trace.workflow_id.is_none());
     }
 
     #[test]
     fn audit_log_preserves_policy_trace_and_full_delivery_breakdown() {
         let registry = seed_registry();
         let mut router = CommandRouter::new();
+        let decision = PolicyDecision::allow_with_rule("policy.route.broadcast").with_context(
+            DecisionContext {
+                timestamp_ms: 260,
+                action: ActionKind::SendText,
+                actor: ActorKind::Workflow,
+                surface: PolicySurface::Swarm,
+                pane_id: Some(7),
+                domain: Some("local".to_string()),
+                capabilities: PaneCapabilities::default(),
+                text_summary: Some("attention all agents".to_string()),
+                workflow_id: Some("wf-broadcast".to_string()),
+                rules_evaluated: Vec::new(),
+                determining_rule: Some("policy.route.broadcast".to_string()),
+                evidence: Vec::new(),
+                rate_limit: None,
+                risk: None,
+            },
+        );
         let request = CommandRequest {
             command_id: "trace-1".to_string(),
             scope: CommandScope::fleet(),
@@ -1471,10 +1519,7 @@ mod tests {
                 text: "attention all agents".to_string(),
                 paste_mode: false,
             },
-            context: test_context(260).with_policy_decision(
-                PolicySurface::Swarm,
-                &PolicyDecision::allow_with_rule("policy.route.broadcast"),
-            ),
+            context: test_context(260).with_policy_decision(PolicySurface::Swarm, &decision),
             dry_run: false,
         };
 
@@ -1494,8 +1539,17 @@ mod tests {
             .as_ref()
             .expect("audit trace must persist");
         assert_eq!(trace.surface, PolicySurface::Swarm);
+        assert_eq!(trace.actor, Some(ActorKind::Workflow));
+        assert_eq!(trace.action, Some(ActionKind::SendText));
         assert_eq!(trace.decision, "allow");
         assert_eq!(trace.rule_id.as_deref(), Some("policy.route.broadcast"));
+        assert_eq!(
+            trace.determining_rule.as_deref(),
+            Some("policy.route.broadcast")
+        );
+        assert_eq!(trace.pane_id, Some(7));
+        assert_eq!(trace.domain.as_deref(), Some("local"));
+        assert_eq!(trace.workflow_id.as_deref(), Some("wf-broadcast"));
     }
 
     // =========================================================================
