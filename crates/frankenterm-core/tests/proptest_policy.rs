@@ -52,6 +52,19 @@ fn arb_risk_category() -> impl Strategy<Value = RiskCategory> {
     ]
 }
 
+fn arb_policy_surface() -> impl Strategy<Value = PolicySurface> {
+    prop_oneof![
+        Just(PolicySurface::Unknown),
+        Just(PolicySurface::Mux),
+        Just(PolicySurface::Swarm),
+        Just(PolicySurface::Robot),
+        Just(PolicySurface::Connector),
+        Just(PolicySurface::Workflow),
+        Just(PolicySurface::Mcp),
+        Just(PolicySurface::Ipc),
+    ]
+}
+
 fn arb_pane_capabilities() -> impl Strategy<Value = PaneCapabilities> {
     (
         proptest::bool::ANY,
@@ -1352,5 +1365,331 @@ proptest! {
         let parsed: SendTextAuditSummary = serde_json::from_str(&summary).unwrap();
         prop_assert_eq!(parsed.command_candidate, is_command_candidate(&text),
             "command_candidate should match is_command_candidate for: {}", text);
+    }
+
+    // ========================================================================
+    // PolicySurface Properties (ft-3681t.6.1 support slice)
+    // ========================================================================
+
+    /// Property 73: PolicySurface serde roundtrip preserves all 8 variants
+    #[test]
+    fn prop_surface_serde_roundtrip(surface in arb_policy_surface()) {
+        let json = serde_json::to_string(&surface).unwrap();
+        let back: PolicySurface = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(surface, back,
+            "PolicySurface serde roundtrip failed for {:?}", surface);
+    }
+
+    /// Property 74: PolicySurface as_str() returns non-empty stable identifier
+    #[test]
+    fn prop_surface_as_str_nonempty(surface in arb_policy_surface()) {
+        let s = surface.as_str();
+        prop_assert!(!s.is_empty(), "as_str() should never be empty");
+        // Verify lowercase convention
+        prop_assert_eq!(s, s.to_lowercase(), "as_str() should be lowercase: {}", s);
+    }
+
+    /// Property 75: PolicySurface as_str() matches serde serialization value
+    #[test]
+    fn prop_surface_as_str_matches_serde(surface in arb_policy_surface()) {
+        let json = serde_json::to_string(&surface).unwrap();
+        // Serde serializes as quoted string: "mux", "robot", etc.
+        let expected = format!("\"{}\"", surface.as_str());
+        prop_assert_eq!(json, expected,
+            "as_str() should match serde output for {:?}", surface);
+    }
+
+    /// Property 76: default_for_actor returns deterministic surface for each actor
+    #[test]
+    fn prop_surface_default_for_actor_deterministic(actor in arb_actor_kind()) {
+        let s1 = PolicySurface::default_for_actor(actor);
+        let s2 = PolicySurface::default_for_actor(actor);
+        prop_assert_eq!(s1, s2,
+            "default_for_actor should be deterministic for {:?}", actor);
+    }
+
+    /// Property 77: Human actor always gets Unknown default surface
+    #[test]
+    fn prop_surface_human_always_unknown(_dummy in 0..100u32) {
+        let surface = PolicySurface::default_for_actor(ActorKind::Human);
+        prop_assert_eq!(surface, PolicySurface::Unknown,
+            "Human actor should always get Unknown surface");
+    }
+
+    /// Property 78: Non-human actors get specific (non-Unknown) default surfaces
+    #[test]
+    fn prop_surface_nonhuman_specific(actor in prop_oneof![
+        Just(ActorKind::Robot),
+        Just(ActorKind::Mcp),
+        Just(ActorKind::Workflow),
+    ]) {
+        let surface = PolicySurface::default_for_actor(actor);
+        prop_assert_ne!(surface, PolicySurface::Unknown,
+            "Non-human actor {:?} should get specific surface", actor);
+    }
+
+    /// Property 79: PolicyInput::new assigns actor-based default surface
+    #[test]
+    fn prop_input_new_default_surface(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+    ) {
+        let input = PolicyInput::new(action, actor);
+        let expected = PolicySurface::default_for_actor(actor);
+        prop_assert_eq!(input.surface, expected,
+            "PolicyInput::new should assign default surface for {:?}", actor);
+    }
+
+    /// Property 80: Direct surface override on PolicyInput takes effect
+    #[test]
+    fn prop_input_surface_override(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        surface in arb_policy_surface(),
+    ) {
+        let mut input = PolicyInput::new(action, actor);
+        input.surface = surface;
+        prop_assert_eq!(input.surface, surface,
+            "Direct surface assignment should take effect");
+    }
+
+    /// Property 81: DecisionContext::from_input preserves input surface
+    #[test]
+    fn prop_context_from_input_preserves_surface(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        surface in arb_policy_surface(),
+    ) {
+        let mut input = PolicyInput::new(action, actor);
+        input.surface = surface;
+        let ctx = DecisionContext::from_input(&input);
+        prop_assert_eq!(ctx.surface, surface,
+            "DecisionContext should preserve input surface");
+    }
+
+    /// Property 82: DecisionContext serde roundtrip preserves surface
+    #[test]
+    fn prop_context_surface_serde_roundtrip(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        surface in arb_policy_surface(),
+    ) {
+        let mut input = PolicyInput::new(action, actor);
+        input.surface = surface;
+        let ctx = DecisionContext::from_input(&input);
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: DecisionContext = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.surface, surface,
+            "DecisionContext surface should survive serde roundtrip");
+    }
+
+    /// Property 83: Empty surfaces list in PolicyRuleMatch is catch-all for surface
+    #[test]
+    fn prop_rule_empty_surfaces_catches_all(
+        surface in arb_policy_surface(),
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+    ) {
+        let rule = frankenterm_core::config::PolicyRuleMatch::default();
+        // An empty catch-all match_on should match any surface
+        let mut input = PolicyInput::new(action, actor);
+        input.surface = surface;
+
+        // Construct a policy engine with a catch-all deny rule
+        let mut engine = PolicyEngine::permissive().with_policy_rules(
+            frankenterm_core::config::PolicyRulesConfig {
+                enabled: true,
+                rules: vec![frankenterm_core::config::PolicyRule {
+                    id: "test.catchall".to_string(),
+                    description: Some("catch-all rule".to_string()),
+                    priority: 1,
+                    match_on: rule,
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: None,
+                }],
+            },
+        );
+
+        // Should match regardless of surface (catch-all)
+        input.capabilities = PaneCapabilities::prompt();
+        let decision = engine.authorize(&input);
+        prop_assert!(!decision.is_allowed(),
+            "Catch-all rule should deny on any surface {:?}", surface);
+    }
+
+    /// Property 84: Surface-specific rule only matches listed surface
+    #[test]
+    fn prop_rule_surface_filter(
+        target_surface in arb_policy_surface(),
+        input_surface in arb_policy_surface(),
+    ) {
+        let rule_match = frankenterm_core::config::PolicyRuleMatch {
+            surfaces: vec![target_surface.as_str().to_string()],
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::permissive().with_policy_rules(
+            frankenterm_core::config::PolicyRulesConfig {
+                enabled: true,
+                rules: vec![frankenterm_core::config::PolicyRule {
+                    id: "test.surface.filter".to_string(),
+                    description: Some("surface-filtered rule".to_string()),
+                    priority: 1,
+                    match_on: rule_match,
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: None,
+                }],
+            },
+        );
+
+        let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
+        input.surface = input_surface;
+        input.capabilities = PaneCapabilities::prompt();
+        let decision = engine.authorize(&input);
+
+        if target_surface == input_surface {
+            prop_assert!(!decision.is_allowed(),
+                "Surface-filtered rule should deny when surfaces match: {:?}",
+                target_surface);
+        } else {
+            prop_assert!(decision.is_allowed(),
+                "Surface-filtered rule should allow when surfaces differ: target={:?}, input={:?}",
+                target_surface, input_surface);
+        }
+    }
+
+    /// Property 85: Surface matching is case-insensitive
+    #[test]
+    fn prop_surface_case_insensitive(surface in arb_policy_surface()) {
+        let upper_name = surface.as_str().to_uppercase();
+        let rule_match = frankenterm_core::config::PolicyRuleMatch {
+            surfaces: vec![upper_name.clone()],
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::permissive().with_policy_rules(
+            frankenterm_core::config::PolicyRulesConfig {
+                enabled: true,
+                rules: vec![frankenterm_core::config::PolicyRule {
+                    id: "test.surface.case".to_string(),
+                    description: None,
+                    priority: 1,
+                    match_on: rule_match,
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: None,
+                }],
+            },
+        );
+
+        let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
+        input.surface = surface;
+        input.capabilities = PaneCapabilities::prompt();
+        let decision = engine.authorize(&input);
+        prop_assert!(!decision.is_allowed(),
+            "Surface matching should be case-insensitive: rule='{}', input='{}'",
+            upper_name, surface.as_str());
+    }
+
+    /// Property 86: Surface specificity contributes to tie-breaking
+    #[test]
+    fn prop_surface_specificity(surface in arb_policy_surface()) {
+        let with_surface = frankenterm_core::config::PolicyRuleMatch {
+            surfaces: vec![surface.as_str().to_string()],
+            ..Default::default()
+        };
+        let without_surface = frankenterm_core::config::PolicyRuleMatch::default();
+
+        // A rule with surface filter should have higher specificity than catch-all
+        prop_assert!(with_surface.specificity() > without_surface.specificity(),
+            "Rule with surface should have higher specificity than catch-all");
+    }
+
+    /// Property 87: Multiple surfaces in rule match any of them (OR semantics)
+    #[test]
+    fn prop_rule_multi_surface_or(
+        s1 in arb_policy_surface(),
+        s2 in arb_policy_surface(),
+        test_surface in arb_policy_surface(),
+    ) {
+        let rule_match = frankenterm_core::config::PolicyRuleMatch {
+            surfaces: vec![s1.as_str().to_string(), s2.as_str().to_string()],
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::permissive().with_policy_rules(
+            frankenterm_core::config::PolicyRulesConfig {
+                enabled: true,
+                rules: vec![frankenterm_core::config::PolicyRule {
+                    id: "test.multi.surface".to_string(),
+                    description: None,
+                    priority: 1,
+                    match_on: rule_match,
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: None,
+                }],
+            },
+        );
+
+        let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot);
+        input.surface = test_surface;
+        input.capabilities = PaneCapabilities::prompt();
+        let decision = engine.authorize(&input);
+
+        let should_match = test_surface == s1 || test_surface == s2;
+        if should_match {
+            prop_assert!(!decision.is_allowed(),
+                "Multi-surface rule should deny when test_surface={:?} matches s1={:?} or s2={:?}",
+                test_surface, s1, s2);
+        } else {
+            prop_assert!(decision.is_allowed(),
+                "Multi-surface rule should allow when test_surface={:?} matches neither s1={:?} nor s2={:?}",
+                test_surface, s1, s2);
+        }
+    }
+
+    /// Property 88: DecisionContext evidence includes surface field
+    #[test]
+    fn prop_context_evidence_includes_surface(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        surface in arb_policy_surface(),
+    ) {
+        let mut input = PolicyInput::new(action, actor);
+        input.surface = surface;
+        let ctx = DecisionContext::from_input(&input);
+        let has_surface_evidence = ctx.evidence.iter().any(|e| e.key == "surface");
+        prop_assert!(has_surface_evidence,
+            "DecisionContext evidence should include surface field");
+        let surface_val = ctx.evidence.iter()
+            .find(|e| e.key == "surface")
+            .map(|e| e.value.as_str())
+            .unwrap();
+        prop_assert_eq!(surface_val, surface.as_str(),
+            "Surface evidence value should match input surface");
+    }
+
+    /// Property 89: All PolicySurface variants have distinct as_str values
+    #[test]
+    fn prop_surface_as_str_unique(
+        s1 in arb_policy_surface(),
+        s2 in arb_policy_surface(),
+    ) {
+        if s1 != s2 {
+            prop_assert_ne!(s1.as_str(), s2.as_str(),
+                "Different PolicySurface variants should have different as_str values: {:?} vs {:?}",
+                s1, s2);
+        }
+    }
+
+    /// Property 90: PolicyInput serde roundtrip preserves surface
+    #[test]
+    fn prop_input_surface_serde_roundtrip(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        surface in arb_policy_surface(),
+    ) {
+        let mut input = PolicyInput::new(action, actor);
+        input.surface = surface;
+        let json = serde_json::to_string(&input).unwrap();
+        let back: PolicyInput = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.surface, surface,
+            "PolicyInput serde roundtrip should preserve surface");
     }
 }

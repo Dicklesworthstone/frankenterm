@@ -44,9 +44,18 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::LazyLock;
 use std::time::SystemTime;
+
+use crate::connector_data_classification::{DataSensitivity, RedactionStrategy};
+use crate::connector_event_model::{CanonicalConnectorEvent, CanonicalSeverity};
+use crate::connector_host_runtime::{
+    ConnectorCapability, ConnectorFailureClass, ConnectorLifecyclePhase,
+};
+use crate::diagnostic_redaction::DiagnosticFieldPolicy;
+use crate::recorder_audit::{AccessTier, AuditEventType, AuthzDecision, RecorderAuditEntry};
 
 // =============================================================================
 // Health tier (unified 4-tier pattern)
@@ -454,6 +463,613 @@ impl RuntimeTelemetryEvent {
             .unwrap_or_default()
             .as_millis() as u64
     }
+}
+
+// =============================================================================
+// Cross-subsystem telemetry normalization
+// =============================================================================
+
+/// Schema version for the cross-subsystem unified telemetry contract.
+pub const UNIFIED_TELEMETRY_SCHEMA_VERSION: &str = "ft.telemetry.unified.v1";
+
+static UNIFIED_TELEMETRY_FIELD_POLICY: LazyLock<DiagnosticFieldPolicy> =
+    LazyLock::new(DiagnosticFieldPolicy::default);
+
+/// Source subsystem family for a normalized telemetry record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnifiedTelemetrySource {
+    /// Runtime / mux / swarm operational telemetry.
+    Runtime,
+    /// Connector lifecycle, inbound, and outbound events.
+    Connector,
+    /// Policy and recorder audit trail events.
+    Policy,
+}
+
+/// Safe cross-subsystem telemetry record for storage, alerting, and dashboards.
+///
+/// This record is intentionally narrower than each source schema. It keeps the
+/// fields needed for correlation, triage, and severity routing while projecting
+/// source-specific payloads into a redacted attribute bag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnifiedTelemetryRecord {
+    /// Unified schema version for this normalized contract.
+    pub schema_version: String,
+    /// Original source family.
+    pub source: UnifiedTelemetrySource,
+    /// Stable identifier for this normalized record.
+    pub record_id: String,
+    /// Original source schema version, when the source schema carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_schema_version: Option<String>,
+    /// Event timestamp in epoch milliseconds.
+    pub timestamp_ms: u64,
+    /// Normalized emitting component identifier.
+    pub component: String,
+    /// Stable reason/event code used for correlation, filtering, and alerting.
+    pub reason_code: String,
+    /// Shared correlation identifier when the source provides one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// Primary normalized scope identifier, when one can be inferred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
+    /// Normalized health/severity tier.
+    pub health_tier: HealthTier,
+    /// Normalized failure class when present or inferable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<FailureClass>,
+    /// Highest sensitivity classification still implied by this record.
+    pub sensitivity: DataSensitivity,
+    /// Dominant redaction strategy used to make this record safe to emit.
+    pub redaction_strategy: RedactionStrategy,
+    /// Safe structural attributes preserved from the source event.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attributes: BTreeMap<String, serde_json::Value>,
+}
+
+impl UnifiedTelemetryRecord {
+    /// Normalize a runtime telemetry event into the shared record shape.
+    #[must_use]
+    pub fn from_runtime_event(event: &RuntimeTelemetryEvent) -> Self {
+        let mut attributes = BTreeMap::new();
+        let (sanitized_details, sensitivity, redaction_strategy, redacted_detail_count) =
+            sanitize_runtime_details(&event.details);
+
+        attributes.insert(
+            "event_kind".to_string(),
+            serde_json::json!(enum_string(&event.event_kind)),
+        );
+        attributes.insert(
+            "category".to_string(),
+            serde_json::json!(event.event_kind.category()),
+        );
+        attributes.insert(
+            "phase".to_string(),
+            serde_json::json!(event.phase.to_string()),
+        );
+        if redacted_detail_count > 0 {
+            attributes.insert(
+                "redacted_detail_count".to_string(),
+                serde_json::json!(redacted_detail_count),
+            );
+        }
+        attributes.extend(sanitized_details);
+
+        Self {
+            schema_version: UNIFIED_TELEMETRY_SCHEMA_VERSION.to_string(),
+            source: UnifiedTelemetrySource::Runtime,
+            record_id: runtime_record_id(event),
+            source_schema_version: None,
+            timestamp_ms: event.timestamp_ms,
+            component: event.component.clone(),
+            reason_code: runtime_reason_code(event),
+            correlation_id: non_empty_string(&event.correlation_id),
+            scope_id: event.scope_id.clone(),
+            health_tier: event.health_tier,
+            failure_class: event.failure_class,
+            sensitivity,
+            redaction_strategy,
+            attributes,
+        }
+    }
+
+    /// Normalize a canonical connector event into the shared record shape.
+    #[must_use]
+    pub fn from_connector_event(event: &CanonicalConnectorEvent) -> Self {
+        let mut attributes = BTreeMap::new();
+        let mut sensitivity = DataSensitivity::Internal;
+        let mut redaction_strategy = RedactionStrategy::Passthrough;
+        let failure_class = event.failure_class.map(|class| match class {
+            ConnectorFailureClass::Auth => FailureClass::Permanent,
+            ConnectorFailureClass::Quota => FailureClass::Overload,
+            ConnectorFailureClass::Network => FailureClass::Transient,
+            ConnectorFailureClass::Policy => FailureClass::Safety,
+            ConnectorFailureClass::Validation => FailureClass::Configuration,
+            ConnectorFailureClass::Timeout => FailureClass::Timeout,
+            ConnectorFailureClass::Unknown => FailureClass::Permanent,
+        });
+
+        attributes.insert(
+            "direction".to_string(),
+            serde_json::json!(event.direction.as_str()),
+        );
+        attributes.insert(
+            "severity".to_string(),
+            serde_json::json!(event.severity.as_str()),
+        );
+        if let Some(name) = &event.connector_name {
+            attributes.insert("connector_name".to_string(), serde_json::json!(name));
+        }
+        if let Some(kind) = &event.signal_kind {
+            attributes.insert(
+                "signal_kind".to_string(),
+                serde_json::json!(enum_string(kind)),
+            );
+        }
+        if let Some(sub_type) = &event.signal_sub_type {
+            attributes.insert("signal_sub_type".to_string(), serde_json::json!(sub_type));
+        }
+        if let Some(source) = &event.event_source {
+            attributes.insert(
+                "event_source".to_string(),
+                serde_json::json!(enum_string(source)),
+            );
+        }
+        if let Some(kind) = &event.action_kind {
+            attributes.insert(
+                "action_kind".to_string(),
+                serde_json::json!(enum_string(kind)),
+            );
+        }
+        if let Some(phase) = event.lifecycle_phase {
+            attributes.insert(
+                "lifecycle_phase".to_string(),
+                serde_json::json!(phase.as_str()),
+            );
+        }
+        if let Some(class) = event.failure_class {
+            attributes.insert(
+                "connector_failure_class".to_string(),
+                serde_json::json!(class.as_str()),
+            );
+        }
+        if let Some(pane_id) = event.pane_id {
+            attributes.insert("pane_id".to_string(), serde_json::json!(pane_id));
+        }
+        if let Some(workflow_id) = &event.workflow_id {
+            attributes.insert("workflow_id".to_string(), serde_json::json!(workflow_id));
+        }
+        if let Some(zone_id) = &event.zone_id {
+            attributes.insert("zone_id".to_string(), serde_json::json!(zone_id));
+        }
+        if let Some(capability) = event.capability {
+            attributes.insert(
+                "capability".to_string(),
+                serde_json::json!(capability.as_str()),
+            );
+        }
+
+        if !event.metadata.is_empty() {
+            let metadata_keys = event.metadata.keys().cloned().collect::<Vec<_>>();
+            attributes.insert(
+                "metadata_keys".to_string(),
+                serde_json::json!(metadata_keys),
+            );
+            attributes.insert(
+                "metadata_count".to_string(),
+                serde_json::json!(event.metadata.len()),
+            );
+            redaction_strategy = RedactionStrategy::Remove;
+        }
+
+        if !event.payload.is_null() {
+            attributes.insert("payload_redacted".to_string(), serde_json::json!(true));
+            summarize_value_shape("payload", &event.payload, &mut attributes);
+            sensitivity = sensitivity.max(DataSensitivity::Confidential);
+            redaction_strategy = RedactionStrategy::Remove;
+        }
+
+        if matches!(event.capability, Some(ConnectorCapability::SecretBroker))
+            || matches!(event.failure_class, Some(ConnectorFailureClass::Auth))
+        {
+            sensitivity = sensitivity.max(DataSensitivity::Restricted);
+            redaction_strategy = RedactionStrategy::Remove;
+        }
+
+        Self {
+            schema_version: UNIFIED_TELEMETRY_SCHEMA_VERSION.to_string(),
+            source: UnifiedTelemetrySource::Connector,
+            record_id: event.event_id.clone(),
+            source_schema_version: Some(event.schema_version.to_string()),
+            timestamp_ms: event.timestamp_ms,
+            component: format!("connector.{}", event.connector_id),
+            reason_code: event.event_type.clone(),
+            correlation_id: non_empty_string(&event.correlation_id),
+            scope_id: connector_scope_id(event),
+            health_tier: connector_health_tier(event, failure_class),
+            failure_class,
+            sensitivity,
+            redaction_strategy,
+            attributes,
+        }
+    }
+
+    /// Normalize a recorder audit entry into the shared record shape.
+    #[must_use]
+    pub fn from_recorder_audit(entry: &RecorderAuditEntry) -> Self {
+        let mut attributes = BTreeMap::new();
+        let access_tier = audit_access_tier(entry.event_type);
+        let mut sensitivity = sensitivity_for_access_tier(access_tier);
+        let mut redaction_strategy = RedactionStrategy::Passthrough;
+
+        attributes.insert(
+            "event_type".to_string(),
+            serde_json::json!(enum_string(&entry.event_type)),
+        );
+        attributes.insert(
+            "actor_kind".to_string(),
+            serde_json::json!(entry.actor.kind.as_str()),
+        );
+        attributes.insert(
+            "actor_identity_hash".to_string(),
+            serde_json::json!(stable_hash(&entry.actor.identity)),
+        );
+        attributes.insert(
+            "decision".to_string(),
+            serde_json::json!(enum_string(&entry.decision)),
+        );
+        attributes.insert(
+            "access_tier".to_string(),
+            serde_json::json!(access_tier.level()),
+        );
+        attributes.insert(
+            "policy_version".to_string(),
+            serde_json::json!(entry.policy_version),
+        );
+
+        if !entry.scope.pane_ids.is_empty() {
+            attributes.insert(
+                "pane_count".to_string(),
+                serde_json::json!(entry.scope.pane_ids.len()),
+            );
+            attributes.insert(
+                "pane_ids".to_string(),
+                serde_json::json!(entry.scope.pane_ids),
+            );
+        }
+        if let Some((start_ms, end_ms)) = entry.scope.time_range {
+            attributes.insert(
+                "time_range_start_ms".to_string(),
+                serde_json::json!(start_ms),
+            );
+            attributes.insert("time_range_end_ms".to_string(), serde_json::json!(end_ms));
+        }
+        if !entry.scope.segment_ids.is_empty() {
+            attributes.insert(
+                "segment_count".to_string(),
+                serde_json::json!(entry.scope.segment_ids.len()),
+            );
+        }
+        if let Some(result_count) = entry.scope.result_count {
+            attributes.insert("result_count".to_string(), serde_json::json!(result_count));
+        }
+        if let Some(query) = &entry.scope.query {
+            attributes.insert("query_redacted".to_string(), serde_json::json!(true));
+            attributes.insert(
+                "query_length".to_string(),
+                serde_json::json!(query.chars().count()),
+            );
+            sensitivity = sensitivity.max(DataSensitivity::Confidential);
+            redaction_strategy = RedactionStrategy::Remove;
+        }
+        if let Some(justification) = &entry.justification {
+            attributes.insert(
+                "justification_redacted".to_string(),
+                serde_json::json!(true),
+            );
+            attributes.insert(
+                "justification_length".to_string(),
+                serde_json::json!(justification.chars().count()),
+            );
+            sensitivity = sensitivity.max(DataSensitivity::Restricted);
+            redaction_strategy = RedactionStrategy::Remove;
+        }
+        if let Some(details) = &entry.details {
+            attributes.insert("details_redacted".to_string(), serde_json::json!(true));
+            summarize_value_shape("details", details, &mut attributes);
+            sensitivity = sensitivity.max(DataSensitivity::Restricted);
+            redaction_strategy = RedactionStrategy::Remove;
+        }
+
+        Self {
+            schema_version: UNIFIED_TELEMETRY_SCHEMA_VERSION.to_string(),
+            source: UnifiedTelemetrySource::Policy,
+            record_id: format!("audit-{}", entry.ordinal),
+            source_schema_version: Some(entry.audit_version.clone()),
+            timestamp_ms: entry.timestamp_ms,
+            component: "policy.recorder_audit".to_string(),
+            reason_code: format!("policy.audit.{}", enum_string(&entry.event_type)),
+            correlation_id: audit_correlation_id(entry),
+            scope_id: audit_scope_id(entry),
+            health_tier: audit_health_tier(entry.decision.clone(), access_tier),
+            failure_class: audit_failure_class(entry.decision.clone()),
+            sensitivity,
+            redaction_strategy,
+            attributes,
+        }
+    }
+}
+
+impl From<&RuntimeTelemetryEvent> for UnifiedTelemetryRecord {
+    fn from(event: &RuntimeTelemetryEvent) -> Self {
+        Self::from_runtime_event(event)
+    }
+}
+
+impl From<&CanonicalConnectorEvent> for UnifiedTelemetryRecord {
+    fn from(event: &CanonicalConnectorEvent) -> Self {
+        Self::from_connector_event(event)
+    }
+}
+
+impl From<&RecorderAuditEntry> for UnifiedTelemetryRecord {
+    fn from(entry: &RecorderAuditEntry) -> Self {
+        Self::from_recorder_audit(entry)
+    }
+}
+
+fn sanitize_runtime_details(
+    details: &HashMap<String, serde_json::Value>,
+) -> (
+    BTreeMap<String, serde_json::Value>,
+    DataSensitivity,
+    RedactionStrategy,
+    usize,
+) {
+    let mut attributes = BTreeMap::new();
+    let mut sensitivity = DataSensitivity::Internal;
+    let mut redaction_strategy = RedactionStrategy::Passthrough;
+    let mut redacted_fields = 0usize;
+
+    let mut keys = details.keys().cloned().collect::<Vec<_>>();
+    keys.sort_unstable();
+
+    for key in keys {
+        let Some(value) = details.get(&key) else {
+            continue;
+        };
+
+        if UNIFIED_TELEMETRY_FIELD_POLICY.always_redact.contains(&key) {
+            attributes.insert(
+                key,
+                serde_json::json!(UNIFIED_TELEMETRY_FIELD_POLICY.redaction_marker),
+            );
+            sensitivity = sensitivity.max(DataSensitivity::Restricted);
+            redaction_strategy = RedactionStrategy::Mask;
+            redacted_fields += 1;
+            continue;
+        }
+
+        let safe_key = UNIFIED_TELEMETRY_FIELD_POLICY.always_safe.contains(&key);
+        match value {
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                attributes.insert(key, value.clone());
+            }
+            serde_json::Value::String(_) if safe_key => {
+                attributes.insert(key, value.clone());
+            }
+            _ => {
+                attributes.insert(
+                    key,
+                    serde_json::json!(UNIFIED_TELEMETRY_FIELD_POLICY.redaction_marker),
+                );
+                sensitivity = sensitivity.max(DataSensitivity::Confidential);
+                redaction_strategy = RedactionStrategy::Mask;
+                redacted_fields += 1;
+            }
+        }
+    }
+
+    (attributes, sensitivity, redaction_strategy, redacted_fields)
+}
+
+fn runtime_record_id(event: &RuntimeTelemetryEvent) -> String {
+    let reason_code = runtime_reason_code(event);
+    match non_empty_string(&event.correlation_id) {
+        Some(correlation_id) => format!(
+            "rt:{}:{}:{}:{}",
+            event.timestamp_ms, event.component, correlation_id, reason_code
+        ),
+        None => format!(
+            "rt:{}:{}:{}",
+            event.timestamp_ms, event.component, reason_code
+        ),
+    }
+}
+
+fn runtime_reason_code(event: &RuntimeTelemetryEvent) -> String {
+    if event.reason_code.is_empty() {
+        enum_string(&event.event_kind)
+    } else {
+        event.reason_code.clone()
+    }
+}
+
+fn connector_scope_id(event: &CanonicalConnectorEvent) -> Option<String> {
+    event
+        .workflow_id
+        .as_ref()
+        .map(|workflow_id| format!("workflow:{workflow_id}"))
+        .or_else(|| event.pane_id.map(|pane_id| format!("pane:{pane_id}")))
+        .or_else(|| {
+            event
+                .zone_id
+                .as_ref()
+                .map(|zone_id| format!("zone:{zone_id}"))
+        })
+}
+
+fn connector_health_tier(
+    event: &CanonicalConnectorEvent,
+    failure_class: Option<FailureClass>,
+) -> HealthTier {
+    let mut tier = match event.severity {
+        CanonicalSeverity::Info => HealthTier::Green,
+        CanonicalSeverity::Warning => HealthTier::Yellow,
+        CanonicalSeverity::Critical => HealthTier::Red,
+    };
+
+    if let Some(phase) = event.lifecycle_phase {
+        let phase_tier = match phase {
+            ConnectorLifecyclePhase::Stopped
+            | ConnectorLifecyclePhase::Starting
+            | ConnectorLifecyclePhase::Running => HealthTier::Green,
+            ConnectorLifecyclePhase::Degraded => HealthTier::Red,
+            ConnectorLifecyclePhase::Failed => HealthTier::Black,
+        };
+        tier = tier.max(phase_tier);
+    }
+
+    if let Some(failure_class) = failure_class {
+        tier = tier.max(failure_class.suggested_tier());
+    }
+
+    tier
+}
+
+fn audit_access_tier(event_type: AuditEventType) -> AccessTier {
+    match event_type {
+        AuditEventType::RecorderQuery => AccessTier::A1RedactedQuery,
+        AuditEventType::RecorderQueryPrivileged => AccessTier::A3PrivilegedRaw,
+        AuditEventType::RecorderReplay | AuditEventType::RecorderExport => AccessTier::A2FullQuery,
+        AuditEventType::AdminRetentionOverride
+        | AuditEventType::AdminPurge
+        | AuditEventType::AdminPolicyChange => AccessTier::A4Admin,
+        AuditEventType::AccessApprovalGranted
+        | AuditEventType::AccessApprovalExpired
+        | AuditEventType::AccessIncidentMode
+        | AuditEventType::AccessDebugMode => AccessTier::A3PrivilegedRaw,
+        AuditEventType::RetentionSegmentSealed
+        | AuditEventType::RetentionSegmentArchived
+        | AuditEventType::RetentionSegmentPurged
+        | AuditEventType::RetentionAcceleratedPurge => AccessTier::A2FullQuery,
+    }
+}
+
+fn sensitivity_for_access_tier(access_tier: AccessTier) -> DataSensitivity {
+    match access_tier {
+        AccessTier::A0PublicMetadata => DataSensitivity::Public,
+        AccessTier::A1RedactedQuery => DataSensitivity::Internal,
+        AccessTier::A2FullQuery => DataSensitivity::Confidential,
+        AccessTier::A3PrivilegedRaw | AccessTier::A4Admin => DataSensitivity::Restricted,
+    }
+}
+
+fn audit_health_tier(decision: AuthzDecision, access_tier: AccessTier) -> HealthTier {
+    let base_tier = match access_tier {
+        AccessTier::A0PublicMetadata | AccessTier::A1RedactedQuery => HealthTier::Green,
+        AccessTier::A2FullQuery => HealthTier::Yellow,
+        AccessTier::A3PrivilegedRaw | AccessTier::A4Admin => HealthTier::Red,
+    };
+    let decision_tier = match decision {
+        AuthzDecision::Allow => HealthTier::Green,
+        AuthzDecision::Elevate => HealthTier::Yellow,
+        AuthzDecision::Deny => HealthTier::Red,
+    };
+    base_tier.max(decision_tier)
+}
+
+fn audit_failure_class(decision: AuthzDecision) -> Option<FailureClass> {
+    match decision {
+        AuthzDecision::Allow => None,
+        AuthzDecision::Deny | AuthzDecision::Elevate => Some(FailureClass::Safety),
+    }
+}
+
+fn audit_scope_id(entry: &RecorderAuditEntry) -> Option<String> {
+    match entry.scope.pane_ids.as_slice() {
+        [pane_id] => Some(format!("pane:{pane_id}")),
+        _ => None,
+    }
+}
+
+fn audit_correlation_id(entry: &RecorderAuditEntry) -> Option<String> {
+    let details = entry.details.as_ref()?;
+    extract_json_string(details, "correlation_id")
+        .or_else(|| extract_json_string(details, "request_id"))
+        .or_else(|| extract_json_string(details, "operation_id"))
+}
+
+fn extract_json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .as_object()
+        .and_then(|object| object.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn summarize_value_shape(
+    prefix: &str,
+    value: &serde_json::Value,
+    attributes: &mut BTreeMap<String, serde_json::Value>,
+) {
+    attributes.insert(
+        format!("{prefix}_type"),
+        serde_json::json!(json_value_kind(value)),
+    );
+
+    match value {
+        serde_json::Value::Array(items) => {
+            attributes.insert(
+                format!("{prefix}_item_count"),
+                serde_json::json!(items.len()),
+            );
+        }
+        serde_json::Value::Object(fields) => {
+            attributes.insert(
+                format!("{prefix}_field_count"),
+                serde_json::json!(fields.len()),
+            );
+        }
+        serde_json::Value::String(text) => {
+            attributes.insert(
+                format!("{prefix}_length"),
+                serde_json::json!(text.chars().count()),
+            );
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn stable_hash(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(value.as_bytes());
+    hex::encode(digest)
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn enum_string<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|serialized| serialized.as_str().map(ToOwned::to_owned))
+        .unwrap_or_default()
 }
 
 // =============================================================================
@@ -1084,6 +1700,11 @@ pub mod reason_codes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector_event_model::EventDirection;
+    use crate::policy::ActorKind;
+    use crate::recorder_audit::{
+        ActorIdentity, AuditEventBuilder, AuditLog, AuditLogConfig, AUDIT_SCHEMA_VERSION,
+    };
 
     // ── HealthTier ──
 
@@ -1464,6 +2085,151 @@ mod tests {
         assert!(json.get("scope_id").is_none());
         assert!(json.get("failure_class").is_none());
         assert!(json.get("details").is_none());
+    }
+
+    // ── UnifiedTelemetryRecord ──
+
+    #[test]
+    fn unified_runtime_record_redacts_sensitive_details() {
+        let event =
+            RuntimeTelemetryEventBuilder::new("rt.error", RuntimeTelemetryKind::TransientError)
+                .scope_id("pane:7")
+                .timestamp_ms(1111)
+                .tier(HealthTier::Yellow)
+                .phase(RuntimePhase::Recovering)
+                .reason("error.recovering.transient")
+                .correlation("corr-123")
+                .failure(FailureClass::Transient)
+                .detail_u64("queue_depth", 9)
+                .detail_str("error_message", "token=super-secret")
+                .detail_str("custom_context", "raw-user-content")
+                .build();
+
+        let record = UnifiedTelemetryRecord::from(&event);
+
+        assert_eq!(record.source, UnifiedTelemetrySource::Runtime);
+        assert_eq!(
+            record.record_id,
+            "rt:1111:rt.error:corr-123:error.recovering.transient"
+        );
+        assert_eq!(record.reason_code, "error.recovering.transient");
+        assert_eq!(record.correlation_id.as_deref(), Some("corr-123"));
+        assert_eq!(record.scope_id.as_deref(), Some("pane:7"));
+        assert_eq!(record.health_tier, HealthTier::Yellow);
+        assert_eq!(record.failure_class, Some(FailureClass::Transient));
+        assert_eq!(record.sensitivity, DataSensitivity::Restricted);
+        assert_eq!(record.redaction_strategy, RedactionStrategy::Mask);
+        assert_eq!(
+            record.attributes.get("queue_depth"),
+            Some(&serde_json::json!(9))
+        );
+        assert_eq!(
+            record.attributes.get("error_message"),
+            Some(&serde_json::json!("[REDACTED]"))
+        );
+        assert_eq!(
+            record.attributes.get("custom_context"),
+            Some(&serde_json::json!("[REDACTED]"))
+        );
+    }
+
+    #[test]
+    fn unified_connector_record_maps_failure_and_payload_redaction() {
+        let event = CanonicalConnectorEvent::new(
+            EventDirection::Outbound,
+            "github",
+            "outbound.notify",
+            serde_json::json!({
+                "token": "secret",
+                "attempts": 2,
+            }),
+        )
+        .with_event_id("evt-42")
+        .with_correlation_id("corr-456")
+        .with_timestamp_ms(2222)
+        .with_severity(CanonicalSeverity::Critical)
+        .with_failure(ConnectorFailureClass::Policy)
+        .with_workflow_id("wf-9")
+        .with_sandbox("zone-a", ConnectorCapability::SecretBroker)
+        .with_connector_name("GitHub")
+        .with_metadata("attempt", "2");
+
+        let record = UnifiedTelemetryRecord::from(&event);
+
+        assert_eq!(record.source, UnifiedTelemetrySource::Connector);
+        assert_eq!(record.record_id, "evt-42");
+        assert_eq!(record.source_schema_version.as_deref(), Some("1.0"));
+        assert_eq!(record.component, "connector.github");
+        assert_eq!(record.reason_code, "outbound.notify");
+        assert_eq!(record.correlation_id.as_deref(), Some("corr-456"));
+        assert_eq!(record.scope_id.as_deref(), Some("workflow:wf-9"));
+        assert_eq!(record.health_tier, HealthTier::Black);
+        assert_eq!(record.failure_class, Some(FailureClass::Safety));
+        assert_eq!(record.sensitivity, DataSensitivity::Restricted);
+        assert_eq!(record.redaction_strategy, RedactionStrategy::Remove);
+        assert_eq!(
+            record.attributes.get("payload_redacted"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            record.attributes.get("payload_field_count"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            record.attributes.get("metadata_keys"),
+            Some(&serde_json::json!(["attempt"]))
+        );
+    }
+
+    #[test]
+    fn unified_policy_record_uses_access_tier_and_safe_correlation() {
+        let log = AuditLog::new(AuditLogConfig::default());
+        let entry = log.append(
+            AuditEventBuilder::new(
+                AuditEventType::RecorderQueryPrivileged,
+                ActorIdentity::new(ActorKind::Human, "session-123"),
+                3333,
+            )
+            .with_decision(AuthzDecision::Deny)
+            .with_pane_ids(vec![7])
+            .with_query("secret")
+            .with_result_count(4)
+            .with_justification("triage")
+            .with_details(serde_json::json!({
+                "correlation_id": "corr-789",
+                "raw": "keep out",
+            })),
+        );
+
+        let record = UnifiedTelemetryRecord::from(&entry);
+
+        assert_eq!(record.source, UnifiedTelemetrySource::Policy);
+        assert_eq!(record.record_id, "audit-0");
+        assert_eq!(
+            record.source_schema_version.as_deref(),
+            Some(AUDIT_SCHEMA_VERSION)
+        );
+        assert_eq!(record.component, "policy.recorder_audit");
+        assert_eq!(record.reason_code, "policy.audit.recorder_query_privileged");
+        assert_eq!(record.correlation_id.as_deref(), Some("corr-789"));
+        assert_eq!(record.scope_id.as_deref(), Some("pane:7"));
+        assert_eq!(record.health_tier, HealthTier::Red);
+        assert_eq!(record.failure_class, Some(FailureClass::Safety));
+        assert_eq!(record.sensitivity, DataSensitivity::Restricted);
+        assert_eq!(record.redaction_strategy, RedactionStrategy::Remove);
+        assert_eq!(
+            record.attributes.get("query_redacted"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            record.attributes.get("query_length"),
+            Some(&serde_json::json!(6))
+        );
+        assert_eq!(
+            record.attributes.get("justification_length"),
+            Some(&serde_json::json!(6))
+        );
+        assert!(record.attributes.contains_key("actor_identity_hash"));
     }
 
     // ── RuntimeTelemetryLog ──

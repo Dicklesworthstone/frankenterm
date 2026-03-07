@@ -70,7 +70,10 @@ impl DataSensitivity {
     /// Whether this level requires redaction before storage.
     #[must_use]
     pub const fn requires_redaction(self) -> bool {
-        matches!(self, Self::Confidential | Self::Restricted | Self::Prohibited)
+        matches!(
+            self,
+            Self::Confidential | Self::Restricted | Self::Prohibited
+        )
     }
 
     /// Whether this level must be completely removed (never stored).
@@ -445,6 +448,26 @@ pub struct RedactionAction {
     pub original_bytes: usize,
 }
 
+impl RedactedEvent {
+    /// Count of fields that were redacted but retained in sanitized form.
+    #[must_use]
+    pub fn fields_redacted(&self) -> u32 {
+        self.redaction_actions
+            .iter()
+            .filter(|action| !matches!(action.strategy, RedactionStrategy::Remove))
+            .count() as u32
+    }
+
+    /// Count of fields that were removed entirely.
+    #[must_use]
+    pub fn fields_removed(&self) -> u32 {
+        self.redaction_actions
+            .iter()
+            .filter(|action| matches!(action.strategy, RedactionStrategy::Remove))
+            .count() as u32
+    }
+}
+
 // =============================================================================
 // Ingestion decision
 // =============================================================================
@@ -673,13 +696,18 @@ impl ConnectorDataClassifier {
         &mut self,
         event: &CanonicalConnectorEvent,
     ) -> Result<ClassifiedEvent, ClassificationError> {
+        self.telemetry.policy_lookups += 1;
+
         let policy = self
             .policies
             .iter()
             .find(|p| p.matches_connector(&event.connector_id))
             .cloned()
-            .ok_or_else(|| ClassificationError::NoPolicyFound {
-                connector_id: event.connector_id.clone(),
+            .ok_or_else(|| {
+                self.telemetry.policy_misses += 1;
+                ClassificationError::NoPolicyFound {
+                    connector_id: event.connector_id.clone(),
+                }
             })?;
 
         // Check payload size
@@ -794,8 +822,7 @@ impl ConnectorDataClassifier {
         sorted_rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
 
         for rule in sorted_rules {
-            let field_match =
-                rule.matches_field(field_name) || rule.matches_field(leaf_name);
+            let field_match = rule.matches_field(field_name) || rule.matches_field(leaf_name);
             if field_match && rule.matches_content(field_value) {
                 return FieldClassification {
                     field_path: field_name.to_string(),
@@ -919,6 +946,26 @@ impl ConnectorDataClassifier {
         event: &CanonicalConnectorEvent,
         classified: &ClassifiedEvent,
     ) -> RedactedEvent {
+        let decision = if classified.has_prohibited() {
+            IngestionDecision::Reject {
+                reason: "prohibited data".into(),
+            }
+        } else if classified.requires_redaction() {
+            IngestionDecision::AcceptRedacted
+        } else {
+            IngestionDecision::Accept
+        };
+
+        self.redact_event_with_decision(event, classified, decision)
+    }
+
+    /// Apply redaction while recording an explicit ingestion decision.
+    pub fn redact_event_with_decision(
+        &mut self,
+        event: &CanonicalConnectorEvent,
+        classified: &ClassifiedEvent,
+        decision: IngestionDecision,
+    ) -> RedactedEvent {
         let mut redacted_event = event.clone();
         let mut actions = Vec::new();
 
@@ -987,16 +1034,6 @@ impl ConnectorDataClassifier {
             .filter(|a| matches!(a.strategy, RedactionStrategy::Remove))
             .count() as u32;
 
-        let decision = if classified.has_prohibited() {
-            IngestionDecision::Reject {
-                reason: "prohibited data".into(),
-            }
-        } else if !actions.is_empty() {
-            IngestionDecision::AcceptRedacted
-        } else {
-            IngestionDecision::Accept
-        };
-
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1007,7 +1044,7 @@ impl ConnectorDataClassifier {
             connector_id: classified.connector_id.clone(),
             policy_id: classified.policy_id.clone(),
             sensitivity: classified.overall_sensitivity,
-            decision,
+            decision: decision.clone(),
             fields_redacted,
             fields_removed,
             secrets_detected: classified.secrets_detected,
@@ -1015,13 +1052,19 @@ impl ConnectorDataClassifier {
         };
         self.push_audit(audit);
 
-        // Update accept/reject telemetry
-        if classified.has_prohibited() {
-            self.telemetry.events_rejected += 1;
-        } else if !actions.is_empty() {
-            self.telemetry.events_accepted_redacted += 1;
-        } else {
-            self.telemetry.events_accepted += 1;
+        match decision {
+            IngestionDecision::Accept => {
+                self.telemetry.events_accepted += 1;
+            }
+            IngestionDecision::AcceptRedacted => {
+                self.telemetry.events_accepted_redacted += 1;
+            }
+            IngestionDecision::Reject { .. } => {
+                self.telemetry.events_rejected += 1;
+            }
+            IngestionDecision::Quarantine { .. } => {
+                self.telemetry.events_quarantined += 1;
+            }
         }
 
         RedactedEvent {
@@ -1132,8 +1175,7 @@ fn set_json_path(value: &mut serde_json::Value, path: &str, new_value: Option<St
                 if let Some(inner) = obj.get_mut(parts[0]) {
                     if let Some(inner_obj) = inner.as_object_mut() {
                         if let Some(val) = new_value {
-                            inner_obj
-                                .insert(parts[1].to_string(), serde_json::Value::String(val));
+                            inner_obj.insert(parts[1].to_string(), serde_json::Value::String(val));
                         } else {
                             inner_obj.remove(parts[1]);
                         }
@@ -1299,11 +1341,8 @@ mod tests {
 
     #[test]
     fn rule_matches_exact_field() {
-        let rule = ClassificationRule::new(
-            "r1",
-            DataSensitivity::Restricted,
-            vec!["password".into()],
-        );
+        let rule =
+            ClassificationRule::new("r1", DataSensitivity::Restricted, vec!["password".into()]);
         assert!(rule.matches_field("password"));
         assert!(!rule.matches_field("password_hash"));
     }
@@ -1323,8 +1362,7 @@ mod tests {
 
     #[test]
     fn rule_matches_content() {
-        let mut rule =
-            ClassificationRule::new("r1", DataSensitivity::Restricted, vec!["*".into()]);
+        let mut rule = ClassificationRule::new("r1", DataSensitivity::Restricted, vec!["*".into()]);
         rule.content_patterns = vec!["sk-ant-".into()];
         assert!(rule.matches_content("token=sk-ant-abc123"));
         assert!(!rule.matches_content("safe text"));
@@ -1332,32 +1370,22 @@ mod tests {
 
     #[test]
     fn rule_no_content_patterns_matches_all() {
-        let rule = ClassificationRule::new(
-            "r1",
-            DataSensitivity::Public,
-            vec!["event_type".into()],
-        );
+        let rule =
+            ClassificationRule::new("r1", DataSensitivity::Public, vec!["event_type".into()]);
         assert!(rule.matches_content("anything"));
     }
 
     #[test]
     fn rule_effective_strategy_override() {
-        let mut rule = ClassificationRule::new(
-            "r1",
-            DataSensitivity::Restricted,
-            vec!["field".into()],
-        );
+        let mut rule =
+            ClassificationRule::new("r1", DataSensitivity::Restricted, vec!["field".into()]);
         rule.redaction_override = Some(RedactionStrategy::Hash);
         assert!(matches!(rule.effective_strategy(), RedactionStrategy::Hash));
     }
 
     #[test]
     fn rule_effective_strategy_default() {
-        let rule = ClassificationRule::new(
-            "r1",
-            DataSensitivity::Restricted,
-            vec!["field".into()],
-        );
+        let rule = ClassificationRule::new("r1", DataSensitivity::Restricted, vec!["field".into()]);
         assert!(matches!(rule.effective_strategy(), RedactionStrategy::Mask));
     }
 
@@ -1473,14 +1501,8 @@ mod tests {
     fn ingestion_decision_predicates() {
         assert!(IngestionDecision::Accept.is_accepted());
         assert!(IngestionDecision::AcceptRedacted.is_accepted());
-        assert!(!IngestionDecision::Reject {
-            reason: "x".into()
-        }
-        .is_accepted());
-        assert!(IngestionDecision::Reject {
-            reason: "x".into()
-        }
-        .is_rejected());
+        assert!(!IngestionDecision::Reject { reason: "x".into() }.is_accepted());
+        assert!(IngestionDecision::Reject { reason: "x".into() }.is_rejected());
         assert!(!IngestionDecision::Accept.is_rejected());
     }
 
@@ -1584,7 +1606,9 @@ mod tests {
     fn classify_metadata_fields() {
         let mut classifier = test_classifier();
         let mut event = test_event("test-connector");
-        event.metadata.insert("password".to_string(), "secret123".to_string());
+        event
+            .metadata
+            .insert("password".to_string(), "secret123".to_string());
 
         let classified = classifier.classify_event(&event).unwrap();
         let pw_fc = classified
@@ -1601,7 +1625,9 @@ mod tests {
     fn redact_event_masks_restricted_fields() {
         let mut classifier = test_classifier();
         let mut event = test_event("test-connector");
-        event.metadata.insert("auth_token".to_string(), "bearer-xyz-secret".to_string());
+        event
+            .metadata
+            .insert("auth_token".to_string(), "bearer-xyz-secret".to_string());
 
         let classified = classifier.classify_event(&event).unwrap();
         let redacted = classifier.redact_event(&event, &classified);
@@ -1788,20 +1814,16 @@ mod tests {
     #[test]
     fn apply_truncate_strategy() {
         let mut classifier = test_classifier();
-        let result = classifier.apply_strategy(
-            &RedactionStrategy::Truncate { max_len: 5 },
-            "hello world",
-        );
+        let result =
+            classifier.apply_strategy(&RedactionStrategy::Truncate { max_len: 5 }, "hello world");
         assert_eq!(result, Some("hello[...]".to_string()));
     }
 
     #[test]
     fn apply_truncate_short_value() {
         let mut classifier = test_classifier();
-        let result = classifier.apply_strategy(
-            &RedactionStrategy::Truncate { max_len: 100 },
-            "short",
-        );
+        let result =
+            classifier.apply_strategy(&RedactionStrategy::Truncate { max_len: 100 }, "short");
         assert_eq!(result, Some("short".to_string()));
     }
 
@@ -1882,6 +1904,53 @@ mod tests {
 
         let json = classifier.audit_log_json().unwrap();
         assert!(json.contains("evt-001"));
+    }
+
+    #[test]
+    fn redact_event_with_explicit_accept_redacted_overrides_reject_audit() {
+        let mut classifier = test_classifier();
+        let mut event = test_event("github");
+        event.payload = serde_json::json!({
+            "password": "super-secret",
+            "status": "ok"
+        });
+
+        let classified = classifier.classify_event(&event).unwrap();
+        let redacted = classifier.redact_event_with_decision(
+            &event,
+            &classified,
+            IngestionDecision::AcceptRedacted,
+        );
+
+        assert!(redacted.event.payload.get("password").is_none());
+        let audit = classifier.audit_log().back().unwrap();
+        assert_eq!(audit.decision, IngestionDecision::AcceptRedacted);
+        assert_eq!(classifier.telemetry().events_accepted_redacted, 1);
+        assert_eq!(classifier.telemetry().events_rejected, 0);
+    }
+
+    #[test]
+    fn redact_event_with_quarantine_tracks_quarantine_telemetry() {
+        let mut classifier = test_classifier();
+        let event = test_event("test-connector");
+        let classified = classifier.classify_event(&event).unwrap();
+
+        let _ = classifier.redact_event_with_decision(
+            &event,
+            &classified,
+            IngestionDecision::Quarantine {
+                reason: "manual review required".to_string(),
+            },
+        );
+
+        let audit = classifier.audit_log().back().unwrap();
+        assert_eq!(
+            audit.decision,
+            IngestionDecision::Quarantine {
+                reason: "manual review required".to_string(),
+            }
+        );
+        assert_eq!(classifier.telemetry().events_quarantined, 1);
     }
 
     // ── Telemetry ──
@@ -2014,7 +2083,12 @@ mod tests {
         let mut val = serde_json::json!({"outer": {"inner": "old"}});
         set_json_path(&mut val, "outer.inner", Some("new".to_string()));
         assert_eq!(
-            val.get("outer").unwrap().get("inner").unwrap().as_str().unwrap(),
+            val.get("outer")
+                .unwrap()
+                .get("inner")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "new"
         );
     }
