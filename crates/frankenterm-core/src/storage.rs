@@ -16055,6 +16055,36 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    fn typed_decision_context_json(
+        action: crate::policy::ActionKind,
+        actor: crate::policy::ActorKind,
+        surface: crate::policy::PolicySurface,
+    ) -> String {
+        let mut context = crate::policy::DecisionContext::empty();
+        context.action = action;
+        context.actor = actor;
+        context.surface = surface;
+        context.set_determining_rule("policy.allow");
+        context.add_evidence("surface", surface.as_str());
+        serde_json::to_string(&context).unwrap()
+    }
+
+    fn typed_sensitive_decision_context_json(
+        action: crate::policy::ActionKind,
+        actor: crate::policy::ActorKind,
+        surface: crate::policy::PolicySurface,
+        secret: &str,
+    ) -> String {
+        let mut context = crate::policy::DecisionContext::empty();
+        context.action = action;
+        context.actor = actor;
+        context.surface = surface;
+        context.text_summary = Some(format!("token {secret}"));
+        context.set_determining_rule("policy.allow");
+        context.add_evidence("token", secret);
+        serde_json::to_string(&context).unwrap()
+    }
+
     // =========================================================================
     // Schema Initialization Tests
     // =========================================================================
@@ -17082,7 +17112,11 @@ mod tests {
             rule_id: Some("policy.allow".to_string()),
             input_summary: Some("echo hi".to_string()),
             verification_summary: Some("prompt_active".to_string()),
-            decision_context: Some("{\"rule\":\"policy.allow\"}".to_string()),
+            decision_context: Some(typed_decision_context_json(
+                crate::policy::ActionKind::SendText,
+                crate::policy::ActorKind::Human,
+                crate::policy::PolicySurface::Mux,
+            )),
             result: "success".to_string(),
         };
 
@@ -17094,6 +17128,7 @@ mod tests {
 
     #[test]
     fn audit_action_redacts_sensitive_fields() {
+        let secret = "sk-abc123456789012345678901234567890123456789012345678901";
         let mut action = AuditActionRecord {
             id: 0,
             ts: 1_700_000_000_000,
@@ -17112,10 +17147,12 @@ mod tests {
                 "API key sk-abc123456789012345678901234567890123456789012345678901".to_string(),
             ),
             verification_summary: Some("checked prompt".to_string()),
-            decision_context: Some(
-                "{\"token\":\"sk-abc123456789012345678901234567890123456789012345678901\"}"
-                    .to_string(),
-            ),
+            decision_context: Some(typed_sensitive_decision_context_json(
+                crate::policy::ActionKind::SendText,
+                crate::policy::ActorKind::Robot,
+                crate::policy::PolicySurface::Mux,
+                secret,
+            )),
             result: "success".to_string(),
         };
 
@@ -17136,6 +17173,7 @@ mod tests {
 
     #[test]
     fn audit_stream_record_redacts_sensitive_fields() {
+        let secret = "sk-abc123456789012345678901234567890";
         let action = AuditActionRecord {
             id: 42,
             ts: 1_700_000_000_123,
@@ -17150,9 +17188,12 @@ mod tests {
             rule_id: None,
             input_summary: Some("API key sk-abc123456789012345678901234567890".to_string()),
             verification_summary: Some("prompt ok".to_string()),
-            decision_context: Some(
-                "{\"token\":\"sk-abc123456789012345678901234567890\"}".to_string(),
-            ),
+            decision_context: Some(typed_sensitive_decision_context_json(
+                crate::policy::ActionKind::SendText,
+                crate::policy::ActorKind::Robot,
+                crate::policy::PolicySurface::Mux,
+                secret,
+            )),
             result: "success".to_string(),
         };
 
@@ -17848,7 +17889,11 @@ mod tests {
             rule_id: Some("rule-1".to_string()),
             input_summary: Some("input".to_string()),
             verification_summary: Some("verify".to_string()),
-            decision_context: Some("{\"ctx\":true}".to_string()),
+            decision_context: Some(typed_decision_context_json(
+                crate::policy::ActionKind::WorkflowRun,
+                crate::policy::ActorKind::Workflow,
+                crate::policy::PolicySurface::Workflow,
+            )),
             result: "success".to_string(),
         };
 

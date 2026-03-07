@@ -778,6 +778,7 @@ impl ConnectorDataClassifier {
     /// Classify a single field against the policy rules.
     /// Rules are matched against both the full path (e.g., "payload.password")
     /// and the leaf field name (e.g., "password").
+    #[allow(clippy::unused_self)]
     fn classify_field(
         &self,
         policy: &ClassificationPolicy,
@@ -790,7 +791,7 @@ impl ConnectorDataClassifier {
         // Sort rules by priority descending
         let mut sorted_rules: Vec<&ClassificationRule> =
             policy.rules.iter().filter(|r| r.enabled).collect();
-        sorted_rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        sorted_rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
 
         for rule in sorted_rules {
             let field_match =
@@ -875,6 +876,7 @@ impl ConnectorDataClassifier {
     }
 
     /// Extract a field value from an event by path (best-effort).
+    #[allow(clippy::unused_self)]
     fn extract_field_value(&self, event: &CanonicalConnectorEvent, path: &str) -> Option<String> {
         if let Some(rest) = path.strip_prefix("metadata.") {
             return event.metadata.get(rest).cloned();

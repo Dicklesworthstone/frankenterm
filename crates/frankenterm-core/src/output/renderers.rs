@@ -8,6 +8,7 @@
 use super::format::{OutputFormat, Style};
 use super::table::{Alignment, Column, Table};
 use crate::event_templates;
+use crate::policy::DecisionContext;
 use crate::storage::{
     ActionHistoryRecord, AuditActionRecord, CorrelationType, PaneRecord, SearchResult,
     SearchSuggestion, StoredEvent, Timeline,
@@ -1161,7 +1162,14 @@ impl AuditListRenderer {
         if let Some(verification) = &action.verification_summary {
             output.push_str(&format!("  Verify:     {verification}\n"));
         }
-        if let Some(context) = &action.decision_context {
+        if let Some(context) = format_decision_context_summary(action.decision_context.as_deref()) {
+            output.push_str(&format!("  Context:    {context}\n"));
+            if let Some(evidence) =
+                format_decision_context_evidence(action.decision_context.as_deref())
+            {
+                output.push_str(&format!("  Evidence:   {evidence}\n"));
+            }
+        } else if let Some(context) = &action.decision_context {
             output.push_str(&format!("  Context:    {context}\n"));
         }
 
@@ -1380,6 +1388,51 @@ fn extract_workflow_name(action: &ActionHistoryRecord) -> Option<String> {
 fn parse_summary_json(summary: Option<&str>) -> Option<serde_json::Value> {
     let summary = summary?;
     serde_json::from_str::<serde_json::Value>(summary).ok()
+}
+
+fn parse_decision_context(decision_context: Option<&str>) -> Option<DecisionContext> {
+    decision_context.and_then(|raw| serde_json::from_str::<DecisionContext>(raw).ok())
+}
+
+fn format_decision_context_summary(decision_context: Option<&str>) -> Option<String> {
+    let context = parse_decision_context(decision_context)?;
+    let mut parts = vec![
+        format!("surface={}", context.surface.as_str()),
+        format!("actor={}", context.actor.as_str()),
+        format!("action={}", context.action.as_str()),
+    ];
+
+    if let Some(rule_id) = context.determining_rule.as_deref() {
+        parts.push(format!("rule={rule_id}"));
+    }
+    if let Some(pane_id) = context.pane_id {
+        parts.push(format!("pane={pane_id}"));
+    }
+    if let Some(domain) = context.domain.as_deref() {
+        parts.push(format!("domain={domain}"));
+    }
+    if let Some(workflow_id) = context.workflow_id.as_deref() {
+        parts.push(format!("workflow={workflow_id}"));
+    }
+
+    Some(parts.join(" "))
+}
+
+fn format_decision_context_evidence(decision_context: Option<&str>) -> Option<String> {
+    let context = parse_decision_context(decision_context)?;
+    if context.evidence.is_empty() {
+        return None;
+    }
+
+    Some(
+        context
+            .evidence
+            .iter()
+            .take(4)
+            .map(|evidence| format!("{}={}", evidence.key, evidence.value))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 fn csv_escape(value: String) -> String {
@@ -2883,6 +2936,17 @@ mod tests {
         }
     }
 
+    fn typed_decision_context_json() -> String {
+        let mut context = crate::policy::DecisionContext::empty();
+        context.surface = crate::policy::PolicySurface::Mux;
+        context.action = crate::policy::ActionKind::SendText;
+        context.actor = crate::policy::ActorKind::Human;
+        context.pane_id = Some(5);
+        context.set_determining_rule("policy.cooldown");
+        context.add_evidence("command", "ft send 5 echo hello");
+        serde_json::to_string(&context).expect("serialize decision context")
+    }
+
     fn sample_history_action(action_kind: &str, ts: i64) -> ActionHistoryRecord {
         ActionHistoryRecord {
             id: 1,
@@ -3048,6 +3112,20 @@ mod tests {
         assert!(output.contains("Result:     success"));
         assert!(output.contains("Reason:     prompt detected"));
         assert!(output.contains("Input:      echo hello"));
+    }
+
+    #[test]
+    fn audit_detail_render_plain_formats_typed_decision_context() {
+        let mut action = sample_audit_action();
+        action.decision_context = Some(typed_decision_context_json());
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render_detail(&action, &ctx);
+
+        assert!(output.contains("Context:    surface=mux actor=human action=send_text"));
+        assert!(output.contains("rule=policy.cooldown"));
+        assert!(output.contains("pane=5"));
+        assert!(output.contains("Evidence:   command=ft send 5 echo hello"));
     }
 
     #[test]

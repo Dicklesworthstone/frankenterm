@@ -1104,6 +1104,16 @@ mod tests {
         }
     }
 
+    fn typed_audit_decision_context_json() -> String {
+        let mut context = crate::policy::DecisionContext::empty();
+        context.action = crate::policy::ActionKind::SendText;
+        context.actor = crate::policy::ActorKind::Workflow;
+        context.surface = crate::policy::PolicySurface::Mux;
+        context.set_determining_rule("policy.allow");
+        context.add_evidence("mode", "auto");
+        serde_json::to_string(&context).unwrap()
+    }
+
     /// Helper to create a test DB with one pane already inserted.
     async fn test_db_with_pane(suffix: &str) -> (StorageHandle, std::path::PathBuf) {
         let tmp =
@@ -1410,7 +1420,7 @@ mod tests {
             rule_id: Some("r1".to_string()),
             input_summary: Some("input".to_string()),
             verification_summary: Some("ok".to_string()),
-            decision_context: Some(r#"{"mode": "auto"}"#.to_string()),
+            decision_context: Some(typed_audit_decision_context_json()),
             result: "ok".to_string(),
         };
         let val: serde_json::Value = serde_json::to_value(&audit).unwrap();

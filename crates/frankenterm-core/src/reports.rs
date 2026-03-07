@@ -3,7 +3,7 @@
 //! Produces session reports (per-pane or global), including major events,
 //! workflow executions with step logs, and output gaps.
 
-use crate::policy::Redactor;
+use crate::policy::{DecisionContext, Redactor};
 use crate::storage::{AuditQuery, EventQuery, ExportQuery, StorageHandle};
 
 /// Options for report generation.
@@ -285,14 +285,22 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+fn parse_decision_context(decision_context: Option<&str>) -> Option<DecisionContext> {
+    decision_context.and_then(|raw| serde_json::from_str::<DecisionContext>(raw).ok())
+}
+
 fn policy_surface_from_decision_context(decision_context: Option<&str>) -> String {
-    decision_context
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .and_then(|value| {
-            value
-                .get("surface")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
+    parse_decision_context(decision_context)
+        .map(|context| context.surface.as_str().to_string())
+        .or_else(|| {
+            decision_context
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|value| {
+                    value
+                        .get("surface")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
         })
         .unwrap_or_else(|| "—".to_string())
 }
@@ -300,6 +308,14 @@ fn policy_surface_from_decision_context(decision_context: Option<&str>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn typed_decision_context_json(surface: crate::policy::PolicySurface) -> String {
+        let mut context = crate::policy::DecisionContext::empty();
+        context.surface = surface;
+        context.action = crate::policy::ActionKind::SendText;
+        context.actor = crate::policy::ActorKind::Workflow;
+        serde_json::to_string(&context).expect("serialize decision context")
+    }
 
     fn run_async_test<F>(future: F)
     where
@@ -553,6 +569,12 @@ mod tests {
 
     #[test]
     fn policy_surface_from_decision_context_extracts_surface() {
+        assert_eq!(
+            policy_surface_from_decision_context(Some(&typed_decision_context_json(
+                crate::policy::PolicySurface::Workflow,
+            ))),
+            "workflow"
+        );
         assert_eq!(
             policy_surface_from_decision_context(Some(r#"{"surface":"mux"}"#)),
             "mux"
@@ -869,7 +891,9 @@ mod tests {
                 rule_id: Some("policy.cooldown".to_string()),
                 input_summary: None,
                 verification_summary: None,
-                decision_context: Some(r#"{"surface":"mux"}"#.to_string()),
+                decision_context: Some(typed_decision_context_json(
+                    crate::policy::PolicySurface::Mux,
+                )),
                 result: "blocked".to_string(),
             };
             storage.record_audit_action(action).await.unwrap();
@@ -1173,7 +1197,9 @@ mod tests {
                 rule_id: Some("policy.cooldown".to_string()),
                 input_summary: None,
                 verification_summary: None,
-                decision_context: Some(r#"{"surface":"mux"}"#.to_string()),
+                decision_context: Some(typed_decision_context_json(
+                    crate::policy::PolicySurface::Mux,
+                )),
                 result: "blocked".to_string(),
             };
             storage.record_audit_action(denial).await.unwrap();
