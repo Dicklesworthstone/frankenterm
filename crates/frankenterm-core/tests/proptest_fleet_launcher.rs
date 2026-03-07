@@ -3,12 +3,16 @@
 use proptest::prelude::*;
 use std::collections::HashMap;
 
+use frankenterm_core::command_transport::CommandRouter;
+use frankenterm_core::durable_state::DurableStateManager;
 use frankenterm_core::fleet_launcher::{
     AgentMixEntry, FleetLaunchError, FleetLaunchStatus, FleetLauncher, FleetSpec, SlotStatus,
     StartupStrategy,
 };
 use frankenterm_core::session_profiles::{ProfileRegistry, ProfileRole};
-use frankenterm_core::session_topology::LifecycleRegistry;
+use frankenterm_core::session_topology::{
+    LifecycleRegistry, LifecycleState, MuxPaneLifecycleState,
+};
 
 fn arb_startup_strategy() -> impl Strategy<Value = StartupStrategy> {
     prop_oneof![
@@ -383,5 +387,242 @@ proptest! {
             prop_assert_eq!(&slot.lifecycle_identity.workspace_id, &spec.workspace_id);
             prop_assert_eq!(&slot.lifecycle_identity.domain, &spec.domain);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Weighted allocation properties
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn weighted_allocation_sum_equals_total(
+        total in 1u32..50u32,
+        mix in proptest::collection::vec(arb_mix_entry(), 1..=5),
+    ) {
+        let spec = FleetSpec {
+            name: "alloc-sum".to_string(),
+            description: None,
+            workspace_id: "ws".to_string(),
+            domain: "local".to_string(),
+            mix,
+            total_panes: total,
+            fleet_template: None,
+            working_directory: None,
+            startup_strategy: StartupStrategy::Parallel,
+            generation: 1,
+            tags: vec![],
+        };
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+        prop_assert_eq!(
+            plan.slots.len() as u32, total,
+            "allocated slots must equal requested total"
+        );
+    }
+
+    #[test]
+    fn weighted_allocation_respects_relative_proportions(
+        total in 10u32..40u32,
+    ) {
+        let mix = vec![
+            AgentMixEntry {
+                program: "a".to_string(),
+                model: None,
+                weight: 3,
+                profile: None,
+                task_template: None,
+                environment: HashMap::new(),
+                role: None,
+            },
+            AgentMixEntry {
+                program: "b".to_string(),
+                model: None,
+                weight: 1,
+                profile: None,
+                task_template: None,
+                environment: HashMap::new(),
+                role: None,
+            },
+        ];
+        let spec = FleetSpec {
+            name: "proportion".to_string(),
+            description: None,
+            workspace_id: "ws".to_string(),
+            domain: "local".to_string(),
+            mix,
+            total_panes: total,
+            fleet_template: None,
+            working_directory: None,
+            startup_strategy: StartupStrategy::Parallel,
+            generation: 1,
+            tags: vec![],
+        };
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+        let a_count = plan.slots.iter().filter(|s| s.mix_entry_index == 0).count() as u32;
+        let b_count = plan.slots.iter().filter(|s| s.mix_entry_index == 1).count() as u32;
+        // With 3:1 ratio, 'a' must always get at least as many as 'b'
+        prop_assert!(a_count >= b_count, "3:1 weight: a={a_count} must >= b={b_count}");
+    }
+
+    // -------------------------------------------------------------------
+    // Sequential halt on conflict
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sequential_halt_skips_remaining_on_conflict(
+        n_slots in 3u32..8u32,
+    ) {
+        let mix = vec![AgentMixEntry {
+            program: "test".to_string(),
+            model: None,
+            weight: n_slots,
+            profile: None,
+            task_template: None,
+            environment: HashMap::new(),
+            role: None,
+        }];
+        let spec = FleetSpec {
+            name: "seq-conflict".to_string(),
+            description: None,
+            workspace_id: "ws".to_string(),
+            domain: "local".to_string(),
+            mix,
+            total_panes: 0,
+            fleet_template: None,
+            working_directory: None,
+            startup_strategy: StartupStrategy::Sequential,
+            generation: 1,
+            tags: vec![],
+        };
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+
+        // Pre-register the second slot's pane identity to trigger conflict
+        let mut lifecycle = LifecycleRegistry::new();
+        if plan.slots.len() >= 2 {
+            lifecycle.register_entity(
+                plan.slots[1].lifecycle_identity.clone(),
+                LifecycleState::Pane(MuxPaneLifecycleState::Running),
+                0,
+            ).ok();
+
+            let outcome = launcher.execute(&plan, &mut lifecycle);
+
+            // First slot succeeds, second fails (conflict), rest skipped
+            prop_assert_eq!(outcome.slot_outcomes[0].status, SlotStatus::Registered);
+            prop_assert_eq!(outcome.slot_outcomes[1].status, SlotStatus::Failed);
+            for so in &outcome.slot_outcomes[2..] {
+                prop_assert_eq!(so.status, SlotStatus::Skipped,
+                    "slots after sequential failure must be skipped");
+            }
+            prop_assert_eq!(outcome.status, FleetLaunchStatus::Partial);
+            prop_assert_eq!(outcome.successful_slots, 1);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Subsystem integration: durable state checkpoint
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn launch_with_durable_state_creates_checkpoint(spec in arb_fleet_spec(1, 3)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let mut durable = DurableStateManager::new();
+
+        let outcome = launcher.launch_with_subsystems(
+            &spec, &mut lifecycle, Some(&mut durable), None
+        ).unwrap();
+
+        prop_assert!(outcome.pre_launch_checkpoint.is_some(),
+            "durable state integration must produce a checkpoint");
+        let checkpoint_id = outcome.pre_launch_checkpoint.unwrap();
+        prop_assert!(checkpoint_id > 0, "checkpoint ID must be positive");
+    }
+
+    // -------------------------------------------------------------------
+    // Subsystem integration: command router bootstrap dispatch
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn launch_with_router_dispatches_bootstrap_commands(
+        n_slots in 1u32..4u32,
+    ) {
+        let mix = vec![AgentMixEntry {
+            program: "test".to_string(),
+            model: None,
+            weight: n_slots,
+            profile: None,
+            task_template: None,
+            environment: HashMap::new(),
+            role: None,
+        }];
+        let spec = FleetSpec {
+            name: "bootstrap-test".to_string(),
+            description: None,
+            workspace_id: "ws".to_string(),
+            domain: "local".to_string(),
+            mix,
+            total_panes: 0,
+            fleet_template: None,
+            working_directory: None,
+            startup_strategy: StartupStrategy::Parallel,
+            generation: 1,
+            tags: vec![],
+        };
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let mut router = CommandRouter::new();
+
+        let outcome = launcher.launch_with_subsystems(
+            &spec, &mut lifecycle, None, Some(&mut router),
+        ).unwrap();
+
+        // Bootstrap dispatches are recorded (may be 0 per slot if no bootstrap commands)
+        for &(slot_idx, cmd_count) in &outcome.bootstrap_dispatches {
+            prop_assert!(slot_idx < n_slots,
+                "dispatch slot index must be within range");
+            // cmd_count may be 0 — just verify it's not absurdly large
+            prop_assert!(cmd_count < 100,
+                "bootstrap commands per slot should be reasonable");
+        }
+        // Router audit log should have entries for any dispatched bootstrap commands
+        let total_dispatched: usize = outcome.bootstrap_dispatches.iter().map(|(_, c)| c).sum();
+        prop_assert_eq!(router.audit_log().len(), total_dispatched);
+    }
+
+    // -------------------------------------------------------------------
+    // Outcome status classification
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn complete_outcome_has_zero_failures(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+
+        if outcome.status == FleetLaunchStatus::Complete {
+            prop_assert_eq!(outcome.failed_slots, 0);
+            prop_assert_eq!(outcome.successful_slots, outcome.total_slots);
+        }
+    }
+
+    #[test]
+    fn outcome_slot_count_sum_invariant(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+
+        // successful + failed always <= total (skipped slots aren't counted in either)
+        prop_assert!(outcome.successful_slots + outcome.failed_slots <= outcome.total_slots);
+        // slot_outcomes len always equals total
+        prop_assert_eq!(outcome.slot_outcomes.len() as u32, outcome.total_slots);
     }
 }
