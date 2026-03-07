@@ -5,14 +5,11 @@ use std::time::Duration;
 
 use crate::config as wa_config;
 #[cfg(feature = "asupersync-runtime")]
-use crate::cx::{self, Cx};
+use crate::cx::{self, Cx, RuntimeHandle};
 #[cfg(test)]
 use crate::runtime_compat::mpsc_reserve_send;
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
-use crate::runtime_compat::{
-    mpsc, mpsc_recv_option, mpsc_try_reserve_send, task, timeout, watch,
-    watch_borrow_and_update_clone, watch_changed,
-};
+use crate::runtime_compat::{mpsc, mpsc_try_reserve_send, task, timeout, watch};
 use codec::{
     CODEC_VERSION, CompressionMode, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
     GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, ListPanes,
@@ -960,8 +957,14 @@ pub struct PaneOutputSubscription {
     cancel: watch::Sender<bool>,
 }
 
+#[cfg(feature = "asupersync-runtime")]
+async fn pane_delta_recv_with_cx(cx: &Cx, rx: &mut mpsc::Receiver<PaneDelta>) -> Option<PaneDelta> {
+    rx.recv(cx).await.ok()
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
 async fn pane_delta_recv(rx: &mut mpsc::Receiver<PaneDelta>) -> Option<PaneDelta> {
-    mpsc_recv_option(rx).await
+    rx.recv().await
 }
 
 #[cfg(test)]
@@ -989,17 +992,233 @@ fn pane_delta_try_emit_ended(
 
 #[allow(clippy::needless_pass_by_ref_mut)] // mut needed for tokio borrow_and_update path
 fn cancel_requested(cancel_rx: &mut watch::Receiver<bool>) -> bool {
-    watch_borrow_and_update_clone(cancel_rx)
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        cancel_rx.borrow_and_clone()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        *cancel_rx.borrow_and_update()
+    }
 }
 
+#[cfg(not(feature = "asupersync-runtime"))]
 async fn wait_for_cancel_change(cancel_rx: &mut watch::Receiver<bool>) -> bool {
-    watch_changed(cancel_rx).await.is_ok()
+    cancel_rx.changed().await.is_ok()
+}
+
+#[cfg(feature = "asupersync-runtime")]
+async fn wait_for_cancel_change_with_cx(cx: &Cx, cancel_rx: &mut watch::Receiver<bool>) -> bool {
+    cancel_rx.changed(cx).await.is_ok()
+}
+
+#[cfg(feature = "asupersync-runtime")]
+async fn run_subscription_loop(
+    cx: &Cx,
+    mut client: DirectMuxClient,
+    pane_id: u64,
+    config: SubscriptionConfig,
+    tx: mpsc::Sender<PaneDelta>,
+    mut cancel_rx: watch::Receiver<bool>,
+) {
+    let mut last_seqno: Option<u64> = None;
+
+    loop {
+        if cancel_requested(&mut cancel_rx) {
+            pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
+            break;
+        }
+
+        let result = client.get_pane_render_changes(pane_id).await;
+
+        let saw_dirty_output = match result {
+            Ok(changes) => {
+                let seqno = changes.seqno as u64;
+                let has_dirty = !changes.dirty_lines.is_empty();
+
+                if let Some(prev) = last_seqno {
+                    if seqno > prev + 1 {
+                        let _ = pane_delta_try_send(
+                            &tx,
+                            PaneDelta::Gap {
+                                pane_id,
+                                reason: format!(
+                                    "seqno jump: {} -> {} (missed {})",
+                                    prev,
+                                    seqno,
+                                    seqno - prev - 1
+                                ),
+                            },
+                        );
+                    }
+                }
+                last_seqno = Some(seqno);
+
+                if has_dirty {
+                    let delta_text = bonus_lines_to_text(changes.bonus_lines);
+                    let dirty_row_count = total_dirty_rows(&changes.dirty_lines);
+                    let delta = PaneDelta::Output {
+                        pane_id,
+                        seqno,
+                        delta_text,
+                        title: changes.title,
+                        dirty_range_count: changes.dirty_lines.len(),
+                        dirty_row_count,
+                    };
+
+                    if !pane_delta_try_send(&tx, delta) {
+                        let _ = pane_delta_try_send(
+                            &tx,
+                            PaneDelta::Gap {
+                                pane_id,
+                                reason: "slow consumer: channel full".to_string(),
+                            },
+                        );
+                    }
+                }
+
+                has_dirty
+            }
+            Err(DirectMuxError::Disconnected) => {
+                pane_delta_try_emit_ended(&tx, pane_id, "mux socket disconnected");
+                break;
+            }
+            Err(DirectMuxError::ReadTimeout) => {
+                tracing::debug!(pane_id, "subscription poll timeout, retrying");
+                false
+            }
+            Err(err) => {
+                pane_delta_try_emit_ended(&tx, pane_id, format!("subscription error: {err}"));
+                break;
+            }
+        };
+
+        let wait_interval = subscription_poll_delay(&config, saw_dirty_output);
+        if let Ok(changed_ok) = timeout(
+            wait_interval,
+            wait_for_cancel_change_with_cx(cx, &mut cancel_rx),
+        )
+        .await
+        {
+            if !changed_ok || cancel_requested(&mut cancel_rx) {
+                pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+async fn run_subscription_loop(
+    mut client: DirectMuxClient,
+    pane_id: u64,
+    config: SubscriptionConfig,
+    tx: mpsc::Sender<PaneDelta>,
+    mut cancel_rx: watch::Receiver<bool>,
+) {
+    let mut last_seqno: Option<u64> = None;
+
+    loop {
+        if cancel_requested(&mut cancel_rx) {
+            pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
+            break;
+        }
+
+        let result = client.get_pane_render_changes(pane_id).await;
+
+        let saw_dirty_output = match result {
+            Ok(changes) => {
+                let seqno = changes.seqno as u64;
+                let has_dirty = !changes.dirty_lines.is_empty();
+
+                if let Some(prev) = last_seqno {
+                    if seqno > prev + 1 {
+                        let _ = pane_delta_try_send(
+                            &tx,
+                            PaneDelta::Gap {
+                                pane_id,
+                                reason: format!(
+                                    "seqno jump: {} -> {} (missed {})",
+                                    prev,
+                                    seqno,
+                                    seqno - prev - 1
+                                ),
+                            },
+                        );
+                    }
+                }
+                last_seqno = Some(seqno);
+
+                if has_dirty {
+                    let delta_text = bonus_lines_to_text(changes.bonus_lines);
+                    let dirty_row_count = total_dirty_rows(&changes.dirty_lines);
+                    let delta = PaneDelta::Output {
+                        pane_id,
+                        seqno,
+                        delta_text,
+                        title: changes.title,
+                        dirty_range_count: changes.dirty_lines.len(),
+                        dirty_row_count,
+                    };
+
+                    if !pane_delta_try_send(&tx, delta) {
+                        let _ = pane_delta_try_send(
+                            &tx,
+                            PaneDelta::Gap {
+                                pane_id,
+                                reason: "slow consumer: channel full".to_string(),
+                            },
+                        );
+                    }
+                }
+
+                has_dirty
+            }
+            Err(DirectMuxError::Disconnected) => {
+                pane_delta_try_emit_ended(&tx, pane_id, "mux socket disconnected");
+                break;
+            }
+            Err(DirectMuxError::ReadTimeout) => {
+                tracing::debug!(pane_id, "subscription poll timeout, retrying");
+                false
+            }
+            Err(err) => {
+                pane_delta_try_emit_ended(&tx, pane_id, format!("subscription error: {err}"));
+                break;
+            }
+        };
+
+        let wait_interval = subscription_poll_delay(&config, saw_dirty_output);
+        if let Ok(changed_ok) = timeout(wait_interval, wait_for_cancel_change(&mut cancel_rx)).await
+        {
+            if !changed_ok || cancel_requested(&mut cancel_rx) {
+                pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
+                break;
+            }
+        }
+    }
 }
 
 impl PaneOutputSubscription {
+    /// Receive the next delta using an explicit capability context.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn next_with_cx(&mut self, cx: &Cx) -> Option<PaneDelta> {
+        pane_delta_recv_with_cx(cx, &mut self.receiver).await
+    }
+
     /// Receive the next delta. Returns `None` when the subscription ends.
     pub async fn next(&mut self) -> Option<PaneDelta> {
-        pane_delta_recv(&mut self.receiver).await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_testing();
+            self.next_with_cx(&cx).await
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            pane_delta_recv(&mut self.receiver).await
+        }
     }
 
     /// Cancel the subscription.
@@ -1030,105 +1249,49 @@ impl Drop for PaneOutputSubscription {
 ///
 /// The poller tracks the last seen `seqno` and emits a `PaneDelta::Gap`
 /// if the mux-side seqno jumps by more than 1.
-pub fn subscribe_pane_output(
-    mut client: DirectMuxClient,
+#[cfg(feature = "asupersync-runtime")]
+#[allow(dead_code)]
+pub fn subscribe_pane_output_with_cx(
+    handle: &RuntimeHandle,
+    cx: &Cx,
+    client: DirectMuxClient,
     pane_id: u64,
     config: SubscriptionConfig,
 ) -> PaneOutputSubscription {
     let (tx, rx) = mpsc::channel(config.channel_capacity);
-    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
 
+    std::mem::drop(cx::spawn_with_cx(handle, cx, move |cx| async move {
+        run_subscription_loop(&cx, client, pane_id, config, tx, cancel_rx).await;
+    }));
+
+    PaneOutputSubscription {
+        receiver: rx,
+        cancel: cancel_tx,
+    }
+}
+
+/// Start a subscription using ambient runtime spawning.
+///
+/// Under `asupersync-runtime`, prefer [`subscribe_pane_output_with_cx`] so the
+/// background poller and receiver path share an explicit caller-owned `Cx`.
+pub fn subscribe_pane_output(
+    client: DirectMuxClient,
+    pane_id: u64,
+    config: SubscriptionConfig,
+) -> PaneOutputSubscription {
+    let (tx, rx) = mpsc::channel(config.channel_capacity);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+
+    #[cfg(feature = "asupersync-runtime")]
     task::spawn(async move {
-        let mut last_seqno: Option<u64> = None;
+        let cx = crate::cx::for_testing();
+        run_subscription_loop(&cx, client, pane_id, config, tx, cancel_rx).await;
+    });
 
-        loop {
-            // Check cancellation
-            if cancel_requested(&mut cancel_rx) {
-                pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
-                break;
-            }
-
-            // Poll for render changes
-            let result = client.get_pane_render_changes(pane_id).await;
-
-            let saw_dirty_output = match result {
-                Ok(changes) => {
-                    let seqno = changes.seqno as u64;
-                    let has_dirty = !changes.dirty_lines.is_empty();
-
-                    // Detect gaps in seqno
-                    if let Some(prev) = last_seqno {
-                        if seqno > prev + 1 {
-                            // Never block the poller on telemetry-only gap signals.
-                            let _ = pane_delta_try_send(
-                                &tx,
-                                PaneDelta::Gap {
-                                    pane_id,
-                                    reason: format!(
-                                        "seqno jump: {} -> {} (missed {})",
-                                        prev,
-                                        seqno,
-                                        seqno - prev - 1
-                                    ),
-                                },
-                            );
-                        }
-                    }
-                    last_seqno = Some(seqno);
-
-                    // Only emit Output delta if there are dirty lines
-                    if has_dirty {
-                        let delta_text = bonus_lines_to_text(changes.bonus_lines);
-                        let dirty_row_count = total_dirty_rows(&changes.dirty_lines);
-                        let delta = PaneDelta::Output {
-                            pane_id,
-                            seqno,
-                            delta_text,
-                            title: changes.title,
-                            dirty_range_count: changes.dirty_lines.len(),
-                            dirty_row_count,
-                        };
-
-                        // Bounded send — if the channel is full, emit a gap
-                        if !pane_delta_try_send(&tx, delta) {
-                            let _ = pane_delta_try_send(
-                                &tx,
-                                PaneDelta::Gap {
-                                    pane_id,
-                                    reason: "slow consumer: channel full".to_string(),
-                                },
-                            );
-                        }
-                    }
-
-                    has_dirty
-                }
-                Err(DirectMuxError::Disconnected) => {
-                    pane_delta_try_emit_ended(&tx, pane_id, "mux socket disconnected");
-                    break;
-                }
-                Err(DirectMuxError::ReadTimeout) => {
-                    // Transient — continue polling
-                    tracing::debug!(pane_id, "subscription poll timeout, retrying");
-                    false
-                }
-                Err(err) => {
-                    pane_delta_try_emit_ended(&tx, pane_id, format!("subscription error: {err}"));
-                    break;
-                }
-            };
-
-            // Wait for either poll interval elapse or cancellation signal.
-            let wait_interval = subscription_poll_delay(&config, saw_dirty_output);
-            if let Ok(changed_ok) =
-                timeout(wait_interval, wait_for_cancel_change(&mut cancel_rx)).await
-            {
-                if !changed_ok || cancel_requested(&mut cancel_rx) {
-                    pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
-                    break;
-                }
-            }
-        }
+    #[cfg(not(feature = "asupersync-runtime"))]
+    task::spawn(async move {
+        run_subscription_loop(client, pane_id, config, tx, cancel_rx).await;
     });
 
     PaneOutputSubscription {
@@ -3547,6 +3710,131 @@ mod tests {
             assert_eq!(dirty_range_count, 2);
             assert_eq!(dirty_row_count, 5);
             sub.cancel();
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn subscription_with_cx_receives_output_delta() {
+        let runtime = crate::cx::CxRuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cx = crate::cx::for_testing();
+        let handle = runtime.handle();
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("subscription-with-cx.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+
+            std::mem::drop(crate::cx::spawn_with_cx(
+                &handle,
+                &cx,
+                |_child_cx| async move {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+                    let mut emitted_output = false;
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = match unix_stream_read(&mut stream, &mut temp).await {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            let response = match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    })
+                                }
+                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                                Pdu::GetPaneRenderChanges(_) => {
+                                    let dirty_lines = if emitted_output {
+                                        Vec::new()
+                                    } else {
+                                        emitted_output = true;
+                                        vec![0isize..2isize]
+                                    };
+
+                                    Pdu::GetPaneRenderChangesResponse(
+                                        GetPaneRenderChangesResponse {
+                                            pane_id: 31,
+                                            mouse_grabbed: false,
+                                            cursor_position:
+                                                mux::renderable::StableCursorPosition::default(),
+                                            dimensions: mux::renderable::RenderableDimensions {
+                                                cols: 80,
+                                                viewport_rows: 24,
+                                                scrollback_rows: 0,
+                                                physical_top: 0,
+                                                scrollback_top: 0,
+                                                dpi: 96,
+                                                pixel_width: 0,
+                                                pixel_height: 0,
+                                                reverse_video: false,
+                                            },
+                                            dirty_lines,
+                                            title: "with-cx".to_string(),
+                                            working_dir: None,
+                                            bonus_lines: Vec::new().into(),
+                                            input_serial: None,
+                                            seqno: 1,
+                                        },
+                                    )
+                                }
+                                _ => continue,
+                            };
+                            let mut out = Vec::new();
+                            response.encode(&mut out, decoded.serial).expect("encode");
+                            stream.write_all(&out).await.expect("write");
+                        }
+                    }
+                },
+            ));
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect");
+            let mut sub = subscribe_pane_output_with_cx(
+                &handle,
+                &cx,
+                client,
+                31,
+                SubscriptionConfig {
+                    poll_interval: Duration::from_millis(10),
+                    min_poll_interval: Duration::from_millis(5),
+                    channel_capacity: 8,
+                },
+            );
+
+            let mut observed = None;
+            for _ in 0..20 {
+                match timeout(Duration::from_millis(200), sub.next_with_cx(&cx)).await {
+                    Ok(Some(PaneDelta::Output {
+                        pane_id,
+                        seqno,
+                        dirty_range_count,
+                        dirty_row_count,
+                        ..
+                    })) => {
+                        observed = Some((pane_id, seqno, dirty_range_count, dirty_row_count));
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+
+            sub.cancel();
+            assert_eq!(observed, Some((31, 1, 1, 2)));
         });
     }
 
