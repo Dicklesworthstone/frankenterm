@@ -21,6 +21,10 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::connector_host_runtime::{ConnectorCapability, ConnectorSandboxZone};
+use crate::policy::{
+    ActionKind as PolicyActionKind, ActorKind, PaneCapabilities, PolicyDecision, PolicyEngine,
+    PolicyInput, PolicySurface,
+};
 
 // =============================================================================
 // Configuration
@@ -171,6 +175,19 @@ impl ConnectorActionKind {
             Self::Ticket | Self::TriggerWorkflow => ConnectorCapability::Invoke,
             Self::Invoke => ConnectorCapability::Invoke,
             Self::CredentialAction => ConnectorCapability::SecretBroker,
+        }
+    }
+
+    /// Map connector actions into the unified policy action space.
+    #[must_use]
+    pub const fn policy_action(self) -> PolicyActionKind {
+        match self {
+            Self::Notify => PolicyActionKind::ConnectorNotify,
+            Self::Ticket => PolicyActionKind::ConnectorTicket,
+            Self::TriggerWorkflow => PolicyActionKind::ConnectorTriggerWorkflow,
+            Self::AuditLog => PolicyActionKind::ConnectorAuditLog,
+            Self::Invoke => PolicyActionKind::ConnectorInvoke,
+            Self::CredentialAction => PolicyActionKind::ConnectorCredentialAction,
         }
     }
 }
@@ -386,6 +403,8 @@ pub struct DispatchedAction {
     pub target_connector: String,
     pub action_kind: ConnectorActionKind,
     pub correlation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_decision: Option<PolicyDecision>,
 }
 
 /// Record of a blocked action with reason.
@@ -395,6 +414,8 @@ pub struct BlockedAction {
     pub target_connector: String,
     pub action_kind: ConnectorActionKind,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_decision: Option<PolicyDecision>,
 }
 
 // =============================================================================
@@ -644,6 +665,7 @@ pub struct ConnectorOutboundBridge {
     config: ConnectorOutboundBridgeConfig,
     rules: Vec<OutboundRoutingRule>,
     deduplicator: OutboundDeduplicator,
+    policy: PolicyEngine,
     sandbox: OutboundSandboxChecker,
     dispatch_queue: VecDeque<ConnectorAction>,
     dispatch_history: VecDeque<DispatchHistoryEntry>,
@@ -661,6 +683,7 @@ impl ConnectorOutboundBridge {
             dispatch_history: VecDeque::with_capacity(config.dispatch_history_capacity.min(1024)),
             config,
             rules: Vec::new(),
+            policy: PolicyEngine::permissive(),
             sandbox: OutboundSandboxChecker::new(),
             telemetry: OutboundBridgeTelemetry::default(),
         }
@@ -672,6 +695,22 @@ impl ConnectorOutboundBridge {
         self.rules.sort_by_key(|r| r.priority);
     }
 
+    /// Replace the policy engine used for connector dispatch decisions.
+    pub fn set_policy_engine(&mut self, policy: PolicyEngine) {
+        self.policy = policy;
+    }
+
+    /// Inspect the current policy engine.
+    #[must_use]
+    pub fn policy_engine(&self) -> &PolicyEngine {
+        &self.policy
+    }
+
+    /// Mutate the current policy engine in place.
+    pub fn policy_engine_mut(&mut self) -> &mut PolicyEngine {
+        &mut self.policy
+    }
+
     /// Register a sandbox zone for a connector.
     pub fn register_sandbox_zone(
         &mut self,
@@ -681,15 +720,56 @@ impl ConnectorOutboundBridge {
         self.sandbox.register_zone(connector, zone);
     }
 
+    fn policy_actor_for_event(event: &OutboundEvent) -> ActorKind {
+        match event.source {
+            OutboundEventSource::UserAction => ActorKind::Robot,
+            OutboundEventSource::PatternDetected
+            | OutboundEventSource::PaneLifecycle
+            | OutboundEventSource::WorkflowLifecycle
+            | OutboundEventSource::PolicyDecision
+            | OutboundEventSource::HealthAlert
+            | OutboundEventSource::Custom => ActorKind::Workflow,
+        }
+    }
+
+    fn build_policy_input(event: &OutboundEvent, rule: &OutboundRoutingRule) -> PolicyInput {
+        let summary = format!(
+            "connector {} {} for event {} ({})",
+            rule.target_connector,
+            rule.action_kind.as_str(),
+            event.event_type,
+            event.source.as_str()
+        );
+
+        let mut input = PolicyInput::new(
+            rule.action_kind.policy_action(),
+            Self::policy_actor_for_event(event),
+        )
+        .with_surface(PolicySurface::Connector)
+        .with_capabilities(PaneCapabilities::prompt())
+        .with_text_summary(summary);
+
+        if let Some(pane_id) = event.pane_id {
+            input = input.with_pane(pane_id);
+        }
+
+        if let Some(workflow_id) = &event.workflow_id {
+            input = input.with_workflow(workflow_id.clone());
+        }
+
+        input
+    }
+
     /// Process an event through the outbound bridge.
     ///
     /// Steps:
     /// 1. Deduplication check (if correlation_id present)
     /// 2. Match event against routing rules
     /// 3. For each matched rule:
-    ///    a. Sandbox capability check
-    ///    b. Build connector action
-    ///    c. Enqueue for dispatch
+    ///    a. Unified policy authorization on the connector surface
+    ///    b. Sandbox capability check
+    ///    c. Build connector action
+    ///    d. Enqueue for dispatch
     /// 4. Record history and telemetry
     pub fn process_event(
         &mut self,
@@ -729,8 +809,12 @@ impl ConnectorOutboundBridge {
         }
 
         // 2. Match routing rules
-        let matched_rules: Vec<&OutboundRoutingRule> =
-            self.rules.iter().filter(|r| r.matches(event)).collect();
+        let matched_rules: Vec<OutboundRoutingRule> = self
+            .rules
+            .iter()
+            .filter(|r| r.matches(event))
+            .cloned()
+            .collect();
 
         if matched_rules.is_empty() {
             self.telemetry.events_unmatched += 1;
@@ -763,9 +847,36 @@ impl ConnectorOutboundBridge {
         let now_ms = event.timestamp_ms;
 
         for rule in &matched_rules {
+            let policy_input = Self::build_policy_input(event, rule);
+            let policy_decision = self.policy.authorize(&policy_input);
+            if !policy_decision.is_allowed() {
+                self.telemetry.actions_blocked_policy += 1;
+                let decision_kind = policy_decision.as_str();
+                let reason = policy_decision
+                    .reason()
+                    .unwrap_or("connector action blocked by policy")
+                    .to_string();
+                warn!(
+                    rule_id = %rule.rule_id,
+                    connector = %rule.target_connector,
+                    action = %rule.action_kind,
+                    decision = %decision_kind,
+                    policy_rule_id = policy_decision.rule_id().unwrap_or("policy.unknown"),
+                    "outbound action blocked by policy"
+                );
+                blocked.push(BlockedAction {
+                    rule_id: rule.rule_id.clone(),
+                    target_connector: rule.target_connector.clone(),
+                    action_kind: rule.action_kind,
+                    reason: format!("policy({decision_kind}): {reason}"),
+                    policy_decision: Some(policy_decision),
+                });
+                continue;
+            }
+
             let required_cap = rule.action_kind.required_capability();
 
-            // 3a. Sandbox check
+            // 3b. Sandbox check
             if self.config.enforce_sandbox {
                 match self
                     .sandbox
@@ -786,13 +897,14 @@ impl ConnectorOutboundBridge {
                             target_connector: rule.target_connector.clone(),
                             action_kind: rule.action_kind,
                             reason: format!("sandbox: {reason}"),
+                            policy_decision: Some(policy_decision.clone()),
                         });
                         continue;
                     }
                 }
             }
 
-            // 3b. Build action
+            // 3c. Build action
             let action = ConnectorAction {
                 target_connector: rule.target_connector.clone(),
                 action_kind: rule.action_kind,
@@ -801,7 +913,7 @@ impl ConnectorOutboundBridge {
                 created_at_ms: now_ms,
             };
 
-            // 3c. Enqueue
+            // 3d. Enqueue
             if self.dispatch_queue.len() >= self.config.dispatch_queue_capacity {
                 self.telemetry.dispatch_queue_overflows += 1;
                 warn!(
@@ -818,6 +930,7 @@ impl ConnectorOutboundBridge {
                 target_connector: rule.target_connector.clone(),
                 action_kind: rule.action_kind,
                 correlation_id: correlation_id.clone(),
+                policy_decision: Some(policy_decision),
             });
 
             info!(
@@ -901,7 +1014,9 @@ impl ConnectorOutboundBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{PolicyRule, PolicyRuleDecision, PolicyRuleMatch, PolicyRulesConfig};
     use crate::connector_host_runtime::ConnectorCapabilityEnvelope;
+    use crate::policy::{PolicyEngine, PolicySurface};
 
     fn make_event(event_type: &str, source: OutboundEventSource) -> OutboundEvent {
         OutboundEvent::new(source, event_type, serde_json::json!({"key": "value"}))
@@ -1056,6 +1171,34 @@ mod tests {
         assert_eq!(
             ConnectorActionKind::CredentialAction.required_capability(),
             ConnectorCapability::SecretBroker
+        );
+    }
+
+    #[test]
+    fn connector_outbound_bridge_action_policy_mapping() {
+        assert_eq!(
+            ConnectorActionKind::Notify.policy_action(),
+            PolicyActionKind::ConnectorNotify
+        );
+        assert_eq!(
+            ConnectorActionKind::Ticket.policy_action(),
+            PolicyActionKind::ConnectorTicket
+        );
+        assert_eq!(
+            ConnectorActionKind::TriggerWorkflow.policy_action(),
+            PolicyActionKind::ConnectorTriggerWorkflow
+        );
+        assert_eq!(
+            ConnectorActionKind::AuditLog.policy_action(),
+            PolicyActionKind::ConnectorAuditLog
+        );
+        assert_eq!(
+            ConnectorActionKind::Invoke.policy_action(),
+            PolicyActionKind::ConnectorInvoke
+        );
+        assert_eq!(
+            ConnectorActionKind::CredentialAction.policy_action(),
+            PolicyActionKind::ConnectorCredentialAction
         );
     }
 
@@ -1219,6 +1362,16 @@ mod tests {
         assert!(!result.deduplicated);
         assert_eq!(result.actions_dispatched.len(), 1);
         assert_eq!(result.actions_dispatched[0].target_connector, "slack");
+        let decision = result.actions_dispatched[0]
+            .policy_decision
+            .as_ref()
+            .expect("allow policy trace should be preserved");
+        assert!(decision.is_allowed());
+        let context = decision
+            .context()
+            .expect("allow decision should include context");
+        assert_eq!(context.surface, PolicySurface::Connector);
+        assert_eq!(context.action, PolicyActionKind::ConnectorNotify);
         assert_eq!(result.actions_blocked.len(), 0);
         assert_eq!(bridge.pending_action_count(), 1);
     }
@@ -1283,6 +1436,134 @@ mod tests {
         assert_eq!(result.actions_dispatched.len(), 0);
         assert_eq!(result.actions_blocked.len(), 1);
         assert!(result.actions_blocked[0].reason.contains("sandbox"));
+        let decision = result.actions_blocked[0]
+            .policy_decision
+            .as_ref()
+            .expect("sandbox block should retain allow policy trace");
+        assert!(decision.is_allowed());
+        assert_eq!(
+            decision
+                .context()
+                .expect("allow context should be present")
+                .surface,
+            PolicySurface::Connector
+        );
+    }
+
+    #[test]
+    fn connector_outbound_bridge_blocks_policy_deny() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.set_policy_engine(
+            PolicyEngine::permissive().with_policy_rules(PolicyRulesConfig {
+                enabled: true,
+                rules: vec![PolicyRule {
+                    id: "block.connector.notify".to_string(),
+                    description: None,
+                    priority: 10,
+                    match_on: PolicyRuleMatch {
+                        actions: vec!["connector_notify".to_string()],
+                        actors: vec!["workflow".to_string()],
+                        surfaces: vec!["connector".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Deny,
+                    message: Some("notifications blocked".to_string()),
+                }],
+            }),
+        );
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("test", OutboundEventSource::Custom).with_pane_id(7);
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 0);
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(result.actions_blocked[0].reason.contains("policy(deny)"));
+        let decision = result.actions_blocked[0]
+            .policy_decision
+            .as_ref()
+            .expect("policy block should preserve denial");
+        assert!(decision.is_denied());
+        assert_eq!(
+            decision.rule_id(),
+            Some("config.rule.block.connector.notify")
+        );
+        let context = decision
+            .context()
+            .expect("policy deny should carry decision context");
+        assert_eq!(context.surface, PolicySurface::Connector);
+        assert_eq!(context.action, PolicyActionKind::ConnectorNotify);
+        assert_eq!(context.pane_id, Some(7));
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_blocked_policy, 1);
+        assert_eq!(tel.actions_blocked_sandbox, 0);
+        assert_eq!(bridge.pending_action_count(), 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_blocks_policy_require_approval() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.set_policy_engine(
+            PolicyEngine::permissive().with_policy_rules(PolicyRulesConfig {
+                enabled: true,
+                rules: vec![PolicyRule {
+                    id: "approve.connector.workflow".to_string(),
+                    description: None,
+                    priority: 10,
+                    match_on: PolicyRuleMatch {
+                        actions: vec!["connector_trigger_workflow".to_string()],
+                        actors: vec!["workflow".to_string()],
+                        surfaces: vec!["connector".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::RequireApproval,
+                    message: Some("workflow triggers require approval".to_string()),
+                }],
+            }),
+        );
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::TriggerWorkflow,
+        ));
+
+        let event =
+            make_event("test", OutboundEventSource::WorkflowLifecycle).with_workflow_id("wf-1");
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 0);
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("policy(require_approval)")
+        );
+        let decision = result.actions_blocked[0]
+            .policy_decision
+            .as_ref()
+            .expect("approval block should preserve decision");
+        assert!(decision.requires_approval());
+        assert_eq!(
+            decision.rule_id(),
+            Some("config.rule.approve.connector.workflow")
+        );
+        let context = decision
+            .context()
+            .expect("approval decision should carry context");
+        assert_eq!(context.surface, PolicySurface::Connector);
+        assert_eq!(context.action, PolicyActionKind::ConnectorTriggerWorkflow);
+        assert_eq!(context.workflow_id.as_deref(), Some("wf-1"));
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_blocked_policy, 1);
+        assert_eq!(bridge.pending_action_count(), 0);
     }
 
     #[test]
@@ -1695,6 +1976,7 @@ mod tests {
                 target_connector: "slack".to_string(),
                 action_kind: ConnectorActionKind::Notify,
                 correlation_id: "corr-1".to_string(),
+                policy_decision: None,
             }],
             blocked: vec![],
         };

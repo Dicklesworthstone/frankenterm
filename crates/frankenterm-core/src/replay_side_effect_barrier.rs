@@ -59,7 +59,14 @@ impl EffectType {
             | ActionKind::SendControl => Self::SendControl,
             ActionKind::Spawn | ActionKind::Split => Self::SpawnProcess,
             ActionKind::Close => Self::ClosePane,
-            ActionKind::BrowserAuth | ActionKind::WorkflowRun => Self::ApiCall,
+            ActionKind::BrowserAuth
+            | ActionKind::WorkflowRun
+            | ActionKind::ConnectorNotify
+            | ActionKind::ConnectorTicket
+            | ActionKind::ConnectorTriggerWorkflow
+            | ActionKind::ConnectorAuditLog
+            | ActionKind::ConnectorInvoke
+            | ActionKind::ConnectorCredentialAction => Self::ApiCall,
             ActionKind::WriteFile | ActionKind::DeleteFile => Self::FileWrite,
             ActionKind::ExecCommand => Self::ExecCommand,
             ActionKind::ReservePane

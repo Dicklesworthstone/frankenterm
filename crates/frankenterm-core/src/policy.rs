@@ -76,6 +76,18 @@ pub enum ActionKind {
     DeleteFile,
     /// Execute external command (future)
     ExecCommand,
+    /// Dispatch a connector notification (Slack/email/webhook)
+    ConnectorNotify,
+    /// Dispatch a connector ticket action (Jira/Linear/GitHub issue)
+    ConnectorTicket,
+    /// Trigger an external workflow via a connector
+    ConnectorTriggerWorkflow,
+    /// Emit an external audit/log action via a connector
+    ConnectorAuditLog,
+    /// Invoke a generic connector RPC/action
+    ConnectorInvoke,
+    /// Rotate or revoke credentials via a connector
+    ConnectorCredentialAction,
 }
 
 impl ActionKind {
@@ -100,7 +112,11 @@ impl ActionKind {
     pub const fn is_destructive(&self) -> bool {
         matches!(
             self,
-            Self::Close | Self::DeleteFile | Self::SendCtrlC | Self::SendCtrlD
+            Self::Close
+                | Self::DeleteFile
+                | Self::SendCtrlC
+                | Self::SendCtrlD
+                | Self::ConnectorCredentialAction
         )
     }
 
@@ -124,6 +140,12 @@ impl ActionKind {
                 | Self::WriteFile
                 | Self::DeleteFile
                 | Self::ExecCommand
+                | Self::ConnectorNotify
+                | Self::ConnectorTicket
+                | Self::ConnectorTriggerWorkflow
+                | Self::ConnectorAuditLog
+                | Self::ConnectorInvoke
+                | Self::ConnectorCredentialAction
         )
     }
 
@@ -149,6 +171,12 @@ impl ActionKind {
             Self::WriteFile => "write_file",
             Self::DeleteFile => "delete_file",
             Self::ExecCommand => "exec_command",
+            Self::ConnectorNotify => "connector_notify",
+            Self::ConnectorTicket => "connector_ticket",
+            Self::ConnectorTriggerWorkflow => "connector_trigger_workflow",
+            Self::ConnectorAuditLog => "connector_audit_log",
+            Self::ConnectorInvoke => "connector_invoke",
+            Self::ConnectorCredentialAction => "connector_credential_action",
         }
     }
 }
@@ -4471,6 +4499,7 @@ mod tests {
         assert!(ActionKind::SendText.is_mutating());
         assert!(ActionKind::SendCtrlC.is_mutating());
         assert!(ActionKind::Close.is_mutating());
+        assert!(!ActionKind::ConnectorNotify.is_mutating());
         assert!(!ActionKind::ReadOutput.is_mutating());
         assert!(!ActionKind::SearchOutput.is_mutating());
     }
@@ -4480,6 +4509,7 @@ mod tests {
         assert!(ActionKind::Close.is_destructive());
         assert!(ActionKind::DeleteFile.is_destructive());
         assert!(ActionKind::SendCtrlC.is_destructive());
+        assert!(ActionKind::ConnectorCredentialAction.is_destructive());
         assert!(!ActionKind::SendText.is_destructive());
         assert!(!ActionKind::ReadOutput.is_destructive());
     }
@@ -4488,6 +4518,7 @@ mod tests {
     fn action_kind_rate_limited() {
         assert!(ActionKind::SendText.is_rate_limited());
         assert!(ActionKind::WorkflowRun.is_rate_limited());
+        assert!(ActionKind::ConnectorNotify.is_rate_limited());
         assert!(!ActionKind::ReadOutput.is_rate_limited());
         assert!(!ActionKind::SearchOutput.is_rate_limited());
     }
@@ -4497,6 +4528,11 @@ mod tests {
         assert_eq!(ActionKind::SendText.as_str(), "send_text");
         assert_eq!(ActionKind::SendCtrlC.as_str(), "send_ctrl_c");
         assert_eq!(ActionKind::WorkflowRun.as_str(), "workflow_run");
+        assert_eq!(ActionKind::ConnectorNotify.as_str(), "connector_notify");
+        assert_eq!(
+            ActionKind::ConnectorCredentialAction.as_str(),
+            "connector_credential_action"
+        );
     }
 
     // ========================================================================
