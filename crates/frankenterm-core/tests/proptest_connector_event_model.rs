@@ -10,14 +10,15 @@ use std::collections::BTreeMap;
 use frankenterm_core::connector_event_model::{
     CANONICAL_SCHEMA_VERSION, CanonicalConnectorEvent, CanonicalSeverity, CompatibilityReport,
     EventDirection, IndexingContract, SchemaEvolutionRegistry, SchemaFieldDef,
-    SchemaValidationResult, SchemaVersion, check_compatibility, from_lifecycle_transition,
+    SchemaValidationResult, SchemaVersion, check_compatibility, from_inbound_signal,
+    from_lifecycle_transition, from_outbound_action,
 };
 use frankenterm_core::connector_host_runtime::{
     ConnectorCapability, ConnectorFailureClass, ConnectorLifecyclePhase,
 };
-use frankenterm_core::connector_inbound_bridge::ConnectorSignalKind;
+use frankenterm_core::connector_inbound_bridge::{ConnectorSignal, ConnectorSignalKind};
 use frankenterm_core::connector_outbound_bridge::{
-    ConnectorActionKind, OutboundEventSource, OutboundSeverity,
+    ConnectorAction, ConnectorActionKind, OutboundEvent, OutboundEventSource, OutboundSeverity,
 };
 
 // =============================================================================
@@ -763,6 +764,214 @@ proptest! {
         let event = from_lifecycle_transition(&connector, phase, ts);
         prop_assert!(event.event_type.starts_with("lifecycle."),
             "event_type should start with 'lifecycle.' but was: {}", event.event_type);
+    }
+}
+
+// =============================================================================
+// Inbound signal conversion properties
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn inbound_signal_direction_is_inbound(
+        source in arb_non_empty_string(),
+        kind in arb_signal_kind(),
+        ts in 1u64..1_000_000u64,
+    ) {
+        let sig = ConnectorSignal::new(source.clone(), kind, serde_json::json!({"k": "v"}))
+            .with_timestamp_ms(ts);
+        let event = from_inbound_signal(&sig);
+        prop_assert_eq!(event.direction, EventDirection::Inbound);
+        prop_assert_eq!(&event.connector_id, &source);
+        prop_assert_eq!(event.timestamp_ms, ts);
+    }
+
+    #[test]
+    fn inbound_signal_event_type_starts_with_inbound(
+        source in arb_non_empty_string(),
+        kind in arb_signal_kind(),
+    ) {
+        let sig = ConnectorSignal::new(source, kind, serde_json::json!({}))
+            .with_timestamp_ms(1000);
+        let event = from_inbound_signal(&sig);
+        prop_assert!(event.event_type.starts_with("inbound."),
+            "event_type should start with 'inbound.' but was: {}", event.event_type);
+        prop_assert!(event.event_type.contains(kind.as_str()));
+    }
+
+    #[test]
+    fn inbound_signal_failure_is_critical(source in arb_non_empty_string()) {
+        let sig = ConnectorSignal::new(source, ConnectorSignalKind::Failure, serde_json::json!({}))
+            .with_timestamp_ms(1000);
+        let event = from_inbound_signal(&sig);
+        prop_assert_eq!(event.severity, CanonicalSeverity::Critical);
+    }
+
+    #[test]
+    fn inbound_signal_preserves_correlation_id(
+        source in arb_non_empty_string(),
+        corr_id in "[a-z0-9]{4,16}",
+    ) {
+        let sig = ConnectorSignal::new(source, ConnectorSignalKind::Webhook, serde_json::json!({}))
+            .with_timestamp_ms(1000)
+            .with_correlation_id(corr_id.clone());
+        let event = from_inbound_signal(&sig);
+        prop_assert_eq!(&event.correlation_id, &corr_id);
+    }
+
+    #[test]
+    fn inbound_signal_preserves_pane_id(
+        source in arb_non_empty_string(),
+        pane_id in 0u64..1000u64,
+    ) {
+        let sig = ConnectorSignal::new(source, ConnectorSignalKind::Stream, serde_json::json!({}))
+            .with_timestamp_ms(1000)
+            .with_pane_id(pane_id);
+        let event = from_inbound_signal(&sig);
+        prop_assert_eq!(event.pane_id, Some(pane_id));
+    }
+
+    #[test]
+    fn inbound_signal_preserves_lifecycle_phase(
+        source in arb_non_empty_string(),
+        phase in arb_lifecycle_phase(),
+    ) {
+        let sig = ConnectorSignal::new(source, ConnectorSignalKind::Lifecycle, serde_json::json!({}))
+            .with_timestamp_ms(1000)
+            .with_lifecycle_phase(phase);
+        let event = from_inbound_signal(&sig);
+        prop_assert_eq!(event.lifecycle_phase, Some(phase));
+    }
+
+    #[test]
+    fn inbound_signal_preserves_failure_class(
+        source in arb_non_empty_string(),
+        class in arb_failure_class(),
+    ) {
+        let sig = ConnectorSignal::new(source, ConnectorSignalKind::Failure, serde_json::json!({}))
+            .with_timestamp_ms(1000)
+            .with_failure_class(class);
+        let event = from_inbound_signal(&sig);
+        prop_assert_eq!(event.failure_class, Some(class));
+    }
+
+    #[test]
+    fn inbound_signal_payload_preserved(
+        source in arb_non_empty_string(),
+        key in "[a-z]{3,8}",
+        val in "[a-z0-9]{1,16}",
+    ) {
+        let payload = serde_json::json!({key.clone(): val.clone()});
+        let sig = ConnectorSignal::new(source, ConnectorSignalKind::Webhook, payload.clone())
+            .with_timestamp_ms(1000);
+        let event = from_inbound_signal(&sig);
+        prop_assert_eq!(&event.payload, &payload);
+    }
+}
+
+// =============================================================================
+// Outbound action conversion properties
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn outbound_action_direction_is_outbound(
+        source in arb_event_source(),
+        action_kind in arb_action_kind(),
+        connector in arb_non_empty_string(),
+        ts in 1u64..1_000_000u64,
+    ) {
+        let event = OutboundEvent::new(source, "test.event", serde_json::json!({}))
+            .with_timestamp_ms(ts);
+        let action = ConnectorAction {
+            target_connector: connector.clone(),
+            action_kind,
+            correlation_id: "corr-1".to_string(),
+            params: serde_json::json!({"k": "v"}),
+            created_at_ms: ts,
+        };
+        let canonical = from_outbound_action(&event, &action);
+        prop_assert_eq!(canonical.direction, EventDirection::Outbound);
+        prop_assert_eq!(&canonical.connector_id, &connector);
+        prop_assert_eq!(canonical.timestamp_ms, ts);
+    }
+
+    #[test]
+    fn outbound_action_event_type_starts_with_outbound(
+        action_kind in arb_action_kind(),
+    ) {
+        let event = OutboundEvent::new(OutboundEventSource::Custom, "test", serde_json::json!({}))
+            .with_timestamp_ms(1000);
+        let action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind,
+            correlation_id: "c1".to_string(),
+            params: serde_json::json!({}),
+            created_at_ms: 1000,
+        };
+        let canonical = from_outbound_action(&event, &action);
+        prop_assert!(canonical.event_type.starts_with("outbound."),
+            "event_type should start with 'outbound.' but was: {}", canonical.event_type);
+        prop_assert!(canonical.event_type.contains(action_kind.as_str()));
+    }
+
+    #[test]
+    fn outbound_action_preserves_pane_id(
+        pane_id in 0u64..1000u64,
+    ) {
+        let event = OutboundEvent::new(OutboundEventSource::Custom, "test", serde_json::json!({}))
+            .with_timestamp_ms(1000)
+            .with_pane_id(pane_id);
+        let action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "c1".to_string(),
+            params: serde_json::json!({}),
+            created_at_ms: 1000,
+        };
+        let canonical = from_outbound_action(&event, &action);
+        prop_assert_eq!(canonical.pane_id, Some(pane_id));
+    }
+
+    #[test]
+    fn outbound_action_preserves_workflow_id(
+        wf_id in "[a-z0-9]{4,12}",
+    ) {
+        let event = OutboundEvent::new(OutboundEventSource::WorkflowLifecycle, "test", serde_json::json!({}))
+            .with_timestamp_ms(1000)
+            .with_workflow_id(wf_id.clone());
+        let action = ConnectorAction {
+            target_connector: "jira".to_string(),
+            action_kind: ConnectorActionKind::Ticket,
+            correlation_id: "c1".to_string(),
+            params: serde_json::json!({}),
+            created_at_ms: 1000,
+        };
+        let canonical = from_outbound_action(&event, &action);
+        prop_assert_eq!(canonical.workflow_id.as_deref(), Some(wf_id.as_str()));
+    }
+
+    #[test]
+    fn outbound_severity_mapping_preserves_rank(
+        sev in arb_outbound_severity(),
+    ) {
+        let event = OutboundEvent::new(OutboundEventSource::Custom, "test", serde_json::json!({}))
+            .with_timestamp_ms(1000)
+            .with_severity(sev);
+        let action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "c1".to_string(),
+            params: serde_json::json!({}),
+            created_at_ms: 1000,
+        };
+        let canonical = from_outbound_action(&event, &action);
+        let expected = CanonicalSeverity::from_outbound(sev);
+        prop_assert_eq!(canonical.severity, expected);
     }
 }
 
