@@ -142,3 +142,4 @@ storage.sqlite3.bak
 .gemini.mcp.json.*
 .opencode.json.*
 .windsurf.mcp.json.*
+.claude/settings.local.json
