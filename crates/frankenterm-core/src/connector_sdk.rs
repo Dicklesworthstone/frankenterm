@@ -1558,7 +1558,11 @@ pub fn compute_sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     let result = hasher.finalize();
-    result.iter().map(|b| format!("{b:02x}")).collect()
+    result.iter().fold(String::with_capacity(result.len() * 2), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1962,7 +1966,7 @@ mod tests {
         let payload = test_payload();
         let manifest = ManifestBuilder::new("bad-digest")
             .version("1.0.0")
-            .build_with_precomputed_digest("a".repeat(64))
+            .build_with_precomputed_digest("x".repeat(64))
             .unwrap();
 
         let report = pipeline.certify(&manifest, &payload);

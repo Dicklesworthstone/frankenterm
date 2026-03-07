@@ -792,7 +792,7 @@ pub fn from_inbound_signal(
     let severity = match signal.severity() {
         crate::patterns::Severity::Critical => CanonicalSeverity::Critical,
         crate::patterns::Severity::Warning => CanonicalSeverity::Warning,
-        _ => CanonicalSeverity::Info,
+        crate::patterns::Severity::Info => CanonicalSeverity::Info,
     };
 
     let event_type = format!("inbound.{}", signal.signal_kind.as_str());

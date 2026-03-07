@@ -790,16 +790,16 @@ impl FleetLaunchPlan {
                 .or_insert((mix.slot_count, mix.total_weight));
         }
 
-        let mut programs: BTreeMap<String, ()> = BTreeMap::new();
+        let mut programs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for program in target_by_program.keys() {
-            programs.insert(program.clone(), ());
+            programs.insert(program.clone());
         }
         for program in actual_by_program.keys() {
-            programs.insert(program.clone(), ());
+            programs.insert(program.clone());
         }
 
         programs
-            .into_keys()
+            .into_iter()
             .map(|program| {
                 let target_weight = target_by_program.get(&program).copied().unwrap_or(0);
                 let (actual_slots, actual_weight) =

@@ -362,7 +362,12 @@ impl<T: Ord + Clone, V> IntervalTree<T, V> {
         Some(value)
     }
 
-    fn remove_at(&mut self, node: Option<usize>, target: usize, unlinked: &mut Vec<usize>) -> Option<usize>
+    fn remove_at(
+        &mut self,
+        node: Option<usize>,
+        target: usize,
+        unlinked: &mut Vec<usize>,
+    ) -> Option<usize>
     where
         V: Clone,
     {

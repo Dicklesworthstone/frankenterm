@@ -1470,6 +1470,72 @@ impl ftui::Model for WaModel {
 // Rendering helpers
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportClass {
+    Compact,
+    Regular,
+    Wide,
+}
+
+fn viewport_class(width: u16, height: u16) -> ViewportClass {
+    if width >= 132 && height >= 36 {
+        ViewportClass::Wide
+    } else if width < 96 || height < 28 {
+        ViewportClass::Compact
+    } else {
+        ViewportClass::Regular
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListDetailLayout {
+    list_y: u16,
+    list_width: u16,
+    list_height: u16,
+    detail_x: u16,
+    detail_y: u16,
+    detail_width: u16,
+    detail_height: u16,
+    stacked: bool,
+}
+
+fn list_detail_layout(
+    y: u16,
+    width: u16,
+    height: u16,
+    list_ratio_percent: u16,
+    preferred_detail_height: u16,
+) -> ListDetailLayout {
+    if matches!(viewport_class(width, height), ViewportClass::Compact) {
+        let min_list_height = height.min(4);
+        let detail_height = preferred_detail_height.min(height.saturating_sub(min_list_height));
+        let list_height = height.saturating_sub(detail_height);
+        ListDetailLayout {
+            list_y: y,
+            list_width: width,
+            list_height,
+            detail_x: 0,
+            detail_y: y.saturating_add(list_height),
+            detail_width: width,
+            detail_height,
+            stacked: true,
+        }
+    } else {
+        let list_width = (((width as u32) * (list_ratio_percent as u32)) / 100) as u16;
+        let list_width = list_width.min(width);
+        ListDetailLayout {
+            list_y: y,
+            list_width,
+            list_height: height,
+            detail_x: list_width,
+            detail_y: y,
+            detail_width: width.saturating_sub(list_width),
+            detail_height: height,
+            stacked: false,
+        }
+    }
+}
+
 /// Render the tab bar at the given row.
 fn render_tab_bar(frame: &mut ftui::Frame, row: u16, width: u16, active: View) {
     let mut col = 0u16;
@@ -1760,9 +1826,9 @@ fn render_home_view(
 
 /// Render the Panes view.
 ///
-/// Two-panel layout:
-///   Left 2/3: Pane list with column headers, selection, and filter indicator.
-///   Right 1/3: Detail panel for the selected pane.
+/// Responsive pane layout:
+///   Regular/wide: left list + right detail panel.
+///   Compact: full-width list with a stacked detail panel below it.
 fn render_panes_view(
     frame: &mut ftui::Frame,
     y: u16,
@@ -1777,20 +1843,27 @@ fn render_panes_view(
         return;
     }
 
-    let max_row = y.saturating_add(height);
-    let list_width = (width * 2 / 3).max(20);
-    let detail_x = list_width;
-    let detail_width = width.saturating_sub(list_width);
-
-    let mut row = y;
+    let layout = list_detail_layout(y, width, height, 67, 8);
+    let list_width = layout.list_width;
+    let list_end = layout.list_y.saturating_add(layout.list_height);
+    let mut row = layout.list_y;
 
     // -- Header: count and filter status --
-    let header = format!(
-        "  Panes ({}/{})  domain={}",
-        filtered_indices.len(),
-        panes.len(),
-        domain_filter.unwrap_or("all"),
-    );
+    let header = if layout.stacked {
+        format!(
+            "  Panes {}/{}  domain={}  [compact]",
+            filtered_indices.len(),
+            panes.len(),
+            domain_filter.unwrap_or("all"),
+        )
+    } else {
+        format!(
+            "  Panes ({}/{})  domain={}",
+            filtered_indices.len(),
+            panes.len(),
+            domain_filter.unwrap_or("all"),
+        )
+    };
     write_styled(frame, 0, row, &header, CellStyle::new().bold());
     let hlen = header.len() as u16;
     if hlen < list_width {
@@ -1800,7 +1873,7 @@ fn render_panes_view(
     row += 1;
 
     // -- Column headers --
-    if row < max_row {
+    if row < list_end {
         let col_header = format!(
             "  {:>3} {:8} {:12} {:>9}  {}",
             "ID", "Agent", "State", "Unhandled", "Title"
@@ -1815,7 +1888,7 @@ fn render_panes_view(
     }
 
     // -- Pane rows --
-    if filtered_indices.is_empty() && row < max_row {
+    if filtered_indices.is_empty() && row < list_end {
         write_styled(
             frame,
             0,
@@ -1831,7 +1904,7 @@ fn render_panes_view(
         row += 1;
     } else {
         for (pos, &pane_idx) in filtered_indices.iter().enumerate() {
-            if row >= max_row {
+            if row >= list_end {
                 break;
             }
             let pane = &panes[pane_idx];
@@ -1862,17 +1935,24 @@ fn render_panes_view(
 
     // Fill remaining list area
     let blank_list = " ".repeat(list_width as usize);
-    while row < max_row {
+    while row < list_end {
         write_styled(frame, 0, row, &blank_list, CellStyle::new());
         row += 1;
     }
 
-    // -- Detail panel (right side) --
+    if layout.detail_width == 0 || layout.detail_height == 0 {
+        return;
+    }
+
+    // -- Detail panel --
     let selected_pane = filtered_indices
         .get(selected)
         .and_then(|&idx| panes.get(idx));
 
-    let mut drow = y;
+    let detail_x = layout.detail_x;
+    let detail_width = layout.detail_width;
+    let detail_end = layout.detail_y.saturating_add(layout.detail_height);
+    let mut drow = layout.detail_y;
 
     // Detail header
     write_styled(
@@ -1910,7 +1990,7 @@ fn render_panes_view(
         ];
 
         for line in &detail_lines {
-            if drow >= max_row {
+            if drow >= detail_end {
                 break;
             }
             write_styled(frame, detail_x, drow, line, CellStyle::new());
@@ -1921,7 +2001,7 @@ fn render_panes_view(
             }
             drow += 1;
         }
-    } else if drow < max_row {
+    } else if drow < detail_end {
         write_styled(
             frame,
             detail_x,
@@ -1939,7 +2019,7 @@ fn render_panes_view(
 
     // Fill remaining detail area
     let blank_detail = " ".repeat(detail_width as usize);
-    while drow < max_row {
+    while drow < detail_end {
         write_styled(frame, detail_x, drow, &blank_detail, CellStyle::new());
         drow += 1;
     }
@@ -1950,7 +2030,7 @@ fn render_panes_view(
 /// Layout:
 ///   Row 0:    Search input bar with cursor/prompt
 ///   Row 1:    Separator / status
-///   Rows 2+:  Two-panel (results list left 55%, detail right 45%) or empty message
+///   Rows 2+:  Responsive results layout; compact mode stacks detail below the list
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 fn render_search_view(
     frame: &mut ftui::Frame,
@@ -2031,16 +2111,16 @@ fn render_search_view(
         return;
     }
 
-    // -- Two-panel: results list (left 55%) + detail (right 45%) --
-    let list_width = (width * 55 / 100).max(20);
-    let detail_x = list_width;
-    let detail_width = width.saturating_sub(list_width);
-
+    let layout = list_detail_layout(row, width, max_row.saturating_sub(row), 55, 8);
+    let list_width = layout.list_width;
+    let detail_x = layout.detail_x;
+    let detail_width = layout.detail_width;
+    let list_end = layout.list_y.saturating_add(layout.list_height);
     let clamped_sel = selected.min(results.len().saturating_sub(1));
-    let results_start_row = row;
+    row = layout.list_y;
 
     // Column header
-    if row < max_row {
+    if row < list_end {
         let header = format!("  {:>4} {:>6}  {}", "Pane", "Rank", "Snippet");
         write_styled(frame, 0, row, &header, CellStyle::new().dim());
         let hlen = header.len() as u16;
@@ -2054,7 +2134,7 @@ fn render_search_view(
     // Result rows
     let snippet_max = list_width.saturating_sub(16).max(5) as usize;
     for (pos, result) in results.iter().enumerate() {
-        if row >= max_row {
+        if row >= list_end {
             break;
         }
         let line = format!(
@@ -2079,13 +2159,18 @@ fn render_search_view(
 
     // Fill remaining list area
     let blank_list = " ".repeat(list_width as usize);
-    while row < max_row {
+    while row < list_end {
         write_styled(frame, 0, row, &blank_list, CellStyle::new());
         row += 1;
     }
 
-    // -- Detail panel (right side) --
-    let mut drow = results_start_row;
+    if detail_width == 0 || layout.detail_height == 0 {
+        return;
+    }
+
+    // -- Detail panel --
+    let detail_end = layout.detail_y.saturating_add(layout.detail_height);
+    let mut drow = layout.detail_y;
 
     // Detail header
     write_styled(
@@ -2118,7 +2203,7 @@ fn render_search_view(
         ];
 
         for line in &detail_lines {
-            if drow >= max_row {
+            if drow >= detail_end {
                 break;
             }
             write_styled(frame, detail_x, drow, line, CellStyle::new());
@@ -2133,7 +2218,7 @@ fn render_search_view(
 
     // Fill remaining detail area
     let blank_detail = " ".repeat(detail_width as usize);
-    while drow < max_row {
+    while drow < detail_end {
         write_styled(frame, detail_x, drow, &blank_detail, CellStyle::new());
         drow += 1;
     }
@@ -2213,9 +2298,9 @@ fn render_help_view(frame: &mut ftui::Frame, y: u16, width: u16, height: u16) {
 
 /// Render the Events view.
 ///
-/// Two-panel layout:
-///   Left 60%: Event list with filter header, selection, and severity indicators.
-///   Right 40%: Detail panel for the selected event.
+/// Responsive event layout:
+///   Regular/wide: left list + right detail panel.
+///   Compact: full-width list with a stacked detail panel below it.
 fn render_events_view(
     frame: &mut ftui::Frame,
     y: u16,
@@ -2230,12 +2315,10 @@ fn render_events_view(
         return;
     }
 
-    let max_row = y.saturating_add(height);
-    let list_width = (width * 3 / 5).max(20); // 60%
-    let detail_x = list_width;
-    let detail_width = width.saturating_sub(list_width);
-
-    let mut row = y;
+    let layout = list_detail_layout(y, width, height, 60, 10);
+    let list_width = layout.list_width;
+    let list_end = layout.list_y.saturating_add(layout.list_height);
+    let mut row = layout.list_y;
 
     // -- Header: count and filter status (with focus-aware cursor) --
     let filter_text = events_state.pane_filter.text();
@@ -2244,14 +2327,25 @@ fn render_events_view(
     } else {
         ""
     };
-    let header = format!(
-        "  Events ({}/{})  unhandled_only={}  pane/rule='{}{}'",
-        filtered_indices.len(),
-        events_state.items.len(),
-        events_state.unhandled_only,
-        filter_text,
-        cursor_indicator,
-    );
+    let header = if layout.stacked {
+        format!(
+            "  Events {}/{}  u={}  q='{}{}'",
+            filtered_indices.len(),
+            events_state.items.len(),
+            events_state.unhandled_only,
+            filter_text,
+            cursor_indicator,
+        )
+    } else {
+        format!(
+            "  Events ({}/{})  unhandled_only={}  pane/rule='{}{}'",
+            filtered_indices.len(),
+            events_state.items.len(),
+            events_state.unhandled_only,
+            filter_text,
+            cursor_indicator,
+        )
+    };
     write_styled(frame, 0, row, &header, CellStyle::new().bold());
     let hlen = header.len() as u16;
     if hlen < list_width {
@@ -2261,7 +2355,7 @@ fn render_events_view(
     row += 1;
 
     // -- Column headers --
-    if row < max_row {
+    if row < list_end {
         let col_header = format!("  {:8}  {:>4}  {:28}  {}", "sev", "pane", "rule", "status");
         write_styled(frame, 0, row, &col_header, CellStyle::new().dim());
         let clen = col_header.len() as u16;
@@ -2273,7 +2367,7 @@ fn render_events_view(
     }
 
     // -- Event rows --
-    if filtered_indices.is_empty() && row < max_row {
+    if filtered_indices.is_empty() && row < list_end {
         let msg = if events_state.items.is_empty() {
             "  No events yet. Watcher will capture pattern matches here."
         } else {
@@ -2288,7 +2382,7 @@ fn render_events_view(
         row += 1;
     } else {
         for (pos, &event_idx) in filtered_indices.iter().enumerate() {
-            if row >= max_row {
+            if row >= list_end {
                 break;
             }
             let event = &events_state.items[event_idx];
@@ -2319,12 +2413,16 @@ fn render_events_view(
 
     // Fill remaining list area
     let blank_list = " ".repeat(list_width as usize);
-    while row < max_row {
+    while row < list_end {
         write_styled(frame, 0, row, &blank_list, CellStyle::new());
         row += 1;
     }
 
-    // -- Detail panel (right side) --
+    if layout.detail_width == 0 || layout.detail_height == 0 {
+        return;
+    }
+
+    // -- Detail panel --
     let selected_event = filtered_indices
         .get(selected)
         .and_then(|&idx| events_state.items.get(idx));
@@ -2332,7 +2430,10 @@ fn render_events_view(
         .get(selected)
         .and_then(|&idx| events_state.rows.get(idx));
 
-    let mut drow = y;
+    let detail_x = layout.detail_x;
+    let detail_width = layout.detail_width;
+    let detail_end = layout.detail_y.saturating_add(layout.detail_height);
+    let mut drow = layout.detail_y;
 
     // Detail header
     write_styled(
@@ -2386,7 +2487,7 @@ fn render_events_view(
         ];
 
         for line in &detail_lines {
-            if drow >= max_row {
+            if drow >= detail_end {
                 break;
             }
             write_styled(frame, detail_x, drow, line, CellStyle::new());
@@ -2397,7 +2498,7 @@ fn render_events_view(
             }
             drow += 1;
         }
-    } else if drow < max_row {
+    } else if drow < detail_end {
         write_styled(
             frame,
             detail_x,
@@ -2415,7 +2516,7 @@ fn render_events_view(
 
     // Fill remaining detail area
     let blank_detail = " ".repeat(detail_width as usize);
-    while drow < max_row {
+    while drow < detail_end {
         write_styled(frame, detail_x, drow, &blank_detail, CellStyle::new());
         drow += 1;
     }
@@ -2699,9 +2800,9 @@ fn render_triage_view(
 
 /// Render the History view.
 ///
-/// Two-panel layout:
-///   Left 60%: History entry list with filter header, column headers, and selection.
-///   Right 40%: Detail panel for the selected history entry with provenance.
+/// Responsive history layout:
+///   Regular/wide: left list + right detail panel.
+///   Compact: full-width list with a stacked detail panel below it.
 fn render_history_view(
     frame: &mut ftui::Frame,
     y: u16,
@@ -2716,12 +2817,10 @@ fn render_history_view(
         return;
     }
 
-    let max_row = y.saturating_add(height);
-    let list_width = (width * 3 / 5).max(20); // 60%
-    let detail_x = list_width;
-    let detail_width = width.saturating_sub(list_width);
-
-    let mut row = y;
+    let layout = list_detail_layout(y, width, height, 60, 10);
+    let list_width = layout.list_width;
+    let list_end = layout.list_y.saturating_add(layout.list_height);
+    let mut row = layout.list_y;
 
     // -- Header: count and filter status (with focus-aware cursor) --
     let filter_text = history_state.filter_input.text();
@@ -2730,14 +2829,25 @@ fn render_history_view(
     } else {
         ""
     };
-    let header = format!(
-        "  History ({}/{})  undoable_only={}  q='{}{}'",
-        filtered_indices.len(),
-        history_state.items.len(),
-        history_state.undoable_only,
-        filter_text,
-        cursor_indicator,
-    );
+    let header = if layout.stacked {
+        format!(
+            "  History {}/{}  u={}  q='{}{}'",
+            filtered_indices.len(),
+            history_state.items.len(),
+            history_state.undoable_only,
+            filter_text,
+            cursor_indicator,
+        )
+    } else {
+        format!(
+            "  History ({}/{})  undoable_only={}  q='{}{}'",
+            filtered_indices.len(),
+            history_state.items.len(),
+            history_state.undoable_only,
+            filter_text,
+            cursor_indicator,
+        )
+    };
     write_styled(frame, 0, row, &header, CellStyle::new().bold());
     let hlen = header.len() as u16;
     if hlen < list_width {
@@ -2747,7 +2857,7 @@ fn render_history_view(
     row += 1;
 
     // -- Column headers --
-    if row < max_row {
+    if row < list_end {
         let col_header = format!(
             "  {:>6}  {:18}  {:8}  {:>8}  {}",
             "audit", "action", "result", "undo", "actor"
@@ -2762,7 +2872,7 @@ fn render_history_view(
     }
 
     // -- History rows --
-    if filtered_indices.is_empty() && row < max_row {
+    if filtered_indices.is_empty() && row < list_end {
         let msg = if history_state.items.is_empty() {
             "  No history entries yet."
         } else {
@@ -2777,7 +2887,7 @@ fn render_history_view(
         row += 1;
     } else {
         for (pos, &entry_idx) in filtered_indices.iter().enumerate() {
-            if row >= max_row {
+            if row >= list_end {
                 break;
             }
             let hrow = &history_state.rows[entry_idx];
@@ -2808,12 +2918,16 @@ fn render_history_view(
 
     // Fill remaining list area
     let blank_list = " ".repeat(list_width as usize);
-    while row < max_row {
+    while row < list_end {
         write_styled(frame, 0, row, &blank_list, CellStyle::new());
         row += 1;
     }
 
-    // -- Detail panel (right side) --
+    if layout.detail_width == 0 || layout.detail_height == 0 {
+        return;
+    }
+
+    // -- Detail panel --
     let selected_entry = filtered_indices
         .get(selected)
         .and_then(|&idx| history_state.items.get(idx));
@@ -2821,7 +2935,10 @@ fn render_history_view(
         .get(selected)
         .and_then(|&idx| history_state.rows.get(idx));
 
-    let mut drow = y;
+    let detail_x = layout.detail_x;
+    let detail_width = layout.detail_width;
+    let detail_end = layout.detail_y.saturating_add(layout.detail_height);
+    let mut drow = layout.detail_y;
 
     // Detail header
     write_styled(
@@ -2880,7 +2997,7 @@ fn render_history_view(
         detail_lines.push(" Keys: j/k=nav u=undoable filter Esc=clear".to_string());
 
         for line in &detail_lines {
-            if drow >= max_row {
+            if drow >= detail_end {
                 break;
             }
             write_styled(frame, detail_x, drow, line, CellStyle::new());
@@ -2891,7 +3008,7 @@ fn render_history_view(
             }
             drow += 1;
         }
-    } else if drow < max_row {
+    } else if drow < detail_end {
         write_styled(
             frame,
             detail_x,
@@ -2909,7 +3026,7 @@ fn render_history_view(
 
     // Fill remaining detail area
     let blank_detail = " ".repeat(detail_width as usize);
-    while drow < max_row {
+    while drow < detail_end {
         write_styled(frame, detail_x, drow, &blank_detail, CellStyle::new());
         drow += 1;
     }
@@ -2928,9 +3045,9 @@ fn truncate_str(s: &str, max: usize) -> String {
 
 /// Render the Timeline view — cross-pane event timeline with correlation markers.
 ///
-/// Two-panel layout:
-///   Left 60%:  Timeline list with severity, pane, type, and correlation indicators.
-///   Right 40%: Detail panel for the selected event.
+/// Responsive timeline layout:
+///   Regular/wide: left list + right detail panel.
+///   Compact: full-width list with a stacked detail panel below it.
 fn render_timeline_view(
     frame: &mut ftui::Frame,
     y: u16,
@@ -2944,12 +3061,10 @@ fn render_timeline_view(
         return;
     }
 
-    let max_row = y.saturating_add(height);
-    let list_width = (width * 3 / 5).max(20); // 60%
-    let detail_x = list_width;
-    let detail_width = width.saturating_sub(list_width);
-
-    let mut row = y;
+    let layout = list_detail_layout(y, width, height, 60, 9);
+    let list_width = layout.list_width;
+    let list_end = layout.list_y.saturating_add(layout.list_height);
+    let mut row = layout.list_y;
 
     // -- Header: count + zoom level --
     let zoom_label = match zoom {
@@ -2958,11 +3073,19 @@ fn render_timeline_view(
         2 => "2h",
         _ => "6h+",
     };
-    let header = format!(
-        "  Timeline ({} events)  zoom={}  +/-=zoom j/k=nav",
-        rows.len(),
-        zoom_label,
-    );
+    let header = if layout.stacked {
+        format!(
+            "  Timeline {}  zoom={}  +/- j/k  [compact]",
+            rows.len(),
+            zoom_label,
+        )
+    } else {
+        format!(
+            "  Timeline ({} events)  zoom={}  +/-=zoom j/k=nav",
+            rows.len(),
+            zoom_label,
+        )
+    };
     write_styled(frame, 0, row, &header, CellStyle::new().bold());
     let hlen = header.len() as u16;
     if hlen < list_width {
@@ -2972,7 +3095,7 @@ fn render_timeline_view(
     row += 1;
 
     // -- Column headers --
-    if row < max_row {
+    if row < list_end {
         let col_header = format!(
             "  {:>8}  {:6}  {:8}  {:12}  {}",
             "time", "pane", "severity", "type", "corr"
@@ -2987,7 +3110,7 @@ fn render_timeline_view(
     }
 
     // -- Timeline rows --
-    if rows.is_empty() && row < max_row {
+    if rows.is_empty() && row < list_end {
         let msg = "  No timeline events in the current window.";
         write_styled(frame, 0, row, msg, CellStyle::new().dim());
         let msg_len = msg.len() as u16;
@@ -2998,7 +3121,7 @@ fn render_timeline_view(
         row += 1;
     } else {
         for (pos, trow) in rows.iter().enumerate() {
-            if row >= max_row {
+            if row >= list_end {
                 break;
             }
             let corr_marker = if trow.correlation_label.is_empty() {
@@ -3033,13 +3156,20 @@ fn render_timeline_view(
 
     // Fill remaining list area
     let blank_list = " ".repeat(list_width as usize);
-    while row < max_row {
+    while row < list_end {
         write_styled(frame, 0, row, &blank_list, CellStyle::new());
         row += 1;
     }
 
-    // -- Detail panel (right side) --
-    let mut drow = y;
+    if layout.detail_width == 0 || layout.detail_height == 0 {
+        return;
+    }
+
+    // -- Detail panel --
+    let detail_x = layout.detail_x;
+    let detail_width = layout.detail_width;
+    let detail_end = layout.detail_y.saturating_add(layout.detail_height);
+    let mut drow = layout.detail_y;
 
     // Detail header
     write_styled(
@@ -3080,7 +3210,7 @@ fn render_timeline_view(
         ];
 
         for line in &detail_lines {
-            if drow >= max_row {
+            if drow >= detail_end {
                 break;
             }
             write_styled(frame, detail_x, drow, line, CellStyle::new());
@@ -3091,7 +3221,7 @@ fn render_timeline_view(
             }
             drow += 1;
         }
-    } else if drow < max_row {
+    } else if drow < detail_end {
         write_styled(
             frame,
             detail_x,
@@ -3109,7 +3239,7 @@ fn render_timeline_view(
 
     // Fill remaining detail area
     let blank_detail = " ".repeat(detail_width as usize);
-    while drow < max_row {
+    while drow < detail_end {
         write_styled(frame, detail_x, drow, &blank_detail, CellStyle::new());
         drow += 1;
     }
@@ -3690,7 +3820,32 @@ mod tests {
         s
     }
 
+    fn first_row_containing(frame: &ftui::Frame, height: u16, needle: &str) -> Option<u16> {
+        (0..height).find(|&row| read_row(frame, row).contains(needle))
+    }
+
     // -- View navigation tests --
+
+    #[test]
+    fn viewport_class_breakpoints_are_stable() {
+        assert_eq!(viewport_class(150, 40), ViewportClass::Wide);
+        assert_eq!(viewport_class(100, 30), ViewportClass::Regular);
+        assert_eq!(viewport_class(80, 24), ViewportClass::Compact);
+    }
+
+    #[test]
+    fn list_detail_layout_stacks_on_compact_terminals() {
+        let compact = list_detail_layout(0, 80, 22, 60, 8);
+        assert!(compact.stacked);
+        assert_eq!(compact.list_width, 80);
+        assert_eq!(compact.detail_x, 0);
+        assert!(compact.detail_y >= 10);
+
+        let regular = list_detail_layout(0, 120, 28, 60, 8);
+        assert!(!regular.stacked);
+        assert_eq!(regular.detail_y, 0);
+        assert!(regular.detail_x > 0);
+    }
 
     #[test]
     fn view_all_returns_eight_views() {
@@ -4130,6 +4285,25 @@ mod tests {
     }
 
     #[test]
+    fn render_panes_narrow_stacks_detail_below_list() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+
+        let mut model = make_model(MockQuery::healthy());
+        model.refresh_data();
+
+        let filtered = model.filtered_pane_indices();
+        render_panes_view(&mut frame, 0, 80, 22, &model.panes, &filtered, 0, None);
+
+        let detail_row = first_row_containing(&frame, 22, "Pane Details")
+            .expect("compact panes layout should still show detail header");
+        assert!(
+            detail_row >= 10,
+            "compact panes detail should stack below list, got row {detail_row}"
+        );
+    }
+
+    #[test]
     fn render_panes_empty_shows_message() {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = ftui::Frame::new(100, 24, &mut pool);
@@ -4356,6 +4530,35 @@ mod tests {
             }
         }
         assert!(found, "Detail panel header not found");
+    }
+
+    #[test]
+    fn render_search_narrow_stacks_detail_below_list() {
+        let rows: Vec<super::SearchRow> = sample_search_results()
+            .iter()
+            .map(super::adapt_search)
+            .collect();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        render_search_view(
+            &mut frame,
+            0,
+            80,
+            22,
+            "error",
+            5,
+            FocusRegion::PrimaryList,
+            "error",
+            &rows,
+            0,
+        );
+
+        let detail_row = first_row_containing(&frame, 22, "Match Context")
+            .expect("compact search layout should still show detail header");
+        assert!(
+            detail_row >= 10,
+            "compact search detail should stack below list, got row {detail_row}"
+        );
     }
 
     #[test]
@@ -4677,6 +4880,35 @@ mod tests {
             }
         }
         assert!(found_detail, "Detail panel header not found");
+    }
+
+    #[test]
+    fn render_events_narrow_stacks_detail_below_list() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+
+        let mut model = make_model(MockQuery::with_events());
+        model.refresh_data();
+
+        let filtered = model.view_state.events.filtered_indices();
+        let clamped = model.view_state.events.clamped_selection();
+        render_events_view(
+            &mut frame,
+            0,
+            80,
+            22,
+            &model.view_state.events,
+            &filtered,
+            clamped,
+            FocusRegion::PrimaryList,
+        );
+
+        let detail_row = first_row_containing(&frame, 22, "Event Details")
+            .expect("compact events layout should still show detail header");
+        assert!(
+            detail_row >= 10,
+            "compact events detail should stack below list, got row {detail_row}"
+        );
     }
 
     #[test]
@@ -5469,6 +5701,34 @@ mod tests {
             }
         }
         assert!(found_detail, "Detail panel should be visible");
+    }
+
+    #[test]
+    fn render_history_narrow_stacks_detail_below_list() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        let mut model = make_model(MockQuery::with_history());
+        model.refresh_data();
+
+        let filtered = model.view_state.history.filtered_indices();
+        let clamped = model.view_state.history.clamped_selection();
+        render_history_view(
+            &mut frame,
+            0,
+            80,
+            22,
+            &model.view_state.history,
+            &filtered,
+            clamped,
+            FocusRegion::PrimaryList,
+        );
+
+        let detail_row = first_row_containing(&frame, 22, "History Details")
+            .expect("compact history layout should still show detail header");
+        assert!(
+            detail_row >= 10,
+            "compact history detail should stack below list, got row {detail_row}"
+        );
     }
 
     #[test]
@@ -7920,6 +8180,52 @@ mod tests {
         let mut frame = ftui::Frame::new(100, 24, &mut pool);
         // selected=1 should render detail panel for second event
         render_timeline_view(&mut frame, 1, 100, 22, &rows, 1, 2);
+    }
+
+    #[test]
+    fn render_timeline_narrow_stacks_detail_below_list() {
+        let rows = vec![
+            TimelineRow {
+                id: "evt-1".to_string(),
+                timestamp: "12:34:56".to_string(),
+                pane_label: "P0".to_string(),
+                agent_label: "codex".to_string(),
+                event_type: "error_burst".to_string(),
+                severity_label: "error".to_string(),
+                handled_label: "unhandled".to_string(),
+                correlation_label: "failover".to_string(),
+                summary: "Test error event".to_string(),
+                severity_style: StyleSpec::new(),
+                agent_style: StyleSpec::new(),
+                handled_style: StyleSpec::new(),
+                correlation_style: StyleSpec::new(),
+            },
+            TimelineRow {
+                id: "evt-2".to_string(),
+                timestamp: "12:34:57".to_string(),
+                pane_label: "P1".to_string(),
+                agent_label: "claude".to_string(),
+                event_type: "idle_timeout".to_string(),
+                severity_label: "warning".to_string(),
+                handled_label: "handled".to_string(),
+                correlation_label: String::new(),
+                summary: "Warning event".to_string(),
+                severity_style: StyleSpec::new(),
+                agent_style: StyleSpec::new(),
+                handled_style: StyleSpec::new(),
+                correlation_style: StyleSpec::new(),
+            },
+        ];
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 24, &mut pool);
+        render_timeline_view(&mut frame, 2, 80, 20, &rows, 0, 0);
+
+        let detail_row = first_row_containing(&frame, 24, "Event Details")
+            .expect("compact timeline layout should still show detail header");
+        assert!(
+            detail_row >= 10,
+            "compact timeline detail should stack below list, got row {detail_row}"
+        );
     }
 
     #[test]

@@ -613,6 +613,7 @@ impl TopologyOrchestrator {
     // Validation
     // -------------------------------------------------------------------------
 
+    #[allow(clippy::unused_self)]
     /// Validate a single topology operation against the lifecycle registry.
     pub fn validate_op(&self, op: &TopologyOp, registry: &LifecycleRegistry) -> OpCheckResult {
         match op {
@@ -839,6 +840,7 @@ impl TopologyOrchestrator {
     // Lifecycle-aware helpers
     // -------------------------------------------------------------------------
 
+    #[allow(clippy::unused_self)]
     fn check_pane_mutable(
         &self,
         identity: &LifecycleIdentity,
@@ -862,6 +864,7 @@ impl TopologyOrchestrator {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn check_pane_closeable(
         &self,
         identity: &LifecycleIdentity,
@@ -889,6 +892,7 @@ impl TopologyOrchestrator {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn check_pane_exists(
         &self,
         identity: &LifecycleIdentity,
@@ -902,6 +906,7 @@ impl TopologyOrchestrator {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn check_entity_exists(
         &self,
         identity: &LifecycleIdentity,
@@ -1424,7 +1429,10 @@ mod tests {
 
         let plan = orch.validate_plan(ops, &reg);
         assert!(!plan.validated);
-        assert_eq!(plan.operations[0].check, OpCheckResult::Ok);
+        assert!(matches!(
+            plan.operations[0].check,
+            OpCheckResult::Ok
+        ));
         assert!(matches!(
             plan.operations[1].check,
             OpCheckResult::NotFound { .. }

@@ -76,6 +76,7 @@ pub struct Treap<K, V> {
     nodes: Vec<TreapNode<K, V>>,
     root: Option<usize>,
     rng: Rng,
+    free: Vec<usize>,
 }
 
 impl<K: Ord + Clone, V> Default for Treap<K, V> {
@@ -98,6 +99,7 @@ impl<K: Ord + Clone, V> Treap<K, V> {
             nodes: Vec::new(),
             root: None,
             rng: Rng::new(seed),
+            free: Vec::new(),
         }
     }
 
@@ -118,28 +120,40 @@ impl<K: Ord + Clone, V> Treap<K, V> {
     where
         V: Clone,
     {
-        let priority = self.rng.next();
-        let new_idx = self.nodes.len();
-        self.nodes.push(TreapNode {
-            key: key.clone(),
-            value,
-            priority,
-            left: None,
-            right: None,
-            size: 1,
-        });
-
         let (left, existing, right) = self.split_by_key(self.root, &key);
         let old_value = existing.map(|idx| self.nodes[idx].value.clone());
 
         if let Some(existing_idx) = existing {
-            // Key already exists: update value in existing slot, discard unused new node
-            let new_node = self.nodes.pop().expect("just pushed");
-            self.nodes[existing_idx].value = new_node.value;
+            // Key already exists: update value in existing slot
+            self.nodes[existing_idx].value = value;
             let merged = self.merge(left, Some(existing_idx));
             self.root = self.merge(merged, right);
         } else {
-            // New key: merge left + new_node + right
+            // New key: allocate node and merge
+            let priority = self.rng.next();
+            let new_idx = if let Some(idx) = self.free.pop() {
+                self.nodes[idx] = TreapNode {
+                    key,
+                    value,
+                    priority,
+                    left: None,
+                    right: None,
+                    size: 1,
+                };
+                idx
+            } else {
+                let idx = self.nodes.len();
+                self.nodes.push(TreapNode {
+                    key,
+                    value,
+                    priority,
+                    left: None,
+                    right: None,
+                    size: 1,
+                });
+                idx
+            };
+
             let merged = self.merge(left, Some(new_idx));
             self.root = self.merge(merged, right);
         }
@@ -165,7 +179,11 @@ impl<K: Ord + Clone, V> Treap<K, V> {
         V: Clone,
     {
         let (left, existing, right) = self.split_by_key(self.root, key);
-        let old_value = existing.map(|idx| self.nodes[idx].value.clone());
+        let old_value = existing.map(|idx| {
+            let val = self.nodes[idx].value.clone();
+            self.free.push(idx);
+            val
+        });
         self.root = self.merge(left, right);
         old_value
     }
@@ -859,5 +877,21 @@ mod tests {
             .collect();
         let expected: Vec<(i32, i32)> = (1..=9).map(|i| (i, i * 10)).collect();
         assert_eq!(sorted, expected);
+    }
+
+    #[test]
+    fn free_list_reuse() {
+        let mut treap = Treap::new();
+        treap.insert(1, "a");
+        treap.insert(2, "b");
+        treap.insert(3, "c");
+        let arena_before = treap.nodes.len();
+
+        treap.remove(&2);
+        treap.insert(4, "d");
+
+        assert_eq!(treap.nodes.len(), arena_before);
+        assert_eq!(treap.len(), 3);
+        assert_eq!(*treap.get(&4).unwrap(), "d");
     }
 }

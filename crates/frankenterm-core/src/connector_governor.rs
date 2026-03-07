@@ -521,7 +521,7 @@ impl CostBudget {
     /// Estimate cost of an action kind (cents).
     #[must_use]
     pub fn estimate_cost(&self, action_kind: &ConnectorActionKind) -> u64 {
-        let key = action_kind_str(action_kind);
+        let key = action_kind_str(*action_kind);
         self.config.action_costs.get(key).copied().unwrap_or(1)
     }
 
@@ -1013,7 +1013,7 @@ impl ConnectorGovernor {
     pub fn evaluate(&mut self, action: &ConnectorAction, now_ms: u64) -> GovernorDecision {
         self.telemetry.evaluations += 1;
         let connector_id = action.target_connector.clone();
-        let action_kind = action_kind_str(&action.action_kind);
+        let action_kind = action_kind_str(action.action_kind);
 
         // 1. Queue backpressure — hard reject
         if self.queue.should_reject() {
@@ -1265,7 +1265,7 @@ pub struct GovernorSnapshot {
 // =============================================================================
 
 /// Convert `ConnectorActionKind` to a string key.
-fn action_kind_str(kind: &ConnectorActionKind) -> &'static str {
+fn action_kind_str(kind: ConnectorActionKind) -> &'static str {
     match kind {
         ConnectorActionKind::Notify => "notify",
         ConnectorActionKind::Ticket => "ticket",

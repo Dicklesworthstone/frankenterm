@@ -266,10 +266,16 @@ impl CuckooFilter {
         let mut idx = if self.count % 2 == 0 { i1 } else { i2 };
         let mut evicted_fp = fp;
 
+        // Track the path of swaps so we can rollback if we hit max_kicks.
+        // This prevents the filter from silently deleting an item when full.
+        let mut swap_path = Vec::with_capacity(self.max_kicks);
+
         for _ in 0..self.max_kicks {
             // Pick a random slot in the bucket to evict
             let slot = (evicted_fp as usize) % self.buckets[idx].len();
-            evicted_fp = self.buckets[idx].swap(slot, evicted_fp);
+            let old_fp = self.buckets[idx].swap(slot, evicted_fp);
+            swap_path.push((idx, slot, old_fp));
+            evicted_fp = old_fp;
 
             // Try to insert evicted fingerprint in its alternate bucket
             idx = alt_index(idx, evicted_fp, self.num_buckets);
@@ -277,6 +283,12 @@ impl CuckooFilter {
                 self.count += 1;
                 return InsertResult::Ok;
             }
+        }
+
+        // We failed to find a spot. Rollback all swaps to prevent data loss.
+        // We iterate in reverse order to restore the original state.
+        for (idx, slot, fp) in swap_path.into_iter().rev() {
+            self.buckets[idx].entries[slot] = fp;
         }
 
         InsertResult::Full

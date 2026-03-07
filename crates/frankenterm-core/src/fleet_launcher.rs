@@ -504,10 +504,7 @@ impl<'a> FleetLauncher<'a> {
         let mut sequential_halt: Option<(u32, String)> = None;
 
         // Take a durable-state checkpoint before fleet provisioning
-        let mut pre_launch_checkpoint = durable_state
-            .as_ref()
-            .and_then(|ds| ds.latest_checkpoint().map(|cp| cp.id));
-        if let Some(ds) = durable_state {
+        let pre_launch_checkpoint = if let Some(ref mut ds) = durable_state {
             let mut metadata = HashMap::new();
             metadata.insert("fleet_name".to_string(), plan.name.clone());
             metadata.insert("total_slots".to_string(), plan.slots.len().to_string());
@@ -519,8 +516,10 @@ impl<'a> FleetLauncher<'a> {
                 },
                 metadata,
             );
-            pre_launch_checkpoint = Some(checkpoint.id);
-        }
+            Some(checkpoint.id)
+        } else {
+            None
+        };
 
         // Register session entity (one per fleet launch)
         let session_identity = LifecycleIdentity::new(

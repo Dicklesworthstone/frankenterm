@@ -1980,5 +1980,4 @@ mod tests {
         let detections = gzr.detect_params(&[cmd], error);
         assert!(detections.is_empty());
     }
-
 }

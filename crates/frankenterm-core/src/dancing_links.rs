@@ -123,12 +123,12 @@ impl DancingLinks {
     /// `columns` is a list of column indices (0-based) that have a 1
     /// in this row.
     pub fn add_row(&mut self, columns: &[usize]) -> usize {
-        if columns.is_empty() {
-            return self.num_rows;
-        }
-
         let row_id = self.num_rows + 1; // 1-based row IDs
         self.num_rows += 1;
+
+        if columns.is_empty() {
+            return row_id - 1; // 0-based row index
+        }
 
         let first_node = self.nodes.len();
 
@@ -185,9 +185,7 @@ impl DancingLinks {
                 .filter(|(_, v)| **v)
                 .map(|(i, _)| i)
                 .collect();
-            if !cols.is_empty() {
-                dlx.add_row(&cols);
-            }
+            dlx.add_row(&cols);
         }
 
         dlx
@@ -724,13 +722,13 @@ mod tests {
     }
 
     #[test]
-    fn add_empty_row_noop() {
-        // Empty column list should be a no-op (no nodes added)
+    fn add_empty_row_reserves_index() {
+        // Empty column list should reserve the row index but add no nodes
         let mut dlx = DancingLinks::new(3);
         let before_nodes = dlx.nodes.len();
         let idx = dlx.add_row(&[]);
-        assert_eq!(idx, 0); // returns num_rows (0)
-        assert_eq!(dlx.num_rows(), 0); // not incremented
+        assert_eq!(idx, 0); // returns 0-based index
+        assert_eq!(dlx.num_rows(), 1); // incremented
         assert_eq!(dlx.nodes.len(), before_nodes); // no nodes added
     }
 
@@ -757,8 +755,9 @@ mod tests {
         dlx.add_row(&[0]);
         dlx.add_row(&[1]);
         dlx.add_row(&[2]);
-        dlx.add_row(&[0, 1]);
-        dlx.add_row(&[1, 2]);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
+        dlx.add_row(&[2]);
 
         let all1 = dlx.solve_all();
         let all2 = dlx.solve_all();
@@ -805,7 +804,7 @@ mod tests {
 
     #[test]
     fn from_matrix_all_false_rows_skipped() {
-        // Rows with no 1s should be skipped
+        // Rows with no 1s should still reserve their row index
         let matrix = vec![
             vec![false, false, false],
             vec![true, false, false],
@@ -813,11 +812,13 @@ mod tests {
             vec![false, true, true],
         ];
         let mut dlx = DancingLinks::from_matrix(&matrix);
-        // Only rows 1 and 3 have 1s
-        assert_eq!(dlx.num_rows(), 2);
+        // All rows are added to preserve indexing
+        assert_eq!(dlx.num_rows(), 4);
         let solution = dlx.solve().unwrap();
-        // Solution covers all 3 columns with 2 rows
+        // Solution covers all 3 columns with rows 1 and 3
         assert_eq!(solution.len(), 2);
+        assert!(solution.contains(&1));
+        assert!(solution.contains(&3));
     }
 
     #[test]
@@ -1101,7 +1102,8 @@ mod tests {
     #[test]
     fn clone_independence() {
         let mut dlx = DancingLinks::new(3);
-        dlx.add_row(&[0, 1]);
+        dlx.add_row(&[0]);
+        dlx.add_row(&[1]);
         dlx.add_row(&[2]);
 
         let mut cloned = dlx.clone();
@@ -1293,15 +1295,17 @@ mod tests {
     fn from_matrix_jagged_shorter_rows_treated_as_missing_false() {
         let matrix = vec![
             vec![true, false, false],
-            vec![false], // shorter row: no true values, should be skipped
+            vec![false], // shorter row: no true values, should reserve index 1
             vec![false, true, true],
         ];
         let mut dlx = DancingLinks::from_matrix(&matrix);
         assert_eq!(dlx.num_columns(), 3);
-        assert_eq!(dlx.num_rows(), 2);
+        assert_eq!(dlx.num_rows(), 3);
 
         let solution = dlx.solve().unwrap();
         assert_eq!(solution.len(), 2);
+        assert!(solution.contains(&0));
+        assert!(solution.contains(&2));
     }
 
     #[test]

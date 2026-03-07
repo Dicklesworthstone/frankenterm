@@ -560,17 +560,17 @@ impl ConnectorLifecycleManager {
         mc.previous_version = Some(old_version.clone());
         // Snapshot rollback metadata from pre-upgrade state rather than the incoming manifest.
         let mut rollback = manifest.clone();
-        rollback.version = old_version.clone();
+        rollback.version.clone_from(&old_version);
         rollback.package_id = connector_id.to_string();
         rollback.display_name = old_display_name;
         rollback.required_capabilities = old_capabilities;
         mc.rollback_manifest = Some(rollback);
 
         // Apply update.
-        mc.version = manifest.version.clone();
-        mc.display_name = manifest.display_name.clone();
+        mc.version.clone_from(&manifest.version);
+        mc.display_name.clone_from(&manifest.display_name);
         mc.trust_level = trust_level;
-        mc.granted_capabilities = manifest.required_capabilities.clone();
+        mc.granted_capabilities.clone_from(&manifest.required_capabilities);
         mc.admin_state = AdminState::Upgrading;
         mc.last_transition_at_ms = now_ms;
 
@@ -879,9 +879,9 @@ impl ConnectorLifecycleManager {
         let old_phase = mc.runtime_phase;
 
         // Apply rollback.
-        mc.version = previous_version.clone();
-        mc.display_name = rollback_manifest.display_name.clone();
-        mc.granted_capabilities = rollback_manifest.required_capabilities.clone();
+        mc.version.clone_from(&previous_version);
+        mc.display_name.clone_from(&rollback_manifest.display_name);
+        mc.granted_capabilities.clone_from(&rollback_manifest.required_capabilities);
         mc.previous_version = None;
         mc.rollback_manifest = None;
         mc.admin_state = AdminState::Enabled;

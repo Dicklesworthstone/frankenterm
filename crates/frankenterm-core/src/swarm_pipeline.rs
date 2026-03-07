@@ -1162,9 +1162,9 @@ impl PipelineExecutor {
                     status: StepStatus::Failed {
                         error: "circuit breaker open".to_string(),
                     },
-                    attempts: 0,
-                    duration_ms: 0,
-                    recovery_attempts: 0,
+                    attempts,
+                    duration_ms: u64::from(attempts), // Simulated.
+                    recovery_attempts,
                     compensations_run: 0,
                 };
             }
@@ -1344,14 +1344,14 @@ impl PipelineExecutor {
         // Run compensating actions in reverse step order.
         let total_steps = pipeline.steps.len();
         let mut compensation_time = now_ms;
-        let completed_steps: Vec<usize> = execution
+
+        for step_idx in execution
             .step_outcomes
             .iter()
             .filter(|(_, outcome)| outcome.status == StepStatus::Succeeded)
             .map(|(&idx, _)| idx)
-            .collect();
-
-        for step_idx in completed_steps.into_iter().rev() {
+            .rev()
+        {
             if let Some(compensation) = &pipeline.steps[step_idx].compensation {
                 compensation_time = compensation_time.saturating_add(1);
                 let step_label = pipeline.steps[step_idx].label.clone();
@@ -1427,6 +1427,7 @@ impl PipelineExecutor {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn make_hook_context(
         &self,
         execution: &PipelineExecution,
