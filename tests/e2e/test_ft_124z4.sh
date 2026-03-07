@@ -15,7 +15,13 @@ CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/rch-e2e-ft124z4}"
 export CARGO_TARGET_DIR
 
 LAST_STEP_LOG=""
-RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|Failed to connect to ubuntu@'
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_SOCKET_PATH_REGEX='unix_listener: path .*too long for Unix domain socket|too long for Unix domain socket'
+LOCAL_RCH_TMPDIR_OVERRIDE=""
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  LOCAL_RCH_TMPDIR_OVERRIDE="/tmp"
+fi
 
 emit_log() {
   local component="$1"
@@ -70,6 +76,19 @@ rch_fail_open_detected() {
   grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${log_path}"
 }
 
+rch_socket_path_issue_detected() {
+  local log_path="$1"
+  grep -Eq "${RCH_SOCKET_PATH_REGEX}" "${log_path}"
+}
+
+run_rch() {
+  if [[ -n "${LOCAL_RCH_TMPDIR_OVERRIDE}" ]]; then
+    TMPDIR="${LOCAL_RCH_TMPDIR_OVERRIDE}" rch "$@"
+  else
+    rch "$@"
+  fi
+}
+
 require_cmd() {
   local cmd="$1"
   if ! command -v "${cmd}" >/dev/null 2>&1; then
@@ -88,15 +107,24 @@ require_cmd cargo
 
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
 
+if [[ -n "${LOCAL_RCH_TMPDIR_OVERRIDE}" ]]; then
+  emit_log "preflight" "rch_local_tmpdir_workaround" "TMPDIR=${LOCAL_RCH_TMPDIR_OVERRIDE}" "applied" "darwin_controlmaster_socket_guard" "none" "$(basename "${STDOUT_FILE}")"
+fi
+
 probe_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_probe.json"
 set +e
-rch workers probe --all --json > "${probe_log}" 2>>"${STDOUT_FILE}"
+run_rch workers probe --all --json > "${probe_log}" 2>>"${STDOUT_FILE}"
 probe_rc=$?
 set -e
 
 if [[ ${probe_rc} -ne 0 ]]; then
-  emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_probe_failed" "RCH-E100" "$(basename "${probe_log}")"
-  echo "rch workers probe failed" >&2
+  if rch_socket_path_issue_detected "${STDOUT_FILE}"; then
+    emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_local_socket_path_too_long" "RCH-LOCAL-TMPDIR" "$(basename "${STDOUT_FILE}")"
+    echo "rch workers probe failed due to local SSH control socket path length; try TMPDIR=/tmp" >&2
+  else
+    emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_probe_failed" "RCH-E100" "$(basename "${probe_log}")"
+    echo "rch workers probe failed" >&2
+  fi
   exit 2
 fi
 
@@ -109,22 +137,26 @@ fi
 
 emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
 
-emit_log "preflight" "rch_remote_smoke" "cargo_version" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-if run_step rch_remote_smoke rch exec -- env TMPDIR=/tmp cargo --version; then
+emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
+if run_step rch_remote_smoke run_rch exec -- cargo check --help; then
   if rch_fail_open_detected "${LAST_STEP_LOG}"; then
-    emit_log "preflight" "rch_remote_smoke" "cargo_version" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    if rch_socket_path_issue_detected "${LAST_STEP_LOG}"; then
+      emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_local_socket_path_too_long" "RCH-LOCAL-TMPDIR" "$(basename "${LAST_STEP_LOG}")"
+    else
+      emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    fi
     echo "rch remote smoke check failed-open to local execution; refusing offload policy violation" >&2
     exit 3
   fi
-  emit_log "preflight" "rch_remote_smoke" "cargo_version" "passed" "remote_exec_confirmed" "none" "$(basename "${LAST_STEP_LOG}")"
+  emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "passed" "remote_exec_confirmed" "none" "$(basename "${LAST_STEP_LOG}")"
 else
-  emit_log "preflight" "rch_remote_smoke" "cargo_version" "failed" "rch_remote_smoke_failed" "RCH-REMOTE-SMOKE-FAIL" "$(basename "${LAST_STEP_LOG}")"
+  emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_remote_smoke_failed" "RCH-REMOTE-SMOKE-FAIL" "$(basename "${LAST_STEP_LOG}")"
   exit 2
 fi
 
 emit_log "validation" "nominal_path" "tailer_labruntime_tests" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
 if run_step nominal_labruntime \
-  rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --test tailer_labruntime --features asupersync-runtime -- --nocapture; then
+  run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo test -p frankenterm-core --test tailer_labruntime --features asupersync-runtime -- --nocapture; then
   if rch_fail_open_detected "${LAST_STEP_LOG}"; then
     emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
     echo "rch fell back to local execution; failing per offload-only policy" >&2
@@ -139,7 +171,7 @@ fi
 emit_log "validation" "failure_injection_path" "bench_without_feature" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
 set +e
 run_step failure_missing_feature \
-  rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check -p frankenterm-core --bench tailer --message-format short
+  run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check -p frankenterm-core --bench tailer --message-format short
 missing_feature_rc=$?
 set -e
 
@@ -163,7 +195,7 @@ emit_log "validation" "failure_injection_path" "bench_without_feature" "passed" 
 
 emit_log "validation" "recovery_path" "bench_with_feature" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
 if run_step recovery_with_feature \
-  rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check -p frankenterm-core --bench tailer --features asupersync-runtime --message-format short; then
+  run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo check -p frankenterm-core --bench tailer --features asupersync-runtime --message-format short; then
   if rch_fail_open_detected "${LAST_STEP_LOG}"; then
     emit_log "validation" "recovery_path" "bench_with_feature" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
     echo "rch fell back to local execution; failing per offload-only policy" >&2
