@@ -14,11 +14,11 @@ use frankenterm_core::command_transport::{
     CommandContext, CommandDeduplicator, CommandKind, CommandPolicyTrace, CommandRequest,
     CommandRouter, CommandScope, CommandTransportError, InterruptSignal,
 };
-use frankenterm_core::policy::{PolicyDecision, PolicySurface};
 use frankenterm_core::durable_state::{CheckpointTrigger, DurableStateError, DurableStateManager};
 use frankenterm_core::headless_mux_server::{
     HeadlessMuxServer, RemoteRequest, RemoteResponse, ServerConfig, ServerNodeId,
 };
+use frankenterm_core::policy::{PolicyDecision, PolicySurface};
 use frankenterm_core::session_profiles::{
     AgentIdentitySpec, FleetProgramTarget, FleetSlot, FleetStartupStrategy, FleetTemplate, Persona,
     ProfilePolicy, ProfileRegistry, ProfileRole, ResourceHints, SessionProfile,
@@ -27,6 +27,10 @@ use frankenterm_core::session_topology::{
     LifecycleDecision, LifecycleEntityKind, LifecycleEvent, LifecycleIdentity, LifecycleRegistry,
     LifecycleState, LifecycleTransitionContext, LifecycleTransitionRequest, MuxPaneLifecycleState,
     SessionLifecycleState, WindowLifecycleState,
+};
+use frankenterm_core::topology_orchestration::{
+    LayoutNode, LayoutTemplate, OpCheckResult, TemplateRegistry, TopologyError,
+    TopologyMoveDirection, TopologyOp, TopologyOrchestrator, TopologySplitDirection,
 };
 
 // =============================================================================
@@ -1393,4 +1397,1204 @@ fn policy_surface_serde_roundtrip_all_variants() {
         let rt: PolicySurface = serde_json::from_str(&json).unwrap();
         assert_eq!(&rt, surface);
     }
+}
+
+// =============================================================================
+// 12. Topology orchestration integration
+// =============================================================================
+
+#[test]
+fn topology_default_templates_register_correctly() {
+    let orch = TopologyOrchestrator::new();
+    let names = orch.templates().names();
+    assert!(names.contains(&"side-by-side"));
+    assert!(names.contains(&"primary-sidebar"));
+    assert!(names.contains(&"grid-2x2"));
+    assert!(names.contains(&"swarm-1+3"));
+    assert_eq!(orch.templates().len(), 4);
+}
+
+#[test]
+fn topology_layout_from_template_produces_correct_pane_tree() {
+    let orch = TopologyOrchestrator::new();
+    let pane_node = orch
+        .layout_from_template("side-by-side", &[10, 20])
+        .unwrap();
+
+    // Should be a VSplit with 2 leaves
+    match &pane_node {
+        frankenterm_core::session_topology::PaneNode::VSplit { children } => {
+            assert_eq!(children.len(), 2);
+            // Check that pane IDs are assigned depth-first
+            match &children[0].1 {
+                frankenterm_core::session_topology::PaneNode::Leaf { pane_id, .. } => {
+                    assert_eq!(*pane_id, 10);
+                }
+                other => panic!("expected Leaf, got {other:?}"),
+            }
+            match &children[1].1 {
+                frankenterm_core::session_topology::PaneNode::Leaf { pane_id, .. } => {
+                    assert_eq!(*pane_id, 20);
+                }
+                other => panic!("expected Leaf, got {other:?}"),
+            }
+        }
+        other => panic!("expected VSplit, got {other:?}"),
+    }
+}
+
+#[test]
+fn topology_template_pane_count_mismatch_returns_error() {
+    let orch = TopologyOrchestrator::new();
+
+    // Too few panes for grid-2x2 (needs 4)
+    let err = orch.layout_from_template("grid-2x2", &[1, 2]).unwrap_err();
+    assert!(matches!(
+        err,
+        TopologyError::TemplatePaneMismatch {
+            required: 4,
+            available: 2,
+            ..
+        }
+    ));
+
+    // Too many panes for side-by-side (max 2)
+    let err = orch
+        .layout_from_template("side-by-side", &[1, 2, 3])
+        .unwrap_err();
+    assert!(matches!(err, TopologyError::TemplatePaneMismatch { .. }));
+}
+
+#[test]
+fn topology_nonexistent_template_returns_error() {
+    let orch = TopologyOrchestrator::new();
+    let err = orch
+        .layout_from_template("does-not-exist", &[1])
+        .unwrap_err();
+    assert!(matches!(err, TopologyError::TemplateNotFound { .. }));
+}
+
+#[test]
+fn topology_validate_split_on_running_pane_succeeds() {
+    let orch = TopologyOrchestrator::new();
+    let registry = fleet_registry(3);
+
+    let op = TopologyOp::Split {
+        target: pane_id(1),
+        direction: TopologySplitDirection::Right,
+        ratio: 0.5,
+    };
+    assert_eq!(orch.validate_op(&op, &registry), OpCheckResult::Ok);
+}
+
+#[test]
+fn topology_validate_split_on_nonexistent_pane_returns_not_found() {
+    let orch = TopologyOrchestrator::new();
+    let registry = fleet_registry(1);
+
+    let op = TopologyOp::Split {
+        target: pane_id(99),
+        direction: TopologySplitDirection::Left,
+        ratio: 0.5,
+    };
+    let check = orch.validate_op(&op, &registry);
+    assert!(matches!(check, OpCheckResult::NotFound { .. }));
+}
+
+#[test]
+fn topology_validate_split_invalid_ratio_returns_constraint_violation() {
+    let orch = TopologyOrchestrator::new();
+    let registry = fleet_registry(1);
+
+    for bad_ratio in [0.0, 1.0, -0.5, 1.5] {
+        let op = TopologyOp::Split {
+            target: pane_id(1),
+            direction: TopologySplitDirection::Bottom,
+            ratio: bad_ratio,
+        };
+        let check = orch.validate_op(&op, &registry);
+        assert!(
+            matches!(check, OpCheckResult::ConstraintViolation { .. }),
+            "ratio {bad_ratio} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn topology_validate_close_on_closed_pane_returns_invalid_state() {
+    let orch = TopologyOrchestrator::new();
+    let mut registry = fleet_registry(2);
+
+    // Transition pane 1 to Closed
+    registry
+        .apply_transition(LifecycleTransitionRequest {
+            identity: pane_id(1),
+            event: LifecycleEvent::ForceClose,
+            expected_version: Some(0),
+            context: ctx(100, "topology-test", "close-pane"),
+        })
+        .unwrap();
+
+    let op = TopologyOp::Close { target: pane_id(1) };
+    let check = orch.validate_op(&op, &registry);
+    assert!(matches!(check, OpCheckResult::InvalidState { .. }));
+}
+
+#[test]
+fn topology_validate_swap_requires_both_panes_exist() {
+    let orch = TopologyOrchestrator::new();
+    let registry = fleet_registry(2);
+
+    // Both exist: OK
+    let op = TopologyOp::Swap {
+        a: pane_id(1),
+        b: pane_id(2),
+    };
+    assert_eq!(orch.validate_op(&op, &registry), OpCheckResult::Ok);
+
+    // Second doesn't exist: NotFound
+    let op = TopologyOp::Swap {
+        a: pane_id(1),
+        b: pane_id(99),
+    };
+    assert!(matches!(
+        orch.validate_op(&op, &registry),
+        OpCheckResult::NotFound { .. }
+    ));
+}
+
+#[test]
+fn topology_validate_plan_marks_invalid_ops() {
+    let orch = TopologyOrchestrator::new();
+    let registry = fleet_registry(2);
+
+    let ops = vec![
+        TopologyOp::Split {
+            target: pane_id(1),
+            direction: TopologySplitDirection::Right,
+            ratio: 0.5,
+        },
+        TopologyOp::Close {
+            target: pane_id(99), // doesn't exist
+        },
+        TopologyOp::Swap {
+            a: pane_id(1),
+            b: pane_id(2),
+        },
+    ];
+
+    let plan = orch.validate_plan(ops, &registry);
+    assert!(
+        !plan.validated,
+        "plan with invalid op should not be validated"
+    );
+    assert_eq!(plan.operations.len(), 3);
+    assert_eq!(plan.operations[0].check, OpCheckResult::Ok);
+    assert!(matches!(
+        plan.operations[1].check,
+        OpCheckResult::NotFound { .. }
+    ));
+    assert_eq!(plan.operations[2].check, OpCheckResult::Ok);
+}
+
+#[test]
+fn topology_validate_plan_all_valid_marks_validated() {
+    let orch = TopologyOrchestrator::new();
+    let registry = fleet_registry(3);
+
+    let ops = vec![
+        TopologyOp::Split {
+            target: pane_id(1),
+            direction: TopologySplitDirection::Right,
+            ratio: 0.3,
+        },
+        TopologyOp::Move {
+            target: pane_id(2),
+            direction: TopologyMoveDirection::Left,
+        },
+    ];
+
+    let plan = orch.validate_plan(ops, &registry);
+    assert!(plan.validated);
+    assert!(plan.operations.iter().all(|v| v.check == OpCheckResult::Ok));
+}
+
+#[test]
+fn topology_focus_group_lifecycle() {
+    let mut orch = TopologyOrchestrator::new();
+    let registry = fleet_registry(3);
+
+    // Create a focus group
+    let group = orch
+        .create_focus_group("agents".into(), vec![pane_id(1), pane_id(2)], &registry)
+        .unwrap();
+    assert_eq!(group.name, "agents");
+    assert!(!group.focused);
+    assert_eq!(group.members.len(), 2);
+
+    // Toggle focus
+    let focused = orch.toggle_focus_group("agents").unwrap();
+    assert!(focused);
+    let focused = orch.toggle_focus_group("agents").unwrap();
+    assert!(!focused);
+
+    // Duplicate name fails
+    let err = orch
+        .create_focus_group("agents".into(), vec![pane_id(3)], &registry)
+        .unwrap_err();
+    assert!(matches!(err, TopologyError::DuplicateFocusGroup { .. }));
+
+    // Remove
+    assert!(orch.remove_focus_group("agents"));
+    assert!(!orch.remove_focus_group("agents")); // already removed
+
+    // Toggle on nonexistent returns None
+    assert!(orch.toggle_focus_group("nonexistent").is_none());
+}
+
+#[test]
+fn topology_focus_group_rejects_nonexistent_members() {
+    let mut orch = TopologyOrchestrator::new();
+    let registry = fleet_registry(1);
+
+    let err = orch
+        .create_focus_group("bad".into(), vec![pane_id(1), pane_id(99)], &registry)
+        .unwrap_err();
+    assert!(matches!(err, TopologyError::EntityNotFound { .. }));
+}
+
+#[test]
+fn topology_audit_log_records_operations() {
+    let mut orch = TopologyOrchestrator::new();
+
+    orch.record_audit(
+        TopologyOp::Split {
+            target: pane_id(1),
+            direction: TopologySplitDirection::Right,
+            ratio: 0.5,
+        },
+        true,
+        None,
+        Some("corr-1".into()),
+    );
+    orch.record_audit(
+        TopologyOp::Close { target: pane_id(2) },
+        false,
+        Some("pane not found".into()),
+        Some("corr-2".into()),
+    );
+
+    let log = orch.audit_log();
+    assert_eq!(log.len(), 2);
+    assert!(log[0].succeeded);
+    assert!(!log[1].succeeded);
+    assert_eq!(log[1].error.as_deref(), Some("pane not found"));
+}
+
+#[test]
+fn topology_rebalance_equalizes_ratios() {
+    use frankenterm_core::session_topology::PaneNode;
+
+    // Build a VSplit with unequal ratios
+    let tree = PaneNode::VSplit {
+        children: vec![
+            (
+                0.7,
+                PaneNode::Leaf {
+                    pane_id: 1,
+                    rows: 24,
+                    cols: 80,
+                    cwd: None,
+                    title: None,
+                    is_active: false,
+                },
+            ),
+            (
+                0.3,
+                PaneNode::Leaf {
+                    pane_id: 2,
+                    rows: 24,
+                    cols: 80,
+                    cwd: None,
+                    title: None,
+                    is_active: false,
+                },
+            ),
+        ],
+    };
+
+    let balanced = TopologyOrchestrator::rebalance_tree(&tree);
+    match balanced {
+        PaneNode::VSplit { children } => {
+            let (r1, _) = &children[0];
+            let (r2, _) = &children[1];
+            assert!((r1 - 0.5).abs() < 0.01, "ratio should be ~0.5, got {r1}");
+            assert!((r2 - 0.5).abs() < 0.01, "ratio should be ~0.5, got {r2}");
+        }
+        other => panic!("expected VSplit, got {other:?}"),
+    }
+}
+
+#[test]
+fn topology_custom_template_registration_and_layout() {
+    let mut registry = TemplateRegistry::new();
+    registry.register(LayoutTemplate {
+        name: "custom-3".into(),
+        description: Some("Three vertical panes".into()),
+        root: LayoutNode::VSplit {
+            children: vec![
+                LayoutNode::Slot {
+                    role: Some("a".into()),
+                    weight: 1.0,
+                },
+                LayoutNode::Slot {
+                    role: Some("b".into()),
+                    weight: 2.0,
+                },
+                LayoutNode::Slot {
+                    role: Some("c".into()),
+                    weight: 1.0,
+                },
+            ],
+        },
+        min_panes: 3,
+        max_panes: Some(3),
+    });
+
+    let orch = TopologyOrchestrator::with_templates(registry);
+    // Default templates should NOT be present
+    assert!(orch.templates().get("side-by-side").is_none());
+    // Custom template should be present
+    assert!(orch.templates().get("custom-3").is_some());
+
+    let layout = orch
+        .layout_from_template("custom-3", &[10, 20, 30])
+        .unwrap();
+    match &layout {
+        frankenterm_core::session_topology::PaneNode::VSplit { children } => {
+            assert_eq!(children.len(), 3);
+            // Check weight ratios: 1/4, 2/4, 1/4
+            let (r0, _) = &children[0];
+            let (r1, _) = &children[1];
+            let (r2, _) = &children[2];
+            assert!((r0 - 0.25).abs() < 0.01);
+            assert!((r1 - 0.5).abs() < 0.01);
+            assert!((r2 - 0.25).abs() < 0.01);
+        }
+        other => panic!("expected VSplit, got {other:?}"),
+    }
+}
+
+#[test]
+fn topology_layout_node_slot_count_and_roles() {
+    let node = LayoutNode::HSplit {
+        children: vec![
+            LayoutNode::VSplit {
+                children: vec![
+                    LayoutNode::Slot {
+                        role: Some("tl".into()),
+                        weight: 1.0,
+                    },
+                    LayoutNode::Slot {
+                        role: Some("tr".into()),
+                        weight: 1.0,
+                    },
+                ],
+            },
+            LayoutNode::Slot {
+                role: Some("bottom".into()),
+                weight: 1.0,
+            },
+        ],
+    };
+
+    assert_eq!(node.slot_count(), 3);
+    let roles = node.roles();
+    assert_eq!(roles, vec!["tl", "tr", "bottom"]);
+}
+
+#[test]
+fn topology_op_serde_roundtrip() {
+    let ops = vec![
+        TopologyOp::Split {
+            target: pane_id(1),
+            direction: TopologySplitDirection::Right,
+            ratio: 0.5,
+        },
+        TopologyOp::Close { target: pane_id(2) },
+        TopologyOp::Swap {
+            a: pane_id(1),
+            b: pane_id(3),
+        },
+        TopologyOp::Move {
+            target: pane_id(1),
+            direction: TopologyMoveDirection::Up,
+        },
+        TopologyOp::ApplyTemplate {
+            window: window_id(0),
+            template_name: "grid-2x2".into(),
+        },
+        TopologyOp::Rebalance {
+            scope: window_id(0),
+        },
+        TopologyOp::CreateFocusGroup {
+            name: "test-group".into(),
+            members: vec![pane_id(1), pane_id(2)],
+        },
+    ];
+
+    for op in &ops {
+        let json = serde_json::to_string(op).unwrap();
+        let deserialized: TopologyOp = serde_json::from_str(&json).unwrap();
+        assert_eq!(op, &deserialized, "roundtrip failed for {op:?}");
+    }
+}
+
+// =============================================================================
+// 13. Cross-module: topology + durable state checkpoint/rollback
+// =============================================================================
+
+#[test]
+fn topology_changes_checkpoint_and_rollback_via_durable_state() {
+    let mut lifecycle_reg = fleet_registry(4);
+    let mut durable = DurableStateManager::new();
+    let orch = TopologyOrchestrator::new();
+
+    // Phase 1: Checkpoint with 4 running panes
+    let cp_before = durable
+        .checkpoint(
+            &lifecycle_reg,
+            "before-topology-change",
+            CheckpointTrigger::PreOperation {
+                operation: "apply-template".into(),
+            },
+            HashMap::new(),
+        )
+        .id;
+
+    // Phase 2: Validate topology plan (split pane 1, close pane 4)
+    let plan = orch.validate_plan(
+        vec![
+            TopologyOp::Split {
+                target: pane_id(1),
+                direction: TopologySplitDirection::Right,
+                ratio: 0.5,
+            },
+            TopologyOp::Close { target: pane_id(4) },
+        ],
+        &lifecycle_reg,
+    );
+    assert!(plan.validated);
+
+    // Phase 3: Simulate the topology change by transitioning pane 4 to Closed
+    lifecycle_reg
+        .apply_transition(LifecycleTransitionRequest {
+            identity: pane_id(4),
+            event: LifecycleEvent::ForceClose,
+            expected_version: Some(0),
+            context: ctx(200, "topology-close", "close-pane-4"),
+        })
+        .unwrap();
+
+    // Phase 4: Verify pane 4 is now closed
+    let state = lifecycle_reg.get(&pane_id(4)).unwrap().state.clone();
+    assert!(matches!(
+        state,
+        LifecycleState::Pane(MuxPaneLifecycleState::Closed)
+    ));
+
+    // Phase 5: Diff shows the topology change
+    let diff = durable
+        .diff_from_current(cp_before, &lifecycle_reg)
+        .unwrap();
+    assert!(
+        !diff.changed.is_empty(),
+        "diff should show state change for pane 4"
+    );
+
+    // Phase 6: Rollback restores pane 4 to Running
+    durable
+        .rollback(cp_before, &mut lifecycle_reg, "undo topology change")
+        .unwrap();
+    let restored_state = lifecycle_reg.get(&pane_id(4)).unwrap().state.clone();
+    assert!(matches!(
+        restored_state,
+        LifecycleState::Pane(MuxPaneLifecycleState::Running)
+    ));
+}
+
+// =============================================================================
+// 14. Cross-module: profile-driven fleet provisioning + topology
+// =============================================================================
+
+#[test]
+fn profile_fleet_template_drives_topology_layout() {
+    let orch = TopologyOrchestrator::new();
+
+    // Create a fleet template with 4 slots
+    let fleet_template = FleetTemplate {
+        name: "agent-quad".into(),
+        description: Some("4-agent deployment".into()),
+        slots: vec![
+            FleetSlot {
+                label: "leader".into(),
+                persona: Some("claude-code".into()),
+                profile: None,
+                env: HashMap::new(),
+                weight: 1,
+                startup_phase: 0,
+            },
+            FleetSlot {
+                label: "worker-1".into(),
+                persona: Some("codex".into()),
+                profile: None,
+                env: HashMap::new(),
+                weight: 1,
+                startup_phase: 1,
+            },
+            FleetSlot {
+                label: "worker-2".into(),
+                persona: Some("codex".into()),
+                profile: None,
+                env: HashMap::new(),
+                weight: 1,
+                startup_phase: 1,
+            },
+            FleetSlot {
+                label: "worker-3".into(),
+                persona: Some("codex".into()),
+                profile: None,
+                env: HashMap::new(),
+                weight: 1,
+                startup_phase: 1,
+            },
+        ],
+        layout_template: Some("swarm-1+3".into()),
+        startup_strategy: FleetStartupStrategy::default(),
+        topology_profile: None,
+        program_mix_targets: vec![FleetProgramTarget {
+            program: "claude-code".into(),
+            weight: 1,
+        }],
+    };
+
+    // Fleet template has 4 slots
+    let total = fleet_template.slots.len() as u32;
+    assert_eq!(total, 4);
+
+    // Use swarm-1+3 template which also expects 4 panes
+    let pane_ids: Vec<u64> = (100..100 + total as u64).collect();
+    let layout = orch.layout_from_template("swarm-1+3", &pane_ids).unwrap();
+
+    // Verify layout structure matches fleet template expectations
+    match &layout {
+        frankenterm_core::session_topology::PaneNode::VSplit { children } => {
+            assert_eq!(children.len(), 2); // primary + agent stack
+            // Right side is HSplit with 3 agents
+            match &children[1].1 {
+                frankenterm_core::session_topology::PaneNode::HSplit { children: agents } => {
+                    assert_eq!(agents.len(), 3);
+                }
+                other => panic!("expected HSplit for agent stack, got {other:?}"),
+            }
+        }
+        other => panic!("expected VSplit, got {other:?}"),
+    }
+}
+
+#[test]
+fn topology_validate_apply_template_checks_template_exists() {
+    let orch = TopologyOrchestrator::new();
+    let registry = fleet_registry(1);
+
+    // Valid template
+    let op = TopologyOp::ApplyTemplate {
+        window: window_id(0),
+        template_name: "grid-2x2".into(),
+    };
+    assert_eq!(orch.validate_op(&op, &registry), OpCheckResult::Ok);
+
+    // Invalid template
+    let op = TopologyOp::ApplyTemplate {
+        window: window_id(0),
+        template_name: "nonexistent".into(),
+    };
+    assert!(matches!(
+        orch.validate_op(&op, &registry),
+        OpCheckResult::InvalidState { .. }
+    ));
+}
+
+#[test]
+fn topology_validate_rebalance_checks_scope_exists() {
+    let orch = TopologyOrchestrator::new();
+    let registry = fleet_registry(1);
+
+    // Window exists in registry
+    let op = TopologyOp::Rebalance {
+        scope: window_id(0),
+    };
+    assert_eq!(orch.validate_op(&op, &registry), OpCheckResult::Ok);
+
+    // Nonexistent scope
+    let op = TopologyOp::Rebalance {
+        scope: window_id(99),
+    };
+    assert!(matches!(
+        orch.validate_op(&op, &registry),
+        OpCheckResult::NotFound { .. }
+    ));
+}
+
+#[test]
+fn topology_validate_move_on_draining_pane_rejected() {
+    let orch = TopologyOrchestrator::new();
+    let mut registry = fleet_registry(1);
+
+    // Transition pane to Draining
+    registry
+        .apply_transition(LifecycleTransitionRequest {
+            identity: pane_id(1),
+            event: LifecycleEvent::DrainRequested,
+            expected_version: Some(0),
+            context: ctx(100, "topology-move-test", "drain"),
+        })
+        .unwrap();
+
+    let op = TopologyOp::Move {
+        target: pane_id(1),
+        direction: TopologyMoveDirection::Down,
+    };
+    let check = orch.validate_op(&op, &registry);
+    assert!(
+        matches!(check, OpCheckResult::InvalidState { .. }),
+        "draining pane should reject Move, got {check:?}"
+    );
+}
+
+#[test]
+fn topology_validate_create_focus_group_checks_members_in_registry() {
+    let orch = TopologyOrchestrator::new();
+    let registry = fleet_registry(2);
+
+    let op = TopologyOp::CreateFocusGroup {
+        name: "valid".into(),
+        members: vec![pane_id(1), pane_id(2)],
+    };
+    assert_eq!(orch.validate_op(&op, &registry), OpCheckResult::Ok);
+
+    let op = TopologyOp::CreateFocusGroup {
+        name: "invalid".into(),
+        members: vec![pane_id(1), pane_id(99)],
+    };
+    assert!(matches!(
+        orch.validate_op(&op, &registry),
+        OpCheckResult::NotFound { .. }
+    ));
+}
+
+// =============================================================================
+// 15. Cross-module: command transport routing through topology plan validation
+// =============================================================================
+
+#[test]
+fn commands_route_only_to_running_panes_after_topology_close() {
+    // Setup: 4 running panes, then close one via topology plan
+    let mut registry = fleet_registry(4);
+    let orch = TopologyOrchestrator::new();
+
+    // Validate a topology plan that closes pane 4
+    let plan = orch.validate_plan(
+        vec![TopologyOp::Close {
+            target: pane_id(4),
+        }],
+        &registry,
+    );
+    assert!(plan.validated, "close plan should validate");
+
+    // Apply the close via lifecycle transition
+    registry
+        .apply_transition(LifecycleTransitionRequest {
+            identity: pane_id(4),
+            event: LifecycleEvent::ForceClose,
+            expected_version: Some(0),
+            context: ctx(300, "topo-close", "close-pane-4"),
+        })
+        .unwrap();
+
+    // Now route a fleet-wide command — should only hit panes 1-3
+    let mut router = CommandRouter::new();
+    let result = router
+        .route(
+            &CommandRequest {
+                command_id: "fleet-broadcast-1".into(),
+                scope: CommandScope::fleet(),
+                command: CommandKind::Broadcast {
+                    text: "hello fleet".into(),
+                    paste_mode: false,
+                },
+                context: cmd_ctx(301),
+                dry_run: false,
+            },
+            &registry,
+        )
+        .unwrap();
+
+    // Pane 4 should be skipped (closed), panes 1-3 delivered
+    assert_eq!(result.delivered_count(), 3);
+    assert_eq!(result.skipped_count(), 1);
+}
+
+#[test]
+fn commands_skip_draining_panes_after_topology_drain() {
+    let mut registry = fleet_registry(3);
+    let orch = TopologyOrchestrator::new();
+
+    // Validate and execute drain on pane 2
+    let drain_op = TopologyOp::Move {
+        target: pane_id(2),
+        direction: TopologyMoveDirection::Down,
+    };
+    // Drain the pane via lifecycle
+    registry
+        .apply_transition(LifecycleTransitionRequest {
+            identity: pane_id(2),
+            event: LifecycleEvent::DrainRequested,
+            expected_version: Some(0),
+            context: ctx(400, "topo-drain", "drain-pane-2"),
+        })
+        .unwrap();
+
+    // Topology should reject moves on draining panes
+    assert!(matches!(
+        orch.validate_op(&drain_op, &registry),
+        OpCheckResult::InvalidState { .. }
+    ));
+
+    // Commands should skip draining panes
+    let mut router = CommandRouter::new();
+    let result = router
+        .route(
+            &CommandRequest {
+                command_id: "fleet-cmd-2".into(),
+                scope: CommandScope::fleet(),
+                command: CommandKind::SendInput {
+                    text: "test".into(),
+                    paste_mode: false,
+                    append_newline: true,
+                },
+                context: cmd_ctx(401),
+                dry_run: false,
+            },
+            &registry,
+        )
+        .unwrap();
+
+    // Pane 2 draining → skipped, panes 1 and 3 → delivered
+    assert_eq!(result.delivered_count(), 2);
+    assert!(result.skipped_count() >= 1);
+}
+
+#[test]
+fn topology_split_adds_pane_visible_to_command_router() {
+    let mut registry = fleet_registry(2);
+    let orch = TopologyOrchestrator::new();
+
+    // Validate a split operation
+    let plan = orch.validate_plan(
+        vec![TopologyOp::Split {
+            target: pane_id(1),
+            direction: TopologySplitDirection::Right,
+            ratio: 0.5,
+        }],
+        &registry,
+    );
+    assert!(plan.validated);
+
+    // Simulate the new pane from the split by registering pane 3
+    registry
+        .register_entity(
+            pane_id(3),
+            LifecycleState::Pane(MuxPaneLifecycleState::Running),
+            500,
+        )
+        .unwrap();
+
+    // Fleet command should now reach all 3 panes
+    let mut router = CommandRouter::new();
+    let result = router
+        .route(
+            &CommandRequest {
+                command_id: "post-split-cmd".into(),
+                scope: CommandScope::fleet(),
+                command: CommandKind::Broadcast {
+                    text: "post-split".into(),
+                    paste_mode: false,
+                },
+                context: cmd_ctx(501),
+                dry_run: false,
+            },
+            &registry,
+        )
+        .unwrap();
+
+    assert_eq!(result.delivered_count(), 3);
+}
+
+#[test]
+fn topology_plan_validation_with_mixed_state_registry() {
+    let registry = mixed_state_registry();
+    let orch = TopologyOrchestrator::new();
+
+    // Split on running pane → OK
+    assert_eq!(
+        orch.validate_op(
+            &TopologyOp::Split {
+                target: pane_id(1),
+                direction: TopologySplitDirection::Right,
+                ratio: 0.5,
+            },
+            &registry,
+        ),
+        OpCheckResult::Ok
+    );
+
+    // Close on running pane → OK
+    assert_eq!(
+        orch.validate_op(
+            &TopologyOp::Close {
+                target: pane_id(2),
+            },
+            &registry,
+        ),
+        OpCheckResult::Ok
+    );
+
+    // Move on draining pane → InvalidState
+    assert!(matches!(
+        orch.validate_op(
+            &TopologyOp::Move {
+                target: pane_id(5),
+                direction: TopologyMoveDirection::Up,
+            },
+            &registry,
+        ),
+        OpCheckResult::InvalidState { .. }
+    ));
+
+    // Close on already-closed pane → InvalidState
+    assert!(matches!(
+        orch.validate_op(
+            &TopologyOp::Close {
+                target: pane_id(7),
+            },
+            &registry,
+        ),
+        OpCheckResult::InvalidState { .. }
+    ));
+}
+
+#[test]
+fn command_audit_reflects_topology_driven_scope_changes() {
+    let mut registry = fleet_registry(3);
+    let mut router = CommandRouter::new();
+
+    // First command: all 3 panes
+    router
+        .route(
+            &CommandRequest {
+                command_id: "before-topo".into(),
+                scope: CommandScope::fleet(),
+                command: CommandKind::Broadcast {
+                    text: "before".into(),
+                    paste_mode: false,
+                },
+                context: cmd_ctx(600),
+                dry_run: false,
+            },
+            &registry,
+        )
+        .unwrap();
+
+    // Close pane 3
+    registry
+        .apply_transition(LifecycleTransitionRequest {
+            identity: pane_id(3),
+            event: LifecycleEvent::ForceClose,
+            expected_version: Some(0),
+            context: ctx(601, "audit-test", "close-3"),
+        })
+        .unwrap();
+
+    // Second command: only 2 panes
+    router
+        .route(
+            &CommandRequest {
+                command_id: "after-topo".into(),
+                scope: CommandScope::fleet(),
+                command: CommandKind::Broadcast {
+                    text: "after".into(),
+                    paste_mode: false,
+                },
+                context: cmd_ctx(602),
+                dry_run: false,
+            },
+            &registry,
+        )
+        .unwrap();
+
+    // Audit log should show the reduction
+    let audit_json = router.audit_log_json().unwrap();
+    let audit: Vec<serde_json::Value> = serde_json::from_str(&audit_json).unwrap();
+    assert_eq!(audit.len(), 2);
+    assert_eq!(audit[0]["delivered_count"], 3);
+    assert_eq!(audit[1]["delivered_count"], 2);
+}
+
+// =============================================================================
+// 16. Cross-module: headless server + durable state checkpoint federation
+// =============================================================================
+
+#[test]
+fn headless_server_checkpoint_preserved_across_federation_join() {
+    let mut registry = fleet_registry(2);
+    let mut durable = DurableStateManager::new();
+
+    // Checkpoint initial state
+    let cp1 = durable
+        .checkpoint(
+            &registry,
+            "pre-federation",
+            CheckpointTrigger::PreOperation {
+                operation: "federation-join".into(),
+            },
+            HashMap::new(),
+        )
+        .id;
+
+    // Create a headless server node
+    let _server = HeadlessMuxServer::new(ServerConfig {
+        bind_address: "127.0.0.1:9100".into(),
+        node_id: "fed-node-1".into(),
+        label: Some("federation-test".into()),
+        max_panes: 64,
+        ..ServerConfig::default()
+    });
+
+    // Simulate adding a remote pane from federation
+    registry
+        .register_entity(
+            pane_id(10),
+            LifecycleState::Pane(MuxPaneLifecycleState::Running),
+            700,
+        )
+        .unwrap();
+
+    // Diff should show the new pane
+    let diff = durable.diff_from_current(cp1, &registry).unwrap();
+    assert!(!diff.added.is_empty(), "federated pane should appear in diff");
+    assert!(
+        diff.added.iter().any(|ec| ec.identity == pane_id(10)),
+        "pane 10 should be in added set"
+    );
+}
+
+#[test]
+fn headless_server_rollback_removes_federation_panes() {
+    let mut registry = fleet_registry(2);
+    let mut durable = DurableStateManager::new();
+
+    // Checkpoint before federation
+    let cp_before = durable
+        .checkpoint(
+            &registry,
+            "pre-fed",
+            CheckpointTrigger::PreOperation {
+                operation: "federation".into(),
+            },
+            HashMap::new(),
+        )
+        .id;
+
+    // Add federated panes
+    for i in 20..23 {
+        registry
+            .register_entity(
+                pane_id(i),
+                LifecycleState::Pane(MuxPaneLifecycleState::Running),
+                800,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        registry.entity_count_by_kind(LifecycleEntityKind::Pane),
+        5
+    ); // 2 original + 3 federated
+
+    // Rollback should remove federated panes
+    durable
+        .rollback(cp_before, &mut registry, "undo federation")
+        .unwrap();
+    assert_eq!(
+        registry.entity_count_by_kind(LifecycleEntityKind::Pane),
+        2
+    );
+    assert!(registry.get(&pane_id(20)).is_none());
+    assert!(registry.get(&pane_id(21)).is_none());
+    assert!(registry.get(&pane_id(22)).is_none());
+}
+
+#[test]
+fn headless_server_config_serde_roundtrip_consistency() {
+    let config = ServerConfig {
+        bind_address: "0.0.0.0:9200".into(),
+        node_id: "test-node".into(),
+        label: Some("serde-test".into()),
+        max_panes: 128,
+        heartbeat_interval_ms: 10_000,
+        ..ServerConfig::default()
+    };
+    let json = serde_json::to_string(&config).unwrap();
+    let back: ServerConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(config.node_id, back.node_id);
+    assert_eq!(config.max_panes, back.max_panes);
+    assert_eq!(config.heartbeat_interval_ms, back.heartbeat_interval_ms);
+    assert_eq!(config.auto_checkpoint, back.auto_checkpoint);
+}
+
+#[test]
+fn fleet_provisioning_checkpoint_diff_tracks_profile_assignments() {
+    let mut registry = fleet_registry(0); // just session + window
+    let mut durable = DurableStateManager::new();
+
+    // Checkpoint empty fleet
+    let cp_empty = durable
+        .checkpoint(
+            &registry,
+            "empty-fleet",
+            CheckpointTrigger::Manual,
+            HashMap::new(),
+        )
+        .id;
+
+    // Provision agents (simulating profile-driven provisioning)
+    for i in 1..=5 {
+        registry
+            .register_entity(
+                pane_id(i),
+                LifecycleState::Pane(MuxPaneLifecycleState::Running),
+                900 + i,
+            )
+            .unwrap();
+    }
+
+    // Diff should show 5 added panes
+    let diff = durable.diff_from_current(cp_empty, &registry).unwrap();
+    assert_eq!(diff.added.len(), 5);
+
+    // Checkpoint after provisioning
+    let cp_provisioned = durable
+        .checkpoint(
+            &registry,
+            "provisioned",
+            CheckpointTrigger::PreOperation {
+                operation: "post-fleet-provision".into(),
+            },
+            HashMap::new(),
+        )
+        .id;
+
+    // Drain one pane
+    registry
+        .apply_transition(LifecycleTransitionRequest {
+            identity: pane_id(3),
+            event: LifecycleEvent::DrainRequested,
+            expected_version: Some(0),
+            context: ctx(1000, "profile-drain", "scale-down"),
+        })
+        .unwrap();
+
+    // Diff from provisioned checkpoint should show 1 changed
+    let diff2 = durable.diff_from_current(cp_provisioned, &registry).unwrap();
+    assert_eq!(diff2.changed.len(), 1);
+    assert!(diff2.changed.iter().any(|ec| ec.identity == pane_id(3)));
+}
+
+#[test]
+fn command_dedup_survives_topology_operations() {
+    let registry = fleet_registry(2);
+    let mut router = CommandRouter::new();
+    let mut dedup = CommandDeduplicator::new(60_000); // 60s TTL
+
+    let cmd_id = "dedup-topo-1".to_string();
+
+    // First command — should not be duplicate
+    let is_dup = dedup.is_duplicate(&cmd_id, 1100);
+    assert!(!is_dup, "first use should not be duplicate");
+
+    let result = router
+        .route(
+            &CommandRequest {
+                command_id: cmd_id.clone(),
+                scope: CommandScope::pane(pane_id(1)),
+                command: CommandKind::SendInput {
+                    text: "echo hello".into(),
+                    paste_mode: false,
+                    append_newline: true,
+                },
+                context: cmd_ctx(1100),
+                dry_run: false,
+            },
+            &registry,
+        )
+        .unwrap();
+    assert_eq!(result.delivered_count(), 1);
+
+    // Same command ID — dedup should catch it
+    let is_dup = dedup.is_duplicate(&cmd_id, 1101);
+    assert!(is_dup, "second use should be duplicate");
+}
+
+#[test]
+fn dry_run_command_through_topology_validated_fleet() {
+    let registry = fleet_registry(4);
+    let orch = TopologyOrchestrator::new();
+    let mut router = CommandRouter::new();
+
+    // Validate a topology plan first
+    let plan = orch.validate_plan(
+        vec![
+            TopologyOp::Split {
+                target: pane_id(1),
+                direction: TopologySplitDirection::Right,
+                ratio: 0.5,
+            },
+            TopologyOp::CreateFocusGroup {
+                name: "workers".into(),
+                members: vec![pane_id(2), pane_id(3), pane_id(4)],
+            },
+        ],
+        &registry,
+    );
+    assert!(plan.validated);
+
+    // Dry-run a fleet broadcast
+    let result = router
+        .route(
+            &CommandRequest {
+                command_id: "dry-run-fleet".into(),
+                scope: CommandScope::fleet(),
+                command: CommandKind::Broadcast {
+                    text: "dry run test".into(),
+                    paste_mode: false,
+                },
+                context: cmd_ctx(1200),
+                dry_run: true,
+            },
+            &registry,
+        )
+        .unwrap();
+
+    assert!(result.dry_run);
+    assert_eq!(result.delivered_count(), 4); // dry run still shows what would deliver
 }
