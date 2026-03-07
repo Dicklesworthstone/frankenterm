@@ -1345,13 +1345,14 @@ impl PipelineExecutor {
         let total_steps = pipeline.steps.len();
         let mut compensation_time = now_ms;
 
-        for step_idx in execution
+        let succeeded_indices: Vec<usize> = execution
             .step_outcomes
             .iter()
             .filter(|(_, outcome)| outcome.status == StepStatus::Succeeded)
             .map(|(&idx, _)| idx)
             .rev()
-        {
+            .collect();
+        for step_idx in succeeded_indices {
             if let Some(compensation) = &pipeline.steps[step_idx].compensation {
                 compensation_time = compensation_time.saturating_add(1);
                 let step_label = pipeline.steps[step_idx].label.clone();

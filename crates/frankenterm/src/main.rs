@@ -15010,8 +15010,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 print_robot_response(&response, format, stats)?;
                                 return Ok(());
                             }
-                            if let Err(message) = validate_robot_events_replay_limit(replay_limit)
-                            {
+                            if let Err(message) = validate_robot_events_replay_limit(replay_limit) {
                                 let response = RobotResponse::<RobotEventsData>::error_with_code(
                                     ROBOT_ERR_INVALID_ARGS,
                                     message.to_string(),
@@ -39423,7 +39422,10 @@ log_level = "debug"
             next_robot_events_cursor(Some(42), std::iter::empty::<i64>()),
             Some(42)
         );
-        assert_eq!(next_robot_events_cursor(None, std::iter::empty::<i64>()), None);
+        assert_eq!(
+            next_robot_events_cursor(None, std::iter::empty::<i64>()),
+            None
+        );
     }
 
     #[test]

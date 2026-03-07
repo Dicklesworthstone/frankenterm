@@ -61,6 +61,7 @@ fn cmd_ctx(ts: u64) -> CommandContext {
         correlation_id: format!("harness-cmd-{ts}"),
         caller_identity: "harness-agent".to_string(),
         reason: Some("integration test".to_string()),
+        policy_trace: None,
     }
 }
 
@@ -518,7 +519,7 @@ fn headless_server_command_routing_via_remote_protocol() {
 
     // Route a fleet-wide capture command via the remote protocol
     let request = RemoteRequest::Command {
-        request: CommandRequest {
+        request: Box::new(CommandRequest {
             command_id: "remote-cap-1".to_string(),
             scope: CommandScope::fleet(),
             command: CommandKind::Capture {
@@ -527,7 +528,7 @@ fn headless_server_command_routing_via_remote_protocol() {
             },
             context: cmd_ctx(1000),
             dry_run: false,
-        },
+        }),
     };
 
     match server.handle_request(request) {
@@ -922,7 +923,7 @@ fn e2e_fleet_provision_command_fail_rollback_recover() {
 
     // Phase 3: Route commands to the fleet
     let cmd_result = match server.handle_request(RemoteRequest::Command {
-        request: CommandRequest {
+        request: Box::new(CommandRequest {
             command_id: "e2e-send-1".to_string(),
             scope: CommandScope::fleet(),
             command: CommandKind::SendInput {
@@ -932,7 +933,7 @@ fn e2e_fleet_provision_command_fail_rollback_recover() {
             },
             context: cmd_ctx(2000),
             dry_run: false,
-        },
+        }),
     }) {
         RemoteResponse::CommandResult { result } => result,
         other => panic!("expected CommandResult, got {other:?}"),
@@ -954,7 +955,7 @@ fn e2e_fleet_provision_command_fail_rollback_recover() {
 
     // Phase 5: Verify degraded command routing
     let degraded = match server.handle_request(RemoteRequest::Command {
-        request: CommandRequest {
+        request: Box::new(CommandRequest {
             command_id: "e2e-send-degraded".to_string(),
             scope: CommandScope::fleet(),
             command: CommandKind::SendInput {
@@ -964,7 +965,7 @@ fn e2e_fleet_provision_command_fail_rollback_recover() {
             },
             context: cmd_ctx(4000),
             dry_run: false,
-        },
+        }),
     }) {
         RemoteResponse::CommandResult { result } => result,
         other => panic!("expected CommandResult, got {other:?}"),
@@ -990,7 +991,7 @@ fn e2e_fleet_provision_command_fail_rollback_recover() {
 
     // Phase 7: Verify fleet restored — all 5 should accept commands again
     let restored = match server.handle_request(RemoteRequest::Command {
-        request: CommandRequest {
+        request: Box::new(CommandRequest {
             command_id: "e2e-send-restored".to_string(),
             scope: CommandScope::fleet(),
             command: CommandKind::SendInput {
@@ -1000,7 +1001,7 @@ fn e2e_fleet_provision_command_fail_rollback_recover() {
             },
             context: cmd_ctx(5000),
             dry_run: false,
-        },
+        }),
     }) {
         RemoteResponse::CommandResult { result } => result,
         other => panic!("expected CommandResult, got {other:?}"),

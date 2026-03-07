@@ -37,6 +37,7 @@ fn test_ctx(ts: u64) -> CommandContext {
         correlation_id: "corr-pt".to_string(),
         caller_identity: "agent-pt".to_string(),
         reason: None,
+        policy_trace: None,
     }
 }
 

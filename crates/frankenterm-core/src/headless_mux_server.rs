@@ -152,7 +152,7 @@ impl Default for ServerConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteRequest {
     /// Execute a command on the mux.
-    Command { request: CommandRequest },
+    Command { request: Box<CommandRequest> },
     /// Query server status.
     Status,
     /// List all managed entities.

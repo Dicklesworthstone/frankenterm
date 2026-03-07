@@ -492,7 +492,7 @@ impl<'a> FleetLauncher<'a> {
         &self,
         plan: &LaunchPlan,
         registry: &mut LifecycleRegistry,
-        durable_state: Option<&mut DurableStateManager>,
+        mut durable_state: Option<&mut DurableStateManager>,
         mut router: Option<&mut CommandRouter>,
     ) -> LaunchOutcome {
         let timestamp = epoch_ms();
@@ -504,7 +504,7 @@ impl<'a> FleetLauncher<'a> {
         let mut sequential_halt: Option<(u32, String)> = None;
 
         // Take a durable-state checkpoint before fleet provisioning
-        let pre_launch_checkpoint = if let Some(ref mut ds) = durable_state {
+        let pre_launch_checkpoint = if let Some(ds) = durable_state.as_mut() {
             let mut metadata = HashMap::new();
             metadata.insert("fleet_name".to_string(), plan.name.clone());
             metadata.insert("total_slots".to_string(), plan.slots.len().to_string());
