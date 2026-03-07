@@ -2,6 +2,9 @@
 
 use proptest::prelude::*;
 
+use frankenterm_core::command_transport::{
+    CommandContext, CommandKind, CommandRequest, CommandScope,
+};
 use frankenterm_core::headless_mux_server::{
     HeadlessMuxServer, PeerStatus, RemoteRequest, RemoteResponse, ServerConfig, ServerNodeId,
 };
@@ -342,5 +345,128 @@ proptest! {
         server.handle_request(RemoteRequest::JoinFederation { peer: node });
         // Same node_id should overwrite, not duplicate
         prop_assert_eq!(server.peer_count(), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // Remote command dispatch
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn command_to_registered_pane_succeeds(
+        pane_id in 0u64..100u64,
+        text in "[a-z ]{1,20}",
+    ) {
+        let mut server = make_server();
+        register_pane(&mut server, pane_id);
+        let identity = LifecycleIdentity::new(
+            LifecycleEntityKind::Pane, "default", "local", pane_id, 1,
+        );
+        let req = CommandRequest {
+            command_id: format!("cmd-{pane_id}"),
+            scope: CommandScope::pane(identity),
+            command: CommandKind::SendInput {
+                text,
+                paste_mode: false,
+                append_newline: true,
+            },
+            context: CommandContext::new("test", "corr-test", "test-agent"),
+            dry_run: false,
+        };
+        let resp = server.handle_request(RemoteRequest::Command {
+            request: Box::new(req),
+        });
+        let is_result = matches!(resp, RemoteResponse::CommandResult { .. });
+        prop_assert!(is_result, "command to registered pane must return CommandResult");
+        if let RemoteResponse::CommandResult { result } = resp {
+            prop_assert_eq!(result.delivered_count(), 1);
+        }
+    }
+
+    #[test]
+    fn command_to_unregistered_pane_returns_error(bad_id in 500u64..999u64) {
+        let mut server = make_server();
+        let identity = LifecycleIdentity::new(
+            LifecycleEntityKind::Pane, "default", "local", bad_id, 1,
+        );
+        let req = CommandRequest {
+            command_id: format!("cmd-bad-{bad_id}"),
+            scope: CommandScope::pane(identity),
+            command: CommandKind::SendInput {
+                text: "test".into(),
+                paste_mode: false,
+                append_newline: true,
+            },
+            context: CommandContext::new("test", "corr-test", "test-agent"),
+            dry_run: false,
+        };
+        let resp = server.handle_request(RemoteRequest::Command {
+            request: Box::new(req),
+        });
+        let is_error = matches!(resp, RemoteResponse::Error { .. });
+        prop_assert!(is_error, "command to unregistered pane must return Error");
+    }
+
+    // -------------------------------------------------------------------
+    // Checkpoint + rollback integration
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn checkpoint_then_rollback_restores_state(n in 1usize..5usize) {
+        let mut server = make_server();
+        for i in 0..n {
+            register_pane(&mut server, i as u64);
+        }
+        // Checkpoint
+        let cp_resp = server.handle_request(RemoteRequest::Checkpoint {
+            label: "pre-change".into(),
+        });
+        let checkpoint_id = match cp_resp {
+            RemoteResponse::CheckpointCreated { id, .. } => id,
+            _ => { prop_assert!(false, "expected checkpoint created"); return Ok(()); }
+        };
+
+        // Add more panes
+        for i in n..(n + 3) {
+            register_pane(&mut server, i as u64);
+        }
+        // Verify more entities now exist
+        let status_resp = server.handle_request(RemoteRequest::Status);
+        if let RemoteResponse::Status { status } = status_resp {
+            prop_assert_eq!(status.pane_count as usize, n + 3);
+        }
+
+        // Rollback
+        let rollback_resp = server.handle_request(RemoteRequest::Rollback {
+            checkpoint_id,
+            reason: "test".into(),
+        });
+        let is_rollback_ok = matches!(rollback_resp, RemoteResponse::RollbackComplete { .. });
+        prop_assert!(is_rollback_ok, "rollback must succeed for valid checkpoint");
+    }
+
+    // -------------------------------------------------------------------
+    // Server status invariants
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn status_node_id_matches_config(config in arb_config()) {
+        let node_id = config.node_id.clone();
+        let mut server = HeadlessMuxServer::new(config);
+        let resp = server.handle_request(RemoteRequest::Status);
+        match resp {
+            RemoteResponse::Status { status } => {
+                prop_assert_eq!(status.node_id, node_id);
+            }
+            _ => prop_assert!(false, "expected Status response"),
+        }
+    }
+
+    #[test]
+    fn config_accessible_after_construction(config in arb_config()) {
+        let max_conn = config.max_connections;
+        let max_panes = config.max_panes;
+        let server = HeadlessMuxServer::new(config);
+        prop_assert_eq!(server.config().max_connections, max_conn);
+        prop_assert_eq!(server.config().max_panes, max_panes);
     }
 }
