@@ -931,7 +931,10 @@ impl CommandGuard {
 
     fn keyword_filter(&self, command: &str, pane_config: &PaneGuardConfig) -> Vec<&'static str> {
         let mut pack_ids: Vec<&'static str> = Vec::new();
-        let enabled = pane_config.enabled_packs.as_ref().unwrap_or(&self.policy.enabled_packs);
+        let enabled = pane_config
+            .enabled_packs
+            .as_ref()
+            .unwrap_or(&self.policy.enabled_packs);
         let disabled = &self.policy.disabled_packs;
 
         for mat in KEYWORD_AUTOMATON.find_iter(command) {

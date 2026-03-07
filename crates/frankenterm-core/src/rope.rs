@@ -187,13 +187,10 @@ impl Rope {
             return;
         }
 
-        // Split at index, insert between halves
-        let (left, right) = self.split(index);
-        let mut result = left;
-        result.append(text);
-        let right_str = right.to_string_full();
-        result.append(&right_str);
-        *self = result;
+        let new_idx = self.build_from_str(text);
+        let (left, right) = self.split_node(self.root, index);
+        let merged_left = self.merge_node_opt(left, Some(new_idx));
+        self.root = self.merge_node_opt(merged_left, right);
     }
 
     /// Delete characters in the range `[start, end)`.
@@ -204,13 +201,10 @@ impl Rope {
         }
         let end = end.min(len);
 
-        let (left, right_full) = self.split(start);
-        let (_, right) = right_full.split(end - start);
+        let (left, right_full) = self.split_node(self.root, start);
+        let (_, right) = self.split_node(right_full, end - start);
 
-        let right_str = right.to_string_full();
-        let mut result = left;
-        result.append(&right_str);
-        *self = result;
+        self.root = self.merge_node_opt(left, right);
     }
 
     /// Split the rope at the given index.
@@ -224,15 +218,24 @@ impl Rope {
         if index >= self.len() {
             return (self.clone(), Rope::new());
         }
-        let left_str = self.substring(0, index);
-        let right_str = self.substring(index, self.len());
-        (Rope::from_str(&left_str), Rope::from_str(&right_str))
+
+        let mut left_rope = self.clone();
+        let (ll, _) = left_rope.split_node(left_rope.root, index);
+        left_rope.root = ll;
+
+        let mut right_rope = self.clone();
+        let (_, rr) = right_rope.split_node(right_rope.root, index);
+        right_rope.root = rr;
+
+        (left_rope, right_rope)
     }
 
     /// Concatenate another rope onto the end of this one.
     pub fn concat(&mut self, other: &Rope) {
-        let other_str = other.to_string_full();
-        self.append(&other_str);
+        if let Some(other_root) = other.root {
+            let copied_root = self.copy_nodes_from(other, Some(other_root));
+            self.root = self.merge_node_opt(self.root, copied_root);
+        }
     }
 
     /// Return the number of lines (count of '\n' characters + 1 if non-empty).
@@ -277,6 +280,91 @@ impl Rope {
             total_len,
         });
         idx
+    }
+
+    fn split_node(&mut self, node: Option<usize>, index: usize) -> (Option<usize>, Option<usize>) {
+        let idx = match node {
+            Some(i) => i,
+            None => return (None, None),
+        };
+
+        if index == 0 {
+            return (None, Some(idx));
+        }
+        let len = self.node_len(idx);
+        if index >= len {
+            return (Some(idx), None);
+        }
+
+        match self.nodes[idx].clone() {
+            RopeNode::Leaf { text } => {
+                let mut mid = index;
+                while mid > 0 && !text.is_char_boundary(mid) {
+                    mid -= 1;
+                }
+                let left_str = text[..mid].to_string();
+                let right_str = text[mid..].to_string();
+                let l = if left_str.is_empty() {
+                    None
+                } else {
+                    Some(self.alloc_leaf(left_str))
+                };
+                let r = if right_str.is_empty() {
+                    None
+                } else {
+                    Some(self.alloc_leaf(right_str))
+                };
+                (l, r)
+            }
+            RopeNode::Branch {
+                left,
+                right,
+                weight,
+                ..
+            } => {
+                if index < weight {
+                    let (ll, lr) = self.split_node(Some(left), index);
+                    let r = match (lr, Some(right)) {
+                        (Some(lri), Some(ri)) => Some(self.alloc_branch(lri, ri)),
+                        (None, r) => r,
+                        (l, None) => l,
+                    };
+                    (ll, r)
+                } else {
+                    let (rl, rr) = self.split_node(Some(right), index - weight);
+                    let l = match (Some(left), rl) {
+                        (Some(li), Some(rli)) => Some(self.alloc_branch(li, rli)),
+                        (l, None) => l,
+                        (None, r) => r,
+                    };
+                    (l, rr)
+                }
+            }
+        }
+    }
+
+    fn merge_node_opt(&mut self, left: Option<usize>, right: Option<usize>) -> Option<usize> {
+        match (left, right) {
+            (Some(l), Some(r)) => Some(self.alloc_branch(l, r)),
+            (Some(l), None) => Some(l),
+            (None, Some(r)) => Some(r),
+            (None, None) => None,
+        }
+    }
+
+    fn copy_nodes_from(&mut self, other: &Rope, other_node: Option<usize>) -> Option<usize> {
+        let idx = other_node?;
+        match &other.nodes[idx] {
+            RopeNode::Leaf { text } => {
+                let text = text.clone();
+                Some(self.alloc_leaf(text))
+            }
+            RopeNode::Branch { left, right, .. } => {
+                let new_left = self.copy_nodes_from(other, Some(*left)).unwrap();
+                let new_right = self.copy_nodes_from(other, Some(*right)).unwrap();
+                Some(self.alloc_branch(new_left, new_right))
+            }
+        }
     }
 
     fn node_len(&self, idx: usize) -> usize {

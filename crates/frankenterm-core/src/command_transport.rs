@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::policy::{PolicyDecision, PolicySurface};
 use crate::session_topology::{
     LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
     MuxPaneLifecycleState,
@@ -198,6 +199,9 @@ pub struct CommandContext {
     /// Optional reason for the command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Optional upstream policy trace metadata to carry into routing audit logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_trace: Option<CommandPolicyTrace>,
 }
 
 impl CommandContext {
@@ -217,6 +221,7 @@ impl CommandContext {
             correlation_id: correlation_id.into(),
             caller_identity: caller_identity.into(),
             reason: None,
+            policy_trace: None,
         }
     }
 
@@ -232,6 +237,62 @@ impl CommandContext {
     pub fn with_timestamp(mut self, timestamp_ms: u64) -> Self {
         self.timestamp_ms = timestamp_ms;
         self
+    }
+
+    /// Attach upstream policy trace metadata for audit preservation.
+    #[must_use]
+    pub fn with_policy_trace(mut self, policy_trace: CommandPolicyTrace) -> Self {
+        self.policy_trace = Some(policy_trace);
+        self
+    }
+
+    /// Build and attach policy trace metadata from a canonical policy decision.
+    #[must_use]
+    pub fn with_policy_decision(
+        mut self,
+        surface: PolicySurface,
+        decision: &PolicyDecision,
+    ) -> Self {
+        self.policy_trace = Some(CommandPolicyTrace::from_surface_and_decision(
+            surface, decision,
+        ));
+        self
+    }
+}
+
+/// Structured policy metadata preserved alongside command-transport audit events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandPolicyTrace {
+    pub decision: String,
+    pub surface: PolicySurface,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub determining_rule: Option<String>,
+}
+
+impl CommandPolicyTrace {
+    /// Preserve the explicit surface unless a non-unknown decision context surface exists.
+    #[must_use]
+    pub fn from_surface_and_decision(surface: PolicySurface, decision: &PolicyDecision) -> Self {
+        let context_surface = decision.context().map(|ctx| ctx.surface);
+        let determining_rule = decision
+            .context()
+            .and_then(|ctx| ctx.determining_rule.clone());
+        let surface = match context_surface {
+            Some(PolicySurface::Unknown) | None => surface,
+            Some(explicit) => explicit,
+        };
+
+        Self {
+            decision: decision.as_str().to_string(),
+            surface,
+            reason: decision.reason().map(ToString::to_string),
+            rule_id: decision.rule_id().map(ToString::to_string),
+            determining_rule,
+        }
     }
 }
 
@@ -271,6 +332,16 @@ impl DeliveryStatus {
     pub fn is_skipped(&self) -> bool {
         matches!(self, Self::Skipped { .. })
     }
+
+    #[must_use]
+    pub fn is_policy_denied(&self) -> bool {
+        matches!(self, Self::PolicyDenied { .. })
+    }
+
+    #[must_use]
+    pub fn is_routing_error(&self) -> bool {
+        matches!(self, Self::RoutingError { .. })
+    }
 }
 
 /// Aggregate result for a command request (may target multiple panes).
@@ -302,6 +373,24 @@ impl CommandResult {
         self.deliveries
             .iter()
             .filter(|d| d.status.is_skipped())
+            .count()
+    }
+
+    /// Count how many deliveries were rejected by policy.
+    #[must_use]
+    pub fn policy_denied_count(&self) -> usize {
+        self.deliveries
+            .iter()
+            .filter(|d| d.status.is_policy_denied())
+            .count()
+    }
+
+    /// Count how many deliveries failed due to routing errors.
+    #[must_use]
+    pub fn routing_error_count(&self) -> usize {
+        self.deliveries
+            .iter()
+            .filter(|d| d.status.is_routing_error())
             .count()
     }
 
@@ -378,11 +467,15 @@ pub struct CommandAuditEntry {
     pub target_count: usize,
     pub delivered_count: usize,
     pub skipped_count: usize,
+    pub policy_denied_count: usize,
+    pub routing_error_count: usize,
     pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_trace: Option<CommandPolicyTrace>,
 }
 
 /// Routes commands to lifecycle-managed panes with state validation and audit.
@@ -472,9 +565,12 @@ impl CommandRouter {
             target_count: result.deliveries.len(),
             delivered_count: result.delivered_count(),
             skipped_count: result.skipped_count(),
+            policy_denied_count: result.policy_denied_count(),
+            routing_error_count: result.routing_error_count(),
             dry_run: request.dry_run,
             reason: request.context.reason.clone(),
             error: None,
+            policy_trace: request.context.policy_trace.clone(),
         });
 
         tracing::info!(
@@ -489,6 +585,11 @@ impl CommandRouter {
             target_count = result.deliveries.len(),
             delivered = result.delivered_count(),
             skipped = result.skipped_count(),
+            policy_denied = result.policy_denied_count(),
+            routing_errors = result.routing_error_count(),
+            policy_surface = request.context.policy_trace.as_ref().map(|trace| trace.surface.as_str()),
+            policy_decision = request.context.policy_trace.as_ref().map(|trace| trace.decision.as_str()),
+            policy_rule_id = request.context.policy_trace.as_ref().and_then(|trace| trace.rule_id.as_deref()),
             dry_run = request.dry_run,
             elapsed_us,
             "command routed"
@@ -563,6 +664,7 @@ impl CommandRouter {
     ///
     /// Match by workspace_id + domain + generation (panes share these with
     /// their parent window/session when bootstrapped together).
+    #[allow(clippy::unused_self)]
     fn panes_in_container(
         &self,
         container: &LifecycleIdentity,
@@ -582,6 +684,7 @@ impl CommandRouter {
     }
 
     /// Collect all pane identities in the registry.
+    #[allow(clippy::unused_self)]
     fn all_panes(&self, registry: &LifecycleRegistry) -> Vec<LifecycleIdentity> {
         let snapshot = registry.snapshot();
         snapshot
@@ -592,6 +695,7 @@ impl CommandRouter {
     }
 
     /// Evaluate whether a command can be delivered to a specific pane.
+    #[allow(clippy::unused_self)]
     fn evaluate_target(
         &self,
         target: &LifecycleIdentity,
@@ -758,6 +862,9 @@ impl CommandDeduplicator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{
+        ActionKind, ActorKind, DecisionContext, PaneCapabilities, PolicyDecision, PolicySurface,
+    };
     use crate::session_topology::{
         LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
         MuxPaneLifecycleState, SessionLifecycleState, WindowLifecycleState,
@@ -770,6 +877,7 @@ mod tests {
             correlation_id: "corr-1".to_string(),
             caller_identity: "agent-test".to_string(),
             reason: None,
+            policy_trace: None,
         }
     }
 
@@ -1305,6 +1413,89 @@ mod tests {
         let json = router.audit_log_json().unwrap();
         assert!(json.contains("json-1"));
         assert!(json.contains("send_input"));
+    }
+
+    #[test]
+    fn command_policy_trace_prefers_non_unknown_decision_context_surface() {
+        let decision = PolicyDecision::deny_with_rule("blocked", "policy.route.test").with_context(
+            DecisionContext {
+                timestamp_ms: 42,
+                action: ActionKind::SendText,
+                actor: ActorKind::Robot,
+                surface: PolicySurface::Swarm,
+                pane_id: Some(1),
+                domain: None,
+                capabilities: PaneCapabilities::default(),
+                text_summary: Some("route test".to_string()),
+                workflow_id: None,
+                rules_evaluated: Vec::new(),
+                determining_rule: Some("policy.route.test".to_string()),
+                evidence: Vec::new(),
+                rate_limit: None,
+                risk: None,
+            },
+        );
+
+        let trace = CommandPolicyTrace::from_surface_and_decision(PolicySurface::Mux, &decision);
+
+        assert_eq!(trace.decision, "deny");
+        assert_eq!(trace.surface, PolicySurface::Swarm);
+        assert_eq!(trace.reason.as_deref(), Some("blocked"));
+        assert_eq!(trace.rule_id.as_deref(), Some("policy.route.test"));
+        assert_eq!(trace.determining_rule.as_deref(), Some("policy.route.test"));
+    }
+
+    #[test]
+    fn context_builder_attaches_policy_trace_without_decision_context() {
+        let ctx = test_context(250).with_policy_decision(
+            PolicySurface::Mux,
+            &PolicyDecision::allow_with_rule("policy.route.allow"),
+        );
+
+        let trace = ctx.policy_trace.expect("policy trace must be attached");
+        assert_eq!(trace.decision, "allow");
+        assert_eq!(trace.surface, PolicySurface::Mux);
+        assert_eq!(trace.rule_id.as_deref(), Some("policy.route.allow"));
+        assert!(trace.reason.is_none());
+        assert!(trace.determining_rule.is_none());
+    }
+
+    #[test]
+    fn audit_log_preserves_policy_trace_and_full_delivery_breakdown() {
+        let registry = seed_registry();
+        let mut router = CommandRouter::new();
+        let request = CommandRequest {
+            command_id: "trace-1".to_string(),
+            scope: CommandScope::fleet(),
+            command: CommandKind::Broadcast {
+                text: "attention all agents".to_string(),
+                paste_mode: false,
+            },
+            context: test_context(260).with_policy_decision(
+                PolicySurface::Swarm,
+                &PolicyDecision::allow_with_rule("policy.route.broadcast"),
+            ),
+            dry_run: false,
+        };
+
+        let result = router.route(&request, &registry).unwrap();
+        let audit = &router.audit_log()[0];
+
+        assert_eq!(result.delivered_count(), 1);
+        assert_eq!(result.skipped_count(), 5);
+        assert_eq!(result.policy_denied_count(), 0);
+        assert_eq!(result.routing_error_count(), 0);
+        assert_eq!(audit.delivered_count, 1);
+        assert_eq!(audit.skipped_count, 5);
+        assert_eq!(audit.policy_denied_count, 0);
+        assert_eq!(audit.routing_error_count, 0);
+        let trace = audit
+            .policy_trace
+            .as_ref()
+            .expect("audit trace must persist");
+        assert_eq!(trace.surface, PolicySurface::Swarm);
+        assert_eq!(trace.decision, "allow");
+        assert_eq!(trace.rule_id.as_deref(), Some("policy.route.broadcast"));
     }
 
     // =========================================================================

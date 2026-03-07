@@ -1087,6 +1087,7 @@ proptest! {
                 audit_action_id: None,
             },
             _ => InjectionResult::Error {
+                decision: PolicyDecision::allow(),
                 error: "err".to_string(),
                 pane_id: 1,
                 action: ActionKind::SendText,
@@ -1131,6 +1132,7 @@ proptest! {
                 audit_action_id: None,
             },
             _ => InjectionResult::Error {
+                decision: PolicyDecision::allow(),
                 error: "connection lost".to_string(),
                 pane_id: 99,
                 action: ActionKind::SendText,

@@ -13344,6 +13344,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 audit_action_id: None,
                                             },
                                             Err(e) => InjectionResult::Error {
+                                                decision,
                                                 error: e.to_string(),
                                                 pane_id,
                                                 action: ActionKind::SendText,
@@ -19706,6 +19707,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 audit_action_id: None,
                             },
                             Err(e) => frankenterm_core::policy::InjectionResult::Error {
+                                decision,
                                 error: e.to_string(),
                                 pane_id,
                                 action: frankenterm_core::policy::ActionKind::SendText,
@@ -22612,6 +22614,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             audit_action_id: None,
                         },
                         Err(e) => frankenterm_core::policy::InjectionResult::Error {
+                            decision,
                             error: e.to_string(),
                             pane_id,
                             action: frankenterm_core::policy::ActionKind::SendText,

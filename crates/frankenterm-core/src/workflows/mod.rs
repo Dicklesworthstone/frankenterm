@@ -10666,6 +10666,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
     #[test]
     fn ctrl_c_injection_ok_error() {
         let result = InjectionResult::Error {
+            decision: crate::policy::PolicyDecision::allow(),
             error: "connection lost".to_string(),
             pane_id: 1,
             action: crate::policy::ActionKind::SendCtrlC,

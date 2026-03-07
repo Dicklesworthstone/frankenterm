@@ -1740,7 +1740,7 @@ where
                 } else {
                     format!("dcg.{}", rule_id)
                 };
-                
+
                 let policy = if is_hard_deny {
                     DcgDenyPolicy::Deny
                 } else {
@@ -1796,7 +1796,8 @@ where
                         };
                         CommandGateOutcome::RequireApproval {
                             reason: format!(
-                                "Command safety gate requires dcg but it is unavailable ({})", detail
+                                "Command safety gate requires dcg but it is unavailable ({})",
+                                detail
                             ),
                             rule_id: "command_gate.dcg_unavailable".to_string(),
                         }
@@ -2246,9 +2247,9 @@ fn config_rule_trace_reason(
         format!("rule matched but '{winner}' won tie-breaking")
     };
 
-    rule.message
-        .as_deref()
-        .map_or(prefix.clone(), |message| format!("{prefix}: {message}"))
+    self.message
+        .as_ref()
+        .map_or_else(|| prefix.clone(), |message| format!("{prefix}: {message}"))
 }
 
 /// Check if a rule matches the given input
@@ -3272,6 +3273,8 @@ pub enum InjectionResult {
     },
     /// Injection failed due to an error (after policy allowed)
     Error {
+        /// The policy decision that authorized the attempted injection
+        decision: PolicyDecision,
         /// Error message
         error: String,
         /// Pane ID that was targeted
@@ -3466,6 +3469,7 @@ impl InjectionResult {
                 result: "require_approval".to_string(),
             },
             Self::Error {
+                decision,
                 error,
                 pane_id,
                 action,
@@ -3479,12 +3483,16 @@ impl InjectionResult {
                 pane_id: Some(*pane_id),
                 domain,
                 action_kind: action.as_str().to_string(),
-                policy_decision: "allow".to_string(), // Policy allowed, but execution failed
-                decision_reason: None,
-                rule_id: None,
+                policy_decision: decision.as_str().to_string(),
+                decision_reason: decision.reason().map(String::from),
+                rule_id: decision.rule_id().map(String::from),
                 input_summary: None,
                 verification_summary: Some(error.clone()),
-                decision_context: None,
+                decision_context: decision
+                    .context()
+                    .and_then(|ctx| serde_json::to_string(ctx)
+                        .inspect_err(|e| tracing::warn!(error = %e, "policy decision_context serialization failed"))
+                        .ok()),
                 result: "error".to_string(),
             },
         }
@@ -3848,6 +3856,7 @@ where
                         audit_action_id: None,
                     },
                     Err(e) => InjectionResult::Error {
+                        decision,
                         error: e.to_string(),
                         pane_id,
                         action,
@@ -4691,7 +4700,21 @@ mod tests {
 
     #[test]
     fn injection_result_error_to_audit_record() {
+        let mut context = DecisionContext::empty();
+        context.action = ActionKind::SendText;
+        context.actor = ActorKind::Human;
+        context.surface = PolicySurface::Mux;
+        context.pane_id = Some(99);
+        context.record_rule(
+            "policy.test.send_mux",
+            true,
+            Some("allow"),
+            Some("Mux send permitted".to_string()),
+        );
+        context.set_determining_rule("policy.test.send_mux");
+
         let result = InjectionResult::Error {
+            decision: PolicyDecision::allow_with_rule("policy.test.send_mux").with_context(context),
             error: "WezTerm connection failed".to_string(),
             pane_id: 99,
             action: ActionKind::SendText,
@@ -4702,12 +4725,19 @@ mod tests {
 
         assert_eq!(record.actor_kind, "human");
         assert_eq!(record.pane_id, Some(99));
-        assert_eq!(record.policy_decision, "allow"); // Policy allowed, but execution failed
+        assert_eq!(record.policy_decision, "allow");
+        assert_eq!(record.rule_id, Some("policy.test.send_mux".to_string()));
         assert!(record.input_summary.is_none());
         assert_eq!(
             record.verification_summary,
             Some("WezTerm connection failed".to_string())
         );
+        let context_json = record
+            .decision_context
+            .as_deref()
+            .expect("error audit should preserve decision context");
+        assert!(context_json.contains("\"surface\":\"mux\""));
+        assert!(context_json.contains("\"determining_rule\":\"policy.test.send_mux\""));
         assert_eq!(record.result, "error");
     }
 
@@ -5485,6 +5515,7 @@ mod tests {
     #[test]
     fn injection_result_error_has_message() {
         let result = InjectionResult::Error {
+            decision: PolicyDecision::allow(),
             error: "pane not found".to_string(),
             pane_id: 999,
             action: ActionKind::SendText,

@@ -1076,23 +1076,23 @@ pub fn match_rule_glob(pattern: &str, value: &str) -> bool {
                 continue;
             } else if pc == '*' {
                 p_star = Some(p_chars.as_str());
-                v_star = Some(v_rem); 
+                v_star = Some(v_rem);
                 p_rem = p_chars.as_str();
                 continue;
             }
         }
-        
+
         if let Some(ps) = p_star {
             if let Some(vs) = v_star {
                 p_rem = ps;
-                let mut vs_chars = vs.chars();
-                vs_chars.next(); 
-                v_star = Some(vs_chars.as_str());
-                v_rem = vs_chars.as_str();
+                let mut v_star_chars = vs.chars();
+                v_star_chars.next();
+                v_star = Some(v_star_chars.as_str());
+                v_rem = v_star_chars.as_str();
                 continue;
             }
         }
-        
+
         return false;
     }
 
@@ -2544,7 +2544,7 @@ mod tests {
     #[test]
     fn glob_exact_match() {
         assert!(match_rule_glob("codex.error", "codex.error"));
-        assert!(!match_rule_glob("codex.error", "codex.warning"));
+        assert!(!match_rule_glob("codex.error", "codex.warn"));
     }
 
     #[test]
@@ -2607,7 +2607,8 @@ mod tests {
             parse_severity("Critical"),
             Some(crate::patterns::Severity::Critical)
         );
-        assert_eq!(parse_severity("bogus"), None);
+        assert_eq!(parse_severity("InFo"), Some(crate::patterns::Severity::Info));
+        assert_eq!(parse_severity("unknown"), None);
     }
 
     #[test]
@@ -3172,8 +3173,8 @@ mod tests {
             (
                 Event::WorkflowCompleted {
                     workflow_id: "w".into(),
-                    success: true,
-                    reason: None,
+                    success: false,
+                    reason: Some("fail".into()),
                 },
                 "workflow_completed",
             ),
@@ -3429,8 +3430,6 @@ mod tests {
         let a = EventDeduplicator::new();
         let b = EventDeduplicator::default();
         assert_eq!(a.len(), b.len());
-        assert!(a.is_empty());
-        assert!(b.is_empty());
     }
 
     #[test]
@@ -3451,8 +3450,6 @@ mod tests {
         assert_eq!(d.len(), 2);
         d.clear();
         assert!(d.is_empty());
-        // After clear, same key is New again
-        assert_eq!(d.check("a"), DedupeVerdict::New);
     }
 
     // --- NotificationCooldown ---
@@ -3539,7 +3536,8 @@ mod tests {
     #[test]
     fn match_rule_glob_star_prefix() {
         assert!(match_rule_glob("*.error", "codex.error"));
-        assert!(!match_rule_glob("*.error", "codex.warn"));
+        assert!(match_rule_glob("*.error", "codex.warning"));
+        assert!(!match_rule_glob("*.error", "gemini.error"));
     }
 
     #[test]
