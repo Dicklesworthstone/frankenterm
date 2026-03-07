@@ -31,6 +31,12 @@ fn arb_action_kind() -> impl Strategy<Value = ActionKind> {
         Just(ActionKind::WriteFile),
         Just(ActionKind::DeleteFile),
         Just(ActionKind::ExecCommand),
+        Just(ActionKind::ConnectorNotify),
+        Just(ActionKind::ConnectorTicket),
+        Just(ActionKind::ConnectorTriggerWorkflow),
+        Just(ActionKind::ConnectorAuditLog),
+        Just(ActionKind::ConnectorInvoke),
+        Just(ActionKind::ConnectorCredentialAction),
     ]
 }
 
@@ -263,9 +269,10 @@ proptest! {
     fn prop_action_kind_destructive_consistency(action in arb_action_kind()) {
         if action.is_destructive() {
             // DeleteFile is destructive but not mutating (it's a file op, not pane mutation)
+            // ConnectorCredentialAction is destructive but not mutating (connector-level, not pane)
             // Close, SendCtrlC, SendCtrlD are both destructive and mutating
-            let is_file_op = matches!(action, ActionKind::DeleteFile);
-            if !is_file_op {
+            let is_non_pane = matches!(action, ActionKind::DeleteFile | ActionKind::ConnectorCredentialAction);
+            if !is_non_pane {
                 prop_assert!(action.is_mutating(),
                     "Destructive pane action {:?} should also be mutating", action);
             }
