@@ -14,6 +14,7 @@ use frankenterm_core::runtime_telemetry::{
     CancellationTelemetryEmitter, FailureClass, HealthTier, RuntimePhase,
     RuntimeTelemetryEventBuilder, RuntimeTelemetryKind, RuntimeTelemetryLog,
     RuntimeTelemetryLogConfig, ScopeTelemetryEmitter, TierTransitionRecord,
+    UnifiedTelemetryRecord, UnifiedTelemetrySource,
 };
 
 // =============================================================================
@@ -452,5 +453,201 @@ proptest! {
         let known = ["scope", "cancellation", "backpressure", "queue", "error", "resource", "operational"];
         prop_assert!(known.contains(&cat),
             "Event kind {:?} has unknown category '{}'", kind, cat);
+    }
+
+    // ── Filter properties ──
+
+    #[test]
+    fn filter_by_kind_returns_only_matching(
+        target_kind in arb_event_kind(),
+        n in 2usize..15,
+    ) {
+        let mut log = RuntimeTelemetryLog::with_defaults();
+        let mut expected_count = 0;
+        for i in 0..n {
+            let kind = if i % 3 == 0 { target_kind } else { RuntimeTelemetryKind::ScopeCreated };
+            if kind == target_kind { expected_count += 1; }
+            log.emit(
+                RuntimeTelemetryEventBuilder::new(&format!("comp-{i}"), kind)
+                    .tier(HealthTier::Green)
+            );
+        }
+        let filtered = log.filter_by_kind(target_kind);
+        prop_assert_eq!(filtered.len(), expected_count);
+        for event in filtered {
+            prop_assert_eq!(event.event_kind, target_kind);
+        }
+    }
+
+    #[test]
+    fn filter_by_tier_returns_only_matching(
+        target_tier in arb_health_tier(),
+        n in 2usize..15,
+    ) {
+        let mut log = RuntimeTelemetryLog::with_defaults();
+        let mut expected_count = 0;
+        let tiers = [HealthTier::Green, HealthTier::Yellow, HealthTier::Red, HealthTier::Black];
+        for i in 0..n {
+            let tier = tiers[i % 4];
+            if tier == target_tier { expected_count += 1; }
+            log.emit(
+                RuntimeTelemetryEventBuilder::new("comp", RuntimeTelemetryKind::ScopeCreated)
+                    .tier(tier)
+            );
+        }
+        let filtered = log.filter_by_tier(target_tier);
+        prop_assert_eq!(filtered.len(), expected_count);
+        for event in filtered {
+            prop_assert_eq!(event.health_tier, target_tier);
+        }
+    }
+
+    #[test]
+    fn filter_by_component_prefix(prefix in "[a-z]{2,5}", n in 2usize..10) {
+        let mut log = RuntimeTelemetryLog::with_defaults();
+        let mut expected_count = 0;
+        for i in 0..n {
+            let component = if i % 2 == 0 {
+                format!("{prefix}::sub-{i}")
+            } else {
+                format!("other::sub-{i}")
+            };
+            if component.starts_with(&prefix) { expected_count += 1; }
+            log.emit(
+                RuntimeTelemetryEventBuilder::new(&component, RuntimeTelemetryKind::ScopeCreated)
+                    .tier(HealthTier::Green)
+            );
+        }
+        let filtered = log.filter_by_component(&prefix);
+        prop_assert_eq!(filtered.len(), expected_count);
+    }
+
+    #[test]
+    fn filter_by_correlation_isolates_events(
+        corr_id in "[a-z0-9-]{5,15}",
+        n in 3usize..10,
+    ) {
+        let mut log = RuntimeTelemetryLog::with_defaults();
+        let mut expected = 0;
+        for i in 0..n {
+            let builder = RuntimeTelemetryEventBuilder::new(
+                "comp", RuntimeTelemetryKind::ScopeCreated
+            ).tier(HealthTier::Green);
+            let builder = if i % 3 == 0 {
+                expected += 1;
+                builder.correlation(&corr_id)
+            } else {
+                builder.correlation(&format!("other-{i}"))
+            };
+            log.emit(builder);
+        }
+        let filtered = log.filter_by_correlation(&corr_id);
+        prop_assert_eq!(filtered.len(), expected);
+    }
+
+    // ── Drain empties the log ──
+
+    #[test]
+    fn drain_empties_and_returns_all(n in 1usize..20) {
+        let mut log = RuntimeTelemetryLog::with_defaults();
+        for i in 0..n {
+            log.emit(
+                RuntimeTelemetryEventBuilder::new(
+                    &format!("drain-{i}"),
+                    RuntimeTelemetryKind::ScopeCreated,
+                ).tier(HealthTier::Green)
+            );
+        }
+        prop_assert_eq!(log.len(), n);
+        let drained = log.drain();
+        prop_assert_eq!(drained.len(), n);
+        prop_assert!(log.is_empty());
+        prop_assert_eq!(log.len(), 0);
+        // total_emitted should still reflect history
+        prop_assert_eq!(log.total_emitted(), n as u64);
+    }
+
+    // ── Count helpers match filter counts ──
+
+    #[test]
+    fn count_tier_matches_filter(n in 2usize..15) {
+        let mut log = RuntimeTelemetryLog::with_defaults();
+        let tiers = [HealthTier::Green, HealthTier::Yellow, HealthTier::Red, HealthTier::Black];
+        for i in 0..n {
+            log.emit(
+                RuntimeTelemetryEventBuilder::new("comp", RuntimeTelemetryKind::ScopeCreated)
+                    .tier(tiers[i % 4])
+            );
+        }
+        for tier in &tiers {
+            let count = log.count_tier(*tier);
+            let filter_count = log.filter_by_tier(*tier).len();
+            prop_assert_eq!(count, filter_count);
+        }
+    }
+
+    // ── Unified telemetry normalization ──
+
+    #[test]
+    fn unified_from_runtime_preserves_core_fields(
+        kind in arb_event_kind(),
+        tier in arb_health_tier(),
+        component in "[a-z]{3,10}",
+    ) {
+        let event = RuntimeTelemetryEventBuilder::new(&component, kind)
+            .tier(tier)
+            .correlation("corr-test")
+            .scope_id("scope-test")
+            .build();
+        let record = UnifiedTelemetryRecord::from_runtime_event(&event);
+        let check_source = matches!(record.source, UnifiedTelemetrySource::Runtime);
+        prop_assert!(check_source, "source must be Runtime");
+        prop_assert_eq!(record.component, component);
+        prop_assert_eq!(record.health_tier, tier);
+        prop_assert_eq!(record.timestamp_ms, event.timestamp_ms);
+        prop_assert_eq!(record.correlation_id.as_deref(), Some("corr-test"));
+        prop_assert_eq!(record.scope_id.as_deref(), Some("scope-test"));
+        prop_assert!(!record.record_id.is_empty());
+        prop_assert!(!record.schema_version.is_empty());
+    }
+
+    #[test]
+    fn unified_record_serde_roundtrip(
+        kind in arb_event_kind(),
+        tier in arb_health_tier(),
+    ) {
+        let event = RuntimeTelemetryEventBuilder::new("component", kind)
+            .tier(tier)
+            .build();
+        let record = UnifiedTelemetryRecord::from_runtime_event(&event);
+        let json = serde_json::to_string(&record).unwrap();
+        let decoded: UnifiedTelemetryRecord = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(record.record_id, decoded.record_id);
+        prop_assert_eq!(record.component, decoded.component);
+        prop_assert_eq!(record.health_tier, decoded.health_tier);
+        prop_assert_eq!(record.timestamp_ms, decoded.timestamp_ms);
+    }
+
+    // ── Eviction counters ──
+
+    #[test]
+    fn eviction_counter_tracks_overflow(capacity in 5usize..20, total in 20usize..50) {
+        let config = RuntimeTelemetryLogConfig {
+            max_events: capacity,
+            ..RuntimeTelemetryLogConfig::default()
+        };
+        let mut log = RuntimeTelemetryLog::new(config);
+        for i in 0..total {
+            log.emit(
+                RuntimeTelemetryEventBuilder::new(
+                    &format!("evict-{i}"),
+                    RuntimeTelemetryKind::ScopeCreated,
+                ).tier(HealthTier::Green)
+            );
+        }
+        prop_assert_eq!(log.total_emitted(), total as u64);
+        let expected_evicted = if total > capacity { (total - capacity) as u64 } else { 0 };
+        prop_assert_eq!(log.total_evicted(), expected_evicted);
+        prop_assert!(log.len() <= capacity);
     }
 }
