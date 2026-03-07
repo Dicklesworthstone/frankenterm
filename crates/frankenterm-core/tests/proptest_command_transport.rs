@@ -1,13 +1,17 @@
 //! Property-based tests for command_transport (ft-3681t.2.3).
 //!
 //! Coverage: CommandScope, CommandKind, CommandDeduplicator, serde roundtrips,
-//! routing invariants, and deduplication TTL semantics.
+//! routing invariants, deduplication TTL semantics, and CommandPolicyTrace
+//! field preservation.
 
 use proptest::prelude::*;
 
 use frankenterm_core::command_transport::{
-    AckOutcome, CommandContext, CommandDeduplicator, CommandKind, CommandRequest, CommandResult,
-    CommandRouter, CommandScope, DeliveryStatus, InterruptSignal,
+    AckOutcome, CommandContext, CommandDeduplicator, CommandKind, CommandPolicyTrace,
+    CommandRequest, CommandResult, CommandRouter, CommandScope, DeliveryStatus, InterruptSignal,
+};
+use frankenterm_core::policy::{
+    ActionKind, ActorKind, DecisionContext, PaneCapabilities, PolicyDecision, PolicySurface,
 };
 use frankenterm_core::session_topology::{
     LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
@@ -469,4 +473,297 @@ fn command_result_all_delivered_requires_nonempty() {
         !empty.all_delivered(),
         "empty deliveries → not all_delivered"
     );
+}
+
+// ---------------------------------------------------------------------------
+// CommandPolicyTrace strategies
+// ---------------------------------------------------------------------------
+
+fn arb_actor_kind() -> impl Strategy<Value = ActorKind> {
+    prop_oneof![
+        Just(ActorKind::Human),
+        Just(ActorKind::Robot),
+        Just(ActorKind::Mcp),
+        Just(ActorKind::Workflow),
+    ]
+}
+
+fn arb_action_kind() -> impl Strategy<Value = ActionKind> {
+    prop_oneof![
+        Just(ActionKind::SendText),
+        Just(ActionKind::SendCtrlC),
+        Just(ActionKind::SendCtrlD),
+        Just(ActionKind::SendCtrlZ),
+        Just(ActionKind::SendControl),
+        Just(ActionKind::Spawn),
+        Just(ActionKind::Split),
+        Just(ActionKind::Activate),
+        Just(ActionKind::Close),
+        Just(ActionKind::BrowserAuth),
+        Just(ActionKind::WorkflowRun),
+        Just(ActionKind::ReservePane),
+        Just(ActionKind::ReleasePane),
+        Just(ActionKind::ReadOutput),
+        Just(ActionKind::SearchOutput),
+        Just(ActionKind::ConnectorNotify),
+        Just(ActionKind::ConnectorInvoke),
+    ]
+}
+
+fn arb_policy_surface() -> impl Strategy<Value = PolicySurface> {
+    prop_oneof![
+        Just(PolicySurface::Unknown),
+        Just(PolicySurface::Mux),
+        Just(PolicySurface::Swarm),
+        Just(PolicySurface::Robot),
+        Just(PolicySurface::Connector),
+        Just(PolicySurface::Workflow),
+        Just(PolicySurface::Mcp),
+        Just(PolicySurface::Ipc),
+    ]
+}
+
+fn arb_decision_context(
+    action: ActionKind,
+    actor: ActorKind,
+    surface: PolicySurface,
+    pane_id: Option<u64>,
+    domain: Option<String>,
+    workflow_id: Option<String>,
+    determining_rule: Option<String>,
+) -> DecisionContext {
+    DecisionContext {
+        timestamp_ms: 1000,
+        action,
+        actor,
+        surface,
+        pane_id,
+        domain,
+        capabilities: PaneCapabilities::default(),
+        text_summary: None,
+        workflow_id,
+        rules_evaluated: Vec::new(),
+        determining_rule,
+        evidence: Vec::new(),
+        rate_limit: None,
+        risk: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CommandPolicyTrace serde roundtrip
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn policy_trace_serde_roundtrip_with_all_fields(
+        actor in arb_actor_kind(),
+        action in arb_action_kind(),
+        surface in arb_policy_surface(),
+        pane_id in prop::option::of(1u64..1000),
+        domain in prop::option::of("[a-z]{3,10}"),
+        workflow_id in prop::option::of("[a-z0-9-]{5,15}"),
+        rule_id in prop::option::of("[a-z.]{5,20}"),
+        reason in prop::option::of("[a-z ]{5,30}"),
+        determining_rule in prop::option::of("[a-z.]{5,20}"),
+    ) {
+        let trace = CommandPolicyTrace {
+            decision: "allow".to_string(),
+            surface,
+            actor: Some(actor),
+            action: Some(action),
+            reason,
+            rule_id,
+            determining_rule,
+            pane_id,
+            domain,
+            workflow_id,
+        };
+        let json = serde_json::to_string(&trace).unwrap();
+        let decoded: CommandPolicyTrace = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(trace, decoded);
+    }
+
+    #[test]
+    fn policy_trace_serde_roundtrip_minimal(
+        surface in arb_policy_surface(),
+        decision in prop_oneof![Just("allow"), Just("deny"), Just("require_approval")],
+    ) {
+        let trace = CommandPolicyTrace {
+            decision: decision.to_string(),
+            surface,
+            actor: None,
+            action: None,
+            reason: None,
+            rule_id: None,
+            determining_rule: None,
+            pane_id: None,
+            domain: None,
+            workflow_id: None,
+        };
+        let json = serde_json::to_string(&trace).unwrap();
+        let decoded: CommandPolicyTrace = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(trace, decoded);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// from_surface_and_decision property tests
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn from_allow_decision_preserves_decision_string(
+        surface in arb_policy_surface(),
+        rule_id in prop::option::of("[a-z.]{5,20}"),
+    ) {
+        let decision = match rule_id {
+            Some(ref r) => PolicyDecision::allow_with_rule(r.clone()),
+            None => PolicyDecision::allow(),
+        };
+        let trace = CommandPolicyTrace::from_surface_and_decision(surface, &decision);
+        prop_assert_eq!(&trace.decision, "allow");
+        prop_assert_eq!(trace.rule_id.as_deref(), rule_id.as_deref());
+        prop_assert!(trace.reason.is_none(), "allow has no reason");
+        prop_assert!(trace.actor.is_none(), "no context → no actor");
+        prop_assert!(trace.action.is_none(), "no context → no action");
+    }
+
+    #[test]
+    fn from_deny_decision_preserves_reason_and_rule(
+        surface in arb_policy_surface(),
+        reason in "[a-z ]{3,30}",
+        rule_id in prop::option::of("[a-z.]{5,20}"),
+    ) {
+        let decision = match rule_id {
+            Some(ref r) => PolicyDecision::deny_with_rule(reason.clone(), r.clone()),
+            None => PolicyDecision::deny(reason.clone()),
+        };
+        let trace = CommandPolicyTrace::from_surface_and_decision(surface, &decision);
+        prop_assert_eq!(&trace.decision, "deny");
+        prop_assert_eq!(trace.reason.as_deref(), Some(reason.as_str()));
+        prop_assert_eq!(trace.rule_id.as_deref(), rule_id.as_deref());
+    }
+
+    #[test]
+    fn from_require_approval_preserves_reason(
+        surface in arb_policy_surface(),
+        reason in "[a-z ]{3,30}",
+        rule_id in prop::option::of("[a-z.]{5,20}"),
+    ) {
+        let decision = match rule_id {
+            Some(ref r) => PolicyDecision::require_approval_with_rule(reason.clone(), r.clone()),
+            None => PolicyDecision::require_approval(reason.clone()),
+        };
+        let trace = CommandPolicyTrace::from_surface_and_decision(surface, &decision);
+        prop_assert_eq!(&trace.decision, "require_approval");
+        prop_assert_eq!(trace.reason.as_deref(), Some(reason.as_str()));
+        prop_assert_eq!(trace.rule_id.as_deref(), rule_id.as_deref());
+    }
+
+    #[test]
+    fn context_surface_overrides_explicit_when_not_unknown(
+        explicit_surface in arb_policy_surface(),
+        context_surface in arb_policy_surface(),
+        actor in arb_actor_kind(),
+        action in arb_action_kind(),
+    ) {
+        let ctx = arb_decision_context(action, actor, context_surface, None, None, None, None);
+        let decision = PolicyDecision::allow().with_context(ctx);
+        let trace = CommandPolicyTrace::from_surface_and_decision(explicit_surface, &decision);
+
+        if context_surface == PolicySurface::Unknown {
+            prop_assert_eq!(trace.surface, explicit_surface,
+                "Unknown context surface falls back to explicit");
+        } else {
+            prop_assert_eq!(trace.surface, context_surface,
+                "Non-unknown context surface overrides explicit");
+        }
+    }
+
+    #[test]
+    fn context_actor_and_action_preserved(
+        surface in arb_policy_surface(),
+        actor in arb_actor_kind(),
+        action in arb_action_kind(),
+    ) {
+        let ctx = arb_decision_context(action, actor, PolicySurface::Unknown, None, None, None, None);
+        let decision = PolicyDecision::allow().with_context(ctx);
+        let trace = CommandPolicyTrace::from_surface_and_decision(surface, &decision);
+
+        prop_assert_eq!(trace.actor, Some(actor));
+        prop_assert_eq!(trace.action, Some(action));
+    }
+
+    #[test]
+    fn context_pane_id_domain_workflow_preserved(
+        surface in arb_policy_surface(),
+        pane_id in prop::option::of(1u64..1000),
+        domain in prop::option::of("[a-z]{3,10}"),
+        workflow_id in prop::option::of("[a-z0-9-]{5,15}"),
+    ) {
+        let ctx = arb_decision_context(
+            ActionKind::SendText,
+            ActorKind::Robot,
+            PolicySurface::Unknown,
+            pane_id,
+            domain.clone(),
+            workflow_id.clone(),
+            None,
+        );
+        let decision = PolicyDecision::allow().with_context(ctx);
+        let trace = CommandPolicyTrace::from_surface_and_decision(surface, &decision);
+
+        prop_assert_eq!(trace.pane_id, pane_id);
+        prop_assert_eq!(trace.domain, domain);
+        prop_assert_eq!(trace.workflow_id, workflow_id);
+    }
+
+    #[test]
+    fn context_determining_rule_preserved(
+        surface in arb_policy_surface(),
+        determining_rule in prop::option::of("[a-z.]{5,20}"),
+    ) {
+        let ctx = arb_decision_context(
+            ActionKind::SendText,
+            ActorKind::Human,
+            PolicySurface::Unknown,
+            None,
+            None,
+            None,
+            determining_rule.clone(),
+        );
+        let decision = PolicyDecision::allow().with_context(ctx);
+        let trace = CommandPolicyTrace::from_surface_and_decision(surface, &decision);
+        prop_assert_eq!(trace.determining_rule, determining_rule);
+    }
+
+    #[test]
+    fn command_context_with_policy_trace_roundtrips(
+        ts in 0u64..u64::MAX / 2,
+        surface in arb_policy_surface(),
+        actor in arb_actor_kind(),
+        action in arb_action_kind(),
+        pane_id in prop::option::of(1u64..1000),
+    ) {
+        let ctx_decision = arb_decision_context(
+            action, actor, surface, pane_id, None, None, None,
+        );
+        let decision = PolicyDecision::deny("test").with_context(ctx_decision);
+        let ctx = test_ctx(ts).with_policy_decision(surface, &decision);
+
+        let json = serde_json::to_string(&ctx).unwrap();
+        let decoded: CommandContext = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(&ctx, &decoded);
+        let trace = decoded.policy_trace.expect("trace must survive roundtrip");
+        prop_assert_eq!(&trace.decision, "deny");
+        prop_assert_eq!(trace.actor, Some(actor));
+        prop_assert_eq!(trace.action, Some(action));
+        prop_assert_eq!(trace.pane_id, pane_id);
+    }
 }
