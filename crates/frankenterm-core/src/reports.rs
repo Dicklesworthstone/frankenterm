@@ -197,20 +197,24 @@ pub async fn generate_session_report(
 
     if !denials.is_empty() {
         md.push_str("## Policy Denials\n\n");
-        md.push_str("| Time | Actor | Action | Decision | Reason |\n");
-        md.push_str("|------|-------|--------|----------|--------|\n");
+        md.push_str("| Time | Actor | Action | Surface | Decision | Rule | Reason |\n");
+        md.push_str("|------|-------|--------|---------|----------|------|--------|\n");
         for d in &denials {
             let reason = match (&d.decision_reason, &redactor) {
                 (Some(r), Some(red)) => red.redact(r),
                 (Some(r), None) => truncate(r, 60),
                 (None, _) => "—".to_string(),
             };
+            let surface = policy_surface_from_decision_context(d.decision_context.as_deref());
+            let rule = d.rule_id.as_deref().unwrap_or("—");
             md.push_str(&format!(
-                "| {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
                 format_ts(d.ts),
                 d.actor_kind,
                 d.action_kind,
+                surface.replace('|', "\\|"),
                 d.policy_decision,
+                rule.replace('|', "\\|"),
                 reason.replace('|', "\\|"),
             ));
         }
@@ -279,6 +283,18 @@ pub fn truncate(s: &str, max: usize) -> String {
         let prefix: String = s.chars().take(max).collect();
         format!("{prefix}…")
     }
+}
+
+fn policy_surface_from_decision_context(decision_context: Option<&str>) -> String {
+    decision_context
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| {
+            value
+                .get("surface")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "—".to_string())
 }
 
 #[cfg(test)]
@@ -533,6 +549,20 @@ mod tests {
     fn truncate_preserves_exact_fit() {
         assert_eq!(truncate("abc", 3), "abc");
         assert_eq!(truncate("abc", 4), "abc");
+    }
+
+    #[test]
+    fn policy_surface_from_decision_context_extracts_surface() {
+        assert_eq!(
+            policy_surface_from_decision_context(Some(r#"{"surface":"mux"}"#)),
+            "mux"
+        );
+        assert_eq!(
+            policy_surface_from_decision_context(Some(r#"{"other":1}"#)),
+            "—"
+        );
+        assert_eq!(policy_surface_from_decision_context(Some("{not json")), "—");
+        assert_eq!(policy_surface_from_decision_context(None), "—");
     }
 
     #[test]
@@ -836,10 +866,10 @@ mod tests {
                 action_kind: "send_text".to_string(),
                 policy_decision: "deny".to_string(),
                 decision_reason: Some("Rate limit exceeded".to_string()),
-                rule_id: None,
+                rule_id: Some("policy.cooldown".to_string()),
                 input_summary: None,
                 verification_summary: None,
-                decision_context: None,
+                decision_context: Some(r#"{"surface":"mux"}"#.to_string()),
                 result: "blocked".to_string(),
             };
             storage.record_audit_action(action).await.unwrap();
@@ -875,9 +905,14 @@ mod tests {
             let report = generate_session_report(&storage, &opts).await.unwrap();
 
             assert!(report.contains("## Policy Denials"));
+            assert!(
+                report.contains("| Time | Actor | Action | Surface | Decision | Rule | Reason |")
+            );
             assert!(report.contains("deny"));
             assert!(report.contains("Rate limit exceeded"));
             assert!(report.contains("workflow"));
+            assert!(report.contains("mux"));
+            assert!(report.contains("policy.cooldown"));
             // The allow action should NOT show up in denials table
             let denial_section = report.split("## Policy Denials").nth(1).unwrap();
             assert!(!denial_section.contains("operator"));
@@ -1135,10 +1170,10 @@ mod tests {
                 action_kind: "send_text".to_string(),
                 policy_decision: "deny".to_string(),
                 decision_reason: Some("Cooldown active".to_string()),
-                rule_id: None,
+                rule_id: Some("policy.cooldown".to_string()),
                 input_summary: None,
                 verification_summary: None,
-                decision_context: None,
+                decision_context: Some(r#"{"surface":"mux"}"#.to_string()),
                 result: "blocked".to_string(),
             };
             storage.record_audit_action(denial).await.unwrap();
@@ -1174,6 +1209,8 @@ mod tests {
             // Denials
             assert!(report.contains("## Policy Denials"));
             assert!(report.contains("Cooldown active"));
+            assert!(report.contains("policy.cooldown"));
+            assert!(report.contains("mux"));
 
             // Footer
             assert!(report.contains(&format!("ft v{}", crate::VERSION)));

@@ -6248,7 +6248,11 @@ fn build_event_mutation_decision_context(
     timestamp_ms: i64,
 ) -> Option<String> {
     let actor = approval_actor_kind(actor_kind);
-    let surface = frankenterm_core::policy::PolicySurface::default_for_actor(actor);
+    let surface = match interface {
+        "ft.events" => frankenterm_core::policy::PolicySurface::Mux,
+        "ft.robot.events" => frankenterm_core::policy::PolicySurface::Robot,
+        _ => frankenterm_core::policy::PolicySurface::default_for_actor(actor),
+    };
     let mut context = frankenterm_core::policy::DecisionContext {
         timestamp_ms,
         action: frankenterm_core::policy::ActionKind::ExecCommand,
@@ -7925,6 +7929,29 @@ fn build_event_would_handle(
         would_run: Some(would_run),
         reason,
     })
+}
+
+fn validate_robot_events_cursor(cursor: Option<i64>) -> Result<(), &'static str> {
+    if cursor.is_some_and(|value| value < 0) {
+        Err("Invalid --cursor: must be non-negative")
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_robot_events_replay_limit(replay_limit: Option<usize>) -> Result<(), &'static str> {
+    if matches!(replay_limit, Some(0)) {
+        Err("Invalid --replay-limit: must be >= 1")
+    } else {
+        Ok(())
+    }
+}
+
+fn next_robot_events_cursor<I>(cursor: Option<i64>, event_ids: I) -> Option<i64>
+where
+    I: IntoIterator<Item = i64>,
+{
+    cursor.and(event_ids.into_iter().last().or(cursor))
 }
 
 #[allow(dead_code)]
@@ -14970,10 +14997,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
 
                             // Build event query
-                            if cursor.is_some_and(|value| value < 0) {
+                            if let Err(message) = validate_robot_events_cursor(cursor) {
                                 let response = RobotResponse::<RobotEventsData>::error_with_code(
                                     ROBOT_ERR_INVALID_ARGS,
-                                    "Invalid --cursor: must be non-negative".to_string(),
+                                    message.to_string(),
                                     Some(
                                         "Use the last `next_cursor` value from a prior response."
                                             .to_string(),
@@ -14983,10 +15010,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 print_robot_response(&response, format, stats)?;
                                 return Ok(());
                             }
-                            if replay_limit.is_some_and(|value| value == 0) {
+                            if let Err(message) = validate_robot_events_replay_limit(replay_limit)
+                            {
                                 let response = RobotResponse::<RobotEventsData>::error_with_code(
                                     ROBOT_ERR_INVALID_ARGS,
-                                    "Invalid --replay-limit: must be >= 1".to_string(),
+                                    message.to_string(),
                                     None,
                                     elapsed_ms(start),
                                 );
@@ -15064,11 +15092,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         None
                                     };
                                     let total_count = events.len();
-                                    let next_cursor = if cursor_mode {
-                                        events.last().map(|event| event.id)
-                                    } else {
-                                        None
-                                    };
+                                    let next_cursor = next_robot_events_cursor(
+                                        cursor,
+                                        events.iter().map(|event| event.id),
+                                    );
                                     let mut items: Vec<RobotEventItem> =
                                         Vec::with_capacity(events.len());
                                     for e in events {
@@ -39371,6 +39398,41 @@ log_level = "debug"
     }
 
     #[test]
+    fn robot_events_cursor_validation_rejects_negative_values() {
+        assert_eq!(
+            validate_robot_events_cursor(Some(-1)),
+            Err("Invalid --cursor: must be non-negative")
+        );
+        assert!(validate_robot_events_cursor(Some(0)).is_ok());
+        assert!(validate_robot_events_cursor(None).is_ok());
+    }
+
+    #[test]
+    fn robot_events_replay_limit_validation_rejects_zero() {
+        assert_eq!(
+            validate_robot_events_replay_limit(Some(0)),
+            Err("Invalid --replay-limit: must be >= 1")
+        );
+        assert!(validate_robot_events_replay_limit(Some(1)).is_ok());
+        assert!(validate_robot_events_replay_limit(None).is_ok());
+    }
+
+    #[test]
+    fn robot_events_next_cursor_preserves_checkpoint_for_empty_replay_page() {
+        assert_eq!(
+            next_robot_events_cursor(Some(42), std::iter::empty::<i64>()),
+            Some(42)
+        );
+        assert_eq!(next_robot_events_cursor(None, std::iter::empty::<i64>()), None);
+    }
+
+    #[test]
+    fn robot_events_next_cursor_advances_to_last_event_id() {
+        assert_eq!(next_robot_events_cursor(Some(42), [43, 44]), Some(44));
+        assert_eq!(next_robot_events_cursor(None, [43, 44]), None);
+    }
+
+    #[test]
     fn cli_robot_send_dry_run_flag() {
         let cli = Cli::try_parse_from(["ft", "robot", "send", "0", "echo hello", "--dry-run"])
             .expect("robot send --dry-run should parse");
@@ -39772,10 +39834,7 @@ log_level = "debug"
         };
 
         assert_eq!(ctx.actor, frankenterm_core::policy::ActorKind::Human);
-        assert_eq!(
-            ctx.surface,
-            frankenterm_core::policy::PolicySurface::Unknown
-        );
+        assert_eq!(ctx.surface, frankenterm_core::policy::PolicySurface::Mux);
         assert_eq!(
             ctx.action,
             frankenterm_core::policy::ActionKind::ExecCommand
@@ -39787,7 +39846,7 @@ log_level = "debug"
         assert_eq!(evidence("event_action_kind"), Some("event.triage"));
         assert_eq!(evidence("event_id"), Some("42"));
         assert_eq!(evidence("operation"), Some("set_triage_state"));
-        assert_eq!(evidence("event_surface"), Some("unknown"));
+        assert_eq!(evidence("event_surface"), Some("mux"));
         assert_eq!(evidence("actor_id"), Some("ops"));
         assert_eq!(evidence("changed"), Some("true"));
         assert_eq!(evidence("state"), Some("investigating"));
@@ -39838,6 +39897,38 @@ log_level = "debug"
         assert_eq!(evidence("actor_id"), Some("agent-7"));
         assert_eq!(evidence("changed"), Some("false"));
         assert_eq!(evidence("label"), Some("urgent"));
+    }
+
+    #[test]
+    fn event_mutation_decision_context_falls_back_to_actor_surface_for_unknown_interface() {
+        let ctx_json = build_event_mutation_decision_context(
+            "human",
+            "ft.custom.events",
+            "event.annotate",
+            88,
+            "annotate",
+            None,
+            "ft custom events annotate 88",
+            None,
+            None,
+            None,
+            4_321,
+        )
+        .expect("decision context should serialize");
+        let ctx: frankenterm_core::policy::DecisionContext =
+            serde_json::from_str(&ctx_json).expect("decision context should parse");
+        let event_surface = ctx
+            .evidence
+            .iter()
+            .find(|entry| entry.key == "event_surface")
+            .map(|entry| entry.value.as_str());
+
+        assert_eq!(ctx.actor, frankenterm_core::policy::ActorKind::Human);
+        assert_eq!(
+            ctx.surface,
+            frankenterm_core::policy::PolicySurface::Unknown
+        );
+        assert_eq!(event_surface, Some("unknown"));
     }
 
     #[test]
