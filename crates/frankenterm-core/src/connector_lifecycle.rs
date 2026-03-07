@@ -296,21 +296,16 @@ impl RestartPolicy {
 // =============================================================================
 
 /// Strategy for handling version upgrades.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpgradeStrategy {
     /// Stop → upgrade → start (simple, has downtime).
+    #[default]
     StopAndReplace,
     /// Install new version alongside, switch when healthy, remove old.
     BlueGreen,
     /// Mark as upgrading, drain in-flight, switch, verify.
     RollingDrain,
-}
-
-impl Default for UpgradeStrategy {
-    fn default() -> Self {
-        Self::StopAndReplace
-    }
 }
 
 // =============================================================================
@@ -570,7 +565,8 @@ impl ConnectorLifecycleManager {
         mc.version.clone_from(&manifest.version);
         mc.display_name.clone_from(&manifest.display_name);
         mc.trust_level = trust_level;
-        mc.granted_capabilities.clone_from(&manifest.required_capabilities);
+        mc.granted_capabilities
+            .clone_from(&manifest.required_capabilities);
         mc.admin_state = AdminState::Upgrading;
         mc.last_transition_at_ms = now_ms;
 
@@ -881,7 +877,8 @@ impl ConnectorLifecycleManager {
         // Apply rollback.
         mc.version.clone_from(&previous_version);
         mc.display_name.clone_from(&rollback_manifest.display_name);
-        mc.granted_capabilities.clone_from(&rollback_manifest.required_capabilities);
+        mc.granted_capabilities
+            .clone_from(&rollback_manifest.required_capabilities);
         mc.previous_version = None;
         mc.rollback_manifest = None;
         mc.admin_state = AdminState::Enabled;

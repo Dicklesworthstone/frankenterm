@@ -161,20 +161,15 @@ impl MeshZone {
 // =============================================================================
 
 /// Strategy for selecting hosts when routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RoutingStrategy {
     /// Pick the host with the most remaining capacity.
+    #[default]
     LeastLoaded,
     /// Pick within the preferred zone, fall back to others.
     ZoneAffinity,
     /// Round-robin across healthy hosts.
     RoundRobin,
-}
-
-impl Default for RoutingStrategy {
-    fn default() -> Self {
-        Self::LeastLoaded
-    }
 }
 
 impl RoutingStrategy {

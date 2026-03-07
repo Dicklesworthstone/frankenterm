@@ -207,18 +207,13 @@ pub struct OutboundEvent {
 }
 
 /// Severity levels for outbound events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutboundSeverity {
+    #[default]
     Info,
     Warning,
     Critical,
-}
-
-impl Default for OutboundSeverity {
-    fn default() -> Self {
-        Self::Info
-    }
 }
 
 impl OutboundEvent {

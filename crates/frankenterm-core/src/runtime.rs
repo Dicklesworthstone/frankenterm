@@ -1097,10 +1097,7 @@ impl ObservationRuntime {
         let (snapshot_handle, snapshot_shutdown_tx, snapshot_triggers) =
             if let Some(ref snap_config) = self.snapshot_config {
                 if snap_config.enabled {
-                    let db_path = {
-                        let db_path = Arc::new(self.storage.db_path().to_string());
-                        db_path
-                    };
+                    let db_path = Arc::new(self.storage.db_path().to_string());
                     let engine = Arc::new(crate::snapshot_engine::SnapshotEngine::new(
                         db_path,
                         snap_config.clone(),
@@ -2790,9 +2787,7 @@ impl RuntimeHandle {
 
     /// Current write queue depth (pending commands for the storage writer thread).
     pub async fn write_queue_depth(&self) -> usize {
-        let depth = self.storage.write_queue_depth();
-
-        depth
+        self.storage.write_queue_depth()
     }
 
     /// Wait for all tasks to complete.

@@ -7780,8 +7780,8 @@ mod tests {
             surfaces: vec!["ROBOT".to_string()],
             ..Default::default()
         };
-        let input =
-            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_surface(PolicySurface::Robot);
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_surface(PolicySurface::Robot);
         assert!(matches_rule(&match_on, &input));
     }
 
@@ -7821,8 +7821,7 @@ mod tests {
             pane_domains: vec!["local".to_string()],
             ..Default::default()
         };
-        let input =
-            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_domain("local");
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_domain("local");
         assert!(matches_rule(&match_on, &input));
     }
 

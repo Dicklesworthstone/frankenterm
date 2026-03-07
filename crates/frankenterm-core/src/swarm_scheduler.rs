@@ -557,14 +557,11 @@ impl SwarmScheduler {
             for snap in &snapshots {
                 if snap.active_items < snap.max_items {
                     // Agent has capacity — try to pull work
-                    match queue.pull(&snap.agent_id) {
-                        Ok(assignment) => {
-                            assignments.push(WorkAssignment {
-                                item_id: assignment.work_item_id,
-                                agent_id: snap.agent_id.clone(),
-                            });
-                        }
-                        Err(_) => {}
+                    if let Ok(assignment) = queue.pull(&snap.agent_id) {
+                        assignments.push(WorkAssignment {
+                            item_id: assignment.work_item_id,
+                            agent_id: snap.agent_id.clone(),
+                        });
                     }
                 }
             }

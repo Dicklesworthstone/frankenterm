@@ -1429,10 +1429,7 @@ mod tests {
 
         let plan = orch.validate_plan(ops, &reg);
         assert!(!plan.validated);
-        assert!(matches!(
-            plan.operations[0].check,
-            OpCheckResult::Ok
-        ));
+        assert!(matches!(plan.operations[0].check, OpCheckResult::Ok));
         assert!(matches!(
             plan.operations[1].check,
             OpCheckResult::NotFound { .. }

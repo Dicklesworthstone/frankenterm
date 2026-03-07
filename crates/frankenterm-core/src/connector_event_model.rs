@@ -349,18 +349,13 @@ fn generate_event_id(timestamp_ms: u64) -> String {
 // =============================================================================
 
 /// Unified severity levels across all connector event types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CanonicalSeverity {
+    #[default]
     Info,
     Warning,
     Critical,
-}
-
-impl Default for CanonicalSeverity {
-    fn default() -> Self {
-        Self::Info
-    }
 }
 
 impl CanonicalSeverity {

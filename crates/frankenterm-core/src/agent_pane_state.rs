@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Visual state of an agent-controlled pane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentPaneState {
     /// Agent is actively producing output (green border).
@@ -27,13 +27,8 @@ pub enum AgentPaneState {
     /// Pane is idle — no input or output for an extended period (gray border).
     Idle,
     /// Pane is not agent-controlled (no special border).
+    #[default]
     Human,
-}
-
-impl Default for AgentPaneState {
-    fn default() -> Self {
-        Self::Human
-    }
 }
 
 impl AgentPaneState {
@@ -195,12 +190,13 @@ pub struct PaneBackpressureOverlay {
 }
 
 /// Policy for smart auto-layout of agent panes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoLayoutPolicy {
     /// Group panes by project/domain.
     ByDomain,
     /// Sort by status: errors first, active next, idle last.
+    #[default]
     ByStatus,
     /// Sort by most recent activity.
     ByActivity,
@@ -208,11 +204,6 @@ pub enum AutoLayoutPolicy {
     Manual,
 }
 
-impl Default for AutoLayoutPolicy {
-    fn default() -> Self {
-        Self::ByStatus
-    }
-}
 
 #[cfg(test)]
 mod tests {

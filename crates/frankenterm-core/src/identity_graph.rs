@@ -598,7 +598,10 @@ pub enum AuthzDecision {
     /// Denied — includes reason.
     Deny { reason: String },
     /// Requires approval from specific principal.
-    RequireApproval { approver: PrincipalId, reason: String },
+    RequireApproval {
+        approver: PrincipalId,
+        reason: String,
+    },
 }
 
 impl AuthzDecision {
@@ -898,12 +901,12 @@ impl IdentityGraph {
 
     /// Revoke a grant by ID.
     pub fn revoke_grant(&mut self, grant_id: &str) -> Result<(), IdentityGraphError> {
-        let grant = self
-            .grants
-            .get_mut(grant_id)
-            .ok_or_else(|| IdentityGraphError::GrantNotFound {
-                grant_id: grant_id.to_string(),
-            })?;
+        let grant =
+            self.grants
+                .get_mut(grant_id)
+                .ok_or_else(|| IdentityGraphError::GrantNotFound {
+                    grant_id: grant_id.to_string(),
+                })?;
         if grant.active {
             grant.active = false;
             self.telemetry.grants_revoked += 1;
@@ -1070,9 +1073,7 @@ impl IdentityGraph {
         let min_trust = action.default_min_trust();
         if !trust.satisfies(min_trust) {
             let decision = AuthzDecision::Deny {
-                reason: format!(
-                    "insufficient trust: have {trust}, need {min_trust} for {action}"
-                ),
+                reason: format!("insufficient trust: have {trust}, need {min_trust} for {action}"),
             };
             self.record_audit(principal, action, resource, &decision, false, false);
             self.telemetry.authz_denied += 1;
@@ -1396,10 +1397,14 @@ mod tests {
 
     fn test_graph() -> IdentityGraph {
         let mut g = IdentityGraph::new();
-        g.register_principal(PrincipalId::human("operator-1")).unwrap();
-        g.register_principal(PrincipalId::agent("claude-1")).unwrap();
-        g.register_principal(PrincipalId::connector("github-1")).unwrap();
-        g.register_principal(PrincipalId::workflow("deploy-1")).unwrap();
+        g.register_principal(PrincipalId::human("operator-1"))
+            .unwrap();
+        g.register_principal(PrincipalId::agent("claude-1"))
+            .unwrap();
+        g.register_principal(PrincipalId::connector("github-1"))
+            .unwrap();
+        g.register_principal(PrincipalId::workflow("deploy-1"))
+            .unwrap();
         g
     }
 
@@ -1895,11 +1900,16 @@ mod tests {
         g.register_principal(p.clone()).unwrap();
 
         // Delete requires High trust
-        let grant = AuthGrant::new("g1", p.clone(), {
-            let mut s = BTreeSet::new();
-            s.insert(AuthAction::Delete);
-            s
-        }, ResourceId::pane("p1"));
+        let grant = AuthGrant::new(
+            "g1",
+            p.clone(),
+            {
+                let mut s = BTreeSet::new();
+                s.insert(AuthAction::Delete);
+                s
+            },
+            ResourceId::pane("p1"),
+        );
         g.add_grant(grant).unwrap();
 
         let decision = g.authorize(&p, &AuthAction::Delete, &ResourceId::pane("p1"));
@@ -1983,7 +1993,9 @@ mod tests {
             },
             ResourceId::pane("p1"),
         );
-        grant.conditions.push(GrantCondition::RequiresApproval(admin.clone()));
+        grant
+            .conditions
+            .push(GrantCondition::RequiresApproval(admin.clone()));
         g.add_grant(grant).unwrap();
 
         let decision = g.authorize(&agent, &AuthAction::Write, &ResourceId::pane("p1"));

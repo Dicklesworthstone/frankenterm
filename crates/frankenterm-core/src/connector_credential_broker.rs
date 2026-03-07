@@ -24,10 +24,7 @@ pub enum CredentialBrokerError {
     CredentialNotFound { credential_id: String },
 
     #[error("connector not authorized: {connector_id} for scope {scope}")]
-    NotAuthorized {
-        connector_id: String,
-        scope: String,
-    },
+    NotAuthorized { connector_id: String, scope: String },
 
     #[error("credential expired: {credential_id}")]
     CredentialExpired { credential_id: String },
@@ -36,10 +33,7 @@ pub enum CredentialBrokerError {
     CredentialRevoked { credential_id: String },
 
     #[error("provider unavailable: {provider_id}: {reason}")]
-    ProviderUnavailable {
-        provider_id: String,
-        reason: String,
-    },
+    ProviderUnavailable { provider_id: String, reason: String },
 
     #[error("rotation failed for {credential_id}: {reason}")]
     RotationFailed {
@@ -150,12 +144,16 @@ impl CredentialScope {
         }
         // Wildcard resource in `other` covers everything
         if other.resource == "*" {
-            return self.operations.iter().all(|op| other.operations.contains(op) || other.operations.contains(&"*".to_string()));
+            return self.operations.iter().all(|op| {
+                other.operations.contains(op) || other.operations.contains(&"*".to_string())
+            });
         }
         if self.resource != other.resource {
             return false;
         }
-        self.operations.iter().all(|op| other.operations.contains(op) || other.operations.contains(&"*".to_string()))
+        self.operations
+            .iter()
+            .all(|op| other.operations.contains(op) || other.operations.contains(&"*".to_string()))
     }
 }
 
@@ -328,7 +326,8 @@ impl CredentialAccessRule {
     /// Check if this rule matches a given connector and requested scope.
     #[must_use]
     pub fn matches(&self, connector_id: &str, requested_scope: &CredentialScope) -> bool {
-        let connector_matches = self.connector_pattern == "*" || self.connector_pattern == connector_id;
+        let connector_matches =
+            self.connector_pattern == "*" || self.connector_pattern == connector_id;
         let scope_matches = requested_scope.is_subset_of(&self.permitted_scope);
         connector_matches && scope_matches
     }
@@ -690,7 +689,10 @@ impl ConnectorCredentialBroker {
         if let Some(cred) = self.credentials.get_mut(credential_id) {
             cred.active_lease_count += 1;
         }
-        if let Some(prov) = self.providers.get_mut(&self.credentials[credential_id].provider_id) {
+        if let Some(prov) = self
+            .providers
+            .get_mut(&self.credentials[credential_id].provider_id)
+        {
             prov.active_leases += 1;
             prov.total_issued += 1;
         }
@@ -705,7 +707,10 @@ impl ConnectorCredentialBroker {
             credential_id: credential_id.to_string(),
             connector_id: Some(connector_id.to_string()),
             lease_id: Some(lease_id),
-            detail: format!("lease issued, expires at {}", now_ms.saturating_add(lease_ttl)),
+            detail: format!(
+                "lease issued, expires at {}",
+                now_ms.saturating_add(lease_ttl)
+            ),
         });
 
         Ok(result)
@@ -717,11 +722,12 @@ impl ConnectorCredentialBroker {
         lease_id: &str,
         now_ms: u64,
     ) -> Result<(), CredentialBrokerError> {
-        let lease = self.leases.get_mut(lease_id).ok_or_else(|| {
-            CredentialBrokerError::LeaseExpired {
-                lease_id: lease_id.to_string(),
-            }
-        })?;
+        let lease =
+            self.leases
+                .get_mut(lease_id)
+                .ok_or_else(|| CredentialBrokerError::LeaseExpired {
+                    lease_id: lease_id.to_string(),
+                })?;
         if lease.state != LeaseState::Active {
             return Ok(()); // Already revoked/expired
         }
@@ -827,10 +833,7 @@ impl ConnectorCredentialBroker {
     }
 
     /// Complete rotation: set credential back to Active.
-    pub fn complete_rotation(
-        &mut self,
-        credential_id: &str,
-    ) -> Result<(), CredentialBrokerError> {
+    pub fn complete_rotation(&mut self, credential_id: &str) -> Result<(), CredentialBrokerError> {
         let cred = self.credentials.get_mut(credential_id).ok_or_else(|| {
             CredentialBrokerError::CredentialNotFound {
                 credential_id: credential_id.to_string(),
@@ -983,7 +986,11 @@ mod tests {
             kind: CredentialKind::ApiKey,
             sensitivity: CredentialSensitivity::Medium,
             state: CredentialState::Active,
-            permitted_scopes: vec![CredentialScope::new("github", "repos/*", vec!["read".into(), "write".into()])],
+            permitted_scopes: vec![CredentialScope::new(
+                "github",
+                "repos/*",
+                vec!["read".into(), "write".into()],
+            )],
             version: 1,
             created_at_ms: 1000,
             expires_at_ms: 0,
@@ -1005,8 +1012,12 @@ mod tests {
 
     fn setup_broker() -> ConnectorCredentialBroker {
         let mut broker = ConnectorCredentialBroker::new();
-        broker.register_provider(test_provider_config("vault-1"), 1000).unwrap();
-        broker.register_credential(test_credential("cred-1", "vault-1"), 1000).unwrap();
+        broker
+            .register_provider(test_provider_config("vault-1"), 1000)
+            .unwrap();
+        broker
+            .register_credential(test_credential("cred-1", "vault-1"), 1000)
+            .unwrap();
         broker.add_access_rule(test_access_rule("*"));
         broker
     }
@@ -1016,7 +1027,9 @@ mod tests {
     #[test]
     fn register_provider_success() {
         let mut broker = ConnectorCredentialBroker::new();
-        broker.register_provider(test_provider_config("p1"), 100).unwrap();
+        broker
+            .register_provider(test_provider_config("p1"), 100)
+            .unwrap();
         assert_eq!(broker.provider_ids(), vec!["p1"]);
         assert_eq!(broker.telemetry.providers_registered, 1);
     }
@@ -1024,16 +1037,28 @@ mod tests {
     #[test]
     fn update_provider_status() {
         let mut broker = ConnectorCredentialBroker::new();
-        broker.register_provider(test_provider_config("p1"), 100).unwrap();
-        broker.update_provider_status("p1", ProviderStatus::Degraded, 200).unwrap();
-        assert_eq!(broker.get_provider("p1").unwrap().status, ProviderStatus::Degraded);
+        broker
+            .register_provider(test_provider_config("p1"), 100)
+            .unwrap();
+        broker
+            .update_provider_status("p1", ProviderStatus::Degraded, 200)
+            .unwrap();
+        assert_eq!(
+            broker.get_provider("p1").unwrap().status,
+            ProviderStatus::Degraded
+        );
     }
 
     #[test]
     fn update_nonexistent_provider_fails() {
         let mut broker = ConnectorCredentialBroker::new();
-        let err = broker.update_provider_status("ghost", ProviderStatus::Available, 100).unwrap_err();
-        assert!(matches!(err, CredentialBrokerError::ProviderNotFound { .. }));
+        let err = broker
+            .update_provider_status("ghost", ProviderStatus::Available, 100)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CredentialBrokerError::ProviderNotFound { .. }
+        ));
     }
 
     // ---- Credential registration tests ----
@@ -1041,8 +1066,12 @@ mod tests {
     #[test]
     fn register_credential_success() {
         let mut broker = ConnectorCredentialBroker::new();
-        broker.register_provider(test_provider_config("v1"), 100).unwrap();
-        broker.register_credential(test_credential("c1", "v1"), 100).unwrap();
+        broker
+            .register_provider(test_provider_config("v1"), 100)
+            .unwrap();
+        broker
+            .register_credential(test_credential("c1", "v1"), 100)
+            .unwrap();
         assert!(broker.get_credential("c1").is_some());
         assert_eq!(broker.telemetry.credentials_registered, 1);
     }
@@ -1050,8 +1079,13 @@ mod tests {
     #[test]
     fn register_credential_unknown_provider_fails() {
         let mut broker = ConnectorCredentialBroker::new();
-        let err = broker.register_credential(test_credential("c1", "ghost"), 100).unwrap_err();
-        assert!(matches!(err, CredentialBrokerError::ProviderNotFound { .. }));
+        let err = broker
+            .register_credential(test_credential("c1", "ghost"), 100)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CredentialBrokerError::ProviderNotFound { .. }
+        ));
     }
 
     #[test]
@@ -1060,7 +1094,9 @@ mod tests {
         let mut config = test_provider_config("low-sec");
         config.max_sensitivity = CredentialSensitivity::Low;
         broker.register_provider(config, 100).unwrap();
-        let err = broker.register_credential(test_credential("c1", "low-sec"), 100).unwrap_err();
+        let err = broker
+            .register_credential(test_credential("c1", "low-sec"), 100)
+            .unwrap_err();
         assert!(matches!(err, CredentialBrokerError::NotAuthorized { .. }));
     }
 
@@ -1102,7 +1138,9 @@ mod tests {
     fn request_lease_success() {
         let mut broker = setup_broker();
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        let lease = broker.request_lease("conn-1", "cred-1", scope, 2000).unwrap();
+        let lease = broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap();
         assert_eq!(lease.connector_id, "conn-1");
         assert_eq!(lease.credential_id, "cred-1");
         assert_eq!(lease.state, LeaseState::Active);
@@ -1114,8 +1152,13 @@ mod tests {
     fn request_lease_unknown_credential_fails() {
         let mut broker = setup_broker();
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        let err = broker.request_lease("conn-1", "ghost", scope, 2000).unwrap_err();
-        assert!(matches!(err, CredentialBrokerError::CredentialNotFound { .. }));
+        let err = broker
+            .request_lease("conn-1", "ghost", scope, 2000)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CredentialBrokerError::CredentialNotFound { .. }
+        ));
     }
 
     #[test]
@@ -1123,31 +1166,49 @@ mod tests {
         let mut broker = setup_broker();
         broker.revoke_credential("cred-1", 1500).unwrap();
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        let err = broker.request_lease("conn-1", "cred-1", scope, 2000).unwrap_err();
-        assert!(matches!(err, CredentialBrokerError::CredentialRevoked { .. }));
+        let err = broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CredentialBrokerError::CredentialRevoked { .. }
+        ));
     }
 
     #[test]
     fn request_lease_expired_credential_fails() {
         let mut broker = ConnectorCredentialBroker::new();
-        broker.register_provider(test_provider_config("v1"), 100).unwrap();
+        broker
+            .register_provider(test_provider_config("v1"), 100)
+            .unwrap();
         let mut cred = test_credential("c1", "v1");
         cred.expires_at_ms = 5000;
         broker.register_credential(cred, 100).unwrap();
         broker.add_access_rule(test_access_rule("*"));
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        let err = broker.request_lease("conn-1", "c1", scope, 6000).unwrap_err();
-        assert!(matches!(err, CredentialBrokerError::CredentialExpired { .. }));
+        let err = broker
+            .request_lease("conn-1", "c1", scope, 6000)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CredentialBrokerError::CredentialExpired { .. }
+        ));
     }
 
     #[test]
     fn request_lease_unauthorized_connector_fails() {
         let mut broker = ConnectorCredentialBroker::new();
-        broker.register_provider(test_provider_config("v1"), 100).unwrap();
-        broker.register_credential(test_credential("c1", "v1"), 100).unwrap();
+        broker
+            .register_provider(test_provider_config("v1"), 100)
+            .unwrap();
+        broker
+            .register_credential(test_credential("c1", "v1"), 100)
+            .unwrap();
         // No access rules → no authorization
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        let err = broker.request_lease("conn-1", "c1", scope, 2000).unwrap_err();
+        let err = broker
+            .request_lease("conn-1", "c1", scope, 2000)
+            .unwrap_err();
         assert!(matches!(err, CredentialBrokerError::NotAuthorized { .. }));
         assert_eq!(broker.telemetry.access_denied, 1);
     }
@@ -1155,8 +1216,12 @@ mod tests {
     #[test]
     fn request_lease_max_leases_exceeded() {
         let mut broker = ConnectorCredentialBroker::new();
-        broker.register_provider(test_provider_config("v1"), 100).unwrap();
-        broker.register_credential(test_credential("c1", "v1"), 100).unwrap();
+        broker
+            .register_provider(test_provider_config("v1"), 100)
+            .unwrap();
+        broker
+            .register_credential(test_credential("c1", "v1"), 100)
+            .unwrap();
         broker.add_access_rule(CredentialAccessRule {
             rule_id: "tight".to_string(),
             connector_pattern: "*".to_string(),
@@ -1168,17 +1233,29 @@ mod tests {
         let scope = || CredentialScope::new("github", "repos/foo", vec!["read".into()]);
         broker.request_lease("conn-1", "c1", scope(), 2000).unwrap();
         broker.request_lease("conn-1", "c1", scope(), 2001).unwrap();
-        let err = broker.request_lease("conn-1", "c1", scope(), 2002).unwrap_err();
-        assert!(matches!(err, CredentialBrokerError::MaxLeasesExceeded { .. }));
+        let err = broker
+            .request_lease("conn-1", "c1", scope(), 2002)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CredentialBrokerError::MaxLeasesExceeded { .. }
+        ));
     }
 
     #[test]
     fn request_lease_unavailable_provider_fails() {
         let mut broker = setup_broker();
-        broker.update_provider_status("vault-1", ProviderStatus::Unavailable, 1500).unwrap();
+        broker
+            .update_provider_status("vault-1", ProviderStatus::Unavailable, 1500)
+            .unwrap();
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        let err = broker.request_lease("conn-1", "cred-1", scope, 2000).unwrap_err();
-        assert!(matches!(err, CredentialBrokerError::ProviderUnavailable { .. }));
+        let err = broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CredentialBrokerError::ProviderUnavailable { .. }
+        ));
     }
 
     // ---- Lease revocation and expiry ----
@@ -1187,19 +1264,26 @@ mod tests {
     fn revoke_lease_success() {
         let mut broker = setup_broker();
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        let lease = broker.request_lease("conn-1", "cred-1", scope, 2000).unwrap();
+        let lease = broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap();
         broker.revoke_lease(&lease.lease_id, 3000).unwrap();
         assert_eq!(broker.leases[&lease.lease_id].state, LeaseState::Revoked);
         assert_eq!(broker.telemetry.leases_revoked, 1);
         // Lease count decremented
-        assert_eq!(broker.get_credential("cred-1").unwrap().active_lease_count, 0);
+        assert_eq!(
+            broker.get_credential("cred-1").unwrap().active_lease_count,
+            0
+        );
     }
 
     #[test]
     fn expire_leases_past_ttl() {
         let mut broker = setup_broker();
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        let lease = broker.request_lease("conn-1", "cred-1", scope, 2000).unwrap();
+        let lease = broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap();
         let far_future = lease.expires_at_ms + 1;
         let expired = broker.expire_leases(far_future);
         assert_eq!(expired.len(), 1);
@@ -1211,7 +1295,9 @@ mod tests {
     fn expire_leases_not_yet_due() {
         let mut broker = setup_broker();
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        broker.request_lease("conn-1", "cred-1", scope, 2000).unwrap();
+        broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap();
         let expired = broker.expire_leases(2001);
         assert!(expired.is_empty());
     }
@@ -1223,7 +1309,10 @@ mod tests {
         let mut broker = setup_broker();
         let new_version = broker.rotate_credential("cred-1", 5000).unwrap();
         assert_eq!(new_version, 2);
-        assert_eq!(broker.get_credential("cred-1").unwrap().state, CredentialState::Rotating);
+        assert_eq!(
+            broker.get_credential("cred-1").unwrap().state,
+            CredentialState::Rotating
+        );
         assert_eq!(broker.telemetry.rotations_completed, 1);
     }
 
@@ -1232,7 +1321,10 @@ mod tests {
         let mut broker = setup_broker();
         broker.rotate_credential("cred-1", 5000).unwrap();
         broker.complete_rotation("cred-1").unwrap();
-        assert_eq!(broker.get_credential("cred-1").unwrap().state, CredentialState::Active);
+        assert_eq!(
+            broker.get_credential("cred-1").unwrap().state,
+            CredentialState::Active
+        );
     }
 
     #[test]
@@ -1240,7 +1332,10 @@ mod tests {
         let mut broker = setup_broker();
         broker.revoke_credential("cred-1", 5000).unwrap();
         let err = broker.rotate_credential("cred-1", 6000).unwrap_err();
-        assert!(matches!(err, CredentialBrokerError::CredentialRevoked { .. }));
+        assert!(matches!(
+            err,
+            CredentialBrokerError::CredentialRevoked { .. }
+        ));
     }
 
     // ---- Credential revocation tests ----
@@ -1249,11 +1344,18 @@ mod tests {
     fn revoke_credential_terminates_all_leases() {
         let mut broker = setup_broker();
         let scope = || CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        broker.request_lease("conn-1", "cred-1", scope(), 2000).unwrap();
-        broker.request_lease("conn-2", "cred-1", scope(), 2001).unwrap();
+        broker
+            .request_lease("conn-1", "cred-1", scope(), 2000)
+            .unwrap();
+        broker
+            .request_lease("conn-2", "cred-1", scope(), 2001)
+            .unwrap();
         let revoked = broker.revoke_credential("cred-1", 3000).unwrap();
         assert_eq!(revoked.len(), 2);
-        assert_eq!(broker.get_credential("cred-1").unwrap().state, CredentialState::Revoked);
+        assert_eq!(
+            broker.get_credential("cred-1").unwrap().state,
+            CredentialState::Revoked
+        );
         assert_eq!(broker.telemetry.credentials_revoked, 1);
         assert_eq!(broker.telemetry.leases_revoked, 2);
     }
@@ -1264,8 +1366,12 @@ mod tests {
     fn active_leases_for_connector() {
         let mut broker = setup_broker();
         let scope = || CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        broker.request_lease("conn-1", "cred-1", scope(), 2000).unwrap();
-        broker.request_lease("conn-2", "cred-1", scope(), 2001).unwrap();
+        broker
+            .request_lease("conn-1", "cred-1", scope(), 2000)
+            .unwrap();
+        broker
+            .request_lease("conn-2", "cred-1", scope(), 2001)
+            .unwrap();
         assert_eq!(broker.active_leases_for_connector("conn-1").len(), 1);
         assert_eq!(broker.active_leases_for_connector("conn-2").len(), 1);
         assert_eq!(broker.active_leases_for_connector("conn-3").len(), 0);
@@ -1275,8 +1381,12 @@ mod tests {
     fn active_leases_for_credential() {
         let mut broker = setup_broker();
         let scope = || CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        broker.request_lease("conn-1", "cred-1", scope(), 2000).unwrap();
-        broker.request_lease("conn-2", "cred-1", scope(), 2001).unwrap();
+        broker
+            .request_lease("conn-1", "cred-1", scope(), 2000)
+            .unwrap();
+        broker
+            .request_lease("conn-2", "cred-1", scope(), 2001)
+            .unwrap();
         assert_eq!(broker.active_leases_for_credential("cred-1").len(), 2);
     }
 
@@ -1286,7 +1396,9 @@ mod tests {
     fn telemetry_snapshot_reflects_state() {
         let mut broker = setup_broker();
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        broker.request_lease("conn-1", "cred-1", scope, 2000).unwrap();
+        broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap();
         let snap = broker.telemetry_snapshot(3000);
         assert_eq!(snap.active_leases, 1);
         assert_eq!(snap.active_credentials, 1);
@@ -1324,7 +1436,9 @@ mod tests {
     fn audit_log_records_events() {
         let mut broker = setup_broker();
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
-        broker.request_lease("conn-1", "cred-1", scope, 2000).unwrap();
+        broker
+            .request_lease("conn-1", "cred-1", scope, 2000)
+            .unwrap();
         // Provider registered + credential registered + lease issued = 3
         assert_eq!(broker.audit_log().len(), 3);
     }
@@ -1333,19 +1447,20 @@ mod tests {
     fn audit_log_bounded() {
         let mut broker = ConnectorCredentialBroker::new();
         for i in 0..MAX_AUDIT_EVENTS + 100 {
-            broker.register_provider(
-                SecretProviderConfig {
-                    provider_id: format!("p{i}"),
-                    display_name: format!("P{i}"),
-                    provider_type: "env".to_string(),
-                    max_concurrent_leases: 10,
-                    default_lease_ttl_ms: 60_000,
-                    supports_rotation: false,
-                    max_sensitivity: CredentialSensitivity::Low,
-                },
-                i as u64,
-            )
-            .unwrap();
+            broker
+                .register_provider(
+                    SecretProviderConfig {
+                        provider_id: format!("p{i}"),
+                        display_name: format!("P{i}"),
+                        provider_type: "env".to_string(),
+                        max_concurrent_leases: 10,
+                        default_lease_ttl_ms: 60_000,
+                        supports_rotation: false,
+                        max_sensitivity: CredentialSensitivity::Low,
+                    },
+                    i as u64,
+                )
+                .unwrap();
         }
         assert!(broker.audit_log().len() <= MAX_AUDIT_EVENTS);
     }
@@ -1388,7 +1503,10 @@ mod tests {
     fn credential_kind_display() {
         assert_eq!(CredentialKind::ApiKey.to_string(), "api_key");
         assert_eq!(CredentialKind::OAuth2Token.to_string(), "oauth2_token");
-        assert_eq!(CredentialKind::TlsCertificate.to_string(), "tls_certificate");
+        assert_eq!(
+            CredentialKind::TlsCertificate.to_string(),
+            "tls_certificate"
+        );
     }
 
     // ---- Lease validity ----
@@ -1430,14 +1548,24 @@ mod tests {
 
     #[test]
     fn error_display_messages() {
-        let e = CredentialBrokerError::ProviderNotFound { provider_id: "x".into() };
+        let e = CredentialBrokerError::ProviderNotFound {
+            provider_id: "x".into(),
+        };
         assert_eq!(e.to_string(), "provider not found: x");
 
-        let e = CredentialBrokerError::CredentialRevoked { credential_id: "c1".into() };
+        let e = CredentialBrokerError::CredentialRevoked {
+            credential_id: "c1".into(),
+        };
         assert_eq!(e.to_string(), "credential revoked: c1");
 
-        let e = CredentialBrokerError::MaxLeasesExceeded { connector_id: "conn".into(), limit: 5 };
-        assert_eq!(e.to_string(), "max active leases exceeded for conn: limit=5");
+        let e = CredentialBrokerError::MaxLeasesExceeded {
+            connector_id: "conn".into(),
+            limit: 5,
+        };
+        assert_eq!(
+            e.to_string(),
+            "max active leases exceeded for conn: limit=5"
+        );
     }
 
     // ---- Default impl ----
@@ -1454,8 +1582,14 @@ mod tests {
     #[test]
     fn audit_type_display() {
         assert_eq!(CredentialAuditType::LeaseIssued.to_string(), "lease_issued");
-        assert_eq!(CredentialAuditType::CredentialRotated.to_string(), "credential_rotated");
-        assert_eq!(CredentialAuditType::AccessDenied.to_string(), "access_denied");
+        assert_eq!(
+            CredentialAuditType::CredentialRotated.to_string(),
+            "credential_rotated"
+        );
+        assert_eq!(
+            CredentialAuditType::AccessDenied.to_string(),
+            "access_denied"
+        );
     }
 
     // ---- Degraded provider still allows leases ----
@@ -1463,7 +1597,9 @@ mod tests {
     #[test]
     fn degraded_provider_allows_leases() {
         let mut broker = setup_broker();
-        broker.update_provider_status("vault-1", ProviderStatus::Degraded, 1500).unwrap();
+        broker
+            .update_provider_status("vault-1", ProviderStatus::Degraded, 1500)
+            .unwrap();
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".into()]);
         let lease = broker.request_lease("conn-1", "cred-1", scope, 2000);
         assert!(lease.is_ok());

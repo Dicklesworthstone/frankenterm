@@ -2607,7 +2607,10 @@ mod tests {
             parse_severity("Critical"),
             Some(crate::patterns::Severity::Critical)
         );
-        assert_eq!(parse_severity("InFo"), Some(crate::patterns::Severity::Info));
+        assert_eq!(
+            parse_severity("InFo"),
+            Some(crate::patterns::Severity::Info)
+        );
         assert_eq!(parse_severity("unknown"), None);
     }
 

@@ -208,7 +208,6 @@ pub mod mcp_error;
 #[cfg(any(feature = "mcp", feature = "mcp-client"))]
 #[doc(hidden)]
 pub mod mcp_framework;
-pub mod ntm_parity;
 pub mod mdl_extraction;
 pub mod memory_budget;
 pub mod memory_pressure;
@@ -224,6 +223,7 @@ pub mod mission_loop;
 pub mod network_observer;
 pub mod network_reliability;
 pub mod notifications;
+pub mod ntm_parity;
 pub mod orphan_reaper;
 #[cfg(any(feature = "web", feature = "sync", feature = "asupersync-runtime"))]
 pub mod outcome;
