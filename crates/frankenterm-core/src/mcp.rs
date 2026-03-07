@@ -47,8 +47,8 @@ use crate::mcp_error::{
 };
 use crate::patterns::{AgentType, PatternEngine};
 use crate::policy::{
-    ActionKind, ActorKind, InjectionResult, PaneCapabilities, PolicyDecision, PolicyEngine,
-    PolicyGatedInjector, PolicyInput, PolicySurface,
+    ActionKind, ActorKind, DecisionContext, InjectionResult, PaneCapabilities, PolicyDecision,
+    PolicyEngine, PolicyGatedInjector, PolicyInput, PolicySurface,
 };
 use crate::query_contract::{
     SearchQueryDefaults, SearchQueryInput, UnifiedSearchMode, parse_unified_search_query,
@@ -490,19 +490,39 @@ fn mcp_audit_decision_context(
     error_code: Option<&str>,
     elapsed_ms: u64,
 ) -> Option<String> {
-    let mut context = serde_json::Map::new();
-    context.insert(
-        "surface".to_string(),
-        serde_json::json!(PolicySurface::Mcp.as_str()),
+    let mut context = DecisionContext {
+        timestamp_ms: i64::try_from(now_ms()).unwrap_or(0),
+        action: ActionKind::ExecCommand,
+        actor: ActorKind::Mcp,
+        surface: PolicySurface::Mcp,
+        pane_id: None,
+        domain: None,
+        capabilities: PaneCapabilities::default(),
+        text_summary: Some(format!("mcp audit for {tool_name}")),
+        workflow_id: None,
+        rules_evaluated: Vec::new(),
+        determining_rule: None,
+        evidence: Vec::new(),
+        rate_limit: None,
+        risk: None,
+    };
+    let determining_rule = format!("audit.{action_kind}");
+    context.record_rule(
+        &determining_rule,
+        true,
+        Some(decision),
+        Some(format!("MCP tool audit recorded with result={result}")),
     );
-    context.insert("actor_kind".to_string(), serde_json::json!("mcp"));
-    context.insert("tool".to_string(), serde_json::json!(tool_name));
-    context.insert("action_kind".to_string(), serde_json::json!(action_kind));
-    context.insert("policy_decision".to_string(), serde_json::json!(decision));
-    context.insert("result".to_string(), serde_json::json!(result));
-    context.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
+    context.set_determining_rule(&determining_rule);
+    context.add_evidence("stage", "mcp_audit");
+    context.add_evidence("tool", tool_name);
+    context.add_evidence("mcp_action_kind", action_kind);
+    context.add_evidence("mcp_surface", PolicySurface::Mcp.as_str());
+    context.add_evidence("policy_decision", decision);
+    context.add_evidence("result", result);
+    context.add_evidence("elapsed_ms", elapsed_ms.to_string());
     if let Some(error_code) = error_code {
-        context.insert("error_code".to_string(), serde_json::json!(error_code));
+        context.add_evidence("error_code", error_code);
     }
     serde_json::to_string(&context).ok()
 }
@@ -1359,6 +1379,14 @@ mod tests {
         })
     }
 
+    fn evidence<'a>(context: &'a DecisionContext, key: &str) -> Option<&'a str> {
+        context
+            .evidence
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.value.as_str())
+    }
+
     #[test]
     fn mcp_audit_decision_context_tracks_surface_and_error_code() {
         let ctx_json = mcp_audit_decision_context(
@@ -1370,17 +1398,26 @@ mod tests {
             77,
         )
         .expect("decision context should serialize");
-        let ctx: serde_json::Value =
+        let ctx: DecisionContext =
             serde_json::from_str(&ctx_json).expect("decision context should parse");
 
-        assert_eq!(ctx["surface"], "mcp");
-        assert_eq!(ctx["actor_kind"], "mcp");
-        assert_eq!(ctx["tool"], "wa.accounts_refresh");
-        assert_eq!(ctx["action_kind"], "mcp.wa.accounts_refresh");
-        assert_eq!(ctx["policy_decision"], "deny");
-        assert_eq!(ctx["result"], "error");
-        assert_eq!(ctx["elapsed_ms"], 77);
-        assert_eq!(ctx["error_code"], "MCP_TIMEOUT");
+        assert_eq!(ctx.action, ActionKind::ExecCommand);
+        assert_eq!(ctx.actor, ActorKind::Mcp);
+        assert_eq!(ctx.surface, PolicySurface::Mcp);
+        assert_eq!(
+            ctx.determining_rule.as_deref(),
+            Some("audit.mcp.wa.accounts_refresh")
+        );
+        assert_eq!(evidence(&ctx, "stage"), Some("mcp_audit"));
+        assert_eq!(evidence(&ctx, "tool"), Some("wa.accounts_refresh"));
+        assert_eq!(
+            evidence(&ctx, "mcp_action_kind"),
+            Some("mcp.wa.accounts_refresh")
+        );
+        assert_eq!(evidence(&ctx, "policy_decision"), Some("deny"));
+        assert_eq!(evidence(&ctx, "result"), Some("error"));
+        assert_eq!(evidence(&ctx, "elapsed_ms"), Some("77"));
+        assert_eq!(evidence(&ctx, "error_code"), Some("MCP_TIMEOUT"));
     }
 
     #[test]
@@ -1405,21 +1442,29 @@ mod tests {
 
         let audit = latest_audit_action(&db_path, "mcp.wa.rules_list");
         assert_eq!(audit.actor_kind, "mcp");
-        let context: serde_json::Value = serde_json::from_str(
+        let context: DecisionContext = serde_json::from_str(
             audit
                 .decision_context
                 .as_deref()
                 .expect("decision context should be recorded"),
         )
         .expect("decision context should parse");
-        assert_eq!(context["surface"], "mcp");
-        assert_eq!(context["actor_kind"], "mcp");
-        assert_eq!(context["tool"], "wa.rules_list");
-        assert_eq!(context["action_kind"], "mcp.wa.rules_list");
-        assert_eq!(context["policy_decision"], "allow");
-        assert_eq!(context["result"], "success");
-        assert_eq!(context["elapsed_ms"], 12);
-        assert!(context.get("error_code").is_none());
+        assert_eq!(context.action, ActionKind::ExecCommand);
+        assert_eq!(context.actor, ActorKind::Mcp);
+        assert_eq!(context.surface, PolicySurface::Mcp);
+        assert_eq!(
+            context.determining_rule.as_deref(),
+            Some("audit.mcp.wa.rules_list")
+        );
+        assert_eq!(evidence(&context, "tool"), Some("wa.rules_list"));
+        assert_eq!(
+            evidence(&context, "mcp_action_kind"),
+            Some("mcp.wa.rules_list")
+        );
+        assert_eq!(evidence(&context, "policy_decision"), Some("allow"));
+        assert_eq!(evidence(&context, "result"), Some("success"));
+        assert_eq!(evidence(&context, "elapsed_ms"), Some("12"));
+        assert!(evidence(&context, "error_code").is_none());
     }
 
     #[test]

@@ -76,9 +76,9 @@ fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyI
 }
 
 fn serialize_mcp_audit_decision_context(
-    context: serde_json::Map<String, serde_json::Value>,
+    context: &crate::policy::DecisionContext,
 ) -> Option<String> {
-    serde_json::to_string(&serde_json::Value::Object(context))
+    serde_json::to_string(context)
         .inspect_err(
             |e| tracing::warn!(error = %e, "mcp audit decision_context serialization failed"),
         )
@@ -91,19 +91,41 @@ fn mcp_event_mutation_decision_context(
     event_id: i64,
     operation: &str,
     actor_id: Option<&str>,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut context = serde_json::Map::new();
-    context.insert(
-        "surface".to_string(),
-        serde_json::json!(PolicySurface::Mcp.as_str()),
+    input_summary: &str,
+    timestamp_ms: i64,
+) -> crate::policy::DecisionContext {
+    let mut context = crate::policy::DecisionContext {
+        timestamp_ms,
+        action: crate::policy::ActionKind::ExecCommand,
+        actor: crate::policy::ActorKind::Mcp,
+        surface: PolicySurface::Mcp,
+        pane_id: None,
+        domain: None,
+        capabilities: crate::policy::PaneCapabilities::default(),
+        text_summary: Some(input_summary.to_string()),
+        workflow_id: None,
+        rules_evaluated: Vec::new(),
+        determining_rule: None,
+        evidence: Vec::new(),
+        rate_limit: None,
+        risk: None,
+    };
+    let determining_rule = format!("audit.{action_kind}");
+    context.record_rule(
+        &determining_rule,
+        true,
+        Some("allow"),
+        Some("MCP event mutation recorded".to_string()),
     );
-    context.insert("actor_kind".to_string(), serde_json::json!("mcp"));
-    context.insert("tool".to_string(), serde_json::json!(tool_name));
-    context.insert("action_kind".to_string(), serde_json::json!(action_kind));
-    context.insert("event_id".to_string(), serde_json::json!(event_id));
-    context.insert("operation".to_string(), serde_json::json!(operation));
+    context.set_determining_rule(&determining_rule);
+    context.add_evidence("stage", "event_mutation");
+    context.add_evidence("tool", tool_name);
+    context.add_evidence("event_action_kind", action_kind);
+    context.add_evidence("event_id", event_id.to_string());
+    context.add_evidence("operation", operation);
+    context.add_evidence("event_surface", PolicySurface::Mcp.as_str());
     if let Some(actor_id) = actor_id {
-        context.insert("actor_id".to_string(), serde_json::json!(actor_id));
+        context.add_evidence("actor_id", actor_id);
     }
     context
 }
@@ -3791,18 +3813,27 @@ impl ToolHandler for WaEventsAnnotateTool {
                 .await?;
 
             let ts = i64::try_from(now_ms()).unwrap_or(0);
-            let decision_context =
-                serialize_mcp_audit_decision_context(mcp_event_mutation_decision_context(
-                    "wa.events_annotate",
-                    "event.annotate",
-                    params.event_id,
-                    if params.clear {
-                        "clear_note"
-                    } else {
-                        "set_note"
-                    },
-                    params.by.as_deref(),
-                ));
+            let input_summary = if params.clear {
+                format!("wa.events_annotate event_id={} clear=true", params.event_id)
+            } else {
+                format!(
+                    "wa.events_annotate event_id={} note=<redacted>",
+                    params.event_id
+                )
+            };
+            let decision_context = mcp_event_mutation_decision_context(
+                "wa.events_annotate",
+                "event.annotate",
+                params.event_id,
+                if params.clear {
+                    "clear_note"
+                } else {
+                    "set_note"
+                },
+                params.by.as_deref(),
+                &input_summary,
+                ts,
+            );
             let audit = crate::storage::AuditActionRecord {
                 id: 0,
                 ts,
@@ -3815,16 +3846,9 @@ impl ToolHandler for WaEventsAnnotateTool {
                 policy_decision: "allow".to_string(),
                 decision_reason: Some("MCP updated event note".to_string()),
                 rule_id: None,
-                input_summary: Some(if params.clear {
-                    format!("wa.events_annotate event_id={} clear=true", params.event_id)
-                } else {
-                    format!(
-                        "wa.events_annotate event_id={} note=<redacted>",
-                        params.event_id
-                    )
-                }),
+                input_summary: Some(input_summary),
                 verification_summary: None,
-                decision_context,
+                decision_context: serialize_mcp_audit_decision_context(&decision_context),
                 result: "success".to_string(),
             };
             let _ = storage.record_audit_action_redacted(audit).await;
@@ -3934,6 +3958,15 @@ impl ToolHandler for WaEventsTriageTool {
                 .await?;
 
             let ts = i64::try_from(now_ms()).unwrap_or(0);
+            let input_summary = if params.clear {
+                format!("wa.events_triage event_id={} clear=true", params.event_id)
+            } else {
+                format!(
+                    "wa.events_triage event_id={} state={}",
+                    params.event_id,
+                    params.state.clone().unwrap_or_default()
+                )
+            };
             let mut decision_context = mcp_event_mutation_decision_context(
                 "wa.events_triage",
                 "event.triage",
@@ -3944,11 +3977,13 @@ impl ToolHandler for WaEventsTriageTool {
                     "set_triage_state"
                 },
                 params.by.as_deref(),
+                &input_summary,
+                ts,
             );
             if let Some(state) = params.state.as_ref() {
-                decision_context.insert("state".to_string(), serde_json::json!(state));
+                decision_context.add_evidence("state", state);
             }
-            decision_context.insert("changed".to_string(), serde_json::json!(changed));
+            decision_context.add_evidence("changed", changed.to_string());
             let audit = crate::storage::AuditActionRecord {
                 id: 0,
                 ts,
@@ -3961,17 +3996,9 @@ impl ToolHandler for WaEventsTriageTool {
                 policy_decision: "allow".to_string(),
                 decision_reason: Some("MCP updated event triage".to_string()),
                 rule_id: None,
-                input_summary: Some(if params.clear {
-                    format!("wa.events_triage event_id={} clear=true", params.event_id)
-                } else {
-                    format!(
-                        "wa.events_triage event_id={} state={}",
-                        params.event_id,
-                        params.state.clone().unwrap_or_default()
-                    )
-                }),
+                input_summary: Some(input_summary),
                 verification_summary: None,
-                decision_context: serialize_mcp_audit_decision_context(decision_context),
+                decision_context: serialize_mcp_audit_decision_context(&decision_context),
                 result: if changed {
                     "success".to_string()
                 } else {
@@ -4096,6 +4123,8 @@ impl ToolHandler for WaEventsLabelTool {
                 let inserted = storage
                     .add_event_label(params.event_id, label.clone(), params.by.clone())
                     .await?;
+                let input_summary =
+                    format!("wa.events_label event_id={} add={label}", params.event_id);
 
                 let mut decision_context = mcp_event_mutation_decision_context(
                     "wa.events_label",
@@ -4103,9 +4132,11 @@ impl ToolHandler for WaEventsLabelTool {
                     params.event_id,
                     "add_label",
                     params.by.as_deref(),
+                    &input_summary,
+                    ts,
                 );
-                decision_context.insert("label".to_string(), serde_json::json!(label));
-                decision_context.insert("changed".to_string(), serde_json::json!(inserted));
+                decision_context.add_evidence("label", &label);
+                decision_context.add_evidence("changed", inserted.to_string());
                 let audit = crate::storage::AuditActionRecord {
                     id: 0,
                     ts,
@@ -4118,12 +4149,9 @@ impl ToolHandler for WaEventsLabelTool {
                     policy_decision: "allow".to_string(),
                     decision_reason: Some("MCP added event label".to_string()),
                     rule_id: None,
-                    input_summary: Some(format!(
-                        "wa.events_label event_id={} add={label}",
-                        params.event_id
-                    )),
+                    input_summary: Some(input_summary),
                     verification_summary: None,
-                    decision_context: serialize_mcp_audit_decision_context(decision_context),
+                    decision_context: serialize_mcp_audit_decision_context(&decision_context),
                     result: if inserted {
                         "success".to_string()
                     } else {
@@ -4137,6 +4165,10 @@ impl ToolHandler for WaEventsLabelTool {
                 let removed = storage
                     .remove_event_label(params.event_id, label.clone())
                     .await?;
+                let input_summary = format!(
+                    "wa.events_label event_id={} remove={label}",
+                    params.event_id
+                );
 
                 let mut decision_context = mcp_event_mutation_decision_context(
                     "wa.events_label",
@@ -4144,9 +4176,11 @@ impl ToolHandler for WaEventsLabelTool {
                     params.event_id,
                     "remove_label",
                     params.by.as_deref(),
+                    &input_summary,
+                    ts,
                 );
-                decision_context.insert("label".to_string(), serde_json::json!(label));
-                decision_context.insert("changed".to_string(), serde_json::json!(removed));
+                decision_context.add_evidence("label", &label);
+                decision_context.add_evidence("changed", removed.to_string());
                 let audit = crate::storage::AuditActionRecord {
                     id: 0,
                     ts,
@@ -4159,12 +4193,9 @@ impl ToolHandler for WaEventsLabelTool {
                     policy_decision: "allow".to_string(),
                     decision_reason: Some("MCP removed event label".to_string()),
                     rule_id: None,
-                    input_summary: Some(format!(
-                        "wa.events_label event_id={} remove={label}",
-                        params.event_id
-                    )),
+                    input_summary: Some(input_summary),
                     verification_summary: None,
-                    decision_context: serialize_mcp_audit_decision_context(decision_context),
+                    decision_context: serialize_mcp_audit_decision_context(&decision_context),
                     result: if removed {
                         "success".to_string()
                     } else {
@@ -4281,9 +4312,20 @@ mod tests {
         })
     }
 
-    fn parse_audit_decision_context(db_path: &Path, action_kind: &str) -> serde_json::Value {
+    fn parse_audit_decision_context(
+        db_path: &Path,
+        action_kind: &str,
+    ) -> crate::policy::DecisionContext {
         let audit = latest_audit_action(db_path, action_kind);
         serde_json::from_str(audit.decision_context.as_deref().unwrap()).unwrap()
+    }
+
+    fn evidence<'a>(context: &'a crate::policy::DecisionContext, key: &str) -> Option<&'a str> {
+        context
+            .evidence
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.value.as_str())
     }
 
     /// Collect definitions for all 29 tools. Guarantees no panics during construction.
@@ -4437,13 +4479,25 @@ mod tests {
         let audit = latest_audit_action(db_path.as_ref().as_path(), "event.annotate");
         assert_eq!(audit.actor_kind, "mcp");
         let context = parse_audit_decision_context(db_path.as_ref().as_path(), "event.annotate");
-        assert_eq!(context["surface"], "mcp");
-        assert_eq!(context["actor_kind"], "mcp");
-        assert_eq!(context["tool"], "wa.events_annotate");
-        assert_eq!(context["action_kind"], "event.annotate");
-        assert_eq!(context["event_id"], event_id);
-        assert_eq!(context["operation"], "set_note");
-        assert_eq!(context["actor_id"], "mcp-client");
+        let expected_event_id = event_id.to_string();
+        assert_eq!(context.action, ActionKind::ExecCommand);
+        assert_eq!(context.actor, ActorKind::Mcp);
+        assert_eq!(context.surface, PolicySurface::Mcp);
+        assert_eq!(
+            context.determining_rule.as_deref(),
+            Some("audit.event.annotate")
+        );
+        assert_eq!(evidence(&context, "tool"), Some("wa.events_annotate"));
+        assert_eq!(
+            evidence(&context, "event_action_kind"),
+            Some("event.annotate")
+        );
+        assert_eq!(
+            evidence(&context, "event_id"),
+            Some(expected_event_id.as_str())
+        );
+        assert_eq!(evidence(&context, "operation"), Some("set_note"));
+        assert_eq!(evidence(&context, "actor_id"), Some("mcp-client"));
     }
 
     #[test]
@@ -4465,13 +4519,26 @@ mod tests {
         let audit = latest_audit_action(db_path.as_ref().as_path(), "event.triage");
         assert_eq!(audit.actor_kind, "mcp");
         let context = parse_audit_decision_context(db_path.as_ref().as_path(), "event.triage");
-        assert_eq!(context["surface"], "mcp");
-        assert_eq!(context["tool"], "wa.events_triage");
-        assert_eq!(context["action_kind"], "event.triage");
-        assert_eq!(context["event_id"], event_id);
-        assert_eq!(context["operation"], "set_triage_state");
-        assert_eq!(context["state"], "investigating");
-        assert_eq!(context["changed"], true);
+        let expected_event_id = event_id.to_string();
+        assert_eq!(context.action, ActionKind::ExecCommand);
+        assert_eq!(context.actor, ActorKind::Mcp);
+        assert_eq!(context.surface, PolicySurface::Mcp);
+        assert_eq!(
+            context.determining_rule.as_deref(),
+            Some("audit.event.triage")
+        );
+        assert_eq!(evidence(&context, "tool"), Some("wa.events_triage"));
+        assert_eq!(
+            evidence(&context, "event_action_kind"),
+            Some("event.triage")
+        );
+        assert_eq!(
+            evidence(&context, "event_id"),
+            Some(expected_event_id.as_str())
+        );
+        assert_eq!(evidence(&context, "operation"), Some("set_triage_state"));
+        assert_eq!(evidence(&context, "state"), Some("investigating"));
+        assert_eq!(evidence(&context, "changed"), Some("true"));
     }
 
     #[test]
@@ -4493,14 +4560,27 @@ mod tests {
         assert_eq!(add_audit.actor_kind, "mcp");
         let add_context =
             parse_audit_decision_context(db_path.as_ref().as_path(), "event.label.add");
-        assert_eq!(add_context["surface"], "mcp");
-        assert_eq!(add_context["tool"], "wa.events_label");
-        assert_eq!(add_context["action_kind"], "event.label.add");
-        assert_eq!(add_context["event_id"], event_id);
-        assert_eq!(add_context["operation"], "add_label");
-        assert_eq!(add_context["label"], "urgent");
-        assert_eq!(add_context["changed"], true);
-        assert_eq!(add_context["actor_id"], "mcp-client");
+        let expected_event_id = event_id.to_string();
+        assert_eq!(add_context.action, ActionKind::ExecCommand);
+        assert_eq!(add_context.actor, ActorKind::Mcp);
+        assert_eq!(add_context.surface, PolicySurface::Mcp);
+        assert_eq!(
+            add_context.determining_rule.as_deref(),
+            Some("audit.event.label.add")
+        );
+        assert_eq!(evidence(&add_context, "tool"), Some("wa.events_label"));
+        assert_eq!(
+            evidence(&add_context, "event_action_kind"),
+            Some("event.label.add")
+        );
+        assert_eq!(
+            evidence(&add_context, "event_id"),
+            Some(expected_event_id.as_str())
+        );
+        assert_eq!(evidence(&add_context, "operation"), Some("add_label"));
+        assert_eq!(evidence(&add_context, "label"), Some("urgent"));
+        assert_eq!(evidence(&add_context, "changed"), Some("true"));
+        assert_eq!(evidence(&add_context, "actor_id"), Some("mcp-client"));
 
         tool.call(
             &test_mcp_context(),
@@ -4514,14 +4594,27 @@ mod tests {
         assert_eq!(remove_audit.actor_kind, "mcp");
         let remove_context =
             parse_audit_decision_context(db_path.as_ref().as_path(), "event.label.remove");
-        assert_eq!(remove_context["surface"], "mcp");
-        assert_eq!(remove_context["tool"], "wa.events_label");
-        assert_eq!(remove_context["action_kind"], "event.label.remove");
-        assert_eq!(remove_context["event_id"], event_id);
-        assert_eq!(remove_context["operation"], "remove_label");
-        assert_eq!(remove_context["label"], "urgent");
-        assert_eq!(remove_context["changed"], true);
-        assert!(remove_context.get("actor_id").is_none());
+        let expected_event_id = event_id.to_string();
+        assert_eq!(remove_context.action, ActionKind::ExecCommand);
+        assert_eq!(remove_context.actor, ActorKind::Mcp);
+        assert_eq!(remove_context.surface, PolicySurface::Mcp);
+        assert_eq!(
+            remove_context.determining_rule.as_deref(),
+            Some("audit.event.label.remove")
+        );
+        assert_eq!(evidence(&remove_context, "tool"), Some("wa.events_label"));
+        assert_eq!(
+            evidence(&remove_context, "event_action_kind"),
+            Some("event.label.remove")
+        );
+        assert_eq!(
+            evidence(&remove_context, "event_id"),
+            Some(expected_event_id.as_str())
+        );
+        assert_eq!(evidence(&remove_context, "operation"), Some("remove_label"));
+        assert_eq!(evidence(&remove_context, "label"), Some("urgent"));
+        assert_eq!(evidence(&remove_context, "changed"), Some("true"));
+        assert!(evidence(&remove_context, "actor_id").is_none());
     }
 
     // ========================================================================

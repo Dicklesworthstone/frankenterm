@@ -2247,7 +2247,7 @@ fn config_rule_trace_reason(
         format!("rule matched but '{winner}' won tie-breaking")
     };
 
-    self.message
+    rule.message
         .as_ref()
         .map_or_else(|| prefix.clone(), |message| format!("{prefix}: {message}"))
 }
