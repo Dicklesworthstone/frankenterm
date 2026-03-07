@@ -128,7 +128,9 @@ proptest! {
         prop_assert!(ep.e_value() <= max_e, "E-value {} exceeded clamp {}", ep.e_value(), max_e);
     }
 
-    // EP-6: Normal entropy decays e-value
+    // EP-6: Normal entropy keeps e-value at 1.0 (null hypothesis)
+    // The e-process decays *toward* 1.0 on non-collapse observations,
+    // so starting from 1.0, consecutive non-collapses keep it at 1.0.
     #[test]
     fn normal_entropy_decays(
         decay in 0.5..=0.98_f64,
@@ -138,10 +140,10 @@ proptest! {
         for _ in 0..n {
             ep.update(5.0, false, 5.0, 1.0, 0.5, 0.3, 3);
         }
-        // After n non-collapse observations, e-value should be 1.0 * decay^n
-        let expected = decay.powi(n as i32);
-        let diff = (ep.e_value() - expected).abs();
-        prop_assert!(diff < 1e-6, "Expected ~{}, got {}", expected, ep.e_value());
+        // Starting from e_value=1.0 with non-collapse updates, value stays at 1.0
+        // because decay only pulls away-from-1.0 values back toward 1.0
+        prop_assert!((ep.e_value() - 1.0).abs() < 1e-10,
+            "E-value should remain 1.0 after non-collapse from baseline, got {}", ep.e_value());
     }
 
     // EP-7: Streak gate prevents premature accumulation
