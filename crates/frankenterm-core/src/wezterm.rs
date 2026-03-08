@@ -1429,7 +1429,7 @@ impl WeztermInterface for WeztermClient {
         pane_id: u64,
         direction: MoveDirection,
     ) -> WeztermFuture<'_, Option<u64>> {
-        Box::pin(async move { WeztermClient::get_pane_direction(self, pane_id, direction).await })
+        Box::pin(async move { Box::pin(WeztermClient::get_pane_direction(self, pane_id, direction)).await })
     }
 
     fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
@@ -1589,7 +1589,7 @@ impl PaneTextSource for WeztermClient {
     type Fut<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 
     fn get_text(&self, pane_id: u64, escapes: bool) -> Self::Fut<'_> {
-        Box::pin(async move { self.get_text(pane_id, escapes).await })
+        Box::pin(async move { Box::pin(self.get_text(pane_id, escapes)).await })
     }
 }
 

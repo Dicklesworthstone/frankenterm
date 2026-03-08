@@ -15,6 +15,10 @@
 //! - The underlying `Pool<C>` provides semaphore-based concurrency limiting
 //!   and idle timeout eviction.
 
+// Vendored mux pool: large futures are inherent to the mux protocol's
+// deeply-nested async call chains and not worth Box::pin-wrapping individually.
+#![allow(clippy::large_futures)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};

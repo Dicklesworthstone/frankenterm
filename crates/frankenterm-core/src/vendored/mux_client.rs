@@ -1,3 +1,7 @@
+// Vendored mux client: large futures are inherent to the mux protocol's
+// deeply-nested async call chains.
+#![allow(clippy::large_futures)]
+
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

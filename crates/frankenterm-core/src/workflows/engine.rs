@@ -414,7 +414,7 @@ pub(super) fn step_error_code_from_result(step_result: &StepResult) -> Option<St
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum WorkflowStepPolicyDecision {
+pub enum WorkflowStepPolicyDecision {
     Allow,
     Deny,
     RequireApproval,
@@ -429,7 +429,7 @@ impl WorkflowStepPolicyDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WorkflowStepPolicySummary {
+pub struct WorkflowStepPolicySummary {
     pub decision: WorkflowStepPolicyDecision,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<crate::policy::ActionKind>,
@@ -522,7 +522,7 @@ impl WorkflowStepPolicySummary {
 }
 
 #[must_use]
-pub(crate) fn policy_summary_decision_is_allow(summary: &str) -> Option<bool> {
+pub fn policy_summary_decision_is_allow(summary: &str) -> Option<bool> {
     WorkflowStepPolicySummary::parse(summary)
         .map(|parsed| parsed.is_allowed())
         .or_else(|| {
