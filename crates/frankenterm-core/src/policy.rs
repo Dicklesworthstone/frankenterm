@@ -1367,6 +1367,37 @@ impl DecisionContext {
 
         ctx
     }
+
+    /// Build the standard audit-trace context shape for non-policy-originated
+    /// audit records that still need structured policy metadata.
+    #[must_use]
+    pub fn new_audit(
+        timestamp_ms: i64,
+        action: ActionKind,
+        actor: ActorKind,
+        surface: PolicySurface,
+        pane_id: Option<u64>,
+        domain: Option<String>,
+        text_summary: Option<String>,
+        workflow_id: Option<String>,
+    ) -> Self {
+        Self {
+            timestamp_ms,
+            action,
+            actor,
+            surface,
+            pane_id,
+            domain,
+            capabilities: PaneCapabilities::default(),
+            text_summary,
+            workflow_id,
+            rules_evaluated: Vec::new(),
+            determining_rule: None,
+            evidence: Vec::new(),
+            rate_limit: None,
+            risk: None,
+        }
+    }
 }
 
 /// Parse a serialized decision context emitted in audit records.
@@ -7442,6 +7473,34 @@ mod tests {
         );
         assert_eq!(parse_serialized_decision_surface(Some("{not json")), None);
         assert_eq!(parse_serialized_decision_surface(None), None);
+    }
+
+    #[test]
+    fn decision_context_new_audit_uses_standard_defaults() {
+        let context = DecisionContext::new_audit(
+            123,
+            ActionKind::ExecCommand,
+            ActorKind::Mcp,
+            PolicySurface::Mcp,
+            Some(7),
+            Some("remote".to_string()),
+            Some("summary".to_string()),
+            Some("wf-9".to_string()),
+        );
+
+        assert_eq!(context.timestamp_ms, 123);
+        assert_eq!(context.action, ActionKind::ExecCommand);
+        assert_eq!(context.actor, ActorKind::Mcp);
+        assert_eq!(context.surface, PolicySurface::Mcp);
+        assert_eq!(context.pane_id, Some(7));
+        assert_eq!(context.domain.as_deref(), Some("remote"));
+        assert_eq!(context.text_summary.as_deref(), Some("summary"));
+        assert_eq!(context.workflow_id.as_deref(), Some("wf-9"));
+        assert_eq!(context.capabilities, PaneCapabilities::default());
+        assert!(context.rules_evaluated.is_empty());
+        assert!(context.evidence.is_empty());
+        assert!(context.rate_limit.is_none());
+        assert!(context.risk.is_none());
     }
 
     // =========================================================================

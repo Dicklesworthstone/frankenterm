@@ -490,22 +490,16 @@ fn mcp_audit_decision_context(
     error_code: Option<&str>,
     elapsed_ms: u64,
 ) -> Option<String> {
-    let mut context = DecisionContext {
-        timestamp_ms: i64::try_from(now_ms()).unwrap_or(0),
-        action: ActionKind::ExecCommand,
-        actor: ActorKind::Mcp,
-        surface: PolicySurface::Mcp,
-        pane_id: None,
-        domain: None,
-        capabilities: PaneCapabilities::default(),
-        text_summary: Some(format!("mcp audit for {tool_name}")),
-        workflow_id: None,
-        rules_evaluated: Vec::new(),
-        determining_rule: None,
-        evidence: Vec::new(),
-        rate_limit: None,
-        risk: None,
-    };
+    let mut context = DecisionContext::new_audit(
+        i64::try_from(now_ms()).unwrap_or(0),
+        ActionKind::ExecCommand,
+        ActorKind::Mcp,
+        PolicySurface::Mcp,
+        None,
+        None,
+        Some(format!("mcp audit for {tool_name}")),
+        None,
+    );
     let determining_rule = format!("audit.{action_kind}");
     context.record_rule(
         &determining_rule,

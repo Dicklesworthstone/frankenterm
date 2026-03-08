@@ -94,22 +94,16 @@ fn mcp_event_mutation_decision_context(
     input_summary: &str,
     timestamp_ms: i64,
 ) -> crate::policy::DecisionContext {
-    let mut context = crate::policy::DecisionContext {
+    let mut context = crate::policy::DecisionContext::new_audit(
         timestamp_ms,
-        action: crate::policy::ActionKind::ExecCommand,
-        actor: crate::policy::ActorKind::Mcp,
-        surface: PolicySurface::Mcp,
-        pane_id: None,
-        domain: None,
-        capabilities: crate::policy::PaneCapabilities::default(),
-        text_summary: Some(input_summary.to_string()),
-        workflow_id: None,
-        rules_evaluated: Vec::new(),
-        determining_rule: None,
-        evidence: Vec::new(),
-        rate_limit: None,
-        risk: None,
-    };
+        crate::policy::ActionKind::ExecCommand,
+        crate::policy::ActorKind::Mcp,
+        PolicySurface::Mcp,
+        None,
+        None,
+        Some(input_summary.to_string()),
+        None,
+    );
     let determining_rule = format!("audit.{action_kind}");
     context.record_rule(
         &determining_rule,
@@ -2294,7 +2288,7 @@ impl ToolHandler for WaTxRunTool {
             if commit.failed_count > 0 && commit.committed_count > 0 {
                 let mut compensating_contract = prepared_contract.clone();
                 compensating_contract.lifecycle_state = crate::plan::MissionTxState::Compensating;
-                compensating_contract.receipts = commit.receipts.clone();
+                compensating_contract.receipts.clone_from(&commit.receipts);
                 let comp_inputs = mcp_build_tx_compensation_inputs(&commit, None, now_ms);
                 let compensation = match crate::plan::execute_compensation_phase(
                     &compensating_contract,
@@ -2434,7 +2428,9 @@ impl ToolHandler for WaTxRollbackTool {
         );
         let mut compensating_contract = contract.clone();
         compensating_contract.lifecycle_state = crate::plan::MissionTxState::Compensating;
-        compensating_contract.receipts = contract.receipts.clone();
+        compensating_contract
+            .receipts
+            .clone_from(&contract.receipts);
         let compensation_report = match crate::plan::execute_compensation_phase(
             &compensating_contract,
             &commit_report,

@@ -636,22 +636,16 @@ fn build_workflow_audit_decision_context(
     decision_reason: Option<&str>,
     timestamp_ms: i64,
 ) -> Option<String> {
-    let mut context = crate::policy::DecisionContext {
+    let mut context = crate::policy::DecisionContext::new_audit(
         timestamp_ms,
-        action: crate::policy::ActionKind::WorkflowRun,
-        actor: crate::policy::ActorKind::Workflow,
-        surface: crate::policy::PolicySurface::Workflow,
-        pane_id: Some(pane_id),
-        domain: None,
-        capabilities: crate::policy::PaneCapabilities::default(),
-        text_summary: input_summary.map(str::to_string),
-        workflow_id: Some(execution_id.to_string()),
-        rules_evaluated: Vec::new(),
-        determining_rule: None,
-        evidence: Vec::new(),
-        rate_limit: None,
-        risk: None,
-    };
+        crate::policy::ActionKind::WorkflowRun,
+        crate::policy::ActorKind::Workflow,
+        crate::policy::PolicySurface::Workflow,
+        Some(pane_id),
+        None,
+        input_summary.map(str::to_string),
+        Some(execution_id.to_string()),
+    );
     let determining_rule = format!("audit.{action_kind}");
     context.record_rule(
         &determining_rule,
