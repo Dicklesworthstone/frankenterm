@@ -841,4 +841,290 @@ mod tests {
             assert!(idx < 500, "index {idx} out of range");
         }
     }
+
+    mod proptest_bloom_filter {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_item() -> impl Strategy<Value = Vec<u8>> {
+            proptest::collection::vec(any::<u8>(), 1..=32)
+        }
+
+        fn arb_items(max_len: usize) -> impl Strategy<Value = Vec<Vec<u8>>> {
+            proptest::collection::vec(arb_item(), 1..=max_len)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(200))]
+
+            #[test]
+            fn no_false_negatives(items in arb_items(50)) {
+                let mut bf = BloomFilter::with_capacity(items.len().max(1) * 2, 0.01);
+                for item in &items {
+                    bf.insert(item);
+                }
+                for item in &items {
+                    prop_assert!(bf.contains(item), "false negative detected");
+                }
+            }
+
+            #[test]
+            fn count_tracks_inserts(items in arb_items(40)) {
+                let mut bf = BloomFilter::with_capacity(100, 0.01);
+                for (i, item) in items.iter().enumerate() {
+                    bf.insert(item);
+                    let expected = i + 1;
+                    prop_assert_eq!(bf.count(), expected);
+                }
+            }
+
+            #[test]
+            fn clear_resets_all(items in arb_items(30)) {
+                let mut bf = BloomFilter::with_capacity(100, 0.01);
+                for item in &items {
+                    bf.insert(item);
+                }
+                bf.clear();
+                prop_assert_eq!(bf.count(), 0);
+                // After clear, filter should report nothing (no false negatives possible
+                // because nothing was inserted)
+                for item in &items {
+                    prop_assert!(!bf.contains(item));
+                }
+            }
+
+            #[test]
+            fn hash_indices_all_in_range(data in arb_item(), k in 1u32..=20, m in 1usize..=10000) {
+                let indices = hash_indices(&data, k, m);
+                prop_assert_eq!(indices.len(), k as usize);
+                for idx in &indices {
+                    prop_assert!(*idx < m);
+                }
+            }
+
+            #[test]
+            fn hash_indices_deterministic(data in arb_item(), k in 1u32..=15, m in 1usize..=5000) {
+                let i1 = hash_indices(&data, k, m);
+                let i2 = hash_indices(&data, k, m);
+                prop_assert_eq!(i1, i2);
+            }
+
+            #[test]
+            fn estimated_fp_rate_bounded(items in arb_items(30)) {
+                let mut bf = BloomFilter::with_capacity(100, 0.01);
+                for item in &items {
+                    bf.insert(item);
+                }
+                let rate = bf.estimated_fp_rate();
+                prop_assert!(rate >= 0.0);
+                prop_assert!(rate <= 1.0);
+            }
+
+            #[test]
+            fn stats_fill_ratio_bounded(items in arb_items(30)) {
+                let mut bf = BloomFilter::with_capacity(100, 0.01);
+                for item in &items {
+                    bf.insert(item);
+                }
+                let s = bf.stats();
+                prop_assert!(s.fill_ratio >= 0.0);
+                prop_assert!(s.fill_ratio <= 1.0);
+                prop_assert!(s.estimated_fp_rate >= 0.0);
+                prop_assert!(s.estimated_fp_rate <= 1.0);
+                prop_assert_eq!(s.count, items.len());
+            }
+
+            #[test]
+            fn union_preserves_all_elements(
+                items_a in arb_items(20),
+                items_b in arb_items(20)
+            ) {
+                let cap = (items_a.len() + items_b.len()).max(1) * 2;
+                let mut a = BloomFilter::with_capacity(cap, 0.01);
+                let mut b = BloomFilter::with_capacity(cap, 0.01);
+
+                // Both filters need same params, so create with same capacity
+                // Actually with_capacity is deterministic given same args
+                let params_match = a.num_bits() == b.num_bits() && a.num_hashes() == b.num_hashes();
+                prop_assert!(params_match);
+
+                for item in &items_a {
+                    a.insert(item);
+                }
+                for item in &items_b {
+                    b.insert(item);
+                }
+                a.union(&b);
+
+                // All items from both sets must be found (no false negatives)
+                for item in &items_a {
+                    prop_assert!(a.contains(item), "lost item from set A after union");
+                }
+                for item in &items_b {
+                    prop_assert!(a.contains(item), "lost item from set B after union");
+                }
+            }
+
+            #[test]
+            fn serde_roundtrip_preserves_membership(items in arb_items(20)) {
+                let mut bf = BloomFilter::with_capacity(100, 0.01);
+                for item in &items {
+                    bf.insert(item);
+                }
+                let json = serde_json::to_string(&bf).unwrap();
+                let restored: BloomFilter = serde_json::from_str(&json).unwrap();
+                // No false negatives after roundtrip
+                for item in &items {
+                    prop_assert!(restored.contains(item), "false negative after serde roundtrip");
+                }
+                prop_assert_eq!(restored.count(), bf.count());
+                prop_assert_eq!(restored.num_bits(), bf.num_bits());
+                prop_assert_eq!(restored.num_hashes(), bf.num_hashes());
+            }
+
+            // ---- CountingBloomFilter properties ----
+
+            #[test]
+            fn counting_no_false_negatives(items in arb_items(30)) {
+                let mut cbf = CountingBloomFilter::with_capacity(items.len().max(1) * 2, 0.01);
+                for item in &items {
+                    cbf.insert(item);
+                }
+                for item in &items {
+                    prop_assert!(cbf.contains(item), "counting: false negative detected");
+                }
+            }
+
+            #[test]
+            fn counting_insert_remove_roundtrip(items in arb_items(20)) {
+                let mut cbf = CountingBloomFilter::with_capacity(items.len().max(1) * 2, 0.001);
+                // Insert all
+                for item in &items {
+                    cbf.insert(item);
+                }
+                // Remove all
+                for item in &items {
+                    cbf.remove(item);
+                }
+                // If items are unique, all should be absent
+                // (but duplicates may leave residual counts, so just check count)
+                prop_assert_eq!(cbf.count(), 0);
+            }
+
+            #[test]
+            fn counting_remove_preserves_others(
+                keep in arb_items(10),
+                remove in arb_items(10)
+            ) {
+                let total = keep.len() + remove.len();
+                let mut cbf = CountingBloomFilter::with_capacity(total.max(1) * 3, 0.001);
+
+                for item in &keep {
+                    cbf.insert(item);
+                }
+                for item in &remove {
+                    cbf.insert(item);
+                }
+                for item in &remove {
+                    cbf.remove(item);
+                }
+                // Items we kept should still be found
+                for item in &keep {
+                    prop_assert!(cbf.contains(item), "kept item missing after removing others");
+                }
+            }
+
+            #[test]
+            fn counting_multi_insert_needs_multi_remove(
+                item in arb_item(),
+                n in 2u8..=5
+            ) {
+                // Use few hash functions + many buckets to avoid collisions
+                // and keep counters below saturation (15).
+                // k=2, m=50000 means P(collision) ≈ 2/50000 and max counter = 2*5 = 10 < 15.
+                let mut cbf = CountingBloomFilter::with_capacity(5000, 0.01);
+                let k = cbf.num_hashes();
+                let m = cbf.num_buckets();
+                for _ in 0..n {
+                    cbf.insert(&item);
+                }
+                // Check if any bucket would have saturated (collision_count * n >= 15)
+                let indices = hash_indices(&item, k, m);
+                let max_collision = {
+                    let mut counts = std::collections::HashMap::new();
+                    for &idx in &indices {
+                        *counts.entry(idx).or_insert(0u32) += 1;
+                    }
+                    counts.values().copied().max().unwrap_or(1)
+                };
+                let would_saturate = max_collision as u16 * n as u16 >= 15;
+
+                // Remove n-1 times
+                for _ in 0..(n - 1) {
+                    cbf.remove(&item);
+                }
+                // Only assert partial removal preserves item if no saturation risk
+                if !would_saturate {
+                    prop_assert!(cbf.contains(&item), "item gone after only partial removal");
+                }
+                // Remove one more, should be gone (assuming no saturation)
+                cbf.remove(&item);
+                if !would_saturate {
+                    prop_assert!(!cbf.contains(&item), "item still present after full removal");
+                }
+            }
+
+            #[test]
+            fn counting_clear_resets_all(items in arb_items(20)) {
+                let mut cbf = CountingBloomFilter::with_capacity(100, 0.01);
+                for item in &items {
+                    cbf.insert(item);
+                }
+                cbf.clear();
+                prop_assert_eq!(cbf.count(), 0);
+                for item in &items {
+                    prop_assert!(!cbf.contains(item));
+                }
+            }
+
+            #[test]
+            fn counting_serde_roundtrip(items in arb_items(15)) {
+                let mut cbf = CountingBloomFilter::with_capacity(100, 0.01);
+                for item in &items {
+                    cbf.insert(item);
+                }
+                let json = serde_json::to_string(&cbf).unwrap();
+                let restored: CountingBloomFilter = serde_json::from_str(&json).unwrap();
+                for item in &items {
+                    prop_assert!(restored.contains(item), "counting: false negative after serde");
+                }
+                prop_assert_eq!(restored.count(), cbf.count());
+            }
+
+            #[test]
+            fn counting_counter_never_overflows(n in 1u32..=30) {
+                let mut cbf = CountingBloomFilter::with_capacity(10, 0.01);
+                let item = b"overflow-test";
+                for _ in 0..n {
+                    cbf.insert(item);
+                }
+                // Should still contain the item (counters saturate, not overflow)
+                prop_assert!(cbf.contains(item));
+                // Counter should be at most 15 (4-bit saturation)
+                let indices = hash_indices(item, cbf.num_hashes(), cbf.num_buckets());
+                for idx in indices {
+                    let val = cbf.get_counter(idx);
+                    prop_assert!(val <= 15, "counter {} exceeded 4-bit max", val);
+                }
+            }
+
+            #[test]
+            fn optimal_sizing_positive(cap in 1usize..=10000, fp in 0.001f64..0.5) {
+                let bits = optimal_num_bits(cap, fp);
+                let hashes = optimal_num_hashes(bits, cap);
+                prop_assert!(bits > 0);
+                prop_assert!(hashes >= 1);
+            }
+        }
+    }
 }

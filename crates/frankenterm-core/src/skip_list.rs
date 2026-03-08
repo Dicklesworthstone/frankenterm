@@ -1133,4 +1133,316 @@ mod tests {
         }
         assert_eq!(list.current_level(), 0);
     }
+
+    mod proptest_skip_list {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_entries(max_len: usize) -> impl Strategy<Value = Vec<(i32, i64)>> {
+            proptest::collection::vec((-500i32..500, -1000i64..1000), 0..=max_len)
+        }
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Insert(i32, i64),
+            Get(i32),
+            Remove(i32),
+            Min,
+            Max,
+        }
+
+        fn arb_op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                ((-200i32..200), (-500i64..500)).prop_map(|(k, v)| Op::Insert(k, v)),
+                (-200i32..200).prop_map(Op::Get),
+                (-200i32..200).prop_map(Op::Remove),
+                Just(Op::Min),
+                Just(Op::Max),
+            ]
+        }
+
+        fn arb_ops(max_len: usize) -> impl Strategy<Value = Vec<Op>> {
+            proptest::collection::vec(arb_op(), 0..=max_len)
+        }
+
+        /// Assert that the skip list iteration is sorted.
+        fn assert_sorted(list: &SkipList<i32, i64>) {
+            let keys: Vec<i32> = list.iter().map(|(k, _)| *k).collect();
+            for w in keys.windows(2) {
+                assert!(w[0] < w[1], "not sorted: {} >= {}", w[0], w[1]);
+            }
+        }
+
+        /// Assert structural invariants.
+        fn assert_invariants(list: &SkipList<i32, i64>) {
+            // iter count == len
+            assert_eq!(list.iter().count(), list.len());
+            // sorted
+            assert_sorted(list);
+            // empty ↔ len == 0
+            assert_eq!(list.is_empty(), list.len() == 0);
+            // min/max consistency
+            if list.is_empty() {
+                assert!(list.min().is_none());
+                assert!(list.max().is_none());
+            } else {
+                let min = list.min().unwrap();
+                let max = list.max().unwrap();
+                assert!(min.0 <= max.0);
+                // min is first in iter, max is last
+                let first = list.iter().next().unwrap();
+                assert_eq!(min.0, first.0);
+                let last_key = list.iter().map(|(k, _)| *k).last().unwrap();
+                assert_eq!(*max.0, last_key);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(200))]
+
+            #[test]
+            fn iteration_always_sorted(
+                seed in any::<u64>(),
+                entries in arb_entries(60)
+            ) {
+                let mut list = SkipList::new(seed);
+                for (k, v) in &entries {
+                    list.insert(*k, *v);
+                }
+                assert_sorted(&list);
+            }
+
+            #[test]
+            fn len_equals_unique_keys(
+                seed in any::<u64>(),
+                entries in arb_entries(60)
+            ) {
+                let mut list = SkipList::new(seed);
+                let mut unique = std::collections::BTreeSet::new();
+                for (k, v) in &entries {
+                    list.insert(*k, *v);
+                    unique.insert(*k);
+                }
+                prop_assert_eq!(list.len(), unique.len());
+            }
+
+            #[test]
+            fn get_returns_latest_value(
+                seed in any::<u64>(),
+                entries in arb_entries(40),
+                query in -500i32..500
+            ) {
+                let mut list = SkipList::new(seed);
+                let mut expected = None;
+                for (k, v) in &entries {
+                    list.insert(*k, *v);
+                    if *k == query {
+                        expected = Some(*v);
+                    }
+                }
+                match expected {
+                    Some(val) => prop_assert_eq!(list.get(&query), Some(&val)),
+                    None => prop_assert!(list.get(&query).is_none()),
+                }
+            }
+
+            #[test]
+            fn remove_makes_absent(
+                seed in any::<u64>(),
+                entries in arb_entries(30),
+                target in -500i32..500
+            ) {
+                let mut list = SkipList::new(seed);
+                for (k, v) in &entries {
+                    list.insert(*k, *v);
+                }
+                list.remove(&target);
+                prop_assert!(!list.contains_key(&target));
+                prop_assert!(list.get(&target).is_none());
+                assert_invariants(&list);
+            }
+
+            #[test]
+            fn insert_overwrite_preserves_len(
+                seed in any::<u64>(),
+                key in -100i32..100,
+                v1 in -500i64..500,
+                v2 in -500i64..500
+            ) {
+                let mut list = SkipList::new(seed);
+                list.insert(key, v1);
+                let len_before = list.len();
+                let old = list.insert(key, v2);
+                prop_assert_eq!(old, Some(v1));
+                prop_assert_eq!(list.len(), len_before);
+                prop_assert_eq!(list.get(&key), Some(&v2));
+            }
+
+            #[test]
+            fn range_returns_only_keys_in_bounds(
+                seed in any::<u64>(),
+                entries in arb_entries(40),
+                lo in -500i32..500,
+                spread in 0i32..200
+            ) {
+                let mut list = SkipList::new(seed);
+                for (k, v) in &entries {
+                    list.insert(*k, *v);
+                }
+                let hi = lo.saturating_add(spread);
+                let range = list.range(&lo, &hi);
+                for (k, _) in &range {
+                    prop_assert!(**k >= lo, "key {} below range start {}", k, lo);
+                    prop_assert!(**k <= hi, "key {} above range end {}", k, hi);
+                }
+                // range results are sorted
+                for w in range.windows(2) {
+                    prop_assert!(w[0].0 < w[1].0);
+                }
+            }
+
+            #[test]
+            fn range_matches_iter_filter(
+                seed in any::<u64>(),
+                entries in arb_entries(30),
+                lo in -200i32..200,
+                spread in 0i32..100
+            ) {
+                let mut list = SkipList::new(seed);
+                for (k, v) in &entries {
+                    list.insert(*k, *v);
+                }
+                let hi = lo.saturating_add(spread);
+                let range_result: Vec<i32> = list.range(&lo, &hi).iter().map(|(k, _)| **k).collect();
+                let iter_result: Vec<i32> = list.iter()
+                    .filter(|(k, _)| **k >= lo && **k <= hi)
+                    .map(|(k, _)| *k)
+                    .collect();
+                prop_assert_eq!(range_result, iter_result);
+            }
+
+            #[test]
+            fn clear_empties_all(
+                seed in any::<u64>(),
+                entries in arb_entries(30)
+            ) {
+                let mut list = SkipList::new(seed);
+                for (k, v) in &entries {
+                    list.insert(*k, *v);
+                }
+                list.clear();
+                prop_assert!(list.is_empty());
+                prop_assert_eq!(list.len(), 0);
+                prop_assert_eq!(list.current_level(), 0);
+                prop_assert!(list.min().is_none());
+                prop_assert!(list.max().is_none());
+            }
+
+            #[test]
+            fn deterministic_with_same_seed(
+                seed in any::<u64>(),
+                entries in arb_entries(30)
+            ) {
+                let mut list1 = SkipList::new(seed);
+                let mut list2 = SkipList::new(seed);
+                for (k, v) in &entries {
+                    list1.insert(*k, *v);
+                    list2.insert(*k, *v);
+                }
+                prop_assert_eq!(list1.len(), list2.len());
+                prop_assert_eq!(list1.current_level(), list2.current_level());
+                let items1: Vec<_> = list1.iter().map(|(k, v)| (*k, *v)).collect();
+                let items2: Vec<_> = list2.iter().map(|(k, v)| (*k, *v)).collect();
+                prop_assert_eq!(items1, items2);
+            }
+
+            #[test]
+            fn random_ops_maintain_invariants(
+                seed in any::<u64>(),
+                ops in arb_ops(80)
+            ) {
+                let mut list = SkipList::new(seed);
+                let mut reference = std::collections::BTreeMap::new();
+                for op in &ops {
+                    match op {
+                        Op::Insert(k, v) => {
+                            list.insert(*k, *v);
+                            reference.insert(*k, *v);
+                        }
+                        Op::Get(k) => {
+                            let list_val = list.get(k).copied();
+                            let ref_val = reference.get(k).copied();
+                            assert_eq!(list_val, ref_val, "get mismatch for key {}", k);
+                        }
+                        Op::Remove(k) => {
+                            let list_val = list.remove(k);
+                            let ref_val = reference.remove(k);
+                            assert_eq!(list_val, ref_val, "remove mismatch for key {}", k);
+                        }
+                        Op::Min => {
+                            let list_min = list.min().map(|(k, v)| (*k, *v));
+                            let ref_min = reference.iter().next().map(|(k, v)| (*k, *v));
+                            assert_eq!(list_min, ref_min);
+                        }
+                        Op::Max => {
+                            let list_max = list.max().map(|(k, v)| (*k, *v));
+                            let ref_max = reference.iter().next_back().map(|(k, v)| (*k, *v));
+                            assert_eq!(list_max, ref_max);
+                        }
+                    }
+                }
+                prop_assert_eq!(list.len(), reference.len());
+                assert_invariants(&list);
+            }
+
+            #[test]
+            fn free_slots_get_reused(
+                seed in any::<u64>(),
+                entries in arb_entries(30)
+            ) {
+                let mut list = SkipList::new(seed);
+                for (k, v) in &entries {
+                    list.insert(*k, *v);
+                }
+                let keys: Vec<i32> = list.iter().map(|(k, _)| *k).collect();
+                let nodes_before = list.stats().total_nodes;
+                // Remove all
+                for k in &keys {
+                    list.remove(k);
+                }
+                let free_after = list.stats().free_slots;
+                // Reinsert same keys
+                for (k, v) in &entries {
+                    list.insert(*k, *v);
+                }
+                let nodes_after = list.stats().total_nodes;
+                // Arena should not grow if free slots were reused
+                if free_after >= keys.len() {
+                    prop_assert_eq!(nodes_after, nodes_before, "arena grew despite free slots");
+                }
+                assert_invariants(&list);
+            }
+
+            #[test]
+            fn stats_consistency(
+                seed in any::<u64>(),
+                entries in arb_entries(30),
+                removes in proptest::collection::vec(-500i32..500, 0..=10)
+            ) {
+                let mut list = SkipList::new(seed);
+                for (k, v) in &entries {
+                    list.insert(*k, *v);
+                }
+                for k in &removes {
+                    list.remove(k);
+                }
+                let stats = list.stats();
+                prop_assert_eq!(stats.len, list.len());
+                prop_assert_eq!(stats.current_level, list.current_level());
+                // total_nodes >= len + 1 (head) + free_slots
+                // (may have more due to arena allocation)
+                prop_assert!(stats.total_nodes >= stats.len + 1);
+            }
+        }
+    }
 }
