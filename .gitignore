@@ -132,7 +132,30 @@ storage.sqlite3.bak
 .write_probe
 **/test_bug.rs
 **/test_deadlock.rs
+**/*_bug_test.rs
+**/*_test_bug.rs
 /frankenredis/
+
+# Agent worktree target directories (dot-prefixed)
+.target-*/
+
+# Agent mail project ID (runtime state)
+.agent-mail-project-id
+
+# MCP config files (editor/agent-specific, contain local paths/tokens)
+*.mcp.json
+opencode.json
+
+# Agent-generated Python scripts (one-off fix/refactor/update tools)
+fix_*.py
+refactor_*.py
+update_*.py
+
+# E2E test artifacts (runtime output)
+tests/e2e/artifacts/
+
+# UBS (Ultimate Bug Scanner) reports
+ubs*.txt
 
 # Agent tool MCP config backups (timestamped .bak files)
 .claude/*.bak
