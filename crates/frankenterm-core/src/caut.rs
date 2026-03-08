@@ -869,7 +869,7 @@ mod tests {
                         max_preview + 3
                     );
                 }
-                other => prop_assert!(false, "expected InvalidJson, got {other:?}"),
+                other => prop_assert!(false, "expected InvalidJson, got {:?}", other),
             }
         }
     }

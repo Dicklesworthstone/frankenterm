@@ -600,7 +600,7 @@ proptest! {
         event.schema_version = SchemaVersion::new(major, 0);
 
         let result = registry.validate_event(&event);
-        prop_assert!(!result.valid, "version {major}.0 should be incompatible with current");
+        prop_assert!(!result.valid, "version {}.0 should be incompatible with current", major);
     }
 
     #[test]

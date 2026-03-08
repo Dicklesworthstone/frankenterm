@@ -65,7 +65,7 @@ proptest! {
         // If it trips the breaker, it must be retryable
         if kind.trips_breaker() {
             prop_assert!(kind.is_retryable(),
-                "{kind} trips breaker but is not retryable");
+                "{} trips breaker but is not retryable", kind);
         }
     }
 
@@ -401,9 +401,9 @@ proptest! {
         let dlq_id = ctrl.record_failure(&action, "err", kind, 1000);
 
         if kind.is_retryable() {
-            prop_assert!(dlq_id.is_some(), "{kind} is retryable but was not enqueued");
+            prop_assert!(dlq_id.is_some(), "{} is retryable but was not enqueued", kind);
         } else {
-            prop_assert!(dlq_id.is_none(), "{kind} is not retryable but was enqueued");
+            prop_assert!(dlq_id.is_none(), "{} is not retryable but was enqueued", kind);
         }
     }
 

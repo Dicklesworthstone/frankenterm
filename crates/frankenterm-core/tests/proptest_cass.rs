@@ -128,9 +128,9 @@ proptest! {
     ) {
         let ts = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
         let result = parse_cass_timestamp_ms(&ts);
-        prop_assert!(result.is_some(), "should parse RFC3339: {ts}");
+        prop_assert!(result.is_some(), "should parse RFC3339: {}", ts);
         let ms = result.unwrap();
-        prop_assert!(ms > 0, "timestamp should be positive: {ms}");
+        prop_assert!(ms > 0, "timestamp should be positive: {}", ms);
     }
 
     /// Whitespace-padded inputs are handled (trimmed).
@@ -162,7 +162,7 @@ proptest! {
     #[test]
     fn prop_garbage_returns_none(garbage in "[a-z]{3,10}") {
         let result = parse_cass_timestamp_ms(&garbage);
-        prop_assert!(result.is_none(), "should reject garbage: {garbage}");
+        prop_assert!(result.is_none(), "should reject garbage: {}", garbage);
     }
 }
 
@@ -201,7 +201,7 @@ proptest! {
     fn prop_summary_tokens_nonnegative(session in arb_cass_session()) {
         let summary = CassSessionSummary::from_session(&session);
         if let Some(total) = summary.total_tokens {
-            prop_assert!(total >= 0, "total_tokens should be >= 0, got {total}");
+            prop_assert!(total >= 0, "total_tokens should be >= 0, got {}", total);
         }
     }
 

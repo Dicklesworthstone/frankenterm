@@ -100,7 +100,7 @@ proptest! {
             ..Default::default()
         };
         let err = config.validate().unwrap_err();
-        prop_assert!(err.contains("smtp_host"), "error should mention smtp_host: {err}");
+        prop_assert!(err.contains("smtp_host"), "error should mention smtp_host: {}", err);
     }
 
     /// An enabled config with port == 0 always fails validation.
@@ -119,7 +119,7 @@ proptest! {
             ..Default::default()
         };
         let err = config.validate().unwrap_err();
-        prop_assert!(err.contains("smtp_port"), "error should mention smtp_port: {err}");
+        prop_assert!(err.contains("smtp_port"), "error should mention smtp_port: {}", err);
     }
 
     /// An enabled config with empty `to` list always fails.
@@ -137,7 +137,7 @@ proptest! {
             ..Default::default()
         };
         let err = config.validate().unwrap_err();
-        prop_assert!(err.contains("to"), "error should mention 'to': {err}");
+        prop_assert!(err.contains("to"), "error should mention 'to': {}", err);
     }
 
     /// An enabled config with empty `from` always fails.
@@ -155,7 +155,7 @@ proptest! {
             ..Default::default()
         };
         let err = config.validate().unwrap_err();
-        prop_assert!(err.contains("from"), "error should mention 'from': {err}");
+        prop_assert!(err.contains("from"), "error should mention 'from': {}", err);
     }
 }
 

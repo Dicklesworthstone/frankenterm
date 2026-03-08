@@ -1190,8 +1190,8 @@ mod proptest_tests {
             data in prop::collection::vec(any::<u8>(), 1..10_000)
         ) {
             let h = crate::entropy_accounting::compute_entropy(&data);
-            prop_assert!(h >= 0.0, "entropy {h} < 0");
-            prop_assert!(h <= 8.0, "entropy {h} > 8");
+            prop_assert!(h >= 0.0, "entropy {} < 0", h);
+            prop_assert!(h <= 8.0, "entropy {} > 8", h);
         }
 
         #[test]
@@ -1201,7 +1201,7 @@ mod proptest_tests {
         ) {
             let data = vec![byte_val; len];
             let h = crate::entropy_accounting::compute_entropy(&data);
-            prop_assert!(h < 0.01, "constant stream entropy {h} should be ~0");
+            prop_assert!(h < 0.01, "constant stream entropy {} should be ~0", h);
         }
 
         #[test]
@@ -1217,7 +1217,7 @@ mod proptest_tests {
             let high_interval = schedule_interval(&high_data, &cfg);
             prop_assert!(
                 high_interval <= low_interval,
-                "high-entropy interval ({high_interval}) should be <= low-entropy ({low_interval})"
+                "high-entropy interval ({}) should be <= low-entropy ({})", high_interval, low_interval
             );
         }
 
@@ -1239,7 +1239,7 @@ mod proptest_tests {
 
             prop_assert!(
                 h_after <= h_before + 0.01,
-                "after switching to low-entropy data, entropy should decrease: before={h_before}, after={h_after}"
+                "after switching to low-entropy data, entropy should decrease: before={}, after={}", h_before, h_after
             );
         }
 
@@ -1256,8 +1256,8 @@ mod proptest_tests {
             sched.feed_bytes(1, &data);
 
             let density = sched.entropy_density(1).unwrap();
-            prop_assert!(density >= 0.0, "density {density} < 0");
-            prop_assert!(density <= 1.0, "density {density} > 1");
+            prop_assert!(density >= 0.0, "density {} < 0", density);
+            prop_assert!(density <= 1.0, "density {} > 1", density);
         }
 
         #[test]

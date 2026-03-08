@@ -1309,7 +1309,7 @@ mod tests {
                     }
                     let embedding = model.project(&features);
                     for (i, &v) in embedding.iter().enumerate() {
-                        prop_assert!(v.is_finite(), "embedding[{i}]={v} not finite");
+                        prop_assert!(v.is_finite(), "embedding[{}]={} not finite", i, v);
                     }
                 }
             }

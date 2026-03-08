@@ -123,7 +123,7 @@ proptest! {
         let tol = (naive.abs() * 1e-3).max(1e-4);
         let diff = (simd - naive).abs();
         let ok = diff < tol;
-        prop_assert!(ok, "simd={simd} naive={naive} diff={diff} tol={tol}");
+        prop_assert!(ok, "simd={} naive={} diff={} tol={}", simd, naive, diff, tol);
     }
 
     // 2. dot_product_simd is commutative
@@ -135,7 +135,7 @@ proptest! {
         let ab = dot_product_simd(&a, &b);
         let ba = dot_product_simd(&b, &a);
         let diff = (ab - ba).abs();
-        prop_assert!(diff < 1e-4, "a·b={ab} b·a={ba} diff={diff}");
+        prop_assert!(diff < 1e-4, "a·b={} b·a={} diff={}", ab, ba, diff);
     }
 
     // 3. dot_product_simd: empty vectors → 0.0
@@ -152,7 +152,7 @@ proptest! {
         let sum_sq: f32 = a.iter().map(|x| x * x).sum();
         let tol = (sum_sq.abs() * 1e-4).max(1e-4);
         let diff = (self_dot - sum_sq).abs();
-        prop_assert!(diff < tol, "self_dot={self_dot} sum_sq={sum_sq} diff={diff}");
+        prop_assert!(diff < tol, "self_dot={} sum_sq={} diff={}", self_dot, sum_sq, diff);
     }
 
     // 5. dot_product_simd: mismatched lengths use min
@@ -168,7 +168,7 @@ proptest! {
         let aa = dot_product_simd(&a, &a);
         let tol = (aa.abs() * 1e-4).max(1e-4);
         let diff = (ab - aa).abs();
-        prop_assert!(diff < tol, "ab={ab} aa={aa}");
+        prop_assert!(diff < tol, "ab={} aa={}", ab, aa);
     }
 
     // 6. normalize_simd: output is unit vector
@@ -180,7 +180,7 @@ proptest! {
         if is_zero {
             prop_assert!((mag_sq - 0.0).abs() < 1e-6);
         } else {
-            prop_assert!((mag_sq - 1.0).abs() < 1e-3, "mag_sq={mag_sq}");
+            prop_assert!((mag_sq - 1.0).abs() < 1e-3, "mag_sq={}", mag_sq);
         }
     }
 
@@ -201,7 +201,7 @@ proptest! {
         if !is_zero {
             let n = normalize_simd(&v);
             let d = dot_product_simd(&v, &n);
-            prop_assert!(d > 0.0, "dot with normalized should be positive, got {d}");
+            prop_assert!(d > 0.0, "dot with normalized should be positive, got {}", d);
         }
     }
 
@@ -212,7 +212,7 @@ proptest! {
         let n2 = normalize_simd(&n1);
         for (a, b) in n1.iter().zip(&n2) {
             let diff = (a - b).abs();
-            prop_assert!(diff < 1e-4, "a={a} b={b} diff={diff}");
+            prop_assert!(diff < 1e-4, "a={} b={} diff={}", a, b, diff);
         }
     }
 }
@@ -239,8 +239,8 @@ proptest! {
             let q0 = buf.quantile(0.0).unwrap();
             let q50 = buf.quantile(0.5).unwrap();
             let q100 = buf.quantile(1.0).unwrap();
-            prop_assert!(q0 <= q50, "q0={q0} > q50={q50}");
-            prop_assert!(q50 <= q100, "q50={q50} > q100={q100}");
+            prop_assert!(q0 <= q50, "q0={} > q50={}", q0, q50);
+            prop_assert!(q50 <= q100, "q50={} > q100={}", q50, q100);
         }
     }
 
@@ -253,7 +253,7 @@ proptest! {
         let mut buf = SortedCalibrationBuffer::new(capacity);
         for s in &scores {
             buf.insert(*s);
-            prop_assert!(buf.len() <= capacity, "len={} > cap={capacity}", buf.len());
+            prop_assert!(buf.len() <= capacity, "len={} > cap={}", buf.len(), capacity);
         }
     }
 
@@ -270,8 +270,8 @@ proptest! {
         let c_low = buf.count_geq(0.0);
         let c_mid = buf.count_geq(50.0);
         let c_high = buf.count_geq(101.0);
-        prop_assert!(c_low >= c_mid, "c_low={c_low} < c_mid={c_mid}");
-        prop_assert!(c_mid >= c_high, "c_mid={c_mid} < c_high={c_high}");
+        prop_assert!(c_low >= c_mid, "c_low={} < c_mid={}", c_low, c_mid);
+        prop_assert!(c_mid >= c_high, "c_mid={} < c_high={}", c_mid, c_high);
     }
 
     // 13. conformal_p_value in (0, 1]
@@ -286,8 +286,8 @@ proptest! {
             buf.insert(*s);
         }
         let p = buf.conformal_p_value(query);
-        prop_assert!(p > 0.0, "p={p} should be > 0");
-        prop_assert!(p <= 1.0, "p={p} should be <= 1");
+        prop_assert!(p > 0.0, "p={} should be > 0", p);
+        prop_assert!(p <= 1.0, "p={} should be <= 1", p);
     }
 
     // 14. p_value monotonically decreasing with score
@@ -302,7 +302,7 @@ proptest! {
         }
         let p_low = buf.conformal_p_value(0.001);
         let p_high = buf.conformal_p_value(999.0);
-        prop_assert!(p_low >= p_high, "p_low={p_low} < p_high={p_high}");
+        prop_assert!(p_low >= p_high, "p_low={} < p_high={}", p_low, p_high);
     }
 
     // 15. quantile(0) <= quantile(1)
@@ -317,7 +317,7 @@ proptest! {
         }
         let q0 = buf.quantile(0.0).unwrap();
         let q1 = buf.quantile(1.0).unwrap();
-        prop_assert!(q0 <= q1, "q0={q0} > q1={q1}");
+        prop_assert!(q0 <= q1, "q0={} > q1={}", q0, q1);
     }
 
     // 16. Eviction preserves sorted order (stress test with wraps)
@@ -333,7 +333,7 @@ proptest! {
             if buf.len() >= 2 {
                 let q0 = buf.quantile(0.0).unwrap();
                 let q1 = buf.quantile(1.0).unwrap();
-                prop_assert!(q0 <= q1, "After eviction: q0={q0} > q1={q1}");
+                prop_assert!(q0 <= q1, "After eviction: q0={} > q1={}", q0, q1);
             }
         }
     }
@@ -484,8 +484,8 @@ proptest! {
             det.observe(&v);
         }
         let p = det.last_p_value();
-        prop_assert!(p > 0.0, "p={p}");
-        prop_assert!(p <= 1.0, "p={p}");
+        prop_assert!(p > 0.0, "p={}", p);
+        prop_assert!(p <= 1.0, "p={}", p);
     }
 
     // 23. Stable stream FDR <= 2*alpha (empirical)
@@ -512,8 +512,8 @@ proptest! {
         // Allow 2x alpha as margin for small sample effects.
         prop_assert!(
             fdr <= alpha * 2.0 + 0.02,
-            "fdr={fdr} exceeds 2*alpha={} for alpha={alpha}",
-            alpha * 2.0
+            "fdr={} exceeds 2*alpha={} for alpha={}",
+            fdr, alpha * 2.0, alpha
         );
     }
 
@@ -630,7 +630,7 @@ proptest! {
             }
         }
         // Identical inputs should produce very few (if any) shocks.
-        prop_assert!(shocks <= 3, "shocks={shocks} too many for identical inputs");
+        prop_assert!(shocks <= 3, "shocks={} too many for identical inputs", shocks);
     }
 }
 
@@ -652,7 +652,7 @@ proptest! {
         let segment = vec![byte_val; 200];
         let decision = gate.evaluate(&segment);
         let is_skip = matches!(decision, EntropyGateDecision::Skip { .. });
-        prop_assert!(is_skip, "Constant byte {byte_val} should be skipped, got {decision:?}");
+        prop_assert!(is_skip, "Constant byte {} should be skipped, got {:?}", byte_val, decision);
         prop_assert!(!decision.should_embed());
     }
 
@@ -673,7 +673,7 @@ proptest! {
         }
         let decision = gate.evaluate(&segment);
         let is_pass = matches!(decision, EntropyGateDecision::Pass { .. });
-        prop_assert!(is_pass, "Uniform data should pass, got {decision:?}");
+        prop_assert!(is_pass, "Uniform data should pass, got {:?}", decision);
         prop_assert!(decision.should_embed());
     }
 
@@ -782,8 +782,8 @@ proptest! {
             gate.evaluate(seg);
         }
         let ratio = gate.skip_ratio();
-        prop_assert!(ratio >= 0.0, "ratio={ratio} < 0");
-        prop_assert!(ratio <= 1.0, "ratio={ratio} > 1");
+        prop_assert!(ratio >= 0.0, "ratio={} < 0", ratio);
+        prop_assert!(ratio <= 1.0, "ratio={} > 1", ratio);
     }
 
     // 38. Disabled gate always returns Disabled
@@ -799,7 +799,7 @@ proptest! {
         let segment = vec![byte_val; len];
         let decision = gate.evaluate(&segment);
         let is_disabled = matches!(decision, EntropyGateDecision::Disabled);
-        prop_assert!(is_disabled, "Disabled gate should return Disabled, got {decision:?}");
+        prop_assert!(is_disabled, "Disabled gate should return Disabled, got {:?}", decision);
     }
 
     // 39. Average entropy in [0, 8] for measured segments
@@ -816,8 +816,8 @@ proptest! {
             gate.evaluate(seg);
         }
         let avg = gate.average_entropy();
-        prop_assert!(avg >= 0.0, "avg={avg} < 0");
-        prop_assert!(avg <= 8.0, "avg={avg} > 8");
+        prop_assert!(avg >= 0.0, "avg={} < 0", avg);
+        prop_assert!(avg <= 8.0, "avg={} > 8", avg);
     }
 
     // 40. Short segments always bypassed
@@ -838,7 +838,7 @@ proptest! {
         let segment = vec![byte_val; len];
         let decision = gate.evaluate(&segment);
         let is_bypass = matches!(decision, EntropyGateDecision::Bypass { .. });
-        prop_assert!(is_bypass, "Short segment (len={len} < min={min_bytes}) should bypass, got {decision:?}");
+        prop_assert!(is_bypass, "Short segment (len={} < min={}) should bypass, got {:?}", len, min_bytes, decision);
     }
 }
 

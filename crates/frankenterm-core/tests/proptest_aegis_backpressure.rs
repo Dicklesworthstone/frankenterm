@@ -93,7 +93,7 @@ proptest! {
         let p = GaussianPosterior::new(mean1, var1);
         let q = GaussianPosterior::new(mean2, var2);
         let kl = p.kl_divergence(&q);
-        prop_assert!(kl >= -1e-10, "KL should be non-negative: {kl}");
+        prop_assert!(kl >= -1e-10, "KL should be non-negative: {}", kl);
     }
 
     // GP-2: KL divergence of identical distributions is zero
@@ -104,7 +104,7 @@ proptest! {
     ) {
         let p = GaussianPosterior::new(mean, var);
         let kl = p.kl_divergence(&p);
-        prop_assert!(kl.abs() < 1e-10, "KL(P||P) = 0: got {kl}");
+        prop_assert!(kl.abs() < 1e-10, "KL(P||P) = 0: got {}", kl);
     }
 
     // GP-3: Posterior update decreases variance
@@ -185,7 +185,7 @@ proptest! {
         let p = GaussianPosterior::new(mean, var);
         let tight = p.upper_bound(0.01); // 99% confidence
         let loose = p.upper_bound(0.10); // 90% confidence
-        prop_assert!(tight >= loose - 1e-10, "tighter confidence should be wider: tight={tight}, loose={loose}");
+        prop_assert!(tight >= loose - 1e-10, "tighter confidence should be wider: tight={}, loose={}", tight, loose);
     }
 }
 

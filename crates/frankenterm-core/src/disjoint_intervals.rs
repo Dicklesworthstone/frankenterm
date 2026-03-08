@@ -971,4 +971,376 @@ mod tests {
         di.insert(0, 10);
         assert_eq!(di.count(), 1);
     }
+
+    // ── Proptest properties ──────────────────────────────────────────
+
+    mod proptest_disjoint_intervals {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Generate a valid interval [start, end) where start < end.
+        fn arb_interval() -> impl Strategy<Value = (i64, i64)> {
+            (-1000i64..1000i64).prop_flat_map(|start| (Just(start), (start + 1)..=(start + 200)))
+        }
+
+        /// Generate a possibly-empty interval [start, end) where start <= end.
+        fn arb_interval_or_empty() -> impl Strategy<Value = (i64, i64)> {
+            (-1000i64..1000i64).prop_flat_map(|start| (Just(start), start..=(start + 200)))
+        }
+
+        /// Generate a sequence of insert operations.
+        fn arb_inserts(max_len: usize) -> impl Strategy<Value = Vec<(i64, i64)>> {
+            proptest::collection::vec(arb_interval(), 1..=max_len)
+        }
+
+        /// Helper: check that intervals are sorted and non-overlapping.
+        fn assert_invariants(di: &DisjointIntervals) {
+            let ivs = di.intervals();
+            for iv in ivs {
+                assert!(iv.start < iv.end, "empty interval found: {iv:?}");
+            }
+            for w in ivs.windows(2) {
+                assert!(
+                    w[0].end <= w[1].start,
+                    "intervals overlap or not sorted: {:?}, {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+
+        /// Stricter check for merge_adjacent=true: no adjacent intervals.
+        fn assert_invariants_merge_adjacent(di: &DisjointIntervals) {
+            assert_invariants(di);
+            let ivs = di.intervals();
+            for w in ivs.windows(2) {
+                assert!(
+                    w[0].end < w[1].start,
+                    "adjacent intervals not merged: {:?}, {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+
+        proptest! {
+            /// After any sequence of inserts, the sorted-disjoint invariant holds.
+            #[test]
+            fn sorted_disjoint_after_inserts(ops in arb_inserts(30)) {
+                let mut di = DisjointIntervals::new();
+                for (s, e) in &ops {
+                    di.insert(*s, *e);
+                }
+                assert_invariants_merge_adjacent(&di);
+            }
+
+            /// After any sequence of inserts and removes, the invariant holds.
+            #[test]
+            fn sorted_disjoint_after_inserts_and_removes(
+                inserts in arb_inserts(20),
+                removes in proptest::collection::vec(arb_interval_or_empty(), 0..10)
+            ) {
+                let mut di = DisjointIntervals::new();
+                for (s, e) in &inserts {
+                    di.insert(*s, *e);
+                }
+                for (s, e) in &removes {
+                    di.remove(*s, *e);
+                }
+                assert_invariants_merge_adjacent(&di);
+            }
+
+            /// Insert order does not affect the final interval set.
+            #[test]
+            fn insert_order_independence(ops in arb_inserts(15)) {
+                let mut di_fwd = DisjointIntervals::new();
+                for (s, e) in &ops {
+                    di_fwd.insert(*s, *e);
+                }
+
+                let mut di_rev = DisjointIntervals::new();
+                for (s, e) in ops.iter().rev() {
+                    di_rev.insert(*s, *e);
+                }
+
+                prop_assert_eq!(di_fwd.intervals(), di_rev.intervals());
+            }
+
+            /// Every point in an inserted interval is contained.
+            #[test]
+            fn contains_all_inserted_points((start, end) in arb_interval()) {
+                let mut di = DisjointIntervals::new();
+                di.insert(start, end);
+                for p in start..end {
+                    prop_assert!(di.contains(p), "point {} not found in [{}, {})", p, start, end);
+                }
+                // Boundary: end is exclusive
+                let check = !di.contains(end);
+                prop_assert!(check, "end point {} should not be contained", end);
+            }
+
+            /// After removing an interval, no point in that range is contained.
+            #[test]
+            fn remove_clears_all_points(
+                (ins_s, ins_e) in arb_interval(),
+                (rem_s, rem_e) in arb_interval()
+            ) {
+                let mut di = DisjointIntervals::new();
+                di.insert(ins_s, ins_e);
+                di.remove(rem_s, rem_e);
+                for p in rem_s..rem_e {
+                    if ins_s <= p && p < ins_e {
+                        let check = !di.contains(p);
+                        prop_assert!(check, "removed point {} still contained", p);
+                    }
+                }
+                assert_invariants_merge_adjacent(&di);
+            }
+
+            /// Span equals sum of individual interval lengths.
+            #[test]
+            fn span_equals_sum_of_lengths(ops in arb_inserts(20)) {
+                let mut di = DisjointIntervals::new();
+                for (s, e) in &ops {
+                    di.insert(*s, *e);
+                }
+                let computed_span: i64 = di.intervals().iter().map(|iv| iv.len()).sum();
+                prop_assert_eq!(di.span(), computed_span);
+            }
+
+            /// Gaps + intervals = full range [lo, hi).
+            #[test]
+            fn gaps_plus_intervals_cover_range(
+                ops in arb_inserts(15),
+                lo in -500i64..500i64,
+                width in 1i64..500i64,
+            ) {
+                let hi = lo + width;
+                let mut di = DisjointIntervals::new();
+                for (s, e) in &ops {
+                    di.insert(*s, *e);
+                }
+                let gaps = di.gaps(lo, hi);
+                // Verify all gaps are valid
+                for g in &gaps {
+                    prop_assert!(g.start >= lo);
+                    prop_assert!(g.end <= hi);
+                    prop_assert!(g.start < g.end);
+                }
+                // Coverage: every point in [lo, hi) is in either an interval or a gap
+                let gap_span: i64 = gaps.iter().map(|g| g.len()).sum();
+                let interval_span: i64 = di.intervals().iter()
+                    .filter_map(|iv| {
+                        let clamp_s = iv.start.max(lo);
+                        let clamp_e = iv.end.min(hi);
+                        if clamp_s < clamp_e { Some(clamp_e - clamp_s) } else { None }
+                    })
+                    .sum();
+                let total = gap_span + interval_span;
+                let expected = hi - lo;
+                prop_assert_eq!(total, expected);
+            }
+
+            /// intersects(a, b) == true iff there exists a point p in [a,b) contained.
+            #[test]
+            fn intersects_consistent_with_contains(
+                ops in arb_inserts(10),
+                (q_start, q_end) in arb_interval()
+            ) {
+                let mut di = DisjointIntervals::new();
+                for (s, e) in &ops {
+                    di.insert(*s, *e);
+                }
+                let intersects_result = di.intersects(q_start, q_end);
+                let brute_force = (q_start..q_end).any(|p| di.contains(p));
+                prop_assert_eq!(intersects_result, brute_force);
+            }
+
+            /// Empty intervals are always ignored by insert.
+            #[test]
+            fn empty_insert_is_noop(base_ops in arb_inserts(10), point in -1000i64..1000i64) {
+                let mut di = DisjointIntervals::new();
+                for (s, e) in &base_ops {
+                    di.insert(*s, *e);
+                }
+                let before = di.intervals().to_vec();
+                di.insert(point, point); // empty interval
+                let after = di.intervals().to_vec();
+                prop_assert_eq!(before, after, "empty insert changed intervals");
+            }
+
+            /// Empty removes are always noops.
+            #[test]
+            fn empty_remove_is_noop(base_ops in arb_inserts(10), point in -1000i64..1000i64) {
+                let mut di = DisjointIntervals::new();
+                for (s, e) in &base_ops {
+                    di.insert(*s, *e);
+                }
+                let before = di.intervals().to_vec();
+                di.remove(point, point); // empty removal
+                let after = di.intervals().to_vec();
+                prop_assert_eq!(before, after, "empty remove changed intervals");
+            }
+
+            /// Inserting a subset of an existing interval doesn't change the set.
+            #[test]
+            fn insert_subset_is_idempotent((outer_s, outer_e) in arb_interval()) {
+                let mut di = DisjointIntervals::new();
+                di.insert(outer_s, outer_e);
+                let before = di.intervals().to_vec();
+                // Insert a sub-interval
+                let mid_s = outer_s + (outer_e - outer_s) / 3;
+                let mid_e = outer_s + 2 * (outer_e - outer_s) / 3;
+                if mid_s < mid_e {
+                    di.insert(mid_s, mid_e);
+                    let after = di.intervals().to_vec();
+                    prop_assert_eq!(before, after, "subset insert changed intervals");
+                }
+            }
+
+            /// Idempotency: inserting the same interval twice doesn't change the set.
+            #[test]
+            fn double_insert_idempotent((s, e) in arb_interval()) {
+                let mut di = DisjointIntervals::new();
+                di.insert(s, e);
+                let after_first = di.intervals().to_vec();
+                di.insert(s, e);
+                let after_second = di.intervals().to_vec();
+                prop_assert_eq!(after_first, after_second);
+            }
+
+            /// Span is monotonically non-decreasing under inserts.
+            #[test]
+            fn span_monotone_under_inserts(ops in arb_inserts(20)) {
+                let mut di = DisjointIntervals::new();
+                let mut prev_span = 0i64;
+                for (s, e) in &ops {
+                    di.insert(*s, *e);
+                    let new_span = di.span();
+                    prop_assert!(new_span >= prev_span,
+                        "span decreased from {} to {}", prev_span, new_span);
+                    prev_span = new_span;
+                }
+            }
+
+            /// min_start and max_end are consistent with the interval set.
+            #[test]
+            fn min_max_consistent(ops in arb_inserts(15)) {
+                let mut di = DisjointIntervals::new();
+                for (s, e) in &ops {
+                    di.insert(*s, *e);
+                }
+                if let (Some(min_s), Some(max_e)) = (di.min_start(), di.max_end()) {
+                    let ivs = di.intervals();
+                    prop_assert_eq!(min_s, ivs.first().unwrap().start);
+                    prop_assert_eq!(max_e, ivs.last().unwrap().end);
+                    prop_assert!(min_s < max_e);
+                } else {
+                    prop_assert!(di.is_empty());
+                }
+            }
+
+            /// count() matches intervals().len().
+            #[test]
+            fn count_matches_len(ops in arb_inserts(20)) {
+                let mut di = DisjointIntervals::new();
+                for (s, e) in &ops {
+                    di.insert(*s, *e);
+                }
+                prop_assert_eq!(di.count(), di.intervals().len());
+            }
+
+            /// Stats are consistent with actual state.
+            #[test]
+            fn stats_consistent(
+                inserts in arb_inserts(15),
+                removes in proptest::collection::vec(arb_interval_or_empty(), 0..5)
+            ) {
+                let mut di = DisjointIntervals::new();
+                for (s, e) in &inserts {
+                    di.insert(*s, *e);
+                }
+                for (s, e) in &removes {
+                    di.remove(*s, *e);
+                }
+                let stats = di.stats();
+                prop_assert_eq!(stats.interval_count, di.count());
+                prop_assert_eq!(stats.total_span, di.span());
+                prop_assert_eq!(stats.insert_count, inserts.len() as u64);
+                prop_assert_eq!(stats.remove_count, removes.len() as u64);
+                prop_assert!(stats.memory_bytes > 0);
+            }
+
+            /// With merge_adjacent=false, adjacent intervals stay separate.
+            #[test]
+            fn no_merge_adjacent_keeps_touching_separate(
+                base in -500i64..500i64,
+                width1 in 1i64..100i64,
+                width2 in 1i64..100i64,
+            ) {
+                let config = DisjointIntervalsConfig { merge_adjacent: false };
+                let mut di = DisjointIntervals::from_config(&config);
+                let end1 = base + width1;
+                let start2 = end1; // exactly adjacent
+                let end2 = start2 + width2;
+                di.insert(base, end1);
+                di.insert(start2, end2);
+                prop_assert_eq!(di.count(), 2, "adjacent intervals merged with merge_adjacent=false");
+                assert_invariants(&di);
+            }
+
+            /// Serde roundtrip for Interval.
+            #[test]
+            fn interval_serde_roundtrip((s, e) in arb_interval()) {
+                let iv = Interval::new(s, e);
+                let json = serde_json::to_string(&iv).unwrap();
+                let back: Interval = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(iv, back);
+            }
+
+            /// Serde roundtrip for DisjointIntervalsStats.
+            #[test]
+            fn stats_serde_roundtrip(ops in arb_inserts(10)) {
+                let mut di = DisjointIntervals::new();
+                for (s, e) in &ops {
+                    di.insert(*s, *e);
+                }
+                let stats = di.stats();
+                let json = serde_json::to_string(&stats).unwrap();
+                let back: DisjointIntervalsStats = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(stats, back);
+            }
+
+            /// Serde roundtrip for DisjointIntervalsConfig.
+            #[test]
+            fn config_serde_roundtrip(merge_adj in proptest::bool::ANY) {
+                let config = DisjointIntervalsConfig { merge_adjacent: merge_adj };
+                let json = serde_json::to_string(&config).unwrap();
+                let back: DisjointIntervalsConfig = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(config, back);
+            }
+
+            /// After clear, the set is empty but operation counters are preserved.
+            #[test]
+            fn clear_preserves_counters(
+                inserts in arb_inserts(10),
+                removes in proptest::collection::vec(arb_interval_or_empty(), 0..5)
+            ) {
+                let mut di = DisjointIntervals::new();
+                for (s, e) in &inserts {
+                    di.insert(*s, *e);
+                }
+                for (s, e) in &removes {
+                    di.remove(*s, *e);
+                }
+                let stats_before = di.stats();
+                di.clear();
+                prop_assert!(di.is_empty());
+                prop_assert_eq!(di.span(), 0);
+                let stats_after = di.stats();
+                prop_assert_eq!(stats_after.insert_count, stats_before.insert_count);
+                prop_assert_eq!(stats_after.remove_count, stats_before.remove_count);
+            }
+        }
+    }
 }

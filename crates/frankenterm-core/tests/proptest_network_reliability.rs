@@ -136,7 +136,7 @@ proptest! {
         let mut count = 0u32;
         while calc.next_delay().is_some() {
             count += 1;
-            prop_assert!(count <= max + 1, "count {count} exceeded max {max}");
+            prop_assert!(count <= max + 1, "count {} exceeded max {}", count, max);
         }
         prop_assert_eq!(count, max);
     }

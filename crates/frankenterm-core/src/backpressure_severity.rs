@@ -634,7 +634,7 @@ mod tests {
                 let mut m = ContinuousBackpressure::new(config);
                 m.observe_ratio(q);
                 let s = m.severity();
-                prop_assert!((0.0..=1.0).contains(&s), "severity={s} out of range");
+                prop_assert!((0.0..=1.0).contains(&s), "severity={} out of range", s);
             }
 
             /// Severity continuity (Lipschitz bound).

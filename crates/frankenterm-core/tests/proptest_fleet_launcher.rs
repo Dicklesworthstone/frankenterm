@@ -463,7 +463,7 @@ proptest! {
         let a_count = plan.slots.iter().filter(|s| s.mix_entry_index == 0).count() as u32;
         let b_count = plan.slots.iter().filter(|s| s.mix_entry_index == 1).count() as u32;
         // With 3:1 ratio, 'a' must always get at least as many as 'b'
-        prop_assert!(a_count >= b_count, "3:1 weight: a={a_count} must >= b={b_count}");
+        prop_assert!(a_count >= b_count, "3:1 weight: a={} must >= b={}", a_count, b_count);
     }
 
     // -------------------------------------------------------------------

@@ -1337,7 +1337,7 @@ mod tests {
             prop_assert!(holt.level().is_finite(), "level={}", holt.level());
             prop_assert!(holt.trend().is_finite(), "trend={}", holt.trend());
             let forecast = holt.forecast(10.0);
-            prop_assert!(forecast.is_finite(), "forecast={forecast}");
+            prop_assert!(forecast.is_finite(), "forecast={}", forecast);
         }
 
         #[test]
