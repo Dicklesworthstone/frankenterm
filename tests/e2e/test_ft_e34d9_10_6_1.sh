@@ -102,7 +102,8 @@ write_manifest() {
         tests: [
           {name: "lab_tailer_sync_handles_pane_restart_without_resurrecting_removed_pane", seed: 1337},
           {name: "dpor_distributed_reconnect_replay_preserves_contiguous_sequence", base_seed: 89},
-          {name: "dpor_stream_reconnect_receives_ordered_suffix_after_restart", base_seed: 211}
+          {name: "dpor_stream_reconnect_receives_ordered_suffix_after_restart", base_seed: 211},
+          {name: "labruntime_runtime_restart_after_clean_shutdown", seed: 377}
         ]
       },
       commands: [
@@ -111,6 +112,7 @@ write_manifest() {
         "cargo test -p frankenterm-core --test tailer_labruntime --features asupersync-runtime -- --nocapture lab_tailer_sync_handles_pane_restart_without_resurrecting_removed_pane",
         "cargo test -p frankenterm-core --test distributed_merge_dpor --features asupersync-runtime,distributed -- --nocapture dpor_distributed_reconnect_replay_preserves_contiguous_sequence",
         "cargo test -p frankenterm-core --test web_streaming_dpor --features asupersync-runtime,web -- --nocapture dpor_stream_reconnect_receives_ordered_suffix_after_restart",
+        "cargo test -p frankenterm-core --test runtime_labruntime --features asupersync-runtime -- --nocapture labruntime_runtime_restart_after_clean_shutdown",
         "cargo check -p frankenterm-core --bench tailer --message-format short",
         "cargo check -p frankenterm-core --bench tailer --features asupersync-runtime --message-format short"
       ],
@@ -282,6 +284,12 @@ run_rch_test_step \
   "deterministic.scheduler.restart_suffix" \
   "test=dpor_stream_reconnect_receives_ordered_suffix_after_restart;base_seed=211" \
   cargo test -p frankenterm-core --test web_streaming_dpor --features asupersync-runtime,web -- --nocapture dpor_stream_reconnect_receives_ordered_suffix_after_restart
+
+run_rch_test_step \
+  "runtime_shutdown_restart_state_machine" \
+  "deterministic.runtime.shutdown_restart" \
+  "test=labruntime_runtime_restart_after_clean_shutdown;seed=377" \
+  cargo test -p frankenterm-core --test runtime_labruntime --features asupersync-runtime -- --nocapture labruntime_runtime_restart_after_clean_shutdown
 
 run_expected_failure_step \
   "feature_gate_failure_injection" \

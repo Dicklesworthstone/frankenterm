@@ -569,3 +569,80 @@ fn labruntime_shutdown_propagation_drains_all_tasks() {
         );
     });
 }
+
+// ===========================================================================
+// Test 15: Restart cycle — clean shutdown allows same-db restart
+// ===========================================================================
+
+#[test]
+fn labruntime_runtime_restart_after_clean_shutdown() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let (_dir, db_path) = temp_db();
+        let config = test_config();
+
+        let storage_one = frankenterm_core::storage::StorageHandle::new(&db_path)
+            .await
+            .unwrap();
+        let engine_one = frankenterm_core::patterns::PatternEngine::new();
+        let (_mock_one, wezterm_one) = make_mock_handle(&[0]).await;
+
+        let mut runtime_one = frankenterm_core::runtime::ObservationRuntime::new(
+            config.clone(),
+            storage_one,
+            Arc::new(RwLock::new(engine_one)),
+        )
+        .with_wezterm_handle(wezterm_one);
+
+        let handle_one = runtime_one
+            .start()
+            .await
+            .expect("first runtime should start");
+        sleep(Duration::from_millis(40)).await;
+
+        let summary_one = handle_one.shutdown_with_summary().await;
+        assert!(
+            summary_one.clean,
+            "first shutdown should be clean: warnings={:?}",
+            summary_one.warnings
+        );
+
+        let storage_two = frankenterm_core::storage::StorageHandle::new(&db_path)
+            .await
+            .unwrap();
+        let engine_two = frankenterm_core::patterns::PatternEngine::new();
+        let (mock_two, wezterm_two) = make_mock_handle(&[1]).await;
+
+        let mut runtime_two = frankenterm_core::runtime::ObservationRuntime::new(
+            config,
+            storage_two,
+            Arc::new(RwLock::new(engine_two)),
+        )
+        .with_wezterm_handle(wezterm_two);
+
+        let handle_two = runtime_two
+            .start()
+            .await
+            .expect("second runtime should start");
+        mock_two.inject_output(1, "restart output\n").await.unwrap();
+        sleep(Duration::from_millis(80)).await;
+
+        let summary_two = handle_two.shutdown_with_summary().await;
+        assert!(
+            summary_two.clean,
+            "second shutdown should be clean after restart: warnings={:?}",
+            summary_two.warnings
+        );
+        assert!(
+            summary_two.segments_persisted > 0,
+            "restart run should persist at least one segment"
+        );
+        assert!(
+            summary_two
+                .last_seq_by_pane
+                .iter()
+                .any(|(pane_id, seq)| *pane_id == 1 && *seq >= 0),
+            "restart run should observe pane 1 state"
+        );
+    });
+}

@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 
-use crate::runtime_telemetry::{FailureClass, HealthTier, RuntimePhase, RuntimeTelemetryLog};
+use crate::runtime_telemetry::{
+    FailureClass, HealthTier, RuntimePhase, RuntimeTelemetryLog, UnifiedTelemetryRecord,
+};
 
 // =============================================================================
 // Health check result
@@ -486,6 +488,9 @@ pub struct IncidentEnrichment {
     /// Recent telemetry events leading up to the incident.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_events: Vec<crate::runtime_telemetry::RuntimeTelemetryEvent>,
+    /// Recent telemetry records normalized to the shared cross-subsystem schema.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_records: Vec<UnifiedTelemetryRecord>,
     /// Tier transition history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tier_transitions: Vec<crate::runtime_telemetry::TierTransitionRecord>,
@@ -526,6 +531,7 @@ impl IncidentEnrichment {
             phase,
             doctor_report: None,
             recent_events: Vec::new(),
+            recent_records: Vec::new(),
             tier_transitions: Vec::new(),
             active_failures: Vec::new(),
             scope_states: HashMap::new(),
@@ -537,7 +543,12 @@ impl IncidentEnrichment {
     pub fn with_telemetry_log(mut self, log: &RuntimeTelemetryLog, max_events: usize) -> Self {
         let events = log.events();
         let start = events.len().saturating_sub(max_events);
-        self.recent_events = events[start..].to_vec();
+        let recent_events = events[start..].to_vec();
+        self.recent_records = recent_events
+            .iter()
+            .map(UnifiedTelemetryRecord::from)
+            .collect();
+        self.recent_events = recent_events;
         self
     }
 
@@ -1014,6 +1025,8 @@ pub struct IncidentEnrichmentData {
     pub phase: String,
     /// Number of recent telemetry events included.
     pub recent_event_count: usize,
+    /// Number of normalized telemetry records included.
+    pub recent_record_count: usize,
     /// Number of tier transitions included.
     pub tier_transition_count: usize,
     /// Number of active failures.
@@ -1031,6 +1044,7 @@ impl From<&IncidentEnrichment> for IncidentEnrichmentData {
             health_tier: enrichment.health_tier.to_string(),
             phase: enrichment.phase.to_string(),
             recent_event_count: enrichment.recent_events.len(),
+            recent_record_count: enrichment.recent_records.len(),
             tier_transition_count: enrichment.tier_transitions.len(),
             active_failure_count: enrichment.active_failures.len(),
             scope_state_count: enrichment.scope_states.len(),
@@ -1276,6 +1290,7 @@ mod tests {
         assert_eq!(enrichment.health_tier, HealthTier::Red);
         assert_eq!(enrichment.phase, RuntimePhase::Running);
         assert!(enrichment.recent_events.is_empty());
+        assert!(enrichment.recent_records.is_empty());
     }
 
     #[test]
@@ -1294,6 +1309,9 @@ mod tests {
         // Should be the 5 most recent
         assert_eq!(enrichment.recent_events[0].reason_code, "ev_5");
         assert_eq!(enrichment.recent_events[4].reason_code, "ev_9");
+        assert_eq!(enrichment.recent_records.len(), 5);
+        assert_eq!(enrichment.recent_records[0].reason_code, "ev_5");
+        assert_eq!(enrichment.recent_records[4].reason_code, "ev_9");
     }
 
     #[test]
@@ -1553,6 +1571,7 @@ mod tests {
         assert_eq!(data.health_tier, "red");
         assert_eq!(data.phase, "draining");
         assert_eq!(data.recent_event_count, 0);
+        assert_eq!(data.recent_record_count, 0);
         assert!(!data.has_doctor_report);
     }
 

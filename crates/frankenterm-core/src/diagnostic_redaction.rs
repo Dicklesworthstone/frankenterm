@@ -491,6 +491,11 @@ impl DiagnosticRedactor {
         // Redact recent events
         let (safe_events, mut stats) = self.redact_events(&redacted.recent_events);
         redacted.recent_events = safe_events;
+        let retained_record_start = redacted
+            .recent_records
+            .len()
+            .saturating_sub(redacted.recent_events.len());
+        redacted.recent_records = redacted.recent_records[retained_record_start..].to_vec();
 
         // Limit tier transitions
         if redacted.tier_transitions.len() > self.budget.max_tier_transitions {
@@ -934,6 +939,7 @@ mod tests {
 
         let (safe, stats) = redactor.redact_enrichment(&enrichment);
         assert_eq!(safe.recent_events.len(), 5);
+        assert_eq!(safe.recent_records.len(), 5);
         assert_eq!(stats.events_dropped, 15);
     }
 

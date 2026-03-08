@@ -237,6 +237,7 @@ proptest! {
         prop_assert_eq!(data.health_tier, tier.to_string());
         prop_assert_eq!(data.phase, phase.to_string());
         prop_assert_eq!(data.recent_event_count, n_events.min(max_events));
+        prop_assert_eq!(data.recent_record_count, n_events.min(max_events));
     }
 
     // ── Built-in check: telemetry_log ──
