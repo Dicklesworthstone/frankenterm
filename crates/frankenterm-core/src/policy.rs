@@ -31,6 +31,7 @@ use crate::config::{
     CommandGateConfig, DcgDenyPolicy, DcgMode, PolicyRule, PolicyRuleDecision, PolicyRuleMatch,
     PolicyRulesConfig,
 };
+use crate::identity_graph::{AuthAction, PrincipalId, PrincipalKind, ResourceId, ResourceKind};
 use crate::trauma_guard::TraumaDecision;
 // ============================================================================
 // Action Kinds
@@ -179,6 +180,35 @@ impl ActionKind {
             Self::ConnectorCredentialAction => "connector_credential_action",
         }
     }
+
+    /// Map a policy action onto the coarse least-privilege action used by the
+    /// identity graph.
+    #[must_use]
+    pub fn auth_action(&self) -> AuthAction {
+        match self {
+            Self::ReadOutput | Self::SearchOutput => AuthAction::Read,
+            Self::Spawn | Self::Split => AuthAction::Create,
+            Self::Close | Self::DeleteFile => AuthAction::Delete,
+            Self::Activate
+            | Self::BrowserAuth
+            | Self::WorkflowRun
+            | Self::ExecCommand
+            | Self::ConnectorTriggerWorkflow => AuthAction::Execute,
+            Self::ConnectorCredentialAction => AuthAction::Admin,
+            Self::SendText
+            | Self::SendCtrlC
+            | Self::SendCtrlD
+            | Self::SendCtrlZ
+            | Self::SendControl
+            | Self::ReservePane
+            | Self::ReleasePane
+            | Self::WriteFile
+            | Self::ConnectorNotify
+            | Self::ConnectorTicket
+            | Self::ConnectorAuditLog
+            | Self::ConnectorInvoke => AuthAction::Write,
+        }
+    }
 }
 
 // ============================================================================
@@ -214,6 +244,17 @@ impl ActorKind {
             Self::Robot => "robot",
             Self::Mcp => "mcp",
             Self::Workflow => "workflow",
+        }
+    }
+
+    /// Map policy actors to the corresponding identity-graph principal kind.
+    #[must_use]
+    pub const fn principal_kind(&self) -> PrincipalKind {
+        match self {
+            Self::Human => PrincipalKind::Human,
+            Self::Robot => PrincipalKind::Agent,
+            Self::Mcp => PrincipalKind::Mcp,
+            Self::Workflow => PrincipalKind::Workflow,
         }
     }
 }
@@ -273,6 +314,78 @@ impl PolicySurface {
             ActorKind::Mcp => Self::Mcp,
             ActorKind::Workflow => Self::Workflow,
         }
+    }
+}
+
+fn scoped_identity_id(domain: Option<&str>, local_id: impl std::fmt::Display) -> String {
+    match domain {
+        Some(domain) if !domain.is_empty() => format!("{domain}:{local_id}"),
+        _ => local_id.to_string(),
+    }
+}
+
+fn derive_identity_principal(
+    actor: ActorKind,
+    workflow_id: Option<&str>,
+    actor_id: Option<&str>,
+) -> PrincipalId {
+    let principal_id = actor_id
+        .map(str::to_owned)
+        .or_else(|| {
+            if actor == ActorKind::Workflow {
+                workflow_id.map(str::to_owned)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| actor.as_str().to_string());
+
+    match actor {
+        ActorKind::Human => PrincipalId::human(principal_id),
+        ActorKind::Robot => PrincipalId::agent(principal_id),
+        ActorKind::Mcp => PrincipalId::new(PrincipalKind::Mcp, principal_id),
+        ActorKind::Workflow => PrincipalId::workflow(principal_id),
+    }
+}
+
+fn derive_identity_resource(
+    action: ActionKind,
+    pane_id: Option<u64>,
+    domain: Option<&str>,
+    workflow_id: Option<&str>,
+) -> ResourceId {
+    if let Some(pane_id) = pane_id {
+        return ResourceId::pane(scoped_identity_id(domain, pane_id));
+    }
+
+    if action == ActionKind::WorkflowRun {
+        return ResourceId::new(
+            ResourceKind::Workflow,
+            workflow_id.unwrap_or("*").to_string(),
+        );
+    }
+
+    match action {
+        ActionKind::WriteFile | ActionKind::DeleteFile => {
+            ResourceId::new(ResourceKind::File, scoped_identity_id(domain, "*"))
+        }
+        ActionKind::ConnectorCredentialAction => {
+            ResourceId::credential(scoped_identity_id(domain, "*"))
+        }
+        ActionKind::BrowserAuth | ActionKind::ExecCommand => {
+            ResourceId::new(ResourceKind::Capability, action.as_str())
+        }
+        ActionKind::ConnectorNotify
+        | ActionKind::ConnectorTicket
+        | ActionKind::ConnectorTriggerWorkflow
+        | ActionKind::ConnectorAuditLog
+        | ActionKind::ConnectorInvoke => ResourceId::new(
+            ResourceKind::Capability,
+            scoped_identity_id(domain, "connector"),
+        ),
+        _ => domain
+            .map(|domain| ResourceId::session(domain.to_string()))
+            .unwrap_or_else(ResourceId::fleet),
     }
 }
 
@@ -501,6 +614,29 @@ impl DecisionContext {
             key: key.into(),
             value: value.into(),
         });
+    }
+
+    /// Derive the requesting principal identity for least-privilege checks.
+    #[must_use]
+    pub fn identity_principal(&self, actor_id: Option<&str>) -> PrincipalId {
+        derive_identity_principal(self.actor, self.workflow_id.as_deref(), actor_id)
+    }
+
+    /// Derive the target resource identity for least-privilege checks.
+    #[must_use]
+    pub fn identity_resource(&self) -> ResourceId {
+        derive_identity_resource(
+            self.action,
+            self.pane_id,
+            self.domain.as_deref(),
+            self.workflow_id.as_deref(),
+        )
+    }
+
+    /// Derive the coarse authorization action used by the identity graph.
+    #[must_use]
+    pub fn identity_action(&self) -> AuthAction {
+        self.action.auth_action()
     }
 }
 
@@ -1125,6 +1261,29 @@ impl PolicyInput {
         self.agent_type = Some(agent_type.into());
         self
     }
+
+    /// Derive the requesting principal identity for least-privilege checks.
+    #[must_use]
+    pub fn identity_principal(&self, actor_id: Option<&str>) -> PrincipalId {
+        derive_identity_principal(self.actor, self.workflow_id.as_deref(), actor_id)
+    }
+
+    /// Derive the target resource identity for least-privilege checks.
+    #[must_use]
+    pub fn identity_resource(&self) -> ResourceId {
+        derive_identity_resource(
+            self.action,
+            self.pane_id,
+            self.domain.as_deref(),
+            self.workflow_id.as_deref(),
+        )
+    }
+
+    /// Derive the coarse authorization action used by the identity graph.
+    #[must_use]
+    pub fn identity_action(&self) -> AuthAction {
+        self.action.auth_action()
+    }
 }
 
 fn now_ms() -> i64 {
@@ -1175,6 +1334,12 @@ impl DecisionContext {
         );
         ctx.add_evidence("is_reserved", input.capabilities.is_reserved.to_string());
         ctx.add_evidence("surface", input.surface.as_str());
+        let identity_principal = input.identity_principal(None);
+        let identity_resource = input.identity_resource();
+        let identity_action = input.identity_action();
+        ctx.add_evidence("identity_principal", identity_principal.stable_key());
+        ctx.add_evidence("identity_resource", identity_resource.stable_key());
+        ctx.add_evidence("identity_action", identity_action.as_str().to_string());
         if let Some(reserved_by) = &input.capabilities.reserved_by {
             ctx.add_evidence("reserved_by", reserved_by.clone());
         }
@@ -1202,6 +1367,29 @@ impl DecisionContext {
 
         ctx
     }
+}
+
+/// Parse a serialized decision context emitted in audit records.
+#[must_use]
+pub fn parse_serialized_decision_context(serialized: Option<&str>) -> Option<DecisionContext> {
+    serde_json::from_str(serialized?).ok()
+}
+
+/// Extract the best-known policy surface from serialized decision context.
+///
+/// This prefers typed [`DecisionContext`] payloads but tolerates older audit
+/// records that only stored a raw JSON object with a `"surface"` field.
+#[must_use]
+pub fn parse_serialized_decision_surface(serialized: Option<&str>) -> Option<PolicySurface> {
+    parse_serialized_decision_context(serialized)
+        .map(|context| context.surface)
+        .or_else(|| {
+            let surface = serde_json::from_str::<serde_json::Value>(serialized?)
+                .ok()?
+                .get("surface")
+                .cloned()?;
+            serde_json::from_value(surface).ok()
+        })
 }
 
 /// Rolling window for rate limiting
@@ -7217,6 +7405,45 @@ mod tests {
         assert_eq!(ctx2.risk.as_ref().unwrap().score, 0);
     }
 
+    #[test]
+    fn parse_serialized_decision_context_roundtrips_typed_payload() {
+        let mut ctx = DecisionContext::empty();
+        ctx.surface = PolicySurface::Workflow;
+        ctx.action = ActionKind::SendText;
+        ctx.actor = ActorKind::Workflow;
+        ctx.workflow_id = Some("wf-123".to_string());
+
+        let serialized = serde_json::to_string(&ctx).unwrap();
+        let parsed = parse_serialized_decision_context(Some(&serialized)).unwrap();
+
+        assert_eq!(parsed.surface, PolicySurface::Workflow);
+        assert_eq!(parsed.action, ActionKind::SendText);
+        assert_eq!(parsed.actor, ActorKind::Workflow);
+        assert_eq!(parsed.workflow_id.as_deref(), Some("wf-123"));
+    }
+
+    #[test]
+    fn parse_serialized_decision_surface_accepts_typed_and_legacy_payloads() {
+        let mut ctx = DecisionContext::empty();
+        ctx.surface = PolicySurface::Mux;
+        let typed = serde_json::to_string(&ctx).unwrap();
+
+        assert_eq!(
+            parse_serialized_decision_surface(Some(&typed)),
+            Some(PolicySurface::Mux)
+        );
+        assert_eq!(
+            parse_serialized_decision_surface(Some(r#"{"surface":"workflow"}"#)),
+            Some(PolicySurface::Workflow)
+        );
+        assert_eq!(
+            parse_serialized_decision_surface(Some(r#"{"other":1}"#)),
+            None
+        );
+        assert_eq!(parse_serialized_decision_surface(Some("{not json")), None);
+        assert_eq!(parse_serialized_decision_surface(None), None);
+    }
+
     // =========================================================================
     // Batch: DarkBadger wa-1u90p.7.1 — trait & edge coverage
     // =========================================================================
@@ -7412,6 +7639,91 @@ mod tests {
 
         let human = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Human);
         assert_eq!(human.surface, PolicySurface::Unknown);
+    }
+
+    #[test]
+    fn action_kind_identity_action_mapping_is_stable() {
+        assert_eq!(ActionKind::ReadOutput.auth_action(), AuthAction::Read);
+        assert_eq!(ActionKind::SendText.auth_action(), AuthAction::Write);
+        assert_eq!(ActionKind::Spawn.auth_action(), AuthAction::Create);
+        assert_eq!(ActionKind::Close.auth_action(), AuthAction::Delete);
+        assert_eq!(
+            ActionKind::ConnectorCredentialAction.auth_action(),
+            AuthAction::Admin
+        );
+    }
+
+    #[test]
+    fn policy_input_identity_mapping_prefers_specific_ids_and_scopes_panes() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Workflow)
+            .with_workflow("wf-123")
+            .with_domain("local")
+            .with_pane(42);
+
+        assert_eq!(
+            input.identity_principal(None).stable_key(),
+            "workflow:wf-123"
+        );
+        assert_eq!(input.identity_resource().stable_key(), "pane:local:42");
+        assert_eq!(input.identity_action(), AuthAction::Write);
+
+        let robot = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Robot);
+        assert_eq!(
+            robot.identity_principal(Some("codex-agent-7")).stable_key(),
+            "agent:codex-agent-7"
+        );
+        assert_eq!(
+            robot.identity_resource().stable_key(),
+            "capability:exec_command"
+        );
+        assert_eq!(robot.identity_action(), AuthAction::Execute);
+    }
+
+    #[test]
+    fn decision_context_from_input_records_identity_evidence() {
+        let input = PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Workflow)
+            .with_workflow("wf-run-9");
+
+        let context = DecisionContext::from_input(&input);
+        let identity_principal = context
+            .evidence
+            .iter()
+            .find(|entry| entry.key == "identity_principal")
+            .map(|entry| entry.value.as_str());
+        let identity_resource = context
+            .evidence
+            .iter()
+            .find(|entry| entry.key == "identity_resource")
+            .map(|entry| entry.value.as_str());
+        let identity_action = context
+            .evidence
+            .iter()
+            .find(|entry| entry.key == "identity_action")
+            .map(|entry| entry.value.as_str());
+
+        assert_eq!(identity_principal, Some("workflow:wf-run-9"));
+        assert_eq!(identity_resource, Some("workflow:wf-run-9"));
+        assert_eq!(identity_action, Some("execute"));
+    }
+
+    #[test]
+    fn decision_context_identity_principal_uses_supplied_actor_id() {
+        let mut context = DecisionContext::empty();
+        context.actor = ActorKind::Mcp;
+        context.action = ActionKind::ConnectorCredentialAction;
+        context.domain = Some("slack".to_string());
+
+        assert_eq!(
+            context
+                .identity_principal(Some("remote-admin"))
+                .stable_key(),
+            "mcp:remote-admin"
+        );
+        assert_eq!(
+            context.identity_resource().stable_key(),
+            "credential:slack:*"
+        );
+        assert_eq!(context.identity_action(), AuthAction::Admin);
     }
 
     // --- RiskCategory ---
