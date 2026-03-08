@@ -410,9 +410,48 @@ struct RedactedAudit {
     pane_id: Option<u64>,
     input_summary: Option<String>,
     decision_reason: Option<String>,
+    decision_context: Option<serde_json::Value>,
 }
 
-fn redact_audit(action: crate::storage::AuditActionRecord, redactor: &Redactor) -> RedactedAudit {
+fn redact_json_value(value: &mut serde_json::Value, redactor: &Redactor) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = redactor.redact(text);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_value(item, redactor);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values_mut() {
+                redact_json_value(value, redactor);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn redact_decision_context(
+    decision_context: Option<String>,
+    redactor: &Redactor,
+) -> Option<serde_json::Value> {
+    let raw = decision_context?;
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(mut value) => {
+            redact_json_value(&mut value, redactor);
+            Some(value)
+        }
+        Err(_) => Some(serde_json::Value::String(redactor.redact(&raw))),
+    }
+}
+
+fn redact_audit(
+    mut action: crate::storage::AuditActionRecord,
+    redactor: &Redactor,
+) -> RedactedAudit {
+    let decision_context = redact_decision_context(action.decision_context.take(), redactor);
+    action.redact_fields(redactor);
     RedactedAudit {
         id: action.id,
         ts: action.ts,
@@ -421,8 +460,9 @@ fn redact_audit(action: crate::storage::AuditActionRecord, redactor: &Redactor) 
         policy_decision: action.policy_decision,
         result: action.result,
         pane_id: action.pane_id,
-        input_summary: action.input_summary.map(|s| redactor.redact(&s)),
-        decision_reason: action.decision_reason.map(|s| redactor.redact(&s)),
+        input_summary: action.input_summary,
+        decision_reason: action.decision_reason,
+        decision_context,
     }
 }
 
@@ -723,6 +763,16 @@ fn dir_size(path: &Path) -> u64 {
 mod tests {
     use super::*;
 
+    fn typed_decision_context_json(secret: &str) -> String {
+        let mut context = crate::policy::DecisionContext::empty();
+        context.action = crate::policy::ActionKind::SendText;
+        context.actor = crate::policy::ActorKind::Workflow;
+        context.surface = crate::policy::PolicySurface::Mux;
+        context.add_evidence("api_key", secret);
+        context.add_evidence("pane_title", "build");
+        serde_json::to_string(&context).expect("serialize decision context")
+    }
+
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
@@ -852,7 +902,9 @@ mod tests {
             rule_id: None,
             input_summary: Some("input data".to_string()),
             verification_summary: None,
-            decision_context: None,
+            decision_context: Some(typed_decision_context_json(
+                "sk-abc123def456ghi789jkl012mno345pqr678stu901v",
+            )),
             result: "ok".to_string(),
         };
 
@@ -860,6 +912,22 @@ mod tests {
         let reason = redacted.decision_reason.unwrap();
         assert!(reason.contains("[REDACTED]"));
         assert!(!reason.contains("sk-abc123"));
+        let context = redacted
+            .decision_context
+            .expect("decision context should be preserved");
+        assert_eq!(context.get("surface").and_then(|v| v.as_str()), Some("mux"));
+        let evidence = context
+            .get("evidence")
+            .and_then(|v| v.as_array())
+            .expect("evidence should serialize as array");
+        let api_key = evidence
+            .iter()
+            .find(|entry| entry.get("key").and_then(|v| v.as_str()) == Some("api_key"))
+            .and_then(|entry| entry.get("value"))
+            .and_then(|v| v.as_str())
+            .expect("api_key evidence should be preserved");
+        assert!(api_key.contains("[REDACTED]"));
+        assert!(!api_key.contains("sk-abc123"));
     }
 
     #[test]
@@ -1142,7 +1210,9 @@ mod tests {
                 rule_id: None,
                 input_summary: None,
                 verification_summary: None,
-                decision_context: None,
+                decision_context: Some(typed_decision_context_json(
+                    "sk-abc123def456ghi789jkl012mno345pqr678stu901v",
+                )),
                 result: "ok".to_string(),
             };
             storage.record_audit_action(action).await.unwrap();
@@ -1183,6 +1253,23 @@ mod tests {
             // Verify the audit file exists and has [REDACTED]
             let audit_content = fs::read_to_string(output_dir.join("recent_audit.json")).unwrap();
             assert!(audit_content.contains("[REDACTED]"));
+            let audit_json: serde_json::Value =
+                serde_json::from_str(&audit_content).expect("recent audit should parse");
+            assert_eq!(
+                audit_json[0]["decision_context"]["surface"].as_str(),
+                Some("mux")
+            );
+            let api_key = audit_json[0]["decision_context"]["evidence"]
+                .as_array()
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|entry| entry["key"].as_str() == Some("api_key"))
+                })
+                .and_then(|entry| entry["value"].as_str())
+                .expect("redacted decision-context evidence should be present");
+            assert!(api_key.contains("[REDACTED]"));
+            assert!(!api_key.contains(secret));
 
             storage.shutdown().await.unwrap();
             let _ = fs::remove_file(&tmp);
@@ -1936,6 +2023,7 @@ mod tests {
         assert!(redacted.pane_id.is_none());
         assert!(redacted.input_summary.is_none());
         assert!(redacted.decision_reason.is_none());
+        assert!(redacted.decision_context.is_none());
     }
 
     #[test]
@@ -1985,13 +2073,14 @@ mod tests {
             rule_id: None,
             input_summary: None,
             verification_summary: None,
-            decision_context: None,
+            decision_context: Some(typed_decision_context_json("sk-abc123def456ghi789")),
             result: "blocked".to_string(),
         };
         let redacted = redact_audit(action, &redactor);
         let json = serde_json::to_string(&redacted).expect("serialize");
         assert!(json.contains("\"policy_decision\":\"deny\""));
         assert!(json.contains("\"result\":\"blocked\""));
+        assert!(json.contains("\"decision_context\""));
     }
 
     // ---------------------------------------------------------------
