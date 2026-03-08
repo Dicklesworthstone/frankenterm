@@ -1376,3 +1376,100 @@ impl GlyphCache {
         self.line_sprite(key, metrics)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_glyph_cache() -> (GlyphCache, RenderMetrics) {
+        config::use_test_configuration();
+
+        let dpi = config::configuration()
+            .dpi
+            .unwrap_or_else(|| ::window::default_dpi()) as usize;
+        let fonts = Rc::new(FontConfiguration::new(None, dpi).unwrap());
+        let metrics = RenderMetrics::new(&fonts).unwrap();
+        let cache = GlyphCache::new_in_memory(&fonts, 128).unwrap();
+
+        (cache, metrics)
+    }
+
+    #[test]
+    fn cached_color_reuses_sprite_for_identical_rgba() {
+        let (mut cache, _) = test_glyph_cache();
+
+        let first = cache
+            .cached_color(RgbColor::new_8bpc(0x12, 0x34, 0x56), 0.5)
+            .unwrap();
+        let second = cache
+            .cached_color(RgbColor::new_8bpc(0x12, 0x34, 0x56), 0.5)
+            .unwrap();
+
+        assert_eq!(cache.color.len(), 1);
+        assert_eq!(first.coords, second.coords);
+        assert!(Rc::ptr_eq(&first.texture, &second.texture));
+    }
+
+    #[test]
+    fn cached_color_distinguishes_alpha_variants() {
+        let (mut cache, _) = test_glyph_cache();
+
+        let opaque = cache
+            .cached_color(RgbColor::new_8bpc(0xaa, 0xbb, 0xcc), 1.0)
+            .unwrap();
+        let translucent = cache
+            .cached_color(RgbColor::new_8bpc(0xaa, 0xbb, 0xcc), 0.25)
+            .unwrap();
+
+        assert_eq!(cache.color.len(), 2);
+        assert_ne!(opaque.coords, translucent.coords);
+    }
+
+    #[test]
+    fn cached_line_sprite_promotes_hyperlink_without_underline_to_single() {
+        let (mut cache, metrics) = test_glyph_cache();
+
+        let hyperlink = cache
+            .cached_line_sprite(true, false, Underline::None, false, &metrics)
+            .unwrap();
+        let plain_single = cache
+            .cached_line_sprite(false, false, Underline::Single, false, &metrics)
+            .unwrap();
+
+        assert_eq!(cache.line_glyphs.len(), 1);
+        assert_eq!(hyperlink.coords, plain_single.coords);
+        assert!(Rc::ptr_eq(&hyperlink.texture, &plain_single.texture));
+    }
+
+    #[test]
+    fn cached_line_sprite_promotes_hyperlink_single_to_double() {
+        let (mut cache, metrics) = test_glyph_cache();
+
+        let hyperlink = cache
+            .cached_line_sprite(true, false, Underline::Single, false, &metrics)
+            .unwrap();
+        let plain_double = cache
+            .cached_line_sprite(false, false, Underline::Double, false, &metrics)
+            .unwrap();
+
+        assert_eq!(cache.line_glyphs.len(), 1);
+        assert_eq!(hyperlink.coords, plain_double.coords);
+        assert!(Rc::ptr_eq(&hyperlink.texture, &plain_double.texture));
+    }
+
+    #[test]
+    fn cached_block_reuses_sprite_for_same_shape_and_metrics() {
+        let (mut cache, metrics) = test_glyph_cache();
+
+        let first = cache
+            .cached_block(BlockKey::CellDiagonals(CellDiagonal::UPPER_LEFT), &metrics)
+            .unwrap();
+        let second = cache
+            .cached_block(BlockKey::CellDiagonals(CellDiagonal::UPPER_LEFT), &metrics)
+            .unwrap();
+
+        assert_eq!(cache.block_glyphs.len(), 1);
+        assert_eq!(first.coords, second.coords);
+        assert!(Rc::ptr_eq(&first.texture, &second.texture));
+    }
+}
