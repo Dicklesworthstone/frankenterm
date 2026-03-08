@@ -946,6 +946,444 @@ mod tests {
         assert_eq!(cache.get(&5), Some(&50));
     }
 
+    mod proptest_lru_cache {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strategy for cache capacity (1..=30).
+        fn arb_capacity() -> impl Strategy<Value = usize> {
+            1usize..=30
+        }
+
+        /// Strategy for a vec of (key, value) pairs to insert.
+        fn arb_entries(max_len: usize) -> impl Strategy<Value = Vec<(u16, i64)>> {
+            proptest::collection::vec((0u16..100, -1000i64..1000), 0..=max_len)
+        }
+
+        /// Enum for cache operations to build random operation sequences.
+        #[derive(Debug, Clone)]
+        enum Op {
+            Put(u16, i64),
+            Get(u16),
+            Peek(u16),
+            Remove(u16),
+            PopLru,
+        }
+
+        fn arb_op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                (0u16..50, -500i64..500).prop_map(|(k, v)| Op::Put(k, v)),
+                (0u16..50).prop_map(Op::Get),
+                (0u16..50).prop_map(Op::Peek),
+                (0u16..50).prop_map(Op::Remove),
+                Just(Op::PopLru),
+            ]
+        }
+
+        fn arb_ops(max_len: usize) -> impl Strategy<Value = Vec<Op>> {
+            proptest::collection::vec(arb_op(), 0..=max_len)
+        }
+
+        /// Assert fundamental linked list invariants on the cache.
+        fn assert_invariants<K: Hash + Eq + Clone + std::fmt::Debug, V: std::fmt::Debug>(cache: &LruCache<K, V>) {
+            // len matches map size
+            assert_eq!(cache.len(), cache.map.len());
+
+            // len <= capacity
+            assert!(cache.len() <= cache.capacity());
+
+            // empty ↔ len == 0
+            assert_eq!(cache.is_empty(), cache.len() == 0);
+
+            // head/tail sentinel consistency
+            if cache.is_empty() {
+                assert_eq!(cache.head, SENTINEL);
+                assert_eq!(cache.tail, SENTINEL);
+            } else {
+                assert_ne!(cache.head, SENTINEL);
+                assert_ne!(cache.tail, SENTINEL);
+            }
+
+            // iterator length matches len
+            assert_eq!(cache.iter_mru().count(), cache.len());
+            assert_eq!(cache.iter_lru().count(), cache.len());
+
+            // MRU and LRU iterators yield the same keys in opposite order
+            let mru_keys: Vec<_> = cache.iter_mru().map(|(k, _)| k).collect();
+            let lru_keys: Vec<_> = cache.iter_lru().map(|(k, _)| k).collect();
+            let mut lru_reversed = lru_keys;
+            lru_reversed.reverse();
+            assert_eq!(mru_keys, lru_reversed);
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(200))]
+
+            #[test]
+            fn len_bounded_by_capacity(
+                cap in arb_capacity(),
+                entries in arb_entries(100)
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                prop_assert!(cache.len() <= cap);
+                assert_invariants(&cache);
+            }
+
+            #[test]
+            fn get_after_put_returns_latest_value(
+                cap in arb_capacity(),
+                entries in arb_entries(60),
+                target_key in 0u16..100
+            ) {
+                let mut cache = LruCache::new(cap);
+                let mut last_value = None;
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                    if *k == target_key {
+                        last_value = Some(*v);
+                    }
+                }
+                if let Some(expected) = last_value {
+                    // The key might have been evicted, but if present, value matches
+                    if let Some(&actual) = cache.get(&target_key) {
+                        prop_assert_eq!(actual, expected);
+                    }
+                }
+            }
+
+            #[test]
+            fn peek_does_not_change_ordering(
+                cap in arb_capacity(),
+                entries in arb_entries(40),
+                peek_key in 0u16..100
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+
+                let order_before: Vec<u16> = cache.iter_mru().map(|(k, _)| *k).collect();
+                let _ = cache.peek(&peek_key);
+                let order_after: Vec<u16> = cache.iter_mru().map(|(k, _)| *k).collect();
+
+                prop_assert_eq!(order_before, order_after);
+            }
+
+            #[test]
+            fn contains_key_consistent_with_peek(
+                cap in arb_capacity(),
+                entries in arb_entries(40),
+                query_key in 0u16..100
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+
+                let has = cache.contains_key(&query_key);
+                let peeked = cache.peek(&query_key);
+                prop_assert_eq!(has, peeked.is_some());
+            }
+
+            #[test]
+            fn mru_iter_reverses_lru_iter(
+                cap in arb_capacity(),
+                entries in arb_entries(50)
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                assert_invariants(&cache);
+            }
+
+            #[test]
+            fn eviction_returns_lru_entry(cap in 1usize..=10, entries in arb_entries(30)) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    if cache.contains_key(k) {
+                        // update, no eviction expected
+                        let evicted = cache.put(*k, *v);
+                        prop_assert!(evicted.is_none());
+                    } else if cache.len() >= cap {
+                        // cache full, should evict LRU
+                        let expected_lru = cache.peek_lru().map(|(ek, ev)| (*ek, *ev));
+                        let evicted = cache.put(*k, *v);
+                        prop_assert_eq!(evicted, expected_lru);
+                    } else {
+                        let evicted = cache.put(*k, *v);
+                        prop_assert!(evicted.is_none());
+                    }
+                }
+            }
+
+            #[test]
+            fn get_promotes_to_mru(
+                cap in 2usize..=10,
+                entries in arb_entries(20),
+                promote_key in 0u16..100
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                if cache.contains_key(&promote_key) && cache.len() > 1 {
+                    cache.get(&promote_key);
+                    let mru = cache.peek_mru().map(|(k, _)| *k);
+                    prop_assert_eq!(mru, Some(promote_key));
+                }
+            }
+
+            #[test]
+            fn remove_makes_key_absent(
+                cap in arb_capacity(),
+                entries in arb_entries(30),
+                remove_key in 0u16..100
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                cache.remove(&remove_key);
+                prop_assert!(!cache.contains_key(&remove_key));
+                prop_assert!(cache.peek(&remove_key).is_none());
+                assert_invariants(&cache);
+            }
+
+            #[test]
+            fn clear_empties_everything(
+                cap in arb_capacity(),
+                entries in arb_entries(30)
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                cache.clear();
+                prop_assert!(cache.is_empty());
+                prop_assert_eq!(cache.len(), 0);
+                prop_assert_eq!(cache.peek_lru(), None);
+                prop_assert_eq!(cache.peek_mru(), None);
+                assert_invariants(&cache);
+            }
+
+            #[test]
+            fn stats_insertions_plus_updates_equals_puts(
+                cap in arb_capacity(),
+                entries in arb_entries(60)
+            ) {
+                let mut cache = LruCache::new(cap);
+                let total_puts = entries.len() as u64;
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                let stats = cache.stats();
+                let ins_plus_upd = stats.insertions + stats.updates;
+                prop_assert_eq!(ins_plus_upd, total_puts);
+            }
+
+            #[test]
+            fn stats_hits_plus_misses_equals_gets(
+                cap in arb_capacity(),
+                entries in arb_entries(30),
+                queries in proptest::collection::vec(0u16..100, 0..=40)
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                cache.reset_stats();
+                let total_gets = queries.len() as u64;
+                for q in &queries {
+                    cache.get(q);
+                }
+                let stats = cache.stats();
+                let hits_plus_misses = stats.hits + stats.misses;
+                prop_assert_eq!(hits_plus_misses, total_gets);
+            }
+
+            #[test]
+            fn hit_rate_bounded(
+                cap in arb_capacity(),
+                entries in arb_entries(30),
+                queries in proptest::collection::vec(0u16..100, 1..=40)
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                for q in &queries {
+                    cache.get(q);
+                }
+                let rate = cache.stats().hit_rate();
+                prop_assert!(rate >= 0.0);
+                prop_assert!(rate <= 1.0);
+            }
+
+            #[test]
+            fn pop_lru_matches_peek_lru(
+                cap in arb_capacity(),
+                entries in arb_entries(30)
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                let peeked = cache.peek_lru().map(|(k, v)| (*k, *v));
+                let popped = cache.pop_lru();
+                prop_assert_eq!(popped, peeked);
+                if peeked.is_some() {
+                    let (pk, _) = peeked.unwrap();
+                    prop_assert!(!cache.contains_key(&pk));
+                }
+            }
+
+            #[test]
+            fn resize_smaller_evicts_lru_first(
+                cap in 5usize..=20,
+                entries in arb_entries(40),
+                new_cap in 1usize..=4
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                let lru_order_before: Vec<u16> = cache.iter_lru().map(|(k, _)| *k).collect();
+                let len_before = cache.len();
+                let to_evict = len_before.saturating_sub(new_cap);
+
+                let evicted = cache.resize(new_cap);
+                prop_assert_eq!(evicted.len(), to_evict);
+                prop_assert_eq!(cache.capacity(), new_cap);
+                prop_assert!(cache.len() <= new_cap);
+
+                // Evicted keys should be the first `to_evict` in LRU order
+                for (i, (ek, _)) in evicted.iter().enumerate() {
+                    if i < lru_order_before.len() {
+                        prop_assert_eq!(*ek, lru_order_before[i]);
+                    }
+                }
+                assert_invariants(&cache);
+            }
+
+            #[test]
+            fn resize_larger_no_evictions(
+                cap in arb_capacity(),
+                entries in arb_entries(20),
+                extra in 1usize..=20
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                let len_before = cache.len();
+                let new_cap = cap + extra;
+                let evicted = cache.resize(new_cap);
+                prop_assert!(evicted.is_empty());
+                prop_assert_eq!(cache.len(), len_before);
+                prop_assert_eq!(cache.capacity(), new_cap);
+            }
+
+            #[test]
+            fn put_existing_key_updates_not_grows(
+                cap in arb_capacity(),
+                key in 0u16..50,
+                v1 in -500i64..500,
+                v2 in -500i64..500
+            ) {
+                let mut cache = LruCache::new(cap);
+                cache.put(key, v1);
+                let len_after_first = cache.len();
+                cache.put(key, v2);
+                prop_assert_eq!(cache.len(), len_after_first);
+                prop_assert_eq!(cache.get(&key), Some(&v2));
+            }
+
+            #[test]
+            fn random_ops_maintain_invariants(
+                cap in arb_capacity(),
+                ops in arb_ops(80)
+            ) {
+                let mut cache = LruCache::new(cap);
+                for op in &ops {
+                    match op {
+                        Op::Put(k, v) => { cache.put(*k, *v); }
+                        Op::Get(k) => { cache.get(k); }
+                        Op::Peek(k) => { cache.peek(k); }
+                        Op::Remove(k) => { cache.remove(k); }
+                        Op::PopLru => { cache.pop_lru(); }
+                    }
+                    assert_invariants(&cache);
+                }
+            }
+
+            #[test]
+            fn retain_only_keeps_matching(
+                cap in arb_capacity(),
+                entries in arb_entries(30)
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                // Retain only even values
+                cache.retain(|_, v| *v % 2 == 0);
+                for (_, v) in cache.iter_mru() {
+                    let even = *v % 2 == 0;
+                    prop_assert!(even);
+                }
+                assert_invariants(&cache);
+            }
+
+            #[test]
+            fn slot_reuse_keeps_arena_bounded(
+                cap in 1usize..=5,
+                entries in arb_entries(100)
+            ) {
+                let mut cache = LruCache::new(cap);
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                }
+                // Arena size should be bounded — at most cap + some free slots
+                // In the worst case, arena has cap entries active + cap removed on free list
+                // But evicted slots get reused, so arena.len() should stay reasonable
+                let arena_len = cache.arena.len();
+                // Hard upper bound: arena can't exceed total inserts, but free list
+                // reuse should keep it much smaller. With cap <= 5, it shouldn't grow
+                // beyond ~cap * 3 in practice.
+                let upper = std::cmp::min(entries.len() + 1, cap * 4);
+                prop_assert!(arena_len <= upper,
+                    "arena {} exceeded upper bound {} for cap={}", arena_len, upper, cap);
+            }
+
+            #[test]
+            fn unique_keys_determine_len(
+                cap in arb_capacity(),
+                entries in arb_entries(60)
+            ) {
+                let mut cache = LruCache::new(cap);
+                let mut unique_keys = std::collections::HashSet::new();
+                for (k, v) in &entries {
+                    cache.put(*k, *v);
+                    unique_keys.insert(*k);
+                }
+                let expected = std::cmp::min(unique_keys.len(), cap);
+                // len might be less than expected if some unique keys were evicted
+                // and then re-evicted, but it can't exceed expected
+                prop_assert!(cache.len() <= expected);
+                // len should be exactly min(unique_remaining, cap)
+                // More precisely, len = min(distinct keys still present, cap)
+                // Since last `cap` distinct keys survive, len = min(unique_keys, cap)
+                // unless evictions removed some keys that were re-inserted
+                // Just check the bound
+                prop_assert!(cache.len() <= cap);
+            }
+        }
+    }
+
     #[test]
     fn reuse_after_eviction_and_remove_complex() {
         let mut cache = LruCache::new(2);

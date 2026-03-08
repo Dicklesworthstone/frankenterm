@@ -974,4 +974,287 @@ mod tests {
         assert_eq!(t.overwrites, 1);
         assert_eq!(t.clears, 1);
     }
+
+    // ── Proptest properties ──────────────────────────────────────────
+
+    mod proptest_ring_buffer {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Generate a capacity in [1, 50].
+        fn arb_capacity() -> impl Strategy<Value = usize> {
+            1usize..=50
+        }
+
+        /// Generate a sequence of push values.
+        fn arb_pushes(max_len: usize) -> impl Strategy<Value = Vec<i64>> {
+            proptest::collection::vec(-1000i64..1000i64, 0..=max_len)
+        }
+
+        proptest! {
+            /// len() is always <= capacity.
+            #[test]
+            fn len_never_exceeds_capacity(
+                cap in arb_capacity(),
+                items in arb_pushes(100)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items {
+                    rb.push(*item);
+                    prop_assert!(rb.len() <= rb.capacity());
+                }
+            }
+
+            /// After N pushes, len = min(N, capacity).
+            #[test]
+            fn len_is_min_of_pushes_and_capacity(
+                cap in arb_capacity(),
+                items in arb_pushes(100)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items {
+                    rb.push(*item);
+                }
+                let expected = items.len().min(cap);
+                prop_assert_eq!(rb.len(), expected);
+            }
+
+            /// total_pushed always equals number of push calls.
+            #[test]
+            fn total_pushed_tracks_all_pushes(
+                cap in arb_capacity(),
+                items in arb_pushes(100)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items {
+                    rb.push(*item);
+                }
+                prop_assert_eq!(rb.total_pushed(), items.len() as u64);
+            }
+
+            /// total_evicted = max(0, pushes - capacity).
+            #[test]
+            fn evicted_count_is_pushes_minus_capacity(
+                cap in arb_capacity(),
+                items in arb_pushes(100)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items {
+                    rb.push(*item);
+                }
+                let expected = items.len().saturating_sub(cap) as u64;
+                prop_assert_eq!(rb.total_evicted(), expected);
+            }
+
+            /// Iteration yields exactly the last min(N, cap) items in order.
+            #[test]
+            fn iter_yields_last_cap_items_in_order(
+                cap in arb_capacity(),
+                items in arb_pushes(100)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items {
+                    rb.push(*item);
+                }
+                let expected: Vec<i64> = if items.len() > cap {
+                    items[items.len() - cap..].to_vec()
+                } else {
+                    items.clone()
+                };
+                let actual: Vec<i64> = rb.iter().copied().collect();
+                prop_assert_eq!(actual, expected);
+            }
+
+            /// back() returns the most recently pushed item.
+            #[test]
+            fn back_is_most_recent(
+                cap in arb_capacity(),
+                items in proptest::collection::vec(-1000i64..1000i64, 1..=50)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items {
+                    rb.push(*item);
+                    prop_assert_eq!(rb.back(), Some(item));
+                }
+            }
+
+            /// front() returns the oldest surviving item.
+            #[test]
+            fn front_is_oldest_surviving(
+                cap in arb_capacity(),
+                items in proptest::collection::vec(-1000i64..1000i64, 1..=50)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items {
+                    rb.push(*item);
+                }
+                let expected_idx = if items.len() > cap { items.len() - cap } else { 0 };
+                prop_assert_eq!(rb.front(), Some(&items[expected_idx]));
+            }
+
+            /// get(i) is consistent with iter().
+            #[test]
+            fn get_consistent_with_iter(
+                cap in arb_capacity(),
+                items in arb_pushes(50)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items {
+                    rb.push(*item);
+                }
+                let from_iter: Vec<&i64> = rb.iter().collect();
+                for (i, expected) in from_iter.iter().enumerate() {
+                    prop_assert_eq!(rb.get(i), Some(*expected));
+                }
+                // Out of bounds
+                prop_assert_eq!(rb.get(rb.len()), None);
+            }
+
+            /// drain() returns items in oldest-to-newest order and empties buffer.
+            #[test]
+            fn drain_returns_ordered_and_empties(
+                cap in arb_capacity(),
+                items in arb_pushes(50)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items {
+                    rb.push(*item);
+                }
+                let from_iter: Vec<i64> = rb.iter().copied().collect();
+                let drained = rb.drain();
+                prop_assert_eq!(drained, from_iter);
+                prop_assert!(rb.is_empty());
+                prop_assert_eq!(rb.len(), 0);
+            }
+
+            /// Push after clear works correctly.
+            #[test]
+            fn push_after_clear_works(
+                cap in arb_capacity(),
+                items1 in arb_pushes(30),
+                items2 in arb_pushes(30)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items1 {
+                    rb.push(*item);
+                }
+                rb.clear();
+                for item in &items2 {
+                    rb.push(*item);
+                }
+                let expected: Vec<i64> = if items2.len() > cap {
+                    items2[items2.len() - cap..].to_vec()
+                } else {
+                    items2.clone()
+                };
+                let actual: Vec<i64> = rb.iter().copied().collect();
+                prop_assert_eq!(actual, expected);
+            }
+
+            /// Push returns the evicted item (or None if not full).
+            #[test]
+            fn push_returns_correct_evicted(
+                cap in arb_capacity(),
+                items in proptest::collection::vec(-1000i64..1000i64, 1..=80)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                let mut all_items: Vec<i64> = Vec::new();
+                for (i, item) in items.iter().enumerate() {
+                    let evicted = rb.push(*item);
+                    if i < cap {
+                        prop_assert_eq!(evicted, None);
+                    } else {
+                        prop_assert_eq!(evicted, Some(all_items[i - cap]));
+                    }
+                    all_items.push(*item);
+                }
+            }
+
+            /// is_full and is_empty are mutually consistent.
+            #[test]
+            fn full_empty_consistent(
+                cap in arb_capacity(),
+                items in arb_pushes(50)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items {
+                    rb.push(*item);
+                }
+                if rb.len() == 0 {
+                    prop_assert!(rb.is_empty());
+                    let check = !rb.is_full();
+                    prop_assert!(check);
+                } else if rb.len() == rb.capacity() {
+                    let check = !rb.is_empty();
+                    prop_assert!(check);
+                    prop_assert!(rb.is_full());
+                } else {
+                    let check1 = !rb.is_empty();
+                    let check2 = !rb.is_full();
+                    prop_assert!(check1);
+                    prop_assert!(check2);
+                }
+            }
+
+            /// Telemetry counters are consistent with operations.
+            #[test]
+            fn telemetry_consistent(
+                cap in arb_capacity(),
+                items in arb_pushes(50),
+                clear_after in proptest::bool::ANY,
+                drain_after in proptest::bool::ANY,
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items {
+                    rb.push(*item);
+                }
+                if clear_after {
+                    rb.clear();
+                }
+                if drain_after {
+                    let _ = rb.drain();
+                }
+                let t = rb.telemetry();
+                prop_assert_eq!(t.pushes, items.len() as u64);
+                let expected_overwrites = items.len().saturating_sub(cap) as u64;
+                prop_assert_eq!(t.overwrites, expected_overwrites);
+                let expected_clears = if clear_after { 1u64 } else { 0 };
+                prop_assert_eq!(t.clears, expected_clears);
+                let expected_drains = if drain_after { 1u64 } else { 0 };
+                prop_assert_eq!(t.drains, expected_drains);
+            }
+
+            /// Stats fill_ratio is in [0.0, 1.0].
+            #[test]
+            fn fill_ratio_bounded(
+                cap in arb_capacity(),
+                items in arb_pushes(50)
+            ) {
+                let mut rb = RingBuffer::new(cap);
+                for item in &items {
+                    rb.push(*item);
+                }
+                let s = rb.stats();
+                prop_assert!(s.fill_ratio >= 0.0);
+                prop_assert!(s.fill_ratio <= 1.0);
+            }
+
+            /// Telemetry snapshot serde roundtrip.
+            #[test]
+            fn telemetry_snapshot_serde(
+                pushes in 0u64..1000,
+                overwrites in 0u64..1000,
+                clears in 0u64..100,
+                drains in 0u64..100,
+                items_drained in 0u64..1000,
+            ) {
+                let snap = RingBufferTelemetrySnapshot {
+                    pushes, overwrites, clears, drains, items_drained,
+                };
+                let json = serde_json::to_string(&snap).unwrap();
+                let back: RingBufferTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(snap, back);
+            }
+        }
+    }
 }
