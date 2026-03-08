@@ -3101,7 +3101,7 @@ pub fn execute_commit_phase(
                 failed += 1;
                 failure_seen = true;
                 failure_boundary = Some(step.step_id.0.clone());
-                report_error_code = input.error_code.clone();
+                report_error_code.clone_from(&input.error_code);
                 (
                     TxCommitStepOutcome::Failed {
                         reason_code: input.reason_code.clone(),
@@ -3248,7 +3248,7 @@ pub fn execute_compensation_phase(
             } else {
                 failed_count += 1;
                 failure_seen = true;
-                report_error_code = input.error_code.clone();
+                report_error_code.clone_from(&input.error_code);
                 (
                     "failed",
                     input.reason_code.clone(),
