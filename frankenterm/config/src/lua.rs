@@ -4,7 +4,7 @@ use crate::{
     Config, FontAttributes, FontStretch, FontStyle, FontWeight, FreeTypeLoadTarget, RgbaColor,
     TextStyle,
 };
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use frankenterm_dynamic::{
     FromDynamic, FromDynamicOptions, ToDynamic, UnknownFieldAction, Value as DynValue,
 };
@@ -675,7 +675,7 @@ fn exec_domain<'lua>(
         Some(_) => {
             return Err(mlua::Error::external(
                 "label function parameter must be either a string or a lua function",
-            ))
+            ));
         }
         None => None,
     };
@@ -749,7 +749,15 @@ const IS_EVENT: &str = "wezterm-is-event-emission";
 /// Returns true if the current lua context is being called as part
 /// of an emit_event call.
 pub fn is_event_emission<'lua>(lua: &'lua Lua) -> mlua::Result<bool> {
-    lua.named_registry_value(IS_EVENT)
+    match lua.named_registry_value(IS_EVENT)? {
+        Value::Nil => Ok(false),
+        Value::Boolean(value) => Ok(value),
+        value => Err(mlua::Error::external(anyhow!(
+            "registry key for {} has invalid type {}",
+            IS_EVENT,
+            value.type_name()
+        ))),
+    }
 }
 
 /// This implements `wezterm.emit`.
@@ -768,18 +776,21 @@ pub async fn emit_event<'lua>(
     lua: &'lua Lua,
     (name, args): (String, mlua::MultiValue<'lua>),
 ) -> mlua::Result<bool> {
+    let was_emitting = is_event_emission(lua)?;
     lua.set_named_registry_value(IS_EVENT, true)?;
 
     let decorated_name = format!("wezterm-event-{}", name);
     let tbl: mlua::Value = lua.named_registry_value(&decorated_name)?;
-    match tbl {
+    let result = match tbl {
         mlua::Value::Table(tbl) => {
             for func in tbl.sequence_values::<mlua::Function>() {
                 let func = func?;
                 match func.call_async(args.clone()).await? {
                     mlua::Value::Boolean(b) if !b => {
                         // Default action prevented
-                        return Ok(false);
+                        return lua
+                            .set_named_registry_value(IS_EVENT, was_emitting)
+                            .and(Ok(false));
                     }
                     _ => {
                         // Continue with other handlers
@@ -789,6 +800,12 @@ pub async fn emit_event<'lua>(
             Ok(true)
         }
         _ => Ok(true),
+    };
+    let restore_result = lua.set_named_registry_value(IS_EVENT, was_emitting);
+    match (result, restore_result) {
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+        (Ok(value), Ok(())) => Ok(value),
     }
 }
 
@@ -948,6 +965,80 @@ assert(wezterm.emit('bar', 42, 'woot') == true)
         )?;
 
         assert_eq!(*total.lock().unwrap(), 6);
+
+        Ok(())
+    }
+
+    #[test]
+    fn event_emission_flag_defaults_false_and_is_restored_after_success() -> anyhow::Result<()> {
+        let lua = make_lua_context(Path::new("testing"))?;
+        assert!(!is_event_emission(&lua)?);
+
+        let seen_inside_emit = Arc::new(Mutex::new(false));
+        let handler = lua.create_function({
+            let seen_inside_emit = seen_inside_emit.clone();
+            move |lua: &mlua::Lua, ()| {
+                *seen_inside_emit.lock().unwrap() = is_event_emission(lua)?;
+                Ok(())
+            }
+        })?;
+        register_event(&lua, ("flag-success".to_string(), handler))?;
+
+        smol::block_on(
+            lua.load(
+                r#"
+local wezterm = require 'wezterm'
+assert(wezterm.emit('flag-success') == true)
+"#,
+            )
+            .exec_async(),
+        )?;
+
+        assert!(
+            *seen_inside_emit.lock().unwrap(),
+            "handler should observe event-emission state"
+        );
+        assert!(
+            !is_event_emission(&lua)?,
+            "event-emission state should be cleared after emit completes"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn event_emission_flag_is_restored_after_handler_error() -> anyhow::Result<()> {
+        let lua = make_lua_context(Path::new("testing"))?;
+        assert!(!is_event_emission(&lua)?);
+
+        let seen_inside_emit = Arc::new(Mutex::new(false));
+        let handler = lua.create_function({
+            let seen_inside_emit = seen_inside_emit.clone();
+            move |lua: &mlua::Lua, ()| -> mlua::Result<()> {
+                *seen_inside_emit.lock().unwrap() = is_event_emission(lua)?;
+                Err(mlua::Error::external("boom"))
+            }
+        })?;
+        register_event(&lua, ("flag-error".to_string(), handler))?;
+
+        let result = smol::block_on(
+            lua.load(
+                r#"
+local wezterm = require 'wezterm'
+wezterm.emit('flag-error')
+"#,
+            )
+            .exec_async(),
+        );
+        assert!(result.is_err(), "handler error should propagate");
+        assert!(
+            *seen_inside_emit.lock().unwrap(),
+            "handler should observe event-emission state"
+        );
+        assert!(
+            !is_event_emission(&lua)?,
+            "event-emission state should be cleared after handler error"
+        );
 
         Ok(())
     }
