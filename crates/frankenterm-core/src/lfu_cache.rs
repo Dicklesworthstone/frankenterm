@@ -1019,4 +1019,262 @@ mod tests {
         let s2 = cache.stats();
         assert_eq!(s1, s2);
     }
+
+    mod proptest_lfu_cache {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_entries(max_len: usize) -> impl Strategy<Value = Vec<(u16, i64)>> {
+            proptest::collection::vec((0u16..80, -500i64..500), 0..=max_len)
+        }
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Insert(u16, i64),
+            Get(u16),
+            Peek(u16),
+            Remove(u16),
+        }
+
+        fn arb_op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                (0u16..40, -200i64..200).prop_map(|(k, v)| Op::Insert(k, v)),
+                (0u16..40).prop_map(Op::Get),
+                (0u16..40).prop_map(Op::Peek),
+                (0u16..40).prop_map(Op::Remove),
+            ]
+        }
+
+        fn arb_ops(max_len: usize) -> impl Strategy<Value = Vec<Op>> {
+            proptest::collection::vec(arb_op(), 0..=max_len)
+        }
+
+        fn assert_invariants(cache: &LfuCache<u16, i64>) {
+            assert!(cache.len() <= cache.capacity());
+            assert_eq!(cache.is_empty(), cache.len() == 0);
+            assert_eq!(cache.is_full(), cache.len() >= cache.capacity());
+            // Every key in entries should be peek-able
+            for key in cache.keys() {
+                assert!(cache.contains_key(&key));
+                assert!(cache.peek(&key).is_some());
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(200))]
+
+            #[test]
+            fn len_bounded_by_capacity(
+                cap in 1usize..=20,
+                entries in arb_entries(60)
+            ) {
+                let mut cache = LfuCache::new(cap);
+                for (k, v) in &entries {
+                    cache.insert(*k, *v);
+                }
+                prop_assert!(cache.len() <= cap);
+                assert_invariants(&cache);
+            }
+
+            #[test]
+            fn get_after_insert_returns_value(
+                cap in 1usize..=20,
+                entries in arb_entries(40),
+                target in 0u16..80
+            ) {
+                let mut cache = LfuCache::new(cap);
+                let mut last_value = None;
+                for (k, v) in &entries {
+                    cache.insert(*k, *v);
+                    if *k == target {
+                        last_value = Some(*v);
+                    }
+                }
+                if let Some(expected) = last_value {
+                    // Key might have been evicted, but if present, value matches
+                    if let Some(&actual) = cache.peek(&target) {
+                        prop_assert_eq!(actual, expected);
+                    }
+                }
+            }
+
+            #[test]
+            fn peek_does_not_change_frequency(
+                cap in 2usize..=10,
+                entries in arb_entries(20),
+                peek_key in 0u16..80
+            ) {
+                let mut cache = LfuCache::new(cap);
+                for (k, v) in &entries {
+                    cache.insert(*k, *v);
+                }
+                let freq_before = cache.frequency(&peek_key);
+                let _ = cache.peek(&peek_key);
+                let freq_after = cache.frequency(&peek_key);
+                prop_assert_eq!(freq_before, freq_after);
+            }
+
+            #[test]
+            fn get_increments_frequency(
+                cap in 2usize..=10,
+                entries in arb_entries(15),
+                target in 0u16..80
+            ) {
+                let mut cache = LfuCache::new(cap);
+                for (k, v) in &entries {
+                    cache.insert(*k, *v);
+                }
+                if cache.contains_key(&target) {
+                    let freq_before = cache.frequency(&target).unwrap();
+                    cache.get(&target);
+                    let freq_after = cache.frequency(&target).unwrap();
+                    prop_assert_eq!(freq_after, freq_before + 1);
+                }
+            }
+
+            #[test]
+            fn remove_makes_absent(
+                cap in 1usize..=10,
+                entries in arb_entries(20),
+                target in 0u16..80
+            ) {
+                let mut cache = LfuCache::new(cap);
+                for (k, v) in &entries {
+                    cache.insert(*k, *v);
+                }
+                cache.remove(&target);
+                prop_assert!(!cache.contains_key(&target));
+                prop_assert!(cache.peek(&target).is_none());
+                assert_invariants(&cache);
+            }
+
+            #[test]
+            fn clear_empties_everything(
+                cap in 1usize..=10,
+                entries in arb_entries(20)
+            ) {
+                let mut cache = LfuCache::new(cap);
+                for (k, v) in &entries {
+                    cache.insert(*k, *v);
+                }
+                cache.clear();
+                prop_assert!(cache.is_empty());
+                prop_assert_eq!(cache.len(), 0);
+                assert_invariants(&cache);
+            }
+
+            #[test]
+            fn eviction_targets_lowest_frequency(
+                entries in arb_entries(10)
+            ) {
+                // Cache of size 2: insert items, access some to raise frequency,
+                // then insert a new item. The evicted should be lowest frequency.
+                let mut cache = LfuCache::new(2);
+                cache.insert(1u16, 100);
+                cache.insert(2u16, 200);
+                // Access key=1 to raise its frequency
+                cache.get(&1u16);
+                // Now key=1 has freq=2, key=2 has freq=1
+                // Inserting key=3 should evict key=2 (lowest freq)
+                let evicted = cache.insert(3u16, 300);
+                if let Some((ek, _)) = evicted {
+                    prop_assert_eq!(ek, 2u16);
+                }
+                prop_assert!(cache.contains_key(&1u16));
+                prop_assert!(cache.contains_key(&3u16));
+                prop_assert!(!cache.contains_key(&2u16));
+            }
+
+            #[test]
+            fn stats_hits_plus_misses_equals_gets(
+                cap in 1usize..=10,
+                entries in arb_entries(20),
+                queries in proptest::collection::vec(0u16..80, 1..=30)
+            ) {
+                let mut cache = LfuCache::new(cap);
+                for (k, v) in &entries {
+                    cache.insert(*k, *v);
+                }
+                let hits_before = cache.stats().hits;
+                let misses_before = cache.stats().misses;
+                let total_gets = queries.len() as u64;
+                for q in &queries {
+                    cache.get(q);
+                }
+                let stats = cache.stats();
+                let delta_hits = stats.hits - hits_before;
+                let delta_misses = stats.misses - misses_before;
+                prop_assert_eq!(delta_hits + delta_misses, total_gets);
+            }
+
+            #[test]
+            fn insert_existing_updates_value(
+                cap in 1usize..=10,
+                key in 0u16..40,
+                v1 in -200i64..200,
+                v2 in -200i64..200
+            ) {
+                let mut cache = LfuCache::new(cap);
+                cache.insert(key, v1);
+                let len_before = cache.len();
+                let evicted = cache.insert(key, v2);
+                prop_assert!(evicted.is_none());
+                prop_assert_eq!(cache.len(), len_before);
+                prop_assert_eq!(cache.peek(&key), Some(&v2));
+            }
+
+            #[test]
+            fn random_ops_maintain_invariants(
+                cap in 1usize..=15,
+                ops in arb_ops(60)
+            ) {
+                let mut cache = LfuCache::new(cap);
+                for op in &ops {
+                    match op {
+                        Op::Insert(k, v) => { cache.insert(*k, *v); }
+                        Op::Get(k) => { cache.get(k); }
+                        Op::Peek(k) => { cache.peek(k); }
+                        Op::Remove(k) => { cache.remove(k); }
+                    }
+                    assert_invariants(&cache);
+                }
+            }
+
+            #[test]
+            fn stats_serde_roundtrip(
+                cap in 1usize..=10,
+                entries in arb_entries(15)
+            ) {
+                let mut cache = LfuCache::new(cap);
+                for (k, v) in &entries {
+                    cache.insert(*k, *v);
+                }
+                let stats = cache.stats();
+                let json = serde_json::to_string(&stats).unwrap();
+                let back: LfuCacheStats = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(stats, back);
+            }
+
+            #[test]
+            fn zero_capacity_stores_nothing(entries in arb_entries(10)) {
+                let mut cache = LfuCache::new(0);
+                for (k, v) in &entries {
+                    cache.insert(*k, *v);
+                }
+                prop_assert!(cache.is_empty());
+                prop_assert_eq!(cache.len(), 0);
+            }
+
+            #[test]
+            fn frequency_starts_at_one_on_insert(
+                cap in 1usize..=10,
+                key in 0u16..40,
+                val in -200i64..200
+            ) {
+                let mut cache = LfuCache::new(cap);
+                cache.insert(key, val);
+                prop_assert_eq!(cache.frequency(&key), Some(1));
+            }
+        }
+    }
 }
