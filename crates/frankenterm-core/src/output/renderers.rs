@@ -8,7 +8,7 @@
 use super::format::{OutputFormat, Style};
 use super::table::{Alignment, Column, Table};
 use crate::event_templates;
-use crate::policy::DecisionContext;
+use crate::policy::{DecisionContext, parse_serialized_decision_context};
 use crate::storage::{
     ActionHistoryRecord, AuditActionRecord, CorrelationType, PaneRecord, SearchResult,
     SearchSuggestion, StoredEvent, Timeline,
@@ -1391,7 +1391,7 @@ fn parse_summary_json(summary: Option<&str>) -> Option<serde_json::Value> {
 }
 
 fn parse_decision_context(decision_context: Option<&str>) -> Option<DecisionContext> {
-    decision_context.and_then(|raw| serde_json::from_str::<DecisionContext>(raw).ok())
+    parse_serialized_decision_context(decision_context)
 }
 
 fn format_decision_context_summary(decision_context: Option<&str>) -> Option<String> {

@@ -28299,10 +28299,7 @@ async fn handle_why_recent(
                 let decisions: Vec<WhyDecisionJson> = actions
                     .iter()
                     .map(|a| {
-                        let ctx_json = a
-                            .decision_context
-                            .as_ref()
-                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+                        let ctx_json = audit_decision_context_json(a.decision_context.as_deref());
                         let tmpl_id = resolve_template_id(a);
                         WhyDecisionJson {
                             id: a.id,
@@ -28353,19 +28350,29 @@ async fn handle_why_recent(
 }
 
 /// Render a single audit decision as an explanation with evidence and suggestions.
+fn parse_typed_audit_decision_context(
+    serialized: Option<&str>,
+) -> Option<frankenterm_core::policy::DecisionContext> {
+    serde_json::from_str(serialized?).ok()
+}
+
+fn audit_decision_context_json(serialized: Option<&str>) -> Option<serde_json::Value> {
+    if let Some(context) = parse_typed_audit_decision_context(serialized) {
+        return serde_json::to_value(context).ok();
+    }
+
+    serde_json::from_str(serialized?).ok()
+}
+
 fn render_why_decision(
     record: &frankenterm_core::storage::AuditActionRecord,
     output_format: frankenterm_core::output::OutputFormat,
     verbose: u8,
 ) {
     use frankenterm_core::explanations::get_explanation;
-    use frankenterm_core::policy::DecisionContext;
 
     if output_format.is_json() {
-        let ctx_json = record
-            .decision_context
-            .as_ref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+        let ctx_json = audit_decision_context_json(record.decision_context.as_deref());
         let tmpl_id = resolve_template_id(record);
         let tmpl = tmpl_id.as_deref().and_then(get_explanation);
 
@@ -28453,10 +28460,7 @@ fn render_why_decision(
     }
 
     // Parse decision context for evidence
-    let ctx: Option<DecisionContext> = record
-        .decision_context
-        .as_ref()
-        .and_then(|s| serde_json::from_str(s).ok());
+    let ctx = parse_typed_audit_decision_context(record.decision_context.as_deref());
 
     if let Some(ref ctx) = ctx {
         if !ctx.evidence.is_empty() {
@@ -40756,6 +40760,52 @@ log_level = "debug"
         assert_eq!(evidence("ipc_actor_kind"), Some("robot"));
         assert_eq!(evidence("ipc_result"), Some("success"));
         assert_eq!(evidence("request_id"), Some("req-123"));
+    }
+
+    #[test]
+    fn audit_decision_context_json_prefers_typed_policy_context() {
+        let mut context = frankenterm_core::policy::DecisionContext::empty();
+        context.actor = frankenterm_core::policy::ActorKind::Workflow;
+        context.surface = frankenterm_core::policy::PolicySurface::Workflow;
+        context.action = frankenterm_core::policy::ActionKind::WorkflowRun;
+        context.workflow_id = Some("wf-why".to_string());
+        context.set_determining_rule("audit.workflow_run");
+        context.add_evidence("stage", "why");
+
+        let serialized =
+            serde_json::to_string(&context).expect("typed decision context should serialize");
+        let json = audit_decision_context_json(Some(&serialized))
+            .expect("typed decision context should become json");
+
+        assert_eq!(json["actor"], "workflow");
+        assert_eq!(json["surface"], "workflow");
+        assert_eq!(json["action"], "workflow_run");
+        assert_eq!(json["workflow_id"], "wf-why");
+        assert_eq!(json["determining_rule"], "audit.workflow_run");
+        assert_eq!(json["evidence"][0]["key"], "stage");
+        assert_eq!(json["evidence"][0]["value"], "why");
+    }
+
+    #[test]
+    fn audit_decision_context_json_falls_back_to_legacy_json() {
+        let legacy = r#"{"surface":"mux","legacy_rule":"deny.alt_screen","evidence":[{"key":"stage","value":"legacy"}]}"#;
+
+        assert!(
+            parse_typed_audit_decision_context(Some(legacy)).is_none(),
+            "legacy payload should not parse as typed decision context"
+        );
+
+        let json = audit_decision_context_json(Some(legacy))
+            .expect("legacy payload should still round-trip to json");
+        assert_eq!(json["surface"], "mux");
+        assert_eq!(json["legacy_rule"], "deny.alt_screen");
+        assert_eq!(json["evidence"][0]["key"], "stage");
+        assert_eq!(json["evidence"][0]["value"], "legacy");
+    }
+
+    #[test]
+    fn audit_decision_context_json_ignores_invalid_payloads() {
+        assert!(audit_decision_context_json(Some("not-json")).is_none());
     }
 
     #[tokio::test]

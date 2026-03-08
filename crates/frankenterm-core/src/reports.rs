@@ -3,7 +3,7 @@
 //! Produces session reports (per-pane or global), including major events,
 //! workflow executions with step logs, and output gaps.
 
-use crate::policy::{DecisionContext, Redactor};
+use crate::policy::{Redactor, parse_serialized_decision_surface};
 use crate::storage::{AuditQuery, EventQuery, ExportQuery, StorageHandle};
 
 /// Options for report generation.
@@ -285,23 +285,9 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn parse_decision_context(decision_context: Option<&str>) -> Option<DecisionContext> {
-    decision_context.and_then(|raw| serde_json::from_str::<DecisionContext>(raw).ok())
-}
-
 fn policy_surface_from_decision_context(decision_context: Option<&str>) -> String {
-    parse_decision_context(decision_context)
-        .map(|context| context.surface.as_str().to_string())
-        .or_else(|| {
-            decision_context
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .and_then(|value| {
-                    value
-                        .get("surface")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                })
-        })
+    parse_serialized_decision_surface(decision_context)
+        .map(|surface| surface.as_str().to_string())
         .unwrap_or_else(|| "—".to_string())
 }
 

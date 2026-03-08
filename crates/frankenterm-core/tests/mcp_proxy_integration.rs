@@ -5,6 +5,7 @@ use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
     FrameworkContent, FrameworkTestClient, framework_create_memory_transport_pair,
 };
+use frankenterm_core::policy::{ActionKind, ActorKind, DecisionContext, PolicySurface};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -158,13 +159,13 @@ fn make_proxy_config(discovery_path: &Path, server_name: &str) -> Config {
     config
 }
 
-fn wait_for_proxy_audit_row(db_path: &Path, action_kind: &str) -> (String, String) {
+fn wait_for_proxy_audit_row(db_path: &Path, action_kind: &str) -> (String, String, String) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let conn = Connection::open(db_path).expect("open audit db");
         let mut stmt = conn
             .prepare(
-                "SELECT COALESCE(input_summary, ''), result
+                "SELECT COALESCE(input_summary, ''), result, COALESCE(decision_context, '')
                  FROM audit_actions
                  WHERE action_kind = ?1
                  ORDER BY id DESC
@@ -175,7 +176,8 @@ fn wait_for_proxy_audit_row(db_path: &Path, action_kind: &str) -> (String, Strin
             .query_row([action_kind], |row| {
                 let input_summary = row.get::<_, String>(0)?;
                 let result = row.get::<_, String>(1)?;
-                Ok((input_summary, result))
+                let decision_context = row.get::<_, String>(2)?;
+                Ok((input_summary, result, decision_context))
             })
             .optional()
             .expect("query audit row");
@@ -189,6 +191,14 @@ fn wait_for_proxy_audit_row(db_path: &Path, action_kind: &str) -> (String, Strin
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn evidence<'a>(context: &'a DecisionContext, key: &str) -> Option<&'a str> {
+    context
+        .evidence
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.value.as_str())
 }
 
 #[test]
@@ -302,7 +312,8 @@ fn proxy_routes_remote_calls_with_audit_traceability() {
         Some(FrameworkContent::Text { text }) if text == secret_payload
     ));
 
-    let (input_summary, result) = wait_for_proxy_audit_row(&db_path, "mcp.remote/mock/echo");
+    let (input_summary, result, decision_context) =
+        wait_for_proxy_audit_row(&db_path, "mcp.remote/mock/echo");
     assert_eq!(result, "success");
     assert!(
         input_summary.contains("mcp:remote/mock/echo"),
@@ -315,6 +326,29 @@ fn proxy_routes_remote_calls_with_audit_traceability() {
     assert!(
         !input_summary.contains(secret_payload),
         "secret payload should be redacted from audit summary: {input_summary}"
+    );
+
+    let context: DecisionContext =
+        serde_json::from_str(&decision_context).expect("decision context should parse");
+    assert_eq!(context.action, ActionKind::ExecCommand);
+    assert_eq!(context.actor, ActorKind::Mcp);
+    assert_eq!(context.surface, PolicySurface::Mcp);
+    assert_eq!(
+        context.determining_rule.as_deref(),
+        Some("audit.mcp.remote/mock/echo")
+    );
+    assert_eq!(evidence(&context, "stage"), Some("mcp_audit"));
+    assert_eq!(evidence(&context, "tool"), Some("remote/mock/echo"));
+    assert_eq!(
+        evidence(&context, "mcp_action_kind"),
+        Some("mcp.remote/mock/echo")
+    );
+    assert_eq!(evidence(&context, "mcp_surface"), Some("mcp"));
+    assert_eq!(evidence(&context, "policy_decision"), Some("allow"));
+    assert_eq!(evidence(&context, "result"), Some("success"));
+    assert!(
+        evidence(&context, "elapsed_ms").is_some(),
+        "expected elapsed_ms evidence in MCP audit context"
     );
 }
 
