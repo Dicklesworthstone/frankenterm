@@ -702,4 +702,178 @@ mod tests {
         let ft2 = FenwickTree::new(5);
         ft1.merge(&ft2);
     }
+
+    mod proptest_fenwick_tree {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_values(max_len: usize) -> impl Strategy<Value = Vec<i64>> {
+            proptest::collection::vec(-1000i64..1000, 1..=max_len)
+        }
+
+        fn arb_nonneg_values(max_len: usize) -> impl Strategy<Value = Vec<i64>> {
+            proptest::collection::vec(0i64..100, 1..=max_len)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(300))]
+
+            #[test]
+            fn from_slice_matches_incremental(values in arb_values(50)) {
+                let ft_slice = FenwickTree::from_slice(&values);
+                let mut ft_inc = FenwickTree::new(values.len());
+                for (i, &v) in values.iter().enumerate() {
+                    ft_inc.update(i, v);
+                }
+                for i in 0..values.len() {
+                    prop_assert_eq!(
+                        ft_slice.prefix_sum(i),
+                        ft_inc.prefix_sum(i)
+                    );
+                }
+            }
+
+            #[test]
+            fn prefix_sum_is_cumulative(values in arb_values(50)) {
+                let ft = FenwickTree::from_slice(&values);
+                let mut running = 0i64;
+                for (i, &v) in values.iter().enumerate() {
+                    running = running.wrapping_add(v);
+                    prop_assert_eq!(ft.prefix_sum(i), running);
+                }
+            }
+
+            #[test]
+            fn point_query_recovers_original(values in arb_values(50)) {
+                let ft = FenwickTree::from_slice(&values);
+                let recovered = ft.to_vec();
+                prop_assert_eq!(recovered, values);
+            }
+
+            #[test]
+            fn range_sum_equals_prefix_diff(values in arb_values(30), l in any::<usize>(), r in any::<usize>()) {
+                let n = values.len();
+                let l = l % n;
+                let r = r % n;
+                let (left, right) = if l <= r { (l, r) } else { (r, l) };
+
+                let ft = FenwickTree::from_slice(&values);
+                let range = ft.range_sum(left, right);
+                let expected: i64 = values[left..=right].iter().copied().sum();
+                prop_assert_eq!(range, expected);
+            }
+
+            #[test]
+            fn total_sum_matches_slice_sum(values in arb_values(50)) {
+                let ft = FenwickTree::from_slice(&values);
+                let expected: i64 = values.iter().copied().sum();
+                prop_assert_eq!(ft.total_sum(), expected);
+            }
+
+            #[test]
+            fn set_then_point_query(values in arb_values(30), idx in any::<usize>(), new_val in -500i64..500) {
+                let n = values.len();
+                let idx = idx % n;
+                let mut ft = FenwickTree::from_slice(&values);
+                ft.set(idx, new_val);
+                prop_assert_eq!(ft.point_query(idx), new_val);
+                // Total sum should change by (new_val - old_val)
+                let old_sum: i64 = values.iter().copied().sum();
+                let expected_sum = old_sum - values[idx] + new_val;
+                prop_assert_eq!(ft.total_sum(), expected_sum);
+            }
+
+            #[test]
+            fn reset_zeros_everything(values in arb_values(30)) {
+                let mut ft = FenwickTree::from_slice(&values);
+                ft.reset();
+                prop_assert_eq!(ft.total_sum(), 0);
+                prop_assert_eq!(ft.len(), values.len());
+                for i in 0..values.len() {
+                    prop_assert_eq!(ft.point_query(i), 0);
+                }
+            }
+
+            #[test]
+            fn merge_is_elementwise_addition(
+                a in arb_values(20),
+                b_raw in arb_values(20)
+            ) {
+                let n = a.len();
+                // Make b same length as a
+                let b: Vec<i64> = b_raw.iter().cycle().take(n).copied().collect();
+                let mut ft_a = FenwickTree::from_slice(&a);
+                let ft_b = FenwickTree::from_slice(&b);
+                ft_a.merge(&ft_b);
+                for i in 0..n {
+                    let expected = a[i].wrapping_add(b[i]);
+                    prop_assert_eq!(ft_a.point_query(i), expected);
+                }
+            }
+
+            #[test]
+            fn clone_is_independent(values in arb_values(20)) {
+                let ft = FenwickTree::from_slice(&values);
+                let mut clone = ft.clone();
+                clone.update(0, 999);
+                prop_assert_eq!(ft.total_sum(), values.iter().copied().sum::<i64>());
+                prop_assert_eq!(clone.point_query(0), values[0] + 999);
+            }
+
+            #[test]
+            fn find_kth_on_nonneg(values in arb_nonneg_values(30)) {
+                let ft = FenwickTree::from_slice(&values);
+                let total = ft.total_sum();
+                // find_kth(total) should succeed
+                if total > 0 {
+                    let idx = ft.find_kth(total);
+                    prop_assert!(idx.is_some());
+                    let idx = idx.unwrap();
+                    prop_assert!(ft.prefix_sum(idx) >= total);
+                }
+                // find_kth(total + 1) should fail
+                prop_assert_eq!(ft.find_kth(total + 1), None);
+            }
+
+            #[test]
+            fn find_kth_returns_smallest_index(values in arb_nonneg_values(20), target in 1i64..=200) {
+                let ft = FenwickTree::from_slice(&values);
+                if let Some(idx) = ft.find_kth(target) {
+                    // prefix_sum(idx) >= target
+                    prop_assert!(ft.prefix_sum(idx) >= target);
+                    // idx is smallest: if idx > 0, prefix_sum(idx-1) < target
+                    if idx > 0 {
+                        prop_assert!(ft.prefix_sum(idx - 1) < target);
+                    }
+                }
+            }
+
+            #[test]
+            fn stats_serde_roundtrip(values in arb_values(20)) {
+                let mut ft = FenwickTree::from_slice(&values);
+                // Do some operations to populate stats
+                if !values.is_empty() {
+                    ft.update(0, 1);
+                    let _ = ft.prefix_sum(0);
+                }
+                let stats = ft.stats();
+                let json = serde_json::to_string(&stats).unwrap();
+                let back: FenwickStats = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(stats, back);
+            }
+
+            #[test]
+            fn cumulative_updates_are_additive(n in 1usize..=20, updates in proptest::collection::vec((-100i64..100, 0usize..20), 1..=30)) {
+                let mut ft = FenwickTree::new(n);
+                let mut expected = vec![0i64; n];
+                for &(delta, idx_raw) in &updates {
+                    let idx = idx_raw % n;
+                    ft.update(idx, delta);
+                    expected[idx] = expected[idx].wrapping_add(delta);
+                }
+                let recovered = ft.to_vec();
+                prop_assert_eq!(recovered, expected);
+            }
+        }
+    }
 }
