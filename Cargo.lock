@@ -3697,6 +3697,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ftui-a11y"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "ftui-core 0.2.1",
+]
+
+[[package]]
 name = "ftui-backend"
 version = "0.2.1"
 dependencies = [
@@ -3898,6 +3906,7 @@ version = "0.2.1"
 dependencies = [
  "ahash",
  "bitflags 2.11.0",
+ "ftui-a11y",
  "ftui-core 0.2.1",
  "ftui-layout 0.2.1",
  "ftui-render 0.2.1",
