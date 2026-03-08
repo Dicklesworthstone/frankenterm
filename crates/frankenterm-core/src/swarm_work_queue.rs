@@ -1439,9 +1439,9 @@ mod tests {
         q.enqueue(item("a", 0, &[])).unwrap();
         q.pull(&"agent".into()).unwrap();
 
-        assert_eq!(q.agent_load.get(&"agent".to_string()), Some(&1));
+        assert_eq!(q.agent_load.get("agent"), Some(&1));
         q.cancel(&"a".into()).unwrap();
-        assert_eq!(q.agent_load.get(&"agent".to_string()), Some(&0));
+        assert_eq!(q.agent_load.get("agent"), Some(&0));
     }
 
     #[test]
@@ -1944,7 +1944,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             BeadsImportError::ParseError { line, .. } => assert_eq!(line, 1),
-            _ => panic!("expected ParseError"),
+            BeadsImportError::IoError { .. } => panic!("expected ParseError"),
         }
     }
 

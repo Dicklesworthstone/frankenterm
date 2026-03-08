@@ -1756,7 +1756,7 @@ mod tests {
             section: "events".to_string(),
             severity: "warning".to_string(),
             title: "test".to_string(),
-            detail: "".to_string(),
+            detail: String::new(),
             actions: vec![crate::tui::query::TriageAction {
                 label: "Explain".to_string(),
                 command: "ft why --recent".to_string(),
@@ -1776,7 +1776,7 @@ mod tests {
             section: "events".to_string(),
             severity: "warning".to_string(),
             title: "test".to_string(),
-            detail: "".to_string(),
+            detail: String::new(),
             actions: vec![
                 crate::tui::query::TriageAction {
                     label: "First".to_string(),
@@ -1802,7 +1802,7 @@ mod tests {
             section: "events".to_string(),
             severity: "warning".to_string(),
             title: "test".to_string(),
-            detail: "".to_string(),
+            detail: String::new(),
             actions: vec![],
             event_id: Some(1),
             pane_id: Some(0),

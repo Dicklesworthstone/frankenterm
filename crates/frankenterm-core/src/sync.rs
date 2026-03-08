@@ -1875,12 +1875,12 @@ mod tests {
 
         assert_eq!(plan.denied_count, 2);
         assert_eq!(plan.add_count, 1);
-        let denied: Vec<_> = plan
+        let denied_count = plan
             .items
             .iter()
             .filter(|i| i.action == SyncItemAction::Denied)
-            .collect();
-        assert_eq!(denied.len(), 2);
+            .count();
+        assert_eq!(denied_count, 2);
     }
 
     #[test]
@@ -2247,13 +2247,13 @@ mod tests {
             "my-server",
         );
         assert!(name.starts_with("wa_snapshot_"));
-        assert!(name.ends_with(".db"));
+        assert!(std::path::Path::new(&name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("db")));
         assert!(name.contains("0.1.0"));
         assert!(name.contains("20260208_120000"));
         assert!(name.contains("my-server"));
         // workspace key is 8 hex chars
-        let parts: Vec<&str> = name.split('_').collect();
-        assert!(parts.len() >= 5);
+        let parts_count = name.split('_').count();
+        assert!(parts_count >= 5);
     }
 
     #[test]

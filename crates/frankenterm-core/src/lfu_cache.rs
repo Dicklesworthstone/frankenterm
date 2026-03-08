@@ -1049,6 +1049,7 @@ mod tests {
             proptest::collection::vec(arb_op(), 0..=max_len)
         }
 
+        #[allow(clippy::len_zero)]
         fn assert_invariants(cache: &LfuCache<u16, i64>) {
             assert!(cache.len() <= cache.capacity());
             assert_eq!(cache.is_empty(), cache.len() == 0);
@@ -1165,7 +1166,7 @@ mod tests {
 
             #[test]
             fn eviction_targets_lowest_frequency(
-                entries in arb_entries(10)
+                _entries in arb_entries(10)
             ) {
                 // Cache of size 2: insert items, access some to raise frequency,
                 // then insert a new item. The evicted should be lowest frequency.
@@ -1233,7 +1234,7 @@ mod tests {
                     match op {
                         Op::Insert(k, v) => { cache.insert(*k, *v); }
                         Op::Get(k) => { cache.get(k); }
-                        Op::Peek(k) => { cache.peek(k); }
+                        Op::Peek(k) => { let _ = cache.peek(k); }
                         Op::Remove(k) => { cache.remove(k); }
                     }
                     assert_invariants(&cache);

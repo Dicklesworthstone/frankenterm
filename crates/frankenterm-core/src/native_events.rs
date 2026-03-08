@@ -1449,7 +1449,7 @@ mod tests {
         let errors: Vec<NativeEventError> = vec![
             NativeEventError::EmptySocketPath,
             NativeEventError::SocketAlreadyExists("x".into()),
-            NativeEventError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test")),
+            NativeEventError::Io(std::io::Error::other("test")),
         ];
         for e in &errors {
             let dbg = format!("{:?}", e);
@@ -1860,8 +1860,8 @@ mod tests {
                 match crate::runtime_compat::timeout(deadline, recv_next(&mut event_rx)).await {
                     Ok(Some(_)) => received += 1,
                     Ok(None) => break,
-                    Err(_) => {
-                        panic!("timeout: received {received}/{event_count} events");
+                    Err(elapsed) => {
+                        panic!("timeout after {elapsed}: received {received}/{event_count} events");
                     }
                 }
             }

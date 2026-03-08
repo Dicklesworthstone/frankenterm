@@ -830,8 +830,7 @@ mod tests {
 
     #[test]
     fn error_is_error_trait() {
-        let e: Box<dyn std::error::Error> = Box::new(LexicalIngestError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        let e: Box<dyn std::error::Error> = Box::new(LexicalIngestError::Io(std::io::Error::other(
             "test",
         )));
         assert!(e.to_string().contains("I/O error"));
@@ -1064,7 +1063,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let fp_path = dir.path().join(FINGERPRINT_FILENAME);
         std::fs::write(&fp_path, "").unwrap();
-        assert_eq!(read_stored_fingerprint(dir.path()), Some("".to_string()));
+        assert_eq!(read_stored_fingerprint(dir.path()), Some(String::new()));
     }
 
     #[test]
@@ -1178,8 +1177,8 @@ mod tests {
             writer.add_document(&map_event_to_document(&ev, i)).unwrap();
         }
         let stats = writer.commit().unwrap();
-        assert_eq!(stats.docs_added, count as u64);
-        assert_eq!(indexer.doc_count().unwrap(), count as u64);
+        assert_eq!(stats.docs_added, count);
+        assert_eq!(indexer.doc_count().unwrap(), count);
     }
 
     // =========================================================================

@@ -520,8 +520,8 @@ mod tests {
     #[test]
     fn schema_has_25_fields() {
         let (schema, _handles) = build_lexical_schema_v1();
-        let fields: Vec<_> = schema.fields().collect();
-        assert_eq!(fields.len(), 25, "schema must have exactly 25 fields");
+        let field_count = schema.fields().count();
+        assert_eq!(field_count, 25, "schema must have exactly 25 fields");
     }
 
     #[test]
@@ -826,7 +826,7 @@ mod tests {
     #[test]
     fn field_handles_are_clone() {
         let (_, handles) = build_lexical_schema_v1();
-        let cloned = handles.clone();
+        let cloned = handles;
         assert_eq!(handles.text, cloned.text);
     }
 

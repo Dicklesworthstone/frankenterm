@@ -1046,9 +1046,9 @@ mod tests {
             completion_log_size: 0,
         };
         let pressure = scheduler.compute_pressure(&stats, 3);
-        assert_eq!(pressure.ready_ratio, 0.0);
-        assert_eq!(pressure.utilization, 0.0);
-        assert_eq!(pressure.failure_rate, 0.0);
+        assert!((pressure.ready_ratio - 0.0).abs() < f64::EPSILON);
+        assert!((pressure.utilization - 0.0).abs() < f64::EPSILON);
+        assert!((pressure.failure_rate - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1066,7 +1066,7 @@ mod tests {
             completion_log_size: 0,
         };
         let pressure = scheduler.compute_pressure(&stats, 3);
-        assert_eq!(pressure.utilization, 1.0); // 9 / (3*3)
+        assert!((pressure.utilization - 1.0).abs() < f64::EPSILON); // 9 / (3*3)
         assert!(pressure.ready_ratio > 0.0);
     }
 
@@ -1085,7 +1085,7 @@ mod tests {
             completion_log_size: 5,
         };
         let pressure = scheduler.compute_pressure(&stats, 3);
-        assert_eq!(pressure.failure_rate, 2.0 / 5.0);
+        assert!((pressure.failure_rate - 2.0 / 5.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1103,7 +1103,7 @@ mod tests {
             completion_log_size: 0,
         };
         let pressure = scheduler.compute_pressure(&stats, 3);
-        assert_eq!(pressure.utilization, 1.0);
+        assert!((pressure.utilization - 1.0).abs() < f64::EPSILON);
     }
 
     // =========================================================================
@@ -1628,8 +1628,8 @@ mod tests {
     fn compute_queue_pressure_on_empty() {
         let queue = make_queue();
         let pressure = compute_queue_pressure(&queue);
-        assert_eq!(pressure.utilization, 0.0);
-        assert_eq!(pressure.ready_ratio, 0.0);
+        assert!((pressure.utilization - 0.0).abs() < f64::EPSILON);
+        assert!((pressure.ready_ratio - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1650,8 +1650,8 @@ mod tests {
         let pressure_tight = scheduler.evaluate_readonly(&stats, 2, 1000);
         let pressure_loose = scheduler.evaluate_readonly(&stats, 4, 1000);
         assert!(pressure_tight.utilization > pressure_loose.utilization);
-        assert_eq!(pressure_tight.utilization, 1.0);
-        assert_eq!(pressure_loose.utilization, 0.5);
+        assert!((pressure_tight.utilization - 1.0).abs() < f64::EPSILON);
+        assert!((pressure_loose.utilization - 0.5).abs() < f64::EPSILON);
     }
 
     // =========================================================================
