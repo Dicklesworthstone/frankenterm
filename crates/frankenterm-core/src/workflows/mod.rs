@@ -1252,11 +1252,17 @@ steps:
                 .policy_summary
                 .as_ref()
                 .expect("policy summary missing");
-            let summary_json: serde_json::Value = serde_json::from_str(policy_summary).unwrap();
-            assert_ne!(
-                summary_json.get("decision").and_then(|v| v.as_str()),
-                Some("allow")
-            );
+            let summary = WorkflowStepPolicySummary::parse(policy_summary)
+                .expect("typed policy summary should parse");
+            assert!(!summary.is_allowed());
+            assert_eq!(summary.action, Some(crate::policy::ActionKind::SendText));
+            let context = summary
+                .decision_context
+                .as_ref()
+                .expect("workflow send log should preserve typed decision context");
+            assert_eq!(context.actor, crate::policy::ActorKind::Workflow);
+            assert_eq!(context.surface, crate::policy::PolicySurface::Mux);
+            assert_eq!(context.action, crate::policy::ActionKind::SendText);
         });
     }
 

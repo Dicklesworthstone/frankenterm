@@ -412,85 +412,136 @@ pub(super) fn step_error_code_from_result(step_result: &StepResult) -> Option<St
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkflowStepPolicyDecision {
+    Allow,
+    Deny,
+    RequireApproval,
+    Error,
+}
+
+impl WorkflowStepPolicyDecision {
+    #[must_use]
+    pub const fn is_allowed(self) -> bool {
+        matches!(self, Self::Allow)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkflowStepPolicySummary {
+    pub decision: WorkflowStepPolicyDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<crate::policy::ActionKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_context: Option<crate::policy::DecisionContext>,
+}
+
+impl WorkflowStepPolicySummary {
+    #[must_use]
+    pub fn from_injection(result: &crate::policy::InjectionResult) -> Self {
+        use crate::policy::InjectionResult;
+
+        match result {
+            InjectionResult::Allowed {
+                decision,
+                summary,
+                action,
+                ..
+            } => Self {
+                decision: WorkflowStepPolicyDecision::Allow,
+                action: Some(*action),
+                rule_id: decision.rule_id().map(str::to_string),
+                reason: None,
+                summary: Some(summary.clone()),
+                error: None,
+                decision_context: decision.context().cloned(),
+            },
+            InjectionResult::Denied {
+                decision,
+                summary,
+                action,
+                ..
+            } => Self {
+                decision: WorkflowStepPolicyDecision::Deny,
+                action: Some(*action),
+                rule_id: decision.rule_id().map(str::to_string),
+                reason: decision.reason().map(str::to_string),
+                summary: Some(summary.clone()),
+                error: None,
+                decision_context: decision.context().cloned(),
+            },
+            InjectionResult::RequiresApproval {
+                decision,
+                summary,
+                action,
+                ..
+            } => Self {
+                decision: WorkflowStepPolicyDecision::RequireApproval,
+                action: Some(*action),
+                rule_id: decision.rule_id().map(str::to_string),
+                reason: decision.reason().map(str::to_string),
+                summary: Some(summary.clone()),
+                error: None,
+                decision_context: decision.context().cloned(),
+            },
+            InjectionResult::Error {
+                decision,
+                error,
+                action,
+                ..
+            } => Self {
+                decision: WorkflowStepPolicyDecision::Error,
+                action: Some(*action),
+                rule_id: decision.rule_id().map(str::to_string),
+                reason: decision.reason().map(str::to_string),
+                summary: None,
+                error: Some(error.clone()),
+                decision_context: decision.context().cloned(),
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn parse(serialized: &str) -> Option<Self> {
+        serde_json::from_str(serialized).ok()
+    }
+
+    #[must_use]
+    pub const fn is_allowed(&self) -> bool {
+        self.decision.is_allowed()
+    }
+}
+
+#[must_use]
+pub(crate) fn policy_summary_decision_is_allow(summary: &str) -> Option<bool> {
+    WorkflowStepPolicySummary::parse(summary)
+        .map(|parsed| parsed.is_allowed())
+        .or_else(|| {
+            serde_json::from_str::<serde_json::Value>(summary)
+                .ok()
+                .and_then(|data| {
+                    data.get("decision")
+                        .and_then(|value| value.as_str())
+                        .map(|decision| decision == "allow")
+                })
+        })
+}
+
 pub(super) fn policy_summary_from_injection(
     result: &crate::policy::InjectionResult,
 ) -> Option<String> {
-    use crate::policy::InjectionResult;
-
-    let mut obj = serde_json::Map::new();
-    match result {
-        InjectionResult::Allowed {
-            decision,
-            summary,
-            action,
-            ..
-        } => {
-            obj.insert("decision".to_string(), serde_json::json!("allow"));
-            if let Ok(action_val) = serde_json::to_value(action) {
-                obj.insert("action".to_string(), action_val);
-            }
-            if let Some(rule_id) = decision.rule_id() {
-                obj.insert("rule_id".to_string(), serde_json::json!(rule_id));
-            }
-            obj.insert("summary".to_string(), serde_json::json!(summary));
-        }
-        InjectionResult::Denied {
-            decision,
-            summary,
-            action,
-            ..
-        } => {
-            obj.insert("decision".to_string(), serde_json::json!("deny"));
-            if let Ok(action_val) = serde_json::to_value(action) {
-                obj.insert("action".to_string(), action_val);
-            }
-            if let Some(rule_id) = decision.rule_id() {
-                obj.insert("rule_id".to_string(), serde_json::json!(rule_id));
-            }
-            if let Some(reason) = decision.denial_reason() {
-                obj.insert("reason".to_string(), serde_json::json!(reason));
-            }
-            obj.insert("summary".to_string(), serde_json::json!(summary));
-        }
-        InjectionResult::RequiresApproval {
-            decision,
-            summary,
-            action,
-            ..
-        } => {
-            obj.insert(
-                "decision".to_string(),
-                serde_json::json!("require_approval"),
-            );
-            if let Ok(action_val) = serde_json::to_value(action) {
-                obj.insert("action".to_string(), action_val);
-            }
-            if let Some(rule_id) = decision.rule_id() {
-                obj.insert("rule_id".to_string(), serde_json::json!(rule_id));
-            }
-            if let crate::policy::PolicyDecision::RequireApproval { reason, .. } = decision {
-                obj.insert("reason".to_string(), serde_json::json!(reason));
-            }
-            obj.insert("summary".to_string(), serde_json::json!(summary));
-        }
-        InjectionResult::Error { error, action, .. } => {
-            obj.insert("decision".to_string(), serde_json::json!("error"));
-            if let Ok(action_val) = serde_json::to_value(action) {
-                obj.insert("action".to_string(), action_val);
-            }
-            obj.insert("error".to_string(), serde_json::json!(error));
-        }
-    }
-
-    if obj.is_empty() {
-        None
-    } else {
-        serde_json::to_string(&obj)
-            .inspect_err(
-                |e| tracing::warn!(error = %e, "workflow decision_context serialization failed"),
-            )
-            .ok()
-    }
+    serde_json::to_string(&WorkflowStepPolicySummary::from_injection(result))
+        .inspect_err(|e| tracing::warn!(error = %e, "workflow policy summary serialization failed"))
+        .ok()
 }
 
 fn policy_error_code_from_decision(
@@ -1038,6 +1089,68 @@ mod tests {
         assert_eq!(summary_json["step_kind"], "verification");
         assert_eq!(summary_json["result_type"], "continue");
         assert_eq!(summary_json["parent_action_id"], 41);
+    }
+
+    #[test]
+    fn policy_summary_from_injection_serializes_typed_decision_context() {
+        let mut context = crate::policy::DecisionContext::empty();
+        context.actor = crate::policy::ActorKind::Workflow;
+        context.surface = crate::policy::PolicySurface::Mux;
+        context.action = crate::policy::ActionKind::SendText;
+        context.workflow_id = Some("wf-typed".to_string());
+        context.pane_id = Some(11);
+        context.set_determining_rule("policy.test.workflow_send");
+        context.add_evidence("stage", "workflow_send");
+
+        let result = crate::policy::InjectionResult::Denied {
+            decision: crate::policy::PolicyDecision::deny_with_rule(
+                "prompt not active",
+                "policy.prompt_required",
+            )
+            .with_context(context.clone()),
+            summary: "echo secret".to_string(),
+            pane_id: 11,
+            action: crate::policy::ActionKind::SendText,
+            audit_action_id: Some(5),
+        };
+
+        let serialized =
+            policy_summary_from_injection(&result).expect("policy summary should serialize");
+        let summary = WorkflowStepPolicySummary::parse(&serialized)
+            .expect("workflow step policy summary should parse");
+
+        assert_eq!(summary.decision, WorkflowStepPolicyDecision::Deny);
+        assert_eq!(summary.action, Some(crate::policy::ActionKind::SendText));
+        assert_eq!(summary.rule_id.as_deref(), Some("policy.prompt_required"));
+        assert_eq!(summary.reason.as_deref(), Some("prompt not active"));
+        assert_eq!(summary.summary.as_deref(), Some("echo secret"));
+        assert_eq!(summary.error, None);
+
+        let parsed_context = summary
+            .decision_context
+            .expect("typed decision context should be preserved");
+        assert_eq!(parsed_context.actor, crate::policy::ActorKind::Workflow);
+        assert_eq!(parsed_context.surface, crate::policy::PolicySurface::Mux);
+        assert_eq!(parsed_context.action, crate::policy::ActionKind::SendText);
+        assert_eq!(parsed_context.workflow_id.as_deref(), Some("wf-typed"));
+        assert_eq!(parsed_context.pane_id, Some(11));
+        assert_eq!(
+            parsed_context.determining_rule.as_deref(),
+            Some("policy.test.workflow_send")
+        );
+        assert!(
+            parsed_context
+                .evidence
+                .iter()
+                .any(|entry| entry.key == "stage" && entry.value == "workflow_send")
+        );
+        assert_eq!(policy_summary_decision_is_allow(&serialized), Some(false));
+        assert_eq!(
+            policy_summary_decision_is_allow(
+                r#"{"decision":"allow","action":"send_text","summary":"legacy"}"#
+            ),
+            Some(true)
+        );
     }
 
     // ========================================================================

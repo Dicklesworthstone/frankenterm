@@ -107,14 +107,7 @@ pub async fn check_step_idempotency(
             "continue" | "done" => true,
             "send_text" => {
                 if let Some(ref summary) = log.policy_summary {
-                    serde_json::from_str::<serde_json::Value>(summary)
-                        .ok()
-                        .and_then(|data| {
-                            data.get("decision")
-                                .and_then(|v| v.as_str())
-                                .map(|decision| decision == "allow")
-                        })
-                        .unwrap_or(true)
+                    policy_summary_decision_is_allow(summary).unwrap_or(true)
                 } else {
                     true
                 }
