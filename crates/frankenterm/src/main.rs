@@ -17390,14 +17390,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             };
 
                                         final_state = commit.outcome.target_tx_state();
-                                        if matches!(
-                                            commit.outcome,
-                                            frankenterm_core::plan::TxCommitOutcome::PartialFailure
-                                        ) {
+                                        if commit.failed_count > 0 && commit.committed_count > 0 {
                                             let mut compensating_contract =
                                                 prepared_contract.clone();
                                             compensating_contract.lifecycle_state =
                                                 frankenterm_core::plan::MissionTxState::Compensating;
+                                            compensating_contract.receipts =
+                                                commit.receipts.clone();
                                             let comp_inputs = build_robot_tx_compensation_inputs(
                                                 &commit, None, now_ms,
                                             );
@@ -17502,6 +17501,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let mut compensating_contract = contract.clone();
                                     compensating_contract.lifecycle_state =
                                         frankenterm_core::plan::MissionTxState::Compensating;
+                                    compensating_contract.receipts = contract.receipts.clone();
                                     let compensation_report =
                                         match frankenterm_core::plan::execute_compensation_phase(
                                             &compensating_contract,

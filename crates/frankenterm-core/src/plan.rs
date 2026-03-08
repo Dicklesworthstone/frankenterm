@@ -2633,6 +2633,9 @@ impl TxPrepareOutcome {
 pub enum TxCommitOutcome {
     FullyCommitted,
     PartialFailure,
+    ImmediateFailure,
+    KillSwitchBlocked,
+    PauseSuspended,
 }
 
 impl TxCommitOutcome {
@@ -2641,7 +2644,10 @@ impl TxCommitOutcome {
     pub fn target_tx_state(&self) -> MissionTxState {
         match self {
             Self::FullyCommitted => MissionTxState::Committed,
-            Self::PartialFailure => MissionTxState::Failed,
+            Self::PartialFailure | Self::ImmediateFailure | Self::KillSwitchBlocked => {
+                MissionTxState::Failed
+            }
+            Self::PauseSuspended => MissionTxState::Committing,
         }
     }
 }
@@ -2660,6 +2666,12 @@ impl TxCommitStepOutcome {
     #[must_use]
     pub fn is_committed(&self) -> bool {
         matches!(self, Self::Committed { .. })
+    }
+
+    /// Whether this step was skipped.
+    #[must_use]
+    pub fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped { .. })
     }
 }
 
@@ -2837,6 +2849,140 @@ pub struct TxCommitReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxCompensationReport {
     pub outcome: TxCompensationOutcome,
+    pub compensated_count: usize,
+    pub failed_count: usize,
+    pub skipped_count: usize,
+    pub decision_path: String,
+    pub reason_code: String,
+    pub error_code: Option<String>,
+    pub completed_at_ms: i64,
+    #[serde(default)]
+    pub receipts: Vec<serde_json::Value>,
+}
+
+impl TxCommitReport {
+    /// Whether all commit steps completed successfully.
+    #[must_use]
+    pub fn is_fully_committed(&self) -> bool {
+        matches!(self.outcome, TxCommitOutcome::FullyCommitted)
+    }
+
+    /// Whether this report reflects any failure or safety block.
+    #[must_use]
+    pub fn has_failures(&self) -> bool {
+        self.failed_count > 0
+            || matches!(
+                self.outcome,
+                TxCommitOutcome::PartialFailure
+                    | TxCommitOutcome::ImmediateFailure
+                    | TxCommitOutcome::KillSwitchBlocked
+            )
+    }
+}
+
+impl TxCompensationReport {
+    /// Whether compensation fully removed committed effects.
+    #[must_use]
+    pub fn is_fully_rolled_back(&self) -> bool {
+        matches!(self.outcome, TxCompensationOutcome::FullyRolledBack)
+    }
+
+    /// Whether rollback left unresolved work behind.
+    #[must_use]
+    pub fn has_residual_risk(&self) -> bool {
+        matches!(self.outcome, TxCompensationOutcome::CompensationFailed)
+    }
+}
+
+fn tx_last_receipt_seq(receipts: &[serde_json::Value]) -> u64 {
+    receipts
+        .iter()
+        .filter_map(|receipt| receipt.get("seq").and_then(serde_json::Value::as_u64))
+        .max()
+        .unwrap_or(0)
+}
+
+fn tx_build_receipt(
+    seq: u64,
+    phase: &str,
+    tx_id: &TxId,
+    plan_id: &TxPlanId,
+    state: MissionTxState,
+    step_id: Option<&TxStepId>,
+    outcome: &str,
+    reason_code: &str,
+    error_code: Option<&str>,
+    decision_path: &str,
+    emitted_at_ms: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "seq": seq,
+        "phase": phase,
+        "tx_id": tx_id.0,
+        "plan_id": plan_id.0,
+        "state": state,
+        "step_id": step_id.map(|step_id| step_id.0.clone()),
+        "outcome": outcome,
+        "reason_code": reason_code,
+        "error_code": error_code,
+        "decision_path": decision_path,
+        "emitted_at_ms": emitted_at_ms,
+    })
+}
+
+fn tx_blocked_commit_report(
+    contract: &MissionTxContract,
+    outcome: TxCommitOutcome,
+    reason_code: &str,
+    error_code: Option<&str>,
+    decision_path: &str,
+    completed_at_ms: i64,
+) -> TxCommitReport {
+    let mut next_seq = tx_last_receipt_seq(&contract.receipts);
+    let mut step_results = Vec::with_capacity(contract.plan.steps.len());
+    let mut receipts = Vec::with_capacity(contract.plan.steps.len());
+
+    for step in &contract.plan.steps {
+        next_seq += 1;
+        step_results.push(TxCommitStepResult {
+            step_id: step.step_id.clone(),
+            ordinal: step.ordinal,
+            outcome: TxCommitStepOutcome::Skipped {
+                reason_code: reason_code.to_string(),
+            },
+            decision_path: decision_path.to_string(),
+            completed_at_ms,
+        });
+        receipts.push(tx_build_receipt(
+            next_seq,
+            "commit",
+            &contract.intent.tx_id,
+            &contract.plan.plan_id,
+            contract.lifecycle_state,
+            Some(&step.step_id),
+            "skipped",
+            reason_code,
+            error_code,
+            decision_path,
+            completed_at_ms,
+        ));
+    }
+
+    TxCommitReport {
+        tx_id: contract.intent.tx_id.clone(),
+        plan_id: contract.plan.plan_id.clone(),
+        outcome,
+        step_results,
+        failure_boundary: None,
+        committed_count: 0,
+        failed_count: 0,
+        skipped_count: contract.plan.steps.len(),
+        decision_path: decision_path.to_string(),
+        reason_code: reason_code.to_string(),
+        error_code: error_code.map(str::to_string),
+        completed_at_ms,
+        receipts,
+    }
 }
 
 /// Evaluate prepare phase gates and produce a report.
@@ -2874,77 +3020,291 @@ pub fn execute_commit_phase(
     contract: &MissionTxContract,
     commit_inputs: &[TxCommitStepInput],
     kill_switch: MissionKillSwitchLevel,
-    _paused: bool,
-    _now_ms: i64,
+    paused: bool,
+    now_ms: i64,
 ) -> Result<TxCommitReport, String> {
-    if kill_switch == MissionKillSwitchLevel::HardStop {
-        return Err("Kill switch active".to_string());
+    if !matches!(
+        contract.lifecycle_state,
+        MissionTxState::Prepared | MissionTxState::Committing
+    ) {
+        return Err(format!(
+            "Commit requires prepared or committing tx state, got {}",
+            contract.lifecycle_state
+        ));
     }
+
+    if kill_switch != MissionKillSwitchLevel::Off {
+        let error_code = match kill_switch {
+            MissionKillSwitchLevel::SafeMode => Some("tx.kill_switch.safe_mode"),
+            MissionKillSwitchLevel::HardStop => Some("tx.kill_switch.hard_stop"),
+            MissionKillSwitchLevel::Off => None,
+        };
+        return Ok(tx_blocked_commit_report(
+            contract,
+            TxCommitOutcome::KillSwitchBlocked,
+            "kill_switch_blocked",
+            error_code,
+            "commit_phase->kill_switch_blocked",
+            now_ms,
+        ));
+    }
+
+    if paused {
+        return Ok(tx_blocked_commit_report(
+            contract,
+            TxCommitOutcome::PauseSuspended,
+            "pause_suspended",
+            None,
+            "commit_phase->pause_suspended",
+            now_ms,
+        ));
+    }
+
     let mut step_results = Vec::new();
+    let mut receipts = Vec::new();
+    let mut next_seq = tx_last_receipt_seq(&contract.receipts);
     let mut committed = 0usize;
     let mut failed = 0usize;
-    let skipped = 0usize;
-    for input in commit_inputs {
-        let outcome = if input.success {
-            committed += 1;
-            TxCommitStepOutcome::Committed {
-                reason_code: input.reason_code.clone(),
+    let mut skipped = 0usize;
+    let mut failure_boundary = None;
+    let mut report_error_code = None;
+    let mut failure_seen = false;
+
+    for step in &contract.plan.steps {
+        let matched_input = commit_inputs
+            .iter()
+            .find(|input| input.step_id == step.step_id);
+        let (outcome, decision_path, completed_at_ms, reason_code, error_code) = if failure_seen {
+            skipped += 1;
+            (
+                TxCommitStepOutcome::Skipped {
+                    reason_code: "commit_skipped_after_failure".to_string(),
+                },
+                "commit_phase->skipped_after_failure".to_string(),
+                now_ms,
+                "commit_skipped_after_failure".to_string(),
+                None,
+            )
+        } else if let Some(input) = matched_input {
+            if input.success {
+                committed += 1;
+                (
+                    TxCommitStepOutcome::Committed {
+                        reason_code: input.reason_code.clone(),
+                    },
+                    "commit_phase->committed".to_string(),
+                    input.completed_at_ms,
+                    input.reason_code.clone(),
+                    None,
+                )
+            } else {
+                failed += 1;
+                failure_seen = true;
+                failure_boundary = Some(step.step_id.0.clone());
+                report_error_code = input.error_code.clone();
+                (
+                    TxCommitStepOutcome::Failed {
+                        reason_code: input.reason_code.clone(),
+                    },
+                    "commit_phase->failed".to_string(),
+                    input.completed_at_ms,
+                    input.reason_code.clone(),
+                    input.error_code.clone(),
+                )
             }
         } else {
             failed += 1;
-            TxCommitStepOutcome::Failed {
-                reason_code: input.reason_code.clone(),
-            }
+            failure_seen = true;
+            failure_boundary = Some(step.step_id.0.clone());
+            report_error_code = Some("tx.commit.input_missing".to_string());
+            (
+                TxCommitStepOutcome::Failed {
+                    reason_code: "commit_input_missing".to_string(),
+                },
+                "commit_phase->missing_input".to_string(),
+                now_ms,
+                "commit_input_missing".to_string(),
+                Some("tx.commit.input_missing".to_string()),
+            )
         };
+
+        next_seq += 1;
+        receipts.push(tx_build_receipt(
+            next_seq,
+            "commit",
+            &contract.intent.tx_id,
+            &contract.plan.plan_id,
+            contract.lifecycle_state,
+            Some(&step.step_id),
+            match &outcome {
+                TxCommitStepOutcome::Committed { .. } => "committed",
+                TxCommitStepOutcome::Failed { .. } => "failed",
+                TxCommitStepOutcome::Skipped { .. } => "skipped",
+            },
+            &reason_code,
+            error_code.as_deref(),
+            &decision_path,
+            completed_at_ms,
+        ));
         step_results.push(TxCommitStepResult {
-            step_id: input.step_id.clone(),
-            ordinal: step_results.len(),
+            step_id: step.step_id.clone(),
+            ordinal: step.ordinal,
             outcome,
-            decision_path: "commit".to_string(),
-            completed_at_ms: input.completed_at_ms,
+            decision_path,
+            completed_at_ms,
         });
     }
-    let overall = if failed == 0 {
-        TxCommitOutcome::FullyCommitted
+
+    let (overall, reason_code) = if failed == 0 {
+        (TxCommitOutcome::FullyCommitted, "fully_committed")
+    } else if committed == 0 {
+        (TxCommitOutcome::ImmediateFailure, "immediate_failure")
     } else {
-        TxCommitOutcome::PartialFailure
+        (TxCommitOutcome::PartialFailure, "partial_failure")
     };
+
     Ok(TxCommitReport {
         tx_id: contract.intent.tx_id.clone(),
         plan_id: contract.plan.plan_id.clone(),
         outcome: overall,
         step_results,
-        failure_boundary: None,
+        failure_boundary,
         committed_count: committed,
         failed_count: failed,
         skipped_count: skipped,
         decision_path: "commit_phase".to_string(),
-        reason_code: "completed".to_string(),
-        error_code: None,
-        completed_at_ms: _now_ms,
-        receipts: Vec::new(),
+        reason_code: reason_code.to_string(),
+        error_code: report_error_code,
+        completed_at_ms: now_ms,
+        receipts,
     })
 }
 
 /// Execute compensation phase after a failed commit.
 pub fn execute_compensation_phase(
-    _contract: &MissionTxContract,
-    _commit_report: &TxCommitReport,
+    contract: &MissionTxContract,
+    commit_report: &TxCommitReport,
     comp_inputs: &[TxCompensationStepInput],
-    _now_ms: i64,
+    now_ms: i64,
 ) -> Result<TxCompensationReport, String> {
-    if comp_inputs.is_empty() {
+    if contract.lifecycle_state != MissionTxState::Compensating {
+        return Err(format!(
+            "Compensation requires compensating tx state, got {}",
+            contract.lifecycle_state
+        ));
+    }
+
+    let committed_steps = commit_report
+        .step_results
+        .iter()
+        .filter(|result| result.outcome.is_committed())
+        .collect::<Vec<_>>();
+
+    if committed_steps.is_empty() {
         return Ok(TxCompensationReport {
             outcome: TxCompensationOutcome::NothingToCompensate,
+            compensated_count: 0,
+            failed_count: 0,
+            skipped_count: 0,
+            decision_path: "compensation_phase->nothing_to_compensate".to_string(),
+            reason_code: "nothing_to_compensate".to_string(),
+            error_code: None,
+            completed_at_ms: now_ms,
+            receipts: Vec::new(),
         });
     }
-    let all_ok = comp_inputs.iter().all(|c| c.success);
+
+    let mut next_seq = tx_last_receipt_seq(&contract.receipts);
+    let mut receipts = Vec::new();
+    let mut compensated_count = 0usize;
+    let mut failed_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut report_error_code = None;
+    let mut failure_seen = false;
+
+    for committed_step in committed_steps.into_iter().rev() {
+        let matched_input = comp_inputs
+            .iter()
+            .find(|input| input.for_step_id == committed_step.step_id);
+        let (outcome, reason_code, error_code, decision_path, completed_at_ms) = if failure_seen {
+            skipped_count += 1;
+            (
+                "skipped",
+                "compensation_skipped_after_failure".to_string(),
+                None,
+                "compensation_phase->skipped_after_failure".to_string(),
+                now_ms,
+            )
+        } else if let Some(input) = matched_input {
+            if input.success {
+                compensated_count += 1;
+                (
+                    "compensated",
+                    input.reason_code.clone(),
+                    None,
+                    "compensation_phase->compensated".to_string(),
+                    input.completed_at_ms,
+                )
+            } else {
+                failed_count += 1;
+                failure_seen = true;
+                report_error_code = input.error_code.clone();
+                (
+                    "failed",
+                    input.reason_code.clone(),
+                    input.error_code.clone(),
+                    "compensation_phase->failed".to_string(),
+                    input.completed_at_ms,
+                )
+            }
+        } else {
+            failed_count += 1;
+            failure_seen = true;
+            report_error_code = Some("tx.compensation.input_missing".to_string());
+            (
+                "failed",
+                "compensation_input_missing".to_string(),
+                Some("tx.compensation.input_missing".to_string()),
+                "compensation_phase->missing_input".to_string(),
+                now_ms,
+            )
+        };
+
+        next_seq += 1;
+        receipts.push(tx_build_receipt(
+            next_seq,
+            "compensate",
+            &contract.intent.tx_id,
+            &contract.plan.plan_id,
+            contract.lifecycle_state,
+            Some(&committed_step.step_id),
+            outcome,
+            &reason_code,
+            error_code.as_deref(),
+            &decision_path,
+            completed_at_ms,
+        ));
+    }
+
+    let all_ok = failed_count == 0;
     Ok(TxCompensationReport {
         outcome: if all_ok {
             TxCompensationOutcome::FullyRolledBack
         } else {
             TxCompensationOutcome::CompensationFailed
         },
+        compensated_count,
+        failed_count,
+        skipped_count,
+        decision_path: "compensation_phase".to_string(),
+        reason_code: if all_ok {
+            "fully_rolled_back".to_string()
+        } else {
+            "compensation_failed".to_string()
+        },
+        error_code: report_error_code,
+        completed_at_ms: now_ms,
+        receipts,
     })
 }
 
@@ -5281,6 +5641,263 @@ mod tests {
             .dispatch_assignment_dry_run(&AssignmentId("assignment:alpha".to_string()), 2_000_000);
         assert!(result.is_ok());
         assert!(result.unwrap().would_succeed);
+    }
+
+    fn sample_tx_contract(state: MissionTxState) -> MissionTxContract {
+        let tx_id = TxId("tx:test".to_string());
+        MissionTxContract {
+            tx_version: MISSION_TX_SCHEMA_VERSION,
+            intent: TxIntent {
+                tx_id: tx_id.clone(),
+                requested_by: MissionActorRole::Dispatcher,
+                summary: "tx test".to_string(),
+                correlation_id: "corr:test".to_string(),
+                created_at_ms: 1_700_000_000_000,
+            },
+            plan: TxPlan {
+                plan_id: TxPlanId("plan:test".to_string()),
+                tx_id,
+                steps: vec![
+                    TxStep {
+                        step_id: TxStepId("tx-step:1".to_string()),
+                        ordinal: 1,
+                        action: StepAction::SendText {
+                            pane_id: 1,
+                            text: "step-1".to_string(),
+                            paste_mode: Some(false),
+                        },
+                        description: "step 1".to_string(),
+                    },
+                    TxStep {
+                        step_id: TxStepId("tx-step:2".to_string()),
+                        ordinal: 2,
+                        action: StepAction::SendText {
+                            pane_id: 2,
+                            text: "step-2".to_string(),
+                            paste_mode: Some(false),
+                        },
+                        description: "step 2".to_string(),
+                    },
+                    TxStep {
+                        step_id: TxStepId("tx-step:3".to_string()),
+                        ordinal: 3,
+                        action: StepAction::SendText {
+                            pane_id: 3,
+                            text: "step-3".to_string(),
+                            paste_mode: Some(true),
+                        },
+                        description: "step 3".to_string(),
+                    },
+                ],
+                preconditions: vec![TxPrecondition::PromptActive { pane_id: 1 }],
+                compensations: vec![
+                    TxCompensation {
+                        for_step_id: TxStepId("tx-step:1".to_string()),
+                        action: StepAction::SendText {
+                            pane_id: 1,
+                            text: "undo-1".to_string(),
+                            paste_mode: Some(false),
+                        },
+                    },
+                    TxCompensation {
+                        for_step_id: TxStepId("tx-step:2".to_string()),
+                        action: StepAction::SendText {
+                            pane_id: 2,
+                            text: "undo-2".to_string(),
+                            paste_mode: Some(false),
+                        },
+                    },
+                    TxCompensation {
+                        for_step_id: TxStepId("tx-step:3".to_string()),
+                        action: StepAction::SendText {
+                            pane_id: 3,
+                            text: "undo-3".to_string(),
+                            paste_mode: Some(true),
+                        },
+                    },
+                ],
+            },
+            lifecycle_state: state,
+            outcome: TxOutcome::Pending,
+            receipts: Vec::new(),
+        }
+    }
+
+    fn sample_commit_inputs(fail_step: Option<&str>) -> Vec<TxCommitStepInput> {
+        ["tx-step:1", "tx-step:2", "tx-step:3"]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, step_id)| {
+                let should_fail = fail_step == Some(step_id);
+                TxCommitStepInput {
+                    step_id: TxStepId(step_id.to_string()),
+                    success: !should_fail,
+                    reason_code: if should_fail {
+                        "commit_failed_injected".to_string()
+                    } else {
+                        "commit_succeeded".to_string()
+                    },
+                    error_code: should_fail.then(|| "FTX9999".to_string()),
+                    completed_at_ms: 10_000 + idx as i64,
+                }
+            })
+            .collect()
+    }
+
+    fn sample_comp_inputs(fail_step: Option<&str>) -> Vec<TxCompensationStepInput> {
+        ["tx-step:1", "tx-step:2", "tx-step:3"]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, step_id)| {
+                let should_fail = fail_step == Some(step_id);
+                TxCompensationStepInput {
+                    for_step_id: TxStepId(step_id.to_string()),
+                    success: !should_fail,
+                    reason_code: if should_fail {
+                        "compensation_failed_injected".to_string()
+                    } else {
+                        "compensation_succeeded".to_string()
+                    },
+                    error_code: should_fail.then(|| "FTX4999".to_string()),
+                    completed_at_ms: 20_000 + idx as i64,
+                }
+            })
+            .collect()
+    }
+
+    fn receipt_seq(receipt: &serde_json::Value) -> u64 {
+        receipt
+            .get("seq")
+            .and_then(serde_json::Value::as_u64)
+            .expect("receipt seq")
+    }
+
+    #[test]
+    fn tx_commit_phase_sets_failure_boundary_and_skips_later_steps() {
+        let contract = sample_tx_contract(MissionTxState::Prepared);
+        let report = execute_commit_phase(
+            &contract,
+            &sample_commit_inputs(Some("tx-step:2")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+
+        assert_eq!(report.outcome, TxCommitOutcome::PartialFailure);
+        assert_eq!(report.failure_boundary.as_deref(), Some("tx-step:2"));
+        assert_eq!(report.committed_count, 1);
+        assert_eq!(report.failed_count, 1);
+        assert_eq!(report.skipped_count, 1);
+        assert_eq!(report.step_results.len(), 3);
+        assert!(report.step_results[2].outcome.is_skipped());
+        assert_eq!(report.receipts.len(), 3);
+        assert!(receipt_seq(&report.receipts[1]) > receipt_seq(&report.receipts[0]));
+        assert!(receipt_seq(&report.receipts[2]) > receipt_seq(&report.receipts[1]));
+    }
+
+    #[test]
+    fn tx_commit_phase_returns_non_error_reports_for_pause_and_kill_switch() {
+        let contract = sample_tx_contract(MissionTxState::Prepared);
+
+        let paused = execute_commit_phase(
+            &contract,
+            &sample_commit_inputs(None),
+            MissionKillSwitchLevel::Off,
+            true,
+            10_000,
+        )
+        .expect("paused report");
+        assert_eq!(paused.outcome, TxCommitOutcome::PauseSuspended);
+        assert_eq!(paused.committed_count, 0);
+        assert_eq!(paused.failed_count, 0);
+        assert_eq!(paused.skipped_count, 3);
+        assert_eq!(paused.outcome.target_tx_state(), MissionTxState::Committing);
+
+        let blocked = execute_commit_phase(
+            &contract,
+            &sample_commit_inputs(None),
+            MissionKillSwitchLevel::SafeMode,
+            false,
+            10_000,
+        )
+        .expect("blocked report");
+        assert_eq!(blocked.outcome, TxCommitOutcome::KillSwitchBlocked);
+        assert_eq!(blocked.committed_count, 0);
+        assert_eq!(blocked.failed_count, 0);
+        assert_eq!(blocked.skipped_count, 3);
+        assert!(
+            blocked
+                .receipts
+                .iter()
+                .all(|receipt| receipt["reason_code"] == "kill_switch_blocked")
+        );
+    }
+
+    #[test]
+    fn tx_compensation_phase_runs_in_reverse_order_and_continues_receipts() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(Some("tx-step:3")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+
+        let mut compensating_contract = sample_tx_contract(MissionTxState::Compensating);
+        compensating_contract.receipts = commit_report.receipts.clone();
+        let comp_report = execute_compensation_phase(
+            &compensating_contract,
+            &commit_report,
+            &sample_comp_inputs(None),
+            20_500,
+        )
+        .expect("compensation report");
+
+        assert_eq!(comp_report.outcome, TxCompensationOutcome::FullyRolledBack);
+        assert_eq!(comp_report.compensated_count, 2);
+        assert_eq!(comp_report.failed_count, 0);
+        assert_eq!(comp_report.skipped_count, 0);
+        assert_eq!(comp_report.receipts.len(), 2);
+        assert_eq!(comp_report.receipts[0]["step_id"], "tx-step:2");
+        assert_eq!(comp_report.receipts[1]["step_id"], "tx-step:1");
+        let last_commit_seq = receipt_seq(commit_report.receipts.last().expect("commit receipt"));
+        assert!(receipt_seq(&comp_report.receipts[0]) > last_commit_seq);
+        assert!(receipt_seq(&comp_report.receipts[1]) > receipt_seq(&comp_report.receipts[0]));
+    }
+
+    #[test]
+    fn tx_commit_and_compensation_validate_required_lifecycle_states() {
+        let invalid_commit = sample_tx_contract(MissionTxState::Planned);
+        let commit_err = execute_commit_phase(
+            &invalid_commit,
+            &sample_commit_inputs(None),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_000,
+        )
+        .expect_err("commit should reject invalid state");
+        assert!(commit_err.contains("prepared or committing"));
+
+        let valid_commit = execute_commit_phase(
+            &sample_tx_contract(MissionTxState::Prepared),
+            &sample_commit_inputs(Some("tx-step:3")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_000,
+        )
+        .expect("valid commit");
+        let invalid_comp = sample_tx_contract(MissionTxState::Failed);
+        let comp_err = execute_compensation_phase(
+            &invalid_comp,
+            &valid_commit,
+            &sample_comp_inputs(None),
+            20_000,
+        )
+        .expect_err("compensation should reject invalid state");
+        assert!(comp_err.contains("compensating"));
     }
 
     // =========================================================================

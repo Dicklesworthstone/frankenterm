@@ -609,8 +609,26 @@ emit_log "running" "run_failure_injection" "command_execution" "none" \
 run_robot_json "run_fail_step" tx run --fail-step tx-step:2
 assert_jq_true \
   "run_fail_step" \
-  '.ok == true and .data.prepare_report.outcome == "all_ready" and .data.commit_report.outcome == "partial_failure" and .data.compensation_report.outcome == "fully_rolled_back" and .data.final_state == "rolled_back"' \
+  '.ok == true and .data.prepare_report.outcome == "all_ready" and .data.commit_report.outcome == "partial_failure" and .data.commit_report.failure_boundary == "tx-step:2" and .data.commit_report.committed_count == 1 and .data.commit_report.failed_count == 1 and .data.commit_report.skipped_count == 0 and (.data.commit_report.receipts | length) == 2 and .data.compensation_report.outcome == "fully_rolled_back" and .data.compensation_report.compensated_count == 1 and .data.compensation_report.failed_count == 0 and .data.compensation_report.skipped_count == 0 and (.data.compensation_report.receipts | length) == 1 and .data.final_state == "compensated"' \
   "validate run failure-injection path and auto-compensation"
+
+emit_log "running" "run_pause_surface" "command_execution" "none" \
+  "$(basename "${LOG_FILE}")" "ft robot tx run --paused"
+
+run_robot_json "run_paused" tx run --paused
+assert_jq_true \
+  "run_paused" \
+  '.ok == true and .data.prepare_report.outcome == "all_ready" and .data.commit_report.outcome == "pause_suspended" and .data.commit_report.committed_count == 0 and .data.commit_report.failed_count == 0 and .data.commit_report.skipped_count == 2 and (.data.commit_report.receipts | length) == 2 and .data.compensation_report == null and .data.final_state == "committing"' \
+  "validate paused commit path stays non-compensating and explicit"
+
+emit_log "running" "run_safe_mode_surface" "command_execution" "none" \
+  "$(basename "${LOG_FILE}")" "ft robot tx run --kill-switch safe-mode"
+
+run_robot_json "run_safe_mode" tx run --kill-switch safe-mode
+assert_jq_true \
+  "run_safe_mode" \
+  '.ok == true and .data.prepare_report.outcome == "all_ready" and .data.commit_report.outcome == "kill_switch_blocked" and .data.commit_report.committed_count == 0 and .data.commit_report.failed_count == 0 and .data.commit_report.skipped_count == 2 and (.data.commit_report.receipts | length) == 2 and .data.compensation_report == null and .data.final_state == "failed"' \
+  "validate safe-mode kill-switch block path"
 
 emit_log "running" "error_contract_surface" "command_execution" "none" \
   "$(basename "${LOG_FILE}")" "ft robot tx run --fail-step tx-step:missing"
@@ -627,13 +645,13 @@ emit_log "running" "rollback_failure_and_recovery" "command_execution" "none" \
 run_robot_json "rollback_fail_comp" tx rollback --fail-compensation-for-step tx-step:1
 assert_jq_true \
   "rollback_fail_comp" \
-  '.ok == true and .data.compensation_report.outcome == "compensation_failed" and .data.final_state == "failed"' \
+  '.ok == true and .data.compensation_report.outcome == "compensation_failed" and .data.compensation_report.compensated_count == 1 and .data.compensation_report.failed_count == 1 and .data.compensation_report.skipped_count == 0 and (.data.compensation_report.receipts | length) == 2 and .data.final_state == "failed"' \
   "validate rollback failure-injection path"
 
 run_robot_json "rollback_recovery" tx rollback
 assert_jq_true \
   "rollback_recovery" \
-  '.ok == true and .data.compensation_report.outcome == "fully_rolled_back" and .data.final_state == "rolled_back"' \
+  '.ok == true and .data.compensation_report.outcome == "fully_rolled_back" and .data.compensation_report.compensated_count == 2 and .data.compensation_report.failed_count == 0 and .data.compensation_report.skipped_count == 0 and (.data.compensation_report.receipts | length) == 2 and .data.final_state == "compensated"' \
   "validate rollback recovery path"
 
 emit_log \

@@ -2291,9 +2291,10 @@ impl ToolHandler for WaTxRunTool {
             };
 
             final_state = commit.outcome.target_tx_state();
-            if matches!(commit.outcome, crate::plan::TxCommitOutcome::PartialFailure) {
+            if commit.failed_count > 0 && commit.committed_count > 0 {
                 let mut compensating_contract = prepared_contract.clone();
                 compensating_contract.lifecycle_state = crate::plan::MissionTxState::Compensating;
+                compensating_contract.receipts = commit.receipts.clone();
                 let comp_inputs = mcp_build_tx_compensation_inputs(&commit, None, now_ms);
                 let compensation = match crate::plan::execute_compensation_phase(
                     &compensating_contract,
@@ -2433,6 +2434,7 @@ impl ToolHandler for WaTxRollbackTool {
         );
         let mut compensating_contract = contract.clone();
         compensating_contract.lifecycle_state = crate::plan::MissionTxState::Compensating;
+        compensating_contract.receipts = contract.receipts.clone();
         let compensation_report = match crate::plan::execute_compensation_phase(
             &compensating_contract,
             &commit_report,
