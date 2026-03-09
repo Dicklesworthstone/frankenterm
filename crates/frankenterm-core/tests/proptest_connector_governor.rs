@@ -354,3 +354,311 @@ proptest! {
         prop_assert_eq!(snap, back);
     }
 }
+
+// =============================================================================
+// Verdict and Reason type properties
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn verdict_serde_roundtrip(idx in 0usize..3) {
+        let verdicts = [GovernorVerdict::Allow, GovernorVerdict::Throttle, GovernorVerdict::Reject];
+        let v = &verdicts[idx];
+        let json = serde_json::to_string(v).unwrap();
+        let back: GovernorVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(v, &back);
+    }
+
+    #[test]
+    fn verdict_display_non_empty(idx in 0usize..3) {
+        let verdicts = [GovernorVerdict::Allow, GovernorVerdict::Throttle, GovernorVerdict::Reject];
+        let display = verdicts[idx].to_string();
+        prop_assert!(!display.is_empty());
+    }
+
+    #[test]
+    fn reason_serde_roundtrip(idx in 0usize..8) {
+        let reasons = [
+            GovernorReason::Clear,
+            GovernorReason::ConnectorRateLimit,
+            GovernorReason::GlobalRateLimit,
+            GovernorReason::ConnectorQuotaExhausted,
+            GovernorReason::GlobalQuotaExhausted,
+            GovernorReason::BudgetExceeded,
+            GovernorReason::Backpressure,
+            GovernorReason::AdaptiveBackoff,
+        ];
+        let r = &reasons[idx];
+        let json = serde_json::to_string(r).unwrap();
+        let back: GovernorReason = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(r, &back);
+    }
+
+    #[test]
+    fn reason_display_non_empty(idx in 0usize..8) {
+        let reasons = [
+            GovernorReason::Clear,
+            GovernorReason::ConnectorRateLimit,
+            GovernorReason::GlobalRateLimit,
+            GovernorReason::ConnectorQuotaExhausted,
+            GovernorReason::GlobalQuotaExhausted,
+            GovernorReason::BudgetExceeded,
+            GovernorReason::Backpressure,
+            GovernorReason::AdaptiveBackoff,
+        ];
+        let display = reasons[idx].to_string();
+        prop_assert!(!display.is_empty());
+    }
+}
+
+// =============================================================================
+// Queue Backpressure Properties
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn queue_depth_fraction_bounded(
+        max_depth in 10usize..10_000,
+        current_depth in 0usize..20_000,
+    ) {
+        let config = QueueBackpressureConfig {
+            max_queue_depth: max_depth,
+            throttle_threshold: 0.8,
+            reject_threshold: 0.95,
+        };
+        let mut q = QueueBackpressure::new(config);
+        q.update_depth(current_depth);
+        let frac = q.depth_fraction();
+        prop_assert!(frac >= 0.0, "depth fraction negative: {}", frac);
+    }
+
+    #[test]
+    fn queue_peak_tracks_maximum(
+        depths in prop::collection::vec(0usize..1000, 1..20),
+    ) {
+        let config = QueueBackpressureConfig {
+            max_queue_depth: 10_000,
+            throttle_threshold: 0.8,
+            reject_threshold: 0.95,
+        };
+        let mut q = QueueBackpressure::new(config);
+        let mut expected_peak = 0usize;
+        for d in &depths {
+            q.update_depth(*d);
+            expected_peak = expected_peak.max(*d);
+        }
+        prop_assert_eq!(q.peak_depth(), expected_peak);
+    }
+
+    #[test]
+    fn queue_throttle_before_reject(
+        max_depth in 100usize..10_000,
+        throttle_t in 0.5f64..0.8,
+    ) {
+        let reject_t = throttle_t + 0.1;
+        let config = QueueBackpressureConfig {
+            max_queue_depth: max_depth,
+            throttle_threshold: throttle_t,
+            reject_threshold: reject_t.min(0.99),
+        };
+        let mut q = QueueBackpressure::new(config);
+
+        // At throttle threshold: should throttle but not reject
+        let throttle_depth = (max_depth as f64 * throttle_t) as usize + 1;
+        q.update_depth(throttle_depth);
+        if throttle_depth < (max_depth as f64 * reject_t.min(0.99)) as usize {
+            prop_assert!(q.should_throttle(), "should throttle at depth {}", throttle_depth);
+            prop_assert!(!q.should_reject(), "should NOT reject at depth {}", throttle_depth);
+        }
+    }
+
+    #[test]
+    fn queue_snapshot_serde_roundtrip(
+        depth in 0usize..10_000,
+        enqueued in 0u64..100_000,
+    ) {
+        let snap = QueueBackpressureSnapshot {
+            current_depth: depth,
+            peak_depth: depth + 10,
+            max_depth: 10_000,
+            depth_fraction: depth as f64 / 10_000.0,
+            total_enqueued: enqueued,
+            total_rejected: 0,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: QueueBackpressureSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap.current_depth, back.current_depth);
+        prop_assert_eq!(snap.peak_depth, back.peak_depth);
+        prop_assert_eq!(snap.total_enqueued, back.total_enqueued);
+    }
+}
+
+// =============================================================================
+// Token Bucket Config Properties
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn token_bucket_config_serde_roundtrip(config in arb_token_bucket_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: TokenBucketConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(config.capacity, back.capacity);
+        prop_assert_eq!(config.refill_rate, back.refill_rate);
+        prop_assert_eq!(config.refill_interval_ms, back.refill_interval_ms);
+    }
+
+    #[test]
+    fn quota_config_serde_roundtrip(config in arb_quota_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: QuotaConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(config.max_actions, back.max_actions);
+        prop_assert_eq!(config.window_ms, back.window_ms);
+    }
+
+    #[test]
+    fn token_bucket_empty_refuses_consume(config in arb_token_bucket_config()) {
+        let mut bucket = TokenBucket::with_initial(config, 0, 0);
+        // Don't advance time — no refill
+        let consumed = bucket.try_consume(0);
+        prop_assert!(!consumed, "empty bucket should refuse consume");
+    }
+
+    #[test]
+    fn token_bucket_time_until_available_zero_when_full(config in arb_token_bucket_config()) {
+        let mut bucket = TokenBucket::new(config);
+        let wait = bucket.time_until_available(0);
+        prop_assert_eq!(wait, 0, "full bucket should have zero wait time");
+    }
+
+    #[test]
+    fn token_bucket_consume_n_respects_count(
+        config in arb_token_bucket_config(),
+    ) {
+        let cap = config.capacity;
+        let mut bucket = TokenBucket::new(config);
+
+        // Consuming more than capacity should fail
+        if cap < u64::MAX {
+            let consumed = bucket.try_consume_n(cap + 1, 0);
+            prop_assert!(!consumed, "should not consume more than capacity");
+        }
+    }
+}
+
+// =============================================================================
+// Cost estimation properties
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn cost_estimate_deterministic(kind in arb_action_kind()) {
+        let config = CostBudgetConfig::default();
+        let cb = CostBudget::new(config);
+        let cost1 = cb.estimate_cost(&kind);
+        let cost2 = cb.estimate_cost(&kind);
+        prop_assert_eq!(cost1, cost2, "cost estimate should be deterministic for {:?}", kind);
+    }
+
+    #[test]
+    fn cost_budget_snapshot_consistent(
+        n_actions in 0usize..20,
+    ) {
+        let mut config = CostBudgetConfig::default();
+        config.max_cost_cents = 100_000;
+        let mut cb = CostBudget::new(config);
+
+        for i in 0..n_actions {
+            cb.record(&ConnectorActionKind::Notify, i as u64 * 1000);
+        }
+
+        let snap = cb.snapshot(n_actions as u64 * 1000);
+        prop_assert_eq!(snap.max_cost_cents, 100_000);
+        prop_assert!(snap.window_cost_cents + snap.remaining_cents <= snap.max_cost_cents + 1,
+            "window_cost {} + remaining {} should not exceed max {} (±1 for rounding)",
+            snap.window_cost_cents, snap.remaining_cents, snap.max_cost_cents);
+    }
+
+    #[test]
+    fn cost_budget_config_serde_roundtrip(
+        max_cents in 100u64..1_000_000,
+        window_ms in 60_000u64..86_400_000,
+    ) {
+        let config = CostBudgetConfig {
+            max_cost_cents: max_cents,
+            window_ms,
+            ..CostBudgetConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: CostBudgetConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(config.max_cost_cents, back.max_cost_cents);
+        prop_assert_eq!(config.window_ms, back.window_ms);
+    }
+}
+
+// =============================================================================
+// Governor record_outcome and connector state
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn record_outcome_tracks_backoff(
+        connector in arb_connector_id(),
+        n_failures in 1usize..10,
+    ) {
+        let mut gov = ConnectorGovernor::new(ConnectorGovernorConfig::default());
+        // Trigger auto-creation of connector state
+        let action = ConnectorAction {
+            target_connector: connector.clone(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "test".to_string(),
+            params: serde_json::json!({}),
+            created_at_ms: 1000,
+        };
+        gov.evaluate(&action, 1000);
+
+        for i in 0..n_failures {
+            gov.record_outcome(&connector, false, 1000 + i as u64 * 1000);
+        }
+
+        let state = gov.get_connector(&connector);
+        prop_assert!(state.is_some(), "connector should exist after evaluate + record_outcome");
+    }
+
+    #[test]
+    fn connector_ids_tracks_evaluated(
+        actions in prop::collection::vec(arb_connector_action(), 1..10),
+    ) {
+        let mut gov = ConnectorGovernor::new(ConnectorGovernorConfig::default());
+        let mut expected_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for a in &actions {
+            gov.evaluate(a, a.created_at_ms);
+            expected_ids.insert(a.target_connector.clone());
+        }
+
+        let actual_ids: std::collections::HashSet<String> =
+            gov.connector_ids().iter().map(|s| s.to_string()).collect();
+
+        for id in &expected_ids {
+            let contains = actual_ids.contains(id);
+            prop_assert!(contains, "governor should track connector {}", id);
+        }
+    }
+
+    #[test]
+    fn governor_snapshot_covers_all_connectors(
+        actions in prop::collection::vec(arb_connector_action(), 1..8),
+    ) {
+        let mut gov = ConnectorGovernor::new(ConnectorGovernorConfig::default());
+        let mut expected: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for a in &actions {
+            gov.evaluate(a, a.created_at_ms);
+            expected.insert(a.target_connector.clone());
+        }
+
+        let snap = gov.snapshot(200_000);
+        prop_assert_eq!(snap.connectors.len(), expected.len(),
+            "snapshot connector count should match");
+    }
+}
