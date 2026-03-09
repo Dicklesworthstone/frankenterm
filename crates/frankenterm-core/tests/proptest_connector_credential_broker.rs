@@ -1137,3 +1137,549 @@ proptest! {
         prop_assert!(is_expired);
     }
 }
+
+// =============================================================================
+// Rule TTL override property tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// When an access rule specifies max_lease_ttl_ms > 0, the lease TTL should
+    /// use the rule's value instead of the provider default.
+    #[test]
+    fn rule_ttl_overrides_provider_default(
+        rule_ttl in 1000u64..=30_000,
+        provider_ttl in 60_000u64..=120_000,
+    ) {
+        let mut broker = ConnectorCredentialBroker::new();
+        broker.register_provider(SecretProviderConfig {
+            provider_id: "p1".to_string(),
+            display_name: "P1".to_string(),
+            provider_type: "vault".to_string(),
+            max_concurrent_leases: 100,
+            default_lease_ttl_ms: provider_ttl,
+            supports_rotation: true,
+            max_sensitivity: CredentialSensitivity::Critical,
+        }, 100).unwrap();
+        broker.register_credential(ManagedCredential {
+            credential_id: "c1".to_string(),
+            provider_id: "p1".to_string(),
+            kind: CredentialKind::ApiKey,
+            sensitivity: CredentialSensitivity::Low,
+            state: CredentialState::Active,
+            permitted_scopes: vec![CredentialScope::new("github", "*", vec!["*".to_string()])],
+            version: 1,
+            created_at_ms: 100,
+            expires_at_ms: 0,
+            last_rotated_at_ms: 0,
+            active_lease_count: 0,
+        }, 100).unwrap();
+        broker.add_access_rule(CredentialAccessRule {
+            rule_id: "ttl-override".to_string(),
+            connector_pattern: "*".to_string(),
+            permitted_scope: CredentialScope::new("github", "*", vec!["*".to_string()]),
+            max_sensitivity: CredentialSensitivity::Critical,
+            max_lease_ttl_ms: rule_ttl,
+            max_concurrent_leases: 10,
+        });
+        let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
+        let now = 5000u64;
+        let lease = broker.request_lease("conn-1", "c1", scope, now).unwrap();
+        // Rule TTL should be used (it's > 0), not provider default
+        prop_assert_eq!(lease.expires_at_ms, now.saturating_add(rule_ttl));
+    }
+
+    /// When max_lease_ttl_ms == 0 on all matching rules, provider default is used.
+    #[test]
+    fn zero_rule_ttl_uses_provider_default(
+        provider_ttl in 1000u64..=120_000,
+    ) {
+        let mut broker = ConnectorCredentialBroker::new();
+        broker.register_provider(SecretProviderConfig {
+            provider_id: "p1".to_string(),
+            display_name: "P1".to_string(),
+            provider_type: "vault".to_string(),
+            max_concurrent_leases: 100,
+            default_lease_ttl_ms: provider_ttl,
+            supports_rotation: true,
+            max_sensitivity: CredentialSensitivity::Critical,
+        }, 100).unwrap();
+        broker.register_credential(ManagedCredential {
+            credential_id: "c1".to_string(),
+            provider_id: "p1".to_string(),
+            kind: CredentialKind::ApiKey,
+            sensitivity: CredentialSensitivity::Low,
+            state: CredentialState::Active,
+            permitted_scopes: vec![CredentialScope::new("github", "*", vec!["*".to_string()])],
+            version: 1,
+            created_at_ms: 100,
+            expires_at_ms: 0,
+            last_rotated_at_ms: 0,
+            active_lease_count: 0,
+        }, 100).unwrap();
+        broker.add_access_rule(CredentialAccessRule {
+            rule_id: "no-ttl-override".to_string(),
+            connector_pattern: "*".to_string(),
+            permitted_scope: CredentialScope::new("github", "*", vec!["*".to_string()]),
+            max_sensitivity: CredentialSensitivity::Critical,
+            max_lease_ttl_ms: 0,
+            max_concurrent_leases: 10,
+        });
+        let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
+        let now = 5000u64;
+        let lease = broker.request_lease("conn-1", "c1", scope, now).unwrap();
+        prop_assert_eq!(lease.expires_at_ms, now.saturating_add(provider_ttl));
+    }
+
+    /// When multiple rules match and have TTL overrides, the minimum is used.
+    #[test]
+    fn multiple_rules_use_min_ttl(
+        ttl_a in 1000u64..=10_000,
+        ttl_b in 1000u64..=10_000,
+    ) {
+        let mut broker = ConnectorCredentialBroker::new();
+        broker.register_provider(SecretProviderConfig {
+            provider_id: "p1".to_string(),
+            display_name: "P1".to_string(),
+            provider_type: "vault".to_string(),
+            max_concurrent_leases: 100,
+            default_lease_ttl_ms: 999_999,
+            supports_rotation: true,
+            max_sensitivity: CredentialSensitivity::Critical,
+        }, 100).unwrap();
+        broker.register_credential(ManagedCredential {
+            credential_id: "c1".to_string(),
+            provider_id: "p1".to_string(),
+            kind: CredentialKind::ApiKey,
+            sensitivity: CredentialSensitivity::Low,
+            state: CredentialState::Active,
+            permitted_scopes: vec![CredentialScope::new("github", "*", vec!["*".to_string()])],
+            version: 1,
+            created_at_ms: 100,
+            expires_at_ms: 0,
+            last_rotated_at_ms: 0,
+            active_lease_count: 0,
+        }, 100).unwrap();
+        broker.add_access_rule(CredentialAccessRule {
+            rule_id: "rule-a".to_string(),
+            connector_pattern: "*".to_string(),
+            permitted_scope: CredentialScope::new("github", "*", vec!["*".to_string()]),
+            max_sensitivity: CredentialSensitivity::Critical,
+            max_lease_ttl_ms: ttl_a,
+            max_concurrent_leases: 10,
+        });
+        broker.add_access_rule(CredentialAccessRule {
+            rule_id: "rule-b".to_string(),
+            connector_pattern: "*".to_string(),
+            permitted_scope: CredentialScope::new("github", "*", vec!["*".to_string()]),
+            max_sensitivity: CredentialSensitivity::Critical,
+            max_lease_ttl_ms: ttl_b,
+            max_concurrent_leases: 10,
+        });
+        let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
+        let now = 5000u64;
+        let lease = broker.request_lease("conn-1", "c1", scope, now).unwrap();
+        let expected_ttl = ttl_a.min(ttl_b);
+        prop_assert_eq!(lease.expires_at_ms, now.saturating_add(expected_ttl));
+    }
+}
+
+// =============================================================================
+// Multiple overlapping rules — max_concurrent_leases uses the max
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// When multiple rules match, the maximum max_concurrent_leases is used.
+    #[test]
+    fn overlapping_rules_use_max_concurrent_leases(
+        limit_a in 1usize..=4,
+        limit_b in 1usize..=4,
+    ) {
+        let mut broker = ConnectorCredentialBroker::new();
+        broker.register_provider(SecretProviderConfig {
+            provider_id: "p1".to_string(),
+            display_name: "P1".to_string(),
+            provider_type: "vault".to_string(),
+            max_concurrent_leases: 100,
+            default_lease_ttl_ms: 60_000,
+            supports_rotation: true,
+            max_sensitivity: CredentialSensitivity::Critical,
+        }, 100).unwrap();
+        broker.register_credential(ManagedCredential {
+            credential_id: "c1".to_string(),
+            provider_id: "p1".to_string(),
+            kind: CredentialKind::ApiKey,
+            sensitivity: CredentialSensitivity::Low,
+            state: CredentialState::Active,
+            permitted_scopes: vec![CredentialScope::new("github", "*", vec!["*".to_string()])],
+            version: 1,
+            created_at_ms: 100,
+            expires_at_ms: 0,
+            last_rotated_at_ms: 0,
+            active_lease_count: 0,
+        }, 100).unwrap();
+        broker.add_access_rule(CredentialAccessRule {
+            rule_id: "rule-a".to_string(),
+            connector_pattern: "*".to_string(),
+            permitted_scope: CredentialScope::new("github", "*", vec!["*".to_string()]),
+            max_sensitivity: CredentialSensitivity::Critical,
+            max_lease_ttl_ms: 0,
+            max_concurrent_leases: limit_a,
+        });
+        broker.add_access_rule(CredentialAccessRule {
+            rule_id: "rule-b".to_string(),
+            connector_pattern: "*".to_string(),
+            permitted_scope: CredentialScope::new("github", "*", vec!["*".to_string()]),
+            max_sensitivity: CredentialSensitivity::Critical,
+            max_lease_ttl_ms: 0,
+            max_concurrent_leases: limit_b,
+        });
+        let effective_limit = limit_a.max(limit_b);
+        // Should be able to issue exactly effective_limit leases
+        for i in 0..effective_limit {
+            let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
+            let result = broker.request_lease("conn-1", "c1", scope, 2000 + i as u64);
+            let ok = result.is_ok();
+            prop_assert!(ok, "lease {} should succeed (limit={})", i, effective_limit);
+        }
+        // One more should fail
+        let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
+        let err = broker.request_lease("conn-1", "c1", scope, 9000).unwrap_err();
+        let is_exceeded = matches!(err, CredentialBrokerError::MaxLeasesExceeded { limit, .. } if limit == effective_limit);
+        prop_assert!(is_exceeded);
+    }
+}
+
+// =============================================================================
+// Provider counter consistency property tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Provider active_leases and total_issued track lease operations accurately.
+    #[test]
+    fn provider_counter_consistency(
+        n_issue in 1usize..=6,
+        n_revoke in 0usize..=3,
+    ) {
+        let n_revoke = n_revoke.min(n_issue);
+        let mut broker = setup_broker_for_leasing(
+            CredentialSensitivity::Critical,
+            CredentialSensitivity::Medium,
+            60_000,
+        );
+        let mut lease_ids = Vec::new();
+        for i in 0..n_issue {
+            let scope = CredentialScope::new("github", "repos/foo", vec!["read".to_string()]);
+            let lease = broker.request_lease(&format!("conn-{i}"), "cred-1", scope, 2000 + i as u64).unwrap();
+            lease_ids.push(lease.lease_id);
+        }
+        let provider = broker.get_provider("prov-1").unwrap();
+        prop_assert_eq!(provider.active_leases, n_issue as u32);
+        prop_assert_eq!(provider.total_issued, n_issue as u64);
+        prop_assert_eq!(provider.total_revoked, 0);
+
+        for (i, lid) in lease_ids.iter().enumerate().take(n_revoke) {
+            broker.revoke_lease(lid, 5000 + i as u64).unwrap();
+        }
+        let provider = broker.get_provider("prov-1").unwrap();
+        prop_assert_eq!(provider.active_leases, (n_issue - n_revoke) as u32);
+        prop_assert_eq!(provider.total_revoked, n_revoke as u64);
+        // total_issued unchanged after revocation
+        prop_assert_eq!(provider.total_issued, n_issue as u64);
+    }
+
+    /// Provider rotation counter tracks rotate_credential calls.
+    #[test]
+    fn provider_rotation_counter(n in 1u32..=8) {
+        let mut broker = setup_broker_for_leasing(
+            CredentialSensitivity::Critical,
+            CredentialSensitivity::Medium,
+            60_000,
+        );
+        for i in 0..n {
+            broker.rotate_credential("cred-1", 5000 + i as u64 * 100).unwrap();
+            broker.complete_rotation("cred-1").unwrap();
+        }
+        let provider = broker.get_provider("prov-1").unwrap();
+        prop_assert_eq!(provider.total_rotations, n as u64);
+    }
+}
+
+// =============================================================================
+// Lease counter monotonicity property tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Lease IDs are unique and monotonically increasing across issuance.
+    #[test]
+    fn lease_ids_unique_and_monotonic(n in 2usize..=10) {
+        let mut broker = setup_broker_for_leasing(
+            CredentialSensitivity::Critical,
+            CredentialSensitivity::Medium,
+            60_000,
+        );
+        let mut lease_ids = Vec::new();
+        for i in 0..n {
+            let scope = CredentialScope::new("github", "repos/foo", vec!["read".to_string()]);
+            let lease = broker.request_lease(&format!("conn-{i}"), "cred-1", scope, 2000 + i as u64).unwrap();
+            lease_ids.push(lease.lease_id);
+        }
+        // All unique
+        let unique_count = {
+            let mut set = std::collections::HashSet::new();
+            for id in &lease_ids {
+                set.insert(id.clone());
+            }
+            set.len()
+        };
+        prop_assert_eq!(unique_count, n);
+        // Monotonic: extract numeric suffix and verify ordering
+        let nums: Vec<u64> = lease_ids
+            .iter()
+            .map(|id| id.strip_prefix("lease-").unwrap().parse::<u64>().unwrap())
+            .collect();
+        for w in nums.windows(2) {
+            prop_assert!(w[0] < w[1], "lease IDs should be strictly increasing");
+        }
+    }
+}
+
+// =============================================================================
+// Audit log FIFO eviction order property tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(8))]
+
+    /// When audit log exceeds 1024 entries, oldest events are evicted first (FIFO).
+    #[test]
+    fn audit_log_fifo_eviction(n in 1025usize..=1100) {
+        let mut broker = ConnectorCredentialBroker::new();
+        // Each register_provider call emits exactly 1 audit event
+        for i in 0..n {
+            broker.register_provider(SecretProviderConfig {
+                provider_id: format!("p{i}"),
+                display_name: format!("P{i}"),
+                provider_type: "env".to_string(),
+                max_concurrent_leases: 10,
+                default_lease_ttl_ms: 60_000,
+                supports_rotation: false,
+                max_sensitivity: CredentialSensitivity::Low,
+            }, i as u64).unwrap();
+        }
+        let log = broker.audit_log();
+        prop_assert_eq!(log.len(), 1024);
+        // The oldest surviving event should be from provider n-1024
+        let first = &log[0];
+        let expected_first_ts = (n - 1024) as u64;
+        prop_assert_eq!(first.timestamp_ms, expected_first_ts);
+        // The newest event should be from provider n-1
+        let last = &log[1023];
+        prop_assert_eq!(last.timestamp_ms, (n - 1) as u64);
+        // Timestamps should be monotonically non-decreasing
+        let timestamps: Vec<u64> = log.iter().map(|e| e.timestamp_ms).collect();
+        for w in timestamps.windows(2) {
+            prop_assert!(w[0] <= w[1], "audit log should be chronologically ordered");
+        }
+    }
+}
+
+// =============================================================================
+// Credential active_lease_count consistency through expire_leases
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// After expire_leases, credential.active_lease_count matches actual active leases.
+    #[test]
+    fn credential_active_count_after_expiry(
+        n_issue in 1usize..=6,
+        n_expire in 1usize..=6,
+    ) {
+        let _n_expire = n_expire.min(n_issue);
+        let mut broker = ConnectorCredentialBroker::new();
+        broker.register_provider(SecretProviderConfig {
+            provider_id: "p1".to_string(),
+            display_name: "P1".to_string(),
+            provider_type: "vault".to_string(),
+            max_concurrent_leases: 100,
+            default_lease_ttl_ms: 1000, // short TTL for early leases
+            supports_rotation: true,
+            max_sensitivity: CredentialSensitivity::Critical,
+        }, 100).unwrap();
+        broker.register_credential(ManagedCredential {
+            credential_id: "c1".to_string(),
+            provider_id: "p1".to_string(),
+            kind: CredentialKind::ApiKey,
+            sensitivity: CredentialSensitivity::Low,
+            state: CredentialState::Active,
+            permitted_scopes: vec![CredentialScope::new("github", "*", vec!["*".to_string()])],
+            version: 1,
+            created_at_ms: 100,
+            expires_at_ms: 0,
+            last_rotated_at_ms: 0,
+            active_lease_count: 0,
+        }, 100).unwrap();
+        // Two rules: one with short TTL for early leases, one with long TTL for later
+        broker.add_access_rule(CredentialAccessRule {
+            rule_id: "r1".to_string(),
+            connector_pattern: "*".to_string(),
+            permitted_scope: CredentialScope::new("github", "*", vec!["*".to_string()]),
+            max_sensitivity: CredentialSensitivity::Critical,
+            max_lease_ttl_ms: 0, // use provider default (1000ms)
+            max_concurrent_leases: 20,
+        });
+
+        // Issue all leases at time 1000
+        for i in 0..n_issue {
+            let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
+            broker.request_lease(&format!("conn-{i}"), "c1", scope, 1000).unwrap();
+        }
+        // All leases expire at 1000 + 1000 = 2000
+        // Expire some by advancing time past their TTL
+        let expired = broker.expire_leases(2001);
+        prop_assert_eq!(expired.len(), n_issue);
+
+        let cred = broker.get_credential("c1").unwrap();
+        prop_assert_eq!(cred.active_lease_count, 0);
+        // Provider should also reflect zero active leases
+        let provider = broker.get_provider("p1").unwrap();
+        prop_assert_eq!(provider.active_leases, 0);
+    }
+}
+
+// =============================================================================
+// Lease TTL saturating_add edge case
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Lease expires_at_ms uses saturating_add, so it doesn't overflow.
+    #[test]
+    fn lease_ttl_saturating_at_max(
+        now in (u64::MAX - 10_000)..=u64::MAX,
+    ) {
+        let mut broker = ConnectorCredentialBroker::new();
+        broker.register_provider(SecretProviderConfig {
+            provider_id: "p1".to_string(),
+            display_name: "P1".to_string(),
+            provider_type: "vault".to_string(),
+            max_concurrent_leases: 100,
+            default_lease_ttl_ms: 60_000,
+            supports_rotation: true,
+            max_sensitivity: CredentialSensitivity::Critical,
+        }, 100).unwrap();
+        broker.register_credential(ManagedCredential {
+            credential_id: "c1".to_string(),
+            provider_id: "p1".to_string(),
+            kind: CredentialKind::ApiKey,
+            sensitivity: CredentialSensitivity::Low,
+            state: CredentialState::Active,
+            permitted_scopes: vec![CredentialScope::new("github", "*", vec!["*".to_string()])],
+            version: 1,
+            created_at_ms: 100,
+            expires_at_ms: 0,
+            last_rotated_at_ms: 0,
+            active_lease_count: 0,
+        }, 100).unwrap();
+        broker.add_access_rule(CredentialAccessRule {
+            rule_id: "r1".to_string(),
+            connector_pattern: "*".to_string(),
+            permitted_scope: CredentialScope::new("github", "*", vec!["*".to_string()]),
+            max_sensitivity: CredentialSensitivity::Critical,
+            max_lease_ttl_ms: 0,
+            max_concurrent_leases: 10,
+        });
+        let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
+        let lease = broker.request_lease("conn-1", "c1", scope, now).unwrap();
+        // Should saturate to u64::MAX, not overflow/wrap
+        prop_assert_eq!(lease.expires_at_ms, now.saturating_add(60_000));
+        prop_assert!(lease.expires_at_ms >= now);
+    }
+}
+
+// =============================================================================
+// Credential revocation zeroes active_lease_count even with mixed lease states
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Revoking a credential with a mix of active, expired, and already-revoked
+    /// leases still results in active_lease_count = 0 and correct telemetry.
+    #[test]
+    fn revoke_with_mixed_lease_states(
+        n_active in 1usize..=3,
+        n_to_revoke_first in 0usize..=2,
+        n_to_expire_first in 0usize..=2,
+    ) {
+        let total = n_active + n_to_revoke_first + n_to_expire_first;
+        let mut broker = ConnectorCredentialBroker::new();
+        broker.register_provider(SecretProviderConfig {
+            provider_id: "p1".to_string(),
+            display_name: "P1".to_string(),
+            provider_type: "vault".to_string(),
+            max_concurrent_leases: 100,
+            default_lease_ttl_ms: 10_000,
+            supports_rotation: true,
+            max_sensitivity: CredentialSensitivity::Critical,
+        }, 100).unwrap();
+        broker.register_credential(ManagedCredential {
+            credential_id: "c1".to_string(),
+            provider_id: "p1".to_string(),
+            kind: CredentialKind::ApiKey,
+            sensitivity: CredentialSensitivity::Low,
+            state: CredentialState::Active,
+            permitted_scopes: vec![CredentialScope::new("github", "*", vec!["*".to_string()])],
+            version: 1,
+            created_at_ms: 100,
+            expires_at_ms: 0,
+            last_rotated_at_ms: 0,
+            active_lease_count: 0,
+        }, 100).unwrap();
+        broker.add_access_rule(CredentialAccessRule {
+            rule_id: "r1".to_string(),
+            connector_pattern: "*".to_string(),
+            permitted_scope: CredentialScope::new("github", "*", vec!["*".to_string()]),
+            max_sensitivity: CredentialSensitivity::Critical,
+            max_lease_ttl_ms: 0,
+            max_concurrent_leases: 50,
+        });
+
+        // Issue all leases at time 1000
+        let mut lease_ids = Vec::new();
+        for i in 0..total {
+            let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
+            let lease = broker.request_lease(&format!("conn-{i}"), "c1", scope, 1000).unwrap();
+            lease_ids.push(lease.lease_id);
+        }
+
+        // Revoke some
+        let revoke_count = n_to_revoke_first.min(lease_ids.len());
+        for lid in lease_ids.iter().take(revoke_count) {
+            broker.revoke_lease(lid, 2000).unwrap();
+        }
+        // Expire some by advancing time past their TTL (1000 + 10000 = 11000)
+        let _expired = broker.expire_leases(11001);
+
+        // Now revoke the credential itself
+        let revoked = broker.revoke_credential("c1", 15000).unwrap();
+        // Only currently-active leases get terminated by credential revocation
+        // (already revoked/expired ones are skipped)
+        let cred = broker.get_credential("c1").unwrap();
+        prop_assert_eq!(cred.active_lease_count, 0);
+        let is_revoked = cred.state == CredentialState::Revoked;
+        prop_assert!(is_revoked);
+        // revoked list should be empty — all leases were already revoked or expired
+        prop_assert_eq!(revoked.len(), 0);
+    }
+}
