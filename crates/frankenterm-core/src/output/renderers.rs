@@ -1394,45 +1394,168 @@ fn parse_decision_context(decision_context: Option<&str>) -> Option<DecisionCont
     parse_serialized_decision_context(decision_context)
 }
 
-fn format_decision_context_summary(decision_context: Option<&str>) -> Option<String> {
-    let context = parse_decision_context(decision_context)?;
-    let mut parts = vec![
-        format!("surface={}", context.surface.as_str()),
-        format!("actor={}", context.actor.as_str()),
-        format!("action={}", context.action.as_str()),
-    ];
+fn parse_legacy_decision_context_object(
+    decision_context: Option<&str>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    serde_json::from_str::<serde_json::Value>(decision_context?)
+        .ok()?
+        .as_object()
+        .cloned()
+}
 
-    if let Some(rule_id) = context.determining_rule.as_deref() {
+fn legacy_decision_context_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Null => Some("null".to_string()),
+        _ => None,
+    }
+}
+
+fn legacy_decision_context_scalar_pairs(
+    object: &serde_json::Map<String, serde_json::Value>,
+    excluded_keys: &[&str],
+) -> Vec<String> {
+    let mut pairs = object
+        .iter()
+        .filter(|(key, _)| !excluded_keys.contains(&key.as_str()))
+        .filter_map(|(key, value)| {
+            legacy_decision_context_value(value).map(|value| format!("{key}={value}"))
+        })
+        .collect::<Vec<_>>();
+    pairs.sort();
+    pairs
+}
+
+fn format_decision_context_summary(decision_context: Option<&str>) -> Option<String> {
+    if let Some(context) = parse_decision_context(decision_context) {
+        let mut parts = vec![
+            format!("surface={}", context.surface.as_str()),
+            format!("actor={}", context.actor.as_str()),
+            format!("action={}", context.action.as_str()),
+        ];
+
+        if let Some(rule_id) = context.determining_rule.as_deref() {
+            parts.push(format!("rule={rule_id}"));
+        }
+        if let Some(pane_id) = context.pane_id {
+            parts.push(format!("pane={pane_id}"));
+        }
+        if let Some(domain) = context.domain.as_deref() {
+            parts.push(format!("domain={domain}"));
+        }
+        if let Some(workflow_id) = context.workflow_id.as_deref() {
+            parts.push(format!("workflow={workflow_id}"));
+        }
+
+        return Some(parts.join(" "));
+    }
+
+    let object = parse_legacy_decision_context_object(decision_context)?;
+    let mut parts = Vec::new();
+
+    if let Some(surface) = object.get("surface").and_then(serde_json::Value::as_str) {
+        parts.push(format!("surface={surface}"));
+    }
+    if let Some(actor) = object.get("actor").and_then(serde_json::Value::as_str) {
+        parts.push(format!("actor={actor}"));
+    }
+    if let Some(action) = object.get("action").and_then(serde_json::Value::as_str) {
+        parts.push(format!("action={action}"));
+    }
+    if let Some(rule_id) = object
+        .get("determining_rule")
+        .or_else(|| object.get("rule_id"))
+        .or_else(|| object.get("legacy_rule"))
+        .and_then(serde_json::Value::as_str)
+    {
         parts.push(format!("rule={rule_id}"));
     }
-    if let Some(pane_id) = context.pane_id {
+    if let Some(pane_id) = object
+        .get("pane_id")
+        .and_then(legacy_decision_context_value)
+    {
         parts.push(format!("pane={pane_id}"));
     }
-    if let Some(domain) = context.domain.as_deref() {
+    if let Some(domain) = object.get("domain").and_then(serde_json::Value::as_str) {
         parts.push(format!("domain={domain}"));
     }
-    if let Some(workflow_id) = context.workflow_id.as_deref() {
+    if let Some(workflow_id) = object
+        .get("workflow_id")
+        .and_then(serde_json::Value::as_str)
+    {
         parts.push(format!("workflow={workflow_id}"));
     }
+    if parts.is_empty() {
+        parts.extend(
+            legacy_decision_context_scalar_pairs(&object, &["evidence"])
+                .into_iter()
+                .take(4),
+        );
+    }
 
-    Some(parts.join(" "))
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
 }
 
 fn format_decision_context_evidence(decision_context: Option<&str>) -> Option<String> {
-    let context = parse_decision_context(decision_context)?;
-    if context.evidence.is_empty() {
-        return None;
+    if let Some(context) = parse_decision_context(decision_context) {
+        if context.evidence.is_empty() {
+            return None;
+        }
+
+        return Some(
+            context
+                .evidence
+                .iter()
+                .take(4)
+                .map(|evidence| format!("{}={}", evidence.key, evidence.value))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
     }
 
-    Some(
-        context
-            .evidence
+    let object = parse_legacy_decision_context_object(decision_context)?;
+    if let Some(evidence) = object.get("evidence").and_then(serde_json::Value::as_array) {
+        let rendered = evidence
             .iter()
+            .filter_map(|entry| {
+                let entry = entry.as_object()?;
+                let key = entry.get("key")?.as_str()?;
+                let value = legacy_decision_context_value(entry.get("value")?)?;
+                Some(format!("{key}={value}"))
+            })
             .take(4)
-            .map(|evidence| format!("{}={}", evidence.key, evidence.value))
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
+            .collect::<Vec<_>>();
+        if !rendered.is_empty() {
+            return Some(rendered.join(", "));
+        }
+    }
+
+    let extra = legacy_decision_context_scalar_pairs(
+        &object,
+        &[
+            "surface",
+            "actor",
+            "action",
+            "determining_rule",
+            "rule_id",
+            "legacy_rule",
+            "pane_id",
+            "domain",
+            "workflow_id",
+            "evidence",
+        ],
+    );
+    if extra.is_empty() {
+        None
+    } else {
+        Some(extra.into_iter().take(4).collect::<Vec<_>>().join(", "))
+    }
 }
 
 fn csv_escape(value: String) -> String {
@@ -3126,6 +3249,33 @@ mod tests {
         assert!(output.contains("rule=policy.cooldown"));
         assert!(output.contains("pane=5"));
         assert!(output.contains("Evidence:   command=ft send 5 echo hello"));
+    }
+
+    #[test]
+    fn audit_detail_render_plain_formats_legacy_decision_context() {
+        let mut action = sample_audit_action();
+        action.decision_context = Some(
+            r#"{"surface":"mux","legacy_rule":"deny.alt_screen","evidence":[{"key":"stage","value":"legacy"},{"key":"detail","value":"alt-screen blocked"}]}"#
+                .to_string(),
+        );
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render_detail(&action, &ctx);
+
+        assert!(output.contains("Context:    surface=mux rule=deny.alt_screen"));
+        assert!(output.contains("Evidence:   stage=legacy, detail=alt-screen blocked"));
+    }
+
+    #[test]
+    fn audit_detail_render_plain_formats_legacy_scalar_decision_context() {
+        let mut action = sample_audit_action();
+        action.decision_context = Some(r#"{"risk":"high","source":"legacy"}"#.to_string());
+
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render_detail(&action, &ctx);
+
+        assert!(output.contains("Context:    risk=high source=legacy"));
+        assert!(output.contains("Evidence:   risk=high, source=legacy"));
     }
 
     #[test]

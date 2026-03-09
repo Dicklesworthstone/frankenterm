@@ -6273,22 +6273,16 @@ fn build_approval_decision_context(
         }
         _ => frankenterm_core::policy::PolicySurface::default_for_actor(actor),
     };
-    let mut context = frankenterm_core::policy::DecisionContext {
+    let mut context = frankenterm_core::policy::DecisionContext::new_audit(
         timestamp_ms,
         action,
         actor,
         surface,
         pane_id,
-        domain: None,
-        capabilities: frankenterm_core::policy::PaneCapabilities::default(),
-        text_summary: Some(format!("approval consume for {action_kind}")),
-        workflow_id: None,
-        rules_evaluated: Vec::new(),
-        determining_rule: None,
-        evidence: Vec::new(),
-        rate_limit: None,
-        risk: None,
-    };
+        None,
+        Some(format!("approval consume for {action_kind}")),
+        None,
+    );
     context.record_rule(
         "approval.allow_once.consume",
         true,
@@ -6326,22 +6320,16 @@ fn build_event_mutation_decision_context(
         "ft.robot.events" => frankenterm_core::policy::PolicySurface::Robot,
         _ => frankenterm_core::policy::PolicySurface::default_for_actor(actor),
     };
-    let mut context = frankenterm_core::policy::DecisionContext {
+    let mut context = frankenterm_core::policy::DecisionContext::new_audit(
         timestamp_ms,
-        action: frankenterm_core::policy::ActionKind::ExecCommand,
+        frankenterm_core::policy::ActionKind::ExecCommand,
         actor,
         surface,
-        pane_id: None,
-        domain: None,
-        capabilities: frankenterm_core::policy::PaneCapabilities::default(),
-        text_summary: Some(input_summary.to_string()),
-        workflow_id: None,
-        rules_evaluated: Vec::new(),
-        determining_rule: None,
-        evidence: Vec::new(),
-        rate_limit: None,
-        risk: None,
-    };
+        None,
+        None,
+        Some(input_summary.to_string()),
+        None,
+    );
     let determining_rule = format!("audit.{action_kind}");
     context.record_rule(
         &determining_rule,
@@ -6379,22 +6367,16 @@ fn build_ipc_rpc_decision_context(
     timestamp_ms: i64,
 ) -> Option<String> {
     let actor = approval_actor_kind(actor_kind);
-    let mut context = frankenterm_core::policy::DecisionContext {
+    let mut context = frankenterm_core::policy::DecisionContext::new_audit(
         timestamp_ms,
-        action: frankenterm_core::policy::ActionKind::ExecCommand,
+        frankenterm_core::policy::ActionKind::ExecCommand,
         actor,
-        surface: frankenterm_core::policy::PolicySurface::Ipc,
-        pane_id: None,
-        domain: None,
-        capabilities: frankenterm_core::policy::PaneCapabilities::default(),
-        text_summary: Some(summary.to_string()),
-        workflow_id: None,
-        rules_evaluated: Vec::new(),
-        determining_rule: None,
-        evidence: Vec::new(),
-        rate_limit: None,
-        risk: None,
-    };
+        frankenterm_core::policy::PolicySurface::Ipc,
+        None,
+        None,
+        Some(summary.to_string()),
+        None,
+    );
     context.record_rule(
         "audit.ipc.rpc",
         true,
@@ -7036,22 +7018,16 @@ fn build_plan_audit_context(
 ) -> Option<String> {
     let action = audit_target_action_kind(action_kind);
     let surface = plan_audit_surface(action);
-    let mut context = frankenterm_core::policy::DecisionContext {
+    let mut context = frankenterm_core::policy::DecisionContext::new_audit(
         timestamp_ms,
         action,
-        actor: frankenterm_core::policy::ActorKind::Human,
+        frankenterm_core::policy::ActorKind::Human,
         surface,
         pane_id,
-        domain: None,
-        capabilities: frankenterm_core::policy::PaneCapabilities::default(),
-        text_summary: Some(format!("{stage} plan for {action_kind}")),
-        workflow_id: None,
-        rules_evaluated: Vec::new(),
-        determining_rule: None,
-        evidence: Vec::new(),
-        rate_limit: None,
-        risk: None,
-    };
+        None,
+        Some(format!("{stage} plan for {action_kind}")),
+        None,
+    );
     let determining_rule = format!("audit.plan.{stage}.{action_kind}");
     context.record_rule(
         &determining_rule,
