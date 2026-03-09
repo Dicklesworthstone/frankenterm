@@ -40313,184 +40313,193 @@ log_level = "debug"
         });
     }
 
-    #[tokio::test]
-    async fn robot_approve_wrong_pane() {
-        let (storage, db_path) = setup_storage("wrong_pane").await;
-        let workspace_id = "ws-pane";
-        let code = "PANE1234";
-        let fingerprint = "sha256:pane";
-        let expires_at = now_ms() + 60_000;
-
-        insert_token(
-            &storage,
-            workspace_id,
-            code,
-            Some(9),
-            expires_at,
-            None,
-            fingerprint,
-        )
-        .await;
-
-        let err = evaluate_robot_approve(
-            &storage,
-            workspace_id,
-            code,
-            Some(7),
-            Some(fingerprint),
-            false,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(err.code, "E_WRONG_PANE");
-
-        cleanup_storage(storage, &db_path).await;
-    }
-
-    #[tokio::test]
-    async fn robot_approve_wrong_workspace() {
-        let (storage, db_path) = setup_storage("wrong_ws").await;
-        let code = "WS123456";
-        let fingerprint = "sha256:ws";
-        let expires_at = now_ms() + 60_000;
-
-        insert_token(&storage, "ws-a", code, None, expires_at, None, fingerprint).await;
-
-        let err = evaluate_robot_approve(&storage, "ws-b", code, None, Some(fingerprint), false)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.code, "E_WRONG_WORKSPACE");
-
-        cleanup_storage(storage, &db_path).await;
-    }
-
-    #[tokio::test]
-    async fn robot_approve_fingerprint_mismatch() {
-        let (storage, db_path) = setup_storage("fingerprint").await;
-        let workspace_id = "ws-fp";
-        let code = "FP123456";
-        let expires_at = now_ms() + 60_000;
-
-        insert_token(
-            &storage,
-            workspace_id,
-            code,
-            Some(4),
-            expires_at,
-            None,
-            "sha256:expected",
-        )
-        .await;
-
-        let err = evaluate_robot_approve(
-            &storage,
-            workspace_id,
-            code,
-            Some(4),
-            Some("sha256:other"),
-            false,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(err.code, "E_FINGERPRINT_MISMATCH");
-
-        cleanup_storage(storage, &db_path).await;
-    }
-
-    #[tokio::test]
-    async fn approve_records_surface_aware_decision_context_in_audit() {
-        let cases = [
-            (
-                "human",
-                frankenterm_core::policy::ActorKind::Human,
-                frankenterm_core::policy::PolicySurface::Mux,
-            ),
-            (
-                "robot",
-                frankenterm_core::policy::ActorKind::Robot,
-                frankenterm_core::policy::PolicySurface::Mux,
-            ),
-        ];
-
-        for (actor_kind, expected_actor, expected_surface) in cases {
-            let label = format!("approve_audit_ctx_{actor_kind}");
-            let (storage, db_path) = setup_storage(&label).await;
-            let workspace_id = format!("ws-{actor_kind}");
-            let code = if actor_kind == "human" {
-                "HUM12345"
-            } else {
-                "ROB12345"
-            };
-            let fingerprint = format!("sha256:{actor_kind}");
+    #[test]
+    fn robot_approve_wrong_pane() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("wrong_pane").await;
+            let workspace_id = "ws-pane";
+            let code = "PANE1234";
+            let fingerprint = "sha256:pane";
+            let expires_at = now_ms() + 60_000;
 
             insert_token(
                 &storage,
-                &workspace_id,
+                workspace_id,
                 code,
-                Some(12),
-                now_ms() + 60_000,
+                Some(9),
+                expires_at,
                 None,
-                &fingerprint,
+                fingerprint,
             )
             .await;
 
-            let data = evaluate_approve(
+            let err = evaluate_robot_approve(
                 &storage,
-                &workspace_id,
+                workspace_id,
                 code,
-                Some(12),
-                Some(&fingerprint),
+                Some(7),
+                Some(fingerprint),
                 false,
-                actor_kind,
             )
             .await
-            .unwrap();
-            assert!(data.valid);
-            assert!(data.consumed_at.is_some());
+            .unwrap_err();
 
-            let audits = storage
-                .get_audit_actions(frankenterm_core::storage::AuditQuery {
-                    action_kind: Some("approve_allow_once".to_string()),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(audits.len(), 1);
-
-            let ctx_json = audits[0]
-                .decision_context
-                .as_deref()
-                .expect("approval audit should retain decision_context");
-            let ctx: frankenterm_core::policy::DecisionContext =
-                serde_json::from_str(ctx_json).expect("decision_context should parse");
-
-            assert_eq!(ctx.actor, expected_actor);
-            assert_eq!(ctx.surface, expected_surface);
-            assert_eq!(ctx.action, frankenterm_core::policy::ActionKind::SendText);
-            assert_eq!(ctx.pane_id, Some(12));
-            assert_eq!(
-                ctx.determining_rule.as_deref(),
-                Some("approval.allow_once.consume")
-            );
-            assert!(
-                ctx.evidence
-                    .iter()
-                    .any(|ev| ev.key == "stage" && ev.value == "approval")
-            );
-            assert!(ctx.evidence.iter().any(|ev| {
-                ev.key == "approval_surface" && ev.value == expected_surface.as_str()
-            }));
-            assert!(
-                ctx.evidence
-                    .iter()
-                    .any(|ev| { ev.key == "workspace_id" && ev.value == workspace_id })
-            );
+            assert_eq!(err.code, "E_WRONG_PANE");
 
             cleanup_storage(storage, &db_path).await;
-        }
+        });
+    }
+
+    #[test]
+    fn robot_approve_wrong_workspace() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("wrong_ws").await;
+            let code = "WS123456";
+            let fingerprint = "sha256:ws";
+            let expires_at = now_ms() + 60_000;
+
+            insert_token(&storage, "ws-a", code, None, expires_at, None, fingerprint).await;
+
+            let err =
+                evaluate_robot_approve(&storage, "ws-b", code, None, Some(fingerprint), false)
+                    .await
+                    .unwrap_err();
+
+            assert_eq!(err.code, "E_WRONG_WORKSPACE");
+
+            cleanup_storage(storage, &db_path).await;
+        });
+    }
+
+    #[test]
+    fn robot_approve_fingerprint_mismatch() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("fingerprint").await;
+            let workspace_id = "ws-fp";
+            let code = "FP123456";
+            let expires_at = now_ms() + 60_000;
+
+            insert_token(
+                &storage,
+                workspace_id,
+                code,
+                Some(4),
+                expires_at,
+                None,
+                "sha256:expected",
+            )
+            .await;
+
+            let err = evaluate_robot_approve(
+                &storage,
+                workspace_id,
+                code,
+                Some(4),
+                Some("sha256:other"),
+                false,
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.code, "E_FINGERPRINT_MISMATCH");
+
+            cleanup_storage(storage, &db_path).await;
+        });
+    }
+
+    #[test]
+    fn approve_records_surface_aware_decision_context_in_audit() {
+        run_async_test(async {
+            let cases = [
+                (
+                    "human",
+                    frankenterm_core::policy::ActorKind::Human,
+                    frankenterm_core::policy::PolicySurface::Mux,
+                ),
+                (
+                    "robot",
+                    frankenterm_core::policy::ActorKind::Robot,
+                    frankenterm_core::policy::PolicySurface::Mux,
+                ),
+            ];
+
+            for (actor_kind, expected_actor, expected_surface) in cases {
+                let label = format!("approve_audit_ctx_{actor_kind}");
+                let (storage, db_path) = setup_storage(&label).await;
+                let workspace_id = format!("ws-{actor_kind}");
+                let code = if actor_kind == "human" {
+                    "HUM12345"
+                } else {
+                    "ROB12345"
+                };
+                let fingerprint = format!("sha256:{actor_kind}");
+
+                insert_token(
+                    &storage,
+                    &workspace_id,
+                    code,
+                    Some(12),
+                    now_ms() + 60_000,
+                    None,
+                    &fingerprint,
+                )
+                .await;
+
+                let data = evaluate_approve(
+                    &storage,
+                    &workspace_id,
+                    code,
+                    Some(12),
+                    Some(&fingerprint),
+                    false,
+                    actor_kind,
+                )
+                .await
+                .unwrap();
+                assert!(data.valid);
+                assert!(data.consumed_at.is_some());
+
+                let audits = storage
+                    .get_audit_actions(frankenterm_core::storage::AuditQuery {
+                        action_kind: Some("approve_allow_once".to_string()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(audits.len(), 1);
+
+                let ctx_json = audits[0]
+                    .decision_context
+                    .as_deref()
+                    .expect("approval audit should retain decision_context");
+                let ctx: frankenterm_core::policy::DecisionContext =
+                    serde_json::from_str(ctx_json).expect("decision_context should parse");
+
+                assert_eq!(ctx.actor, expected_actor);
+                assert_eq!(ctx.surface, expected_surface);
+                assert_eq!(ctx.action, frankenterm_core::policy::ActionKind::SendText);
+                assert_eq!(ctx.pane_id, Some(12));
+                assert_eq!(
+                    ctx.determining_rule.as_deref(),
+                    Some("approval.allow_once.consume")
+                );
+                assert!(
+                    ctx.evidence
+                        .iter()
+                        .any(|ev| ev.key == "stage" && ev.value == "approval")
+                );
+                assert!(ctx.evidence.iter().any(|ev| {
+                    ev.key == "approval_surface" && ev.value == expected_surface.as_str()
+                }));
+                assert!(
+                    ctx.evidence
+                        .iter()
+                        .any(|ev| { ev.key == "workspace_id" && ev.value == workspace_id })
+                );
+
+                cleanup_storage(storage, &db_path).await;
+            }
+        });
     }
 
     #[test]
@@ -40849,48 +40858,50 @@ log_level = "debug"
         assert!(audit_decision_context_json(Some("not-json")).is_none());
     }
 
-    #[tokio::test]
-    async fn record_ipc_rpc_audit_persists_structured_decision_context() {
-        let (storage, db_path) = setup_storage("ipc_rpc_audit_ctx").await;
-        let shared_storage = Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage));
+    #[test]
+    fn record_ipc_rpc_audit_persists_structured_decision_context() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("ipc_rpc_audit_ctx").await;
+            let shared_storage = Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage));
 
-        record_ipc_rpc_audit(
-            &shared_storage,
-            Some("req-456".to_string()),
-            "ft robot state".to_string(),
-            "success",
-        )
-        .await;
+            record_ipc_rpc_audit(
+                &shared_storage,
+                Some("req-456".to_string()),
+                "ft robot state".to_string(),
+                "success",
+            )
+            .await;
 
-        let storage_handle = shared_storage.lock().await.clone();
-        let audits = storage_handle
-            .get_audit_actions(frankenterm_core::storage::AuditQuery {
-                action_kind: Some("ipc.rpc".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(audits.len(), 1);
-        assert_eq!(audits[0].actor_kind, "robot");
-        assert_eq!(audits[0].correlation_id.as_deref(), Some("req-456"));
+            let storage_handle = shared_storage.lock().await.clone();
+            let audits = storage_handle
+                .get_audit_actions(frankenterm_core::storage::AuditQuery {
+                    action_kind: Some("ipc.rpc".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0].actor_kind, "robot");
+            assert_eq!(audits[0].correlation_id.as_deref(), Some("req-456"));
 
-        let ctx_json = audits[0]
-            .decision_context
-            .as_deref()
-            .expect("ipc rpc audit should retain decision_context");
-        let ctx: frankenterm_core::policy::DecisionContext =
-            serde_json::from_str(ctx_json).expect("decision context should parse");
-        assert_eq!(ctx.actor, frankenterm_core::policy::ActorKind::Robot);
-        assert_eq!(ctx.surface, frankenterm_core::policy::PolicySurface::Ipc);
-        assert_eq!(ctx.determining_rule.as_deref(), Some("audit.ipc.rpc"));
-        assert_eq!(ctx.text_summary.as_deref(), Some("ft robot state"));
-        assert!(
-            ctx.evidence
-                .iter()
-                .any(|entry| entry.key == "request_id" && entry.value == "req-456")
-        );
+            let ctx_json = audits[0]
+                .decision_context
+                .as_deref()
+                .expect("ipc rpc audit should retain decision_context");
+            let ctx: frankenterm_core::policy::DecisionContext =
+                serde_json::from_str(ctx_json).expect("decision context should parse");
+            assert_eq!(ctx.actor, frankenterm_core::policy::ActorKind::Robot);
+            assert_eq!(ctx.surface, frankenterm_core::policy::PolicySurface::Ipc);
+            assert_eq!(ctx.determining_rule.as_deref(), Some("audit.ipc.rpc"));
+            assert_eq!(ctx.text_summary.as_deref(), Some("ft robot state"));
+            assert!(
+                ctx.evidence
+                    .iter()
+                    .any(|entry| entry.key == "request_id" && entry.value == "req-456")
+            );
 
-        cleanup_storage(storage_handle, &db_path).await;
+            cleanup_storage(storage_handle, &db_path).await;
+        });
     }
 
     // ---- Triage scoring / ordering tests ----
