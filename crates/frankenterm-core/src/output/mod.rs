@@ -40,6 +40,7 @@ pub use renderers::{
     EventListRenderer, HealthDiagnostic, HealthDiagnosticStatus, HealthSnapshotRenderer,
     PaneTableRenderer, Render, RenderContext, ResizeDashboardSnapshot, RuleDetail,
     RuleDetailRenderer, RuleListItem, RuleTestMatch, RulesListRenderer, RulesTestRenderer,
-    SearchResultRenderer, SearchSuggestRenderer, TimelineRenderer, WorkflowResultRenderer,
+    SearchResultRenderer, SearchSuggestRenderer, Summary, TimelineRenderer, WorkflowResult,
+    WorkflowResultRenderer, WorkflowStepResult,
 };
 pub use table::{Alignment, Column, Table, strip_ansi};

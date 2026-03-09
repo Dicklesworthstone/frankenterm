@@ -9,9 +9,9 @@ use std::collections::BTreeSet;
 use proptest::prelude::*;
 
 use frankenterm_core::identity_graph::{
-    AuthAction, AuthGrant, AuthzDecision, Delegation, DelegationScope, GrantCondition,
-    IdentityGraph, IdentityGraphError, IdentityGraphTelemetry, PrincipalId, PrincipalKind,
-    ResourceId, ResourceKind, TrustLevel,
+    AuthAction, AuthGrant, AuthzAuditEntry, AuthzDecision, Delegation, DelegationScope,
+    GrantCondition, GroupMembership, IdentityGraph, IdentityGraphError, IdentityGraphTelemetry,
+    PrincipalId, PrincipalKind, ResourceId, ResourceKind, TrustLevel,
 };
 
 // =============================================================================
@@ -1128,6 +1128,204 @@ proptest! {
         let json = serde_json::to_string(&variant).unwrap();
         let back: DelegationScope = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(variant, back);
+    }
+}
+
+// =============================================================================
+// AuthGrant serde roundtrip
+// =============================================================================
+
+fn arb_grant_condition() -> impl Strategy<Value = GrantCondition> {
+    prop_oneof![
+        (0..1_000_000u64, 0..1_000_000u64)
+            .prop_map(|(s, e)| GrantCondition::TimeWindow {
+                start_ms: s,
+                end_ms: s + e,
+            }),
+        arb_trust_level().prop_map(GrantCondition::MinTrust),
+        arb_id_string().prop_map(GrantCondition::Domain),
+        arb_principal_id().prop_map(GrantCondition::RequiresApproval),
+        (1..100u32, 1000..60_000u64)
+            .prop_map(|(m, w)| GrantCondition::RateLimit {
+                max_uses: m,
+                window_ms: w,
+            }),
+    ]
+}
+
+fn arb_auth_grant() -> impl Strategy<Value = AuthGrant> {
+    (
+        arb_id_string(),
+        arb_principal_id(),
+        arb_action_set(),
+        arb_resource_id(),
+        prop::collection::vec(arb_grant_condition(), 0..=2),
+        proptest::bool::ANY,
+        0..1_000_000_000u64,
+        proptest::option::of(0..2_000_000_000u64),
+        proptest::option::of(arb_principal_id()),
+        proptest::option::of(arb_id_string()),
+    )
+        .prop_map(
+            |(grant_id, principal, actions, resource, conditions, active, created, expires, by, reason)| {
+                AuthGrant {
+                    grant_id,
+                    principal,
+                    actions,
+                    resource,
+                    conditions,
+                    active,
+                    created_at_ms: created,
+                    expires_at_ms: expires,
+                    granted_by: by,
+                    reason,
+                }
+            },
+        )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// AuthGrant serde roundtrip.
+    #[test]
+    fn auth_grant_serde_roundtrip(grant in arb_auth_grant()) {
+        let json = serde_json::to_string(&grant).unwrap();
+        let back: AuthGrant = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(grant, back);
+    }
+}
+
+// =============================================================================
+// Delegation serde roundtrip
+// =============================================================================
+
+fn arb_delegation_scope() -> impl Strategy<Value = DelegationScope> {
+    prop_oneof![
+        prop::collection::vec(arb_id_string(), 1..=3).prop_map(DelegationScope::Grants),
+        prop::collection::vec(arb_resource_id(), 1..=3).prop_map(DelegationScope::Resources),
+        arb_action_set().prop_map(DelegationScope::Actions),
+        Just(DelegationScope::AllNonAdmin),
+    ]
+}
+
+fn arb_delegation() -> impl Strategy<Value = Delegation> {
+    (
+        arb_id_string(),
+        arb_principal_id(),
+        arb_principal_id(),
+        arb_delegation_scope(),
+        proptest::bool::ANY,
+        0..1_000_000_000u64,
+        proptest::option::of(0..2_000_000_000u64),
+    )
+        .prop_map(
+            |(delegation_id, delegator, delegate, scope, active, created, expires)| Delegation {
+                delegation_id,
+                delegator,
+                delegate,
+                scope,
+                active,
+                created_at_ms: created,
+                expires_at_ms: expires,
+            },
+        )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Delegation serde roundtrip.
+    #[test]
+    fn delegation_serde_roundtrip(d in arb_delegation()) {
+        let json = serde_json::to_string(&d).unwrap();
+        let back: Delegation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(d, back);
+    }
+}
+
+// =============================================================================
+// GroupMembership serde roundtrip
+// =============================================================================
+
+fn arb_group_membership() -> impl Strategy<Value = GroupMembership> {
+    (
+        arb_principal_id(),
+        arb_principal_id(),
+        0..1_000_000_000u64,
+        proptest::option::of(0..2_000_000_000u64),
+        proptest::bool::ANY,
+    )
+        .prop_map(|(group, member, added, expires, active)| GroupMembership {
+            group,
+            member,
+            added_at_ms: added,
+            expires_at_ms: expires,
+            active,
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// GroupMembership serde roundtrip.
+    #[test]
+    fn group_membership_serde_roundtrip(m in arb_group_membership()) {
+        let json = serde_json::to_string(&m).unwrap();
+        let back: GroupMembership = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(m, back);
+    }
+}
+
+// =============================================================================
+// AuthzAuditEntry serde roundtrip (no PartialEq — compare fields)
+// =============================================================================
+
+fn arb_authz_decision() -> impl Strategy<Value = AuthzDecision> {
+    prop_oneof![
+        prop::collection::vec(arb_id_string(), 1..=3)
+            .prop_map(|ids| AuthzDecision::Allow { grant_ids: ids }),
+        arb_id_string().prop_map(|r| AuthzDecision::Deny { reason: r }),
+        (arb_principal_id(), arb_id_string())
+            .prop_map(|(a, r)| AuthzDecision::RequireApproval {
+                approver: a,
+                reason: r,
+            }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// AuthzAuditEntry serde roundtrip (field-by-field comparison).
+    #[test]
+    fn authz_audit_entry_serde_roundtrip(
+        principal in arb_principal_id(),
+        action in arb_action(),
+        resource in arb_resource_id(),
+        decision in arb_authz_decision(),
+        via_delegation in proptest::bool::ANY,
+        via_group in proptest::bool::ANY,
+        timestamp_ms in 0..1_000_000_000u64,
+    ) {
+        let entry = AuthzAuditEntry {
+            principal,
+            action,
+            resource,
+            decision,
+            via_delegation,
+            via_group,
+            timestamp_ms,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: AuthzAuditEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.principal, &entry.principal);
+        prop_assert_eq!(&back.action, &entry.action);
+        prop_assert_eq!(&back.resource, &entry.resource);
+        prop_assert_eq!(&back.decision, &entry.decision);
+        prop_assert_eq!(back.via_delegation, entry.via_delegation);
+        prop_assert_eq!(back.via_group, entry.via_group);
+        prop_assert_eq!(back.timestamp_ms, entry.timestamp_ms);
     }
 }
 

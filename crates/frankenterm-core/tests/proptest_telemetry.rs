@@ -690,7 +690,7 @@ proptest! {
         }
         let summary = h.summary();
         let json = serde_json::to_string(&summary).unwrap();
-        let back: frankenterm_core::telemetry::HistogramSummary = serde_json::from_str(&json).unwrap();
+        let back: HistogramSummary = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.name, "test_summary");
         prop_assert_eq!(back.count, values.len() as u64);
     }

@@ -2,13 +2,15 @@
 //
 // Covers: serde roundtrips for all publicly exported Serialize/Deserialize types
 // from the output module: RuleListItem, RuleTestMatch, RuleDetail,
-// AnalyticsSummaryData, HealthDiagnosticStatus.
+// AnalyticsSummaryData, HealthDiagnosticStatus, WorkflowResult,
+// WorkflowStepResult, Summary.
 #![allow(clippy::ignored_unit_patterns)]
 
 use proptest::prelude::*;
 
 use frankenterm_core::output::{
     AnalyticsSummaryData, HealthDiagnosticStatus, RuleDetail, RuleListItem, RuleTestMatch,
+    Summary, WorkflowResult, WorkflowStepResult,
 };
 
 // =============================================================================
@@ -271,5 +273,99 @@ proptest! {
         prop_assert!(val.total_cost >= 0.0);
         prop_assert!(val.rate_limit_hits >= 0);
         prop_assert!(val.workflow_runs >= 0);
+    }
+
+    // ========================================================================
+    // Serde roundtrip tests for types that had generators but lacked coverage
+    // ========================================================================
+
+    /// WorkflowStepResult serde roundtrip (no PartialEq — field comparison)
+    #[test]
+    fn workflow_step_result_serde_roundtrip(
+        name in "[a-z_]{3,20}",
+        outcome in prop_oneof![
+            Just("success".to_string()),
+            Just("failed".to_string()),
+            Just("skipped".to_string()),
+        ],
+        duration_ms in 0..60_000u64,
+        error in proptest::option::of("[a-zA-Z ]{5,40}"),
+    ) {
+        let step = WorkflowStepResult { name: name.clone(), outcome: outcome.clone(), duration_ms, error: error.clone() };
+        let json = serde_json::to_string(&step).unwrap();
+        let back: WorkflowStepResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &name);
+        prop_assert_eq!(&back.outcome, &outcome);
+        prop_assert_eq!(back.duration_ms, duration_ms);
+        prop_assert_eq!(back.error, error);
+    }
+
+    /// WorkflowResult serde roundtrip (no PartialEq — field comparison)
+    #[test]
+    fn workflow_result_serde_roundtrip(
+        workflow_id in "[a-z0-9-]{8,36}",
+        workflow_name in "[a-z_]{3,20}",
+        pane_id in 0..1000u64,
+        status in prop_oneof![
+            Just("success".to_string()),
+            Just("failed".to_string()),
+            Just("running".to_string()),
+        ],
+        reason in proptest::option::of("[a-zA-Z ]{5,40}"),
+        step_name in "[a-z_]{3,20}",
+        step_outcome in Just("success".to_string()),
+        step_dur in 0..10_000u64,
+    ) {
+        let steps = vec![WorkflowStepResult {
+            name: step_name,
+            outcome: step_outcome,
+            duration_ms: step_dur,
+            error: None,
+        }];
+        let wr = WorkflowResult {
+            workflow_id: workflow_id.clone(),
+            workflow_name: workflow_name.clone(),
+            pane_id,
+            status: status.clone(),
+            reason: reason.clone(),
+            result: None,
+            steps,
+        };
+        let json = serde_json::to_string(&wr).unwrap();
+        let back: WorkflowResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.workflow_id, &workflow_id);
+        prop_assert_eq!(&back.workflow_name, &workflow_name);
+        prop_assert_eq!(back.pane_id, pane_id);
+        prop_assert_eq!(&back.status, &status);
+        prop_assert_eq!(back.reason, reason);
+        prop_assert_eq!(back.steps.len(), 1);
+    }
+
+    /// Summary serde roundtrip (no PartialEq — field comparison)
+    #[test]
+    fn summary_serde_roundtrip(
+        total_panes in 0..500usize,
+        observed_panes in 0..500usize,
+        total_segments in 0..100_000u64,
+        total_events in 0..10_000u64,
+        unhandled_events in 0..1000u64,
+        active_workflows in 0..50usize,
+    ) {
+        let s = Summary {
+            total_panes,
+            observed_panes,
+            total_segments,
+            total_events,
+            unhandled_events,
+            active_workflows,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Summary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_panes, total_panes);
+        prop_assert_eq!(back.observed_panes, observed_panes);
+        prop_assert_eq!(back.total_segments, total_segments);
+        prop_assert_eq!(back.total_events, total_events);
+        prop_assert_eq!(back.unhandled_events, unhandled_events);
+        prop_assert_eq!(back.active_workflows, active_workflows);
     }
 }

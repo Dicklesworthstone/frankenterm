@@ -3279,6 +3279,86 @@ mod tests {
     }
 
     #[test]
+    fn legacy_decision_context_with_numeric_pane_id() {
+        let mut action = sample_audit_action();
+        action.decision_context =
+            Some(r#"{"surface":"mux","actor":"workflow","action":"send_text","pane_id":7}"#.to_string());
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render_detail(&action, &ctx);
+        assert!(output.contains("surface=mux"));
+        assert!(output.contains("pane=7"));
+    }
+
+    #[test]
+    fn legacy_decision_context_with_rule_id_alias() {
+        let mut action = sample_audit_action();
+        action.decision_context =
+            Some(r#"{"surface":"robot","rule_id":"deny.cooldown"}"#.to_string());
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render_detail(&action, &ctx);
+        assert!(output.contains("rule=deny.cooldown"));
+    }
+
+    #[test]
+    fn legacy_decision_context_none_returns_no_context_line() {
+        let action = sample_audit_action(); // decision_context is None
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render_detail(&action, &ctx);
+        assert!(!output.contains("Context:"));
+    }
+
+    #[test]
+    fn legacy_decision_context_invalid_json_falls_back_to_raw() {
+        let mut action = sample_audit_action();
+        action.decision_context = Some("not valid json at all".to_string());
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render_detail(&action, &ctx);
+        // When parsing fails, the raw string is displayed as the context
+        assert!(output.contains("Context:    not valid json at all"));
+        // No structured evidence line
+        assert!(!output.contains("Evidence:"));
+    }
+
+    #[test]
+    fn legacy_decision_context_evidence_array_with_scalars() {
+        let mut action = sample_audit_action();
+        // Need at least one recognized scalar key so format_decision_context_summary
+        // produces output; otherwise the raw JSON is shown instead
+        action.decision_context = Some(
+            r#"{"surface":"mux","evidence":[{"key":"reason","value":"timeout"},{"key":"retries","value":3}]}"#
+                .to_string(),
+        );
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render_detail(&action, &ctx);
+        assert!(output.contains("surface=mux"));
+        assert!(output.contains("reason=timeout"));
+        assert!(output.contains("retries=3"));
+    }
+
+    #[test]
+    fn legacy_decision_context_bool_and_null_values() {
+        let mut action = sample_audit_action();
+        action.decision_context =
+            Some(r#"{"auto_approve":true,"override":null}"#.to_string());
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render_detail(&action, &ctx);
+        assert!(output.contains("auto_approve=true"));
+        assert!(output.contains("override=null"));
+    }
+
+    #[test]
+    fn legacy_decision_context_skips_nested_objects() {
+        let mut action = sample_audit_action();
+        action.decision_context =
+            Some(r#"{"tag":"v1","nested":{"deep":"value"}}"#.to_string());
+        let ctx = RenderContext::new(OutputFormat::Plain);
+        let output = AuditListRenderer::render_detail(&action, &ctx);
+        assert!(output.contains("tag=v1"));
+        // nested objects should be skipped by legacy_decision_context_value
+        assert!(!output.contains("deep=value"));
+    }
+
+    #[test]
     fn audit_detail_render_json() {
         let action = sample_audit_action();
         let ctx = RenderContext::new(OutputFormat::Json);

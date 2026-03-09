@@ -2,8 +2,6 @@
 
 use frankenterm_core::namespace_isolation::*;
 use proptest::prelude::*;
-use std::collections::{BTreeSet, HashMap};
-
 // =============================================================================
 // Strategies
 // =============================================================================

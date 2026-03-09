@@ -883,7 +883,7 @@ impl CommandDeduplicator {
 mod tests {
     use super::*;
     use crate::policy::{
-        ActionKind, ActorKind, DecisionContext, PaneCapabilities, PolicyDecision, PolicySurface,
+        ActionKind, ActorKind, DecisionContext, PolicyDecision, PolicySurface,
     };
     use crate::session_topology::{
         LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
@@ -1437,24 +1437,19 @@ mod tests {
 
     #[test]
     fn command_policy_trace_prefers_non_unknown_decision_context_surface() {
-        let decision = PolicyDecision::deny_with_rule("blocked", "policy.route.test").with_context(
-            DecisionContext {
-                timestamp_ms: 42,
-                action: ActionKind::SendText,
-                actor: ActorKind::Robot,
-                surface: PolicySurface::Swarm,
-                pane_id: Some(1),
-                domain: None,
-                capabilities: PaneCapabilities::default(),
-                text_summary: Some("route test".to_string()),
-                workflow_id: None,
-                rules_evaluated: Vec::new(),
-                determining_rule: Some("policy.route.test".to_string()),
-                evidence: Vec::new(),
-                rate_limit: None,
-                risk: None,
-            },
+        let mut ctx = DecisionContext::new_audit(
+            42,
+            ActionKind::SendText,
+            ActorKind::Robot,
+            PolicySurface::Swarm,
+            Some(1),
+            None,
+            Some("route test".to_string()),
+            None,
         );
+        ctx.set_determining_rule("policy.route.test");
+        let decision =
+            PolicyDecision::deny_with_rule("blocked", "policy.route.test").with_context(ctx);
 
         let trace = CommandPolicyTrace::from_surface_and_decision(PolicySurface::Mux, &decision);
 
@@ -1494,24 +1489,19 @@ mod tests {
     fn audit_log_preserves_policy_trace_and_full_delivery_breakdown() {
         let registry = seed_registry();
         let mut router = CommandRouter::new();
-        let decision = PolicyDecision::allow_with_rule("policy.route.broadcast").with_context(
-            DecisionContext {
-                timestamp_ms: 260,
-                action: ActionKind::SendText,
-                actor: ActorKind::Workflow,
-                surface: PolicySurface::Swarm,
-                pane_id: Some(7),
-                domain: Some("local".to_string()),
-                capabilities: PaneCapabilities::default(),
-                text_summary: Some("attention all agents".to_string()),
-                workflow_id: Some("wf-broadcast".to_string()),
-                rules_evaluated: Vec::new(),
-                determining_rule: Some("policy.route.broadcast".to_string()),
-                evidence: Vec::new(),
-                rate_limit: None,
-                risk: None,
-            },
+        let mut ctx = DecisionContext::new_audit(
+            260,
+            ActionKind::SendText,
+            ActorKind::Workflow,
+            PolicySurface::Swarm,
+            Some(7),
+            Some("local".to_string()),
+            Some("attention all agents".to_string()),
+            Some("wf-broadcast".to_string()),
         );
+        ctx.set_determining_rule("policy.route.broadcast");
+        let decision =
+            PolicyDecision::allow_with_rule("policy.route.broadcast").with_context(ctx);
         let request = CommandRequest {
             command_id: "trace-1".to_string(),
             scope: CommandScope::fleet(),

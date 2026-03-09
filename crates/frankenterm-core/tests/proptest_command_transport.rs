@@ -11,7 +11,7 @@ use frankenterm_core::command_transport::{
     CommandRequest, CommandResult, CommandRouter, CommandScope, DeliveryStatus, InterruptSignal,
 };
 use frankenterm_core::policy::{
-    ActionKind, ActorKind, DecisionContext, PaneCapabilities, PolicyDecision, PolicySurface,
+    ActionKind, ActorKind, DecisionContext, PolicyDecision, PolicySurface,
 };
 use frankenterm_core::session_topology::{
     LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
@@ -532,22 +532,20 @@ fn arb_decision_context(
     workflow_id: Option<String>,
     determining_rule: Option<String>,
 ) -> DecisionContext {
-    DecisionContext {
-        timestamp_ms: 1000,
+    let mut ctx = DecisionContext::new_audit(
+        1000,
         action,
         actor,
         surface,
         pane_id,
         domain,
-        capabilities: PaneCapabilities::default(),
-        text_summary: None,
+        None,
         workflow_id,
-        rules_evaluated: Vec::new(),
-        determining_rule,
-        evidence: Vec::new(),
-        rate_limit: None,
-        risk: None,
+    );
+    if let Some(rule) = determining_rule {
+        ctx.set_determining_rule(rule);
     }
+    ctx
 }
 
 // ---------------------------------------------------------------------------

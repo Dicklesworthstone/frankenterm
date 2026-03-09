@@ -1,7 +1,9 @@
 //! Property-based tests for the policy module
 //!
 //! Tests invariants for ActionKind, ActorKind, PaneCapabilities, PolicyDecision,
-//! RiskScore, RiskConfig, Redactor, is_command_candidate, RateLimiter, PolicyEngine,
+//! RiskScore, RiskConfig, RiskFactor, ApprovalRequest, SendTextAuditSummary,
+//! RuleEvaluation, DecisionEvidence, RateLimitSnapshot, AppliedRiskFactor,
+//! Redactor, is_command_candidate, RateLimiter, PolicyEngine,
 //! evaluate_policy_rules, and InjectionResult.
 
 use frankenterm_core::policy::*;
@@ -1698,5 +1700,148 @@ proptest! {
         let back: PolicyInput = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.surface, surface,
             "PolicyInput serde roundtrip should preserve surface");
+    }
+
+    // ========================================================================
+    // Serde roundtrip tests for types that have generators but lacked coverage
+    // ========================================================================
+
+    /// Property 91: RuleEvaluation serde roundtrip
+    #[test]
+    fn prop_rule_evaluation_serde_roundtrip(eval in arb_rule_evaluation()) {
+        let json = serde_json::to_string(&eval).unwrap();
+        let back: RuleEvaluation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.rule_id, eval.rule_id);
+        prop_assert_eq!(back.matched, eval.matched);
+        prop_assert_eq!(back.decision, eval.decision);
+        prop_assert_eq!(back.reason, eval.reason);
+    }
+
+    /// Property 92: DecisionEvidence serde roundtrip
+    #[test]
+    fn prop_decision_evidence_serde_roundtrip(ev in arb_decision_evidence()) {
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: DecisionEvidence = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, ev);
+    }
+
+    /// Property 93: RateLimitSnapshot serde roundtrip
+    #[test]
+    fn prop_rate_limit_snapshot_serde_roundtrip(snap in arb_rate_limit_snapshot()) {
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: RateLimitSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, snap);
+    }
+
+    /// Property 94: AppliedRiskFactor serde roundtrip
+    #[test]
+    fn prop_applied_risk_factor_serde_roundtrip(factor in arb_applied_risk_factor()) {
+        let json = serde_json::to_string(&factor).unwrap();
+        let back: AppliedRiskFactor = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, factor);
+    }
+
+    /// Property 95: RiskFactor serde roundtrip
+    #[test]
+    fn prop_risk_factor_serde_roundtrip(
+        id in "[a-z._]{3,30}",
+        cat in arb_risk_category(),
+        weight in 0..=100u8,
+        desc in "[a-zA-Z ]{5,50}",
+    ) {
+        let factor = RiskFactor::new(&id, cat, weight, &desc);
+        let json = serde_json::to_string(&factor).unwrap();
+        let back: RiskFactor = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, factor);
+    }
+
+    /// Property 96: ApprovalRequest serde roundtrip
+    #[test]
+    fn prop_approval_request_serde_roundtrip(
+        code in "[A-Z0-9]{8}",
+        hash in "[a-f0-9]{64}",
+        expires in 1_000_000_000i64..2_000_000_000i64,
+        summary in "[a-zA-Z ]{5,40}",
+        command in "ft approve [A-Z0-9]{8}",
+    ) {
+        let req = ApprovalRequest {
+            allow_once_code: code,
+            allow_once_full_hash: hash,
+            expires_at: expires,
+            summary,
+            command,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ApprovalRequest = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, req);
+    }
+
+    /// Property 97: SendTextAuditSummary serde roundtrip (compare via JSON value
+    /// since the type does not derive PartialEq)
+    #[test]
+    fn prop_send_text_audit_summary_serde_roundtrip(
+        text_length in 0..10_000usize,
+        preview in "[a-zA-Z0-9 ]{0,80}",
+        hash in "[a-f0-9]{64}",
+        command_candidate in proptest::bool::ANY,
+        workflow_id in proptest::option::of("[a-z0-9-]{8,36}"),
+        parent_id in proptest::option::of(0..100_000i64),
+    ) {
+        let summary = SendTextAuditSummary {
+            text_length,
+            text_preview_redacted: preview,
+            text_hash: hash,
+            command_candidate,
+            workflow_execution_id: workflow_id,
+            parent_action_id: parent_id,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: SendTextAuditSummary = serde_json::from_str(&json).unwrap();
+        // Compare field-by-field since no PartialEq
+        prop_assert_eq!(back.text_length, summary.text_length);
+        prop_assert_eq!(back.text_preview_redacted, summary.text_preview_redacted);
+        prop_assert_eq!(back.text_hash, summary.text_hash);
+        prop_assert_eq!(back.command_candidate, summary.command_candidate);
+        prop_assert_eq!(back.workflow_execution_id, summary.workflow_execution_id);
+        prop_assert_eq!(back.parent_action_id, summary.parent_action_id);
+    }
+
+    /// Property 98: SendTextAuditSummary with None optionals round-trips correctly
+    #[test]
+    fn prop_send_text_audit_summary_none_optionals_roundtrip(
+        text_length in 0..10_000usize,
+        preview in "[a-zA-Z0-9 ]{0,80}",
+        hash in "[a-f0-9]{64}",
+        command_candidate in proptest::bool::ANY,
+    ) {
+        let summary = SendTextAuditSummary {
+            text_length,
+            text_preview_redacted: preview.clone(),
+            text_hash: hash.clone(),
+            command_candidate,
+            workflow_execution_id: None,
+            parent_action_id: None,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        // skip_serializing_if should omit None fields
+        let check = json.contains("workflow_execution_id");
+        prop_assert!(!check, "None workflow_execution_id should be omitted from JSON");
+        let check2 = json.contains("parent_action_id");
+        prop_assert!(!check2, "None parent_action_id should be omitted from JSON");
+        // Deserialize back
+        let back: SendTextAuditSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.text_length, text_length);
+        prop_assert_eq!(back.workflow_execution_id, None);
+        prop_assert_eq!(back.parent_action_id, None);
+    }
+
+    /// Property 99: RiskFactor category preserves through serde roundtrip
+    #[test]
+    fn prop_risk_factor_category_roundtrip(cat in arb_risk_category()) {
+        let factor = RiskFactor::new("test.x", cat, 50, "test factor");
+        let json = serde_json::to_string(&factor).unwrap();
+        let back: RiskFactor = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.category, cat,
+            "RiskFactor category should survive serde roundtrip");
     }
 }
