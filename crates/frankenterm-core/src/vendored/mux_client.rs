@@ -1005,7 +1005,61 @@ impl DirectMuxClient {
         _cx: &Cx,
         pdu: Pdu,
     ) -> Result<u64, DirectMuxError> {
-        self.send_request_only(pdu).await
+        let serial = next_request_serial(&mut self.serial)?;
+        let pdu_name = pdu.pdu_name();
+        let mut buf = Vec::new();
+        tracing::trace!(
+            connection_id = self.connection_id,
+            request_serial = serial,
+            request_pdu = pdu_name,
+            explicit_cx = true,
+            phase = "encode",
+            compression_mode = ?self.compression_mode,
+            "encoding mux request"
+        );
+        pdu.encode_with_mode(&mut buf, serial, self.compression_mode)
+            .map_err(|err| DirectMuxError::Codec(err.to_string()))?;
+        let encoded_len = buf.len();
+        match timeout(self.config.write_timeout, self.stream.write_all(&buf)).await {
+            Ok(Ok(())) => {
+                tracing::trace!(
+                    connection_id = self.connection_id,
+                    request_serial = serial,
+                    request_pdu = pdu_name,
+                    encoded_bytes = encoded_len,
+                    explicit_cx = true,
+                    phase = "write_complete",
+                    "mux request write completed"
+                );
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    connection_id = self.connection_id,
+                    request_serial = serial,
+                    request_pdu = pdu_name,
+                    encoded_bytes = encoded_len,
+                    explicit_cx = true,
+                    phase = "write_error",
+                    error = %err,
+                    "mux request write failed"
+                );
+                return Err(DirectMuxError::Io(err));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    connection_id = self.connection_id,
+                    request_serial = serial,
+                    request_pdu = pdu_name,
+                    encoded_bytes = encoded_len,
+                    timeout_ms = duration_to_ms_u64(self.config.write_timeout),
+                    explicit_cx = true,
+                    phase = "write_timeout",
+                    "mux request write timed out"
+                );
+                return Err(DirectMuxError::WriteTimeout);
+            }
+        }
+        Ok(serial)
     }
 
     async fn await_response(&mut self, serial: u64) -> Result<Pdu, DirectMuxError> {
@@ -1158,7 +1212,74 @@ impl DirectMuxClient {
 
     #[cfg(feature = "asupersync-runtime")]
     async fn read_next_pdu_with_cx(&mut self, _cx: &Cx) -> Result<DecodedPdu, DirectMuxError> {
-        self.read_next_pdu().await
+        loop {
+            if let Some(decoded) =
+                decode_from_buffer(&mut self.read_buf, self.config.max_frame_bytes)?
+            {
+                tracing::trace!(
+                    connection_id = self.connection_id,
+                    response_serial = decoded.serial,
+                    response_pdu = decoded.pdu.pdu_name(),
+                    explicit_cx = true,
+                    phase = "decode_buffered_pdu",
+                    "decoded mux response from buffered bytes"
+                );
+                return Ok(decoded);
+            }
+
+            let mut temp = vec![0u8; 4096];
+            let read = match timeout(
+                self.config.read_timeout,
+                unix_stream_read(&mut self.stream, &mut temp),
+            )
+            .await
+            {
+                Ok(Ok(read)) => read,
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        connection_id = self.connection_id,
+                        explicit_cx = true,
+                        phase = "read_io_error",
+                        error = %err,
+                        "mux response read failed"
+                    );
+                    return Err(DirectMuxError::Io(err));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        connection_id = self.connection_id,
+                        timeout_ms = duration_to_ms_u64(self.config.read_timeout),
+                        explicit_cx = true,
+                        phase = "read_timeout",
+                        "mux response read timed out"
+                    );
+                    return Err(DirectMuxError::ReadTimeout);
+                }
+            };
+            if read == 0 {
+                tracing::debug!(
+                    connection_id = self.connection_id,
+                    explicit_cx = true,
+                    phase = "read_eof",
+                    "mux socket disconnected during response read"
+                );
+                return Err(DirectMuxError::Disconnected);
+            }
+            self.read_buf.extend_from_slice(&temp[..read]);
+            if self.read_buf.len() > self.config.max_frame_bytes {
+                tracing::warn!(
+                    connection_id = self.connection_id,
+                    buffered_bytes = self.read_buf.len(),
+                    max_frame_bytes = self.config.max_frame_bytes,
+                    explicit_cx = true,
+                    phase = "frame_too_large",
+                    "mux response frame exceeded configured max size"
+                );
+                return Err(DirectMuxError::FrameTooLarge {
+                    max_bytes: self.config.max_frame_bytes,
+                });
+            }
+        }
     }
 }
 
@@ -1451,7 +1572,7 @@ async fn run_subscription_loop(
             break;
         }
 
-        let result = client.get_pane_render_changes(pane_id).await;
+        let result = client.get_pane_render_changes_with_cx(cx, pane_id).await;
 
         let saw_dirty_output = match result {
             Ok(changes) => {
@@ -4015,6 +4136,126 @@ mod tests {
                 .list_panes()
                 .await
                 .expect_err("list_panes should reject oversized response frames");
+            assert!(matches!(
+                err,
+                DirectMuxError::FrameTooLarge { max_bytes } if max_bytes == max_frame_bytes
+            ));
+            assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable);
+
+            drop(client);
+            server.join().expect("server thread");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn list_panes_with_cx_rejects_oversized_response_frame() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("oversized-frame-with-cx.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let max_frame_bytes = 128usize;
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for oversized-frame with-cx test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "oversized-frame-with-cx-test"
+                                                .to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                        });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    let mut out = Vec::new();
+                                    Pdu::UnitResponse(UnitResponse {})
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::ListPanes(_) => {
+                                    let mut window_titles = HashMap::new();
+                                    for window_id in 0..24usize {
+                                        window_titles.insert(
+                                            window_id + 1,
+                                            format!(
+                                                "oversized-with-cx-window-{window_id:02}-{}",
+                                                "x".repeat(32)
+                                            ),
+                                        );
+                                    }
+                                    let response = Pdu::ListPanesResponse(ListPanesResponse {
+                                        tabs: Vec::new(),
+                                        tab_titles: Vec::new(),
+                                        window_titles,
+                                    });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    assert!(
+                                        out.len() > max_frame_bytes + 1,
+                                        "encoded frame must exceed the configured max"
+                                    );
+
+                                    let prefix = &out[..=max_frame_bytes];
+                                    let chunk_size = (max_frame_bytes / 2).max(1);
+                                    for chunk in prefix.chunks(chunk_size) {
+                                        stream.write_all(chunk).await.expect("write frame chunk");
+                                        sleep(Duration::from_millis(5)).await;
+                                    }
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should be ready before client connects");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.max_frame_bytes = max_frame_bytes;
+            config.read_timeout = Duration::from_millis(200);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect");
+
+            let err = client
+                .list_panes_with_cx(&cx)
+                .await
+                .expect_err("list_panes_with_cx should reject oversized response frames");
             assert!(matches!(
                 err,
                 DirectMuxError::FrameTooLarge { max_bytes } if max_bytes == max_frame_bytes
