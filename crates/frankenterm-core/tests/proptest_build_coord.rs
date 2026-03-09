@@ -801,7 +801,7 @@ proptest! {
     #[test]
     fn prop_offload_invariant(
         prefix in prop_oneof![
-            Just("".to_string()),
+            Just(String::new()),
             Just("TMPDIR=/tmp ".to_string()),
             Just("rch exec -- ".to_string()),
             Just("TMPDIR=/tmp rch exec -- ".to_string()),
