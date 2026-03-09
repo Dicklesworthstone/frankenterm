@@ -815,6 +815,10 @@ mod tests {
                                     tab_titles: Vec::new(),
                                     window_titles: HashMap::new(),
                                 }),
+                                Pdu::GetLines(req) => Pdu::GetLinesResponse(GetLinesResponse {
+                                    pane_id: req.pane_id,
+                                    lines: Vec::new().into(),
+                                }),
                                 Pdu::GetPaneRenderChanges(req) => {
                                     Pdu::GetPaneRenderChangesResponse(
                                         GetPaneRenderChangesResponse {
@@ -1708,6 +1712,33 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_batch_render_multiple_panes_with_cx() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let cx = crate::cx::for_testing();
+
+            let result = pool
+                .get_pane_render_changes_batch_with_cx(&cx, vec![10, 20, 30])
+                .await
+                .expect("multi-pane batch with cx should succeed");
+
+            assert_eq!(result.len(), 3, "should get 3 responses");
+            assert_eq!(result[0].pane_id, 10);
+            assert_eq!(result[1].pane_id, 20);
+            assert_eq!(result[2].pane_id, 30);
+
+            let stats = pool.stats().await;
+            assert!(
+                stats.connections_created >= 1,
+                "should create at least one connection"
+            );
+        });
+    }
+
     #[test]
     fn pool_batch_render_large_batch_preserves_order() {
         run_async_test(async {
@@ -1896,6 +1927,50 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_get_lines_with_cx_succeeds() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let cx = crate::cx::for_testing();
+
+            let requested = vec![-3..0, 0..5];
+            let resp = pool
+                .get_lines_with_cx(&cx, 9, requested)
+                .await
+                .expect("get_lines_with_cx should succeed");
+
+            assert_eq!(resp.pane_id, 9);
+            assert_eq!(resp.lines, Vec::new().into());
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.total_acquired, 1);
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_get_pane_render_changes_with_cx_succeeds() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let cx = crate::cx::for_testing();
+
+            let resp = pool
+                .get_pane_render_changes_with_cx(&cx, 17)
+                .await
+                .expect("get_pane_render_changes_with_cx should succeed");
+
+            assert_eq!(resp.pane_id, 17);
+            assert_eq!(resp.dimensions.cols, 80);
+            assert_eq!(resp.dimensions.viewport_rows, 24);
+        });
+    }
+
     #[test]
     fn pool_write_to_pane_succeeds() {
         run_async_test(async {
@@ -1906,6 +1981,25 @@ mod tests {
             pool.write_to_pane(11, b"echo hi\n".to_vec())
                 .await
                 .expect("write_to_pane should succeed");
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.connections_created, 1);
+            assert_eq!(stats.pool.total_acquired, 1);
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_write_to_pane_with_cx_succeeds() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let cx = crate::cx::for_testing();
+
+            pool.write_to_pane_with_cx(&cx, 21, b"echo from cx\n".to_vec())
+                .await
+                .expect("write_to_pane_with_cx should succeed");
 
             let stats = pool.stats().await;
             assert_eq!(stats.connections_created, 1);
@@ -1931,6 +2025,31 @@ mod tests {
             assert_eq!(
                 stats.connections_created, 1,
                 "send_paste should reuse the existing idle connection"
+            );
+            assert_eq!(stats.pool.total_acquired, 2);
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_send_paste_with_cx_reuses_connection() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let cx = crate::cx::for_testing();
+
+            pool.write_to_pane_with_cx(&cx, 22, b"first\n".to_vec())
+                .await
+                .expect("write_to_pane_with_cx should succeed");
+            pool.send_paste_with_cx(&cx, 22, "second\n".to_string())
+                .await
+                .expect("send_paste_with_cx should succeed");
+
+            let stats = pool.stats().await;
+            assert_eq!(
+                stats.connections_created, 1,
+                "send_paste_with_cx should reuse the existing idle connection"
             );
             assert_eq!(stats.pool.total_acquired, 2);
         });
