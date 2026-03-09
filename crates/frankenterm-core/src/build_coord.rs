@@ -488,7 +488,7 @@ fn cargo_payload_tokens(tokens: &[String]) -> Option<&[String]> {
 
     idx = skip_command_prefixes(tokens, idx);
     match tokens.get(idx).map(String::as_str) {
-        Some("cargo") | Some("cargo-nextest") => Some(&tokens[idx..]),
+        Some("cargo" | "cargo-nextest") => Some(&tokens[idx..]),
         _ => None,
     }
 }
