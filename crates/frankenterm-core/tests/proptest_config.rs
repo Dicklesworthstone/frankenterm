@@ -22,9 +22,10 @@ use proptest::prelude::*;
 use frankenterm_core::config::{
     CaptureBudgetConfig, Config, DistributedAuthMode, DistributedTlsConfig, IpcAuthToken,
     IpcConfig, IpcScope, LogFormat, NativeEventsConfig, PaneFilterConfig, PaneFilterRule,
-    PanePriorityConfig, PanePriorityRule, PatternsConfig, RetentionTier, SearchDaemonConfig,
-    SearchIndexingConfig, SnapshotConfig, SnapshotSchedulingConfig, SnapshotSchedulingMode,
-    StorageConfig, SyncDirection, WorkflowsConfig,
+    PanePriorityConfig, PanePriorityRule, PatternsConfig, PolicyRule, PolicyRuleDecision,
+    PolicyRuleMatch, RetentionTier, SearchDaemonConfig, SearchIndexingConfig, SnapshotConfig,
+    SnapshotSchedulingConfig, SnapshotSchedulingMode, StorageConfig, SyncDirection,
+    WorkflowsConfig,
 };
 
 // =============================================================================
@@ -1270,5 +1271,130 @@ proptest! {
         let back: WorkflowsConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.max_concurrent, cfg.max_concurrent);
         prop_assert_eq!(back.enabled.len(), cfg.enabled.len());
+    }
+}
+
+// =============================================================================
+// PolicyRuleDecision — serde roundtrip
+// =============================================================================
+
+fn arb_policy_rule_decision() -> impl Strategy<Value = PolicyRuleDecision> {
+    prop_oneof![
+        Just(PolicyRuleDecision::Allow),
+        Just(PolicyRuleDecision::Deny),
+        Just(PolicyRuleDecision::RequireApproval),
+    ]
+}
+
+fn arb_policy_rule_match() -> impl Strategy<Value = PolicyRuleMatch> {
+    (
+        prop::collection::vec("[a-z_]{1,15}", 0..=3),
+        prop::collection::vec("[a-z_]{1,10}", 0..=2),
+        prop::collection::vec("[a-z_]{1,10}", 0..=2),
+        prop::collection::vec(any::<u64>(), 0..=3),
+        prop::collection::vec("[a-z*]{1,10}", 0..=2),
+        prop::collection::vec("[a-z/]{1,15}", 0..=2),
+        prop::collection::vec("[a-z-]{1,10}", 0..=2),
+        prop::collection::vec("[a-z.]+", 0..=2),
+        prop::collection::vec("[a-z]{1,8}", 0..=2),
+    )
+        .prop_map(
+            |(actions, actors, surfaces, pane_ids, pane_titles, pane_cwds, pane_domains, command_patterns, agent_types)| {
+                PolicyRuleMatch {
+                    actions,
+                    actors,
+                    surfaces,
+                    pane_ids,
+                    pane_titles,
+                    pane_cwds,
+                    pane_domains,
+                    command_patterns,
+                    agent_types,
+                }
+            },
+        )
+}
+
+fn arb_policy_rule() -> impl Strategy<Value = PolicyRule> {
+    (
+        "[a-z-]{1,20}",
+        prop::option::of("[a-z ]{1,30}"),
+        0..200u32,
+        arb_policy_rule_match(),
+        arb_policy_rule_decision(),
+        prop::option::of("[a-z {}/]{1,30}"),
+    )
+        .prop_map(|(id, description, priority, match_on, decision, message)| PolicyRule {
+            id,
+            description,
+            priority,
+            match_on,
+            decision,
+            message,
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_policy_rule_decision_json_roundtrip(d in arb_policy_rule_decision()) {
+        let json = serde_json::to_string(&d).unwrap();
+        let back: PolicyRuleDecision = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(d, back);
+    }
+
+    #[test]
+    fn prop_policy_rule_match_json_roundtrip(m in arb_policy_rule_match()) {
+        let json = serde_json::to_string(&m).unwrap();
+        let back: PolicyRuleMatch = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(m.actions, back.actions);
+        prop_assert_eq!(m.actors, back.actors);
+        prop_assert_eq!(m.surfaces, back.surfaces);
+        prop_assert_eq!(m.pane_ids, back.pane_ids);
+        prop_assert_eq!(m.pane_titles, back.pane_titles);
+        prop_assert_eq!(m.pane_cwds, back.pane_cwds);
+        prop_assert_eq!(m.pane_domains, back.pane_domains);
+        prop_assert_eq!(m.command_patterns, back.command_patterns);
+        prop_assert_eq!(m.agent_types, back.agent_types);
+    }
+
+    #[test]
+    fn prop_policy_rule_json_roundtrip(r in arb_policy_rule()) {
+        let json = serde_json::to_string(&r).unwrap();
+        let back: PolicyRule = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(r.id, back.id);
+        prop_assert_eq!(r.description, back.description);
+        prop_assert_eq!(r.priority, back.priority);
+        prop_assert_eq!(r.decision, back.decision);
+        prop_assert_eq!(r.message, back.message);
+        prop_assert_eq!(r.match_on.actions, back.match_on.actions);
+        prop_assert_eq!(r.match_on.actors, back.match_on.actors);
+    }
+
+    #[test]
+    fn prop_policy_rule_match_default_is_empty(_dummy in 0..1_u32) {
+        let m = PolicyRuleMatch::default();
+        prop_assert!(m.actions.is_empty());
+        prop_assert!(m.actors.is_empty());
+        prop_assert!(m.surfaces.is_empty());
+        prop_assert!(m.pane_ids.is_empty());
+        prop_assert!(m.pane_titles.is_empty());
+        prop_assert!(m.pane_cwds.is_empty());
+        prop_assert!(m.pane_domains.is_empty());
+        prop_assert!(m.command_patterns.is_empty());
+        prop_assert!(m.agent_types.is_empty());
+    }
+
+    #[test]
+    fn prop_policy_rule_match_specificity_nonneg(m in arb_policy_rule_match()) {
+        // specificity is always non-negative (trivially true for u32, but tests the method)
+        let _spec = m.specificity();
+    }
+
+    #[test]
+    fn prop_policy_rule_match_specificity_bounded(m in arb_policy_rule_match()) {
+        // Max specificity = 11 (pane_ids +2, command_patterns +2, rest +1 each)
+        prop_assert!(m.specificity() <= 11);
     }
 }
