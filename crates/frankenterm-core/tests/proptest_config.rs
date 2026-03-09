@@ -20,9 +20,11 @@
 use proptest::prelude::*;
 
 use frankenterm_core::config::{
-    CaptureBudgetConfig, Config, DistributedAuthMode, LogFormat, PaneFilterConfig, PaneFilterRule,
-    PanePriorityConfig, PanePriorityRule, RetentionTier, SearchIndexingConfig, SnapshotConfig,
-    SnapshotSchedulingConfig, SnapshotSchedulingMode, StorageConfig, SyncDirection,
+    CaptureBudgetConfig, Config, DistributedAuthMode, DistributedTlsConfig, IpcAuthToken,
+    IpcConfig, IpcScope, LogFormat, NativeEventsConfig, PaneFilterConfig, PaneFilterRule,
+    PanePriorityConfig, PanePriorityRule, PatternsConfig, RetentionTier, SearchDaemonConfig,
+    SearchIndexingConfig, SnapshotConfig, SnapshotSchedulingConfig, SnapshotSchedulingMode,
+    StorageConfig, SyncDirection, WorkflowsConfig,
 };
 
 // =============================================================================
@@ -1000,5 +1002,273 @@ proptest! {
         let back: SearchIndexingConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(&back.index_dir, &cfg.index_dir);
         prop_assert_eq!(back.max_index_mb, cfg.max_index_mb);
+    }
+}
+
+// =============================================================================
+// Additional config type strategies
+// =============================================================================
+
+fn arb_ipc_scope() -> impl Strategy<Value = IpcScope> {
+    prop_oneof![
+        Just(IpcScope::Read),
+        Just(IpcScope::Write),
+        Just(IpcScope::All),
+    ]
+}
+
+// =============================================================================
+// SearchDaemonConfig — serde + Default
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_search_daemon_config_serde(
+        enabled in proptest::bool::ANY,
+        auto_spawn in proptest::bool::ANY,
+        scan_secs in 5_u64..300,
+        batch_size in 1_usize..256,
+    ) {
+        let cfg = SearchDaemonConfig {
+            enabled,
+            socket_path: ".ft/test-daemon.sock".to_string(),
+            auto_spawn,
+            worker_scan_interval_secs: scan_secs,
+            worker_batch_size: batch_size,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: SearchDaemonConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.enabled, cfg.enabled);
+        prop_assert_eq!(back.auto_spawn, cfg.auto_spawn);
+        prop_assert_eq!(back.worker_scan_interval_secs, cfg.worker_scan_interval_secs);
+        prop_assert_eq!(back.worker_batch_size, cfg.worker_batch_size);
+    }
+
+    #[test]
+    fn prop_search_daemon_config_default(_dummy in 0..1_u32) {
+        let d = SearchDaemonConfig::default();
+        prop_assert!(!d.enabled);
+        prop_assert!(d.auto_spawn);
+        prop_assert_eq!(d.worker_scan_interval_secs, 30);
+        prop_assert_eq!(d.worker_batch_size, 64);
+    }
+}
+
+// =============================================================================
+// DistributedTlsConfig — serde + Default
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_distributed_tls_config_serde(
+        enabled in proptest::bool::ANY,
+        has_cert in proptest::bool::ANY,
+        has_key in proptest::bool::ANY,
+        has_ca in proptest::bool::ANY,
+    ) {
+        let cfg = DistributedTlsConfig {
+            enabled,
+            cert_path: if has_cert { Some("/etc/cert.pem".to_string()) } else { None },
+            key_path: if has_key { Some("/etc/key.pem".to_string()) } else { None },
+            client_ca_path: if has_ca { Some("/etc/ca.pem".to_string()) } else { None },
+            min_tls_version: "1.3".to_string(),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: DistributedTlsConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.enabled, cfg.enabled);
+        prop_assert_eq!(back.cert_path, cfg.cert_path);
+        prop_assert_eq!(back.key_path, cfg.key_path);
+        prop_assert_eq!(back.client_ca_path, cfg.client_ca_path);
+        prop_assert_eq!(&back.min_tls_version, &cfg.min_tls_version);
+    }
+
+    #[test]
+    fn prop_distributed_tls_config_default(_dummy in 0..1_u32) {
+        let d = DistributedTlsConfig::default();
+        prop_assert!(!d.enabled);
+        prop_assert!(d.cert_path.is_none());
+        prop_assert!(d.key_path.is_none());
+        prop_assert!(d.client_ca_path.is_none());
+        prop_assert_eq!(&d.min_tls_version, "1.2");
+    }
+}
+
+// =============================================================================
+// IpcScope — serde + allows()
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_ipc_scope_serde(scope in arb_ipc_scope()) {
+        let json = serde_json::to_string(&scope).unwrap();
+        let back: IpcScope = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, scope);
+    }
+
+    #[test]
+    fn prop_ipc_scope_all_allows_everything(required in arb_ipc_scope()) {
+        prop_assert!(IpcScope::All.allows(required));
+    }
+
+    #[test]
+    fn prop_ipc_scope_read_allows_only_read(_dummy in 0..1_u32) {
+        prop_assert!(IpcScope::Read.allows(IpcScope::Read));
+        prop_assert!(!IpcScope::Read.allows(IpcScope::Write));
+        prop_assert!(!IpcScope::Read.allows(IpcScope::All));
+    }
+}
+
+// =============================================================================
+// IpcAuthToken — serde + Default
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_ipc_auth_token_serde(
+        token in "[a-zA-Z0-9]{8,32}",
+        scope_count in 0_usize..3,
+        has_expiry in proptest::bool::ANY,
+        expiry_ms in 0_u64..u64::MAX / 2,
+    ) {
+        let scopes: Vec<IpcScope> = (0..scope_count)
+            .map(|i| match i % 3 {
+                0 => IpcScope::Read,
+                1 => IpcScope::Write,
+                _ => IpcScope::All,
+            })
+            .collect();
+        let tok = IpcAuthToken {
+            token: token.clone(),
+            scopes: scopes.clone(),
+            expires_at_ms: if has_expiry { Some(expiry_ms) } else { None },
+        };
+        let json = serde_json::to_string(&tok).unwrap();
+        let back: IpcAuthToken = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.token, &tok.token);
+        prop_assert_eq!(back.scopes.len(), tok.scopes.len());
+        prop_assert_eq!(back.expires_at_ms, tok.expires_at_ms);
+    }
+
+    #[test]
+    fn prop_ipc_auth_token_default(_dummy in 0..1_u32) {
+        let d = IpcAuthToken::default();
+        prop_assert!(d.token.is_empty());
+        prop_assert_eq!(d.scopes, vec![IpcScope::All]);
+        prop_assert!(d.expires_at_ms.is_none());
+    }
+}
+
+// =============================================================================
+// IpcConfig — serde + Default
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_ipc_config_serde(
+        enabled in proptest::bool::ANY,
+        permissions in 0o400_u32..0o777,
+        token_count in 0_usize..3,
+    ) {
+        let tokens: Vec<IpcAuthToken> = (0..token_count).map(|i| IpcAuthToken {
+            token: format!("tok_{i}"),
+            scopes: vec![IpcScope::All],
+            expires_at_ms: None,
+        }).collect();
+        let cfg = IpcConfig {
+            enabled,
+            socket_path: "test.sock".to_string(),
+            permissions,
+            tokens,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: IpcConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.enabled, cfg.enabled);
+        prop_assert_eq!(back.permissions, cfg.permissions);
+        prop_assert_eq!(back.tokens.len(), cfg.tokens.len());
+    }
+
+    #[test]
+    fn prop_ipc_config_default(_dummy in 0..1_u32) {
+        let d = IpcConfig::default();
+        prop_assert!(d.enabled);
+        prop_assert_eq!(&d.socket_path, "ipc.sock");
+        prop_assert_eq!(d.permissions, 0o600);
+        prop_assert!(d.tokens.is_empty());
+    }
+}
+
+// =============================================================================
+// NativeEventsConfig — serde + Default
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_native_events_config_serde(
+        enabled in proptest::bool::ANY,
+        path in "[a-z/]{5,20}",
+    ) {
+        let cfg = NativeEventsConfig {
+            enabled,
+            socket_path: path.clone(),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: NativeEventsConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.enabled, cfg.enabled);
+        prop_assert_eq!(&back.socket_path, &cfg.socket_path);
+    }
+
+    #[test]
+    fn prop_native_events_config_default(_dummy in 0..1_u32) {
+        let d = NativeEventsConfig::default();
+        prop_assert!(!d.enabled);
+        prop_assert!(!d.socket_path.is_empty());
+    }
+}
+
+// =============================================================================
+// PatternsConfig — serde + Default
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_patterns_config_default_roundtrip(_dummy in 0..1_u32) {
+        let cfg = PatternsConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: PatternsConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.packs.len(), cfg.packs.len());
+        prop_assert!(back.quick_reject_enabled);
+        prop_assert!(back.user_packs_enabled);
+        prop_assert!(back.user_packs_dir.is_none());
+    }
+}
+
+// =============================================================================
+// WorkflowsConfig — serde + Default
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_workflows_config_default_roundtrip(_dummy in 0..1_u32) {
+        let cfg = WorkflowsConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: WorkflowsConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.max_concurrent, cfg.max_concurrent);
+        prop_assert_eq!(back.enabled.len(), cfg.enabled.len());
     }
 }
