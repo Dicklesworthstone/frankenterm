@@ -8,16 +8,36 @@
 //! `MigrationInvariantSummary`, `MigrationRollbackClassifierConfig`,
 //! `MigrationRollbackDecision`, `Segment`, `SemanticSearchHit`,
 //! `PaneIndexingStats`, `EmbeddingStats`, `IndexingHealthReport`,
-//! and `classify_migration_rollback_trigger`.
+//! `classify_migration_rollback_trigger`, `DbCheckStatus`, `DbCheckItem`,
+//! `DbCheckReport`, `DbRepairItem`, `DbRepairReport`, `TableStats`,
+//! `PaneStats`, `EventTypeStats`, `DbStatsReport`, `SearchLintSeverity`,
+//! `SearchLint`, `SearchSuggestion`, `SemanticBudgetConfig`,
+//! `SemanticBudgetMetrics`, `SemanticBudgetSnapshot`, `Correlation`,
+//! `CorrelationRef`, `PaneInfo`, `HandledInfo`, `TimelineEvent`, `Timeline`,
+//! `DailyMetricSummary`, `AgentMetricBreakdown`,
+//! `MigrationForensicBackendState`, `MigrationForensicMigrationCheckpoint`,
+//! `MigrationForensicCorruptionDetail`, `MigrationForensicCaptureContext`,
+//! `MigrationForensicBundle`, `MigrationRollbackExecutionState`,
+//! `MigrationRollbackExecutionReport`, `MigrationRollbackExecutionError`,
+//! and `SearchResult`.
 
+use frankenterm_core::recorder_storage::{RecorderBackendKind, RecorderOffset};
 use frankenterm_core::storage::{
-    CheckpointResult, CorrelationType, DatabasePageStats, EmbeddingStats, EventAnnotations,
-    EventMuteRecord, FtsIndexState, FtsPaneProgress, FtsSyncResult, Gap,
-    IndexingHealthReport, MetricType, MigrationInvariantSummary, MigrationRollbackClass,
-    MigrationRollbackClassifierConfig, MigrationRollbackClassifierInput,
-    MigrationRollbackDecision, MigrationRollbackTrigger, MigrationStage,
-    NotificationStatus, PaneIndexingStats, Segment, SemanticSearchHit,
-    classify_migration_rollback_trigger,
+    AgentMetricBreakdown, CheckpointResult, Correlation, CorrelationRef, CorrelationType,
+    DailyMetricSummary, DatabasePageStats, DbCheckItem, DbCheckReport, DbCheckStatus,
+    DbRepairItem, DbRepairReport, DbStatsReport, EmbeddingStats, EventAnnotations,
+    EventMuteRecord, EventTypeStats, FtsIndexState, FtsPaneProgress, FtsSyncResult, Gap,
+    HandledInfo, IndexingHealthReport, MetricType, MigrationForensicBackendState,
+    MigrationForensicBundle, MigrationForensicCaptureContext,
+    MigrationForensicCorruptionDetail, MigrationForensicMigrationCheckpoint,
+    MigrationInvariantSummary, MigrationRollbackClass, MigrationRollbackClassifierConfig,
+    MigrationRollbackClassifierInput, MigrationRollbackDecision,
+    MigrationRollbackExecutionError, MigrationRollbackExecutionReport,
+    MigrationRollbackExecutionState, MigrationRollbackTrigger, MigrationStage,
+    NotificationStatus, PaneIndexingStats, PaneInfo, PaneStats, SearchLint,
+    SearchLintSeverity, SearchResult, SearchSuggestion, Segment, SemanticBudgetConfig,
+    SemanticBudgetMetrics, SemanticBudgetSnapshot, SemanticSearchHit, TableStats, Timeline,
+    TimelineEvent, classify_migration_rollback_trigger,
 };
 use proptest::prelude::*;
 
@@ -1048,5 +1068,831 @@ proptest! {
         prop_assert!(decision.should_rollback);
         let has_trigger = decision.triggers.contains(&MigrationRollbackTrigger::InvariantErrors);
         prop_assert!(has_trigger);
+    }
+}
+
+// =========================================================================
+// Strategies — DB health types
+// =========================================================================
+
+fn arb_db_check_status() -> impl Strategy<Value = DbCheckStatus> {
+    prop_oneof![
+        Just(DbCheckStatus::Ok),
+        Just(DbCheckStatus::Warning),
+        Just(DbCheckStatus::Error),
+    ]
+}
+
+fn arb_db_check_item() -> impl Strategy<Value = DbCheckItem> {
+    (
+        "[a-z_]{3,12}",
+        arb_db_check_status(),
+        proptest::option::of("[a-z ]{5,20}"),
+    )
+        .prop_map(|(name, status, detail)| DbCheckItem {
+            name,
+            status,
+            detail,
+        })
+}
+
+fn arb_recorder_offset() -> impl Strategy<Value = RecorderOffset> {
+    (0_u64..100, 0_u64..100_000, 0_u64..100_000)
+        .prop_map(|(segment_id, byte_offset, ordinal)| RecorderOffset {
+            segment_id,
+            byte_offset,
+            ordinal,
+        })
+}
+
+fn arb_recorder_backend_kind() -> impl Strategy<Value = RecorderBackendKind> {
+    prop_oneof![
+        Just(RecorderBackendKind::AppendLog),
+        Just(RecorderBackendKind::FrankenSqlite),
+    ]
+}
+
+fn arb_search_lint_severity() -> impl Strategy<Value = SearchLintSeverity> {
+    prop_oneof![
+        Just(SearchLintSeverity::Error),
+        Just(SearchLintSeverity::Warning),
+    ]
+}
+
+fn arb_pane_info() -> impl Strategy<Value = PaneInfo> {
+    (
+        0_u64..10000,
+        proptest::option::of("[a-f0-9]{8}"),
+        proptest::option::of("codex|claude_code|gemini"),
+        "local|ssh|wsl",
+        proptest::option::of("/tmp/[a-z]{3,8}"),
+        proptest::option::of("[a-z ]{3,15}"),
+    )
+        .prop_map(
+            |(pane_id, pane_uuid, agent_type, domain, cwd, title)| PaneInfo {
+                pane_id,
+                pane_uuid,
+                agent_type,
+                domain,
+                cwd,
+                title,
+            },
+        )
+}
+
+
+// =========================================================================
+// DbCheckStatus — serde + Display
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_db_check_status_serde(status in arb_db_check_status()) {
+        let json = serde_json::to_string(&status).unwrap();
+        let back: DbCheckStatus = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, status);
+    }
+
+    #[test]
+    fn prop_db_check_status_display_not_empty(status in arb_db_check_status()) {
+        let display = status.to_string();
+        prop_assert!(!display.is_empty());
+    }
+}
+
+// =========================================================================
+// DbCheckItem — serde roundtrip
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_db_check_item_serde(item in arb_db_check_item()) {
+        let json = serde_json::to_string(&item).unwrap();
+        let back: DbCheckItem = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &item.name);
+        prop_assert_eq!(back.status, item.status);
+        prop_assert_eq!(&back.detail, &item.detail);
+    }
+}
+
+// =========================================================================
+// DbCheckReport — serde + has_errors/has_warnings/problem_count
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_db_check_report_serde(
+        path in "[a-z/]{5,20}",
+        exists in any::<bool>(),
+        size in proptest::option::of(0_u64..1_000_000),
+        version in proptest::option::of(0_i32..100),
+        items in proptest::collection::vec(arb_db_check_item(), 0..5),
+    ) {
+        let report = DbCheckReport {
+            db_path: path,
+            db_exists: exists,
+            db_size_bytes: size,
+            schema_version: version,
+            checks: items,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: DbCheckReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.db_path, &report.db_path);
+        prop_assert_eq!(back.checks.len(), report.checks.len());
+    }
+
+    #[test]
+    fn prop_db_check_report_has_errors_consistent(
+        items in proptest::collection::vec(arb_db_check_item(), 0..5),
+    ) {
+        let report = DbCheckReport {
+            db_path: "/test".to_string(),
+            db_exists: true,
+            db_size_bytes: None,
+            schema_version: None,
+            checks: items,
+        };
+        let expected = report.checks.iter().any(|c| c.status == DbCheckStatus::Error);
+        prop_assert_eq!(report.has_errors(), expected);
+    }
+
+    #[test]
+    fn prop_db_check_report_problem_count(
+        items in proptest::collection::vec(arb_db_check_item(), 0..5),
+    ) {
+        let report = DbCheckReport {
+            db_path: "/test".to_string(),
+            db_exists: true,
+            db_size_bytes: None,
+            schema_version: None,
+            checks: items,
+        };
+        let expected = report
+            .checks
+            .iter()
+            .filter(|c| c.status != DbCheckStatus::Ok)
+            .count();
+        prop_assert_eq!(report.problem_count(), expected);
+    }
+}
+
+// =========================================================================
+// DbRepairItem + DbRepairReport — serde + all_succeeded
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_db_repair_item_serde(
+        name in "[a-z_]{3,12}",
+        success in any::<bool>(),
+        detail in "[a-z ]{5,20}",
+    ) {
+        let item = DbRepairItem { name, success, detail };
+        let json = serde_json::to_string(&item).unwrap();
+        let back: DbRepairItem = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &item.name);
+        prop_assert_eq!(back.success, item.success);
+    }
+
+    #[test]
+    fn prop_db_repair_report_all_succeeded(
+        repairs in proptest::collection::vec(
+            ("[a-z_]{3,8}", any::<bool>(), "[a-z]{3,8}").prop_map(|(n, s, d)| DbRepairItem { name: n, success: s, detail: d }),
+            0..5,
+        ),
+        backup in proptest::option::of("[a-z/]{5,15}"),
+    ) {
+        let report = DbRepairReport { backup_path: backup, repairs };
+        let expected = report.repairs.iter().all(|r| r.success);
+        prop_assert_eq!(report.all_succeeded(), expected);
+    }
+}
+
+// =========================================================================
+// TableStats, PaneStats, EventTypeStats, DbStatsReport — serde
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_table_stats_serde(name in "[a-z_]{3,12}", row_count in 0_u64..100_000) {
+        let ts = TableStats { name, row_count };
+        let json = serde_json::to_string(&ts).unwrap();
+        let back: TableStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &ts.name);
+        prop_assert_eq!(back.row_count, ts.row_count);
+    }
+
+    #[test]
+    fn prop_pane_stats_serde(
+        pane_id in 0_u64..10000,
+        title in proptest::option::of("[a-z ]{3,10}"),
+        seg_count in 0_u64..10000,
+        seg_bytes in 0_u64..1_000_000,
+        evt_count in 0_u64..10000,
+    ) {
+        let ps = PaneStats { pane_id, title, segment_count: seg_count, segment_bytes: seg_bytes, event_count: evt_count };
+        let json = serde_json::to_string(&ps).unwrap();
+        let back: PaneStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, ps.pane_id);
+        prop_assert_eq!(back.segment_count, ps.segment_count);
+    }
+
+    #[test]
+    fn prop_event_type_stats_serde(event_type in "[a-z_]{3,12}", count in 0_u64..10000) {
+        let ets = EventTypeStats { event_type, count };
+        let json = serde_json::to_string(&ets).unwrap();
+        let back: EventTypeStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.event_type, &ets.event_type);
+        prop_assert_eq!(back.count, ets.count);
+    }
+
+    #[test]
+    fn prop_db_stats_report_serde(
+        path in "[a-z/]{5,15}",
+        size in proptest::option::of(0_u64..1_000_000),
+    ) {
+        let report = DbStatsReport {
+            db_path: path.clone(),
+            db_size_bytes: size,
+            tables: vec![TableStats { name: "events".to_string(), row_count: 42 }],
+            top_panes: vec![],
+            event_types: vec![],
+            suggestions: vec!["run vacuum".to_string()],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: DbStatsReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.db_path, &path);
+        prop_assert_eq!(back.tables.len(), 1);
+    }
+}
+
+// =========================================================================
+// SearchLintSeverity + SearchLint + SearchSuggestion — serde
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_search_lint_severity_serde(sev in arb_search_lint_severity()) {
+        let json = serde_json::to_string(&sev).unwrap();
+        let back: SearchLintSeverity = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, sev);
+    }
+
+    #[test]
+    fn prop_search_lint_serde(
+        code in "[A-Z]{2}[0-9]{3}",
+        sev in arb_search_lint_severity(),
+        message in "[a-z ]{5,20}",
+        suggestion in proptest::option::of("[a-z ]{5,15}"),
+    ) {
+        let lint = SearchLint { code, severity: sev, message, suggestion };
+        let json = serde_json::to_string(&lint).unwrap();
+        let back: SearchLint = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.code, &lint.code);
+        prop_assert_eq!(back.severity, lint.severity);
+    }
+
+    #[test]
+    fn prop_search_lint_skip_none_suggestion(
+        code in "[A-Z]{2}[0-9]{3}",
+        sev in arb_search_lint_severity(),
+        message in "[a-z ]{5,20}",
+    ) {
+        let lint = SearchLint { code, severity: sev, message, suggestion: None };
+        let json = serde_json::to_string(&lint).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let has_suggestion = val.as_object().unwrap().contains_key("suggestion");
+        prop_assert!(!has_suggestion, "None suggestion should be skipped");
+    }
+
+    #[test]
+    fn prop_search_suggestion_serde(
+        text in "[a-z]{3,12}",
+        description in proptest::option::of("[a-z ]{5,15}"),
+    ) {
+        let sug = SearchSuggestion { text, description };
+        let json = serde_json::to_string(&sug).unwrap();
+        let back: SearchSuggestion = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.text, &sug.text);
+    }
+}
+
+// =========================================================================
+// SemanticBudgetConfig — serde + Default
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_semantic_budget_config_default_roundtrip(_dummy in 0..1_u8) {
+        let config = SemanticBudgetConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: SemanticBudgetConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.max_semantic_latency_ms, 75);
+        prop_assert_eq!(back.cache_capacity, 256);
+    }
+
+    #[test]
+    fn prop_semantic_budget_config_serde(
+        latency in 1_u64..1000,
+        cooldown in 1_i64..60_000,
+        queries in 1_u32..1000,
+    ) {
+        let config = SemanticBudgetConfig {
+            max_semantic_latency_ms: latency,
+            semantic_backoff_cooldown_ms: cooldown,
+            max_semantic_queries_per_window: queries,
+            ..SemanticBudgetConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: SemanticBudgetConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.max_semantic_latency_ms, config.max_semantic_latency_ms);
+        prop_assert_eq!(back.max_semantic_queries_per_window, config.max_semantic_queries_per_window);
+    }
+}
+
+// =========================================================================
+// SemanticBudgetMetrics — serde + Default
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_semantic_budget_metrics_default_roundtrip(_dummy in 0..1_u8) {
+        let metrics = SemanticBudgetMetrics::default();
+        let json = serde_json::to_string(&metrics).unwrap();
+        let back: SemanticBudgetMetrics = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_semantic_requests, 0);
+        prop_assert_eq!(back.semantic_cache_hits, 0);
+    }
+
+    #[test]
+    fn prop_semantic_budget_metrics_serde(
+        requests in 0_u64..10_000,
+        hits in 0_u64..10_000,
+        misses in 0_u64..10_000,
+    ) {
+        let mut metrics = SemanticBudgetMetrics::default();
+        metrics.total_semantic_requests = requests;
+        metrics.semantic_cache_hits = hits;
+        metrics.semantic_cache_misses = misses;
+        let json = serde_json::to_string(&metrics).unwrap();
+        let back: SemanticBudgetMetrics = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_semantic_requests, requests);
+        prop_assert_eq!(back.semantic_cache_hits, hits);
+    }
+}
+
+// =========================================================================
+// SemanticBudgetSnapshot — serde
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_semantic_budget_snapshot_serde(
+        cache_entries in 0_usize..1000,
+        backoff in proptest::option::of(0_i64..100_000),
+    ) {
+        let snapshot = SemanticBudgetSnapshot {
+            config: SemanticBudgetConfig::default(),
+            metrics: SemanticBudgetMetrics::default(),
+            ewma_semantic_latency_ms: 12.5,
+            backoff_until_ms: backoff,
+            cache_entries,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let back: SemanticBudgetSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.cache_entries, cache_entries);
+        prop_assert_eq!(back.backoff_until_ms, backoff);
+    }
+}
+
+// =========================================================================
+// Timeline types — Correlation, CorrelationRef, PaneInfo, HandledInfo,
+// TimelineEvent, Timeline
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_correlation_ref_serde(
+        id in "[a-f0-9]{8}",
+        ct in arb_correlation_type(),
+    ) {
+        let cr = CorrelationRef { id, correlation_type: ct };
+        let json = serde_json::to_string(&cr).unwrap();
+        let back: CorrelationRef = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.id, &cr.id);
+        prop_assert_eq!(back.correlation_type, cr.correlation_type);
+    }
+
+    #[test]
+    fn prop_correlation_serde(
+        id in "[a-f0-9]{8}",
+        event_ids in proptest::collection::vec(0_i64..10000, 1..5),
+        ct in arb_correlation_type(),
+        desc in "[a-z ]{5,20}",
+    ) {
+        let corr = Correlation {
+            id,
+            event_ids,
+            correlation_type: ct,
+            confidence: 0.85,
+            description: desc,
+        };
+        let json = serde_json::to_string(&corr).unwrap();
+        let back: Correlation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.id, &corr.id);
+        prop_assert_eq!(back.event_ids.len(), corr.event_ids.len());
+    }
+
+    #[test]
+    fn prop_pane_info_serde(pi in arb_pane_info()) {
+        let json = serde_json::to_string(&pi).unwrap();
+        let back: PaneInfo = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, pi.pane_id);
+        prop_assert_eq!(&back.domain, &pi.domain);
+    }
+
+    #[test]
+    fn prop_handled_info_serde(
+        handled_at in 0_i64..2_000_000_000_000,
+        workflow_id in proptest::option::of("[a-f0-9]{8}"),
+        status in "success|failure|skipped",
+    ) {
+        let hi = HandledInfo { handled_at, workflow_id, status };
+        let json = serde_json::to_string(&hi).unwrap();
+        let back: HandledInfo = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.handled_at, hi.handled_at);
+        prop_assert_eq!(&back.status, &hi.status);
+    }
+
+    #[test]
+    fn prop_timeline_event_serde(pi in arb_pane_info()) {
+        let te = TimelineEvent {
+            id: 42,
+            timestamp: 1700000000000,
+            pane_info: pi,
+            rule_id: "test_rule".to_string(),
+            event_type: "error".to_string(),
+            severity: "high".to_string(),
+            confidence: 0.95,
+            handled: None,
+            correlations: vec![],
+            summary: Some("test summary".to_string()),
+        };
+        let json = serde_json::to_string(&te).unwrap();
+        let back: TimelineEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.id, 42);
+        prop_assert_eq!(&back.rule_id, "test_rule");
+    }
+
+    #[test]
+    fn prop_timeline_serde(
+        total in 0_u64..1000,
+        has_more in any::<bool>(),
+    ) {
+        let timeline = Timeline {
+            start: 1700000000000,
+            end: 1700001000000,
+            events: vec![],
+            correlations: vec![],
+            total_count: total,
+            has_more,
+        };
+        let json = serde_json::to_string(&timeline).unwrap();
+        let back: Timeline = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_count, total);
+        prop_assert_eq!(back.has_more, has_more);
+    }
+}
+
+// =========================================================================
+// SearchResult — serde
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_search_result_serde(
+        pane_id in 0_u64..10000,
+        seq in 0_u64..10000,
+        content in "[a-z ]{5,30}",
+        score in 0.0_f64..100.0,
+    ) {
+        let sr = SearchResult {
+            segment: Segment {
+                id: 1,
+                pane_id,
+                seq,
+                content: content.clone(),
+                content_len: content.len(),
+                content_hash: None,
+                captured_at: 1700000000,
+            },
+            snippet: Some("...match...".to_string()),
+            highlight: None,
+            score,
+        };
+        let json = serde_json::to_string(&sr).unwrap();
+        let back: SearchResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.segment.pane_id, pane_id);
+    }
+}
+
+// =========================================================================
+// DailyMetricSummary + AgentMetricBreakdown — serde
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_daily_metric_summary_serde(
+        day_ts in 0_i64..2_000_000_000_000,
+        agent_type in proptest::option::of("codex|claude_code"),
+        tokens in 0_i64..1_000_000,
+        events in 0_i64..10_000,
+    ) {
+        let dms = DailyMetricSummary {
+            day_ts,
+            agent_type,
+            total_tokens: tokens,
+            total_cost: 1.23,
+            event_count: events,
+        };
+        let json = serde_json::to_string(&dms).unwrap();
+        let back: DailyMetricSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.day_ts, dms.day_ts);
+        prop_assert_eq!(back.total_tokens, dms.total_tokens);
+    }
+
+    #[test]
+    fn prop_agent_metric_breakdown_serde(
+        agent_type in "codex|claude_code|gemini",
+        tokens in 0_i64..1_000_000,
+    ) {
+        let amb = AgentMetricBreakdown {
+            agent_type,
+            total_tokens: tokens,
+            total_cost: 5.67,
+            avg_tokens_per_event: 123.4,
+        };
+        let json = serde_json::to_string(&amb).unwrap();
+        let back: AgentMetricBreakdown = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.agent_type, &amb.agent_type);
+        prop_assert_eq!(back.total_tokens, amb.total_tokens);
+    }
+}
+
+// =========================================================================
+// Migration forensic types — serde roundtrips
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_forensic_backend_state_serde(
+        health in any::<bool>(),
+        head in proptest::option::of(arb_recorder_offset()),
+        cp in proptest::option::of(arb_recorder_offset()),
+    ) {
+        let fbs = MigrationForensicBackendState {
+            health,
+            head_offset: head,
+            last_checkpoint: cp,
+        };
+        let json = serde_json::to_string(&fbs).unwrap();
+        let back: MigrationForensicBackendState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.health, fbs.health);
+        prop_assert_eq!(back, fbs);
+    }
+
+    #[test]
+    fn prop_forensic_migration_checkpoint_serde(
+        stage in arb_migration_stage(),
+        manifest in "[a-z_]{5,15}",
+    ) {
+        let fmc = MigrationForensicMigrationCheckpoint {
+            last_completed_stage: stage,
+            manifest,
+        };
+        let json = serde_json::to_string(&fmc).unwrap();
+        let back: MigrationForensicMigrationCheckpoint = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, fmc);
+    }
+
+    #[test]
+    fn prop_forensic_corruption_detail_serde(
+        location in "[a-z_]{5,15}",
+        ordinals in proptest::collection::vec(0_u64..10_000, 0..5),
+        detail in "[a-z ]{5,20}",
+    ) {
+        let fcd = MigrationForensicCorruptionDetail {
+            location,
+            affected_ordinals: ordinals,
+            detail,
+        };
+        let json = serde_json::to_string(&fcd).unwrap();
+        let back: MigrationForensicCorruptionDetail = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, fcd);
+    }
+
+    #[test]
+    fn prop_forensic_capture_context_serde(
+        src_health in any::<bool>(),
+        tgt_health in any::<bool>(),
+        stage in arb_migration_stage(),
+    ) {
+        let ctx = MigrationForensicCaptureContext {
+            source_state: MigrationForensicBackendState {
+                health: src_health,
+                head_offset: None,
+                last_checkpoint: None,
+            },
+            target_state: MigrationForensicBackendState {
+                health: tgt_health,
+                head_offset: None,
+                last_checkpoint: None,
+            },
+            migration_checkpoint: MigrationForensicMigrationCheckpoint {
+                last_completed_stage: stage,
+                manifest: "v1".to_string(),
+            },
+            corruption_detail: MigrationForensicCorruptionDetail {
+                location: "index".to_string(),
+                affected_ordinals: vec![],
+                detail: "none".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: MigrationForensicCaptureContext = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, ctx);
+    }
+
+    #[test]
+    fn prop_forensic_bundle_serde(
+        captured_at in 0_i64..2_000_000_000_000,
+        rc in arb_rollback_class(),
+        stage in arb_migration_stage(),
+    ) {
+        let bundle = MigrationForensicBundle {
+            captured_at_ms: captured_at,
+            rollback_class: rc,
+            from_stage: stage,
+            source_state: MigrationForensicBackendState {
+                health: true,
+                head_offset: None,
+                last_checkpoint: None,
+            },
+            target_state: MigrationForensicBackendState {
+                health: false,
+                head_offset: None,
+                last_checkpoint: None,
+            },
+            migration_checkpoint: MigrationForensicMigrationCheckpoint {
+                last_completed_stage: MigrationStage::Preflight,
+                manifest: "m1".to_string(),
+            },
+            corruption_detail: MigrationForensicCorruptionDetail {
+                location: "wal".to_string(),
+                affected_ordinals: vec![1, 2, 3],
+                detail: "crc mismatch".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&bundle).unwrap();
+        let back: MigrationForensicBundle = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, bundle);
+    }
+}
+
+// =========================================================================
+// MigrationRollbackExecutionState — serde + Default + methods
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_execution_state_default_roundtrip(_dummy in 0..1_u8) {
+        let state = MigrationRollbackExecutionState::default();
+        let json = serde_json::to_string(&state).unwrap();
+        let back: MigrationRollbackExecutionState = serde_json::from_str(&json).unwrap();
+        prop_assert!(!back.migration_active);
+        prop_assert!(!back.emergency_freeze);
+        prop_assert_eq!(back, state);
+    }
+
+    #[test]
+    fn prop_execution_state_recorder_writes_blocked(freeze in any::<bool>()) {
+        let mut state = MigrationRollbackExecutionState::default();
+        state.emergency_freeze = freeze;
+        prop_assert_eq!(state.recorder_writes_blocked(), freeze);
+    }
+
+    #[test]
+    fn prop_execution_state_manual_reenable(_dummy in 0..1_u8) {
+        let mut state = MigrationRollbackExecutionState::default();
+        state.emergency_freeze = true;
+        prop_assert!(state.recorder_writes_blocked());
+        state.manual_reenable_recorder_writes();
+        prop_assert!(!state.recorder_writes_blocked());
+    }
+}
+
+// =========================================================================
+// MigrationRollbackExecutionReport — serde
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_execution_report_serde(
+        rc in arb_rollback_class(),
+        stage in arb_migration_stage(),
+        active in any::<bool>(),
+        backend in arb_recorder_backend_kind(),
+    ) {
+        let report = MigrationRollbackExecutionReport {
+            tier: rc,
+            from_stage: stage,
+            migration_active: active,
+            backend_selector: backend,
+            target_cleared: false,
+            projection_rebuild_triggered: true,
+            checkpoints_reset: false,
+            source_health_verified: true,
+            index_health_verified: true,
+            emergency_freeze_active: false,
+            forensic_bundle_path: None,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: MigrationRollbackExecutionReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, report);
+    }
+}
+
+// =========================================================================
+// MigrationRollbackExecutionError — tagged serde
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_execution_error_unsupported_tier_serde(rc in arb_rollback_class()) {
+        let err = MigrationRollbackExecutionError::UnsupportedTier { rollback_class: rc };
+        let json = serde_json::to_string(&err).unwrap();
+        let back: MigrationRollbackExecutionError = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, err);
+        prop_assert!(json.contains("unsupported_tier"));
+    }
+
+    #[test]
+    fn prop_execution_error_source_health_failed_serde(rc in arb_rollback_class()) {
+        let err = MigrationRollbackExecutionError::SourceHealthFailed { tier: rc };
+        let json = serde_json::to_string(&err).unwrap();
+        let back: MigrationRollbackExecutionError = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, err);
+        prop_assert!(json.contains("source_health_failed"));
+    }
+
+    #[test]
+    fn prop_execution_error_all_variants_distinct(_dummy in 0..1_u8) {
+        let variants = vec![
+            serde_json::to_string(&MigrationRollbackExecutionError::IndexHealthFailedPostCutover).unwrap(),
+            serde_json::to_string(&MigrationRollbackExecutionError::ForensicCaptureMissing).unwrap(),
+            serde_json::to_string(&MigrationRollbackExecutionError::ForensicPersistFailed {
+                path: std::path::PathBuf::from("/tmp/forensic.json"),
+                error: "disk full".to_string(),
+            }).unwrap(),
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i != j {
+                    prop_assert_ne!(a, b);
+                }
+            }
+        }
     }
 }

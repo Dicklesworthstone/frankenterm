@@ -7,7 +7,7 @@
 //! and structural invariants.
 
 use frankenterm_core::tantivy_reindex::{
-    BackfillRange, CheckedRange, IntegrityReport, OffsetMismatch, ReindexProgress,
+    BackfillRange, CheckedRange, IntegrityReport, OffsetMismatch, ReindexProgress, ReindexStats,
 };
 use proptest::prelude::*;
 
@@ -559,5 +559,105 @@ proptest! {
     fn prop_offset_mismatch_clone(mismatch in arb_offset_mismatch()) {
         let cloned = mismatch.clone();
         prop_assert_eq!(mismatch, cloned);
+    }
+}
+
+// =========================================================================
+// ReindexStats — serde roundtrip + field preservation
+// =========================================================================
+
+fn arb_reindex_stats() -> impl Strategy<Value = ReindexStats> {
+    (
+        0_u64..100_000,
+        0_u64..100_000,
+        0_u64..10_000,
+        0_u64..10_000,
+        0_u64..1000,
+        0_u64..600_000,
+        proptest::option::of(0_u64..100_000),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(event_count, indexed_count, skipped, filtered, errors, duration_ms, final_ordinal, caught_up)| {
+                let eps = if duration_ms > 0 {
+                    event_count as f64 / (duration_ms as f64 / 1000.0)
+                } else {
+                    0.0
+                };
+                ReindexStats {
+                    event_count,
+                    indexed_count,
+                    skipped_count: skipped,
+                    filtered_count: filtered,
+                    error_count: errors,
+                    duration_ms,
+                    final_ordinal,
+                    caught_up,
+                    events_per_sec: eps,
+                }
+            },
+        )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_reindex_stats_serde(stats in arb_reindex_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: ReindexStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.event_count, stats.event_count);
+        prop_assert_eq!(back.indexed_count, stats.indexed_count);
+        prop_assert_eq!(back.skipped_count, stats.skipped_count);
+        prop_assert_eq!(back.filtered_count, stats.filtered_count);
+        prop_assert_eq!(back.error_count, stats.error_count);
+        prop_assert_eq!(back.duration_ms, stats.duration_ms);
+        prop_assert_eq!(back.final_ordinal, stats.final_ordinal);
+        prop_assert_eq!(back.caught_up, stats.caught_up);
+    }
+
+    #[test]
+    fn prop_reindex_stats_deterministic(stats in arb_reindex_stats()) {
+        let j1 = serde_json::to_string(&stats).unwrap();
+        let j2 = serde_json::to_string(&stats).unwrap();
+        prop_assert_eq!(&j1, &j2);
+    }
+
+    #[test]
+    fn prop_reindex_stats_json_keys(stats in arb_reindex_stats()) {
+        let json = serde_json::to_string(&stats).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = val.as_object().unwrap();
+        prop_assert!(obj.contains_key("event_count"));
+        prop_assert!(obj.contains_key("indexed_count"));
+        prop_assert!(obj.contains_key("events_per_sec"));
+        prop_assert!(obj.contains_key("caught_up"));
+    }
+
+    #[test]
+    fn prop_reindex_stats_clone(stats in arb_reindex_stats()) {
+        let cloned = stats.clone();
+        prop_assert_eq!(stats, cloned);
+    }
+
+    #[test]
+    fn prop_reindex_stats_zero_duration_zero_eps(
+        event_count in 0_u64..100_000,
+    ) {
+        let stats = ReindexStats {
+            event_count,
+            indexed_count: 0,
+            skipped_count: 0,
+            filtered_count: 0,
+            error_count: 0,
+            duration_ms: 0,
+            final_ordinal: None,
+            caught_up: true,
+            events_per_sec: 0.0,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: ReindexStats = serde_json::from_str(&json).unwrap();
+        let eps_zero = back.events_per_sec == 0.0;
+        prop_assert!(eps_zero, "zero duration should give zero eps");
     }
 }
