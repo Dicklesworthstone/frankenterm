@@ -6,7 +6,9 @@
 #   2. Failure injection proves the detector trips when the allowlist is removed
 #   3. Recovery restores the nominal allowlist contract
 #   4. Production call sites do not regress to runtime_compat helper shims
-#   5. Guard + smoke tests pass through rch-offloaded cargo execution only
+#   5. RCH preflight uses an actual remote-only smoke command and rejects local fallback
+#   6. Guard test passes through rch-offloaded cargo execution only
+#   7. Smoke test passes through rch-offloaded cargo execution only
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -185,6 +187,25 @@ ensure_rch_remote_only() {
   fi
 }
 
+run_rch_remote_smoke_preflight() {
+  local label="$1"
+  local smoke_command="cargo check --help"
+
+  emit_log "running" "${label}" "rch_preflight" "started" "none" "${LAST_STEP_LOG}" "${smoke_command}"
+  if run_step "${label}" rch exec -- cargo check --help; then
+    if grep -Eq '\[RCH\] local|running locally' "${LAST_STEP_LOG}"; then
+      emit_log "failed" "${label}" "rch_preflight" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK" "${LAST_STEP_LOG}" "${smoke_command}"
+      echo "rch remote smoke fell back to local execution; failing preflight" >&2
+      return 1
+    fi
+    emit_log "passed" "${label}" "rch_preflight" "rch_remote_smoke_ok" "none" "${LAST_STEP_LOG}" "${smoke_command}"
+    return 0
+  fi
+
+  emit_log "failed" "${label}" "rch_preflight" "rch_remote_smoke_failed" "RCH-E101" "${LAST_STEP_LOG}" "${smoke_command}"
+  return 1
+}
+
 run_rch_test_step() {
   local label="$1"
   local test_name="$2"
@@ -271,25 +292,32 @@ if [[ ${RCH_PROBE_RC} -eq 0 ]]; then
   fi
 fi
 
-if [[ "${RCH_REACHABLE}" != "true" ]]; then
-  if rch --json status --workers --jobs > "${RCH_STATUS_LOG}" 2>>"${RCH_CHECK_LOG}"; then
-    emit_log "failed" "rch_probe" "rch_preflight" "rch_workers_unreachable_probe" "RCH-E100" "${RCH_STATUS_LOG}" "workers_probe"
+if rch --json status --workers --jobs > "${RCH_STATUS_LOG}" 2>>"${RCH_CHECK_LOG}"; then
+  if [[ "${RCH_REACHABLE}" == "true" ]]; then
+    emit_log "passed" "rch_probe" "rch_preflight" "rch_workers_probe_ok" "none" "${RCH_PROBE_LOG}" "workers_probe"
   else
-    emit_log "failed" "rch_probe" "rch_preflight" "rch_status_unavailable" "RCH-E100" "${RCH_CHECK_LOG}" "workers_probe"
+    emit_log "failed" "rch_probe" "rch_preflight" "rch_workers_unreachable_probe" "RCH-E100" "${RCH_STATUS_LOG}" "workers_probe"
   fi
-  echo "workers probe found no reachable remote workers; refusing local fallback" >&2
+else
+  emit_log "failed" "rch_probe" "rch_preflight" "rch_status_unavailable" "RCH-E100" "${RCH_CHECK_LOG}" "workers_probe"
+fi
+
+echo ""
+echo "--- Scenario 5: rch remote-only smoke preflight ---"
+if ! run_rch_remote_smoke_preflight "rch_remote_smoke"; then
+  echo "rch remote smoke preflight failed; refusing local fallback" >&2
   exit 2
 fi
 
 echo ""
-echo "--- Scenario 5: runtime_compat_surface_guard passes via rch ---"
+echo "--- Scenario 6: runtime_compat_surface_guard passes via rch ---"
 run_rch_test_step \
   "runtime_compat_surface_guard" \
   "cargo test -p frankenterm-core --test runtime_compat_surface_guard -- --nocapture" \
   cargo test -p frankenterm-core --test runtime_compat_surface_guard -- --nocapture
 
 echo ""
-echo "--- Scenario 6: runtime_compat_smoke passes via rch ---"
+echo "--- Scenario 7: runtime_compat_smoke passes via rch ---"
 run_rch_test_step \
   "runtime_compat_smoke" \
   "cargo test -p frankenterm-core --test runtime_compat_smoke -- --nocapture" \

@@ -12,6 +12,8 @@ raw_log="$LOG_DIR/${run_id}.cargo.log"
 cargo_home="/tmp/cargo-home-replay-capture-e2e"
 cargo_target_dir="${FT_REPLAY_CAPTURE_TARGET_DIR:-$ROOT_DIR/target-replay-capture-e2e-${run_id}}"
 component="replay_capture_extraction"
+local_tmpdir="${FT_REPLAY_CAPTURE_LOCAL_TMPDIR:-${TMPDIR:-/tmp}}"
+remote_tmpdir="${FT_REPLAY_CAPTURE_REMOTE_TMPDIR:-/home/ubuntu}"
 
 now_ts() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -32,11 +34,12 @@ require_cmd() {
 
 probe_rch_workers() {
   local probe_log="$LOG_DIR/${run_id}.rch_probe.json"
+  local probe_json
 
   log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"$component\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario_id\",\"pane_id\":null,\"step\":\"rch_probe\",\"status\":\"running\",\"correlation_id\":\"$run_id\",\"decision_path\":\"preflight\",\"inputs\":{},\"outcome\":\"running\",\"reason_code\":null,\"error_code\":null,\"artifact_path\":\"${probe_log#$ROOT_DIR/}\"}"
 
   set +e
-  rch workers probe --all --json >"$probe_log" 2>&1
+  env TMPDIR="$local_tmpdir" rch workers probe --all --json >"$probe_log" 2>&1
   local probe_rc=$?
   set -e
 
@@ -46,8 +49,9 @@ probe_rch_workers() {
     exit 2
   fi
 
+  probe_json="$(awk 'capture || /^[[:space:]]*[{]/{capture=1; print}' "$probe_log")"
   local healthy_workers
-  healthy_workers="$(jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "$probe_log" 2>/dev/null || echo 0)"
+  healthy_workers="$(printf '%s\n' "$probe_json" | jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' 2>/dev/null || echo 0)"
   if [[ "$healthy_workers" -lt 1 ]]; then
     log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"$component\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario_id\",\"pane_id\":null,\"step\":\"rch_probe\",\"status\":\"failed\",\"correlation_id\":\"$run_id\",\"decision_path\":\"preflight\",\"inputs\":{\"healthy_workers\":$healthy_workers},\"outcome\":\"failed\",\"reason_code\":\"rch_workers_unreachable\",\"error_code\":\"RCH-E100\",\"artifact_path\":\"${probe_log#$ROOT_DIR/}\"}"
     echo "no reachable rch workers; refusing local fallback" >&2
@@ -65,9 +69,12 @@ require_cmd cargo
 probe_rch_workers
 
 cmd=(
+  env
+  "TMPDIR=$local_tmpdir"
   rch exec -- env
-  CARGO_HOME="$cargo_home"
-  CARGO_TARGET_DIR="$cargo_target_dir"
+  "TMPDIR=$remote_tmpdir"
+  "CARGO_HOME=$cargo_home"
+  "CARGO_TARGET_DIR=$cargo_target_dir"
   cargo test -p frankenterm-core --lib runtime_emits_replay_capture_events_when_adapter_is_enabled -- --nocapture
 )
 cmd_str="${cmd[*]}"

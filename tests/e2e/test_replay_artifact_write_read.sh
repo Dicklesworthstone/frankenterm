@@ -14,6 +14,8 @@ component="replay_artifact_write_read"
 
 cargo_home="/tmp/cargo-home-replay-artifact-write-read"
 cargo_target_dir="${FT_REPLAY_CAPTURE_TARGET_DIR:-$ROOT_DIR/target-replay-artifact-write-read-${run_id}}"
+local_tmpdir="${FT_REPLAY_CAPTURE_LOCAL_TMPDIR:-${TMPDIR:-/tmp}}"
+remote_tmpdir="${FT_REPLAY_CAPTURE_REMOTE_TMPDIR:-/home/ubuntu}"
 work_dir="$ROOT_DIR/tests/e2e/tmp/${run_id}"
 mkdir -p "$work_dir"
 
@@ -59,11 +61,12 @@ require_cmd() {
 
 probe_rch_workers() {
   local probe_log="$raw_dir/${run_id}.rch_probe.json"
+  local probe_json
 
   log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_probe\",\"status\":\"running\",\"decision_path\":\"preflight\",\"inputs\":{},\"outcome\":\"running\",\"artifact_path\":\"${probe_log#$ROOT_DIR/}\"}"
 
   set +e
-  rch workers probe --all --json >"$probe_log" 2>&1
+  env TMPDIR="$local_tmpdir" rch workers probe --all --json >"$probe_log" 2>&1
   local probe_rc=$?
   set -e
 
@@ -73,8 +76,9 @@ probe_rch_workers() {
     exit 2
   fi
 
+  probe_json="$(awk 'capture || /^[[:space:]]*[{]/{capture=1; print}' "$probe_log")"
   local healthy_workers
-  healthy_workers="$(jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "$probe_log" 2>/dev/null || echo 0)"
+  healthy_workers="$(printf '%s\n' "$probe_json" | jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' 2>/dev/null || echo 0)"
   if [[ "$healthy_workers" -lt 1 ]]; then
     log_json "{\"scenario_id\":\"$scenario_id\",\"step\":\"rch_probe\",\"status\":\"failed\",\"decision_path\":\"preflight\",\"inputs\":{\"healthy_workers\":$healthy_workers},\"outcome\":\"failed\",\"reason_code\":\"rch_workers_unreachable\",\"error_code\":\"RCH-E100\",\"artifact_path\":\"${probe_log#$ROOT_DIR/}\"}"
     echo "no reachable rch workers; refusing local fallback" >&2
@@ -107,7 +111,9 @@ run_harvest_command() {
   local stderr_file="$5"
 
   set +e
-  rch exec -- env \
+  env TMPDIR="$local_tmpdir" \
+    rch exec -- env \
+    TMPDIR="$remote_tmpdir" \
     CARGO_HOME="$cargo_home" \
     CARGO_TARGET_DIR="$cargo_target_dir" \
     cargo run -q -p frankenterm -- \
