@@ -1,5 +1,6 @@
 //! Property-based tests for the policy_dsl module.
 
+use frankenterm_core::config::{PolicyRule, PolicyRuleDecision, PolicyRuleMatch};
 use frankenterm_core::policy::{
     ActionKind, ActorKind, PaneCapabilities, PolicyInput, PolicySurface,
 };
@@ -584,5 +585,171 @@ proptest! {
         let result = evaluate_dsl_rules(&rules, &input);
         let m = result.matched_rule.unwrap();
         prop_assert_eq!(m.rule_id, "high-priority-deny");
+    }
+
+    // ---- Bridge compiler property tests ----
+
+    #[test]
+    fn compile_empty_match_is_always(_dummy in 0u8..1) {
+        let m = PolicyRuleMatch::default();
+        let pred = compile_rule_match(&m);
+        let check = matches!(pred, RulePredicate::Always);
+        prop_assert!(check, "empty match should compile to Always");
+    }
+
+    #[test]
+    fn compile_decompile_roundtrip_actions(
+        actions in prop::collection::vec(arb_action_kind(), 1..=4)
+    ) {
+        let action_strs: Vec<String> = actions.iter().map(|a| {
+            serde_json::to_string(a).unwrap().trim_matches('"').to_owned()
+        }).collect();
+        let m = PolicyRuleMatch {
+            actions: action_strs.clone(),
+            ..PolicyRuleMatch::default()
+        };
+        let pred = compile_rule_match(&m);
+        let back = decompile_to_match(&pred).expect("flat AND should decompile");
+        prop_assert_eq!(back.actions, action_strs);
+    }
+
+    #[test]
+    fn compile_decompile_roundtrip_actors(
+        actors in prop::collection::vec(arb_actor_kind(), 1..=3)
+    ) {
+        let actor_strs: Vec<String> = actors.iter().map(|a| {
+            serde_json::to_string(a).unwrap().trim_matches('"').to_owned()
+        }).collect();
+        let m = PolicyRuleMatch {
+            actors: actor_strs.clone(),
+            ..PolicyRuleMatch::default()
+        };
+        let pred = compile_rule_match(&m);
+        let back = decompile_to_match(&pred).expect("flat AND should decompile");
+        prop_assert_eq!(back.actors, actor_strs);
+    }
+
+    #[test]
+    fn compile_decompile_roundtrip_surfaces(
+        surfaces in prop::collection::vec(arb_policy_surface(), 1..=3)
+    ) {
+        let surface_strs: Vec<String> = surfaces.iter().map(|s| {
+            serde_json::to_string(s).unwrap().trim_matches('"').to_owned()
+        }).collect();
+        let m = PolicyRuleMatch {
+            surfaces: surface_strs.clone(),
+            ..PolicyRuleMatch::default()
+        };
+        let pred = compile_rule_match(&m);
+        let back = decompile_to_match(&pred).expect("flat AND should decompile");
+        prop_assert_eq!(back.surfaces, surface_strs);
+    }
+
+    #[test]
+    fn compile_decompile_roundtrip_pane_ids(
+        pane_ids in prop::collection::vec(any::<u64>(), 1..=5)
+    ) {
+        let m = PolicyRuleMatch {
+            pane_ids: pane_ids.clone(),
+            ..PolicyRuleMatch::default()
+        };
+        let pred = compile_rule_match(&m);
+        let back = decompile_to_match(&pred).expect("flat AND should decompile");
+        prop_assert_eq!(back.pane_ids, pane_ids);
+    }
+
+    #[test]
+    fn compile_decompile_roundtrip_multi_field(
+        actions in prop::collection::vec(arb_action_kind(), 1..=2),
+        actors in prop::collection::vec(arb_actor_kind(), 1..=2),
+        pane_ids in prop::collection::vec(any::<u64>(), 0..=3),
+    ) {
+        let action_strs: Vec<String> = actions.iter().map(|a| {
+            serde_json::to_string(a).unwrap().trim_matches('"').to_owned()
+        }).collect();
+        let actor_strs: Vec<String> = actors.iter().map(|a| {
+            serde_json::to_string(a).unwrap().trim_matches('"').to_owned()
+        }).collect();
+        let m = PolicyRuleMatch {
+            actions: action_strs.clone(),
+            actors: actor_strs.clone(),
+            pane_ids: pane_ids.clone(),
+            ..PolicyRuleMatch::default()
+        };
+        let pred = compile_rule_match(&m);
+        let back = decompile_to_match(&pred).expect("multi-field should decompile");
+        prop_assert_eq!(back.actions, action_strs);
+        prop_assert_eq!(back.actors, actor_strs);
+        prop_assert_eq!(back.pane_ids, pane_ids);
+    }
+
+    #[test]
+    fn compile_policy_rule_preserves_decision(
+        decision in prop_oneof![
+            Just(PolicyRuleDecision::Allow),
+            Just(PolicyRuleDecision::Deny),
+            Just(PolicyRuleDecision::RequireApproval),
+        ],
+        id in "[a-z-]{1,15}",
+        priority in 0..200u32,
+    ) {
+        let rule = PolicyRule {
+            id: id.clone(),
+            description: None,
+            priority,
+            match_on: PolicyRuleMatch::default(),
+            decision,
+            message: None,
+        };
+        let dsl = compile_policy_rule(&rule);
+        prop_assert_eq!(&dsl.id, &id);
+        prop_assert_eq!(dsl.priority, priority);
+        let expected_decision = match decision {
+            PolicyRuleDecision::Allow => DslDecision::Allow,
+            PolicyRuleDecision::Deny => DslDecision::Deny,
+            PolicyRuleDecision::RequireApproval => DslDecision::RequireApproval,
+        };
+        prop_assert_eq!(dsl.decision, expected_decision);
+    }
+
+    #[test]
+    fn or_not_predicates_cannot_decompile(
+        left in arb_atomic_predicate(),
+        right in arb_atomic_predicate(),
+    ) {
+        let or_pred = RulePredicate::Or {
+            left: Box::new(left),
+            right: Box::new(right.clone()),
+        };
+        prop_assert!(decompile_to_match(&or_pred).is_none(), "OR should not decompile");
+
+        let not_pred = RulePredicate::Not {
+            inner: Box::new(right),
+        };
+        prop_assert!(decompile_to_match(&not_pred).is_none(), "NOT should not decompile");
+    }
+
+    #[test]
+    fn never_predicate_cannot_decompile(_dummy in 0u8..1) {
+        prop_assert!(decompile_to_match(&RulePredicate::Never).is_none());
+    }
+
+    #[test]
+    fn compiled_predicate_evaluates_consistently(
+        actions in prop::collection::vec(arb_action_kind(), 1..=2),
+        input in arb_policy_input(),
+    ) {
+        let action_strs: Vec<String> = actions.iter().map(|a| {
+            serde_json::to_string(a).unwrap().trim_matches('"').to_owned()
+        }).collect();
+        let m = PolicyRuleMatch {
+            actions: action_strs,
+            ..PolicyRuleMatch::default()
+        };
+        let pred = compile_rule_match(&m);
+        let result = evaluate_predicate(&pred, &input);
+        let trace = evaluate_with_trace(&pred, &input);
+        // evaluate and evaluate_with_trace must agree
+        prop_assert_eq!(result, trace.matched);
     }
 }
