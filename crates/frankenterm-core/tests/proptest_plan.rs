@@ -1569,3 +1569,322 @@ proptest! {
         }
     }
 }
+
+// =============================================================================
+// Additional plan.rs type coverage: ApprovalState, Outcome, MissionTxState,
+// MissionKillSwitchLevel, TxOutcome, TxPrepareOutcome, TxCommitOutcome,
+// TxCommitStepOutcome, TxCompensationOutcome, TxPrecondition
+// =============================================================================
+
+fn arb_approval_state() -> impl Strategy<Value = ApprovalState> {
+    prop_oneof![
+        Just(ApprovalState::NotRequired),
+        ("[a-z_]{3,15}", 0i64..9_999_999_999i64).prop_map(|(requested_by, requested_at_ms)| {
+            ApprovalState::Pending {
+                requested_by,
+                requested_at_ms,
+            }
+        }),
+        (
+            "[a-z_]{3,15}",
+            0i64..9_999_999_999i64,
+            "[a-f0-9]{16,32}",
+        )
+            .prop_map(|(approved_by, approved_at_ms, approval_code_hash)| {
+                ApprovalState::Approved {
+                    approved_by,
+                    approved_at_ms,
+                    approval_code_hash,
+                }
+            }),
+        (
+            "[a-z_]{3,15}",
+            0i64..9_999_999_999i64,
+            "[a-z_.]{3,20}",
+        )
+            .prop_map(|(denied_by, denied_at_ms, reason_code)| {
+                ApprovalState::Denied {
+                    denied_by,
+                    denied_at_ms,
+                    reason_code,
+                }
+            }),
+        (0i64..9_999_999_999i64, "[a-z_.]{3,20}").prop_map(|(expired_at_ms, reason_code)| {
+            ApprovalState::Expired {
+                expired_at_ms,
+                reason_code,
+            }
+        }),
+    ]
+}
+
+fn arb_outcome() -> impl Strategy<Value = Outcome> {
+    prop_oneof![
+        ("[a-z_.]{3,20}", 0i64..9_999_999_999i64).prop_map(|(reason_code, completed_at_ms)| {
+            Outcome::Success {
+                reason_code,
+                completed_at_ms,
+            }
+        }),
+        (
+            "[a-z_.]{3,20}",
+            "[a-z_.]{3,20}",
+            0i64..9_999_999_999i64,
+        )
+            .prop_map(|(reason_code, error_code, completed_at_ms)| {
+                Outcome::Failed {
+                    reason_code,
+                    error_code,
+                    completed_at_ms,
+                }
+            }),
+        ("[a-z_.]{3,20}", 0i64..9_999_999_999i64).prop_map(|(reason_code, completed_at_ms)| {
+            Outcome::Cancelled {
+                reason_code,
+                completed_at_ms,
+            }
+        }),
+    ]
+}
+
+fn arb_mission_tx_state() -> impl Strategy<Value = MissionTxState> {
+    prop_oneof![
+        Just(MissionTxState::Planned),
+        Just(MissionTxState::Prepared),
+        Just(MissionTxState::Committing),
+        Just(MissionTxState::Committed),
+        Just(MissionTxState::Failed),
+        Just(MissionTxState::Compensating),
+        Just(MissionTxState::Compensated),
+    ]
+}
+
+fn arb_mission_kill_switch_level() -> impl Strategy<Value = MissionKillSwitchLevel> {
+    prop_oneof![
+        Just(MissionKillSwitchLevel::Off),
+        Just(MissionKillSwitchLevel::SafeMode),
+        Just(MissionKillSwitchLevel::HardStop),
+    ]
+}
+
+fn arb_tx_outcome() -> impl Strategy<Value = TxOutcome> {
+    prop_oneof![
+        Just(TxOutcome::Pending),
+        Just(TxOutcome::Committed),
+        Just(TxOutcome::Failed),
+        Just(TxOutcome::Compensated),
+    ]
+}
+
+fn arb_tx_prepare_outcome() -> impl Strategy<Value = TxPrepareOutcome> {
+    prop_oneof![
+        Just(TxPrepareOutcome::AllReady),
+        Just(TxPrepareOutcome::Denied),
+        Just(TxPrepareOutcome::Deferred),
+    ]
+}
+
+fn arb_tx_commit_outcome() -> impl Strategy<Value = TxCommitOutcome> {
+    prop_oneof![
+        Just(TxCommitOutcome::FullyCommitted),
+        Just(TxCommitOutcome::PartialFailure),
+        Just(TxCommitOutcome::ImmediateFailure),
+        Just(TxCommitOutcome::KillSwitchBlocked),
+        Just(TxCommitOutcome::PauseSuspended),
+    ]
+}
+
+fn arb_tx_commit_step_outcome() -> impl Strategy<Value = TxCommitStepOutcome> {
+    prop_oneof![
+        "[a-z_.]{3,20}".prop_map(|reason_code| TxCommitStepOutcome::Committed { reason_code }),
+        "[a-z_.]{3,20}".prop_map(|reason_code| TxCommitStepOutcome::Failed { reason_code }),
+        "[a-z_.]{3,20}".prop_map(|reason_code| TxCommitStepOutcome::Skipped { reason_code }),
+    ]
+}
+
+fn arb_tx_compensation_outcome() -> impl Strategy<Value = TxCompensationOutcome> {
+    prop_oneof![
+        Just(TxCompensationOutcome::FullyRolledBack),
+        Just(TxCompensationOutcome::CompensationFailed),
+        Just(TxCompensationOutcome::NothingToCompensate),
+    ]
+}
+
+fn arb_tx_precondition() -> impl Strategy<Value = TxPrecondition> {
+    prop_oneof![
+        (0u64..10_000).prop_map(|pane_id| TxPrecondition::PromptActive { pane_id }),
+        "[a-z_.]{3,30}".prop_map(|check| TxPrecondition::Custom { check }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    // ── ApprovalState serde roundtrip ────────────────────────────────────
+
+    #[test]
+    fn approval_state_serde_roundtrip(val in arb_approval_state()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: ApprovalState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val, back);
+    }
+
+    #[test]
+    fn approval_state_serializes_with_state_tag(val in arb_approval_state()) {
+        let json = serde_json::to_string(&val).unwrap();
+        prop_assert!(json.contains("\"state\":"));
+    }
+
+    #[test]
+    fn approval_state_canonical_nonempty(val in arb_approval_state()) {
+        let s = val.canonical_string();
+        prop_assert!(!s.is_empty());
+    }
+
+    // ── Outcome serde roundtrip ──────────────────────────────────────────
+
+    #[test]
+    fn outcome_serde_roundtrip(val in arb_outcome()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: Outcome = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val, back);
+    }
+
+    #[test]
+    fn outcome_serializes_with_kind_tag(val in arb_outcome()) {
+        let json = serde_json::to_string(&val).unwrap();
+        prop_assert!(json.contains("\"kind\":"));
+    }
+
+    #[test]
+    fn outcome_canonical_nonempty(val in arb_outcome()) {
+        let s = val.canonical_string();
+        prop_assert!(!s.is_empty());
+    }
+
+    // ── MissionTxState serde roundtrip ────────────────────────────────────
+
+    #[test]
+    fn mission_tx_state_serde_roundtrip(state in arb_mission_tx_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let back: MissionTxState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(state, back);
+    }
+
+    #[test]
+    fn mission_tx_state_display_nonempty(state in arb_mission_tx_state()) {
+        let s = state.to_string();
+        prop_assert!(!s.is_empty());
+    }
+
+    // ── MissionKillSwitchLevel serde roundtrip ────────────────────────────
+
+    #[test]
+    fn kill_switch_level_serde_roundtrip(level in arb_mission_kill_switch_level()) {
+        let json = serde_json::to_string(&level).unwrap();
+        let back: MissionKillSwitchLevel = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(level, back);
+    }
+
+    // ── TxOutcome serde roundtrip ─────────────────────────────────────────
+
+    #[test]
+    fn tx_outcome_serde_roundtrip(val in arb_tx_outcome()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxOutcome = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val, back);
+    }
+
+    // ── TxPrepareOutcome serde roundtrip + commit_eligible ────────────────
+
+    #[test]
+    fn tx_prepare_outcome_serde_roundtrip(val in arb_tx_prepare_outcome()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxPrepareOutcome = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val, back);
+    }
+
+    #[test]
+    fn tx_prepare_only_all_ready_is_commit_eligible(val in arb_tx_prepare_outcome()) {
+        let expected = matches!(val, TxPrepareOutcome::AllReady);
+        prop_assert_eq!(val.commit_eligible(), expected);
+    }
+
+    // ── TxCommitOutcome serde roundtrip + target_tx_state ─────────────────
+
+    #[test]
+    fn tx_commit_outcome_serde_roundtrip(val in arb_tx_commit_outcome()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxCommitOutcome = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val, back);
+    }
+
+    #[test]
+    fn tx_commit_outcome_target_state_correct(val in arb_tx_commit_outcome()) {
+        let target = val.target_tx_state();
+        match val {
+            TxCommitOutcome::FullyCommitted => {
+                let check = matches!(target, MissionTxState::Committed);
+                prop_assert!(check);
+            }
+            _ => {
+                let check = matches!(target, MissionTxState::Failed | MissionTxState::Committing);
+                prop_assert!(check);
+            }
+        }
+    }
+
+    // ── TxCommitStepOutcome serde roundtrip + is_committed ────────────────
+
+    #[test]
+    fn tx_commit_step_outcome_serde_roundtrip(val in arb_tx_commit_step_outcome()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxCommitStepOutcome = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn tx_commit_step_outcome_is_committed_correct(val in arb_tx_commit_step_outcome()) {
+        let expected = matches!(val, TxCommitStepOutcome::Committed { .. });
+        prop_assert_eq!(val.is_committed(), expected);
+    }
+
+    // ── TxCompensationOutcome serde roundtrip + target_tx_state ───────────
+
+    #[test]
+    fn tx_compensation_outcome_serde_roundtrip(val in arb_tx_compensation_outcome()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxCompensationOutcome = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val, back);
+    }
+
+    #[test]
+    fn tx_compensation_outcome_target_state_correct(val in arb_tx_compensation_outcome()) {
+        let target = val.target_tx_state();
+        match val {
+            TxCompensationOutcome::FullyRolledBack => {
+                let check = matches!(target, MissionTxState::Compensated);
+                prop_assert!(check);
+            }
+            TxCompensationOutcome::CompensationFailed => {
+                let check = matches!(target, MissionTxState::Failed);
+                prop_assert!(check);
+            }
+            TxCompensationOutcome::NothingToCompensate => {
+                let check = matches!(target, MissionTxState::Compensated);
+                prop_assert!(check);
+            }
+        }
+    }
+
+    // ── TxPrecondition serde roundtrip ────────────────────────────────────
+
+    #[test]
+    fn tx_precondition_serde_roundtrip(val in arb_tx_precondition()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxPrecondition = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(json, json2);
+    }
+}

@@ -6,7 +6,10 @@
 use proptest::prelude::*;
 
 use frankenterm_core::byte_compression::ByteCompressor;
-use frankenterm_core::scan_pipeline::{ChunkedPipelineState, ScanPipeline, ScanPipelineConfig};
+use frankenterm_core::scan_pipeline::{
+    ChunkedPipelineState, CompressionLevelConfig, ScanMetricsSummary, ScanPipeline,
+    ScanPipelineConfig,
+};
 
 // =============================================================================
 // Strategies
@@ -401,5 +404,77 @@ proptest! {
         let json = serde_json::to_string(&config).unwrap();
         let rt: ScanPipelineConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(rt.compression_threshold, threshold);
+    }
+}
+
+// =============================================================================
+// CompressionLevelConfig and ScanMetricsSummary coverage
+// =============================================================================
+
+fn arb_compression_level_config() -> impl Strategy<Value = CompressionLevelConfig> {
+    prop_oneof![
+        Just(CompressionLevelConfig::Fast),
+        Just(CompressionLevelConfig::Default),
+        Just(CompressionLevelConfig::High),
+        Just(CompressionLevelConfig::Maximum),
+    ]
+}
+
+fn arb_scan_metrics_summary() -> impl Strategy<Value = ScanMetricsSummary> {
+    (0usize..10_000, 0usize..10_000, 0usize..10_000, 0.0f64..=1.0f64).prop_map(
+        |(newline_count, ansi_byte_count, logical_lines, ansi_density)| ScanMetricsSummary {
+            newline_count,
+            ansi_byte_count,
+            logical_lines,
+            ansi_density,
+        },
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// CompressionLevelConfig survives JSON roundtrip.
+    #[test]
+    fn compression_level_config_serde_roundtrip(val in arb_compression_level_config()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: CompressionLevelConfig = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(json, json2);
+    }
+
+    /// CompressionLevelConfig serializes to snake_case string.
+    #[test]
+    fn compression_level_config_snake_case_tag(val in arb_compression_level_config()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let valid_tags = ["\"fast\"", "\"default\"", "\"high\"", "\"maximum\""];
+        let is_valid = valid_tags.iter().any(|t| json == *t);
+        prop_assert!(is_valid, "Unexpected JSON: {}", json);
+    }
+
+    /// ScanMetricsSummary survives JSON roundtrip.
+    #[test]
+    fn scan_metrics_summary_serde_roundtrip(val in arb_scan_metrics_summary()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: ScanMetricsSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val.newline_count, back.newline_count);
+        prop_assert_eq!(val.ansi_byte_count, back.ansi_byte_count);
+        prop_assert_eq!(val.logical_lines, back.logical_lines);
+        prop_assert!((val.ansi_density - back.ansi_density).abs() < 1e-10);
+    }
+
+    /// ScanMetricsSummary density is in [0, 1] range.
+    #[test]
+    fn scan_metrics_summary_density_bounded(val in arb_scan_metrics_summary()) {
+        prop_assert!(val.ansi_density >= 0.0);
+        prop_assert!(val.ansi_density <= 1.0);
+    }
+
+    /// CompressionLevelConfig converts to ByteCompressor level.
+    #[test]
+    fn compression_level_config_converts_to_level(val in arb_compression_level_config()) {
+        let level: frankenterm_core::byte_compression::CompressionLevel = val.into();
+        // Just verify conversion doesn't panic
+        let _ = format!("{level:?}");
     }
 }
