@@ -4,9 +4,10 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 
 use frankenterm_core::runtime_health::{
-    CheckStatus, HealthCheckData, HealthCheckRegistry, IncidentEnrichment, IncidentEnrichmentData,
-    RemediationEffort, RemediationHint, RuntimeHealthCheck, check_failure_patterns,
-    check_scope_health, check_telemetry_log, check_tier_distribution,
+    ActiveFailure, CheckStatus, HealthCheckData, HealthCheckItem, HealthCheckRegistry,
+    HealthSummary, IncidentEnrichment, IncidentEnrichmentData, RemediationEffort, RemediationHint,
+    RemediationItem, RuntimeHealthCheck, StatusCounts, check_failure_patterns, check_scope_health,
+    check_telemetry_log, check_tier_distribution,
 };
 use frankenterm_core::runtime_telemetry::{
     FailureClass, HealthTier, RuntimePhase, RuntimeTelemetryEventBuilder, RuntimeTelemetryKind,
@@ -383,5 +384,211 @@ proptest! {
         let report = reg.build_report();
         let summary = report.format_summary();
         prop_assert!(!summary.is_empty());
+    }
+}
+
+// =============================================================================
+// Additional type-level property tests
+// =============================================================================
+
+fn arb_failure_class() -> impl Strategy<Value = FailureClass> {
+    prop_oneof![
+        Just(FailureClass::Transient),
+        Just(FailureClass::Permanent),
+        Just(FailureClass::Degraded),
+        Just(FailureClass::Overload),
+        Just(FailureClass::Corruption),
+        Just(FailureClass::Timeout),
+        Just(FailureClass::Panic),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    // ── RemediationEffort serde ──
+
+    #[test]
+    fn remediation_effort_serde_roundtrip(effort in arb_remediation_effort()) {
+        let json = serde_json::to_string(&effort).unwrap();
+        let back: RemediationEffort = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, effort);
+        // snake_case
+        prop_assert!(json.starts_with('"') && json.ends_with('"'));
+    }
+
+    // ── StatusCounts serde + total ──
+
+    #[test]
+    fn status_counts_serde_and_total(
+        pass in 0_u32..100,
+        warn in 0_u32..100,
+        fail in 0_u32..100,
+        skip in 0_u32..100,
+    ) {
+        let counts = StatusCounts { pass, warn, fail, skip };
+        let json = serde_json::to_string(&counts).unwrap();
+        let back: StatusCounts = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pass, counts.pass);
+        prop_assert_eq!(back.warn, counts.warn);
+        prop_assert_eq!(back.fail, counts.fail);
+        prop_assert_eq!(back.skip, counts.skip);
+        prop_assert_eq!(counts.total(), pass + warn + fail + skip);
+    }
+
+    #[test]
+    fn status_counts_default(_dummy in 0..1_u32) {
+        let d = StatusCounts::default();
+        prop_assert_eq!(d.pass, 0);
+        prop_assert_eq!(d.warn, 0);
+        prop_assert_eq!(d.fail, 0);
+        prop_assert_eq!(d.skip, 0);
+        prop_assert_eq!(d.total(), 0);
+    }
+
+    // ── ActiveFailure serde ──
+
+    #[test]
+    fn active_failure_serde(
+        component in "[a-z_]{3,15}",
+        failure_class in arb_failure_class(),
+        started_ms in 0_u64..u64::MAX / 2,
+        occurrence_count in 0_u64..1000,
+        has_error in proptest::bool::ANY,
+    ) {
+        let af = ActiveFailure {
+            component: component.clone(),
+            failure_class,
+            started_ms,
+            occurrence_count,
+            last_error: if has_error { Some("test error".to_string()) } else { None },
+        };
+        let json = serde_json::to_string(&af).unwrap();
+        let back: ActiveFailure = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.component, &af.component);
+        prop_assert_eq!(back.failure_class, af.failure_class);
+        prop_assert_eq!(back.started_ms, af.started_ms);
+        prop_assert_eq!(back.occurrence_count, af.occurrence_count);
+        // last_error: None is skipped in serialization → deserialization gives None
+        prop_assert_eq!(back.last_error, af.last_error);
+    }
+
+    // ── HealthCheckItem serde ──
+
+    #[test]
+    fn health_check_item_serde(
+        check_id in "[a-z_]{3,10}",
+        name in "[a-zA-Z ]{3,20}",
+        status in prop_oneof![Just("pass"), Just("warn"), Just("fail"), Just("skip")],
+        evidence_count in 0_usize..3,
+    ) {
+        let evidence: Vec<String> = (0..evidence_count).map(|i| format!("ev_{i}")).collect();
+        let item = HealthCheckItem {
+            check_id: check_id.clone(),
+            name: name.clone(),
+            status: status.to_string(),
+            tier: "green".to_string(),
+            summary: "test summary".to_string(),
+            evidence: evidence.clone(),
+            remediation: vec![],
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let back: HealthCheckItem = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.check_id, &item.check_id);
+        prop_assert_eq!(&back.name, &item.name);
+        prop_assert_eq!(&back.status, &item.status);
+        prop_assert_eq!(back.evidence.len(), item.evidence.len());
+    }
+
+    // ── RemediationItem serde ──
+
+    #[test]
+    fn remediation_item_serde(
+        description in "[a-zA-Z ]{5,30}",
+        has_command in proptest::bool::ANY,
+        effort in prop_oneof![Just("low"), Just("medium"), Just("high")],
+    ) {
+        let item = RemediationItem {
+            description: description.clone(),
+            command: if has_command { Some("ft doctor --fix".to_string()) } else { None },
+            effort: effort.to_string(),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let back: RemediationItem = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.description, &item.description);
+        prop_assert_eq!(back.command, item.command);
+        prop_assert_eq!(&back.effort, &item.effort);
+    }
+
+    // ── HealthSummary serde ──
+
+    #[test]
+    fn health_summary_serde(
+        total in 0_u32..100,
+        pass in 0_u32..100,
+        warn in 0_u32..100,
+        fail in 0_u32..100,
+        skip in 0_u32..100,
+    ) {
+        let summary = HealthSummary { total, pass, warn, fail, skip };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: HealthSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total, summary.total);
+        prop_assert_eq!(back.pass, summary.pass);
+        prop_assert_eq!(back.warn, summary.warn);
+        prop_assert_eq!(back.fail, summary.fail);
+        prop_assert_eq!(back.skip, summary.skip);
+    }
+
+    // ── IncidentEnrichmentData serde ──
+
+    #[test]
+    fn incident_enrichment_data_serde(
+        schema_version in 1_u32..10,
+        recent_events in 0_usize..100,
+        active_failures in 0_usize..20,
+        has_report in proptest::bool::ANY,
+    ) {
+        let data = IncidentEnrichmentData {
+            schema_version,
+            health_tier: "green".to_string(),
+            phase: "running".to_string(),
+            recent_event_count: recent_events,
+            recent_record_count: recent_events,
+            tier_transition_count: 0,
+            active_failure_count: active_failures,
+            scope_state_count: 0,
+            has_doctor_report: has_report,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: IncidentEnrichmentData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.schema_version, data.schema_version);
+        prop_assert_eq!(&back.health_tier, &data.health_tier);
+        prop_assert_eq!(back.recent_event_count, data.recent_event_count);
+        prop_assert_eq!(back.active_failure_count, data.active_failure_count);
+        prop_assert_eq!(back.has_doctor_report, data.has_doctor_report);
+    }
+
+    // ── RemediationHint with command and doc_link ──
+
+    #[test]
+    fn remediation_hint_with_command_serde(
+        description in "[a-zA-Z ]{5,30}",
+        command in "[a-z \\-]{5,20}",
+    ) {
+        let hint = RemediationHint::with_command(&description, &command);
+        let json = serde_json::to_string(&hint).unwrap();
+        let back: RemediationHint = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.description, &description);
+        prop_assert_eq!(back.command.as_deref(), Some(command.as_str()));
+        prop_assert_eq!(back.effort, RemediationEffort::Low);
+    }
+
+    // ── CheckStatus Display ──
+
+    #[test]
+    fn check_status_display_not_empty(status in arb_check_status()) {
+        let display = status.to_string();
+        prop_assert!(!display.is_empty());
     }
 }
