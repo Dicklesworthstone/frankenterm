@@ -3,11 +3,21 @@
 //! Covers serde roundtrips and behaviour for `CorrelationType`, `MetricType`,
 //! `NotificationStatus`, `DatabasePageStats` (with `free_ratio()`),
 //! `CheckpointResult`, `Gap`, `EventAnnotations`, `EventMuteRecord`,
-//! `FtsIndexState`, `FtsPaneProgress`, and `FtsSyncResult`.
+//! `FtsIndexState`, `FtsPaneProgress`, `FtsSyncResult`,
+//! `MigrationStage`, `MigrationRollbackClass`, `MigrationRollbackTrigger`,
+//! `MigrationInvariantSummary`, `MigrationRollbackClassifierConfig`,
+//! `MigrationRollbackDecision`, `Segment`, `SemanticSearchHit`,
+//! `PaneIndexingStats`, `EmbeddingStats`, `IndexingHealthReport`,
+//! and `classify_migration_rollback_trigger`.
 
 use frankenterm_core::storage::{
-    CheckpointResult, CorrelationType, DatabasePageStats, EventAnnotations, EventMuteRecord,
-    FtsIndexState, FtsPaneProgress, FtsSyncResult, Gap, MetricType, NotificationStatus,
+    CheckpointResult, CorrelationType, DatabasePageStats, EmbeddingStats, EventAnnotations,
+    EventMuteRecord, FtsIndexState, FtsPaneProgress, FtsSyncResult, Gap,
+    IndexingHealthReport, MetricType, MigrationInvariantSummary, MigrationRollbackClass,
+    MigrationRollbackClassifierConfig, MigrationRollbackClassifierInput,
+    MigrationRollbackDecision, MigrationRollbackTrigger, MigrationStage,
+    NotificationStatus, PaneIndexingStats, Segment, SemanticSearchHit,
+    classify_migration_rollback_trigger,
 };
 use proptest::prelude::*;
 
@@ -591,5 +601,452 @@ proptest! {
         let back: FtsPaneProgress = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.pane_id, pane_id);
         prop_assert_eq!(back.indexed_count, indexed);
+    }
+}
+
+// =========================================================================
+// Migration + search type strategies
+// =========================================================================
+
+fn arb_migration_stage() -> impl Strategy<Value = MigrationStage> {
+    prop_oneof![
+        Just(MigrationStage::Preflight),
+        Just(MigrationStage::Export),
+        Just(MigrationStage::Import),
+        Just(MigrationStage::CheckpointSync),
+        Just(MigrationStage::ProjectionRebuild),
+        Just(MigrationStage::Activate),
+        Just(MigrationStage::Soak),
+    ]
+}
+
+fn arb_rollback_class() -> impl Strategy<Value = MigrationRollbackClass> {
+    prop_oneof![
+        Just(MigrationRollbackClass::Immediate),
+        Just(MigrationRollbackClass::PostCutover),
+        Just(MigrationRollbackClass::DataIntegrityEmergency),
+    ]
+}
+
+fn arb_rollback_trigger() -> impl Strategy<Value = MigrationRollbackTrigger> {
+    prop_oneof![
+        Just(MigrationRollbackTrigger::ImportDigestMismatch),
+        Just(MigrationRollbackTrigger::EventCardinalityMismatch),
+        Just(MigrationRollbackTrigger::CheckpointRegression),
+        Just(MigrationRollbackTrigger::CorruptImport),
+        Just(MigrationRollbackTrigger::InvariantErrors),
+        Just(MigrationRollbackTrigger::InvariantCritical),
+        Just(MigrationRollbackTrigger::SustainedSloBreach),
+        Just(MigrationRollbackTrigger::SloAppendP95Breached),
+        Just(MigrationRollbackTrigger::SloFlushP95Breached),
+        Just(MigrationRollbackTrigger::HealthTierBlack),
+        Just(MigrationRollbackTrigger::ProjectionLagBreach),
+        Just(MigrationRollbackTrigger::RepeatedWriteFailures),
+        Just(MigrationRollbackTrigger::RepeatedIndexFailures),
+        Just(MigrationRollbackTrigger::PolicyAuditRegression),
+        Just(MigrationRollbackTrigger::CanonicalDataLossConfirmed),
+        Just(MigrationRollbackTrigger::CanonicalCorruptionSuspected),
+    ]
+}
+
+// =========================================================================
+// MigrationStage — serde + as_str + Default
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_migration_stage_serde_and_as_str(stage in arb_migration_stage()) {
+        // Serde roundtrip
+        let json = serde_json::to_string(&stage).unwrap();
+        let back: MigrationStage = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, stage);
+
+        // as_str matches snake_case serde encoding
+        let expected_json = format!("\"{}\"", stage.as_str());
+        prop_assert_eq!(json, expected_json);
+    }
+
+    #[test]
+    fn prop_migration_stage_default(_dummy in 0..1_u32) {
+        let default = MigrationStage::default();
+        prop_assert_eq!(default, MigrationStage::Preflight);
+    }
+}
+
+// =========================================================================
+// MigrationRollbackClass — serde + as_str
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_rollback_class_serde_and_as_str(class in arb_rollback_class()) {
+        let json = serde_json::to_string(&class).unwrap();
+        let back: MigrationRollbackClass = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, class);
+
+        let expected_json = format!("\"{}\"", class.as_str());
+        prop_assert_eq!(json, expected_json);
+    }
+}
+
+// =========================================================================
+// MigrationRollbackTrigger — serde + as_str (16 variants)
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_rollback_trigger_serde_and_as_str(trigger in arb_rollback_trigger()) {
+        let json = serde_json::to_string(&trigger).unwrap();
+        let back: MigrationRollbackTrigger = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, trigger);
+
+        let expected_json = format!("\"{}\"", trigger.as_str());
+        prop_assert_eq!(json, expected_json);
+    }
+}
+
+// =========================================================================
+// MigrationInvariantSummary — serde + Default + has_breakage
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_invariant_summary_serde(
+        warning_count in 0_usize..100,
+        error_count in 0_usize..100,
+        critical_count in 0_usize..100,
+    ) {
+        let summary = MigrationInvariantSummary {
+            warning_count,
+            error_count,
+            critical_count,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: MigrationInvariantSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, summary);
+    }
+
+    #[test]
+    fn prop_invariant_summary_default(_dummy in 0..1_u32) {
+        let d = MigrationInvariantSummary::default();
+        prop_assert_eq!(d.warning_count, 0);
+        prop_assert_eq!(d.error_count, 0);
+        prop_assert_eq!(d.critical_count, 0);
+        prop_assert!(!d.has_breakage());
+    }
+
+    #[test]
+    fn prop_invariant_summary_has_breakage(
+        errors in 0_usize..10,
+        criticals in 0_usize..10,
+    ) {
+        let summary = MigrationInvariantSummary {
+            warning_count: 5,
+            error_count: errors,
+            critical_count: criticals,
+        };
+        let expected = errors > 0 || criticals > 0;
+        prop_assert_eq!(summary.has_breakage(), expected);
+    }
+}
+
+// =========================================================================
+// MigrationRollbackClassifierConfig — serde + Default
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_classifier_config_serde(
+        slo_windows in 1_u32..10,
+        write_threshold in 1_u32..10,
+        index_threshold in 1_u32..10,
+    ) {
+        let config = MigrationRollbackClassifierConfig {
+            sustained_slo_windows: slo_windows,
+            repeated_write_failure_threshold: write_threshold,
+            repeated_index_failure_threshold: index_threshold,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: MigrationRollbackClassifierConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, config);
+    }
+
+    #[test]
+    fn prop_classifier_config_default(_dummy in 0..1_u32) {
+        let d = MigrationRollbackClassifierConfig::default();
+        prop_assert_eq!(d.sustained_slo_windows, 3);
+        prop_assert_eq!(d.repeated_write_failure_threshold, 3);
+        prop_assert_eq!(d.repeated_index_failure_threshold, 3);
+    }
+}
+
+// =========================================================================
+// MigrationRollbackDecision — serde
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_rollback_decision_serde(
+        should_rollback in proptest::bool::ANY,
+        has_class in proptest::bool::ANY,
+        class in arb_rollback_class(),
+        stage in arb_migration_stage(),
+        trigger_count in 0_usize..4,
+    ) {
+        let triggers: Vec<MigrationRollbackTrigger> = (0..trigger_count)
+            .map(|i| match i % 3 {
+                0 => MigrationRollbackTrigger::CorruptImport,
+                1 => MigrationRollbackTrigger::InvariantErrors,
+                _ => MigrationRollbackTrigger::HealthTierBlack,
+            })
+            .collect();
+        let decision = MigrationRollbackDecision {
+            should_rollback,
+            rollback_class: if has_class { Some(class) } else { None },
+            triggers,
+            stage,
+            rationale: "test rationale".to_string(),
+        };
+        let json = serde_json::to_string(&decision).unwrap();
+        let back: MigrationRollbackDecision = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.should_rollback, decision.should_rollback);
+        prop_assert_eq!(back.rollback_class, decision.rollback_class);
+        prop_assert_eq!(back.triggers.len(), decision.triggers.len());
+        prop_assert_eq!(back.stage, decision.stage);
+        prop_assert_eq!(back.rationale, decision.rationale);
+    }
+}
+
+// =========================================================================
+// Segment — serde roundtrip
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_segment_serde(
+        id in 0_i64..100_000,
+        pane_id in 0_u64..100,
+        seq in 0_u64..100_000,
+        content in "[a-zA-Z0-9 ]{1,50}",
+        has_hash in proptest::bool::ANY,
+        captured_at in 1_000_000_000_000_i64..2_000_000_000_000,
+    ) {
+        let content_len = content.len();
+        let segment = Segment {
+            id,
+            pane_id,
+            seq,
+            content: content.clone(),
+            content_len,
+            content_hash: if has_hash { Some("abc123".to_string()) } else { None },
+            captured_at,
+        };
+        let json = serde_json::to_string(&segment).unwrap();
+        let back: Segment = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.id, segment.id);
+        prop_assert_eq!(back.pane_id, segment.pane_id);
+        prop_assert_eq!(back.seq, segment.seq);
+        prop_assert_eq!(&back.content, &segment.content);
+        prop_assert_eq!(back.content_len, segment.content_len);
+        prop_assert_eq!(back.content_hash, segment.content_hash);
+        prop_assert_eq!(back.captured_at, segment.captured_at);
+    }
+}
+
+// =========================================================================
+// SemanticSearchHit — serde roundtrip
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_semantic_search_hit_serde(
+        segment_id in 0_i64..100_000,
+        score in -1.0_f64..1.0,
+    ) {
+        let hit = SemanticSearchHit { segment_id, score };
+        let json = serde_json::to_string(&hit).unwrap();
+        let back: SemanticSearchHit = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.segment_id, hit.segment_id);
+        prop_assert!((back.score - hit.score).abs() < 1e-10);
+    }
+}
+
+// =========================================================================
+// PaneIndexingStats — serde + fts_consistent invariant
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_pane_indexing_stats_serde(
+        pane_id in 0_u64..100,
+        segment_count in 0_u64..10_000,
+        total_bytes in 0_u64..1_000_000,
+        has_max_seq in proptest::bool::ANY,
+        max_seq_val in 0_u64..100_000,
+        fts_row_count in 0_u64..10_000,
+    ) {
+        let fts_consistent = segment_count == fts_row_count;
+        let stats = PaneIndexingStats {
+            pane_id,
+            segment_count,
+            total_bytes,
+            max_seq: if has_max_seq { Some(max_seq_val) } else { None },
+            last_segment_at: Some(1_700_000_000_000),
+            fts_row_count,
+            fts_consistent,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: PaneIndexingStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, stats.pane_id);
+        prop_assert_eq!(back.segment_count, stats.segment_count);
+        prop_assert_eq!(back.fts_row_count, stats.fts_row_count);
+        prop_assert_eq!(back.fts_consistent, stats.fts_consistent);
+    }
+}
+
+// =========================================================================
+// EmbeddingStats — serde roundtrip
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_embedding_stats_serde(
+        embedder_id in "[a-z_]{3,15}",
+        dimension in 64_i32..2048,
+        count in 0_i64..100_000,
+        earliest_at in 1_000_000_000_i64..1_700_000_000,
+        latest_at in 1_700_000_000_i64..2_000_000_000,
+    ) {
+        let stats = EmbeddingStats {
+            embedder_id: embedder_id.clone(),
+            dimension,
+            count,
+            earliest_at,
+            latest_at,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: EmbeddingStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.embedder_id, &stats.embedder_id);
+        prop_assert_eq!(back.dimension, stats.dimension);
+        prop_assert_eq!(back.count, stats.count);
+        prop_assert_eq!(back.earliest_at, stats.earliest_at);
+        prop_assert_eq!(back.latest_at, stats.latest_at);
+    }
+}
+
+// =========================================================================
+// IndexingHealthReport — serde roundtrip
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_indexing_health_report_serde(
+        pane_count in 0_usize..5,
+        total_segments in 0_u64..10_000,
+        total_bytes in 0_u64..1_000_000,
+        healthy in proptest::bool::ANY,
+    ) {
+        let panes: Vec<PaneIndexingStats> = (0..pane_count).map(|i| PaneIndexingStats {
+            pane_id: i as u64,
+            segment_count: 10,
+            total_bytes: 1000,
+            max_seq: Some(10),
+            last_segment_at: Some(1_700_000_000_000),
+            fts_row_count: 10,
+            fts_consistent: true,
+        }).collect();
+        let report = IndexingHealthReport {
+            panes,
+            total_segments,
+            total_bytes,
+            total_fts_rows: total_segments,
+            inconsistent_panes: 0,
+            healthy,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: IndexingHealthReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.panes.len(), report.panes.len());
+        prop_assert_eq!(back.total_segments, report.total_segments);
+        prop_assert_eq!(back.healthy, report.healthy);
+    }
+}
+
+// =========================================================================
+// classify_migration_rollback_trigger — no rollback on clean input
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_classifier_clean_input_no_rollback(stage in arb_migration_stage()) {
+        let mut input = MigrationRollbackClassifierInput::default();
+        input.stage = stage;
+        // All signals are clean/false
+        let decision = classify_migration_rollback_trigger(&input);
+        prop_assert!(!decision.should_rollback);
+        prop_assert!(decision.rollback_class.is_none());
+        prop_assert!(decision.triggers.is_empty());
+        prop_assert_eq!(decision.stage, stage);
+    }
+
+    #[test]
+    fn prop_classifier_data_loss_triggers_emergency(_dummy in 0..1_u32) {
+        let mut input = MigrationRollbackClassifierInput::default();
+        input.confirmed_canonical_data_loss = true;
+        let decision = classify_migration_rollback_trigger(&input);
+        prop_assert!(decision.should_rollback);
+        let is_emergency = decision.rollback_class == Some(MigrationRollbackClass::DataIntegrityEmergency);
+        prop_assert!(is_emergency);
+        let has_trigger = decision.triggers.contains(&MigrationRollbackTrigger::CanonicalDataLossConfirmed);
+        prop_assert!(has_trigger);
+    }
+
+    #[test]
+    fn prop_classifier_corrupt_import_triggers_immediate(_dummy in 0..1_u32) {
+        let mut input = MigrationRollbackClassifierInput::default();
+        input.corrupt_import = true;
+        let decision = classify_migration_rollback_trigger(&input);
+        prop_assert!(decision.should_rollback);
+        let has_trigger = decision.triggers.contains(&MigrationRollbackTrigger::CorruptImport);
+        prop_assert!(has_trigger);
+    }
+
+    #[test]
+    fn prop_classifier_invariant_errors_trigger(
+        errors in 1_usize..10,
+    ) {
+        let mut input = MigrationRollbackClassifierInput::default();
+        input.invariants = Some(MigrationInvariantSummary {
+            warning_count: 0,
+            error_count: errors,
+            critical_count: 0,
+        });
+        let decision = classify_migration_rollback_trigger(&input);
+        prop_assert!(decision.should_rollback);
+        let has_trigger = decision.triggers.contains(&MigrationRollbackTrigger::InvariantErrors);
+        prop_assert!(has_trigger);
     }
 }
