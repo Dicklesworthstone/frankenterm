@@ -579,17 +579,18 @@ proptest! {
         prop_assert_eq!(orig_norm, rest_norm);
     }
 
-    // ── 23. all-false matrix: num_rows==0, no solutions ──────────
+    // ── 23. all-false matrix: rows reserved, no solutions ────────
 
     #[test]
     fn from_matrix_all_false_no_solutions(n_rows in 1usize..6, n_cols in 1usize..6) {
         let matrix: Vec<Vec<bool>> = vec![vec![false; n_cols]; n_rows];
         let mut dlx = DancingLinks::from_matrix(&matrix);
 
-        // from_matrix skips all-false rows, so num_rows should be 0
-        prop_assert_eq!(dlx.num_rows(), 0usize, "all-false matrix should have 0 rows added");
+        // from_matrix calls add_row for every row, even all-false ones.
+        // add_row(&[]) reserves a row index, so num_rows == n_rows.
+        prop_assert_eq!(dlx.num_rows(), n_rows, "all-false rows should still reserve indices");
 
-        // With columns but no rows, there is no way to cover any column
+        // With columns but no covering rows, there is no way to cover any column
         let result = dlx.solve();
         prop_assert!(result.is_none(), "all-false matrix with {} cols should have no solution", n_cols);
     }
@@ -611,10 +612,10 @@ proptest! {
         prop_assert_eq!(sol1, sol2, "solve() called twice returned different results");
     }
 
-    // ── 25. add_row(&[]) doesn't increment num_rows ─────────────
+    // ── 25. add_row(&[]) reserves index (no nodes added) ────────
 
     #[test]
-    fn add_row_empty_is_noop(
+    fn add_row_empty_reserves_index(
         num_cols in 1usize..8,
         n_empty in 1usize..5,
         n_real in 0usize..4
@@ -628,12 +629,13 @@ proptest! {
         let rows_before = dlx.num_rows();
         prop_assert_eq!(rows_before, n_real, "real rows mismatch before empty adds");
 
-        // Add empty rows — these should not increment num_rows
+        // Empty rows still reserve their row index (no nodes added though)
         for _ in 0..n_empty {
             dlx.add_row(&[]);
         }
         let rows_after = dlx.num_rows();
-        prop_assert_eq!(rows_after, rows_before, "add_row(&[]) should not change num_rows");
+        prop_assert_eq!(rows_after, rows_before + n_empty,
+            "add_row(&[]) should reserve index, incrementing num_rows");
     }
 }
 
