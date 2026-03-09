@@ -825,3 +825,453 @@ proptest! {
         prop_assert!(is_accept);
     }
 }
+
+// =============================================================================
+// classify_event end-to-end property tests
+// =============================================================================
+
+use frankenterm_core::connector_event_model::{CanonicalConnectorEvent, EventDirection};
+
+fn make_test_event(connector_id: &str, payload: serde_json::Value) -> CanonicalConnectorEvent {
+    CanonicalConnectorEvent {
+        connector_id: connector_id.to_string(),
+        event_type: "test.event".to_string(),
+        event_id: "evt-001".to_string(),
+        correlation_id: "corr-001".to_string(),
+        payload,
+        metadata: std::collections::BTreeMap::new(),
+        ..CanonicalConnectorEvent::new(
+            EventDirection::Inbound,
+            connector_id,
+            "test.event",
+            serde_json::Value::Null,
+        )
+    }
+}
+
+fn setup_classifier_with_default_policy() -> ConnectorDataClassifier {
+    let mut classifier = ConnectorDataClassifier::new(ClassifierConfig::default());
+    classifier.register_policy(ClassificationPolicy::default());
+    classifier
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// classify_event classifies structural fields (event_type, event_id, etc.).
+    #[test]
+    fn classify_event_includes_structural_fields(
+        connector in arb_connector_id(),
+    ) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let event = make_test_event(&connector, serde_json::json!({"status": "ok"}));
+        let classified = classifier.classify_event(&event).unwrap();
+
+        // Should have at least 4 structural fields + payload fields
+        prop_assert!(classified.field_classifications.len() >= 4);
+        // Should include event_type, event_id, connector_id, correlation_id
+        let paths: Vec<&str> = classified.field_classifications.iter().map(|f| f.field_path.as_str()).collect();
+        prop_assert!(paths.contains(&"event_type"), "should classify event_type");
+        prop_assert!(paths.contains(&"event_id"), "should classify event_id");
+        prop_assert!(paths.contains(&"connector_id"), "should classify connector_id");
+        prop_assert!(paths.contains(&"correlation_id"), "should classify correlation_id");
+    }
+
+    /// classify_event overall_sensitivity is max of all field sensitivities.
+    #[test]
+    fn classify_event_overall_is_max_sensitivity(
+        connector in arb_connector_id(),
+    ) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({"safe_field": "hello", "message": "world"});
+        let event = make_test_event(&connector, payload);
+        let classified = classifier.classify_event(&event).unwrap();
+
+        let max_field_sensitivity = classified.field_classifications
+            .iter()
+            .map(|f| f.sensitivity)
+            .max()
+            .unwrap_or(DataSensitivity::Public);
+        prop_assert_eq!(classified.overall_sensitivity, max_field_sensitivity);
+    }
+
+    /// classify_event increments telemetry.events_classified.
+    #[test]
+    fn classify_event_increments_telemetry(n in 1usize..=5) {
+        let mut classifier = setup_classifier_with_default_policy();
+        for i in 0..n {
+            let event = make_test_event("conn-1", serde_json::json!({"step": i}));
+            classifier.classify_event(&event).unwrap();
+        }
+        prop_assert_eq!(classifier.telemetry().events_classified, n as u64);
+    }
+
+    /// classify_event with no matching policy returns NoPolicyFound.
+    #[test]
+    fn classify_event_no_policy_error(connector in arb_connector_id()) {
+        let mut classifier = ConnectorDataClassifier::new(ClassifierConfig::default());
+        // No policy registered
+        let event = make_test_event(&connector, serde_json::json!({}));
+        let result = classifier.classify_event(&event);
+        let is_err = result.is_err();
+        prop_assert!(is_err);
+        let is_no_policy = matches!(result.unwrap_err(), ClassificationError::NoPolicyFound { .. });
+        prop_assert!(is_no_policy);
+    }
+
+    /// classify_event counts fields_classified in telemetry.
+    #[test]
+    fn classify_event_fields_classified_telemetry(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({"field_a": "val_a", "field_b": "val_b"});
+        let event = make_test_event("conn-1", payload);
+        let classified = classifier.classify_event(&event).unwrap();
+
+        let total_fields = classified.field_classifications.len() as u64;
+        prop_assert_eq!(classifier.telemetry().fields_classified, total_fields);
+    }
+
+    /// classify_event with payload containing secret field names classifies them as Prohibited.
+    #[test]
+    fn classify_event_secret_fields_prohibited(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({"password": "super-secret-123", "username": "admin"});
+        let event = make_test_event("conn-1", payload);
+        let classified = classifier.classify_event(&event).unwrap();
+
+        let password_fc = classified.field_classifications.iter()
+            .find(|f| f.field_path == "payload.password");
+        let pw_found = password_fc.is_some();
+        prop_assert!(pw_found, "password field should be classified");
+        prop_assert_eq!(password_fc.unwrap().sensitivity, DataSensitivity::Prohibited);
+    }
+
+    /// classify_event payload truncation detection increments telemetry.
+    #[test]
+    fn classify_event_payload_truncation_detected(_dummy in 0u8..1) {
+        let mut classifier = ConnectorDataClassifier::new(ClassifierConfig::default());
+        let mut policy = ClassificationPolicy::default();
+        policy.max_payload_bytes = 10; // Very small limit
+        classifier.register_policy(policy);
+
+        let payload = serde_json::json!({"big_field": "a very long string that exceeds the tiny limit"});
+        let event = make_test_event("conn-1", payload);
+        classifier.classify_event(&event).unwrap();
+
+        prop_assert_eq!(classifier.telemetry().payload_truncations, 1);
+    }
+
+    /// classify_event with nested JSON classifies nested fields.
+    #[test]
+    fn classify_event_nested_payload(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({
+            "outer": {
+                "password": "nested-secret"
+            }
+        });
+        let event = make_test_event("conn-1", payload);
+        let classified = classifier.classify_event(&event).unwrap();
+
+        // Should have classified the nested password field
+        let has_nested = classified.field_classifications.iter()
+            .any(|f| f.field_path.contains("password"));
+        prop_assert!(has_nested, "should classify nested password field");
+    }
+}
+
+// =============================================================================
+// redact_event property tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// redact_event on all-public fields produces no redaction actions.
+    #[test]
+    fn redact_all_public_no_actions(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({"event_type": "test", "status": "ok"});
+        let event = make_test_event("conn-1", payload);
+        let classified = classifier.classify_event(&event).unwrap();
+
+        // If overall is public, no redaction needed
+        if classified.overall_sensitivity <= DataSensitivity::Internal {
+            let redacted = classifier.redact_event(&event, &classified);
+            prop_assert_eq!(redacted.redaction_actions.len(), 0);
+        }
+    }
+
+    /// redact_event removes prohibited payload fields.
+    #[test]
+    fn redact_removes_prohibited_payload(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({"password": "my-secret", "safe": "hello"});
+        let event = make_test_event("conn-1", payload);
+        let classified = classifier.classify_event(&event).unwrap();
+        let redacted = classifier.redact_event(&event, &classified);
+
+        // password should be removed from the payload
+        let result_payload = &redacted.event.payload;
+        let pw_present = result_payload.get("password").is_some();
+        prop_assert!(!pw_present, "password should be removed from redacted payload");
+        // safe field should remain
+        let safe_present = result_payload.get("safe").is_some();
+        prop_assert!(safe_present, "safe field should remain");
+    }
+
+    /// redact_event creates audit entry.
+    #[test]
+    fn redact_creates_audit_entry(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({"password": "secret123"});
+        let event = make_test_event("conn-1", payload);
+        let classified = classifier.classify_event(&event).unwrap();
+        let _redacted = classifier.redact_event(&event, &classified);
+
+        prop_assert_eq!(classifier.audit_log().len(), 1);
+        let entry = &classifier.audit_log()[0];
+        prop_assert_eq!(&entry.event_id, "evt-001");
+        prop_assert_eq!(&entry.connector_id, "conn-1");
+    }
+
+    /// redact_event telemetry: fields_removed and fields_redacted track actions.
+    #[test]
+    fn redact_telemetry_tracks_actions(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({"password": "secret", "api_key": "key123"});
+        let event = make_test_event("conn-1", payload);
+        let classified = classifier.classify_event(&event).unwrap();
+        let _redacted = classifier.redact_event(&event, &classified);
+
+        // At least some fields should be removed/redacted
+        let total_actions = classifier.telemetry().fields_redacted + classifier.telemetry().fields_removed;
+        prop_assert!(total_actions > 0, "should have tracked redaction actions");
+    }
+
+    /// RedactedEvent.fields_redacted + fields_removed == total redaction_actions.
+    #[test]
+    fn redacted_event_counts_match_actions(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({"password": "s", "api_key": "k", "name": "safe"});
+        let event = make_test_event("conn-1", payload);
+        let classified = classifier.classify_event(&event).unwrap();
+        let redacted = classifier.redact_event(&event, &classified);
+
+        let total = redacted.fields_redacted() + redacted.fields_removed();
+        prop_assert_eq!(total, redacted.redaction_actions.len() as u32);
+    }
+}
+
+// =============================================================================
+// redact_event_with_decision property tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// redact_event_with_decision tracks Accept in telemetry.
+    #[test]
+    fn redact_with_accept_increments_accepted(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({"safe": "value"});
+        let event = make_test_event("conn-1", payload);
+        let classified = classifier.classify_event(&event).unwrap();
+        let _redacted = classifier.redact_event_with_decision(
+            &event, &classified, IngestionDecision::Accept,
+        );
+        prop_assert_eq!(classifier.telemetry().events_accepted, 1);
+    }
+
+    /// redact_event_with_decision tracks AcceptRedacted in telemetry.
+    #[test]
+    fn redact_with_accept_redacted_increments(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({"password": "secret"});
+        let event = make_test_event("conn-1", payload);
+        let classified = classifier.classify_event(&event).unwrap();
+        let _redacted = classifier.redact_event_with_decision(
+            &event, &classified, IngestionDecision::AcceptRedacted,
+        );
+        prop_assert_eq!(classifier.telemetry().events_accepted_redacted, 1);
+    }
+
+    /// redact_event_with_decision tracks Reject in telemetry.
+    #[test]
+    fn redact_with_reject_increments_rejected(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({"data": "test"});
+        let event = make_test_event("conn-1", payload);
+        let classified = classifier.classify_event(&event).unwrap();
+        let _redacted = classifier.redact_event_with_decision(
+            &event, &classified,
+            IngestionDecision::Reject { reason: "test reason".into() },
+        );
+        prop_assert_eq!(classifier.telemetry().events_rejected, 1);
+    }
+
+    /// redact_event_with_decision tracks Quarantine in telemetry.
+    #[test]
+    fn redact_with_quarantine_increments_quarantined(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let payload = serde_json::json!({"data": "test"});
+        let event = make_test_event("conn-1", payload);
+        let classified = classifier.classify_event(&event).unwrap();
+        let _redacted = classifier.redact_event_with_decision(
+            &event, &classified,
+            IngestionDecision::Quarantine { reason: "suspicious".into() },
+        );
+        prop_assert_eq!(classifier.telemetry().events_quarantined, 1);
+    }
+
+    /// Multiple classify+redact cycles keep telemetry consistent.
+    #[test]
+    fn classify_redact_cycle_telemetry(n in 1usize..=6) {
+        let mut classifier = setup_classifier_with_default_policy();
+        for i in 0..n {
+            let payload = serde_json::json!({"step": i, "safe": "data"});
+            let event = make_test_event("conn-1", payload);
+            let classified = classifier.classify_event(&event).unwrap();
+            let _redacted = classifier.redact_event_with_decision(
+                &event, &classified, IngestionDecision::Accept,
+            );
+        }
+        prop_assert_eq!(classifier.telemetry().events_classified, n as u64);
+        prop_assert_eq!(classifier.telemetry().events_accepted, n as u64);
+        prop_assert_eq!(classifier.audit_log().len(), n);
+    }
+}
+
+// =============================================================================
+// Audit log lifecycle property tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(8))]
+
+    /// Audit log is bounded by max_audit_entries config.
+    #[test]
+    fn audit_log_bounded_by_config(max_entries in 5usize..=20) {
+        let config = ClassifierConfig {
+            max_audit_entries: max_entries,
+            ..ClassifierConfig::default()
+        };
+        let mut classifier = ConnectorDataClassifier::new(config);
+        classifier.register_policy(ClassificationPolicy::default());
+
+        // Generate more events than max_entries
+        for i in 0..(max_entries + 10) {
+            let payload = serde_json::json!({"step": i});
+            let event = make_test_event("conn-1", payload);
+            let classified = classifier.classify_event(&event).unwrap();
+            classifier.redact_event_with_decision(
+                &event, &classified, IngestionDecision::Accept,
+            );
+        }
+        prop_assert!(classifier.audit_log().len() <= max_entries);
+    }
+
+    /// audit_log_json serializes without error.
+    #[test]
+    fn audit_log_json_serializes(n in 1usize..=5) {
+        let mut classifier = setup_classifier_with_default_policy();
+        for i in 0..n {
+            let payload = serde_json::json!({"step": i});
+            let event = make_test_event("conn-1", payload);
+            let classified = classifier.classify_event(&event).unwrap();
+            classifier.redact_event(&event, &classified);
+        }
+        let json_result = classifier.audit_log_json();
+        let is_ok = json_result.is_ok();
+        prop_assert!(is_ok, "audit_log_json should serialize successfully");
+        let json_str = json_result.unwrap();
+        prop_assert!(!json_str.is_empty());
+    }
+}
+
+// =============================================================================
+// Metadata field classification and redaction
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// classify_event classifies metadata fields.
+    #[test]
+    fn classify_event_with_metadata(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let mut event = make_test_event("conn-1", serde_json::json!({}));
+        event.metadata.insert("safe_key".to_string(), "safe_value".to_string());
+        event.metadata.insert("password".to_string(), "secret_in_metadata".to_string());
+
+        let classified = classifier.classify_event(&event).unwrap();
+        // Should have metadata.password classified
+        let has_meta_pw = classified.field_classifications.iter()
+            .any(|f| f.field_path == "metadata.password");
+        prop_assert!(has_meta_pw, "should classify metadata.password");
+    }
+
+    /// redact_event redacts metadata fields with sensitive classification.
+    #[test]
+    fn redact_event_redacts_metadata(_dummy in 0u8..1) {
+        let mut classifier = setup_classifier_with_default_policy();
+        let mut event = make_test_event("conn-1", serde_json::json!({}));
+        event.metadata.insert("password".to_string(), "meta_secret".to_string());
+
+        let classified = classifier.classify_event(&event).unwrap();
+        let redacted = classifier.redact_event(&event, &classified);
+
+        // Password should be removed from metadata
+        let pw_in_meta = redacted.event.metadata.get("password");
+        // If classified as Prohibited with Remove strategy, it should be gone
+        let has_pw_action = redacted.redaction_actions.iter()
+            .any(|a| a.field_path == "metadata.password");
+        if has_pw_action {
+            // Either removed or replaced
+            let action = redacted.redaction_actions.iter()
+                .find(|a| a.field_path == "metadata.password").unwrap();
+            if matches!(action.strategy, RedactionStrategy::Remove) {
+                let is_none = pw_in_meta.is_none();
+                prop_assert!(is_none, "removed metadata should not be present");
+            }
+        }
+    }
+}
+
+// =============================================================================
+// ClassificationAuditEntry serde roundtrip
+// =============================================================================
+
+use frankenterm_core::connector_data_classification::ClassificationAuditEntry;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// ClassificationAuditEntry survives serde roundtrip.
+    #[test]
+    fn audit_entry_serde_roundtrip(
+        sensitivity in arb_sensitivity(),
+        secrets in any::<bool>(),
+        fields_r in 0u32..=20,
+        fields_rem in 0u32..=20,
+    ) {
+        let entry = ClassificationAuditEntry {
+            event_id: "e1".to_string(),
+            connector_id: "c1".to_string(),
+            policy_id: "p1".to_string(),
+            sensitivity,
+            decision: IngestionDecision::Accept,
+            fields_redacted: fields_r,
+            fields_removed: fields_rem,
+            secrets_detected: secrets,
+            timestamp_ms: 12345,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: ClassificationAuditEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(entry.event_id, back.event_id);
+        prop_assert_eq!(entry.sensitivity, back.sensitivity);
+        prop_assert_eq!(entry.fields_redacted, back.fields_redacted);
+        prop_assert_eq!(entry.fields_removed, back.fields_removed);
+        prop_assert_eq!(entry.secrets_detected, back.secrets_detected);
+    }
+}
