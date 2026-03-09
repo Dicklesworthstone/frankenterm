@@ -7,7 +7,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use frankenterm_core::build_coord::{BuildCoordConfig, BuildLockMetadata, detect_cargo_command};
+use frankenterm_core::build_coord::{
+    BuildCoordConfig, BuildLockMetadata, command_uses_rch, detect_cargo_command,
+    is_heavy_cargo_command, requires_rch_offload,
+};
 use proptest::prelude::*;
 
 // =========================================================================
@@ -619,6 +622,200 @@ proptest! {
         prop_assert_eq!(
             back.lock_dir_override.as_ref().map(|p| p.to_str().unwrap()),
             Some(lock.as_str())
+        );
+    }
+}
+
+// =========================================================================
+// RCH-aware command classification properties
+// =========================================================================
+
+fn rch_binary_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("rch".to_string()),
+        Just("/usr/local/bin/rch".to_string()),
+        Just("/Users/jemanuel/.local/bin/rch".to_string()),
+        Just("/opt/homebrew/bin/rch".to_string()),
+    ]
+}
+
+fn env_var_strategy() -> impl Strategy<Value = String> {
+    ("[A-Z_][A-Z0-9_]{0,10}", "[a-zA-Z0-9/._-]{1,15}")
+        .prop_map(|(name, val)| format!("{name}={val}"))
+}
+
+fn heavy_subcommand() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just("build"),
+        Just("b"),
+        Just("check"),
+        Just("c"),
+        Just("test"),
+        Just("t"),
+        Just("nextest"),
+        Just("bench"),
+        Just("clippy"),
+    ]
+}
+
+fn non_heavy_subcommand() -> impl Strategy<Value = &'static str> {
+    prop_oneof![Just("run"), Just("r"), Just("doc"),]
+}
+
+fn flag_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("--release".to_string()),
+        Just("--workspace".to_string()),
+        Just("--all-targets".to_string()),
+        Just("-p".to_string()),
+        Just("frankenterm-core".to_string()),
+        Just("--".to_string()),
+        Just("--nocapture".to_string()),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    // ── command_uses_rch ────────────────────────────────────────────────
+
+    /// An rch exec -- wrapped command should be detected.
+    #[test]
+    fn prop_rch_detected_with_rch_prefix(
+        rch in rch_binary_strategy(),
+        sub in heavy_subcommand(),
+    ) {
+        let cmd = format!("{rch} exec -- cargo {sub}");
+        prop_assert!(command_uses_rch(&cmd), "failed: '{}'", cmd);
+    }
+
+    /// An rch-wrapped command with env var prefixes should still be detected.
+    #[test]
+    fn prop_rch_detected_with_env_prefix(
+        envs in prop::collection::vec(env_var_strategy(), 1..3),
+        rch in rch_binary_strategy(),
+        sub in heavy_subcommand(),
+    ) {
+        let mut parts = envs;
+        parts.extend(["exec".to_string(), "--".to_string(),
+                       "cargo".to_string(), sub.to_string()]);
+        parts.insert(parts.len() - 4, rch);
+        let cmd = parts.join(" ");
+        let uses = command_uses_rch(&cmd);
+        prop_assert!(uses, "env+rch not detected: '{}'", cmd);
+    }
+
+    /// A bare cargo command without rch should not be detected.
+    #[test]
+    fn prop_rch_false_for_bare_cargo(
+        sub in heavy_subcommand(),
+        flags in prop::collection::vec(flag_strategy(), 0..3),
+    ) {
+        let mut parts = vec!["cargo".to_string(), sub.to_string()];
+        parts.extend(flags);
+        let cmd = parts.join(" ");
+        prop_assert!(!command_uses_rch(&cmd), "bare cargo false positive: '{}'", cmd);
+    }
+
+    /// An env-prefixed bare cargo command should not be detected as rch.
+    #[test]
+    fn prop_rch_false_for_env_cargo(
+        envs in prop::collection::vec(env_var_strategy(), 1..3),
+        sub in heavy_subcommand(),
+    ) {
+        let mut parts = envs;
+        parts.push("cargo".to_string());
+        parts.push(sub.to_string());
+        let cmd = parts.join(" ");
+        prop_assert!(!command_uses_rch(&cmd), "env+cargo false positive: '{}'", cmd);
+    }
+
+    // ── is_heavy_cargo_command ──────────────────────────────────────────
+
+    /// Known heavy subcommands should be classified as heavy.
+    #[test]
+    fn prop_heavy_for_known_heavy(sub in heavy_subcommand()) {
+        let cmd = format!("cargo {sub}");
+        prop_assert!(is_heavy_cargo_command(&cmd), "'cargo {}' should be heavy", sub);
+    }
+
+    /// Non-heavy subcommands should not be classified as heavy.
+    #[test]
+    fn prop_not_heavy_for_non_heavy(sub in non_heavy_subcommand()) {
+        let cmd = format!("cargo {sub}");
+        prop_assert!(!is_heavy_cargo_command(&cmd), "'cargo {}' should not be heavy", sub);
+    }
+
+    /// Heavy classification survives trailing flags.
+    #[test]
+    fn prop_heavy_with_flags(
+        sub in heavy_subcommand(),
+        flags in prop::collection::vec(flag_strategy(), 1..4),
+    ) {
+        let mut parts = vec!["cargo".to_string(), sub.to_string()];
+        parts.extend(flags);
+        let cmd = parts.join(" ");
+        prop_assert!(is_heavy_cargo_command(&cmd), "flags broke heavy: '{}'", cmd);
+    }
+
+    /// Heavy classification survives env var prefixes.
+    #[test]
+    fn prop_heavy_with_env_prefixes(
+        envs in prop::collection::vec(env_var_strategy(), 1..3),
+        sub in heavy_subcommand(),
+    ) {
+        let mut parts = envs;
+        parts.push("cargo".to_string());
+        parts.push(sub.to_string());
+        let cmd = parts.join(" ");
+        prop_assert!(is_heavy_cargo_command(&cmd), "env broke heavy: '{}'", cmd);
+    }
+
+    // ── requires_rch_offload ───────────────────────────────────────────
+
+    /// Unwrapped heavy cargo commands should require offload.
+    #[test]
+    fn prop_offload_for_unwrapped_heavy(sub in heavy_subcommand()) {
+        let cmd = format!("cargo {sub}");
+        prop_assert!(requires_rch_offload(&cmd), "'cargo {}' should need offload", sub);
+    }
+
+    /// Rch-wrapped heavy commands should NOT require offload.
+    #[test]
+    fn prop_no_offload_for_rch_wrapped(
+        rch in rch_binary_strategy(),
+        sub in heavy_subcommand(),
+    ) {
+        let cmd = format!("{rch} exec -- cargo {sub}");
+        prop_assert!(!requires_rch_offload(&cmd), "rch-wrapped should not need offload: '{}'", cmd);
+    }
+
+    /// Non-heavy commands never require offload (regardless of rch wrapping).
+    #[test]
+    fn prop_no_offload_for_non_heavy(sub in non_heavy_subcommand()) {
+        let cmd = format!("cargo {sub}");
+        prop_assert!(!requires_rch_offload(&cmd), "'cargo {}' should not need offload", sub);
+    }
+
+    /// Invariant: requires_rch_offload(cmd) ⟺ is_heavy(cmd) ∧ ¬uses_rch(cmd)
+    #[test]
+    fn prop_offload_invariant(
+        prefix in prop_oneof![
+            Just("".to_string()),
+            Just("TMPDIR=/tmp ".to_string()),
+            Just("rch exec -- ".to_string()),
+            Just("TMPDIR=/tmp rch exec -- ".to_string()),
+        ],
+        sub in prop_oneof![
+            heavy_subcommand().prop_map(|s| s.to_string()),
+            non_heavy_subcommand().prop_map(|s| s.to_string()),
+        ],
+    ) {
+        let cmd = format!("{prefix}cargo {sub}");
+        let expected = is_heavy_cargo_command(&cmd) && !command_uses_rch(&cmd);
+        prop_assert_eq!(
+            requires_rch_offload(&cmd), expected,
+            "invariant broken for '{}'", cmd
         );
     }
 }
