@@ -1,6 +1,7 @@
 use crate::sshd::*;
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use frankenterm_ssh::runtime::block_on;
 use rstest::*;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use std::convert::TryInto;
@@ -12,7 +13,7 @@ fn metadata_should_retrieve_file_stat(#[future] session: SessionWithSshd) {
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -41,7 +42,7 @@ fn read_dir_should_retrieve_next_dir_entry(#[future] session: SessionWithSshd) {
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -94,7 +95,7 @@ fn should_support_async_reading(#[future] session: SessionWithSshd) {
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -130,7 +131,7 @@ fn should_support_async_writing(#[future] session: SessionWithSshd) {
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -164,7 +165,7 @@ fn should_support_async_flush(#[future] session: SessionWithSshd) {
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -193,7 +194,7 @@ fn should_support_async_close(#[future] session: SessionWithSshd) {
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();

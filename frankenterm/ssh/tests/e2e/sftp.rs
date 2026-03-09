@@ -1,6 +1,7 @@
 use crate::sshd::*;
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use frankenterm_ssh::runtime::block_on;
 use frankenterm_ssh::{FileType, SftpChannelError, SftpError, Utf8PathBuf};
 use predicates::prelude::*;
 use rstest::*;
@@ -28,7 +29,7 @@ fn read_dir_should_return_list_of_directories_files_and_symlinks(
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         // $TEMP/dir1/
@@ -86,7 +87,7 @@ fn create_dir_should_create_a_directory_on_the_remote_filesystem(
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -110,7 +111,7 @@ fn create_dir_should_return_error_if_unable_to_create_directory(
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -140,7 +141,7 @@ fn remove_dir_should_remove_a_remote_directory(#[future] session: SessionWithSsh
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -167,7 +168,7 @@ fn remove_dir_should_return_an_error_if_failed_to_remove_directory(
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -219,7 +220,7 @@ fn metadata_should_return_metadata_about_a_file(#[future] session: SessionWithSs
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -243,7 +244,7 @@ fn metadata_should_return_metadata_about_a_directory(#[future] session: SessionW
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -269,7 +270,7 @@ fn metadata_should_return_metadata_about_the_file_pointed_to_by_a_symlink(
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -300,7 +301,7 @@ fn metadata_should_return_metadata_about_the_dir_pointed_to_by_a_symlink(
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -329,7 +330,7 @@ fn metadata_should_fail_if_path_missing(#[future] session: SessionWithSshd) {
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -352,7 +353,7 @@ fn symlink_metadata_should_return_metadata_about_a_file(#[future] session: Sessi
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -376,7 +377,7 @@ fn symlink_metadata_should_return_metadata_about_a_directory(#[future] session: 
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -402,7 +403,7 @@ fn symlink_metadata_should_return_metadata_about_symlink_pointing_to_a_file(
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -433,7 +434,7 @@ fn symlink_metadata_should_return_metadata_about_symlink_pointing_to_a_directory
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -462,7 +463,7 @@ fn symlink_metadata_should_fail_if_path_missing(#[future] session: SessionWithSs
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -485,7 +486,7 @@ fn symlink_should_create_symlink_pointing_to_file(#[future] session: SessionWith
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -520,7 +521,7 @@ fn symlink_should_create_symlink_pointing_to_directory(#[future] session: Sessio
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -545,7 +546,7 @@ fn symlink_should_succeed_even_if_path_missing(#[future] session: SessionWithSsh
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -569,7 +570,7 @@ fn read_link_should_return_the_target_of_the_symlink(#[future] session: SessionW
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -608,7 +609,7 @@ fn read_link_should_fail_if_path_is_not_a_symlink(#[future] session: SessionWith
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -652,7 +653,7 @@ fn canonicalize_should_resolve_absolute_path_for_relative_path(#[future] session
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         // For resolving parts of a path, all components must exist
@@ -684,7 +685,7 @@ fn canonicalize_should_either_return_resolved_path_or_error_if_missing(
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -725,7 +726,7 @@ fn canonicalize_should_fail_if_resolving_missing_path_with_dots(
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -745,7 +746,7 @@ fn rename_should_support_singular_file(#[future] session: SessionWithSshd) {
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -776,7 +777,7 @@ fn rename_should_support_dirtectory(#[future] session: SessionWithSshd) {
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -816,7 +817,7 @@ fn rename_should_fail_if_source_path_missing(#[future] session: SessionWithSshd)
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -845,7 +846,7 @@ fn remove_file_should_remove_file(#[future] session: SessionWithSshd) {
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -868,7 +869,7 @@ fn remove_file_should_remove_symlink_to_file(#[future] session: SessionWithSshd)
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -895,7 +896,7 @@ fn remove_file_should_remove_symlink_to_directory(#[future] session: SessionWith
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -922,7 +923,7 @@ fn remove_file_should_fail_if_path_to_directory(#[future] session: SessionWithSs
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();
@@ -947,7 +948,7 @@ fn remove_file_should_fail_if_path_missing(#[future] session: SessionWithSshd) {
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let temp = TempDir::new().unwrap();

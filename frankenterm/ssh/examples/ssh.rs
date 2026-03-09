@@ -3,6 +3,7 @@
 //! to be a full fledged replacement for ssh.
 use anyhow::Context;
 use clap::Parser;
+use frankenterm_ssh::runtime::block_on;
 use frankenterm_ssh::{Config, Session, SessionEvent};
 use portable_pty::{Child, MasterPty, PtySize};
 use std::io::{Read, Write};
@@ -59,7 +60,7 @@ fn main() {
         config.insert("user".to_string(), user.to_string());
     }
 
-    let res = smol::block_on(async move {
+    let res = block_on(async move {
         let (session, events) = Session::connect(config.clone())?;
 
         while let Ok(event) = events.recv().await {

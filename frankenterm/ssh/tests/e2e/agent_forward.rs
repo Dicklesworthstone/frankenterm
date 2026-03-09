@@ -1,4 +1,5 @@
 use crate::sshd::*;
+use frankenterm_ssh::runtime::block_on;
 use frankenterm_ssh::Config;
 use portable_pty::{MasterPty, PtySize};
 use rstest::*;
@@ -22,7 +23,7 @@ fn ssh_add_should_be_able_to_list_identities_with_agent_forward(
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session_with_agent_forward.await;
 
         let (pty, _child_process) = session
@@ -43,7 +44,7 @@ fn no_agent_forward_should_happen_when_disabled(#[future] session: SessionWithSs
     if !sshd_available() {
         return;
     }
-    smol::block_on(async {
+    block_on(async {
         let session: SessionWithSshd = session.await;
 
         let (pty, _child_process) = session
