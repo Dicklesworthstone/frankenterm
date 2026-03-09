@@ -816,6 +816,235 @@ fn interpolate_message(template: &str, input: &PolicyInput) -> String {
 }
 
 // =============================================================================
+// Bridge: PolicyRuleMatch <-> RulePredicate
+// =============================================================================
+
+/// Compiles a flat [`PolicyRuleMatch`](crate::config::PolicyRuleMatch) into a
+/// composable [`RulePredicate`].
+///
+/// Each non-empty criteria field becomes an atomic predicate; they are all
+/// AND'd together. An empty `PolicyRuleMatch` compiles to `Always` (catch-all).
+///
+/// String fields (`actions`, `actors`, `surfaces`) are parsed via serde
+/// `snake_case` names. Unknown values are silently ignored.
+#[must_use]
+pub fn compile_rule_match(m: &crate::config::PolicyRuleMatch) -> RulePredicate {
+    let mut clauses: Vec<RulePredicate> = Vec::new();
+
+    // Actions
+    if !m.actions.is_empty() {
+        let parsed: Vec<ActionKind> = m
+            .actions
+            .iter()
+            .filter_map(|s| parse_action_kind(s))
+            .collect();
+        if !parsed.is_empty() {
+            clauses.push(RulePredicate::ActionIn { actions: parsed });
+        }
+    }
+
+    // Actors
+    if !m.actors.is_empty() {
+        let parsed: Vec<ActorKind> = m
+            .actors
+            .iter()
+            .filter_map(|s| parse_actor_kind(s))
+            .collect();
+        if !parsed.is_empty() {
+            clauses.push(RulePredicate::ActorIn { actors: parsed });
+        }
+    }
+
+    // Surfaces
+    if !m.surfaces.is_empty() {
+        let parsed: Vec<PolicySurface> = m
+            .surfaces
+            .iter()
+            .filter_map(|s| parse_policy_surface(s))
+            .collect();
+        if !parsed.is_empty() {
+            clauses.push(RulePredicate::SurfaceIn { surfaces: parsed });
+        }
+    }
+
+    // Pane IDs
+    if !m.pane_ids.is_empty() {
+        clauses.push(RulePredicate::PaneIdIn {
+            pane_ids: m.pane_ids.clone(),
+        });
+    }
+
+    // Pane titles (glob)
+    if !m.pane_titles.is_empty() {
+        clauses.push(RulePredicate::PaneTitleGlob {
+            patterns: m.pane_titles.clone(),
+        });
+    }
+
+    // Pane CWDs (glob)
+    if !m.pane_cwds.is_empty() {
+        clauses.push(RulePredicate::PaneCwdGlob {
+            patterns: m.pane_cwds.clone(),
+        });
+    }
+
+    // Domains
+    if !m.pane_domains.is_empty() {
+        clauses.push(RulePredicate::DomainIn {
+            domains: m.pane_domains.clone(),
+        });
+    }
+
+    // Command patterns (regex)
+    if !m.command_patterns.is_empty() {
+        clauses.push(RulePredicate::CommandRegex {
+            patterns: m.command_patterns.clone(),
+        });
+    }
+
+    // Agent types
+    if !m.agent_types.is_empty() {
+        clauses.push(RulePredicate::AgentTypeIn {
+            agent_types: m.agent_types.clone(),
+        });
+    }
+
+    // AND all clauses together; empty = Always
+    if clauses.is_empty() {
+        RulePredicate::Always
+    } else {
+        let mut result = clauses.remove(0);
+        for clause in clauses {
+            result = result.and(clause);
+        }
+        result
+    }
+}
+
+/// Compiles a full [`PolicyRule`](crate::config::PolicyRule) into a [`DslRule`].
+#[must_use]
+pub fn compile_policy_rule(rule: &crate::config::PolicyRule) -> DslRule {
+    let predicate = compile_rule_match(&rule.match_on);
+    let decision = match rule.decision {
+        crate::config::PolicyRuleDecision::Allow => DslDecision::Allow,
+        crate::config::PolicyRuleDecision::Deny => DslDecision::Deny,
+        crate::config::PolicyRuleDecision::RequireApproval => DslDecision::RequireApproval,
+    };
+    DslRule {
+        id: rule.id.clone(),
+        description: rule.description.clone(),
+        priority: rule.priority,
+        predicate,
+        decision,
+        message: rule.message.clone(),
+    }
+}
+
+/// Attempts to decompile a simple `RulePredicate` back to `PolicyRuleMatch`.
+///
+/// Only succeeds for predicates that are a flat AND of atomic matchers
+/// (i.e., predicates originally compiled from `PolicyRuleMatch`).
+/// Returns `None` if the predicate uses OR, NOT, or nested logic.
+#[must_use]
+pub fn decompile_to_match(pred: &RulePredicate) -> Option<crate::config::PolicyRuleMatch> {
+    let mut m = crate::config::PolicyRuleMatch::default();
+    if !collect_flat_and_clauses(pred, &mut m) {
+        return None;
+    }
+    Some(m)
+}
+
+/// Recursively collects atomic clauses from a flat AND tree.
+/// Returns false if any non-decompilable node is found.
+fn collect_flat_and_clauses(pred: &RulePredicate, m: &mut crate::config::PolicyRuleMatch) -> bool {
+    match pred {
+        RulePredicate::Always => true,
+        RulePredicate::ActionIn { actions } => {
+            m.actions = actions
+                .iter()
+                .map(|a| {
+                    serde_json::to_string(a)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_owned()
+                })
+                .collect();
+            true
+        }
+        RulePredicate::ActorIn { actors } => {
+            m.actors = actors
+                .iter()
+                .map(|a| {
+                    serde_json::to_string(a)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_owned()
+                })
+                .collect();
+            true
+        }
+        RulePredicate::SurfaceIn { surfaces } => {
+            m.surfaces = surfaces
+                .iter()
+                .map(|s| {
+                    serde_json::to_string(s)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_owned()
+                })
+                .collect();
+            true
+        }
+        RulePredicate::PaneIdIn { pane_ids } => {
+            m.pane_ids = pane_ids.clone();
+            true
+        }
+        RulePredicate::PaneTitleGlob { patterns } => {
+            m.pane_titles = patterns.clone();
+            true
+        }
+        RulePredicate::PaneCwdGlob { patterns } => {
+            m.pane_cwds = patterns.clone();
+            true
+        }
+        RulePredicate::DomainIn { domains } => {
+            m.pane_domains = domains.clone();
+            true
+        }
+        RulePredicate::CommandRegex { patterns } => {
+            m.command_patterns = patterns.clone();
+            true
+        }
+        RulePredicate::AgentTypeIn { agent_types } => {
+            m.agent_types = agent_types.clone();
+            true
+        }
+        RulePredicate::And { left, right } => {
+            collect_flat_and_clauses(left, m) && collect_flat_and_clauses(right, m)
+        }
+        // OR, NOT, Never cannot be decompiled to flat PolicyRuleMatch
+        _ => false,
+    }
+}
+
+// --- String-to-enum parsers ---
+
+fn parse_action_kind(s: &str) -> Option<ActionKind> {
+    let quoted = format!("\"{s}\"");
+    serde_json::from_str(&quoted).ok()
+}
+
+fn parse_actor_kind(s: &str) -> Option<ActorKind> {
+    let quoted = format!("\"{s}\"");
+    serde_json::from_str(&quoted).ok()
+}
+
+fn parse_policy_surface(s: &str) -> Option<PolicySurface> {
+    let quoted = format!("\"{s}\"");
+    serde_json::from_str(&quoted).ok()
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1431,5 +1660,110 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let back: DslEvalResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result, back);
+    }
+
+    // ---- Bridge compiler tests ----
+
+    #[test]
+    fn compile_empty_match_is_always() {
+        let m = crate::config::PolicyRuleMatch::default();
+        let pred = compile_rule_match(&m);
+        assert!(pred.is_always());
+    }
+
+    #[test]
+    fn compile_single_action() {
+        let m = crate::config::PolicyRuleMatch {
+            actions: vec!["spawn".to_owned()],
+            ..Default::default()
+        };
+        let pred = compile_rule_match(&m);
+        let input = make_input(ActionKind::Spawn, ActorKind::Robot);
+        assert!(evaluate_predicate(&pred, &input));
+        let input2 = make_input(ActionKind::SendText, ActorKind::Robot);
+        assert!(!evaluate_predicate(&pred, &input2));
+    }
+
+    #[test]
+    fn compile_action_and_actor() {
+        let m = crate::config::PolicyRuleMatch {
+            actions: vec!["spawn".to_owned()],
+            actors: vec!["robot".to_owned()],
+            ..Default::default()
+        };
+        let pred = compile_rule_match(&m);
+        // spawn + robot -> match
+        assert!(evaluate_predicate(
+            &pred,
+            &make_input(ActionKind::Spawn, ActorKind::Robot)
+        ));
+        // spawn + human -> no match
+        assert!(!evaluate_predicate(
+            &pred,
+            &make_input(ActionKind::Spawn, ActorKind::Human)
+        ));
+    }
+
+    #[test]
+    fn compile_full_rule() {
+        let rule = crate::config::PolicyRule {
+            id: "test-rule".to_owned(),
+            description: Some("Test".to_owned()),
+            priority: 42,
+            match_on: crate::config::PolicyRuleMatch {
+                actions: vec!["spawn".to_owned()],
+                actors: vec!["robot".to_owned()],
+                ..Default::default()
+            },
+            decision: crate::config::PolicyRuleDecision::Deny,
+            message: Some("Blocked".to_owned()),
+        };
+        let dsl = compile_policy_rule(&rule);
+        assert_eq!(dsl.id, "test-rule");
+        assert_eq!(dsl.priority, 42);
+        assert_eq!(dsl.decision, DslDecision::Deny);
+    }
+
+    #[test]
+    fn decompile_roundtrip() {
+        let m = crate::config::PolicyRuleMatch {
+            actions: vec!["spawn".to_owned(), "close".to_owned()],
+            actors: vec!["robot".to_owned()],
+            pane_ids: vec![42, 99],
+            pane_titles: vec!["*prod*".to_owned()],
+            ..Default::default()
+        };
+        let pred = compile_rule_match(&m);
+        let back = decompile_to_match(&pred).expect("should decompile");
+        assert_eq!(back.actions, m.actions);
+        assert_eq!(back.actors, m.actors);
+        assert_eq!(back.pane_ids, m.pane_ids);
+        assert_eq!(back.pane_titles, m.pane_titles);
+    }
+
+    #[test]
+    fn decompile_rejects_or() {
+        let pred = RulePredicate::Always.or(RulePredicate::Never);
+        assert!(decompile_to_match(&pred).is_none());
+    }
+
+    #[test]
+    fn decompile_rejects_not() {
+        let pred = RulePredicate::Always.not();
+        assert!(decompile_to_match(&pred).is_none());
+    }
+
+    #[test]
+    fn unknown_action_string_ignored() {
+        let m = crate::config::PolicyRuleMatch {
+            actions: vec!["nonexistent_action".to_owned(), "spawn".to_owned()],
+            ..Default::default()
+        };
+        let pred = compile_rule_match(&m);
+        // Should still work with the valid "spawn" action
+        assert!(evaluate_predicate(
+            &pred,
+            &make_input(ActionKind::Spawn, ActorKind::Robot)
+        ));
     }
 }
