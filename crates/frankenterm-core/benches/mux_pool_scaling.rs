@@ -222,7 +222,7 @@ fn bench_health_check_overhead(c: &mut Criterion) {
                 let pool = Arc::clone(&pool);
                 compat_rt.block_on(async move {
                     let cx = cx::for_testing();
-                    pool.health_check_with_cx(&cx)
+                    Box::pin(pool.health_check_with_cx(&cx))
                         .await
                         .expect("health_check_with_cx");
                 });
@@ -336,7 +336,7 @@ fn bench_connection_factory_overhead(c: &mut Criterion) {
             let config = config.clone();
             compat_rt.block_on(async move {
                 let cx = cx::for_testing();
-                let client = DirectMuxClient::connect_with_cx(&cx, config)
+                let client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
                     .await
                     .expect("direct mux connect with cx");
                 black_box(client);
