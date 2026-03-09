@@ -37000,11 +37000,34 @@ mod tests {
     use frankenterm_core::storage::{
         ApprovalTokenRecord, PaneRecord, PreparedPlanRecord, StorageHandle,
     };
+    use std::future::Future;
 
     fn now_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64)
+    }
+
+    fn run_async_test<F>(future: F)
+    where
+        F: Future<Output = ()>,
+    {
+        let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build main.rs test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            frankenterm_core::runtime_compat::clear_runtime_handle();
+        }));
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]
@@ -38104,37 +38127,39 @@ recorder_backend = "frankensqlite"
         );
     }
 
-    #[tokio::test]
-    async fn watcher_startup_frankensqlite_fallback_on_connection_failure() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "ft_recorder_fallback_{}_{}",
-            std::process::id(),
-            now_ms()
-        ));
-        std::fs::create_dir_all(&temp_root).expect("create temp root");
+    #[test]
+    fn watcher_startup_frankensqlite_fallback_on_connection_failure() {
+        run_async_test(async {
+            let temp_root = std::env::temp_dir().join(format!(
+                "ft_recorder_fallback_{}_{}",
+                std::process::id(),
+                now_ms()
+            ));
+            std::fs::create_dir_all(&temp_root).expect("create temp root");
 
-        let append_log = frankenterm_core::recorder_storage::AppendLogStorageConfig {
-            data_path: temp_root.join("recorder-log/events.log"),
-            state_path: temp_root.join("recorder-log/state.json"),
-            ..frankenterm_core::recorder_storage::AppendLogStorageConfig::default()
-        };
+            let append_log = frankenterm_core::recorder_storage::AppendLogStorageConfig {
+                data_path: temp_root.join("recorder-log/events.log"),
+                state_path: temp_root.join("recorder-log/state.json"),
+                ..frankenterm_core::recorder_storage::AppendLogStorageConfig::default()
+            };
 
-        let (storage, fallback_reason) = bootstrap_recorder_backend_with_probe(
-            frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite,
-            append_log,
-        )
-        .await
-        .expect("fallback to append-log should succeed");
+            let (storage, fallback_reason) = bootstrap_recorder_backend_with_probe(
+                frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite,
+                append_log,
+            )
+            .await
+            .expect("fallback to append-log should succeed");
 
-        use frankenterm_core::recorder_storage::RecorderStorage as _;
-        assert_eq!(
-            storage.backend_kind(),
-            frankenterm_core::recorder_storage::RecorderBackendKind::AppendLog
-        );
-        let reason = fallback_reason.expect("fallback reason should be present");
-        assert!(reason.contains("bootstrap_failed"));
+            use frankenterm_core::recorder_storage::RecorderStorage as _;
+            assert_eq!(
+                storage.backend_kind(),
+                frankenterm_core::recorder_storage::RecorderBackendKind::AppendLog
+            );
+            let reason = fallback_reason.expect("fallback reason should be present");
+            assert!(reason.contains("bootstrap_failed"));
 
-        let _ = std::fs::remove_dir_all(&temp_root);
+            let _ = std::fs::remove_dir_all(&temp_root);
+        });
     }
 
     #[test]
@@ -38245,202 +38270,138 @@ recorder_backend = "frankensqlite"
         assert!(!records.iter().any(|r| r.pane_id == 3));
     }
 
-    #[tokio::test]
-    async fn load_distributed_remote_panes_only_returns_distributed_domains() {
-        let (storage, db_path) = setup_storage("distributed_remote_load").await;
+    #[test]
+    fn load_distributed_remote_panes_only_returns_distributed_domains() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("distributed_remote_load").await;
 
-        storage
-            .upsert_pane(make_pane_record(10, "local", Some("local-pane")))
-            .await
-            .unwrap();
-        storage
-            .upsert_pane(make_pane_record(
-                11,
-                "distributed:agent-a:prod",
-                Some("remote-pane-a"),
-            ))
-            .await
-            .unwrap();
-        storage
-            .upsert_pane(make_pane_record(
-                12,
-                "distributed:agent-b:staging",
-                Some("remote-pane-b"),
-            ))
-            .await
-            .unwrap();
+            storage
+                .upsert_pane(make_pane_record(10, "local", Some("local-pane")))
+                .await
+                .unwrap();
+            storage
+                .upsert_pane(make_pane_record(
+                    11,
+                    "distributed:agent-a:prod",
+                    Some("remote-pane-a"),
+                ))
+                .await
+                .unwrap();
+            storage
+                .upsert_pane(make_pane_record(
+                    12,
+                    "distributed:agent-b:staging",
+                    Some("remote-pane-b"),
+                ))
+                .await
+                .unwrap();
 
-        let remote = load_distributed_remote_panes(std::path::Path::new(&db_path))
-            .await
-            .unwrap();
+            let remote = load_distributed_remote_panes(std::path::Path::new(&db_path))
+                .await
+                .unwrap();
 
-        assert_eq!(remote.len(), 2);
-        assert!(
-            remote
-                .iter()
-                .all(|pane| pane.domain.starts_with("distributed:"))
-        );
-        assert!(remote.iter().any(|pane| pane.pane_id == 11));
-        assert!(remote.iter().any(|pane| pane.pane_id == 12));
+            assert_eq!(remote.len(), 2);
+            assert!(
+                remote
+                    .iter()
+                    .all(|pane| pane.domain.starts_with("distributed:"))
+            );
+            assert!(remote.iter().any(|pane| pane.pane_id == 11));
+            assert!(remote.iter().any(|pane| pane.pane_id == 12));
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
-    #[tokio::test]
-    async fn distributed_remote_output_is_searchable_for_query_path() {
-        let (storage, db_path) = setup_storage("distributed_remote_query").await;
-        let remote_pane_id = 42_001;
+    #[test]
+    fn distributed_remote_output_is_searchable_for_query_path() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("distributed_remote_query").await;
+            let remote_pane_id = 42_001;
 
-        storage
-            .upsert_pane(make_pane_record(
-                remote_pane_id,
-                "distributed:agent-query:prod",
-                Some("remote-query-pane"),
-            ))
-            .await
-            .unwrap();
+            storage
+                .upsert_pane(make_pane_record(
+                    remote_pane_id,
+                    "distributed:agent-query:prod",
+                    Some("remote-query-pane"),
+                ))
+                .await
+                .unwrap();
 
-        storage
-            .append_segment(
-                remote_pane_id,
-                "DIST_STATUS_QUERY_MARKER distributed pane output",
-                Some("remote_sender=agent-query;remote_seq=1".to_string()),
+            storage
+                .append_segment(
+                    remote_pane_id,
+                    "DIST_STATUS_QUERY_MARKER distributed pane output",
+                    Some("remote_sender=agent-query;remote_seq=1".to_string()),
+                )
+                .await
+                .unwrap();
+
+            let remote = load_distributed_remote_panes(std::path::Path::new(&db_path))
+                .await
+                .unwrap();
+            let matches = storage.search("DIST_STATUS_QUERY_MARKER").await.unwrap();
+
+            assert!(remote.iter().any(|pane| pane.pane_id == remote_pane_id));
+            assert!(
+                matches
+                    .iter()
+                    .any(|segment| segment.pane_id == remote_pane_id)
+            );
+
+            cleanup_storage(storage, &db_path).await;
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_persist_payload_maps_sender_scoped_pane_ids_for_query_visibility() {
+        run_async_test(async {
+            let (storage_handle, db_path) = setup_storage("distributed_persist_payload_map").await;
+            let storage =
+                std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+            let pane_seq_by_sender =
+                frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<
+                    (String, u64),
+                    u64,
+                >::new());
+
+            let sender = "agent-mapped";
+            let source_pane_id = 17;
+            let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+            let marker = "DIST_PERSIST_PAYLOAD_MAP_MARKER";
+
+            distributed_persist_payload(
+                sender,
+                frankenterm_core::wire_protocol::WirePayload::PaneMeta(
+                    frankenterm_core::wire_protocol::PaneMeta {
+                        pane_id: source_pane_id,
+                        pane_uuid: Some("pane-uuid-17".to_string()),
+                        domain: "prod".to_string(),
+                        title: Some("remote-pane".to_string()),
+                        cwd: Some("/remote/project".to_string()),
+                        rows: Some(24),
+                        cols: Some(120),
+                        observed: true,
+                        timestamp_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
             )
             .await
             .unwrap();
 
-        let remote = load_distributed_remote_panes(std::path::Path::new(&db_path))
-            .await
-            .unwrap();
-        let matches = storage.search("DIST_STATUS_QUERY_MARKER").await.unwrap();
-
-        assert!(remote.iter().any(|pane| pane.pane_id == remote_pane_id));
-        assert!(
-            matches
-                .iter()
-                .any(|segment| segment.pane_id == remote_pane_id)
-        );
-
-        cleanup_storage(storage, &db_path).await;
-    }
-
-    #[cfg(feature = "distributed")]
-    #[tokio::test]
-    async fn distributed_persist_payload_maps_sender_scoped_pane_ids_for_query_visibility() {
-        let (storage_handle, db_path) = setup_storage("distributed_persist_payload_map").await;
-        let storage =
-            std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
-        let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-        let pane_seq_by_sender =
-            frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<
-                (String, u64),
-                u64,
-            >::new());
-
-        let sender = "agent-mapped";
-        let source_pane_id = 17;
-        let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
-        let marker = "DIST_PERSIST_PAYLOAD_MAP_MARKER";
-
-        distributed_persist_payload(
-            sender,
-            frankenterm_core::wire_protocol::WirePayload::PaneMeta(
-                frankenterm_core::wire_protocol::PaneMeta {
-                    pane_id: source_pane_id,
-                    pane_uuid: Some("pane-uuid-17".to_string()),
-                    domain: "prod".to_string(),
-                    title: Some("remote-pane".to_string()),
-                    cwd: Some("/remote/project".to_string()),
-                    rows: Some(24),
-                    cols: Some(120),
-                    observed: true,
-                    timestamp_ms: now_ms(),
-                },
-            ),
-            &storage,
-            &event_bus,
-            &pane_seq_by_sender,
-        )
-        .await
-        .unwrap();
-
-        distributed_persist_payload(
-            sender,
-            frankenterm_core::wire_protocol::WirePayload::PaneDelta(
-                frankenterm_core::wire_protocol::PaneDelta {
-                    pane_id: source_pane_id,
-                    seq: 1,
-                    content: marker.to_string(),
-                    content_len: marker.len(),
-                    captured_at_ms: now_ms(),
-                },
-            ),
-            &storage,
-            &event_bus,
-            &pane_seq_by_sender,
-        )
-        .await
-        .unwrap();
-
-        {
-            let storage_handle = storage.lock().await.clone(); // ubs:ignore
-            let remote = storage_handle.get_pane(remote_pane_id).await.unwrap();
-            assert!(remote.is_some());
-            assert!(
-                storage_handle
-                    .get_pane(source_pane_id)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "raw source pane_id should not be used for persisted remote panes"
-            );
-            let remote = remote.unwrap();
-            assert_eq!(remote.domain, "distributed:agent-mapped:prod");
-
-            let search_hits = storage_handle.search(marker).await.unwrap();
-            assert!(search_hits.iter().any(|seg| seg.pane_id == remote_pane_id));
-        }
-
-        {
-            let storage_handle = storage.lock().await.clone(); // ubs:ignore
-            storage_handle.shutdown().await.unwrap();
-        }
-        drop(storage);
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{db_path}-wal"));
-        let _ = std::fs::remove_file(format!("{db_path}-shm"));
-    }
-
-    #[cfg(feature = "distributed")]
-    #[tokio::test]
-    async fn distributed_persist_payload_out_of_order_records_sender_scoped_gap_and_drops_segment()
-    {
-        let (storage_handle, db_path) = setup_storage("distributed_persist_payload_ordering").await;
-        let storage =
-            std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
-        let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
-        let pane_seq_by_sender =
-            frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<
-                (String, u64),
-                u64,
-            >::new());
-
-        let sender = "agent-order";
-        let source_pane_id = 23;
-        let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
-        let first = "DIST_ORDER_MARKER_FIRST";
-        let gap_jump = "DIST_ORDER_MARKER_GAP_JUMP";
-        let dropped = "DIST_ORDER_MARKER_DROPPED";
-
-        for (seq, content) in [(1_u64, first), (3_u64, gap_jump), (2_u64, dropped)] {
             distributed_persist_payload(
                 sender,
                 frankenterm_core::wire_protocol::WirePayload::PaneDelta(
                     frankenterm_core::wire_protocol::PaneDelta {
                         pane_id: source_pane_id,
-                        seq,
-                        content: content.to_string(),
-                        content_len: content.len(),
+                        seq: 1,
+                        content: marker.to_string(),
+                        content_len: marker.len(),
                         captured_at_ms: now_ms(),
                     },
                 ),
@@ -38450,41 +38411,113 @@ recorder_backend = "frankensqlite"
             )
             .await
             .unwrap();
-        }
 
-        {
-            let storage_handle = storage.lock().await.clone(); // ubs:ignore
-            let segments = storage_handle
-                .get_segments(remote_pane_id, 16)
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                let remote = storage_handle.get_pane(remote_pane_id).await.unwrap();
+                assert!(remote.is_some());
+                assert!(
+                    storage_handle
+                        .get_pane(source_pane_id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "raw source pane_id should not be used for persisted remote panes"
+                );
+                let remote = remote.unwrap();
+                assert_eq!(remote.domain, "distributed:agent-mapped:prod");
+
+                let search_hits = storage_handle.search(marker).await.unwrap();
+                assert!(search_hits.iter().any(|seg| seg.pane_id == remote_pane_id));
+            }
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                storage_handle.shutdown().await.unwrap();
+            }
+            drop(storage);
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_persist_payload_out_of_order_records_sender_scoped_gap_and_drops_segment() {
+        run_async_test(async {
+            let (storage_handle, db_path) =
+                setup_storage("distributed_persist_payload_ordering").await;
+            let storage =
+                std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+            let pane_seq_by_sender =
+                frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<
+                    (String, u64),
+                    u64,
+                >::new());
+
+            let sender = "agent-order";
+            let source_pane_id = 23;
+            let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+            let first = "DIST_ORDER_MARKER_FIRST";
+            let gap_jump = "DIST_ORDER_MARKER_GAP_JUMP";
+            let dropped = "DIST_ORDER_MARKER_DROPPED";
+
+            for (seq, content) in [(1_u64, first), (3_u64, gap_jump), (2_u64, dropped)] {
+                distributed_persist_payload(
+                    sender,
+                    frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                        frankenterm_core::wire_protocol::PaneDelta {
+                            pane_id: source_pane_id,
+                            seq,
+                            content: content.to_string(),
+                            content_len: content.len(),
+                            captured_at_ms: now_ms(),
+                        },
+                    ),
+                    &storage,
+                    &event_bus,
+                    &pane_seq_by_sender,
+                )
                 .await
                 .unwrap();
-            assert_eq!(segments.len(), 2);
-            assert!(segments.iter().any(|seg| seg.content.contains(first)));
-            assert!(segments.iter().any(|seg| seg.content.contains(gap_jump)));
-            assert!(
-                !segments.iter().any(|seg| seg.content.contains(dropped)),
-                "out-of-order pane delta must be dropped from persisted segments"
-            );
+            }
 
-            let gaps = storage_handle.get_gaps().await.unwrap();
-            assert!(gaps.iter().any(|gap| {
-                gap.reason
-                    .contains("distributed_seq_gap:sender=agent-order:expected=2:actual=3")
-            }));
-            assert!(gaps.iter().any(|gap| {
-                gap.reason
-                    .contains("distributed_out_of_order:sender=agent-order:expected=4:actual=2")
-            }));
-        }
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                let segments = storage_handle
+                    .get_segments(remote_pane_id, 16)
+                    .await
+                    .unwrap();
+                assert_eq!(segments.len(), 2);
+                assert!(segments.iter().any(|seg| seg.content.contains(first)));
+                assert!(segments.iter().any(|seg| seg.content.contains(gap_jump)));
+                assert!(
+                    !segments.iter().any(|seg| seg.content.contains(dropped)),
+                    "out-of-order pane delta must be dropped from persisted segments"
+                );
 
-        {
-            let storage_handle = storage.lock().await.clone(); // ubs:ignore
-            storage_handle.shutdown().await.unwrap();
-        }
-        drop(storage);
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{db_path}-wal"));
-        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+                let gaps = storage_handle.get_gaps().await.unwrap();
+                assert!(gaps.iter().any(|gap| {
+                    gap.reason
+                        .contains("distributed_seq_gap:sender=agent-order:expected=2:actual=3")
+                }));
+                assert!(gaps.iter().any(|gap| {
+                    gap.reason
+                        .contains("distributed_out_of_order:sender=agent-order:expected=4:actual=2")
+                }));
+            }
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                storage_handle.shutdown().await.unwrap();
+            }
+            drop(storage);
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        });
     }
 
     #[cfg(feature = "distributed")]
@@ -40116,160 +40149,168 @@ log_level = "debug"
         assert!(validate_uservar_request(1, name, value).is_ok());
     }
 
-    #[tokio::test]
-    async fn robot_approve_valid_code_consumes() {
-        let (storage, db_path) = setup_storage("valid").await;
-        let workspace_id = "ws-valid";
-        let code = "ABC12345";
-        let fingerprint = "sha256:valid";
-        let expires_at = now_ms() + 60_000;
+    #[test]
+    fn robot_approve_valid_code_consumes() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("valid").await;
+            let workspace_id = "ws-valid";
+            let code = "ABC12345";
+            let fingerprint = "sha256:valid";
+            let expires_at = now_ms() + 60_000;
 
-        insert_token(
-            &storage,
-            workspace_id,
-            code,
-            Some(5),
-            expires_at,
-            None,
-            fingerprint,
-        )
-        .await;
+            insert_token(
+                &storage,
+                workspace_id,
+                code,
+                Some(5),
+                expires_at,
+                None,
+                fingerprint,
+            )
+            .await;
 
-        let data = evaluate_robot_approve(
-            &storage,
-            workspace_id,
-            code,
-            Some(5),
-            Some(fingerprint),
-            false,
-        )
-        .await
-        .unwrap();
+            let data = evaluate_robot_approve(
+                &storage,
+                workspace_id,
+                code,
+                Some(5),
+                Some(fingerprint),
+                false,
+            )
+            .await
+            .unwrap();
 
-        assert!(data.valid);
-        assert_eq!(data.code, code);
-        assert_eq!(data.pane_id, Some(5));
-        assert!(data.consumed_at.is_some());
+            assert!(data.valid);
+            assert_eq!(data.code, code);
+            assert_eq!(data.pane_id, Some(5));
+            assert!(data.consumed_at.is_some());
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
-    #[tokio::test]
-    async fn robot_approve_dry_run_does_not_consume() {
-        let (storage, db_path) = setup_storage("dry_run").await;
-        let workspace_id = "ws-dry";
-        let code = "DRY12345";
-        let fingerprint = "sha256:dry";
-        let expires_at = now_ms() + 60_000;
+    #[test]
+    fn robot_approve_dry_run_does_not_consume() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("dry_run").await;
+            let workspace_id = "ws-dry";
+            let code = "DRY12345";
+            let fingerprint = "sha256:dry";
+            let expires_at = now_ms() + 60_000;
 
-        insert_token(
-            &storage,
-            workspace_id,
-            code,
-            Some(1),
-            expires_at,
-            None,
-            fingerprint,
-        )
-        .await;
+            insert_token(
+                &storage,
+                workspace_id,
+                code,
+                Some(1),
+                expires_at,
+                None,
+                fingerprint,
+            )
+            .await;
 
-        let data = evaluate_robot_approve(
-            &storage,
-            workspace_id,
-            code,
-            Some(1),
-            Some(fingerprint),
-            true,
-        )
-        .await
-        .unwrap();
+            let data = evaluate_robot_approve(
+                &storage,
+                workspace_id,
+                code,
+                Some(1),
+                Some(fingerprint),
+                true,
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(data.dry_run, Some(true));
-        assert!(data.consumed_at.is_none());
+            assert_eq!(data.dry_run, Some(true));
+            assert!(data.consumed_at.is_none());
 
-        let data2 = evaluate_robot_approve(
-            &storage,
-            workspace_id,
-            code,
-            Some(1),
-            Some(fingerprint),
-            false,
-        )
-        .await
-        .unwrap();
+            let data2 = evaluate_robot_approve(
+                &storage,
+                workspace_id,
+                code,
+                Some(1),
+                Some(fingerprint),
+                false,
+            )
+            .await
+            .unwrap();
 
-        assert!(data2.consumed_at.is_some());
+            assert!(data2.consumed_at.is_some());
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
-    #[tokio::test]
-    async fn robot_approve_expired_code() {
-        let (storage, db_path) = setup_storage("expired").await;
-        let workspace_id = "ws-expired";
-        let code = "EXP12345";
-        let fingerprint = "sha256:expired";
+    #[test]
+    fn robot_approve_expired_code() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("expired").await;
+            let workspace_id = "ws-expired";
+            let code = "EXP12345";
+            let fingerprint = "sha256:expired";
 
-        insert_token(
-            &storage,
-            workspace_id,
-            code,
-            Some(2),
-            now_ms() - 1,
-            None,
-            fingerprint,
-        )
-        .await;
+            insert_token(
+                &storage,
+                workspace_id,
+                code,
+                Some(2),
+                now_ms() - 1,
+                None,
+                fingerprint,
+            )
+            .await;
 
-        let err = evaluate_robot_approve(
-            &storage,
-            workspace_id,
-            code,
-            Some(2),
-            Some(fingerprint),
-            false,
-        )
-        .await
-        .unwrap_err();
+            let err = evaluate_robot_approve(
+                &storage,
+                workspace_id,
+                code,
+                Some(2),
+                Some(fingerprint),
+                false,
+            )
+            .await
+            .unwrap_err();
 
-        assert_eq!(err.code, "E_APPROVAL_EXPIRED");
+            assert_eq!(err.code, "E_APPROVAL_EXPIRED");
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
-    #[tokio::test]
-    async fn robot_approve_consumed_code() {
-        let (storage, db_path) = setup_storage("consumed").await;
-        let workspace_id = "ws-consumed";
-        let code = "CON12345";
-        let fingerprint = "sha256:consumed";
-        let used_at = now_ms() - 10;
+    #[test]
+    fn robot_approve_consumed_code() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("consumed").await;
+            let workspace_id = "ws-consumed";
+            let code = "CON12345";
+            let fingerprint = "sha256:consumed";
+            let used_at = now_ms() - 10;
 
-        insert_token(
-            &storage,
-            workspace_id,
-            code,
-            Some(3),
-            now_ms() + 60_000,
-            Some(used_at),
-            fingerprint,
-        )
-        .await;
+            insert_token(
+                &storage,
+                workspace_id,
+                code,
+                Some(3),
+                now_ms() + 60_000,
+                Some(used_at),
+                fingerprint,
+            )
+            .await;
 
-        let err = evaluate_robot_approve(
-            &storage,
-            workspace_id,
-            code,
-            Some(3),
-            Some(fingerprint),
-            false,
-        )
-        .await
-        .unwrap_err();
+            let err = evaluate_robot_approve(
+                &storage,
+                workspace_id,
+                code,
+                Some(3),
+                Some(fingerprint),
+                false,
+            )
+            .await
+            .unwrap_err();
 
-        assert_eq!(err.code, "E_APPROVAL_CONSUMED");
+            assert_eq!(err.code, "E_APPROVAL_CONSUMED");
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
     #[tokio::test]
