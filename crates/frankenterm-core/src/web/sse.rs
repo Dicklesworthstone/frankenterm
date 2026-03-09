@@ -182,7 +182,7 @@ impl SseByteStream {
     fn new(rx: mpsc::Receiver<SseEvent>) -> Self {
         Self {
             rx,
-            cx: asupersync::Cx::for_testing(),
+            cx: crate::cx::for_request(),
         }
     }
 

@@ -193,14 +193,14 @@ impl SearchBridge {
 
     /// Run a search using an internally managed capability context.
     ///
-    /// This creates a per-request `Cx::for_testing()` capability context and
+    /// This creates a per-request `Cx::for_request()` capability context and
     /// forwards progressive phases to `on_phase`.
     pub async fn search(
         &self,
         request: SearchBridgeRequest,
         on_phase: impl FnMut(SearchPhase) + Send + 'static,
     ) -> Result<SearchBridgeResult, SearchBridgeError> {
-        self.search_with_cx(Cx::for_testing(), request, on_phase)
+        self.search_with_cx(Cx::for_request(), request, on_phase)
             .await
     }
 

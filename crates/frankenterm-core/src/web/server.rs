@@ -52,7 +52,7 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
     let server_task = {
         let server = Arc::clone(&server);
         task::spawn(async move {
-            let cx = Cx::for_testing();
+            let cx = crate::cx::for_request();
             server.serve_on_handler(&cx, listener, handler).await
         })
     };

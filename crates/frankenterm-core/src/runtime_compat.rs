@@ -185,7 +185,7 @@ impl<T> Mutex<T> {
     }
 
     pub async fn lock(&self) -> MutexGuard<'_, T> {
-        let cx = asupersync::Cx::for_testing();
+        let cx = crate::cx::for_request();
         let guard = self
             .inner
             .lock(&cx)
@@ -233,7 +233,7 @@ impl<T> RwLock<T> {
 
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn read(&self) -> RwLockReadGuard<'_, T> {
-        let cx = asupersync::Cx::for_testing();
+        let cx = crate::cx::for_request();
         let guard = self
             .inner
             .read(&cx)
@@ -244,7 +244,7 @@ impl<T> RwLock<T> {
 
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn write(&self) -> RwLockWriteGuard<'_, T> {
-        let cx = asupersync::Cx::for_testing();
+        let cx = crate::cx::for_request();
         let guard = self
             .inner
             .write(&cx)
@@ -365,7 +365,7 @@ impl Semaphore {
     }
 
     pub async fn acquire(&self) -> Result<SemaphorePermit<'_>, AcquireError> {
-        let cx = asupersync::Cx::for_testing();
+        let cx = crate::cx::for_request();
         self.inner
             .acquire(&cx, 1)
             .await
@@ -390,7 +390,7 @@ impl Semaphore {
     }
 
     pub async fn acquire_owned(self: Arc<Self>) -> Result<OwnedSemaphorePermit, AcquireError> {
-        let cx = asupersync::Cx::for_testing();
+        let cx = crate::cx::for_request();
         asupersync::sync::OwnedSemaphorePermit::acquire(self.inner.clone(), &cx, 1)
             .await
             .map(|inner| OwnedSemaphorePermit { inner })

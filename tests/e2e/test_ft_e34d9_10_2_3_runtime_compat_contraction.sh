@@ -102,7 +102,10 @@ validate_spawn_blocking_allowlist() {
   local mode="$1"
   local output_file="$2"
 
-  rg -n "runtime_compat::task::spawn_blocking" crates/frankenterm-core/src > "${output_file}" || true
+  rg -n "runtime_compat::task::spawn_blocking" \
+    crates/frankenterm/src/main.rs \
+    crates/frankenterm-core/src \
+    > "${output_file}" || true
 
   local unexpected=0
   while IFS= read -r line; do
@@ -128,7 +131,8 @@ validate_spawn_blocking_allowlist() {
 
 validate_runtime_compat_helper_callsites() {
   local output_file="$1"
-  rg -n "\\b(mpsc_recv_option|mpsc_send|watch_has_changed|watch_borrow_and_update_clone|watch_changed)\\b" \
+  rg -n "runtime_compat::process::Command|\\b(mpsc_recv_option|mpsc_send|watch_has_changed|watch_borrow_and_update_clone|watch_changed)\\b" \
+    crates/frankenterm/src/main.rs \
     crates/frankenterm-core/src \
     --glob '!runtime_compat.rs' \
     > "${output_file}" || true
@@ -164,9 +168,9 @@ run_static_contract_checks() {
 
   local helper_guard_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_runtime_compat_helpers.log"
   if validate_runtime_compat_helper_callsites "${helper_guard_log}"; then
-    emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_compat_helper_callsites_outside_runtime_compat_rs" "passed" "runtime_compat_helper_replacement_enforced" "none" "$(basename "${helper_guard_log}")"
+    emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_compat_helper_or_process_callsites_outside_runtime_compat_rs" "passed" "runtime_compat_helper_replacement_enforced" "none" "$(basename "${helper_guard_log}")"
   else
-    emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_compat_helper_callsites_outside_runtime_compat_rs" "failed" "unexpected_runtime_compat_helper_callsite" "SURFACE-E203" "$(basename "${helper_guard_log}")"
+    emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_compat_helper_or_process_callsites_outside_runtime_compat_rs" "failed" "unexpected_runtime_compat_helper_callsite" "SURFACE-E203" "$(basename "${helper_guard_log}")"
     cat "${helper_guard_log}" >&2
     exit 1
   fi

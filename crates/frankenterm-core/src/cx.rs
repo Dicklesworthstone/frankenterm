@@ -146,6 +146,12 @@ pub fn for_testing() -> Cx {
     Cx::for_testing()
 }
 
+/// Construct a request-scoped capability context for production helper paths.
+#[must_use]
+pub fn for_request() -> Cx {
+    Cx::for_request()
+}
+
 /// Execute a closure while explicitly threading the same `Cx`.
 #[inline]
 pub fn with_cx<T>(cx: &Cx, f: impl FnOnce(&Cx) -> T) -> T {

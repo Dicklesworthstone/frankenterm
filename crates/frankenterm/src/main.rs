@@ -9007,26 +9007,32 @@ async fn run_robot_rpc_via_cli(
     config_path: Option<&Path>,
     workspace_root: &Path,
 ) -> Result<frankenterm_core::ipc::IpcResponse, String> {
-    use frankenterm_core::runtime_compat::process::Command;
     use std::process::Stdio;
 
     let exe =
         std::env::current_exe().map_err(|e| format!("failed to resolve wa executable: {e}"))?;
-    let mut cmd = Command::new(exe);
+    let config_path = config_path.map(PathBuf::from);
+    let workspace_root = workspace_root.to_path_buf();
+    let args = args.to_vec();
 
-    if let Some(path) = config_path {
-        cmd.arg("--config").arg(path);
-    }
+    // Keep subprocess ownership explicit here; the runtime only owns the
+    // blocking wait on the child process.
+    let output = frankenterm_core::runtime_compat::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(exe);
 
-    cmd.arg("--workspace").arg(workspace_root);
-    cmd.arg("robot").arg("--format").arg("json");
-    cmd.args(args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(path) = &config_path {
+            cmd.arg("--config").arg(path);
+        }
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("failed to run ft robot: {e}"))?;
+        cmd.arg("--workspace").arg(&workspace_root);
+        cmd.arg("robot").arg("--format").arg("json");
+        cmd.args(&args);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.output()
+    })
+    .await
+    .map_err(|e| format!("failed to run ft robot: {e}"))?
+    .map_err(|e| format!("failed to run ft robot: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -9172,32 +9178,47 @@ async fn run_ft_cli_capture(
     config_path: Option<&Path>,
     workspace_root: &Path,
 ) -> NtmParityCliCapture {
-    use frankenterm_core::runtime_compat::process::Command;
     use std::process::Stdio;
 
-    let mut cmd = Command::new(exe);
-    if let Some(path) = config_path {
-        cmd.arg("--config").arg(path);
-    }
-    cmd.arg("--workspace").arg(workspace_root);
-    cmd.args(args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let exe = exe.to_path_buf();
+    let config_path = config_path.map(PathBuf::from);
+    let workspace_root = workspace_root.to_path_buf();
+    let args = args.to_vec();
+    let exe_display = exe.display().to_string();
 
     let started_at = Instant::now();
-    match cmd.output().await {
-        Ok(output) => NtmParityCliCapture {
+    match frankenterm_core::runtime_compat::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&exe);
+        if let Some(path) = &config_path {
+            cmd.arg("--config").arg(path);
+        }
+        cmd.arg("--workspace").arg(&workspace_root);
+        cmd.args(&args);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.output()
+    })
+    .await
+    {
+        Ok(Ok(output)) => NtmParityCliCapture {
             exit_code: output.status.code(),
             duration_ms: started_at.elapsed().as_millis() as u64,
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             execution_error: None,
         },
+        Ok(Err(err)) => NtmParityCliCapture {
+            exit_code: None,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+            stdout: String::new(),
+            stderr: String::new(),
+            execution_error: Some(format!("failed to execute '{exe_display}': {err}")),
+        },
         Err(err) => NtmParityCliCapture {
             exit_code: None,
             duration_ms: started_at.elapsed().as_millis() as u64,
             stdout: String::new(),
             stderr: String::new(),
-            execution_error: Some(format!("failed to execute '{}': {err}", exe.display())),
+            execution_error: Some(format!("failed to execute '{exe_display}': {err}")),
         },
     }
 }
@@ -12867,10 +12888,11 @@ async fn run_single_scheduled_backup(
     let db_path = db_path.to_path_buf();
     let workspace_root = workspace_root.to_path_buf();
     let workspace_root_for_closure = workspace_root.clone();
-    let export_result = frankenterm_core::runtime_compat::task::spawn_blocking(move || {
+    let export_result = frankenterm_core::runtime_compat::spawn_blocking(move || {
         frankenterm_core::backup::export_backup(&db_path, &workspace_root_for_closure, &opts)
     })
-    .await??;
+    .await
+    .map_err(anyhow::Error::msg)??;
 
     let retention_days = config.retention_days;
     let max_backups = config.max_backups;
@@ -12882,7 +12904,7 @@ async fn run_single_scheduled_backup(
     if retention_days > 0 || max_backups > 0 {
         let now = chrono::Local::now();
         let destination_root = destination_root.clone();
-        frankenterm_core::runtime_compat::task::spawn_blocking(move || {
+        frankenterm_core::runtime_compat::spawn_blocking(move || {
             frankenterm_core::backup::prune_backups(
                 &destination_root,
                 retention_days,
@@ -12890,7 +12912,8 @@ async fn run_single_scheduled_backup(
                 now,
             )
         })
-        .await??;
+        .await
+        .map_err(anyhow::Error::msg)??;
     }
 
     Ok(export_result)
@@ -27398,12 +27421,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             // the main async runtime. The ProductionQueryClient creates its
             // own dedicated runtime for async operations.
             let layout_clone = layout.clone();
-            let result = frankenterm_core::runtime_compat::task::spawn_blocking(move || {
+            let result = frankenterm_core::runtime_compat::spawn_blocking(move || {
                 let query_client = ProductionQueryClient::with_storage(layout_clone, storage);
                 run_tui(query_client, tui_config)
             })
             .await
-            .map_err(|e| anyhow::anyhow!("TUI thread panicked: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("TUI blocking task failed: {e}"))?;
 
             if let Err(e) = result {
                 // Route through tracing, not raw eprintln (FTUI-03.2.a).
@@ -27433,12 +27456,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             let layout_clone = layout.clone();
-            let result = frankenterm_core::runtime_compat::task::spawn_blocking(move || {
+            let result = frankenterm_core::runtime_compat::spawn_blocking(move || {
                 let query_client = ProductionQueryClient::with_storage(layout_clone, storage);
                 run_tui(query_client, tui_config)
             })
             .await
-            .map_err(|e| anyhow::anyhow!("TUI thread panicked: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("TUI blocking task failed: {e}"))?;
 
             if let Err(e) = result {
                 // Route through tracing, not raw eprintln (FTUI-03.2.a).
@@ -27474,12 +27497,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             let layout_clone = layout.clone();
-            let result = frankenterm_core::runtime_compat::task::spawn_blocking(move || {
+            let result = frankenterm_core::runtime_compat::spawn_blocking(move || {
                 let query_client = ProductionQueryClient::with_storage(layout_clone, storage);
                 run_tui(query_client, tui_config)
             })
             .await
-            .map_err(|e| anyhow::anyhow!("TUI thread panicked: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("TUI blocking task failed: {e}"))?;
 
             if let Err(e) = result {
                 tracing::error!(%e, %backend, "TUI runtime error (rollout mode)");
