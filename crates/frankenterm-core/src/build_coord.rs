@@ -12,6 +12,9 @@
 //!   when available.
 //! - **Build coordination**: Wait-for-completion semantics — if another agent is
 //!   building, wait for it to finish, then reuse artifacts.
+//! - **RCH-aware classification**: Detect when heavy cargo commands are already
+//!   routed through `rch exec -- ...` so policy layers can steer agent traffic
+//!   away from local compile storms.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -334,6 +337,8 @@ impl BuildEnv {
 
 // ── Build status checking ───────────────────────────────────────────────────
 
+const HEAVY_CARGO_SUBCOMMANDS: &[&str] = &["build", "check", "test", "bench", "clippy"];
+
 /// Check if a build is currently running for a project.
 ///
 /// Returns `Some(metadata)` if a build lock is held, `None` otherwise.
@@ -408,12 +413,10 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
 /// Returns the cargo subcommand if detected (e.g., "build", "check", "test").
 #[must_use]
 pub fn detect_cargo_command(command: &str) -> Option<&str> {
-    let trimmed = command.trim();
-
-    // Direct cargo invocations
-    if let Some(rest) = trimmed.strip_prefix("cargo ") {
-        let subcommand = rest.split_whitespace().next()?;
-        return match subcommand {
+    let tokens = command_tokens(command);
+    let cargo_tokens = cargo_payload_tokens(&tokens)?;
+    match cargo_tokens {
+        [cargo, subcommand, ..] if cargo == "cargo" => match subcommand.as_str() {
             "build" | "b" => Some("build"),
             "check" | "c" => Some("check"),
             "test" | "t" | "nextest" => Some("test"),
@@ -422,18 +425,125 @@ pub fn detect_cargo_command(command: &str) -> Option<&str> {
             "run" | "r" => Some("run"),
             "doc" => Some("doc"),
             _ => None,
-        };
+        },
+        [cargo_nextest, ..] if cargo_nextest == "cargo-nextest" => Some("test"),
+        _ => None,
     }
+}
 
-    // cargo-nextest
-    if trimmed.starts_with("cargo-nextest") || trimmed.contains("cargo nextest") {
-        return Some("test");
+/// Returns true when the command is already routed through `rch exec --`.
+#[must_use]
+pub fn command_uses_rch(command: &str) -> bool {
+    let tokens = command_tokens(command);
+    let idx = skip_command_prefixes(&tokens, 0);
+    matches!(
+        (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2)),
+        (Some(cmd), Some(exec), Some(sep))
+            if is_rch_binary(cmd) && exec == "exec" && sep == "--"
+    )
+}
+
+/// Returns true when the command is a heavy cargo workload that should be offloaded.
+#[must_use]
+pub fn is_heavy_cargo_command(command: &str) -> bool {
+    detect_cargo_command(command)
+        .is_some_and(|subcommand| HEAVY_CARGO_SUBCOMMANDS.contains(&subcommand))
+}
+
+/// Returns true when a heavy cargo command is missing an `rch exec --` wrapper.
+#[must_use]
+pub fn requires_rch_offload(command: &str) -> bool {
+    is_heavy_cargo_command(command) && !command_uses_rch(command)
+}
+
+/// Recommended `rch` prefix for the current platform.
+#[must_use]
+pub const fn recommended_rch_prefix() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "TMPDIR=/tmp rch exec --"
+    } else {
+        "rch exec --"
     }
-
-    None
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn command_tokens(command: &str) -> Vec<String> {
+    let trimmed = command.trim_start();
+    let trimmed = trimmed.strip_prefix('$').map_or(trimmed, str::trim_start);
+    shell_words::split(trimmed)
+        .unwrap_or_else(|_| trimmed.split_whitespace().map(str::to_string).collect())
+}
+
+fn cargo_payload_tokens(tokens: &[String]) -> Option<&[String]> {
+    let mut idx = skip_command_prefixes(tokens, 0);
+
+    if matches!(
+        (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2)),
+        (Some(cmd), Some(exec), Some(sep))
+            if is_rch_binary(cmd) && exec == "exec" && sep == "--"
+    ) {
+        idx += 3;
+    }
+
+    idx = skip_command_prefixes(tokens, idx);
+    match tokens.get(idx).map(String::as_str) {
+        Some("cargo") | Some("cargo-nextest") => Some(&tokens[idx..]),
+        _ => None,
+    }
+}
+
+fn skip_command_prefixes(tokens: &[String], start: usize) -> usize {
+    let mut idx = start;
+
+    loop {
+        let next = skip_env_assignments(tokens, idx);
+        if next != idx {
+            idx = next;
+            continue;
+        }
+
+        match tokens.get(idx).map(String::as_str) {
+            Some("env") => {
+                idx += 1;
+                while let Some(token) = tokens.get(idx) {
+                    if token.starts_with('-') || is_env_assignment(token) {
+                        idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+
+    idx
+}
+
+fn skip_env_assignments(tokens: &[String], mut idx: usize) -> usize {
+    while let Some(token) = tokens.get(idx) {
+        if is_env_assignment(token) {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    idx
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(ch) if ch == '_' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn is_rch_binary(token: &str) -> bool {
+    token == "rch" || token.ends_with("/rch")
+}
 
 /// Detect sccache binary path.
 fn detect_sccache() -> Option<String> {
@@ -634,6 +744,36 @@ mod tests {
     }
 
     #[test]
+    fn detect_cargo_command_under_rch_wrapper() {
+        assert_eq!(
+            detect_cargo_command("rch exec -- cargo test -p frankenterm-core"),
+            Some("test")
+        );
+        assert_eq!(
+            detect_cargo_command("TMPDIR=/tmp rch exec -- cargo check --help"),
+            Some("check")
+        );
+        assert_eq!(
+            detect_cargo_command(
+                "TMPDIR=/tmp rch exec -- env CARGO_TARGET_DIR=target/rch cargo clippy -- -D warnings"
+            ),
+            Some("clippy")
+        );
+    }
+
+    #[test]
+    fn detect_cargo_command_under_env_wrapper() {
+        assert_eq!(
+            detect_cargo_command("env CARGO_TARGET_DIR=target cargo bench --no-run"),
+            Some("bench")
+        );
+        assert_eq!(
+            detect_cargo_command("env -i CARGO_TARGET_DIR=target cargo-nextest run"),
+            Some("test")
+        );
+    }
+
+    #[test]
     fn build_env_sets_target_dir() {
         let tmp = setup_project();
         let config = BuildCoordConfig {
@@ -797,6 +937,45 @@ mod tests {
             detect_cargo_command("cargo clippy -- -D warnings"),
             Some("clippy")
         );
+    }
+
+    #[test]
+    fn command_uses_rch_detects_common_prefix_shapes() {
+        assert!(command_uses_rch("rch exec -- cargo test --workspace"));
+        assert!(command_uses_rch(
+            "TMPDIR=/tmp rch exec -- cargo check --help"
+        ));
+        assert!(command_uses_rch(
+            "env TMPDIR=/tmp /Users/jemanuel/.local/bin/rch exec -- cargo clippy"
+        ));
+        assert!(!command_uses_rch("cargo test --workspace"));
+        assert!(!command_uses_rch("env CARGO_TARGET_DIR=target cargo test"));
+    }
+
+    #[test]
+    fn heavy_cargo_detection_matches_policy_expectations() {
+        assert!(is_heavy_cargo_command("cargo build"));
+        assert!(is_heavy_cargo_command("cargo check --workspace"));
+        assert!(is_heavy_cargo_command("cargo nextest run"));
+        assert!(is_heavy_cargo_command(
+            "TMPDIR=/tmp rch exec -- cargo clippy"
+        ));
+        assert!(!is_heavy_cargo_command("cargo fmt --check"));
+        assert!(!is_heavy_cargo_command("cargo metadata"));
+        assert!(!is_heavy_cargo_command("cargo doc --open"));
+    }
+
+    #[test]
+    fn requires_rch_offload_only_for_unwrapped_heavy_commands() {
+        assert!(requires_rch_offload("cargo test -p frankenterm-core"));
+        assert!(requires_rch_offload("cargo check --help"));
+        assert!(!requires_rch_offload("cargo fmt --check"));
+        assert!(!requires_rch_offload(
+            "TMPDIR=/tmp rch exec -- cargo test --workspace"
+        ));
+        assert!(!requires_rch_offload(
+            "TMPDIR=/tmp rch exec -- env CARGO_TARGET_DIR=target cargo check --help"
+        ));
     }
 
     // ====================================================================

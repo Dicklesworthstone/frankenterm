@@ -1779,6 +1779,7 @@ const COMMAND_TOKENS: &[&str] = &[
 const TRAUMA_BYPASS_ENV: &str = "FT_BYPASS_TRAUMA";
 const TRAUMA_LOOP_BLOCK_RULE_ID: &str = "policy.trauma_guard.loop_block";
 const TRAUMA_FEEDBACK_PREFIX: &str = "[ft::TraumaGuard]";
+const RCH_HEAVY_COMPUTE_RULE_ID: &str = "policy.rch.heavy_compute";
 
 /// Determine whether the text looks like a shell command
 #[must_use]
@@ -3253,6 +3254,29 @@ impl PolicyEngine {
                     );
                 }
 
+                if input.actor != ActorKind::Human && crate::build_coord::requires_rch_offload(text)
+                {
+                    let prefix = crate::build_coord::recommended_rch_prefix();
+                    let reason = format!(
+                        "Heavy cargo commands from {} actions must be routed through `{prefix}` to avoid local contention",
+                        input.actor.as_str()
+                    );
+                    context.record_rule(
+                        RCH_HEAVY_COMPUTE_RULE_ID,
+                        true,
+                        Some("require_approval"),
+                        Some(reason.clone()),
+                    );
+                    context.set_determining_rule(RCH_HEAVY_COMPUTE_RULE_ID);
+                    context.add_evidence("rch_required", "true");
+                    context.add_evidence("rch_recommended_prefix", prefix);
+                    return PolicyDecision::require_approval_with_rule(
+                        reason,
+                        RCH_HEAVY_COMPUTE_RULE_ID,
+                    )
+                    .with_context(context);
+                }
+
                 match evaluate_command_gate(text, &self.command_gate) {
                     CommandGateOutcome::Allow => {
                         context.record_rule(
@@ -4503,6 +4527,61 @@ mod tests {
 
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn robot_heavy_cargo_without_rch_requires_approval() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("cargo test -p frankenterm-core -- --nocapture");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+        assert_eq!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
+        assert!(
+            decision
+                .reason()
+                .is_some_and(|reason| reason.contains("rch exec"))
+        );
+    }
+
+    #[test]
+    fn robot_heavy_cargo_with_rch_prefix_is_allowed() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("TMPDIR=/tmp rch exec -- cargo check --help");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn robot_light_cargo_without_rch_is_allowed() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("cargo fmt --check");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn human_heavy_cargo_without_rch_is_not_forced_through_rch_policy() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("cargo build --workspace");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+        assert_ne!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
     }
 
     #[test]
