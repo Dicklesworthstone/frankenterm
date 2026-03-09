@@ -1346,3 +1346,212 @@ proptest! {
         }
     }
 }
+
+// =============================================================================
+// Additional serde roundtrips for composite types (coverage gaps)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// LogLevel serde roundtrip.
+    #[test]
+    fn log_level_serde_roundtrip(level in arb_log_level()) {
+        let json = serde_json::to_string(&level).unwrap();
+        let restored: LogLevel = serde_json::from_str(&json).unwrap();
+        assert_eq!(level, restored);
+    }
+
+    /// LogLevel Debug is non-empty.
+    #[test]
+    fn log_level_debug_not_empty(level in arb_log_level()) {
+        let debug = format!("{level:?}");
+        prop_assert!(!debug.is_empty());
+    }
+
+    /// PreconditionCheck serde roundtrip.
+    #[test]
+    fn precondition_check_serde_roundtrip(check in arb_precondition_check()) {
+        let json = serde_json::to_string(&check).unwrap();
+        let restored: PreconditionCheck = serde_json::from_str(&json).unwrap();
+        // Compare via serde_json::Value for deterministic equality
+        let val1: serde_json::Value = serde_json::to_value(&check).unwrap();
+        let val2: serde_json::Value = serde_json::to_value(&restored).unwrap();
+        assert_eq!(val1, val2);
+    }
+
+    /// PipelineCondition serde roundtrip.
+    #[test]
+    fn pipeline_condition_serde_roundtrip(cond in arb_pipeline_condition()) {
+        let json = serde_json::to_string(&cond).unwrap();
+        let restored: PipelineCondition = serde_json::from_str(&json).unwrap();
+        let val1: serde_json::Value = serde_json::to_value(&cond).unwrap();
+        let val2: serde_json::Value = serde_json::to_value(&restored).unwrap();
+        assert_eq!(val1, val2);
+    }
+
+    /// CircuitBreakerConfig serde roundtrip + Default.
+    #[test]
+    fn circuit_breaker_config_serde_roundtrip(config in arb_circuit_breaker_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: CircuitBreakerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.failure_threshold, restored.failure_threshold);
+        assert_eq!(config.reset_timeout_ms, restored.reset_timeout_ms);
+        assert_eq!(config.success_threshold, restored.success_threshold);
+    }
+
+    /// CircuitBreakerConfig Default roundtrip.
+    #[test]
+    fn circuit_breaker_config_default_roundtrip(_dummy in 0..1_u8) {
+        let config = CircuitBreakerConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: CircuitBreakerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.failure_threshold, restored.failure_threshold);
+    }
+
+    /// CircuitBreaker serde roundtrip.
+    #[test]
+    fn circuit_breaker_serde_roundtrip(
+        config in arb_circuit_breaker_config(),
+        state in arb_circuit_state(),
+        failures in 0_u32..100,
+        successes in 0_u32..100,
+        total_f in 0_u64..10_000,
+        total_s in 0_u64..10_000,
+    ) {
+        let cb = CircuitBreaker {
+            config: config.clone(),
+            state,
+            consecutive_failures: failures,
+            consecutive_successes: successes,
+            total_failures: total_f,
+            total_successes: total_s,
+        };
+        let json = serde_json::to_string(&cb).unwrap();
+        let restored: CircuitBreaker = serde_json::from_str(&json).unwrap();
+        assert_eq!(cb.consecutive_failures, restored.consecutive_failures);
+        assert_eq!(cb.total_failures, restored.total_failures);
+        assert_eq!(cb.state, restored.state);
+    }
+
+    /// RecoveryPolicy serde roundtrip + Default.
+    #[test]
+    fn recovery_policy_default_roundtrip(_dummy in 0..1_u8) {
+        let policy = RecoveryPolicy::default();
+        let json = serde_json::to_string(&policy).unwrap();
+        let restored: RecoveryPolicy = serde_json::from_str(&json).unwrap();
+        // Compare via serde_json::Value since RecoveryPolicy may not impl PartialEq
+        let val1: serde_json::Value = serde_json::to_value(&policy).unwrap();
+        let val2: serde_json::Value = serde_json::to_value(&restored).unwrap();
+        assert_eq!(val1, val2);
+    }
+
+    /// RecoveryPolicy serde roundtrip with custom values.
+    #[test]
+    fn recovery_policy_serde_roundtrip(
+        max_retries in 0_u32..10,
+        compensate in any::<bool>(),
+    ) {
+        let policy = RecoveryPolicy {
+            max_retries,
+            compensate_on_failure: compensate,
+            ..RecoveryPolicy::default()
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let restored: RecoveryPolicy = serde_json::from_str(&json).unwrap();
+        let val1: serde_json::Value = serde_json::to_value(&policy).unwrap();
+        let val2: serde_json::Value = serde_json::to_value(&restored).unwrap();
+        assert_eq!(val1, val2);
+    }
+
+    /// CompensatingAction serde roundtrip.
+    #[test]
+    fn compensating_action_serde_roundtrip(
+        label in "[a-z_]{3,10}",
+        compensates in "[a-z_]{3,10}",
+        kind in arb_compensation_kind(),
+        timeout in 1000_u64..60_000,
+        required in any::<bool>(),
+    ) {
+        let action = CompensatingAction {
+            label,
+            compensates_step: compensates,
+            action: kind,
+            timeout_ms: timeout,
+            required,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let restored: CompensatingAction = serde_json::from_str(&json).unwrap();
+        let val1: serde_json::Value = serde_json::to_value(&action).unwrap();
+        let val2: serde_json::Value = serde_json::to_value(&restored).unwrap();
+        assert_eq!(val1, val2);
+    }
+
+    /// HookContext serde roundtrip.
+    #[test]
+    fn hook_context_serde_roundtrip(
+        pipeline_name in "[a-z_]{3,10}",
+        elapsed in 0_u64..600_000,
+        steps_completed in 0_usize..20,
+        total_steps in 1_usize..20,
+    ) {
+        let ctx = HookContext {
+            execution_id: "exec-123".to_string(),
+            pipeline_name,
+            step_index: Some(0),
+            step_label: Some("step-0".to_string()),
+            elapsed_ms: elapsed,
+            steps_completed,
+            total_steps,
+            last_result: None,
+            metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        let restored: HookContext = serde_json::from_str(&json).unwrap();
+        let val1: serde_json::Value = serde_json::to_value(&ctx).unwrap();
+        let val2: serde_json::Value = serde_json::to_value(&restored).unwrap();
+        assert_eq!(val1, val2);
+    }
+
+    /// PipelineStep serde roundtrip via simple noop step.
+    #[test]
+    fn pipeline_step_serde_roundtrip(label in "[a-z_]{3,10}") {
+        let step = noop_step(&label);
+        let json = serde_json::to_string(&step).unwrap();
+        let restored: PipelineStep = serde_json::from_str(&json).unwrap();
+        let val1: serde_json::Value = serde_json::to_value(&step).unwrap();
+        let val2: serde_json::Value = serde_json::to_value(&restored).unwrap();
+        assert_eq!(val1, val2);
+    }
+
+    /// PipelineDefinition serde roundtrip.
+    #[test]
+    fn pipeline_definition_serde_roundtrip(n in 1_usize..4) {
+        let steps: Vec<PipelineStep> = (0..n)
+            .map(|i| noop_step(&format!("step-{i}")))
+            .collect();
+        let pipeline = simple_pipeline("roundtrip-test", steps);
+        let json = serde_json::to_string(&pipeline).unwrap();
+        let restored: PipelineDefinition = serde_json::from_str(&json).unwrap();
+        let val1: serde_json::Value = serde_json::to_value(&pipeline).unwrap();
+        let val2: serde_json::Value = serde_json::to_value(&restored).unwrap();
+        assert_eq!(val1, val2);
+    }
+
+    /// PipelineExecution serde roundtrip via executor.
+    #[test]
+    fn pipeline_execution_serde_roundtrip(n in 1_usize..=3) {
+        let steps: Vec<PipelineStep> = (0..n)
+            .map(|i| noop_step(&format!("step-{i}")))
+            .collect();
+        let pipeline = simple_pipeline("exec-roundtrip", steps);
+        let mut executor = PipelineExecutor::new();
+        let execution = executor.execute(&pipeline, 1000).unwrap();
+        let json = serde_json::to_string(&execution).unwrap();
+        let restored: PipelineExecution = serde_json::from_str(&json).unwrap();
+        assert_eq!(execution.execution_id, restored.execution_id);
+        assert_eq!(execution.pipeline_name, restored.pipeline_name);
+        assert_eq!(execution.status, restored.status);
+        assert_eq!(execution.step_outcomes.len(), restored.step_outcomes.len());
+    }
+}

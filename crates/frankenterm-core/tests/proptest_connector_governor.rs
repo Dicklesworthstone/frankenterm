@@ -662,3 +662,57 @@ proptest! {
             "snapshot connector count should match");
     }
 }
+
+// =============================================================================
+// Additional serde roundtrip tests (coverage gaps)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    /// ConnectorGovernorConfig Default serde roundtrip.
+    #[test]
+    fn governor_config_default_serde(_dummy in 0..1_u8) {
+        let config = ConnectorGovernorConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ConnectorGovernorConfig = serde_json::from_str(&json).unwrap();
+        // Compare via serde_json::Value (f64 fields)
+        let val1: serde_json::Value = serde_json::to_value(&config).unwrap();
+        let val2: serde_json::Value = serde_json::to_value(&back).unwrap();
+        prop_assert_eq!(val1, val2);
+    }
+
+    /// GovernorSnapshot serde roundtrip via live governor.
+    #[test]
+    fn governor_snapshot_serde_roundtrip(
+        actions in prop::collection::vec(arb_connector_action(), 1..5),
+    ) {
+        let mut gov = ConnectorGovernor::new(ConnectorGovernorConfig::default());
+        for a in &actions {
+            gov.evaluate(a, a.created_at_ms);
+        }
+        let snap = gov.snapshot(200_000);
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: GovernorSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.telemetry, snap.telemetry);
+        prop_assert_eq!(back.connectors.len(), snap.connectors.len());
+    }
+
+    /// GovernorSnapshot JSON contains expected top-level keys.
+    #[test]
+    fn governor_snapshot_json_keys(
+        actions in prop::collection::vec(arb_connector_action(), 1..3),
+    ) {
+        let mut gov = ConnectorGovernor::new(ConnectorGovernorConfig::default());
+        for a in &actions {
+            gov.evaluate(a, a.created_at_ms);
+        }
+        let snap = gov.snapshot(200_000);
+        let json = serde_json::to_string(&snap).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = val.as_object().unwrap();
+        prop_assert!(obj.contains_key("telemetry"));
+        prop_assert!(obj.contains_key("connectors"));
+        prop_assert!(obj.contains_key("global_rate_fill_ratio"));
+    }
+}
