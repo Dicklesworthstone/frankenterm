@@ -15,9 +15,10 @@
 use frankenterm_core::connector_host_runtime::{ConnectorCapability, ConnectorHostConfig};
 use frankenterm_core::connector_registry::TrustLevel;
 use frankenterm_core::connector_sdk::{
-    CertificationPipeline, CertificationReport, ConnectorSimulator, LintFinding, LintReport,
-    LintSeverity, ManifestBuilder, ManifestLinter, SimulationEvent, SimulationEventType,
-    TrustPolicyBuilder, compute_sha256_hex,
+    CertificationPipeline, CertificationPhase, CertificationReport, CertificationTelemetry,
+    CertificationTelemetrySnapshot, CertificationVerdict, ConnectorSimulator, LintFinding,
+    LintReport, LintRule, LintSeverity, ManifestBuilder, ManifestLinter, PhaseResult,
+    PhaseVerdict, SimulationEvent, SimulationEventType, TrustPolicyBuilder, compute_sha256_hex,
 };
 use proptest::prelude::*;
 
@@ -552,5 +553,337 @@ proptest! {
             }
         }
         prop_assert_eq!(sim.connector_count(), registered);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Additional strategies for coverage gaps
+// ---------------------------------------------------------------------------
+
+fn arb_certification_phase() -> impl Strategy<Value = CertificationPhase> {
+    prop_oneof![
+        Just(CertificationPhase::SchemaValidation),
+        Just(CertificationPhase::LintCheck),
+        Just(CertificationPhase::DigestVerification),
+        Just(CertificationPhase::CapabilityAudit),
+        Just(CertificationPhase::TrustPolicyGate),
+        Just(CertificationPhase::IntegrationProbe),
+    ]
+}
+
+fn arb_certification_verdict() -> impl Strategy<Value = CertificationVerdict> {
+    prop_oneof![
+        Just(CertificationVerdict::Certified),
+        Just(CertificationVerdict::ConditionalPass),
+        Just(CertificationVerdict::Rejected),
+    ]
+}
+
+fn arb_simulation_event_type() -> impl Strategy<Value = SimulationEventType> {
+    prop_oneof![
+        Just(SimulationEventType::Registered),
+        Just(SimulationEventType::Started),
+        Just(SimulationEventType::Stopped),
+        Just(SimulationEventType::Heartbeat),
+        Just(SimulationEventType::UsageChecked),
+        Just(SimulationEventType::OperationAuthorized),
+        Just(SimulationEventType::OperationDenied),
+        Just(SimulationEventType::CertificationRun),
+        Just(SimulationEventType::FailureRecorded),
+        Just(SimulationEventType::Restarted),
+    ]
+}
+
+fn arb_phase_verdict() -> impl Strategy<Value = PhaseVerdict> {
+    prop_oneof![
+        Just(PhaseVerdict::Passed),
+        proptest::collection::vec("[a-z ]{3,20}", 1..4)
+            .prop_map(|warnings| PhaseVerdict::PassedWithWarnings { warnings }),
+        proptest::collection::vec("[a-z ]{3,20}", 1..4)
+            .prop_map(|reasons| PhaseVerdict::Failed { reasons }),
+        "[a-z ]{3,20}".prop_map(|reason| PhaseVerdict::Skipped { reason }),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// CertificationPhase — serde + as_str + Display
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn certification_phase_serde_and_as_str(phase in arb_certification_phase()) {
+        let json = serde_json::to_string(&phase).unwrap();
+        let back: CertificationPhase = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, phase);
+
+        let expected_json = format!("\"{}\"", phase.as_str());
+        prop_assert_eq!(json, expected_json);
+
+        // Display matches as_str
+        let display = phase.to_string();
+        prop_assert_eq!(display.as_str(), phase.as_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CertificationVerdict — serde + as_str + Display
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn certification_verdict_serde_and_as_str(verdict in arb_certification_verdict()) {
+        let json = serde_json::to_string(&verdict).unwrap();
+        let back: CertificationVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, verdict);
+
+        let expected_json = format!("\"{}\"", verdict.as_str());
+        prop_assert_eq!(json, expected_json);
+
+        let display = verdict.to_string();
+        prop_assert_eq!(display.as_str(), verdict.as_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PhaseVerdict — serde roundtrip + is_pass
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn phase_verdict_serde_and_is_pass(verdict in arb_phase_verdict()) {
+        let expected_pass = matches!(verdict, PhaseVerdict::Passed | PhaseVerdict::PassedWithWarnings { .. });
+        let is_pass = verdict.is_pass();
+        let json = serde_json::to_string(&verdict).unwrap();
+        let back: PhaseVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, verdict);
+
+        // is_pass matches Passed/PassedWithWarnings
+        prop_assert_eq!(is_pass, expected_pass);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PhaseResult — serde roundtrip
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn phase_result_serde(
+        phase in arb_certification_phase(),
+        verdict in arb_phase_verdict(),
+        elapsed_ms in 0_u64..10_000,
+    ) {
+        let result = PhaseResult {
+            phase,
+            verdict: verdict.clone(),
+            elapsed_ms,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: PhaseResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.phase, result.phase);
+        prop_assert_eq!(back.verdict, result.verdict);
+        prop_assert_eq!(back.elapsed_ms, result.elapsed_ms);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LintRule — serde roundtrip
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn lint_rule_serde(
+        rule_id in "[a-z\\.]{3,20}",
+        severity in arb_lint_severity(),
+        description in "[a-zA-Z0-9 ]{5,40}",
+    ) {
+        let rule = LintRule {
+            rule_id: rule_id.clone(),
+            severity,
+            description: description.clone(),
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let back: LintRule = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.rule_id, &rule.rule_id);
+        prop_assert_eq!(back.severity, rule.severity);
+        prop_assert_eq!(&back.description, &rule.description);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LintSeverity — as_str + Display + ordering
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn lint_severity_as_str_and_display(severity in arb_lint_severity()) {
+        let as_str = severity.as_str();
+        let display = severity.to_string();
+        prop_assert_eq!(as_str, display.as_str());
+
+        let json = serde_json::to_string(&severity).unwrap();
+        let expected = format!("\"{as_str}\"");
+        prop_assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn lint_severity_ordering(_dummy in 0..1_u32) {
+        // Info < Warning < Error
+        prop_assert!(LintSeverity::Info < LintSeverity::Warning);
+        prop_assert!(LintSeverity::Warning < LintSeverity::Error);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SimulationEventType — all 10 variants serde
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn simulation_event_type_serde_all_variants(evt in arb_simulation_event_type()) {
+        let json = serde_json::to_string(&evt).unwrap();
+        let back: SimulationEventType = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, evt);
+        // snake_case encoding
+        prop_assert!(json.starts_with('"') && json.ends_with('"'));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CertificationTelemetry — serde + Default
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn certification_telemetry_serde(
+        total in 0_u64..1000,
+        certified in 0_u64..500,
+        conditional in 0_u64..500,
+        rejections in 0_u64..500,
+        failure_keys in proptest::collection::vec("[a-z_]{3,10}", 0..5),
+    ) {
+        let mut phase_failures = std::collections::BTreeMap::new();
+        for (i, key) in failure_keys.iter().enumerate() {
+            phase_failures.insert(key.clone(), i as u64 + 1);
+        }
+        let telem = CertificationTelemetry {
+            total_runs: total,
+            certified,
+            conditional_passes: conditional,
+            rejections,
+            phase_failures: phase_failures.clone(),
+        };
+        let json = serde_json::to_string(&telem).unwrap();
+        let back: CertificationTelemetry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_runs, telem.total_runs);
+        prop_assert_eq!(back.certified, telem.certified);
+        prop_assert_eq!(back.conditional_passes, telem.conditional_passes);
+        prop_assert_eq!(back.rejections, telem.rejections);
+        prop_assert_eq!(back.phase_failures.len(), telem.phase_failures.len());
+    }
+
+    #[test]
+    fn certification_telemetry_default(_dummy in 0..1_u32) {
+        let d = CertificationTelemetry::default();
+        prop_assert_eq!(d.total_runs, 0);
+        prop_assert_eq!(d.certified, 0);
+        prop_assert_eq!(d.conditional_passes, 0);
+        prop_assert_eq!(d.rejections, 0);
+        prop_assert!(d.phase_failures.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CertificationTelemetrySnapshot — serde roundtrip
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn certification_telemetry_snapshot_serde(
+        total in 0_u64..1000,
+        certified in 0_u64..500,
+        conditional in 0_u64..500,
+        rejections in 0_u64..500,
+    ) {
+        let snap = CertificationTelemetrySnapshot {
+            total_runs: total,
+            certified,
+            conditional_passes: conditional,
+            rejections,
+            phase_failures: std::collections::BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: CertificationTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, snap);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CertificationReport — passed() invariant
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn certification_report_passed_invariant(verdict in arb_certification_verdict()) {
+        let report = CertificationReport {
+            package_id: "test-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            verdict,
+            phases: vec![],
+            trust_level: None,
+            total_elapsed_ms: 0,
+        };
+        let expected_passed = matches!(verdict, CertificationVerdict::Certified | CertificationVerdict::ConditionalPass);
+        prop_assert_eq!(report.passed(), expected_passed);
+    }
+
+    #[test]
+    fn certification_report_display_not_empty(verdict in arb_certification_verdict()) {
+        let report = CertificationReport {
+            package_id: "test-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            verdict,
+            phases: vec![],
+            trust_level: None,
+            total_elapsed_ms: 42,
+        };
+        let display = report.to_string();
+        prop_assert!(!display.is_empty());
+        prop_assert!(display.contains("test-pkg"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LintFinding Display
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn lint_finding_display_contains_rule_id(finding in arb_lint_finding()) {
+        let display = finding.to_string();
+        prop_assert!(display.contains(&finding.rule_id));
+        prop_assert!(display.contains(&finding.message));
     }
 }
