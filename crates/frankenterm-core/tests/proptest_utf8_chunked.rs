@@ -5,7 +5,10 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::utf8_chunked::Utf8ChunkedValidator;
+use frankenterm_core::utf8_chunked::{
+    ChunkValidation, Utf8ChunkedValidator, Utf8ValidationStats, is_valid_utf8,
+    valid_utf8_prefix_len,
+};
 
 // =============================================================================
 // Strategies
@@ -252,10 +255,180 @@ proptest! {
         v.finish();
         let stats = v.stats();
         let json = serde_json::to_string(&stats).unwrap();
-        let rt: frankenterm_core::utf8_chunked::Utf8ValidationStats =
-            serde_json::from_str(&json).unwrap();
+        let rt: Utf8ValidationStats = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(rt.valid_bytes, stats.valid_bytes);
         prop_assert_eq!(rt.invalid_bytes, stats.invalid_bytes);
         prop_assert_eq!(rt.replacements, stats.replacements);
+    }
+}
+
+// =============================================================================
+// Additional coverage tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// UC-12: ChunkValidation serde roundtrip.
+    #[test]
+    fn uc12_chunk_validation_serde(
+        valid_bytes in 0usize..10000,
+        invalid_bytes in 0usize..1000,
+        valid_prefix_end in 0usize..10000,
+        has_trailing in any::<bool>(),
+    ) {
+        let cv = ChunkValidation {
+            valid_bytes,
+            invalid_bytes,
+            valid_prefix_end,
+            has_trailing_partial: has_trailing,
+        };
+        let json = serde_json::to_string(&cv).unwrap();
+        let back: ChunkValidation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(cv.valid_bytes, back.valid_bytes);
+        prop_assert_eq!(cv.invalid_bytes, back.invalid_bytes);
+        prop_assert_eq!(cv.valid_prefix_end, back.valid_prefix_end);
+        prop_assert_eq!(cv.has_trailing_partial, back.has_trailing_partial);
+    }
+
+    /// UC-13: Utf8ValidationStats serde roundtrip with arbitrary values.
+    #[test]
+    fn uc13_stats_serde_arbitrary(
+        valid in 0u64..1_000_000,
+        invalid in 0u64..1_000_000,
+        replacements in 0u64..10000,
+    ) {
+        let total = valid + invalid;
+        let ratio = if total > 0 { valid as f64 / total as f64 } else { 1.0 };
+        let stats = Utf8ValidationStats {
+            valid_bytes: valid,
+            invalid_bytes: invalid,
+            replacements,
+            validity_ratio: ratio,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: Utf8ValidationStats = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(stats.valid_bytes, back.valid_bytes);
+        prop_assert_eq!(stats.invalid_bytes, back.invalid_bytes);
+        prop_assert_eq!(stats.replacements, back.replacements);
+        prop_assert!((stats.validity_ratio - back.validity_ratio).abs() < 1e-10);
+    }
+
+    /// UC-14: valid_utf8_prefix_len agrees with std::str::from_utf8.
+    #[test]
+    fn uc14_prefix_len_matches_std(data in random_bytes()) {
+        let prefix_len = valid_utf8_prefix_len(&data);
+        let std_prefix = match std::str::from_utf8(&data) {
+            Ok(_) => data.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        prop_assert_eq!(prefix_len, std_prefix);
+    }
+
+    /// UC-15: is_valid_utf8 agrees with std::str::from_utf8.
+    #[test]
+    fn uc15_is_valid_matches_std(data in random_bytes()) {
+        let ours = is_valid_utf8(&data);
+        let std_result = std::str::from_utf8(&data).is_ok();
+        prop_assert_eq!(ours, std_result);
+    }
+
+    /// UC-16: Valid UTF-8 text always has is_valid_utf8 == true.
+    #[test]
+    fn uc16_valid_string_is_valid(text in valid_utf8_text()) {
+        prop_assert!(is_valid_utf8(text.as_bytes()));
+    }
+
+    /// UC-17: finish() with no pending returns zero invalid.
+    #[test]
+    fn uc17_finish_no_pending(text in "[a-z]{0,100}") {
+        let mut v = Utf8ChunkedValidator::new();
+        v.validate_chunk(text.as_bytes());
+        prop_assert!(!v.has_pending());
+        let f = v.finish();
+        prop_assert_eq!(f.invalid_bytes, 0);
+    }
+
+    /// UC-18: Empty chunk after non-empty preserves state.
+    #[test]
+    fn uc18_empty_chunk_preserves_state(data in random_bytes()) {
+        let mut v = Utf8ChunkedValidator::new();
+        v.validate_chunk(&data);
+        let stats_before = v.stats();
+        v.validate_chunk(b"");
+        let stats_after = v.stats();
+        prop_assert_eq!(stats_before.valid_bytes, stats_after.valid_bytes);
+        prop_assert_eq!(stats_before.invalid_bytes, stats_after.invalid_bytes);
+    }
+
+    /// UC-19: has_pending is true exactly when last chunk ended mid-codepoint.
+    #[test]
+    fn uc19_has_pending_after_split_multibyte(
+        prefix in "[a-z]{0,20}",
+    ) {
+        let mut v = Utf8ChunkedValidator::new();
+        // Feed valid ASCII — no pending
+        v.validate_chunk(prefix.as_bytes());
+        prop_assert!(!v.has_pending());
+
+        // Feed first byte of é (0xC3 0xA9) — should be pending
+        v.validate_chunk(&[0xC3]);
+        prop_assert!(v.has_pending());
+
+        // Complete it
+        v.validate_chunk(&[0xA9]);
+        prop_assert!(!v.has_pending());
+    }
+
+    /// UC-20: Splitting multi-byte chars at every byte position produces
+    /// same total valid bytes as single-pass.
+    #[test]
+    fn uc20_multibyte_split_every_position(
+        text in "[a-zéèêëà€🦀]{1,30}",
+    ) {
+        let data = text.as_bytes();
+
+        // Single pass
+        let mut v1 = Utf8ChunkedValidator::new();
+        v1.validate_chunk(data);
+        v1.finish();
+        let stats1 = v1.stats();
+
+        // Split at every position
+        for split in 0..=data.len() {
+            let mut v2 = Utf8ChunkedValidator::new();
+            v2.validate_chunk(&data[..split]);
+            v2.validate_chunk(&data[split..]);
+            v2.finish();
+            let stats2 = v2.stats();
+            prop_assert_eq!(
+                stats1.valid_bytes, stats2.valid_bytes,
+                "mismatch at split={}", split
+            );
+            prop_assert_eq!(stats2.invalid_bytes, 0);
+        }
+    }
+
+    /// UC-21: Stats validity_ratio is exactly valid/(valid+invalid).
+    #[test]
+    fn uc21_validity_ratio_exact(data in mixed_utf8_and_binary()) {
+        let mut v = Utf8ChunkedValidator::new();
+        v.validate_chunk(&data);
+        v.finish();
+        let stats = v.stats();
+        let total = stats.valid_bytes + stats.invalid_bytes;
+        if total > 0 {
+            let expected = stats.valid_bytes as f64 / total as f64;
+            prop_assert!((stats.validity_ratio - expected).abs() < 1e-10,
+                "ratio {} != expected {}", stats.validity_ratio, expected);
+        } else {
+            prop_assert!((stats.validity_ratio - 1.0).abs() < f64::EPSILON);
+        }
+    }
+
+    /// UC-22: valid_utf8_prefix_len on valid text returns full length.
+    #[test]
+    fn uc22_prefix_len_full_on_valid(text in valid_utf8_text()) {
+        prop_assert_eq!(valid_utf8_prefix_len(text.as_bytes()), text.len());
     }
 }
