@@ -302,25 +302,20 @@ fn build_approval_grant_decision_context(
     input: &PolicyInput,
     timestamp_ms: i64,
 ) -> Option<String> {
-    let mut context = DecisionContext {
+    let mut context = DecisionContext::new_audit(
         timestamp_ms,
-        action: input.action,
-        actor: input.actor,
-        surface: input.surface,
-        pane_id: input.pane_id,
-        domain: input.domain.clone(),
-        capabilities: input.capabilities.clone(),
-        text_summary: input
+        input.action,
+        input.actor,
+        input.surface,
+        input.pane_id,
+        input.domain.clone(),
+        input
             .text_summary
             .clone()
             .or_else(|| Some(format!("approval consume for {}", input.action.as_str()))),
-        workflow_id: input.workflow_id.clone(),
-        rules_evaluated: Vec::new(),
-        determining_rule: None,
-        evidence: Vec::new(),
-        rate_limit: None,
-        risk: None,
-    };
+        input.workflow_id.clone(),
+    );
+    context.capabilities = input.capabilities.clone();
     context.record_rule(
         "approval.allow_once.consume",
         true,
@@ -1780,6 +1775,8 @@ mod tests {
             assert_eq!(context.action, ActionKind::SendText);
             assert_eq!(context.actor, ActorKind::Robot);
             assert_eq!(context.surface, PolicySurface::Mux);
+            assert_eq!(context.text_summary.as_deref(), Some("echo hi"));
+            assert_eq!(context.capabilities, PaneCapabilities::prompt());
             assert_eq!(
                 context.determining_rule.as_deref(),
                 Some("approval.allow_once.consume")
