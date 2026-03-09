@@ -91,6 +91,7 @@ triage.json
 
 # Proptest regression files (auto-generated, machine-specific)
 **/proptest-regressions/
+*.proptest-regressions
 
 # TLA+ model checker generated state files (multi-GB, regeneratable)
 docs/formal/states/
