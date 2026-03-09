@@ -927,3 +927,422 @@ proptest! {
         let _: &dyn std::error::Error = &e;
     }
 }
+
+// =============================================================================
+// Circuit breaker: HalfOpen→Open transition on failure
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// A failure in HalfOpen state transitions back to Open.
+    #[test]
+    fn circuit_breaker_halfopen_failure_reopens(
+        threshold in 1u32..=10,
+        now_ms in 0u64..1_000_000,
+    ) {
+        let config = CircuitBreakerConfig {
+            failure_threshold: threshold,
+            reset_timeout_ms: 10_000,
+            success_threshold: 3,
+        };
+        let mut cb = CircuitBreaker::new(config);
+        // Force into HalfOpen state
+        cb.state = CircuitState::HalfOpen { attempt_count: 1 };
+        cb.record_failure(now_ms);
+        let is_open = matches!(cb.state, CircuitState::Open { opened_at_ms } if opened_at_ms == now_ms);
+        prop_assert!(is_open, "failure in HalfOpen should re-open");
+    }
+
+    /// allow_request_and_advance transitions Open→HalfOpen at timeout.
+    #[test]
+    fn circuit_breaker_advance_opens_halfopen(
+        opened_at in 0u64..500_000,
+        timeout in 1000u64..100_000,
+    ) {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 5,
+            reset_timeout_ms: timeout,
+            success_threshold: 2,
+        };
+        let mut cb = CircuitBreaker::new(config);
+        cb.state = CircuitState::Open { opened_at_ms: opened_at };
+
+        // Before timeout: rejected
+        let before = opened_at.saturating_add(timeout / 2);
+        let allowed = cb.allow_request_and_advance(before);
+        if timeout / 2 < timeout {
+            prop_assert!(!allowed, "should reject before timeout");
+        }
+
+        // After timeout: allowed and state transitions
+        let after = opened_at.saturating_add(timeout);
+        let allowed = cb.allow_request_and_advance(after);
+        prop_assert!(allowed, "should allow after timeout");
+        let is_halfopen = matches!(cb.state, CircuitState::HalfOpen { attempt_count: 0 });
+        prop_assert!(is_halfopen, "should be HalfOpen after timeout advance");
+    }
+
+    /// Full cycle: Closed→Open→HalfOpen→Closed.
+    #[test]
+    fn circuit_breaker_full_lifecycle(
+        failure_threshold in 1u32..=5,
+        success_threshold in 1u32..=5,
+    ) {
+        let config = CircuitBreakerConfig {
+            failure_threshold,
+            reset_timeout_ms: 10_000,
+            success_threshold,
+        };
+        let mut cb = CircuitBreaker::new(config);
+
+        // Step 1: Record enough failures to open
+        for i in 0..failure_threshold {
+            cb.record_failure(1000 + u64::from(i));
+        }
+        let is_open = matches!(cb.state, CircuitState::Open { .. });
+        prop_assert!(is_open, "should be Open after {} failures", failure_threshold);
+
+        // Step 2: Advance past timeout → HalfOpen
+        let allowed = cb.allow_request_and_advance(20_000);
+        prop_assert!(allowed);
+        let is_halfopen = matches!(cb.state, CircuitState::HalfOpen { .. });
+        prop_assert!(is_halfopen, "should be HalfOpen after timeout");
+
+        // Step 3: Record enough successes to close
+        for i in 0..success_threshold {
+            cb.record_success(20_000 + u64::from(i));
+        }
+        let is_closed = cb.state == CircuitState::Closed;
+        prop_assert!(is_closed, "should be Closed after {} successes", success_threshold);
+    }
+
+    /// Total counters accumulate correctly through the full lifecycle.
+    #[test]
+    fn circuit_breaker_counters_across_lifecycle(
+        n_fail in 1u32..=10,
+        n_success in 1u32..=10,
+    ) {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 100, // high so it doesn't trip
+            reset_timeout_ms: 10_000,
+            success_threshold: 2,
+        };
+        let mut cb = CircuitBreaker::new(config);
+        for i in 0..n_fail {
+            cb.record_failure(1000 + u64::from(i));
+        }
+        for i in 0..n_success {
+            cb.record_success(5000 + u64::from(i));
+        }
+        prop_assert_eq!(cb.total_failures, u64::from(n_fail));
+        prop_assert_eq!(cb.total_successes, u64::from(n_success));
+    }
+}
+
+// =============================================================================
+// RecoveryPolicy: non-retryable error matching
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Empty non_retryable_errors means all errors are retryable.
+    #[test]
+    fn empty_non_retryable_always_retryable(error in "[a-z ]{5,30}") {
+        let policy = RecoveryPolicy {
+            non_retryable_errors: vec![],
+            ..RecoveryPolicy::default()
+        };
+        prop_assert!(!policy.is_non_retryable(&error));
+    }
+
+    /// Non-retryable pattern matching is case-sensitive substring.
+    #[test]
+    fn non_retryable_case_sensitive(
+        pattern in "[a-z]{3,8}",
+        prefix in "[a-z]{2,5}",
+        suffix in "[a-z]{2,5}",
+    ) {
+        let policy = RecoveryPolicy {
+            non_retryable_errors: vec![pattern.clone()],
+            ..RecoveryPolicy::default()
+        };
+        // Exact substring should match
+        let error_with = format!("{prefix}{pattern}{suffix}");
+        prop_assert!(policy.is_non_retryable(&error_with));
+        // Uppercase version should NOT match
+        let upper_error = pattern.to_uppercase();
+        prop_assert!(!policy.is_non_retryable(&upper_error));
+    }
+
+    /// Multiple non_retryable patterns: any match is non-retryable.
+    #[test]
+    fn multiple_non_retryable_any_matches(
+        p1 in "[a-z]{4,8}",
+        p2 in "[a-z]{4,8}",
+    ) {
+        let policy = RecoveryPolicy {
+            non_retryable_errors: vec![p1.clone(), p2.clone()],
+            ..RecoveryPolicy::default()
+        };
+        prop_assert!(policy.is_non_retryable(&p1));
+        prop_assert!(policy.is_non_retryable(&p2));
+        prop_assert!(!policy.is_non_retryable("zzz-no-match-zzz"));
+    }
+}
+
+// =============================================================================
+// HookRegistry: set_enabled toggles hook dispatch
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// Disabling a hook causes it to not fire during dispatch.
+    #[test]
+    fn hook_registry_disable_prevents_dispatch(_dummy in 0u8..1) {
+        let mut registry = HookRegistry::new();
+        let hook = HookRegistration {
+            name: "test-hook".to_string(),
+            phases: [HookPhase::PreStep].into_iter().collect(),
+            priority: 10,
+            enabled: true,
+            handler: HookHandler::Log {
+                level: LogLevel::Info,
+                template: "hello".to_string(),
+            },
+        };
+        registry.register(hook);
+
+        // Before disabling: dispatch returns 1 outcome
+        let ctx = HookContext {
+            execution_id: "exec-1".to_string(),
+            pipeline_name: "test".to_string(),
+            step_index: Some(0),
+            step_label: Some("step-a".to_string()),
+            elapsed_ms: 0,
+            steps_completed: 0,
+            total_steps: 1,
+            last_result: None,
+            metadata: HashMap::new(),
+        };
+        let outcomes = registry.dispatch(HookPhase::PreStep, &ctx);
+        prop_assert_eq!(outcomes.len(), 1);
+
+        // After disabling: dispatch returns 0 outcomes
+        registry.set_enabled("test-hook", false);
+        let outcomes = registry.dispatch(HookPhase::PreStep, &ctx);
+        prop_assert_eq!(outcomes.len(), 0);
+
+        // Re-enabling: dispatch returns 1 outcome again
+        registry.set_enabled("test-hook", true);
+        let outcomes = registry.dispatch(HookPhase::PreStep, &ctx);
+        prop_assert_eq!(outcomes.len(), 1);
+    }
+
+    /// Hooks only fire for their registered phase.
+    #[test]
+    fn hook_only_fires_for_registered_phase(
+        hook_phase in arb_hook_phase(),
+        dispatch_phase in arb_hook_phase(),
+    ) {
+        let mut registry = HookRegistry::new();
+        registry.register(HookRegistration {
+            name: "phase-hook".to_string(),
+            phases: [hook_phase].into_iter().collect(),
+            priority: 10,
+            enabled: true,
+            handler: HookHandler::Log {
+                level: LogLevel::Info,
+                template: "test".to_string(),
+            },
+        });
+        let ctx = HookContext {
+            execution_id: "exec-1".to_string(),
+            pipeline_name: "test".to_string(),
+            step_index: None,
+            step_label: None,
+            elapsed_ms: 0,
+            steps_completed: 0,
+            total_steps: 1,
+            last_result: None,
+            metadata: HashMap::new(),
+        };
+        let outcomes = registry.dispatch(dispatch_phase, &ctx);
+        if hook_phase == dispatch_phase {
+            prop_assert_eq!(outcomes.len(), 1, "should fire for matching phase");
+        } else {
+            prop_assert_eq!(outcomes.len(), 0, "should not fire for non-matching phase");
+        }
+    }
+}
+
+// =============================================================================
+// Pipeline validation: additional edge cases
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Pipeline with a missing dependency (referencing non-existent step) fails validation.
+    #[test]
+    fn missing_dependency_fails_validation(
+        label in "[a-z]{3,8}",
+        phantom in "[a-z]{9,14}",
+    ) {
+        let step = PipelineStep {
+            label: label.clone(),
+            depends_on: vec![phantom],
+            ..noop_step(&label)
+        };
+        let pipeline = simple_pipeline("test", vec![step]);
+        let result = pipeline.validate();
+        let is_err = result.is_err();
+        prop_assert!(is_err, "missing dependency should fail validation");
+    }
+
+    /// Pipeline with cycle (A→B→A) fails validation.
+    #[test]
+    fn cyclic_dependency_fails_validation(_dummy in 0u8..1) {
+        let step_a = PipelineStep {
+            label: "step-a".to_string(),
+            depends_on: vec!["step-b".to_string()],
+            ..noop_step("step-a")
+        };
+        let step_b = PipelineStep {
+            label: "step-b".to_string(),
+            depends_on: vec!["step-a".to_string()],
+            ..noop_step("step-b")
+        };
+        let pipeline = simple_pipeline("cyclic", vec![step_a, step_b]);
+        let result = pipeline.validate();
+        let is_err = result.is_err();
+        prop_assert!(is_err, "cyclic dependency should fail validation");
+    }
+
+    /// Ready steps after completing first step returns its dependents.
+    #[test]
+    fn ready_steps_after_completion(_dummy in 0u8..1) {
+        let step_a = noop_step("step-a");
+        let step_b = step_with_deps("step-b", vec!["step-a"]);
+        let step_c = step_with_deps("step-c", vec!["step-a"]);
+        let pipeline = simple_pipeline("test", vec![step_a, step_b, step_c]);
+
+        let completed: HashSet<String> = ["step-a".to_string()].into_iter().collect();
+        let ready = pipeline.ready_steps(&completed);
+        // Both step-b (idx=1) and step-c (idx=2) should be ready
+        prop_assert!(ready.contains(&1), "step-b should be ready");
+        prop_assert!(ready.contains(&2), "step-c should be ready");
+    }
+}
+
+// =============================================================================
+// Backoff: edge cases
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Exponential backoff at attempt=0 equals base_ms.
+    #[test]
+    fn exponential_backoff_attempt_zero_is_base(
+        base_ms in 100u64..10_000,
+        multiplier in 1.1f64..4.0,
+        max_delay_ms in 100_000u64..300_000,
+    ) {
+        let strategy = BackoffStrategy::Exponential {
+            base_ms,
+            multiplier,
+            max_delay_ms,
+        };
+        let delay = strategy.delay_for_attempt(0);
+        prop_assert_eq!(delay, Duration::from_millis(base_ms));
+    }
+
+    /// Linear backoff at attempt=0 equals initial_ms.
+    #[test]
+    fn linear_backoff_attempt_zero_is_initial(
+        initial_ms in 100u64..10_000,
+        increment_ms in 100u64..2_000,
+        max_delay_ms in 100_000u64..300_000,
+    ) {
+        let strategy = BackoffStrategy::Linear {
+            initial_ms,
+            increment_ms,
+            max_delay_ms,
+        };
+        let delay = strategy.delay_for_attempt(0);
+        prop_assert_eq!(delay, Duration::from_millis(initial_ms));
+    }
+
+    /// All backoff strategies produce non-negative delays.
+    #[test]
+    fn backoff_always_nonnegative(
+        strategy in arb_backoff_strategy(),
+        attempt in 0u32..20,
+    ) {
+        let delay = strategy.delay_for_attempt(attempt);
+        prop_assert!(delay >= Duration::ZERO);
+    }
+}
+
+// =============================================================================
+// PipelineExecutor: execution properties
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// Executing a pipeline with optional failing steps still succeeds.
+    #[test]
+    fn optional_failing_step_still_succeeds(_dummy in 0u8..1) {
+        let mut step_a = noop_step("step-a");
+        step_a.optional = true;
+        // Force it to "fail" by making preconditions unsatisfied
+        step_a.preconditions = vec!["nonexistent_key".to_string()];
+        let step_b = noop_step("step-b");
+
+        let pipeline = simple_pipeline("test", vec![step_a, step_b]);
+        let mut executor = PipelineExecutor::new();
+        let result = executor.execute(&pipeline, 1000);
+        let is_ok = result.is_ok();
+        prop_assert!(is_ok, "pipeline with optional failing step should succeed");
+        let execution = result.unwrap();
+        // step-a should be skipped, step-b should succeed
+        let is_succeeded = matches!(execution.status, PipelineStatus::Succeeded);
+        prop_assert!(is_succeeded, "pipeline should succeed");
+    }
+
+    /// Execution step_outcomes keys match pipeline step indices.
+    #[test]
+    fn execution_step_outcomes_match_indices(n in 1usize..=5) {
+        let steps: Vec<PipelineStep> = (0..n)
+            .map(|i| noop_step(&format!("step-{i}")))
+            .collect();
+        let pipeline = simple_pipeline("test", steps);
+        let mut executor = PipelineExecutor::new();
+        let execution = executor.execute(&pipeline, 1000).unwrap();
+
+        for i in 0..n {
+            let has_outcome = execution.step_outcomes.contains_key(&i);
+            prop_assert!(has_outcome, "step_outcome should exist for index {}", i);
+        }
+        prop_assert_eq!(execution.step_outcomes.len(), n);
+    }
+
+    /// Pipeline execution ended_at_ms is always >= started_at_ms.
+    #[test]
+    fn execution_end_time_after_start(n in 1usize..=3) {
+        let steps: Vec<PipelineStep> = (0..n)
+            .map(|i| noop_step(&format!("step-{i}")))
+            .collect();
+        let pipeline = simple_pipeline("test", steps);
+        let mut executor = PipelineExecutor::new();
+        let execution = executor.execute(&pipeline, 1000).unwrap();
+
+        if let Some(end_ms) = execution.ended_at_ms {
+            prop_assert!(end_ms >= execution.started_at_ms);
+        }
+    }
+}
