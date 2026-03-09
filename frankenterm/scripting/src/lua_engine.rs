@@ -233,6 +233,7 @@ mod tests {
     use super::*;
     use crate::ScriptingEngine;
     use proptest::prelude::*;
+    use tempfile::tempdir;
     use std::ops::RangeInclusive;
 
     fn dynamic_strategy() -> impl Strategy<Value = Value> {
@@ -340,6 +341,33 @@ mod tests {
             Action::Custom { name, .. } => assert_eq!(name, "lua:script-event"),
             other => panic!("unexpected action {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_extension_executes_lua_entrypoint() {
+        let tempdir = tempdir().unwrap();
+        let script_path = tempdir.path().join("extension.lua");
+        std::fs::write(
+            &script_path,
+            r#"
+local wezterm = require 'wezterm'
+wezterm.on('extension-event', function() end)
+"#,
+        )
+        .unwrap();
+
+        let engine = LuaEngine::new();
+        let extension_id = engine
+            .load_extension(&ExtensionManifest {
+                id: "lua-ext".to_string(),
+                version: "0.1.0".to_string(),
+                entrypoint: Some(script_path.to_string_lossy().into_owned()),
+                metadata: Value::Null,
+            })
+            .unwrap();
+
+        assert_eq!(extension_id, 1);
+        engine.unload_extension(extension_id).unwrap();
     }
 
     proptest! {
