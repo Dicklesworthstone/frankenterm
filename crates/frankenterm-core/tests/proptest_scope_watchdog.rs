@@ -10,7 +10,7 @@
 
 use frankenterm_core::scope_tree::{ScopeId, ScopeState, ScopeTier, ScopeTree};
 use frankenterm_core::scope_watchdog::{
-    AlertKind, AlertSeverity, ScanSummary, ScopeWatchdog, WatchdogConfig,
+    AlertKind, AlertSeverity, ScanSummary, ScopeWatchdog, WatchdogAlert, WatchdogConfig,
 };
 use proptest::prelude::*;
 
@@ -250,6 +250,520 @@ proptest! {
         // No alerts for a healthy tree (short time since creation)
         prop_assert!(alerts.is_empty(), "healthy tree should have no alerts, got: {:?}",
             alerts.iter().map(|a| format!("{}", a.kind)).collect::<Vec<_>>());
+    }
+
+    // ── Orphan detection ────────────────────────────────────────────────
+
+    #[test]
+    fn orphan_detected_when_parent_closed(
+        n_orphans in 1usize..5,
+    ) {
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        // Create a daemon, start it
+        let parent = ScopeId("daemon:parent".into());
+        tree.register(parent.clone(), ScopeTier::Daemon, &ScopeId::root(), "p", 1000).unwrap();
+        tree.start(&parent, 1100).unwrap();
+
+        // Register children under the parent
+        for i in 0..n_orphans {
+            let child = ScopeId(format!("worker:child{i}"));
+            tree.register(child.clone(), ScopeTier::Worker, &parent, format!("c{i}"), 1200).unwrap();
+            tree.start(&child, 1300).unwrap();
+        }
+
+        // Force parent to Closed state via get_mut (can't do via API with live children)
+        tree.get_mut(&parent).unwrap().state = ScopeState::Closed;
+
+        let mut watchdog = ScopeWatchdog::new();
+        let alerts = watchdog.scan(&tree, 4000);
+
+        let orphans: Vec<_> = alerts.iter()
+            .filter(|a| matches!(a.kind, AlertKind::OrphanTask { .. }))
+            .collect();
+
+        prop_assert_eq!(orphans.len(), n_orphans, "each running child with closed parent is an orphan");
+        for alert in &orphans {
+            prop_assert_eq!(alert.severity, AlertSeverity::Error);
+        }
+    }
+
+    // ── Zombie finalizer detection ─────────────────────────────────────
+
+    #[test]
+    fn zombie_finalizer_detected(
+        timeout_ms in 1000u64..20_000,
+        elapsed_ms in 0i64..40_000,
+    ) {
+        let mut config = WatchdogConfig::default();
+        config.finalizer_timeout_ms = timeout_ms;
+
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let scope = ScopeId("daemon:zombie".into());
+        tree.register(scope.clone(), ScopeTier::Daemon, &ScopeId::root(), "z", 1000).unwrap();
+        tree.start(&scope, 1100).unwrap();
+        tree.request_shutdown(&scope, 2000).unwrap();
+        tree.finalize(&scope).unwrap();
+
+        // Check at shutdown_time + elapsed
+        let check_ms = 2000 + elapsed_ms;
+
+        let mut watchdog = ScopeWatchdog::with_config(config);
+        let alerts = watchdog.scan(&tree, check_ms);
+
+        let zombies: Vec<_> = alerts.iter()
+            .filter(|a| matches!(a.kind, AlertKind::ZombieFinalizer { .. }))
+            .collect();
+
+        if elapsed_ms > timeout_ms as i64 {
+            prop_assert!(!zombies.is_empty(), "should detect zombie at {}ms > {}ms", elapsed_ms, timeout_ms);
+        } else {
+            prop_assert!(zombies.is_empty(), "should NOT detect zombie at {}ms <= {}ms", elapsed_ms, timeout_ms);
+        }
+    }
+
+    // ── Stale Created detection ────────────────────────────────────────
+
+    #[test]
+    fn stale_created_detected(
+        threshold_ms in 5000i64..60_000,
+        elapsed_ms in 0i64..120_000,
+    ) {
+        let mut config = WatchdogConfig::default();
+        config.stale_created_threshold_ms = threshold_ms;
+
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        // Register but don't start
+        let scope = ScopeId("daemon:stale".into());
+        tree.register(scope.clone(), ScopeTier::Daemon, &ScopeId::root(), "s", 1000).unwrap();
+
+        let check_ms = 1000 + elapsed_ms;
+
+        let mut watchdog = ScopeWatchdog::with_config(config);
+        let alerts = watchdog.scan(&tree, check_ms);
+
+        let stale: Vec<_> = alerts.iter()
+            .filter(|a| matches!(a.kind, AlertKind::StaleCreated { .. }))
+            .collect();
+
+        if elapsed_ms > threshold_ms {
+            prop_assert!(!stale.is_empty(), "should detect stale at {}ms > {}ms", elapsed_ms, threshold_ms);
+        } else {
+            prop_assert!(stale.is_empty(), "should NOT detect stale at {}ms <= {}ms", elapsed_ms, threshold_ms);
+        }
+    }
+
+    // ── Excessive depth detection ──────────────────────────────────────
+
+    #[test]
+    fn excessive_depth_detected(
+        max_depth in 2usize..6,
+        actual_depth in 2usize..10,
+    ) {
+        let mut config = WatchdogConfig::default();
+        config.max_depth = max_depth;
+        // Don't trigger scope leak alerts for daemon tier
+        config.tier_scope_limits.insert("daemon".into(), 100);
+
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        // Build a chain of daemon scopes to desired depth
+        let mut parent = ScopeId::root();
+        for d in 0..actual_depth {
+            let child = ScopeId(format!("daemon:depth{d}"));
+            tree.register(child.clone(), ScopeTier::Daemon, &parent, format!("d{d}"), 1000).unwrap();
+            tree.start(&child, 1100).unwrap();
+            parent = child;
+        }
+
+        let mut watchdog = ScopeWatchdog::with_config(config);
+        let alerts = watchdog.scan(&tree, 2000);
+
+        let depth_alerts: Vec<_> = alerts.iter()
+            .filter(|a| matches!(a.kind, AlertKind::ExcessiveDepth { .. }))
+            .collect();
+
+        if actual_depth > max_depth {
+            prop_assert!(!depth_alerts.is_empty(), "should detect excessive depth {} > {}", actual_depth, max_depth);
+        } else {
+            prop_assert!(depth_alerts.is_empty(), "should NOT detect excessive depth {} <= {}", actual_depth, max_depth);
+        }
+    }
+
+    // ── Scope leak severity escalation ─────────────────────────────────
+
+    #[test]
+    fn scope_leak_severity_escalation(
+        limit in 2usize..10,
+        over_factor in 1usize..4,
+    ) {
+        let mut config = WatchdogConfig::default();
+        config.tier_scope_limits.insert("worker".into(), limit);
+
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let daemon = ScopeId("daemon:host".into());
+        tree.register(daemon.clone(), ScopeTier::Daemon, &ScopeId::root(), "host", 1000).unwrap();
+        tree.start(&daemon, 1100).unwrap();
+
+        let n_workers = limit * over_factor + 1;
+        for i in 0..n_workers {
+            tree.register(
+                ScopeId(format!("worker:w{i}")),
+                ScopeTier::Worker,
+                &daemon,
+                format!("w{i}"),
+                1000,
+            ).unwrap();
+        }
+
+        let mut watchdog = ScopeWatchdog::with_config(config);
+        let alerts = watchdog.scan(&tree, 2000);
+
+        let leaks: Vec<_> = alerts.iter()
+            .filter(|a| matches!(a.kind, AlertKind::ScopeLeak { tier: ScopeTier::Worker, .. }))
+            .collect();
+
+        prop_assert!(!leaks.is_empty());
+        let severity = leaks[0].severity;
+        if n_workers > limit * 2 {
+            prop_assert_eq!(severity, AlertSeverity::Critical, "severe overcount should be Critical");
+        } else {
+            prop_assert_eq!(severity, AlertSeverity::Warning, "mild overcount should be Warning");
+        }
+    }
+
+    // ── Scan count and total_alerts tracking ───────────────────────────
+
+    #[test]
+    fn scan_count_increments(n_scans in 1usize..10) {
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let mut watchdog = ScopeWatchdog::new();
+        prop_assert_eq!(watchdog.scan_count(), 0);
+
+        for i in 0..n_scans {
+            let _ = watchdog.scan(&tree, 1000 * (i as i64 + 1));
+        }
+        prop_assert_eq!(watchdog.scan_count(), n_scans as u64);
+    }
+
+    // ── Total alerts accumulates across scans ──────────────────────────
+
+    #[test]
+    fn total_alerts_accumulates(n_scans in 1usize..5) {
+        let mut config = WatchdogConfig::default();
+        config.tier_scope_limits.insert("ephemeral".into(), 1);
+
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        // Create a leak that fires every scan
+        for i in 0..3 {
+            tree.register(
+                ScopeId(format!("ephemeral:e{i}")),
+                ScopeTier::Ephemeral,
+                &ScopeId::root(),
+                format!("e{i}"),
+                1000,
+            ).unwrap();
+        }
+
+        let mut watchdog = ScopeWatchdog::with_config(config);
+        let mut running_total = 0u64;
+        for i in 0..n_scans {
+            let alerts = watchdog.scan(&tree, 2000 + i as i64);
+            running_total += alerts.len() as u64;
+        }
+
+        prop_assert_eq!(watchdog.total_alerts(), running_total);
+        prop_assert_eq!(watchdog.scan_count(), n_scans as u64);
+    }
+
+    // ── Deadlock detection disabled ────────────────────────────────────
+
+    #[test]
+    fn deadlock_detection_respects_config_flag(_dummy in 0u8..1) {
+        let mut config = WatchdogConfig::default();
+        config.detect_deadlocks = false;
+
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        // Draining parent with non-closed child (could be wait-for)
+        let parent = ScopeId("daemon:p".into());
+        tree.register(parent.clone(), ScopeTier::Daemon, &ScopeId::root(), "p", 1000).unwrap();
+        tree.start(&parent, 1100).unwrap();
+        let child = ScopeId("worker:c".into());
+        tree.register(child.clone(), ScopeTier::Worker, &parent, "c", 1000).unwrap();
+        tree.start(&child, 1100).unwrap();
+        tree.request_shutdown(&parent, 2000).unwrap();
+
+        let mut watchdog = ScopeWatchdog::with_config(config);
+        let alerts = watchdog.scan(&tree, 50_000);
+
+        let deadlocks: Vec<_> = alerts.iter()
+            .filter(|a| matches!(a.kind, AlertKind::DeadlockRisk { .. }))
+            .collect();
+        prop_assert!(deadlocks.is_empty(), "deadlock detection should be disabled");
+    }
+
+    // ── WatchdogAlert serde roundtrip ──────────────────────────────────
+
+    #[test]
+    fn alert_serde_roundtrip(
+        grace_ms in 100u64..10_000,
+    ) {
+        let mut config = WatchdogConfig::default();
+        config.tier_grace_periods.insert("daemon".into(), grace_ms);
+
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let scope = ScopeId("daemon:serde".into());
+        tree.register(scope.clone(), ScopeTier::Daemon, &ScopeId::root(), "s", 1000).unwrap();
+        tree.start(&scope, 1100).unwrap();
+        tree.request_shutdown(&scope, 2000).unwrap();
+
+        let check_ms = 2000 + grace_ms as i64 * 2 + 1;
+        let mut watchdog = ScopeWatchdog::with_config(config);
+        let alerts = watchdog.scan(&tree, check_ms);
+
+        for alert in &alerts {
+            let json = serde_json::to_string(alert).unwrap();
+            let restored: WatchdogAlert = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(restored.severity, alert.severity);
+            prop_assert_eq!(restored.timestamp_ms, alert.timestamp_ms);
+            prop_assert_eq!(&restored.message, &alert.message);
+        }
+    }
+
+    // ── ScanSummary serde roundtrip ────────────────────────────────────
+
+    #[test]
+    fn scan_summary_serde_roundtrip(n_scopes in 0usize..5) {
+        let mut config = WatchdogConfig::default();
+        config.tier_scope_limits.insert("worker".into(), 1);
+
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let daemon = ScopeId("daemon:host".into());
+        tree.register(daemon.clone(), ScopeTier::Daemon, &ScopeId::root(), "host", 1000).unwrap();
+        tree.start(&daemon, 1100).unwrap();
+
+        for i in 0..n_scopes {
+            tree.register(
+                ScopeId(format!("worker:w{i}")),
+                ScopeTier::Worker,
+                &daemon,
+                format!("w{i}"),
+                1000,
+            ).unwrap();
+        }
+
+        let mut watchdog = ScopeWatchdog::with_config(config);
+        let alerts = watchdog.scan(&tree, 2000);
+        let summary = ScanSummary::from_alerts(&alerts, 2000);
+
+        let json = serde_json::to_string(&summary).unwrap();
+        let restored: ScanSummary = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(restored.total_alerts, summary.total_alerts);
+        prop_assert_eq!(restored.orphans, summary.orphans);
+        prop_assert_eq!(restored.stuck_cancellations, summary.stuck_cancellations);
+        prop_assert_eq!(restored.zombie_finalizers, summary.zombie_finalizers);
+        prop_assert_eq!(restored.scope_leaks, summary.scope_leaks);
+        prop_assert_eq!(restored.stale_created, summary.stale_created);
+        prop_assert_eq!(restored.excessive_depth, summary.excessive_depth);
+    }
+
+    // ── AlertKind serde roundtrip ──────────────────────────────────────
+
+    #[test]
+    fn alert_kind_serde_roundtrip(tier in arb_tier()) {
+        let kinds = vec![
+            AlertKind::OrphanTask {
+                scope_id: ScopeId("child".into()),
+                parent_id: ScopeId("parent".into()),
+                scope_state: ScopeState::Running,
+                parent_state: ScopeState::Closed,
+            },
+            AlertKind::StuckCancellation {
+                scope_id: ScopeId("stuck".into()),
+                draining_since_ms: 1000,
+                elapsed_ms: 5000,
+                expected_grace_ms: 3000,
+            },
+            AlertKind::ZombieFinalizer {
+                scope_id: ScopeId("zombie".into()),
+                finalizing_since_ms: 2000,
+                elapsed_ms: 8000,
+            },
+            AlertKind::DeadlockRisk {
+                cycle: vec![ScopeId("a".into()), ScopeId("b".into()), ScopeId("a".into())],
+            },
+            AlertKind::ScopeLeak {
+                tier,
+                count: 100,
+                threshold: 50,
+            },
+            AlertKind::StaleCreated {
+                scope_id: ScopeId("stale".into()),
+                created_at_ms: 0,
+                elapsed_ms: 30_000,
+            },
+            AlertKind::ExcessiveDepth {
+                scope_id: ScopeId("deep".into()),
+                depth: 10,
+                max_depth: 5,
+            },
+        ];
+
+        for kind in &kinds {
+            let json = serde_json::to_string(kind).unwrap();
+            let restored: AlertKind = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(kind, &restored);
+        }
+    }
+
+    // ── AlertKind Display is non-empty ─────────────────────────────────
+
+    #[test]
+    fn alert_kind_display_non_empty(tier in arb_tier()) {
+        let kinds = vec![
+            AlertKind::OrphanTask {
+                scope_id: ScopeId("c".into()),
+                parent_id: ScopeId("p".into()),
+                scope_state: ScopeState::Running,
+                parent_state: ScopeState::Closed,
+            },
+            AlertKind::ScopeLeak { tier, count: 10, threshold: 5 },
+            AlertKind::ExcessiveDepth {
+                scope_id: ScopeId("d".into()),
+                depth: 10,
+                max_depth: 5,
+            },
+        ];
+        for kind in &kinds {
+            let display = kind.to_string();
+            prop_assert!(!display.is_empty());
+        }
+    }
+
+    // ── AlertSeverity serde roundtrip ──────────────────────────────────
+
+    #[test]
+    fn alert_severity_serde_roundtrip(
+        idx in 0usize..4,
+    ) {
+        let sevs = [AlertSeverity::Info, AlertSeverity::Warning, AlertSeverity::Error, AlertSeverity::Critical];
+        let sev = sevs[idx];
+        let json = serde_json::to_string(&sev).unwrap();
+        let restored: AlertSeverity = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(sev, restored);
+    }
+
+    // ── AlertSeverity ordering ─────────────────────────────────────────
+
+    #[test]
+    fn alert_severity_ordering(a in 0usize..4, b in 0usize..4) {
+        let sevs = [AlertSeverity::Info, AlertSeverity::Warning, AlertSeverity::Error, AlertSeverity::Critical];
+        let sa = sevs[a];
+        let sb = sevs[b];
+        if a < b {
+            prop_assert!(sa < sb);
+        } else if a > b {
+            prop_assert!(sa > sb);
+        } else {
+            prop_assert_eq!(sa, sb);
+        }
+    }
+
+    // ── ScanSummary has_errors accuracy ────────────────────────────────
+
+    #[test]
+    fn scan_summary_has_errors_accuracy(
+        n_workers in 0usize..10,
+    ) {
+        let mut config = WatchdogConfig::default();
+        config.tier_scope_limits.insert("worker".into(), 3);
+
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let daemon = ScopeId("daemon:host".into());
+        tree.register(daemon.clone(), ScopeTier::Daemon, &ScopeId::root(), "host", 1000).unwrap();
+        tree.start(&daemon, 1100).unwrap();
+
+        for i in 0..n_workers {
+            tree.register(
+                ScopeId(format!("worker:w{i}")),
+                ScopeTier::Worker,
+                &daemon,
+                format!("w{i}"),
+                1000,
+            ).unwrap();
+        }
+
+        let mut watchdog = ScopeWatchdog::with_config(config);
+        let alerts = watchdog.scan(&tree, 2000);
+        let summary = ScanSummary::from_alerts(&alerts, 2000);
+
+        let any_error_or_crit = alerts.iter().any(|a|
+            a.severity == AlertSeverity::Error || a.severity == AlertSeverity::Critical
+        );
+        prop_assert_eq!(summary.has_errors(), any_error_or_crit);
+    }
+
+    // ── scope_limit_for_tier returns MAX for unconfigured ──────────────
+
+    #[test]
+    fn unconfigured_tier_limit_is_max(_dummy in 0u8..1) {
+        let mut config = WatchdogConfig::default();
+        config.tier_scope_limits.clear();
+
+        let limit = config.scope_limit_for_tier(ScopeTier::Worker);
+        prop_assert_eq!(limit, usize::MAX);
+    }
+
+    // ── grace_period_for_tier falls back to default ────────────────────
+
+    #[test]
+    fn grace_period_fallback_to_default(
+        default_ms in 1000u64..60_000,
+    ) {
+        let mut config = WatchdogConfig::default();
+        config.tier_grace_periods.clear();
+        config.default_grace_period_ms = default_ms;
+
+        let grace = config.grace_period_for_tier(ScopeTier::Daemon);
+        prop_assert_eq!(grace, default_ms);
+    }
+
+    // ── Canonical string changes after scan ────────────────────────────
+
+    #[test]
+    fn canonical_string_updates_after_scan(_dummy in 0u8..1) {
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let mut watchdog = ScopeWatchdog::new();
+        let before = watchdog.canonical_string();
+        let _ = watchdog.scan(&tree, 2000);
+        let after = watchdog.canonical_string();
+
+        let check_scans = after.contains("scans=1");
+        prop_assert_ne!(before, after, "canonical string should change after scan");
+        prop_assert!(check_scans, "should show scans=1 after one scan");
     }
 }
 
