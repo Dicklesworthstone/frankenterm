@@ -6,7 +6,7 @@ publish = false
 
 [features]
 default = []
-lua = ["dep:config", "dep:luahelper", "dep:mlua", "dep:smol", "config/lua"]
+lua = ["dep:config", "dep:luahelper", "dep:mlua", "dep:promise", "config/lua"]
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:log", "dep:serde_json"]
 
 [dependencies]
@@ -20,7 +20,7 @@ toml.workspace = true
 zip.workspace = true
 luahelper = { workspace = true, optional = true }
 mlua = { workspace = true, optional = true, features = ["vendored", "lua54", "async", "send", "serialize"] }
-smol = { workspace = true, optional = true }
+promise = { workspace = true, optional = true }
 wasmtime = { workspace = true, optional = true }
 wasmtime-wasi = { workspace = true, optional = true }
 

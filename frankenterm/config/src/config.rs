@@ -1289,7 +1289,7 @@ impl Config {
             frankenterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
                 let cfg: Config;
 
-                let config: mlua::Value = smol::block_on(
+                let config: mlua::Value = promise::spawn::block_on(
                     // Skip a potential BOM that Windows software may have placed in the
                     // file. Note that we can't catch this happening for files that are
                     // imported via the lua require function.

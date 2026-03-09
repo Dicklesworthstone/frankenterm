@@ -69,7 +69,7 @@ impl ScriptingEngine for LuaEngine {
 
         let lua = make_lua_context(path)
             .with_context(|| format!("make_lua_context({})", path.display()))?;
-        let config_value: mlua::Value = smol::block_on(
+        let config_value: mlua::Value = promise::spawn::block_on(
             lua.load(source.trim_start_matches('\u{FEFF}'))
                 .set_name(path.to_string_lossy())
                 .eval_async(),
@@ -186,7 +186,7 @@ impl ScriptingEngine for LuaEngine {
             .lua
             .as_ref()
             .ok_or_else(|| anyhow!("lua state unexpectedly missing after initialization"))?;
-        smol::block_on(
+        promise::spawn::block_on(
             lua.load(&source)
                 .set_name(path.to_string_lossy())
                 .exec_async(),

@@ -937,7 +937,7 @@ mod test {
             ),
         )?;
 
-        smol::block_on(
+        promise::spawn::block_on(
             lua.load(
                 r#"
 local wezterm = require 'wezterm';
@@ -984,7 +984,7 @@ assert(wezterm.emit('bar', 42, 'woot') == true)
         })?;
         register_event(&lua, ("flag-success".to_string(), handler))?;
 
-        smol::block_on(
+        promise::spawn::block_on(
             lua.load(
                 r#"
 local wezterm = require 'wezterm'
@@ -1021,7 +1021,7 @@ assert(wezterm.emit('flag-success') == true)
         })?;
         register_event(&lua, ("flag-error".to_string(), handler))?;
 
-        let result = smol::block_on(
+        let result = promise::spawn::block_on(
             lua.load(
                 r#"
 local wezterm = require 'wezterm'
