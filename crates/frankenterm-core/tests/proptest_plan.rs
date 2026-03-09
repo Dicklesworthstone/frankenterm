@@ -1251,3 +1251,321 @@ proptest! {
         );
     }
 }
+
+// =============================================================================
+// 14. Mission lifecycle, IDs, failure codes (PL-46 through PL-65)
+// =============================================================================
+
+fn arb_mission_lifecycle_state() -> impl Strategy<Value = MissionLifecycleState> {
+    prop_oneof![
+        Just(MissionLifecycleState::Planned),
+        Just(MissionLifecycleState::Planning),
+        Just(MissionLifecycleState::Dispatching),
+        Just(MissionLifecycleState::AwaitingApproval),
+        Just(MissionLifecycleState::Running),
+        Just(MissionLifecycleState::Executing),
+        Just(MissionLifecycleState::RetryPending),
+        Just(MissionLifecycleState::Blocked),
+        Just(MissionLifecycleState::Paused),
+        Just(MissionLifecycleState::Completed),
+        Just(MissionLifecycleState::Cancelled),
+        Just(MissionLifecycleState::Failed),
+    ]
+}
+
+fn arb_mission_transition_kind() -> impl Strategy<Value = MissionLifecycleTransitionKind> {
+    prop_oneof![
+        Just(MissionLifecycleTransitionKind::Dispatch),
+        Just(MissionLifecycleTransitionKind::RequestApproval),
+        Just(MissionLifecycleTransitionKind::Approve),
+        Just(MissionLifecycleTransitionKind::StartExecution),
+        Just(MissionLifecycleTransitionKind::Retry),
+        Just(MissionLifecycleTransitionKind::Block),
+        Just(MissionLifecycleTransitionKind::Unblock),
+        Just(MissionLifecycleTransitionKind::Complete),
+        Just(MissionLifecycleTransitionKind::Cancel),
+        Just(MissionLifecycleTransitionKind::Fail),
+        Just(MissionLifecycleTransitionKind::PlanFinalized),
+        Just(MissionLifecycleTransitionKind::DispatchStarted),
+        Just(MissionLifecycleTransitionKind::ExecutionStarted),
+        Just(MissionLifecycleTransitionKind::RetryResumed),
+        Just(MissionLifecycleTransitionKind::ExecutionBlocked),
+        Just(MissionLifecycleTransitionKind::MissionCancelled),
+    ]
+}
+
+fn arb_failure_code() -> impl Strategy<Value = MissionFailureCode> {
+    prop_oneof![
+        Just(MissionFailureCode::PolicyDenied),
+        Just(MissionFailureCode::ReservationConflict),
+        Just(MissionFailureCode::RateLimited),
+        Just(MissionFailureCode::StaleState),
+        Just(MissionFailureCode::DispatchError),
+        Just(MissionFailureCode::ApprovalRequired),
+        Just(MissionFailureCode::ApprovalDenied),
+        Just(MissionFailureCode::ApprovalExpired),
+        Just(MissionFailureCode::KillSwitchActivated),
+    ]
+}
+
+fn arb_actor_role() -> impl Strategy<Value = MissionActorRole> {
+    prop_oneof![
+        Just(MissionActorRole::Planner),
+        Just(MissionActorRole::Dispatcher),
+        Just(MissionActorRole::Operator),
+    ]
+}
+
+fn arb_escalation_level() -> impl Strategy<Value = EscalationLevel> {
+    prop_oneof![
+        Just(EscalationLevel::Observe),
+        Just(EscalationLevel::Human),
+        Just(EscalationLevel::Emergency),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    // ── PL-46: MissionLifecycleState serde roundtrip ────────────────────────
+
+    #[test]
+    fn pl46_lifecycle_state_serde(state in arb_mission_lifecycle_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let back: MissionLifecycleState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(state, back);
+    }
+
+    // ── PL-47: MissionLifecycleState is_terminal ────────────────────────────
+
+    #[test]
+    fn pl47_lifecycle_is_terminal(state in arb_mission_lifecycle_state()) {
+        let expected = matches!(
+            state,
+            MissionLifecycleState::Completed
+                | MissionLifecycleState::Cancelled
+                | MissionLifecycleState::Failed
+        );
+        prop_assert_eq!(state.is_terminal(), expected);
+    }
+
+    // ── PL-48: MissionLifecycleState Display non-empty ──────────────────────
+
+    #[test]
+    fn pl48_lifecycle_display(state in arb_mission_lifecycle_state()) {
+        let s = state.to_string();
+        prop_assert!(!s.is_empty());
+    }
+
+    // ── PL-49: MissionLifecycleTransitionKind serde roundtrip ───────────────
+
+    #[test]
+    fn pl49_transition_kind_serde(kind in arb_mission_transition_kind()) {
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: MissionLifecycleTransitionKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(kind, back);
+    }
+
+    // ── PL-50: MissionLifecycleTransitionKind Display non-empty ─────────────
+
+    #[test]
+    fn pl50_transition_kind_display(kind in arb_mission_transition_kind()) {
+        let s = kind.to_string();
+        prop_assert!(!s.is_empty());
+    }
+
+    // ── PL-51: allowed_transitions returns only valid transitions ────────────
+
+    #[test]
+    fn pl51_allowed_transitions_valid(state in arb_mission_lifecycle_state()) {
+        let allowed = state.allowed_transitions();
+        for transition in &allowed {
+            let result = state.apply_transition(*transition);
+            prop_assert!(result.is_ok(),
+                "allowed transition {:?} from {:?} should succeed", transition, state);
+        }
+    }
+
+    // ── PL-52: apply_transition rejects invalid transitions ─────────────────
+
+    #[test]
+    fn pl52_invalid_transitions_rejected(
+        state in arb_mission_lifecycle_state(),
+        kind in arb_mission_transition_kind(),
+    ) {
+        let allowed = state.allowed_transitions();
+        if !allowed.contains(&kind) {
+            let result = state.apply_transition(kind);
+            let is_err = result.is_err();
+            prop_assert!(is_err,
+                "transition {:?} from {:?} should fail", kind, state);
+        }
+    }
+
+    // ── PL-53: terminal states have no allowed transitions ──────────────────
+
+    #[test]
+    fn pl53_terminal_no_transitions(state in arb_mission_lifecycle_state()) {
+        if state.is_terminal() {
+            let allowed = state.allowed_transitions();
+            prop_assert!(allowed.is_empty(),
+                "terminal state {:?} should have no transitions, got {:?}", state, allowed);
+        }
+    }
+
+    // ── PL-54: MissionFailureCode serde roundtrip ───────────────────────────
+
+    #[test]
+    fn pl54_failure_code_serde(code in arb_failure_code()) {
+        let json = serde_json::to_string(&code).unwrap();
+        let back: MissionFailureCode = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(code, back);
+    }
+
+    // ── PL-55: MissionFailureCode reason_code starts with "mission." ────────
+
+    #[test]
+    fn pl55_failure_reason_code(code in arb_failure_code()) {
+        let reason = code.reason_code();
+        prop_assert!(reason.starts_with("mission."),
+            "reason_code should start with 'mission.': {}", reason);
+    }
+
+    // ── PL-56: MissionFailureCode error_code starts with "robot." ───────────
+
+    #[test]
+    fn pl56_failure_error_code(code in arb_failure_code()) {
+        let err = code.error_code();
+        prop_assert!(err.starts_with("robot."),
+            "error_code should start with 'robot.': {}", err);
+    }
+
+    // ── PL-57: terminal failures are not retryable ──────────────────────────
+
+    #[test]
+    fn pl57_terminal_not_retryable(code in arb_failure_code()) {
+        if code.terminality() == MissionFailureTerminality::Terminal {
+            let retryable = code.retryability() == MissionFailureRetryability::Retryable;
+            prop_assert!(!retryable,
+                "terminal failure {:?} should not be retryable", code);
+        }
+    }
+
+    // ── PL-58: MissionActorRole serde roundtrip ─────────────────────────────
+
+    #[test]
+    fn pl58_actor_role_serde(role in arb_actor_role()) {
+        let json = serde_json::to_string(&role).unwrap();
+        let back: MissionActorRole = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(role, back);
+    }
+
+    // ── PL-59: MissionActorRole Display non-empty ───────────────────────────
+
+    #[test]
+    fn pl59_actor_role_display(role in arb_actor_role()) {
+        let s = role.to_string();
+        prop_assert!(!s.is_empty());
+    }
+
+    // ── PL-60: EscalationLevel serde roundtrip ──────────────────────────────
+
+    #[test]
+    fn pl60_escalation_level_serde(level in arb_escalation_level()) {
+        let json = serde_json::to_string(&level).unwrap();
+        let back: EscalationLevel = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(level, back);
+    }
+
+    // ── PL-61: EscalationLevel Display non-empty ────────────────────────────
+
+    #[test]
+    fn pl61_escalation_level_display(level in arb_escalation_level()) {
+        let s = level.to_string();
+        prop_assert!(!s.is_empty());
+    }
+
+    // ── PL-62: MissionId from_hash strips sha256: prefix ────────────────────
+
+    #[test]
+    fn pl62_mission_id_from_hash(hash in "[a-f0-9]{32}") {
+        let from_raw = MissionId::from_hash(&hash);
+        let from_prefixed = MissionId::from_hash(&format!("sha256:{hash}"));
+        prop_assert_eq!(&from_raw, &from_prefixed);
+        prop_assert!(from_raw.0.starts_with("mission:"));
+    }
+
+    // ── PL-63: CandidateActionId from_hash ──────────────────────────────────
+
+    #[test]
+    fn pl63_candidate_id_from_hash(hash in "[a-f0-9]{32}") {
+        let id = CandidateActionId::from_hash(&hash);
+        prop_assert!(id.0.starts_with("candidate:"));
+        let from_prefixed = CandidateActionId::from_hash(&format!("sha256:{hash}"));
+        prop_assert_eq!(&id, &from_prefixed);
+    }
+
+    // ── PL-64: AssignmentId from_hash ───────────────────────────────────────
+
+    #[test]
+    fn pl64_assignment_id_from_hash(hash in "[a-f0-9]{32}") {
+        let id = AssignmentId::from_hash(&hash);
+        prop_assert!(id.0.starts_with("assignment:"));
+    }
+
+    // ── PL-65: Escalation serde roundtrip ───────────────────────────────────
+
+    #[test]
+    fn pl65_escalation_serde(
+        level in arb_escalation_level(),
+        role in arb_actor_role(),
+        reason in arb_name(),
+    ) {
+        let esc = Escalation {
+            level,
+            triggered_by: role,
+            reason_code: reason,
+            error_code: Some("err-1".into()),
+            summary: Some("test".into()),
+            escalated_at_ms: 1000,
+        };
+        let json = serde_json::to_string(&esc).unwrap();
+        let back: Escalation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&esc, &back);
+    }
+
+    // ── PL-66: MissionLifecycleError Display ────────────────────────────────
+
+    #[test]
+    fn pl66_lifecycle_error_display(
+        state in arb_mission_lifecycle_state(),
+        kind in arb_mission_transition_kind(),
+    ) {
+        let err = MissionLifecycleError::InvalidTransition {
+            from: state,
+            transition: kind,
+        };
+        let s = err.to_string();
+        prop_assert!(!s.is_empty());
+        prop_assert!(s.contains("invalid"));
+    }
+
+    // ── PL-67: transition_table is non-empty ────────────────────────────────
+
+    #[test]
+    fn pl67_transition_table_non_empty(_dummy in 0u8..1) {
+        let table = MissionLifecycleState::transition_table();
+        prop_assert!(!table.is_empty());
+        // Every non-terminal state should have at least one transition
+        let non_terminal = [
+            MissionLifecycleState::Planned,
+            MissionLifecycleState::Planning,
+            MissionLifecycleState::Dispatching,
+            MissionLifecycleState::Executing,
+        ];
+        for state in &non_terminal {
+            let has_rules = table.iter().any(|r| r.from == *state);
+            prop_assert!(has_rules, "state {:?} should have transition rules", state);
+        }
+    }
+}
