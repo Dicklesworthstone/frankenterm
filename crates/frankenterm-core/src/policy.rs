@@ -2635,6 +2635,214 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 // ============================================================================
+// Composable Rule Predicate AST
+// ============================================================================
+
+/// A composable boolean predicate tree for policy rule matching.
+///
+/// Unlike `PolicyRuleMatch` which uses flat AND/OR within categories,
+/// `RulePredicate` supports recursive boolean logic via `And`/`Or`/`Not`
+/// combinators. This enables complex policies like:
+///
+/// ```text
+/// (action=spawn AND actor=robot) OR (action=delete AND pane_title="*critical*")
+/// ```
+///
+/// Individual leaf predicates match against `PolicyInput` fields.
+/// Multiple values in a leaf are OR'd (any match succeeds).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RulePredicate {
+    /// Matches if the action kind is in the given list (OR'd).
+    Action { values: Vec<String> },
+    /// Matches if the actor kind is in the given list (OR'd).
+    Actor { values: Vec<String> },
+    /// Matches if the policy surface is in the given list (OR'd, case-insensitive).
+    Surface { values: Vec<String> },
+    /// Matches if the pane ID is in the given list (OR'd).
+    PaneId { values: Vec<u64> },
+    /// Matches if the pane title matches any glob pattern (OR'd).
+    PaneTitle { patterns: Vec<String> },
+    /// Matches if the pane CWD matches any glob pattern (OR'd).
+    PaneCwd { patterns: Vec<String> },
+    /// Matches if the pane domain is in the given list (OR'd).
+    PaneDomain { values: Vec<String> },
+    /// Matches if the command text matches any regex pattern (OR'd).
+    CommandPattern { patterns: Vec<String> },
+    /// Matches if the agent type is in the given list (OR'd, case-insensitive).
+    AgentType { values: Vec<String> },
+    /// All child predicates must match (AND combinator).
+    And { children: Vec<RulePredicate> },
+    /// Any child predicate must match (OR combinator).
+    Or { children: Vec<RulePredicate> },
+    /// Negates the child predicate.
+    Not { child: Box<RulePredicate> },
+    /// Always matches.
+    True,
+    /// Never matches.
+    False,
+}
+
+impl RulePredicate {
+    /// Evaluate this predicate against a `PolicyInput`.
+    #[must_use]
+    pub fn evaluate(&self, input: &PolicyInput) -> bool {
+        match self {
+            Self::Action { values } => {
+                !values.is_empty()
+                    && values.iter().any(|v| v == input.action.as_str())
+            }
+            Self::Actor { values } => {
+                !values.is_empty()
+                    && values.iter().any(|v| v == input.actor.as_str())
+            }
+            Self::Surface { values } => {
+                !values.is_empty()
+                    && values
+                        .iter()
+                        .any(|v| v.eq_ignore_ascii_case(input.surface.as_str()))
+            }
+            Self::PaneId { values } => match input.pane_id {
+                Some(id) => !values.is_empty() && values.contains(&id),
+                None => false,
+            },
+            Self::PaneTitle { patterns } => match &input.pane_title {
+                Some(title) => {
+                    !patterns.is_empty()
+                        && patterns.iter().any(|p| glob_match(p, title))
+                }
+                None => false,
+            },
+            Self::PaneCwd { patterns } => match &input.pane_cwd {
+                Some(cwd) => {
+                    !patterns.is_empty()
+                        && patterns.iter().any(|p| glob_match(p, cwd))
+                }
+                None => false,
+            },
+            Self::PaneDomain { values } => match &input.domain {
+                Some(domain) => !values.is_empty() && values.iter().any(|v| v == domain),
+                None => false,
+            },
+            Self::CommandPattern { patterns } => match &input.command_text {
+                Some(text) => {
+                    !patterns.is_empty()
+                        && patterns.iter().any(|p| {
+                            Regex::new(p).map_or(false, |re| re.is_match(text))
+                        })
+                }
+                None => false,
+            },
+            Self::AgentType { values } => match &input.agent_type {
+                Some(agent) => {
+                    !values.is_empty()
+                        && values.iter().any(|v| v.eq_ignore_ascii_case(agent))
+                }
+                None => false,
+            },
+            Self::And { children } => children.iter().all(|c| c.evaluate(input)),
+            Self::Or { children } => children.iter().any(|c| c.evaluate(input)),
+            Self::Not { child } => !child.evaluate(input),
+            Self::True => true,
+            Self::False => false,
+        }
+    }
+
+    /// Returns the depth of the predicate tree.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        match self {
+            Self::And { children } | Self::Or { children } => {
+                1 + children.iter().map(|c| c.depth()).max().unwrap_or(0)
+            }
+            Self::Not { child } => 1 + child.depth(),
+            _ => 1,
+        }
+    }
+
+    /// Returns the total number of leaf predicates in the tree.
+    #[must_use]
+    pub fn leaf_count(&self) -> usize {
+        match self {
+            Self::And { children } | Self::Or { children } => {
+                children.iter().map(|c| c.leaf_count()).sum()
+            }
+            Self::Not { child } => child.leaf_count(),
+            _ => 1,
+        }
+    }
+
+    /// Convert a flat `PolicyRuleMatch` into a composable predicate tree.
+    ///
+    /// The resulting predicate AND's all non-empty criteria (same semantics
+    /// as the flat `matches_rule` function). A catch-all match becomes `True`.
+    #[must_use]
+    pub fn from_flat_match(m: &PolicyRuleMatch) -> Self {
+        let mut parts = Vec::new();
+
+        if !m.actions.is_empty() {
+            parts.push(Self::Action {
+                values: m.actions.clone(),
+            });
+        }
+        if !m.actors.is_empty() {
+            parts.push(Self::Actor {
+                values: m.actors.clone(),
+            });
+        }
+        if !m.surfaces.is_empty() {
+            parts.push(Self::Surface {
+                values: m.surfaces.clone(),
+            });
+        }
+        if !m.pane_ids.is_empty() {
+            parts.push(Self::PaneId {
+                values: m.pane_ids.clone(),
+            });
+        }
+        if !m.pane_titles.is_empty() {
+            parts.push(Self::PaneTitle {
+                patterns: m.pane_titles.clone(),
+            });
+        }
+        if !m.pane_cwds.is_empty() {
+            parts.push(Self::PaneCwd {
+                patterns: m.pane_cwds.clone(),
+            });
+        }
+        if !m.pane_domains.is_empty() {
+            parts.push(Self::PaneDomain {
+                values: m.pane_domains.clone(),
+            });
+        }
+        if !m.command_patterns.is_empty() {
+            parts.push(Self::CommandPattern {
+                patterns: m.command_patterns.clone(),
+            });
+        }
+        if !m.agent_types.is_empty() {
+            parts.push(Self::AgentType {
+                values: m.agent_types.clone(),
+            });
+        }
+
+        match parts.len() {
+            0 => Self::True,
+            1 => parts.into_iter().next().unwrap(),
+            _ => Self::And { children: parts },
+        }
+    }
+}
+
+/// Evaluates a `RulePredicate` against a `PolicyInput`.
+///
+/// Convenience function that delegates to `RulePredicate::evaluate`.
+#[must_use]
+pub fn evaluate_predicate(predicate: &RulePredicate, input: &PolicyInput) -> bool {
+    predicate.evaluate(input)
+}
+
+// ============================================================================
 // Policy Engine
 // ============================================================================
 
@@ -8471,5 +8679,367 @@ mod tests {
         let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
         input.command_text = Some("anything".to_string());
         assert!(!matches_rule(&match_on, &input));
+    }
+
+    // ========================================================================
+    // RulePredicate tests
+    // ========================================================================
+
+    #[test]
+    fn predicate_true_always_matches() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(RulePredicate::True.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_false_never_matches() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(!RulePredicate::False.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_not_inverts() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let pred = RulePredicate::Not {
+            child: Box::new(RulePredicate::True),
+        };
+        assert!(!pred.evaluate(&input));
+
+        let pred2 = RulePredicate::Not {
+            child: Box::new(RulePredicate::False),
+        };
+        assert!(pred2.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_action_matches() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let pred = RulePredicate::Action {
+            values: vec!["send_text".to_string()],
+        };
+        assert!(pred.evaluate(&input));
+
+        let pred2 = RulePredicate::Action {
+            values: vec!["close".to_string()],
+        };
+        assert!(!pred2.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_actor_matches() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let pred = RulePredicate::Actor {
+            values: vec!["robot".to_string()],
+        };
+        assert!(pred.evaluate(&input));
+
+        let pred2 = RulePredicate::Actor {
+            values: vec!["human".to_string()],
+        };
+        assert!(!pred2.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_surface_case_insensitive() {
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.surface = PolicySurface::Mux;
+        let pred = RulePredicate::Surface {
+            values: vec!["MUX".to_string()],
+        };
+        assert!(pred.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_and_requires_all() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let pred = RulePredicate::And {
+            children: vec![
+                RulePredicate::Action {
+                    values: vec!["send_text".to_string()],
+                },
+                RulePredicate::Actor {
+                    values: vec!["robot".to_string()],
+                },
+            ],
+        };
+        assert!(pred.evaluate(&input));
+
+        let pred2 = RulePredicate::And {
+            children: vec![
+                RulePredicate::Action {
+                    values: vec!["send_text".to_string()],
+                },
+                RulePredicate::Actor {
+                    values: vec!["human".to_string()],
+                },
+            ],
+        };
+        assert!(!pred2.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_or_requires_any() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let pred = RulePredicate::Or {
+            children: vec![
+                RulePredicate::Action {
+                    values: vec!["close".to_string()],
+                },
+                RulePredicate::Actor {
+                    values: vec!["robot".to_string()],
+                },
+            ],
+        };
+        assert!(pred.evaluate(&input));
+
+        let pred_none = RulePredicate::Or {
+            children: vec![
+                RulePredicate::Action {
+                    values: vec!["close".to_string()],
+                },
+                RulePredicate::Actor {
+                    values: vec!["human".to_string()],
+                },
+            ],
+        };
+        assert!(!pred_none.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_and_empty_children_matches() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let pred = RulePredicate::And {
+            children: vec![],
+        };
+        assert!(pred.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_or_empty_children_fails() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let pred = RulePredicate::Or {
+            children: vec![],
+        };
+        assert!(!pred.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_nested_complex() {
+        // (action=spawn AND actor=robot) OR (action=send_text AND actor=mcp)
+        let pred = RulePredicate::Or {
+            children: vec![
+                RulePredicate::And {
+                    children: vec![
+                        RulePredicate::Action {
+                            values: vec!["spawn".to_string()],
+                        },
+                        RulePredicate::Actor {
+                            values: vec!["robot".to_string()],
+                        },
+                    ],
+                },
+                RulePredicate::And {
+                    children: vec![
+                        RulePredicate::Action {
+                            values: vec!["send_text".to_string()],
+                        },
+                        RulePredicate::Actor {
+                            values: vec!["mcp".to_string()],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        // spawn + robot → matches first branch
+        let input1 = PolicyInput::new(ActionKind::Spawn, ActorKind::Robot);
+        assert!(pred.evaluate(&input1));
+
+        // send_text + mcp → matches second branch
+        let input2 = PolicyInput::new(ActionKind::SendText, ActorKind::Mcp);
+        assert!(pred.evaluate(&input2));
+
+        // send_text + robot → matches neither
+        let input3 = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(!pred.evaluate(&input3));
+    }
+
+    #[test]
+    fn predicate_pane_id_matches() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(42);
+        let pred = RulePredicate::PaneId {
+            values: vec![42, 99],
+        };
+        assert!(pred.evaluate(&input));
+
+        let pred2 = RulePredicate::PaneId {
+            values: vec![99],
+        };
+        assert!(!pred2.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_pane_title_glob() {
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.pane_title = Some("my-critical-pane".to_string());
+        let pred = RulePredicate::PaneTitle {
+            patterns: vec!["*critical*".to_string()],
+        };
+        assert!(pred.evaluate(&input));
+
+        let pred2 = RulePredicate::PaneTitle {
+            patterns: vec!["*safe*".to_string()],
+        };
+        assert!(!pred2.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_command_pattern_regex() {
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.command_text = Some("rm -rf /tmp/stuff".to_string());
+        let pred = RulePredicate::CommandPattern {
+            patterns: vec!["^rm\\s+-rf".to_string()],
+        };
+        assert!(pred.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_empty_values_never_matches() {
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        assert!(!RulePredicate::Action { values: vec![] }.evaluate(&input));
+        assert!(!RulePredicate::Actor { values: vec![] }.evaluate(&input));
+        assert!(!RulePredicate::Surface { values: vec![] }.evaluate(&input));
+    }
+
+    #[test]
+    fn predicate_depth() {
+        assert_eq!(RulePredicate::True.depth(), 1);
+        assert_eq!(
+            RulePredicate::Not {
+                child: Box::new(RulePredicate::True)
+            }
+            .depth(),
+            2
+        );
+        assert_eq!(
+            RulePredicate::And {
+                children: vec![
+                    RulePredicate::True,
+                    RulePredicate::Not {
+                        child: Box::new(RulePredicate::False)
+                    },
+                ]
+            }
+            .depth(),
+            3
+        );
+    }
+
+    #[test]
+    fn predicate_leaf_count() {
+        assert_eq!(RulePredicate::True.leaf_count(), 1);
+        assert_eq!(
+            RulePredicate::And {
+                children: vec![RulePredicate::True, RulePredicate::False,]
+            }
+            .leaf_count(),
+            2
+        );
+        assert_eq!(
+            RulePredicate::Or {
+                children: vec![
+                    RulePredicate::True,
+                    RulePredicate::And {
+                        children: vec![RulePredicate::False, RulePredicate::True,]
+                    },
+                ]
+            }
+            .leaf_count(),
+            3
+        );
+    }
+
+    #[test]
+    fn predicate_from_flat_match_catch_all() {
+        let m = PolicyRuleMatch::default();
+        let pred = RulePredicate::from_flat_match(&m);
+        assert_eq!(pred, RulePredicate::True);
+    }
+
+    #[test]
+    fn predicate_from_flat_match_single_criterion() {
+        let m = PolicyRuleMatch {
+            actions: vec!["send_text".to_string()],
+            ..Default::default()
+        };
+        let pred = RulePredicate::from_flat_match(&m);
+        assert_eq!(
+            pred,
+            RulePredicate::Action {
+                values: vec!["send_text".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn predicate_from_flat_match_multiple_criteria() {
+        let m = PolicyRuleMatch {
+            actions: vec!["send_text".to_string()],
+            actors: vec!["robot".to_string()],
+            ..Default::default()
+        };
+        let pred = RulePredicate::from_flat_match(&m);
+        let check = matches!(pred, RulePredicate::And { children } if children.len() == 2);
+        assert!(check);
+    }
+
+    #[test]
+    fn predicate_from_flat_match_parity_with_matches_rule() {
+        let m = PolicyRuleMatch {
+            actions: vec!["send_text".to_string()],
+            actors: vec!["robot".to_string()],
+            pane_ids: vec![42],
+            ..Default::default()
+        };
+        let pred = RulePredicate::from_flat_match(&m);
+
+        let input_match = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(42);
+        let input_no_match =
+            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(99);
+
+        assert_eq!(matches_rule(&m, &input_match), pred.evaluate(&input_match));
+        assert_eq!(
+            matches_rule(&m, &input_no_match),
+            pred.evaluate(&input_no_match)
+        );
+    }
+
+    #[test]
+    fn predicate_serde_roundtrip() {
+        let pred = RulePredicate::And {
+            children: vec![
+                RulePredicate::Action {
+                    values: vec!["send_text".to_string()],
+                },
+                RulePredicate::Not {
+                    child: Box::new(RulePredicate::Actor {
+                        values: vec!["human".to_string()],
+                    }),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&pred).unwrap();
+        let back: RulePredicate = serde_json::from_str(&json).unwrap();
+        assert_eq!(pred, back);
+    }
+
+    #[test]
+    fn predicate_serde_tagged_format() {
+        let pred = RulePredicate::Action {
+            values: vec!["send_text".to_string()],
+        };
+        let json = serde_json::to_string(&pred).unwrap();
+        assert!(json.contains("\"type\":\"action\""));
+        assert!(json.contains("\"values\":[\"send_text\"]"));
     }
 }
