@@ -141,9 +141,9 @@ pub struct ChunkedPipelineState {
     scan_state: OutputScanState,
     /// Accumulated metrics across all chunks.
     accumulated_metrics: OutputScanMetrics,
-    /// Accumulated trigger counts across all chunks.
+    /// Accumulated trigger counts across all chunks (incremental, approximate).
     accumulated_triggers: HashMap<TriggerCategory, u64>,
-    /// Total trigger matches across all chunks.
+    /// Total trigger matches across all chunks (incremental, approximate).
     total_trigger_matches: u64,
     /// Total bytes processed.
     total_bytes: u64,
@@ -155,6 +155,13 @@ pub struct ChunkedPipelineState {
     uncompressed_buffer: Vec<u8>,
     /// Sliding overlap window used to recover trigger matches split across chunks.
     trigger_overlap_buffer: Vec<u8>,
+    /// Accumulated raw data for definitive trigger scan at flush time.
+    ///
+    /// The incremental overlap-based trigger scan is approximate because
+    /// Aho-Corasick LeftmostFirst non-overlapping matching is not composable
+    /// across chunk boundaries. At flush time, we re-scan this buffer in batch
+    /// mode for exact parity with `process()`.
+    trigger_data_buffer: Vec<u8>,
     /// Maximum buffer size before flushing compression.
     max_buffer_bytes: usize,
 }
@@ -173,6 +180,7 @@ impl ChunkedPipelineState {
             ends_with_newline: false,
             uncompressed_buffer: Vec::with_capacity(max_buffer_bytes.min(1_048_576)),
             trigger_overlap_buffer: Vec::new(),
+            trigger_data_buffer: Vec::new(),
             max_buffer_bytes,
         }
     }
@@ -258,6 +266,7 @@ impl ChunkedPipelineState {
         self.ends_with_newline = false;
         self.uncompressed_buffer.clear();
         self.trigger_overlap_buffer.clear();
+        self.trigger_data_buffer.clear();
     }
 }
 
@@ -416,6 +425,7 @@ impl ScanPipeline {
 
         // Stage 2: Pattern trigger scan on this chunk
         if self.config.enable_triggers {
+            // Incremental scan with overlap for real-time feedback
             let chunk_triggers =
                 self.scan_chunk_triggers_with_overlap(bytes, &state.trigger_overlap_buffer);
             state.total_trigger_matches += chunk_triggers.total_matches;
@@ -428,6 +438,9 @@ impl ScanPipeline {
                 bytes,
                 self.trigger_overlap_bytes(),
             );
+
+            // Accumulate raw data for definitive batch scan at flush time
+            state.trigger_data_buffer.extend_from_slice(bytes);
         }
 
         // Stage 3: Buffer for batch compression (no per-chunk compression)
@@ -463,11 +476,11 @@ impl ScanPipeline {
         };
 
         let triggers = if self.config.enable_triggers {
-            Some(TriggerScanResult {
-                counts: state.accumulated_triggers.clone(),
-                total_matches: state.total_trigger_matches,
-                bytes_scanned: total_bytes,
-            })
+            // Definitive batch scan on accumulated data for exact parity with
+            // process(). The incremental overlap-based counts are approximate
+            // because Aho-Corasick LeftmostFirst non-overlapping matching is
+            // context-dependent and not composable across chunk boundaries.
+            Some(self.trigger_scanner.scan_counts(&state.trigger_data_buffer))
         } else {
             None
         };
