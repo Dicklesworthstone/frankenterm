@@ -50,6 +50,28 @@ fn line_aligned_chunks(data: Vec<u8>) -> Vec<Vec<u8>> {
     chunks
 }
 
+fn arbitrary_chunks(data: &[u8], chunk_sizes: &[usize]) -> Vec<Vec<u8>> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+
+    if chunk_sizes.is_empty() {
+        return vec![data.to_vec()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut offset = 0usize;
+    let mut index = 0usize;
+    while offset < data.len() {
+        let requested = chunk_sizes[index % chunk_sizes.len()].max(1);
+        let chunk_len = requested.min(data.len() - offset);
+        chunks.push(data[offset..offset + chunk_len].to_vec());
+        offset += chunk_len;
+        index += 1;
+    }
+    chunks
+}
+
 // =============================================================================
 // Metrics invariant tests
 // =============================================================================
@@ -197,6 +219,57 @@ proptest! {
         let batch_total = batch_output.triggers.as_ref().unwrap().total_matches;
         let chunked_total = chunked_output.triggers.as_ref().unwrap().total_matches;
         prop_assert_eq!(batch_total, chunked_total);
+    }
+
+    /// Arbitrary chunk boundaries preserve trigger totals via overlap carry.
+    #[test]
+    fn chunked_batch_trigger_parity_arbitrary_boundaries(
+        data in terminal_text(),
+        chunk_sizes in prop::collection::vec(0usize..128, 0..16),
+    ) {
+        let pipeline = ScanPipeline::new(ScanPipelineConfig {
+            enable_compression: false,
+            ..Default::default()
+        });
+
+        let batch_output = pipeline.process(&data);
+
+        let chunks = arbitrary_chunks(&data, &chunk_sizes);
+        let mut state = ChunkedPipelineState::new(16_777_216);
+        for chunk in &chunks {
+            pipeline.process_chunk(chunk, &mut state);
+        }
+        let chunked_output = pipeline.flush(&mut state);
+
+        let batch_total = batch_output.triggers.as_ref().unwrap().total_matches;
+        let chunked_total = chunked_output.triggers.as_ref().unwrap().total_matches;
+        prop_assert_eq!(batch_total, chunked_total);
+    }
+
+    /// Arbitrary chunk boundaries preserve logical line count.
+    #[test]
+    fn chunked_batch_logical_line_parity_arbitrary_boundaries(
+        data in terminal_text(),
+        chunk_sizes in prop::collection::vec(0usize..128, 0..16),
+    ) {
+        let pipeline = ScanPipeline::new(ScanPipelineConfig {
+            enable_compression: false,
+            ..Default::default()
+        });
+
+        let batch_output = pipeline.process(&data);
+
+        let chunks = arbitrary_chunks(&data, &chunk_sizes);
+        let mut state = ChunkedPipelineState::new(16_777_216);
+        for chunk in &chunks {
+            pipeline.process_chunk(chunk, &mut state);
+        }
+        let chunked_output = pipeline.flush(&mut state);
+
+        prop_assert_eq!(
+            batch_output.metrics.logical_lines,
+            chunked_output.metrics.logical_lines
+        );
     }
 }
 

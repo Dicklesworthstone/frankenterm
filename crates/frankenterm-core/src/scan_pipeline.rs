@@ -147,8 +147,14 @@ pub struct ChunkedPipelineState {
     total_trigger_matches: u64,
     /// Total bytes processed.
     total_bytes: u64,
+    /// Whether any non-empty chunk has been observed.
+    saw_any_bytes: bool,
+    /// Whether the latest non-empty chunk ended with a newline.
+    ends_with_newline: bool,
     /// Buffered uncompressed output for batch compression.
     uncompressed_buffer: Vec<u8>,
+    /// Sliding overlap window used to recover trigger matches split across chunks.
+    trigger_overlap_buffer: Vec<u8>,
     /// Maximum buffer size before flushing compression.
     max_buffer_bytes: usize,
 }
@@ -163,7 +169,10 @@ impl ChunkedPipelineState {
             accumulated_triggers: HashMap::new(),
             total_trigger_matches: 0,
             total_bytes: 0,
+            saw_any_bytes: false,
+            ends_with_newline: false,
             uncompressed_buffer: Vec::with_capacity(max_buffer_bytes.min(1_048_576)),
+            trigger_overlap_buffer: Vec::new(),
             max_buffer_bytes,
         }
     }
@@ -204,6 +213,20 @@ impl ChunkedPipelineState {
         self.total_trigger_matches
     }
 
+    /// Logical line count using the same semantics as batch scanning.
+    #[must_use]
+    pub fn logical_lines(&self) -> usize {
+        if !self.saw_any_bytes {
+            return 0;
+        }
+
+        if self.ends_with_newline {
+            self.accumulated_metrics.newline_count
+        } else {
+            self.accumulated_metrics.newline_count + 1
+        }
+    }
+
     /// Whether any errors have been detected across all chunks.
     #[must_use]
     pub fn has_errors(&self) -> bool {
@@ -231,8 +254,34 @@ impl ChunkedPipelineState {
         self.accumulated_triggers.clear();
         self.total_trigger_matches = 0;
         self.total_bytes = 0;
+        self.saw_any_bytes = false;
+        self.ends_with_newline = false;
         self.uncompressed_buffer.clear();
+        self.trigger_overlap_buffer.clear();
     }
+}
+
+fn update_trigger_overlap_buffer(overlap: &mut Vec<u8>, bytes: &[u8], max_overlap: usize) {
+    if max_overlap == 0 {
+        overlap.clear();
+        return;
+    }
+
+    let tail_from_bytes = bytes.len().min(max_overlap);
+    let keep_from_overlap = max_overlap.saturating_sub(tail_from_bytes);
+    let mut next = Vec::with_capacity(max_overlap);
+
+    if keep_from_overlap > 0 && !overlap.is_empty() {
+        let overlap_start = overlap.len().saturating_sub(keep_from_overlap);
+        next.extend_from_slice(&overlap[overlap_start..]);
+    }
+
+    if tail_from_bytes > 0 {
+        let byte_start = bytes.len() - tail_from_bytes;
+        next.extend_from_slice(&bytes[byte_start..]);
+    }
+
+    *overlap = next;
 }
 
 // =============================================================================
@@ -273,6 +322,43 @@ impl ScanPipeline {
             trigger_scanner,
             compressor,
         }
+    }
+
+    fn trigger_overlap_bytes(&self) -> usize {
+        self.trigger_scanner
+            .patterns()
+            .iter()
+            .map(|pattern| pattern.pattern.len())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1)
+    }
+
+    fn scan_chunk_triggers_with_overlap(&self, bytes: &[u8], overlap: &[u8]) -> TriggerScanResult {
+        if overlap.is_empty() {
+            return self.trigger_scanner.scan_counts(bytes);
+        }
+
+        let mut combined = Vec::with_capacity(overlap.len() + bytes.len());
+        combined.extend_from_slice(overlap);
+        combined.extend_from_slice(bytes);
+
+        let overlap_len = overlap.len();
+        let mut result = TriggerScanResult {
+            bytes_scanned: bytes.len() as u64,
+            ..Default::default()
+        };
+
+        for matched in self.trigger_scanner.scan_locate(&combined) {
+            if matched.offset + matched.length <= overlap_len {
+                continue;
+            }
+
+            *result.counts.entry(matched.category).or_insert(0) += 1;
+            result.total_matches += 1;
+        }
+
+        result
     }
 
     /// Process a complete buffer through all pipeline stages.
@@ -323,14 +409,25 @@ impl ScanPipeline {
         state.accumulated_metrics.newline_count += chunk_metrics.newline_count;
         state.accumulated_metrics.ansi_byte_count += chunk_metrics.ansi_byte_count;
         state.total_bytes += bytes.len() as u64;
+        if !bytes.is_empty() {
+            state.saw_any_bytes = true;
+            state.ends_with_newline = bytes.last() == Some(&b'\n');
+        }
 
         // Stage 2: Pattern trigger scan on this chunk
         if self.config.enable_triggers {
-            let chunk_triggers = self.trigger_scanner.scan_counts(bytes);
+            let chunk_triggers =
+                self.scan_chunk_triggers_with_overlap(bytes, &state.trigger_overlap_buffer);
             state.total_trigger_matches += chunk_triggers.total_matches;
             for (cat, count) in &chunk_triggers.counts {
                 *state.accumulated_triggers.entry(*cat).or_insert(0) += count;
             }
+
+            update_trigger_overlap_buffer(
+                &mut state.trigger_overlap_buffer,
+                bytes,
+                self.trigger_overlap_bytes(),
+            );
         }
 
         // Stage 3: Buffer for batch compression (no per-chunk compression)
@@ -361,7 +458,7 @@ impl ScanPipeline {
         let summary = ScanMetricsSummary {
             newline_count: state.accumulated_metrics.newline_count,
             ansi_byte_count: state.accumulated_metrics.ansi_byte_count,
-            logical_lines: state.accumulated_metrics.newline_count, // approximate for chunked
+            logical_lines: state.logical_lines(),
             ansi_density,
         };
 
@@ -726,9 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn chunked_may_miss_split_patterns() {
-        // When chunks split in the middle of a keyword, the chunked pipeline
-        // may find fewer matches than batch mode. This is expected behavior.
+    fn chunked_recovers_split_patterns_with_overlap() {
         let pipeline = ScanPipeline::new(ScanPipelineConfig {
             enable_compression: false,
             ..Default::default()
@@ -745,7 +840,28 @@ mod tests {
         let chunked_output = pipeline.flush(&mut state);
         let chunked_total = chunked_output.triggers.unwrap().total_matches;
 
-        // Chunked should find <= batch (split pattern missed)
-        assert!(chunked_total <= batch_total);
+        assert_eq!(chunked_total, batch_total);
+    }
+
+    #[test]
+    fn chunked_flush_preserves_logical_lines_without_trailing_newline() {
+        let pipeline = ScanPipeline::new(ScanPipelineConfig {
+            enable_compression: false,
+            ..Default::default()
+        });
+        let data = b"line1\nline2";
+
+        let batch_output = pipeline.process(data);
+
+        let mut state = ChunkedPipelineState::new(1_048_576);
+        pipeline.process_chunk(b"line1\nli", &mut state);
+        pipeline.process_chunk(b"ne2", &mut state);
+        let chunked_output = pipeline.flush(&mut state);
+
+        assert_eq!(chunked_output.metrics.logical_lines, 2);
+        assert_eq!(
+            chunked_output.metrics.logical_lines,
+            batch_output.metrics.logical_lines
+        );
     }
 }

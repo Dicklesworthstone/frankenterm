@@ -192,10 +192,10 @@ run_rch_expect_success \
   cargo test -p frankenterm-core --test proptest_scan_pipeline chunked_batch_trigger_parity -- --nocapture
 
 run_rch_expect_success \
-  "failure_injection_split_pattern" \
-  "failure_injection.chunk_split_trigger_loss_boundary" \
-  "cargo test -p frankenterm-core --lib chunked_may_miss_split_patterns -- --nocapture" \
-  cargo test -p frankenterm-core --lib chunked_may_miss_split_patterns -- --nocapture
+  "split_pattern_recovery" \
+  "recovery_path.chunk_split_trigger_overlap" \
+  "cargo test -p frankenterm-core --lib chunked_recovers_split_patterns_with_overlap -- --nocapture" \
+  cargo test -p frankenterm-core --lib chunked_recovers_split_patterns_with_overlap -- --nocapture
 
 run_rch_expect_success \
   "recovery_cross_boundary_ansi" \
