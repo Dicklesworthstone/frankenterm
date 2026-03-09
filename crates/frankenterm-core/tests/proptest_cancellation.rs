@@ -376,6 +376,358 @@ proptest! {
         prop_assert_eq!(summary.reason, ShutdownReason::GracefulTermination);
         prop_assert!(!summary.escalated);
     }
+
+    // ── CancellationToken scope_id preservation ────────────────────────
+
+    #[test]
+    fn token_preserves_scope_id(scope_name in "[a-z][a-z0-9_:]{1,20}") {
+        let id = ScopeId(scope_name.clone());
+        let token = CancellationToken::new(id);
+        prop_assert_eq!(token.scope_id().0.as_str(), scope_name.as_str());
+    }
+
+    // ── CancellationToken child_count tracking ─────────────────────────
+
+    #[test]
+    fn token_child_count_accurate(n_children in 0usize..10) {
+        let parent = CancellationToken::new(ScopeId("parent".into()));
+        let mut children = Vec::new();
+        for i in 0..n_children {
+            children.push(parent.child(ScopeId(format!("child_{i}"))));
+        }
+        prop_assert_eq!(parent.child_count(), n_children);
+    }
+
+    // ── CancellationToken generation only bumps once ───────────────────
+
+    #[test]
+    fn token_generation_bumps_once(n_cancels in 1usize..10) {
+        let token = CancellationToken::new(ScopeId("test".into()));
+        prop_assert_eq!(token.generation(), 0);
+
+        for _ in 0..n_cancels {
+            token.cancel(ShutdownReason::UserRequested);
+        }
+        // Generation should be exactly 1 (idempotent cancel)
+        prop_assert_eq!(token.generation(), 1);
+    }
+
+    // ── Telemetry counter tracking ─────────────────────────────────────
+
+    #[test]
+    fn telemetry_counters_track_operations(
+        n_scopes in 1usize..5,
+        n_finalizers_per_scope in 0usize..3,
+    ) {
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let mut coord = ShutdownCoordinator::new();
+        coord.register_scope(&ScopeId::root(), ScopeTier::Root, None).unwrap();
+
+        let mut scope_ids = Vec::new();
+        for i in 0..n_scopes {
+            let id = ScopeId(format!("worker:tel{i}"));
+            tree.register(id.clone(), ScopeTier::Worker, &ScopeId::root(), format!("t{i}"), 1000).unwrap();
+            tree.start(&id, 1100).unwrap();
+            coord.register_scope(&id, ScopeTier::Worker, Some(&ScopeId::root())).unwrap();
+
+            for j in 0..n_finalizers_per_scope {
+                coord.register_finalizer(&id, Finalizer {
+                    name: format!("f_{i}_{j}"),
+                    priority: j as u32,
+                    action: FinalizerAction::Custom {
+                        action_name: format!("a_{i}_{j}"),
+                        metadata: HashMap::new(),
+                    },
+                    status: FinalizerStatus::Pending,
+                }).unwrap();
+            }
+            scope_ids.push(id);
+        }
+
+        let snap = coord.telemetry().snapshot();
+        // +1 for root
+        prop_assert_eq!(snap.scopes_registered, (n_scopes + 1) as u64);
+        prop_assert_eq!(snap.finalizers_registered, (n_scopes * n_finalizers_per_scope) as u64);
+    }
+
+    // ── Telemetry snapshot serde roundtrip ──────────────────────────────
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip(
+        n_scopes in 1usize..3,
+    ) {
+        let mut coord = ShutdownCoordinator::new();
+        for i in 0..n_scopes {
+            coord.register_scope(&ScopeId(format!("w:{i}")), ScopeTier::Worker, None).unwrap();
+        }
+
+        let snap = coord.telemetry().snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored: frankenterm_core::cancellation::ShutdownCoordinatorTelemetrySnapshot =
+            serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap, restored);
+    }
+
+    // ── Cascade children count ─────────────────────────────────────────
+
+    #[test]
+    fn cascade_shutdown_propagates_to_children(n_children in 1usize..6) {
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let parent = ScopeId("daemon:cascade_parent".into());
+        tree.register(parent.clone(), ScopeTier::Daemon, &ScopeId::root(), "p", 1000).unwrap();
+        tree.start(&parent, 1100).unwrap();
+
+        let mut coord = ShutdownCoordinator::new();
+        coord.register_scope(&ScopeId::root(), ScopeTier::Root, None).unwrap();
+        coord.register_scope(&parent, ScopeTier::Daemon, Some(&ScopeId::root())).unwrap();
+
+        let mut child_ids = Vec::new();
+        for i in 0..n_children {
+            let cid = ScopeId(format!("worker:cascade_child{i}"));
+            tree.register(cid.clone(), ScopeTier::Worker, &parent, format!("c{i}"), 1200).unwrap();
+            tree.start(&cid, 1300).unwrap();
+            coord.register_scope(&cid, ScopeTier::Worker, Some(&parent)).unwrap();
+            child_ids.push(cid);
+        }
+
+        let cascaded = coord.request_shutdown(&mut tree, &parent, ShutdownReason::UserRequested, 5000).unwrap();
+        prop_assert_eq!(cascaded.len(), n_children, "all children should be cascaded");
+
+        // All children should be draining
+        for cid in &child_ids {
+            let state = tree.get(cid).unwrap().state;
+            prop_assert_eq!(state, ScopeState::Draining);
+        }
+    }
+
+    // ── Finalizer failure in summary ───────────────────────────────────
+
+    #[test]
+    fn finalizer_failure_tracked_in_summary(
+        n_succeed in 0usize..3,
+        n_fail in 1usize..3,
+    ) {
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let scope = ScopeId("worker:fail_test".into());
+        tree.register(scope.clone(), ScopeTier::Worker, &ScopeId::root(), "test", 1000).unwrap();
+        tree.start(&scope, 1100).unwrap();
+
+        let mut coord = ShutdownCoordinator::new();
+        coord.register_scope(&ScopeId::root(), ScopeTier::Root, None).unwrap();
+        coord.register_scope(&scope, ScopeTier::Worker, Some(&ScopeId::root())).unwrap();
+
+        let total = n_succeed + n_fail;
+        for i in 0..total {
+            coord.register_finalizer(&scope, Finalizer {
+                name: format!("f_{i}"),
+                priority: (total - i) as u32,
+                action: FinalizerAction::Custom {
+                    action_name: format!("a_{i}"),
+                    metadata: HashMap::new(),
+                },
+                status: FinalizerStatus::Pending,
+            }).unwrap();
+        }
+
+        coord.request_shutdown(&mut tree, &scope, ShutdownReason::GracefulTermination, 2000).unwrap();
+        coord.begin_finalize(&mut tree, &scope, 200, 2200).unwrap();
+
+        // Run finalizers: first n_succeed succeed, then n_fail fail
+        for i in 0..total {
+            let name = format!("f_{i}");
+            coord.mark_finalizer_started(&scope, &name, 2200 + i as i64 * 100).unwrap();
+            if i < n_succeed {
+                coord.mark_finalizer_completed(&scope, &name, 50, 2250 + i as i64 * 100).unwrap();
+            } else {
+                coord.mark_finalizer_failed(&scope, &name, "test error", 50, 2250 + i as i64 * 100).unwrap();
+            }
+        }
+
+        let summary = coord.complete_shutdown(&mut tree, &scope, 3000).unwrap();
+        prop_assert_eq!(summary.finalizers_run, total);
+        prop_assert_eq!(summary.finalizers_succeeded, n_succeed);
+        prop_assert_eq!(summary.finalizers_failed, n_fail);
+    }
+
+    // ── Policy override replaces tier default ──────────────────────────
+
+    #[test]
+    fn policy_override_replaces_default(
+        custom_grace_ms in 100u64..60_000,
+    ) {
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let scope = ScopeId("worker:policy_test".into());
+        tree.register(scope.clone(), ScopeTier::Worker, &ScopeId::root(), "test", 1000).unwrap();
+        tree.start(&scope, 1100).unwrap();
+
+        let mut coord = ShutdownCoordinator::new();
+        coord.register_scope(&ScopeId::root(), ScopeTier::Root, None).unwrap();
+        coord.register_scope(&scope, ScopeTier::Worker, Some(&ScopeId::root())).unwrap();
+
+        let custom = ShutdownPolicy {
+            grace_period_ms: custom_grace_ms,
+            ..ShutdownPolicy::for_tier(ScopeTier::Worker)
+        };
+        coord.set_policy(&scope, custom).unwrap();
+
+        coord.request_shutdown(&mut tree, &scope, ShutdownReason::UserRequested, 5000).unwrap();
+
+        let before_expiry = coord.is_grace_expired(&tree, &scope, 5000 + custom_grace_ms as i64 - 1);
+        let after_expiry = coord.is_grace_expired(&tree, &scope, 5000 + custom_grace_ms as i64 + 1);
+
+        prop_assert!(!before_expiry, "should not be expired before custom grace");
+        prop_assert!(after_expiry, "should be expired after custom grace");
+    }
+
+    // ── events_for_scope filters correctly ─────────────────────────────
+
+    #[test]
+    fn events_for_scope_filters_correctly(n_scopes in 2usize..5) {
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let mut coord = ShutdownCoordinator::new();
+        coord.register_scope(&ScopeId::root(), ScopeTier::Root, None).unwrap();
+
+        let mut scope_ids = Vec::new();
+        for i in 0..n_scopes {
+            let id = ScopeId(format!("worker:evt{i}"));
+            tree.register(id.clone(), ScopeTier::Worker, &ScopeId::root(), format!("e{i}"), 1000).unwrap();
+            tree.start(&id, 1100).unwrap();
+            coord.register_scope(&id, ScopeTier::Worker, Some(&ScopeId::root())).unwrap();
+            scope_ids.push(id);
+        }
+
+        // Shut down each scope
+        for (i, id) in scope_ids.iter().enumerate() {
+            let _ = coord.request_shutdown(&mut tree, id, ShutdownReason::UserRequested, 2000 + i as i64 * 1000);
+        }
+
+        // Each scope's events should only contain that scope's events
+        for id in &scope_ids {
+            let events = coord.events_for_scope(id);
+            for event in &events {
+                prop_assert_eq!(&event.scope_id, id, "event scope_id mismatch");
+            }
+            prop_assert!(!events.is_empty(), "scope {:?} should have at least one event", id);
+        }
+    }
+
+    // ── ExtendGrace escalation extends the period ──────────────────────
+
+    #[test]
+    fn extend_grace_escalation(
+        base_grace in 100u64..5000,
+        extra_ms in 100u64..5000,
+    ) {
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let scope = ScopeId("daemon:extend_test".into());
+        tree.register(scope.clone(), ScopeTier::Daemon, &ScopeId::root(), "ext", 1000).unwrap();
+        tree.start(&scope, 1100).unwrap();
+
+        let mut coord = ShutdownCoordinator::new();
+        coord.register_scope(&ScopeId::root(), ScopeTier::Root, None).unwrap();
+        coord.register_scope(&scope, ScopeTier::Daemon, Some(&ScopeId::root())).unwrap();
+        coord.set_policy(&scope, ShutdownPolicy {
+            grace_period_ms: base_grace,
+            escalation: EscalationAction::ExtendGrace { extra_ms },
+            cascade_to_children: false,
+            run_finalizers: true,
+            finalizer_timeout_ms: 5000,
+        }).unwrap();
+
+        coord.request_shutdown(&mut tree, &scope, ShutdownReason::UserRequested, 5000).unwrap();
+
+        // Trigger escalation
+        let action = coord.handle_grace_expiry(&mut tree, &scope, 5000 + base_grace as i64 + 1).unwrap();
+        let is_extend = matches!(action, EscalationAction::ExtendGrace { .. });
+        prop_assert!(is_extend, "should return ExtendGrace action");
+
+        // Grace is now extended — check not yet expired at base+extra-1
+        let extended_grace = base_grace + extra_ms;
+        let still_within = coord.is_grace_expired(&tree, &scope, 5000 + extended_grace as i64 - 1);
+        prop_assert!(!still_within, "should NOT be expired after extension");
+
+        let past_extended = coord.is_grace_expired(&tree, &scope, 5000 + extended_grace as i64 + 1);
+        prop_assert!(past_extended, "should be expired past extended grace");
+    }
+
+    // ── ShutdownReason Display always non-empty ────────────────────────
+
+    #[test]
+    fn shutdown_reason_display_non_empty(reason in arb_shutdown_reason()) {
+        let display = reason.to_string();
+        prop_assert!(!display.is_empty());
+    }
+
+    // ── EscalationAction Display always non-empty ──────────────────────
+
+    #[test]
+    fn escalation_display_non_empty(action in arb_escalation()) {
+        let display = action.to_string();
+        prop_assert!(!display.is_empty());
+    }
+
+    // ── FinalizerStatus Display always non-empty ───────────────────────
+
+    #[test]
+    fn finalizer_status_display_non_empty(status in arb_finalizer_status()) {
+        let display = status.to_string();
+        prop_assert!(!display.is_empty());
+    }
+
+    // ── Coordinator canonical_string updates ───────────────────────────
+
+    #[test]
+    fn coordinator_canonical_string_reflects_scope_count(n_scopes in 0usize..5) {
+        let mut coord = ShutdownCoordinator::new();
+        for i in 0..n_scopes {
+            coord.register_scope(&ScopeId(format!("w:{i}")), ScopeTier::Worker, None).unwrap();
+        }
+        let s = coord.canonical_string();
+        let expected = format!("scopes={n_scopes}");
+        let contains_count = s.contains(&expected);
+        prop_assert!(contains_count, "canonical string should contain {}: got {}", expected, s);
+    }
+
+    // ── Correlation prefix appears in events ───────────────────────────
+
+    #[test]
+    fn correlation_prefix_appears_in_events(
+        prefix in "[a-z]{3,10}",
+    ) {
+        let mut tree = ScopeTree::new(1000);
+        tree.start(&ScopeId::root(), 1000).unwrap();
+
+        let scope = ScopeId("worker:corr".into());
+        tree.register(scope.clone(), ScopeTier::Worker, &ScopeId::root(), "c", 1000).unwrap();
+        tree.start(&scope, 1100).unwrap();
+
+        let mut coord = ShutdownCoordinator::new();
+        coord.set_correlation_prefix(&prefix);
+        coord.register_scope(&ScopeId::root(), ScopeTier::Root, None).unwrap();
+        coord.register_scope(&scope, ScopeTier::Worker, Some(&ScopeId::root())).unwrap();
+
+        let _ = coord.request_shutdown(&mut tree, &scope, ShutdownReason::UserRequested, 5000);
+
+        let events = coord.events();
+        if !events.is_empty() {
+            let has_correlation = events.iter().any(|e| {
+                e.correlation_id.as_ref().is_some_and(|cid| cid.starts_with(&prefix))
+            });
+            prop_assert!(has_correlation, "events should have correlation IDs starting with prefix");
+        }
+    }
 }
 
 // ── Non-proptest structural tests ──────────────────────────────────────────
