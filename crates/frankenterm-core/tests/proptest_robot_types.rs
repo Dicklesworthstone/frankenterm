@@ -912,3 +912,497 @@ proptest! {
         prop_assert!(json.contains("\"tab_id\""));
     }
 }
+
+// ============================================================================
+// Additional coverage tests (RT-42 through RT-66)
+// ============================================================================
+
+fn arb_mission_run_state() -> impl Strategy<Value = MissionRunState> {
+    prop_oneof![
+        Just(MissionRunState::Pending),
+        Just(MissionRunState::Succeeded),
+        Just(MissionRunState::Failed),
+        Just(MissionRunState::Cancelled),
+    ]
+}
+
+fn arb_mission_agent_state() -> impl Strategy<Value = MissionAgentState> {
+    prop_oneof![
+        Just(MissionAgentState::NotRequired),
+        Just(MissionAgentState::Pending),
+        Just(MissionAgentState::Approved),
+        Just(MissionAgentState::Denied),
+        Just(MissionAgentState::Expired),
+    ]
+}
+
+fn arb_mission_action_state() -> impl Strategy<Value = MissionActionState> {
+    prop_oneof![
+        Just(MissionActionState::Ready),
+        Just(MissionActionState::Blocked),
+        Just(MissionActionState::Completed),
+    ]
+}
+
+fn arb_tx_step_risk() -> impl Strategy<Value = TxStepRisk> {
+    prop_oneof![
+        Just(TxStepRisk::Low),
+        Just(TxStepRisk::Medium),
+        Just(TxStepRisk::High),
+        Just(TxStepRisk::Critical),
+    ]
+}
+
+fn arb_tx_phase_state() -> impl Strategy<Value = TxPhaseState> {
+    prop_oneof![
+        Just(TxPhaseState::Planned),
+        Just(TxPhaseState::Preparing),
+        Just(TxPhaseState::Committing),
+        Just(TxPhaseState::Compensating),
+        Just(TxPhaseState::Completed),
+        Just(TxPhaseState::Aborted),
+    ]
+}
+
+fn arb_tx_resume_recommendation() -> impl Strategy<Value = TxResumeRecommendation> {
+    prop_oneof![
+        Just(TxResumeRecommendation::ContinueFromCheckpoint),
+        Just(TxResumeRecommendation::RestartFresh),
+        Just(TxResumeRecommendation::CompensateAndAbort),
+        Just(TxResumeRecommendation::AlreadyComplete),
+    ]
+}
+
+fn arb_tx_bundle_classification() -> impl Strategy<Value = TxBundleClassification> {
+    prop_oneof![
+        Just(TxBundleClassification::Internal),
+        Just(TxBundleClassification::TeamReview),
+        Just(TxBundleClassification::ExternalAudit),
+    ]
+}
+
+fn arb_tx_precondition_kind() -> impl Strategy<Value = TxPreconditionKind> {
+    prop_oneof![
+        Just(TxPreconditionKind::PolicyApproved),
+        prop::collection::vec("[a-z/]{3,15}", 1..4)
+            .prop_map(|paths| TxPreconditionKind::ReservationHeld { paths }),
+        "[a-z]{3,10}".prop_map(|approver| TxPreconditionKind::ApprovalRequired { approver }),
+        "[a-z0-9-]{5,15}".prop_map(|target_id| TxPreconditionKind::TargetReachable { target_id }),
+        (0u64..60_000).prop_map(|max_age_ms| TxPreconditionKind::ContextFresh { max_age_ms }),
+    ]
+}
+
+fn arb_tx_compensation_kind() -> impl Strategy<Value = TxCompensationKind> {
+    prop_oneof![
+        Just(TxCompensationKind::Rollback),
+        Just(TxCompensationKind::NotifyOperator),
+        (1u32..10).prop_map(|max_retries| TxCompensationKind::RetryWithBackoff { max_retries }),
+        Just(TxCompensationKind::SkipAndContinue),
+        "[a-z0-9-]{5,15}".prop_map(|alternative_step_id| TxCompensationKind::Alternative { alternative_step_id }),
+    ]
+}
+
+fn arb_tx_step_outcome() -> impl Strategy<Value = TxStepOutcome> {
+    prop_oneof![
+        proptest::option::of("[a-z]{3,15}").prop_map(|result| TxStepOutcome::Success { result }),
+        ("[a-z.]{3,10}", "[a-z ]{5,20}", proptest::bool::ANY)
+            .prop_map(|(error_code, error_message, compensated)| TxStepOutcome::Failed { error_code, error_message, compensated }),
+        "[a-z ]{5,20}".prop_map(|reason| TxStepOutcome::Skipped { reason }),
+        "[a-z ]{5,20}".prop_map(|compensation_result| TxStepOutcome::Compensated { compensation_result }),
+        Just(TxStepOutcome::Pending),
+    ]
+}
+
+fn arb_search_stream_phase() -> impl Strategy<Value = SearchStreamPhase> {
+    prop_oneof![
+        (0usize..1000).prop_map(|result_count| SearchStreamPhase::Fast { result_count }),
+        (0usize..1000).prop_map(|result_count| SearchStreamPhase::Quality { result_count }),
+        (0usize..1000, 0u64..1_000_000)
+            .prop_map(|(total_results, total_us)| SearchStreamPhase::Done { total_results, total_us }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    // ── RT-42: MissionRunState serde roundtrip ──────────────────────────────
+
+    #[test]
+    fn rt42_mission_run_state_serde(state in arb_mission_run_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let back: MissionRunState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, state);
+    }
+
+    // ── RT-43: MissionRunState serializes to snake_case ─────────────────────
+
+    #[test]
+    fn rt43_mission_run_state_snake_case(state in arb_mission_run_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let s = json.trim_matches('"');
+        prop_assert!(s.chars().all(|c| c.is_lowercase() || c == '_'),
+            "MissionRunState should serialize to snake_case: {}", s);
+    }
+
+    // ── RT-44: MissionAgentState serde roundtrip ────────────────────────────
+
+    #[test]
+    fn rt44_mission_agent_state_serde(state in arb_mission_agent_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let back: MissionAgentState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, state);
+    }
+
+    // ── RT-45: MissionAgentState snake_case ─────────────────────────────────
+
+    #[test]
+    fn rt45_mission_agent_state_snake_case(state in arb_mission_agent_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let s = json.trim_matches('"');
+        prop_assert!(s.chars().all(|c| c.is_lowercase() || c == '_'),
+            "MissionAgentState should serialize to snake_case: {}", s);
+    }
+
+    // ── RT-46: MissionActionState serde roundtrip ───────────────────────────
+
+    #[test]
+    fn rt46_mission_action_state_serde(state in arb_mission_action_state()) {
+        let json = serde_json::to_string(&state).unwrap();
+        let back: MissionActionState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, state);
+    }
+
+    // ── RT-47: TxStepRisk serde roundtrip ───────────────────────────────────
+
+    #[test]
+    fn rt47_tx_step_risk_serde(risk in arb_tx_step_risk()) {
+        let json = serde_json::to_string(&risk).unwrap();
+        let back: TxStepRisk = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, risk);
+    }
+
+    // ── RT-48: TxPhaseState serde roundtrip ─────────────────────────────────
+
+    #[test]
+    fn rt48_tx_phase_state_serde(phase in arb_tx_phase_state()) {
+        let json = serde_json::to_string(&phase).unwrap();
+        let back: TxPhaseState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, phase);
+    }
+
+    // ── RT-49: TxResumeRecommendation serde roundtrip ───────────────────────
+
+    #[test]
+    fn rt49_tx_resume_recommendation_serde(rec in arb_tx_resume_recommendation()) {
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: TxResumeRecommendation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, rec);
+    }
+
+    // ── RT-50: TxBundleClassification serde roundtrip ───────────────────────
+
+    #[test]
+    fn rt50_tx_bundle_classification_serde(cls in arb_tx_bundle_classification()) {
+        let json = serde_json::to_string(&cls).unwrap();
+        let back: TxBundleClassification = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, cls);
+    }
+
+    // ── RT-51: TxPreconditionKind tagged serde roundtrip ────────────────────
+
+    #[test]
+    fn rt51_tx_precondition_kind_serde(kind in arb_tx_precondition_kind()) {
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: TxPreconditionKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, kind);
+        // Verify JSON has "kind" tag
+        prop_assert!(json.contains("\"kind\""), "missing kind tag in {}", json);
+    }
+
+    // ── RT-52: TxCompensationKind tagged serde roundtrip ────────────────────
+
+    #[test]
+    fn rt52_tx_compensation_kind_serde(kind in arb_tx_compensation_kind()) {
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: TxCompensationKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, kind);
+        prop_assert!(json.contains("\"kind\""), "missing kind tag in {}", json);
+    }
+
+    // ── RT-53: TxStepOutcome tagged serde roundtrip ─────────────────────────
+
+    #[test]
+    fn rt53_tx_step_outcome_serde(outcome in arb_tx_step_outcome()) {
+        let json = serde_json::to_string(&outcome).unwrap();
+        let back: TxStepOutcome = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, outcome);
+        prop_assert!(json.contains("\"kind\""), "missing kind tag in {}", json);
+    }
+
+    // ── RT-54: SearchStreamPhase tagged serde roundtrip ─────────────────────
+
+    #[test]
+    fn rt54_search_stream_phase_serde(phase in arb_search_stream_phase()) {
+        let json = serde_json::to_string(&phase).unwrap();
+        let back: SearchStreamPhase = serde_json::from_str(&json).unwrap();
+        // Can't use prop_assert_eq because no PartialEq, compare JSON
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &json2);
+        prop_assert!(json.contains("\"type\""), "missing type tag in {}", json);
+    }
+
+    // ── RT-55: SearchScoringBreakdown serde roundtrip ───────────────────────
+
+    #[test]
+    fn rt55_search_scoring_breakdown_serde(
+        final_score in 0.0f64..100.0,
+        bm25 in proptest::option::of(0.0f64..100.0),
+        semantic in proptest::option::of(0.0f64..1.0),
+    ) {
+        let breakdown = SearchScoringBreakdown {
+            bm25_score: bm25,
+            matching_terms: vec!["test".to_string()],
+            semantic_similarity: semantic,
+            embedder_tier: None,
+            rrf_rank: None,
+            rrf_score: None,
+            reranker_score: None,
+            final_score,
+        };
+        let json = serde_json::to_string(&breakdown).unwrap();
+        let back: SearchScoringBreakdown = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.final_score - breakdown.final_score).abs() < 1e-10);
+        prop_assert_eq!(back.bm25_score.is_some(), breakdown.bm25_score.is_some());
+    }
+
+    // ── RT-56: SearchPipelineTiming serde roundtrip ─────────────────────────
+
+    #[test]
+    fn rt56_search_pipeline_timing_serde(
+        total_us in 0u64..1_000_000,
+        lexical_us in proptest::option::of(0u64..500_000),
+        semantic_us in proptest::option::of(0u64..500_000),
+    ) {
+        let timing = SearchPipelineTiming {
+            total_us,
+            lexical_us,
+            semantic_us,
+            fusion_us: None,
+            rerank_us: None,
+        };
+        let json = serde_json::to_string(&timing).unwrap();
+        let back: SearchPipelineTiming = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_us, timing.total_us);
+        prop_assert_eq!(back.lexical_us, timing.lexical_us);
+        prop_assert_eq!(back.semantic_us, timing.semantic_us);
+    }
+
+    // ── RT-57: MissionAssignmentCounters default is all zeros ───────────────
+
+    #[test]
+    fn rt57_mission_counters_default(_dummy in 0u8..1) {
+        let counters = MissionAssignmentCounters::default();
+        prop_assert_eq!(counters.pending_approval, 0);
+        prop_assert_eq!(counters.approved, 0);
+        prop_assert_eq!(counters.denied, 0);
+        prop_assert_eq!(counters.expired, 0);
+        prop_assert_eq!(counters.succeeded, 0);
+        prop_assert_eq!(counters.failed, 0);
+        prop_assert_eq!(counters.cancelled, 0);
+        prop_assert_eq!(counters.unresolved, 0);
+    }
+
+    // ── RT-58: MissionAssignmentCounters serde roundtrip ────────────────────
+
+    #[test]
+    fn rt58_mission_counters_serde(
+        pa in 0usize..100,
+        ap in 0usize..100,
+        dn in 0usize..100,
+        ex in 0usize..100,
+        su in 0usize..100,
+        fa in 0usize..100,
+        ca in 0usize..100,
+        un in 0usize..100,
+    ) {
+        let counters = MissionAssignmentCounters {
+            pending_approval: pa, approved: ap, denied: dn, expired: ex,
+            succeeded: su, failed: fa, cancelled: ca, unresolved: un,
+        };
+        let json = serde_json::to_string(&counters).unwrap();
+        let back: MissionAssignmentCounters = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pending_approval, counters.pending_approval);
+        prop_assert_eq!(back.succeeded, counters.succeeded);
+        prop_assert_eq!(back.failed, counters.failed);
+        prop_assert_eq!(back.unresolved, counters.unresolved);
+    }
+
+    // ── RT-59: MissionTransitionInfo serde roundtrip ────────────────────────
+
+    #[test]
+    fn rt59_mission_transition_info_serde(
+        kind in "[a-z_]{3,15}",
+        to in "[a-z_]{3,15}",
+    ) {
+        let info = MissionTransitionInfo { kind: kind.clone(), to: to.clone() };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: MissionTransitionInfo = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.kind, &kind);
+        prop_assert_eq!(&back.to, &to);
+    }
+
+    // ── RT-60: MissionFailureCatalogEntry serde roundtrip ───────────────────
+
+    #[test]
+    fn rt60_mission_failure_catalog_serde(
+        reason in "[a-z_]{3,15}",
+        error in "[a-z_]{3,15}",
+        hint in "[a-z ]{5,30}",
+    ) {
+        let entry = MissionFailureCatalogEntry {
+            reason_code: reason.clone(),
+            error_code: error.clone(),
+            terminality: "terminal".to_string(),
+            retryability: "not_retryable".to_string(),
+            human_hint: hint.clone(),
+            machine_hint: "check logs".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: MissionFailureCatalogEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.reason_code, &reason);
+        prop_assert_eq!(&back.error_code, &error);
+        prop_assert_eq!(&back.human_hint, &hint);
+    }
+
+    // ── RT-61: TxRiskSummaryData serde roundtrip ────────────────────────────
+
+    #[test]
+    fn rt61_tx_risk_summary_serde(
+        total in 0usize..100,
+        high in 0usize..50,
+        critical in 0usize..20,
+        uncompensated in 0usize..50,
+        risk in arb_tx_step_risk(),
+    ) {
+        let summary = TxRiskSummaryData {
+            total_steps: total,
+            high_risk_count: high,
+            critical_risk_count: critical,
+            uncompensated_steps: uncompensated,
+            overall_risk: risk,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: TxRiskSummaryData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_steps, summary.total_steps);
+        prop_assert_eq!(back.high_risk_count, summary.high_risk_count);
+        prop_assert_eq!(back.critical_risk_count, summary.critical_risk_count);
+    }
+
+    // ── RT-62: TxChainVerificationData serde roundtrip ──────────────────────
+
+    #[test]
+    fn rt62_tx_chain_verification_serde(
+        intact in proptest::bool::ANY,
+        total in 0usize..1000,
+    ) {
+        let data = TxChainVerificationData {
+            chain_intact: intact,
+            first_break_at: if intact { None } else { Some(5) },
+            missing_ordinals: vec![],
+            total_records: total,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TxChainVerificationData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.chain_intact, intact);
+        prop_assert_eq!(back.total_records, total);
+    }
+
+    // ── RT-63: PaneTextResult::Ok tagged serde roundtrip ────────────────────
+
+    #[test]
+    fn rt63_pane_text_result_ok_serde(
+        text in "[a-z ]{5,50}",
+        truncated in proptest::bool::ANY,
+    ) {
+        let result = PaneTextResult::Ok {
+            text: text.clone(),
+            truncated,
+            truncation_info: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: PaneTextResult = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &json2);
+        prop_assert!(json.contains("\"status\":\"ok\""), "missing ok tag: {}", json);
+    }
+
+    // ── RT-64: PaneTextResult::Error tagged serde roundtrip ─────────────────
+
+    #[test]
+    fn rt64_pane_text_result_error_serde(
+        code in "[A-Z]{2}-[0-9]{4}",
+        message in "[a-z ]{5,30}",
+    ) {
+        let result = PaneTextResult::Error {
+            code: code.clone(),
+            message: message.clone(),
+            hint: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: PaneTextResult = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &json2);
+        prop_assert!(json.contains("\"status\":\"error\""), "missing error tag: {}", json);
+    }
+
+    // ── RT-65: SearchData serde roundtrip ───────────────────────────────────
+
+    #[test]
+    fn rt65_search_data_serde(
+        query in "[a-z ]{3,20}",
+        total in 0usize..1000,
+        limit in 1usize..100,
+    ) {
+        let data = SearchData {
+            query: query.clone(),
+            results: vec![],
+            total_hits: total,
+            limit,
+            pane_filter: None,
+            since_filter: None,
+            until_filter: None,
+            mode: Some("hybrid".to_string()),
+            metrics: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: SearchData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.query, &query);
+        prop_assert_eq!(back.total_hits, total);
+        prop_assert_eq!(back.limit, limit);
+    }
+
+    // ── RT-66: WorkflowRunData serde roundtrip ──────────────────────────────
+
+    #[test]
+    fn rt66_workflow_run_data_serde(
+        name in "[a-z_]{3,20}",
+        pane_id in 0u64..1000,
+        status in prop_oneof![Just("running".to_string()), Just("completed".to_string()), Just("failed".to_string())],
+    ) {
+        let data = WorkflowRunData {
+            workflow_name: name.clone(),
+            pane_id,
+            execution_id: Some("exec-123".to_string()),
+            status: status.clone(),
+            message: None,
+            started_at: Some(1_700_000_000_000),
+            step_index: None,
+            elapsed_ms: Some(42),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: WorkflowRunData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.workflow_name, &name);
+        prop_assert_eq!(back.pane_id, pane_id);
+        prop_assert_eq!(&back.status, &status);
+    }
+}
