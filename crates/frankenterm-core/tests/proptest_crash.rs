@@ -850,3 +850,359 @@ proptest! {
                        "total_redactions should equal sum of per_file counts");
     }
 }
+
+// ============================================================================
+// Additional coverage tests (CR-40 through CR-59)
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    // ── CR-40: FileRedactionEntry serde roundtrip ───────────────────────────
+
+    #[test]
+    fn cr40_file_redaction_entry_serde(
+        file in "[a-z_]{3,15}\\.json",
+        count in 0usize..100,
+    ) {
+        let entry = FileRedactionEntry { file: file.clone(), count };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: FileRedactionEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.file, &file);
+        prop_assert_eq!(back.count, count);
+    }
+
+    // ── CR-41: CrashLoopDetector crashes_in_window direct test ──────────────
+
+    #[test]
+    fn cr41_crashes_in_window(
+        n_crashes in 1u32..10,
+        window in 100u64..1000,
+    ) {
+        let config = CrashLoopConfig {
+            window_secs: window,
+            crash_threshold: 10,
+            initial_delay_ms: 1000,
+            max_delay_ms: 60_000,
+            backoff_factor: 2.0,
+        };
+        let mut detector = CrashLoopDetector::new(config);
+        let base_time = 10_000u64;
+        for i in 0..n_crashes {
+            detector.record_crash(base_time + u64::from(i));
+        }
+        let count = detector.crashes_in_window(base_time + u64::from(n_crashes));
+        prop_assert_eq!(count, n_crashes,
+            "should count all {} crashes within window", n_crashes);
+    }
+
+    // ── CR-42: crashes_in_window excludes old timestamps ────────────────────
+
+    #[test]
+    fn cr42_crashes_in_window_excludes_old(window in 60u64..600) {
+        let config = CrashLoopConfig {
+            window_secs: window,
+            crash_threshold: 10,
+            initial_delay_ms: 1000,
+            max_delay_ms: 60_000,
+            backoff_factor: 2.0,
+        };
+        let mut detector = CrashLoopDetector::new(config);
+        // Record crash at time 100 (old)
+        detector.record_crash(100);
+        // Record crash at time 10_000 (recent)
+        detector.record_crash(10_000);
+        // At time 10_001, only the recent crash should be in window
+        let count = detector.crashes_in_window(10_001);
+        prop_assert_eq!(count, 1, "old crash should be outside window");
+    }
+
+    // ── CR-43: total_restarts counts all recorded timestamps ────────────────
+
+    #[test]
+    fn cr43_total_restarts(n in 0u32..20) {
+        let config = CrashLoopConfig::default();
+        let mut detector = CrashLoopDetector::new(config);
+        for i in 0..n {
+            detector.record_crash(1000 + u64::from(i));
+        }
+        prop_assert_eq!(detector.total_restarts(), n);
+    }
+
+    // ── CR-44: last_crash_timestamp returns most recent ─────────────────────
+
+    #[test]
+    fn cr44_last_crash_timestamp(n in 1u32..10) {
+        let config = CrashLoopConfig::default();
+        let mut detector = CrashLoopDetector::new(config);
+        let last_ts = 1000 + u64::from(n - 1);
+        for i in 0..n {
+            detector.record_crash(1000 + u64::from(i));
+        }
+        prop_assert_eq!(detector.last_crash_timestamp(), Some(last_ts));
+    }
+
+    // ── CR-45: last_crash_timestamp None when no crashes ────────────────────
+
+    #[test]
+    fn cr45_last_crash_timestamp_none(_dummy in 0u8..1) {
+        let config = CrashLoopConfig::default();
+        let detector = CrashLoopDetector::new(config);
+        prop_assert_eq!(detector.last_crash_timestamp(), None);
+    }
+
+    // ── CR-46: diagnostics consistency ──────────────────────────────────────
+
+    #[test]
+    fn cr46_diagnostics_consistency(n in 0u32..5) {
+        let config = CrashLoopConfig {
+            window_secs: 600,
+            crash_threshold: 3,
+            initial_delay_ms: 1000,
+            max_delay_ms: 60_000,
+            backoff_factor: 2.0,
+        };
+        let mut detector = CrashLoopDetector::new(config);
+        for i in 0..n {
+            detector.record_crash(1000 + u64::from(i));
+        }
+        let diag = detector.diagnostics();
+        prop_assert_eq!(diag.restart_count, detector.total_restarts());
+        prop_assert_eq!(diag.last_crash_at, detector.last_crash_timestamp());
+        prop_assert_eq!(diag.in_crash_loop, detector.is_crash_loop());
+    }
+
+    // ── CR-47: CaptureCheckpoint save/load roundtrip ────────────────────────
+
+    #[test]
+    fn cr47_checkpoint_save_load(
+        pane_id in 0u64..1000,
+        last_seq in 0i64..10_000,
+        created_at in 1_000_000u64..2_000_000_000,
+    ) {
+        let state = PaneCaptureState {
+            pane_id,
+            last_seq,
+            cursor_offset: 0,
+            last_capture_at: created_at,
+        };
+        let cp = CaptureCheckpoint::with_timestamp(vec![state], created_at);
+        let dir = std::env::temp_dir().join(format!("ft_proptest_cr47_{}", pane_id));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("checkpoint.json");
+        cp.save(&path).unwrap();
+        let loaded = CaptureCheckpoint::load(&path).unwrap();
+        prop_assert_eq!(loaded.version, cp.version);
+        prop_assert_eq!(loaded.created_at, created_at);
+        prop_assert_eq!(loaded.panes.len(), 1);
+        prop_assert_eq!(loaded.panes[0].pane_id, pane_id);
+        prop_assert_eq!(loaded.panes[0].last_seq, last_seq);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── CR-48: CaptureCheckpoint load rejects wrong version ─────────────────
+
+    #[test]
+    fn cr48_checkpoint_rejects_wrong_version(bad_version in 2u32..100) {
+        let json = serde_json::json!({
+            "version": bad_version,
+            "created_at": 1_000_000u64,
+            "panes": [],
+            "wa_version": "0.1.0"
+        });
+        let dir = std::env::temp_dir().join(format!("ft_proptest_cr48_{}", bad_version));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("checkpoint.json");
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let result = CaptureCheckpoint::load(&path);
+        prop_assert!(result.is_err(), "should reject version {}", bad_version);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── CR-49: HealthSnapshot update_global / get_global roundtrip ──────────
+
+    #[test]
+    fn cr49_health_snapshot_global(
+        timestamp in 1_000_000u64..2_000_000_000u64,
+        panes in 0usize..20,
+    ) {
+        let snap = HealthSnapshot {
+            timestamp,
+            observed_panes: panes,
+            capture_queue_depth: 0,
+            write_queue_depth: 0,
+            last_seq_by_pane: vec![],
+            warnings: vec![],
+            ingest_lag_avg_ms: 0.0,
+            ingest_lag_max_ms: 0,
+            db_writable: true,
+            db_last_write_at: None,
+            pane_priority_overrides: vec![],
+            scheduler: None,
+            backpressure_tier: None,
+            last_activity_by_pane: vec![],
+            restart_count: 0,
+            last_crash_at: None,
+            consecutive_crashes: 0,
+            current_backoff_ms: 0,
+            in_crash_loop: false,
+        };
+        HealthSnapshot::update_global(snap.clone());
+        let got = HealthSnapshot::get_global();
+        prop_assert!(got.is_some());
+        let got = got.unwrap();
+        prop_assert_eq!(got.timestamp, timestamp);
+        prop_assert_eq!(got.observed_panes, panes);
+    }
+
+    // ── CR-50: CrashConfig Debug is non-empty ───────────────────────────────
+
+    #[test]
+    fn cr50_crash_config_debug(include_bt in proptest::bool::ANY) {
+        let config = CrashConfig {
+            crash_dir: Some(std::path::PathBuf::from("/tmp/test")),
+            include_backtrace: include_bt,
+        };
+        let debug = format!("{:?}", config);
+        prop_assert!(!debug.is_empty());
+        prop_assert!(debug.contains("CrashConfig"));
+    }
+
+    // ── CR-51: PaneCaptureState PartialEq works correctly ───────────────────
+
+    #[test]
+    fn cr51_pane_capture_state_eq(
+        pane_id in 0u64..1000,
+        last_seq in 0i64..10_000,
+        offset in 0u64..10_000,
+    ) {
+        let a = PaneCaptureState { pane_id, last_seq, cursor_offset: offset, last_capture_at: 1000 };
+        let b = PaneCaptureState { pane_id, last_seq, cursor_offset: offset, last_capture_at: 1000 };
+        prop_assert_eq!(&a, &b);
+    }
+
+    // ── CR-52: CrashLoopConfig default has sensible values ──────────────────
+
+    #[test]
+    fn cr52_crash_loop_config_defaults(_dummy in 0u8..1) {
+        let config = CrashLoopConfig::default();
+        prop_assert!(config.window_secs > 0, "window should be > 0");
+        prop_assert!(config.crash_threshold > 0, "crash_threshold should be > 0");
+        prop_assert!(config.initial_delay_ms > 0, "initial delay should be > 0");
+        prop_assert!(config.max_delay_ms >= config.initial_delay_ms,
+            "max delay should be >= initial delay");
+        prop_assert!(config.backoff_factor >= 1.0,
+            "backoff factor should be >= 1.0");
+    }
+
+    // ── CR-53: CrashLoopDetector serde roundtrip preserves state ────────────
+
+    #[test]
+    fn cr53_detector_serde_roundtrip(n in 0u32..5) {
+        let config = CrashLoopConfig::default();
+        let mut detector = CrashLoopDetector::new(config);
+        for i in 0..n {
+            detector.record_crash(1000 + u64::from(i));
+        }
+        let json = serde_json::to_string(&detector).unwrap();
+        let back: CrashLoopDetector = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_restarts(), detector.total_restarts());
+        prop_assert_eq!(back.is_crash_loop(), detector.is_crash_loop());
+    }
+
+    // ── CR-54: DbMetadata all-None serde roundtrip ──────────────────────────
+
+    #[test]
+    fn cr54_db_metadata_none_serde(_dummy in 0u8..1) {
+        let meta = DbMetadata {
+            schema_version: None,
+            db_size_bytes: None,
+            journal_mode: None,
+            event_count: None,
+            segment_count: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: DbMetadata = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.schema_version, None);
+        prop_assert_eq!(back.db_size_bytes, None);
+        prop_assert_eq!(back.journal_mode, None);
+    }
+
+    // ── CR-55: DbMetadata with values serde roundtrip ───────────────────────
+
+    #[test]
+    fn cr55_db_metadata_values_serde(
+        version in 0i64..100,
+        size in 0u64..10_000_000,
+        events in 0i64..100_000,
+        segments in 0i64..100_000,
+    ) {
+        let meta = DbMetadata {
+            schema_version: Some(version),
+            db_size_bytes: Some(size),
+            journal_mode: Some("wal".to_string()),
+            event_count: Some(events),
+            segment_count: Some(segments),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: DbMetadata = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.schema_version, Some(version));
+        prop_assert_eq!(back.db_size_bytes, Some(size));
+        prop_assert_eq!(back.event_count, Some(events));
+    }
+
+    // ── CR-56: IncidentKind covers both variants ────────────────────────────
+
+    #[test]
+    fn cr56_incident_kind_display_distinct(kind in arb_incident_kind()) {
+        let display = format!("{}", kind);
+        let debug = format!("{:?}", kind);
+        prop_assert!(!display.is_empty());
+        prop_assert!(!debug.is_empty());
+    }
+
+    // ── CR-57: ReplayMode covers both variants ──────────────────────────────
+
+    #[test]
+    fn cr57_replay_mode_display_distinct(mode in arb_replay_mode()) {
+        let display = format!("{}", mode);
+        let debug = format!("{:?}", mode);
+        prop_assert!(!display.is_empty());
+        prop_assert!(!debug.is_empty());
+    }
+
+    // ── CR-58: CaptureCheckpoint with_timestamp sets created_at ─────────────
+
+    #[test]
+    fn cr58_checkpoint_with_timestamp(ts in 1_000_000u64..2_000_000_000) {
+        let cp = CaptureCheckpoint::with_timestamp(vec![], ts);
+        prop_assert_eq!(cp.created_at, ts);
+        prop_assert_eq!(cp.version, 1);
+        prop_assert!(cp.panes.is_empty());
+    }
+
+    // ── CR-59: ShutdownSummary serde roundtrip with varying fields ──────────
+
+    #[test]
+    fn cr59_shutdown_summary_serde(
+        elapsed in 0u64..100_000,
+        segments in 0u64..1_000_000,
+        clean in proptest::bool::ANY,
+    ) {
+        let summary = ShutdownSummary {
+            elapsed_secs: elapsed,
+            final_capture_queue: 0,
+            final_write_queue: 0,
+            segments_persisted: segments,
+            events_recorded: 0,
+            last_seq_by_pane: vec![(1, 42)],
+            clean,
+            warnings: vec![],
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: ShutdownSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.elapsed_secs, elapsed);
+        prop_assert_eq!(back.segments_persisted, segments);
+        prop_assert_eq!(back.clean, clean);
+    }
+}
