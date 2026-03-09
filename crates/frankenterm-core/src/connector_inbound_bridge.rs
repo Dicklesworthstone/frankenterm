@@ -1035,7 +1035,7 @@ mod tests {
         let event = sub.try_recv().unwrap();
         if let Ok(Event::PatternDetected { detection, .. }) = event {
             assert_eq!(detection.rule_id, "connector.slack:stream.message");
-            assert_eq!(detection.confidence, 1.0);
+            assert!((detection.confidence - 1.0).abs() < f64::EPSILON);
             assert_eq!(detection.severity, Severity::Info);
             assert_eq!(detection.agent_type, AgentType::Unknown);
             assert!(detection.event_type.contains("connector."));

@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-fn schedule_task(runtime: &mut LabRuntime, task_id: TaskId) {
+fn schedule_task(runtime: &LabRuntime, task_id: TaskId) {
     runtime.scheduler.lock().schedule(task_id, 0);
 }
 

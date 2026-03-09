@@ -2017,7 +2017,7 @@ mod tests {
         assert_eq!(strategy.delay_for_attempt(2), Duration::from_millis(400));
         assert_eq!(strategy.delay_for_attempt(3), Duration::from_millis(800));
         // Capped at max.
-        assert_eq!(strategy.delay_for_attempt(10), Duration::from_millis(5000));
+        assert_eq!(strategy.delay_for_attempt(10), Duration::from_secs(5));
     }
 
     #[test]
@@ -2030,7 +2030,7 @@ mod tests {
         assert_eq!(strategy.delay_for_attempt(0), Duration::from_millis(100));
         assert_eq!(strategy.delay_for_attempt(1), Duration::from_millis(300));
         assert_eq!(strategy.delay_for_attempt(2), Duration::from_millis(500));
-        assert_eq!(strategy.delay_for_attempt(5), Duration::from_millis(1000)); // capped
+        assert_eq!(strategy.delay_for_attempt(5), Duration::from_secs(1)); // capped
     }
 
     #[test]

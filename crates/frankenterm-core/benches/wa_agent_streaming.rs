@@ -65,10 +65,10 @@ fn capture_cycle_for_profile(pane_count: usize, append_bytes: usize, rounds: usi
             let delta = extract_delta(snapshot, &current, 4096);
             match delta {
                 DeltaResult::Content(content) => {
-                    extracted_bytes = extracted_bytes.saturating_add(content.len())
+                    extracted_bytes = extracted_bytes.saturating_add(content.len());
                 }
                 DeltaResult::Gap { content, .. } => {
-                    extracted_bytes = extracted_bytes.saturating_add(content.len())
+                    extracted_bytes = extracted_bytes.saturating_add(content.len());
                 }
                 DeltaResult::NoChange => {}
             }

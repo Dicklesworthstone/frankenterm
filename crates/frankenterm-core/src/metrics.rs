@@ -821,7 +821,7 @@ mod pure_tests {
 
     #[test]
     fn format_float_normal_renders_value() {
-        assert_eq!(format_float(3.14), "3.14");
+        assert_eq!(format_float(3.15), "3.15");
         assert_eq!(format_float(0.0), "0");
     }
 
@@ -1069,11 +1069,11 @@ mod pure_tests {
     #[test]
     fn render_prometheus_coalesce_ratio_float() {
         let snap = MetricsSnapshot {
-            native_output_coalesce_ratio: 3.14,
+            native_output_coalesce_ratio: 3.15,
             ..MetricsSnapshot::default()
         };
         let rendered = snap.render_prometheus("ft");
-        assert!(rendered.contains("ft_native_output_coalesce_ratio 3.14"));
+        assert!(rendered.contains("ft_native_output_coalesce_ratio 3.15"));
     }
 }
 

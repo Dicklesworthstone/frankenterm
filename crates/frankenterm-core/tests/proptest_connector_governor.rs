@@ -105,7 +105,7 @@ proptest! {
     ) {
         let mut bucket = TokenBucket::new(config);
         let ratio = bucket.fill_ratio(now_ms);
-        prop_assert!(ratio >= 0.0 && ratio <= 1.0,
+        prop_assert!((0.0..=1.0).contains(&ratio),
             "fill_ratio out of bounds: {}", ratio);
     }
 }

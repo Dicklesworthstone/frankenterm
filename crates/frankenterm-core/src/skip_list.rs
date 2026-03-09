@@ -1174,6 +1174,7 @@ mod tests {
         }
 
         /// Assert structural invariants.
+        #[allow(clippy::len_zero)]
         fn assert_invariants(list: &SkipList<i32, i64>) {
             // iter count == len
             assert_eq!(list.iter().count(), list.len());
@@ -1441,7 +1442,7 @@ mod tests {
                 prop_assert_eq!(stats.current_level, list.current_level());
                 // total_nodes >= len + 1 (head) + free_slots
                 // (may have more due to arena allocation)
-                prop_assert!(stats.total_nodes >= stats.len + 1);
+                prop_assert!(stats.total_nodes > stats.len);
             }
         }
     }

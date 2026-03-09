@@ -1099,7 +1099,7 @@ mod tests {
             total_capacity: 0,
             total_active: 0,
         };
-        assert_eq!(snap.utilization(), 0.0);
+        assert!((snap.utilization() - 0.0).abs() < f64::EPSILON);
     }
 
     // ========================================================================

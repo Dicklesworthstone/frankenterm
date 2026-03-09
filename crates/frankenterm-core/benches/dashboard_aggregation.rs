@@ -61,7 +61,7 @@ fn make_cost_snapshot(provider_count: usize, pane_count: usize) -> CostDashboard
             ProviderCostSummary {
                 agent_type: agent_type.to_string(),
                 total_tokens: 50_000 + (i as u64 * 10_000),
-                total_cost_usd: 25.0 + (i as f64 * 5.0),
+                total_cost_usd: (i as f64).mul_add(5.0, 25.0),
                 pane_count: pane_count / provider_count.max(1),
                 record_count: 100 + i as u64 * 20,
             }
@@ -73,7 +73,7 @@ fn make_cost_snapshot(provider_count: usize, pane_count: usize) -> CostDashboard
             pane_id: i as u64,
             agent_type: providers[i % provider_count.max(1)].agent_type.clone(),
             total_tokens: 10_000 + (i as u64 * 500),
-            total_cost_usd: 5.0 + (i as f64 * 0.5),
+            total_cost_usd: (i as f64).mul_add(0.5, 5.0),
             record_count: 20 + i as u64 * 2,
             last_updated_ms: 1_700_000_000_000_i64 + (i as i64 * 1000),
         })

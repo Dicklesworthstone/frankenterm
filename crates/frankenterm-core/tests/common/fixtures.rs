@@ -296,9 +296,11 @@ impl TestPaneData {
     /// Generate mock pane content of the specified line count.
     #[must_use]
     pub fn pane_content(pane_id: u64, lines: usize) -> String {
-        (0..lines)
-            .map(|i| format!("[pane-{pane_id}] line {i}: output data\n"))
-            .collect()
+        (0..lines).fold(String::new(), |mut acc, i| {
+            use std::fmt::Write;
+            writeln!(acc, "[pane-{pane_id}] line {i}: output data").unwrap();
+            acc
+        })
     }
 
     /// Generate a set of pane contents for multiple panes.

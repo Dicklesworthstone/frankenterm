@@ -1061,7 +1061,7 @@ mod tests {
         };
         let result = router.route(&request, &registry).unwrap();
         // Should find all panes in the window (ws1, local, gen 1)
-        assert!(result.deliveries.len() >= 1);
+        assert!(!result.deliveries.is_empty());
     }
 
     #[test]
@@ -1076,7 +1076,7 @@ mod tests {
             dry_run: false,
         };
         let result = router.route(&request, &registry).unwrap();
-        assert!(result.deliveries.len() >= 1);
+        assert!(!result.deliveries.is_empty());
     }
 
     #[test]

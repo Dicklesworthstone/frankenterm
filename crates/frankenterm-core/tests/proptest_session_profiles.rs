@@ -694,7 +694,7 @@ fn validation_defaults_clean() {
 fn validation_catches_empty_profile_name() {
     let mut reg = ProfileRegistry::new();
     reg.register_profile(SessionProfile {
-        name: "".into(),
+        name: String::new(),
         description: None,
         role: ProfileRole::Custom,
         spawn_command: None,

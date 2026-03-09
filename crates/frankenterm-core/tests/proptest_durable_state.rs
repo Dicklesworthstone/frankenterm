@@ -121,11 +121,11 @@ proptest! {
         let count = (n as usize).min(triggers.len());
 
         let mut ids = Vec::new();
-        for i in 0..count {
+        for (i, trigger) in triggers.iter().enumerate().take(count) {
             let cp = mgr.checkpoint(
                 &reg,
                 format!("cp-{i}"),
-                triggers[i].clone(),
+                trigger.clone(),
                 HashMap::new(),
             );
             ids.push(cp.id);

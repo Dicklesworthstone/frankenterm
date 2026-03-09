@@ -149,7 +149,7 @@ proptest! {
     #[test]
     fn cycle_detection_rejects_all_self_loops(id in work_item_id()) {
         let q = SwarmWorkQueue::with_defaults();
-        let has_cycle = q.would_create_cycle(&id, &[id.clone()]);
+        let has_cycle = q.would_create_cycle(&id, std::slice::from_ref(&id));
         prop_assert!(has_cycle, "self-loop must be detected as cycle");
     }
 
@@ -291,7 +291,7 @@ proptest! {
         let mut q = SwarmWorkQueue::with_defaults();
         let mut batch = Vec::new();
 
-        for i in 0..chain_len {
+        for (i, prio) in prios.iter().enumerate().take(chain_len) {
             let id = format!("chain-{i}");
             let deps = if i == 0 {
                 vec![]
@@ -301,7 +301,7 @@ proptest! {
             batch.push(WorkItem {
                 id: id.clone(),
                 title: id,
-                priority: prios[i],
+                priority: *prio,
                 depends_on: deps,
                 effort: 1,
                 labels: Vec::new(),
@@ -331,7 +331,7 @@ proptest! {
         let mut q = SwarmWorkQueue::with_defaults();
         let mut batch = Vec::new();
 
-        for i in 0..chain_len {
+        for (i, prio) in prios.iter().enumerate().take(chain_len) {
             let id = format!("rev-{i}");
             let deps = if i == 0 {
                 vec![]
@@ -341,7 +341,7 @@ proptest! {
             batch.push(WorkItem {
                 id: id.clone(),
                 title: id,
-                priority: prios[i],
+                priority: *prio,
                 depends_on: deps,
                 effort: 1,
                 labels: Vec::new(),
@@ -371,8 +371,8 @@ proptest! {
     ) {
         let mut q = SwarmWorkQueue::with_defaults();
 
-        for i in 0..n_items {
-            q.enqueue(make_item(&format!("s-{i}"), prios[i])).unwrap();
+        for (i, prio) in prios.iter().enumerate().take(n_items) {
+            q.enqueue(make_item(&format!("s-{i}"), *prio)).unwrap();
         }
 
         let stats = q.stats();
@@ -406,8 +406,8 @@ proptest! {
         };
         let mut q = SwarmWorkQueue::new(config.clone());
 
-        for i in 0..n_items {
-            q.enqueue(make_item(&format!("snap-{i}"), prios[i])).unwrap();
+        for (i, prio) in prios.iter().enumerate().take(n_items) {
+            q.enqueue(make_item(&format!("snap-{i}"), *prio)).unwrap();
         }
 
         let snapshot = q.snapshot();

@@ -83,7 +83,7 @@ impl DistributedBridge {
     }
 
     async fn ingest_raw(&mut self, raw: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-        match self.aggregator.ingest(&raw)? {
+        match self.aggregator.ingest(raw)? {
             IngestResult::Accepted(payload) => self.persist_payload(payload).await,
             IngestResult::Duplicate { sender: _, seq: _ } => {
                 self.diagnostics.duplicates += 1;

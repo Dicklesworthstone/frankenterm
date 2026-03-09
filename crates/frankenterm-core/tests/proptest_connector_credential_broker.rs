@@ -1016,8 +1016,8 @@ proptest! {
             let lease = broker.request_lease(&format!("conn-{i}"), "cred-1", scope, 2000 + i as u64).unwrap();
             lease_ids.push(lease.lease_id);
         }
-        for i in 0..n_revoke {
-            broker.revoke_lease(&lease_ids[i], 5000 + i as u64).unwrap();
+        for (i, lid) in lease_ids.iter().enumerate().take(n_revoke) {
+            broker.revoke_lease(lid, 5000 + i as u64).unwrap();
         }
         let snap = broker.telemetry_snapshot(9000);
         prop_assert_eq!(snap.active_leases, (n_lease - n_revoke) as u32);

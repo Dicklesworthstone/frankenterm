@@ -22,7 +22,7 @@ fn arb_event_id() -> impl Strategy<Value = String> {
     prop_oneof![
         "[a-z0-9\\-]{5,40}",
         Just("ev-test-1".to_string()),
-        Just("".to_string()),
+        Just(String::new()),
     ]
 }
 
@@ -284,12 +284,11 @@ proptest! {
             .expect("document JSON should be valid");
 
         // pane_id is a u64 field, should appear in the JSON
-        let pane_ids: Vec<_> = parsed["pane_id"].as_array()
+        prop_assert!(parsed["pane_id"].as_array()
             .expect("pane_id should be array")
             .iter()
             .filter_map(|v| v.as_u64())
-            .collect();
-        prop_assert!(pane_ids.contains(&fields.pane_id),
+            .any(|x| x == fields.pane_id),
             "document should contain pane_id {}", fields.pane_id);
     }
 
@@ -302,12 +301,11 @@ proptest! {
         let parsed: serde_json::Value = serde_json::from_str(&json)
             .expect("document JSON should be valid");
 
-        let gap_values: Vec<_> = parsed["is_gap"].as_array()
+        prop_assert!(parsed["is_gap"].as_array()
             .expect("is_gap should be array")
             .iter()
             .filter_map(|v| v.as_bool())
-            .collect();
-        prop_assert!(gap_values.contains(&fields.is_gap),
+            .any(|x| x == fields.is_gap),
             "document should contain is_gap={}", fields.is_gap);
     }
 
@@ -485,7 +483,7 @@ proptest! {
     #[test]
     fn field_handles_clone_identical(_seed in any::<u64>()) {
         let (_schema, handles) = build_lexical_schema_v1();
-        let cloned = handles.clone();
+        let cloned = handles;
         prop_assert_eq!(handles.event_id, cloned.event_id);
         prop_assert_eq!(handles.pane_id, cloned.pane_id);
         prop_assert_eq!(handles.text, cloned.text);
@@ -555,12 +553,11 @@ proptest! {
         let doc = fields_to_document(&fields, &handles);
         let json = doc.to_json(&schema);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let seq_values: Vec<_> = parsed["sequence"].as_array()
+        prop_assert!(parsed["sequence"].as_array()
             .expect("sequence should be array")
             .iter()
             .filter_map(|v| v.as_u64())
-            .collect();
-        prop_assert!(seq_values.contains(&fields.sequence),
+            .any(|x| x == fields.sequence),
             "document should contain sequence {}", fields.sequence);
     }
 

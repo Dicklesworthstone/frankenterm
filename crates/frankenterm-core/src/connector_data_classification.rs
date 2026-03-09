@@ -1203,6 +1203,7 @@ fn simple_hash(salt: &str, value: &str) -> u64 {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::similar_names)]
 mod tests {
     use super::*;
     use crate::connector_event_model::{CanonicalConnectorEvent, EventDirection};
@@ -1989,7 +1990,7 @@ mod tests {
     #[test]
     fn telemetry_redaction_rate_zero_fields() {
         let t = ClassificationTelemetry::default();
-        assert_eq!(t.redaction_rate(), 0.0);
+        assert!((t.redaction_rate() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2136,6 +2137,7 @@ mod tests {
 
     // ── End-to-end classify + redact + ingest ──
 
+    #[allow(clippy::similar_names)]
     #[test]
     fn e2e_classify_redact_safe_event() {
         let mut classifier = test_classifier();
@@ -2152,6 +2154,7 @@ mod tests {
         assert!(decision.is_accepted());
     }
 
+    #[allow(clippy::similar_names)]
     #[test]
     fn e2e_classify_redact_sensitive_event() {
         let mut classifier = test_classifier();
@@ -2176,6 +2179,7 @@ mod tests {
 
     // ── Disabled rules ──
 
+    #[allow(clippy::similar_names)]
     #[test]
     fn disabled_rule_not_applied() {
         let mut policy = ClassificationPolicy::default();

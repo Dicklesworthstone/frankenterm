@@ -542,7 +542,7 @@ proptest! {
             blocking_min_threads: 1,
             blocking_max_threads: 4,
         };
-        let cloned = tuning.clone();
+        let cloned = tuning;
         prop_assert_eq!(cloned.poll_budget, tuning.poll_budget);
         prop_assert_eq!(cloned.worker_threads, tuning.worker_threads);
     }

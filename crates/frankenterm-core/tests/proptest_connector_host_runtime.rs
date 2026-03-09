@@ -79,10 +79,10 @@ fn arb_valid_config() -> impl Strategy<Value = ConnectorHostConfig> {
 
 fn arb_usage_within(budgets: &ConnectorRuntimeBudgets) -> ConnectorRuntimeUsage {
     ConnectorRuntimeUsage {
-        cpu_millis_in_window: budgets.cpu_millis_per_second.saturating_sub(1).max(0),
-        memory_bytes: budgets.memory_bytes.saturating_sub(1).max(0),
-        io_bytes_in_window: budgets.io_bytes_per_second.saturating_sub(1).max(0),
-        inflight_ops: budgets.max_inflight_ops.saturating_sub(1).max(0),
+        cpu_millis_in_window: budgets.cpu_millis_per_second.saturating_sub(1),
+        memory_bytes: budgets.memory_bytes.saturating_sub(1),
+        io_bytes_in_window: budgets.io_bytes_per_second.saturating_sub(1),
+        inflight_ops: budgets.max_inflight_ops.saturating_sub(1),
     }
 }
 
@@ -432,7 +432,7 @@ proptest! {
 #[test]
 fn config_rejects_empty_host_id() {
     let mut config = ConnectorHostConfig::default();
-    config.host_id = "".to_string();
+    config.host_id = String::new();
     assert!(ConnectorHostRuntime::new(config).is_err());
 }
 

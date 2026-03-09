@@ -348,7 +348,7 @@ proptest! {
         let states: Vec<AgentPaneState> = times.iter().map(|&t| ts.classify(t, &config)).collect();
 
         // Define severity ordering
-        fn severity(s: &AgentPaneState) -> u8 {
+        fn severity(s: AgentPaneState) -> u8 {
             match s {
                 AgentPaneState::Active => 0,
                 AgentPaneState::Thinking => 1,
@@ -360,8 +360,8 @@ proptest! {
 
         // Severity should be non-decreasing (allow equal)
         for i in 1..states.len() {
-            let prev = severity(&states[i - 1]);
-            let curr = severity(&states[i]);
+            let prev = severity(states[i - 1]);
+            let curr = severity(states[i]);
             // Note: Idle (severity 3) can be reached before Stuck (severity 2) due to
             // the idle check coming before the stuck check when input is also old.
             // So we allow Idle → Stuck transitions.

@@ -27,6 +27,7 @@ mod bench_common;
 
 #[cfg(feature = "ftui")]
 mod enabled {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
 
     #[allow(dead_code)] // Referenced by CI budget enforcement tooling

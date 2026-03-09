@@ -1897,7 +1897,7 @@ fn topology_changes_checkpoint_and_rollback_via_durable_state() {
         .unwrap();
 
     // Phase 4: Verify pane 4 is now closed
-    let state = lifecycle_reg.get(&pane_id(4)).unwrap().state.clone();
+    let state = lifecycle_reg.get(&pane_id(4)).unwrap().state;
     assert!(matches!(
         state,
         LifecycleState::Pane(MuxPaneLifecycleState::Closed)
@@ -1916,7 +1916,7 @@ fn topology_changes_checkpoint_and_rollback_via_durable_state() {
     durable
         .rollback(cp_before, &mut lifecycle_reg, "undo topology change")
         .unwrap();
-    let restored_state = lifecycle_reg.get(&pane_id(4)).unwrap().state.clone();
+    let restored_state = lifecycle_reg.get(&pane_id(4)).unwrap().state;
     assert!(matches!(
         restored_state,
         LifecycleState::Pane(MuxPaneLifecycleState::Running)

@@ -252,7 +252,7 @@ mod tui_tests {
         ) {
             let mut mgr = DashboardManager::new();
             mgr.update_backpressure(BackpressureSnapshot {
-                tier: bp_tier.clone(),
+                tier: bp_tier,
                 timestamp_epoch_ms: 0,
                 capture_depth: 0,
                 capture_capacity: 1000,
@@ -346,11 +346,11 @@ mod tui_tests {
 
             let cap_pct_str = model.bp_capture_label.trim_end_matches('%');
             let cap_pct: f64 = cap_pct_str.parse().expect("valid float");
-            prop_assert!(cap_pct >= 0.0 && cap_pct <= 100.0, "capture {}%", cap_pct);
+            prop_assert!((0.0..=100.0).contains(&cap_pct), "capture {}%", cap_pct);
 
             let wr_pct_str = model.bp_write_label.trim_end_matches('%');
             let wr_pct: f64 = wr_pct_str.parse().expect("valid float");
-            prop_assert!(wr_pct >= 0.0 && wr_pct <= 100.0, "write {}%", wr_pct);
+            prop_assert!((0.0..=100.0).contains(&wr_pct), "write {}%", wr_pct);
         }
 
         /// adapt_dashboard is deterministic — same input produces same output.

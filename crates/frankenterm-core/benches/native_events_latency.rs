@@ -229,19 +229,14 @@ fn bench_native_backpressure_impact(c: &mut Criterion) {
 
                     let consumer = task::spawn(async move {
                         let mut received = 0_u64;
-                        loop {
-                            match timeout(Duration::from_millis(250), mpsc_recv_option(&mut event_rx))
+                        while let Ok(Some(_event)) = timeout(Duration::from_millis(250), mpsc_recv_option(&mut event_rx))
                                 .await
-                            {
-                                Ok(Some(_event)) => {
-                                    received += 1;
-                                    frankenterm_core::runtime_compat::sleep(BACKPRESSURE_DRAIN_DELAY)
-                                        .await;
-                                    if received >= BACKPRESSURE_EVENTS_PER_BATCH {
-                                        break;
-                                    }
-                                }
-                                Ok(None) | Err(_) => break,
+                        {
+                            received += 1;
+                            frankenterm_core::runtime_compat::sleep(BACKPRESSURE_DRAIN_DELAY)
+                                .await;
+                            if received >= BACKPRESSURE_EVENTS_PER_BATCH {
+                                break;
                             }
                         }
                         received

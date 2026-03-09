@@ -973,7 +973,7 @@ mod tests {
             display_name: format!("Test Provider {id}"),
             provider_type: "vault".to_string(),
             max_concurrent_leases: 100,
-            default_lease_ttl_ms: 3600_000,
+            default_lease_ttl_ms: 3_600_000,
             supports_rotation: true,
             max_sensitivity: CredentialSensitivity::Critical,
         }

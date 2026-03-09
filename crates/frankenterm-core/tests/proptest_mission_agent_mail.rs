@@ -505,7 +505,7 @@ proptest! {
         let tid = ctx.canonical_thread_id();
         // Thread IDs should contain only lowercase alphanumerics and dashes
         // (except when explicit thread_id is provided, which is returned as-is trimmed)
-        if ctx.thread_id.as_ref().map_or(true, |t| t.trim().is_empty()) {
+        if ctx.thread_id.as_ref().is_none_or(|t| t.trim().is_empty()) {
             for ch in tid.chars() {
                 assert!(
                     ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-',
@@ -602,7 +602,7 @@ proptest! {
                 kind: CoordinationEventKind::ProgressUpdate,
                 summary: "test".to_string(),
                 body: "body".to_string(),
-                recipients: vec!["  ".to_string(), "   ".to_string(), "".to_string()],
+                recipients: vec!["  ".to_string(), "   ".to_string(), String::new()],
                 ack_required: false,
                 context: ctx,
                 reason_code: "test".to_string(),

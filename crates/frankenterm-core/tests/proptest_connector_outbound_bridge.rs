@@ -534,7 +534,7 @@ proptest! {
         for i in 0..num_events {
             let event = OutboundEvent::new(
                 OutboundEventSource::Custom,
-                &format!("event.{i}"),
+                format!("event.{i}"),
                 serde_json::json!({}),
             ).with_timestamp_ms(1000 + i as u64 * 10);
             let _ = bridge.process_event(&event);
@@ -567,7 +567,7 @@ proptest! {
         for i in 0..num_events {
             let event = OutboundEvent::new(
                 OutboundEventSource::Custom,
-                &format!("event.{i}"),
+                format!("event.{i}"),
                 serde_json::json!({}),
             ).with_timestamp_ms(1000 + i as u64 * 10);
             let _ = bridge.process_event(&event);
@@ -591,7 +591,7 @@ proptest! {
         for i in 0..num_events {
             let event = OutboundEvent::new(
                 OutboundEventSource::Custom,
-                &format!("event.{i}"),
+                format!("event.{i}"),
                 serde_json::json!({}),
             ).with_timestamp_ms(1000 + i as u64 * 10);
             let _ = bridge.process_event(&event);
@@ -721,7 +721,7 @@ proptest! {
         for i in 0..n {
             let event = OutboundEvent::new(
                 OutboundEventSource::Custom,
-                &format!("event.{i}"),
+                format!("event.{i}"),
                 serde_json::json!({}),
             )
             .with_correlation_id(corr_id.clone())
@@ -774,13 +774,8 @@ proptest! {
         let result = bridge.process_event(&event).unwrap();
         // Verify dispatched actions are in non-decreasing priority order
         // (we can infer from connector names which had which priority)
-        let dispatched_connectors: Vec<String> = result
-            .actions_dispatched
-            .iter()
-            .map(|a| a.target_connector.clone())
-            .collect();
         // All rules should match since no filters
-        prop_assert_eq!(dispatched_connectors.len(), priorities.len());
+        prop_assert_eq!(result.actions_dispatched.len(), priorities.len());
     }
 
     // ---- Drain empties the queue ----
@@ -806,7 +801,7 @@ proptest! {
         for i in 0..num_events {
             let event = OutboundEvent::new(
                 OutboundEventSource::Custom,
-                &format!("event.{i}"),
+                format!("event.{i}"),
                 serde_json::json!({}),
             ).with_timestamp_ms(1000 + i as u64 * 10);
             let _ = bridge.process_event(&event);

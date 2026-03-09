@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-fn schedule_task(runtime: &mut LabRuntime, task_id: TaskId) {
+fn schedule_task(runtime: &LabRuntime, task_id: TaskId) {
     runtime.scheduler.lock().schedule(task_id, 0);
 }
 
@@ -824,7 +824,7 @@ fn dpor_stream_reconnect_receives_ordered_suffix_after_restart() {
             "reconnected subscriber should receive a post-restart suffix"
         );
         assert!(
-            sub3[0] >= reconnect_after + 1,
+            sub3[0] > reconnect_after,
             "reconnected subscriber must not receive pre-restart backlog"
         );
         assert!(

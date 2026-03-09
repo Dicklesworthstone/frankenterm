@@ -95,7 +95,7 @@ fn make_pane(pane_id: u64) -> PaneInfo {
     }
 }
 
-fn schedule_task(runtime: &mut LabRuntime, task_id: TaskId) {
+fn schedule_task(runtime: &LabRuntime, task_id: TaskId) {
     runtime.scheduler.lock().schedule(task_id, 0);
 }
 

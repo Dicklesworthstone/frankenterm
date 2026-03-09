@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use proptest::prelude::*;
-use serde_json;
+
 
 use frankenterm_core::swarm_scheduler::*;
 use frankenterm_core::swarm_work_queue::{QueueStats, SwarmWorkQueue, WorkItem, WorkQueueConfig};

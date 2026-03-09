@@ -45,6 +45,7 @@ impl TaskGraph {
 ///
 /// Each task can depend on any earlier task (by index), ensuring the graph
 /// is always a valid DAG (no cycles).
+#[allow(clippy::needless_collect)]
 fn arb_task_graph(min_tasks: usize, max_tasks: usize) -> impl Strategy<Value = TaskGraph> {
     (min_tasks..=max_tasks).prop_flat_map(|n| {
         let task_strategies: Vec<_> = (0..n)

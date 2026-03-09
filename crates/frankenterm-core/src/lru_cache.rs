@@ -985,6 +985,7 @@ mod tests {
         }
 
         /// Assert fundamental linked list invariants on the cache.
+        #[allow(clippy::len_zero)]
         fn assert_invariants<K: Hash + Eq + Clone + std::fmt::Debug, V: std::fmt::Debug>(cache: &LruCache<K, V>) {
             // len matches map size
             assert_eq!(cache.len(), cache.map.len());

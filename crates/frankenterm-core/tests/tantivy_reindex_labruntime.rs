@@ -1798,21 +1798,15 @@ fn reindex_range_parity_across_backends() {
 
         // Manually run the same range using the in-memory cursor
         let mut mem_docs = Vec::new();
-        loop {
-            let batch = cursor.next_batch(20).unwrap();
-            if batch.is_empty() {
+        let batch = cursor.next_batch(20).unwrap();
+        for record in &batch {
+            if record.offset.ordinal >= to.ordinal {
                 break;
             }
-            for record in &batch {
-                if record.offset.ordinal >= to.ordinal {
-                    break;
-                }
-                if record.offset.ordinal < from.ordinal {
-                    continue;
-                }
-                mem_docs.push(map_event_to_document(&record.event, record.offset.ordinal));
+            if record.offset.ordinal < from.ordinal {
+                continue;
             }
-            break; // single batch sufficient for 8 events
+            mem_docs.push(map_event_to_document(&record.event, record.offset.ordinal));
         }
 
         // Compare results

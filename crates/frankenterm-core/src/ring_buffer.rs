@@ -1180,7 +1180,7 @@ mod tests {
                 for item in &items {
                     rb.push(*item);
                 }
-                if rb.len() == 0 {
+                if rb.is_empty() {
                     prop_assert!(rb.is_empty());
                     let check = !rb.is_full();
                     prop_assert!(check);
@@ -1218,9 +1218,9 @@ mod tests {
                 prop_assert_eq!(t.pushes, items.len() as u64);
                 let expected_overwrites = items.len().saturating_sub(cap) as u64;
                 prop_assert_eq!(t.overwrites, expected_overwrites);
-                let expected_clears = if clear_after { 1u64 } else { 0 };
+                let expected_clears = u64::from(clear_after);
                 prop_assert_eq!(t.clears, expected_clears);
-                let expected_drains = if drain_after { 1u64 } else { 0 };
+                let expected_drains = u64::from(drain_after);
                 prop_assert_eq!(t.drains, expected_drains);
             }
 

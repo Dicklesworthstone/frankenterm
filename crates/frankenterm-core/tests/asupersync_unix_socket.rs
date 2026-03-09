@@ -146,7 +146,7 @@ fn unix_socket_read_timeout_is_enforced() -> io::Result<()> {
             let mut stream = unix::connect(&client_path).await?;
             let mut byte = [0_u8; 1];
             let timed = runtime_compat::timeout(Duration::from_millis(30), async {
-                stream.read_exact(&mut byte).await.map(|_| ())
+                stream.read_exact(&mut byte).await.map(|()| ())
             })
             .await;
             assert!(

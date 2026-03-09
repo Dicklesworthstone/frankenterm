@@ -524,7 +524,7 @@ proptest! {
     fn register_n_principals(n in 1usize..=15) {
         let mut g = IdentityGraph::new();
         for i in 0..n {
-            g.register_principal(PrincipalId::agent(&format!("a{i}"))).unwrap();
+            g.register_principal(PrincipalId::agent(format!("a{i}"))).unwrap();
         }
         prop_assert_eq!(g.principal_count(), n);
     }
@@ -592,7 +592,7 @@ proptest! {
                 &format!("g{i}"),
                 &p,
                 [AuthAction::Read].into(),
-                ResourceId::pane(&format!("p{i}")),
+                ResourceId::pane(format!("p{i}")),
             );
             g.add_grant(grant).unwrap();
         }
@@ -624,7 +624,7 @@ proptest! {
                 &format!("g{i}"),
                 &p,
                 [AuthAction::Read].into(),
-                ResourceId::pane(&format!("p{i}")),
+                ResourceId::pane(format!("p{i}")),
             )).unwrap();
         }
         g.revoke_grant("g0").unwrap();
@@ -642,7 +642,7 @@ proptest! {
                 &format!("g{i}"),
                 &p,
                 [AuthAction::Read].into(),
-                ResourceId::pane(&format!("p{i}")),
+                ResourceId::pane(format!("p{i}")),
             )).unwrap();
         }
         g.deactivate_principal(&p).unwrap();
@@ -741,7 +741,7 @@ proptest! {
 
         let mut members = Vec::new();
         for i in 0..n_members {
-            let m = register(&mut g, PrincipalId::agent(&format!("a{i}")));
+            let m = register(&mut g, PrincipalId::agent(format!("a{i}")));
             g.add_to_group(&group, &m).unwrap();
             members.push(m);
         }
@@ -903,7 +903,7 @@ proptest! {
                 &format!("g{i}"),
                 &p,
                 [AuthAction::Read].into(),
-                ResourceId::pane(&format!("p{i}")),
+                ResourceId::pane(format!("p{i}")),
             );
             grant.expires_at_ms = Some(1000 + ttl);
             g.add_grant(grant).unwrap();
@@ -925,7 +925,7 @@ proptest! {
                 &format!("g{i}"),
                 &p,
                 [AuthAction::Read].into(),
-                ResourceId::pane(&format!("p{i}")),
+                ResourceId::pane(format!("p{i}")),
             )).unwrap();
         }
         let expired = g.expire_stale(u64::MAX);
@@ -968,7 +968,7 @@ proptest! {
     fn telemetry_tracks_registrations(n in 1usize..=10) {
         let mut g = IdentityGraph::new();
         for i in 0..n {
-            g.register_principal(PrincipalId::agent(&format!("a{i}"))).unwrap();
+            g.register_principal(PrincipalId::agent(format!("a{i}"))).unwrap();
         }
         prop_assert_eq!(g.telemetry().principals_registered, n as u64);
     }
@@ -1023,7 +1023,7 @@ proptest! {
     ) {
         let mut g = IdentityGraph::new();
         for i in 0..n_principals {
-            g.register_principal(PrincipalId::agent(&format!("a{i}"))).unwrap();
+            g.register_principal(PrincipalId::agent(format!("a{i}"))).unwrap();
         }
         // Add grants to first principal
         let p = PrincipalId::agent("a0");
@@ -1032,7 +1032,7 @@ proptest! {
                 &format!("g{i}"),
                 &p,
                 [AuthAction::Read].into(),
-                ResourceId::pane(&format!("p{i}")),
+                ResourceId::pane(format!("p{i}")),
             )).unwrap();
         }
         let s = g.summary();

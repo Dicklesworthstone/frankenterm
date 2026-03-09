@@ -134,7 +134,7 @@ async fn prime_connections(pool: Arc<MuxPool>, concurrent: usize) {
     for _ in 0..concurrent {
         let pool = Arc::clone(&pool);
         joins.push(tokio::spawn(async move {
-            pool.list_panes().await.expect("prime list_panes");
+            Box::pin(pool.list_panes()).await.expect("prime list_panes");
         }));
     }
     for join in joins {
@@ -160,7 +160,7 @@ fn bench_acquire_release_cycle(c: &mut Criterion) {
             b.to_async(&rt).iter(|| {
                 let pool = Arc::clone(&pool);
                 async move {
-                    pool.write_to_pane(1, b"echo hi\n".to_vec())
+                    Box::pin(pool.write_to_pane(1, b"echo hi\n".to_vec()))
                         .await
                         .expect("write_to_pane");
                 }
@@ -189,7 +189,7 @@ fn bench_health_check_overhead(c: &mut Criterion) {
             b.to_async(&rt).iter(|| {
                 let pool = Arc::clone(&pool);
                 async move {
-                    pool.health_check().await.expect("health_check");
+                    Box::pin(pool.health_check()).await.expect("health_check");
                 }
             });
         });
@@ -224,7 +224,7 @@ fn bench_throughput_scaling(c: &mut Criterion) {
                         for _ in 0..n {
                             let pool = Arc::clone(&pool);
                             joins.push(tokio::spawn(async move {
-                                pool.list_panes().await.expect("list_panes");
+                                Box::pin(pool.list_panes()).await.expect("list_panes");
                             }));
                         }
                         for join in joins {

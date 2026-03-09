@@ -91,7 +91,7 @@ proptest! {
         msg in "[a-zA-Z0-9 ]{1,50}",
     ) {
         let err = LexicalIngestError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, msg.clone())
+            std::io::Error::other(msg.clone())
         );
         let display = err.to_string();
         prop_assert!(display.contains("I/O"),
@@ -788,7 +788,7 @@ proptest! {
         prop_assert!(!mismatch.to_string().is_empty());
 
         let io_err = LexicalIngestError::Io(
-            std::io::Error::new(std::io::ErrorKind::Other, "test")
+            std::io::Error::other("test")
         );
         prop_assert!(!io_err.to_string().is_empty());
     }

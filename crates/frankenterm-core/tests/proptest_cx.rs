@@ -62,7 +62,7 @@ proptest! {
     // 3
     #[test]
     fn preset_clone_preserves_value(p in arb_preset()) {
-        let cloned = p.clone();
+        let cloned = p;
         prop_assert_eq!(p, cloned);
     }
 
@@ -112,7 +112,7 @@ proptest! {
     // 9
     #[test]
     fn tuning_clone_preserves_value(t in arb_tuning()) {
-        let cloned = t.clone();
+        let cloned = t;
         prop_assert_eq!(t, cloned);
     }
 
@@ -418,6 +418,8 @@ proptest! {
 
 // ── spawn_bounded_with_cx tests ─────────────────────────────────────────
 
+type CxTask<T> = Box<dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = T> + Send>> + Send>;
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
@@ -427,12 +429,11 @@ proptest! {
         let rt = make_runtime();
         let cx = for_testing();
         let handle = rt.handle();
-        let tasks: Vec<Box<dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = u32> + Send>> + Send>> =
+        let tasks: Vec<CxTask<u32>> =
             (0..n as u32)
                 .map(|i| {
-                    let closure: Box<
-                        dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = u32> + Send>> + Send,
-                    > = Box::new(move |_cx| Box::pin(async move { i }));
+                    let closure: CxTask<u32> =
+                        Box::new(move |_cx| Box::pin(async move { i }));
                     closure
                 })
                 .collect();
@@ -449,12 +450,11 @@ proptest! {
         let cx = for_testing();
         let handle = rt.handle();
         let expected: Vec<u32> = (0..n as u32).collect();
-        let tasks: Vec<Box<dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = u32> + Send>> + Send>> =
+        let tasks: Vec<CxTask<u32>> =
             (0..n as u32)
                 .map(|i| {
-                    let closure: Box<
-                        dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = u32> + Send>> + Send,
-                    > = Box::new(move |_cx| Box::pin(async move { i }));
+                    let closure: CxTask<u32> =
+                        Box::new(move |_cx| Box::pin(async move { i }));
                     closure
                 })
                 .collect();
@@ -470,8 +470,7 @@ proptest! {
         let rt = make_runtime();
         let cx = for_testing();
         let handle = rt.handle();
-        let tasks: Vec<Box<dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>> =
-            Vec::new();
+        let tasks: Vec<CxTask<()>> = Vec::new();
         let results =
             rt.block_on(async { spawn_bounded_with_cx(&handle, &cx, concurrency, tasks).await });
         prop_assert!(results.is_empty());
