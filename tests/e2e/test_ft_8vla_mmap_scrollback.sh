@@ -12,7 +12,13 @@ LOG_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.stdout.log"
 TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/target-rch-ft-8vla}-${RUN_ID}"
 LAST_STEP_LOG=""
-RCH_LOCAL_FALLBACK_COUNT=0
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_SOCKET_PATH_REGEX='unix_listener: path .*too long for Unix domain socket|too long for Unix domain socket'
+LOCAL_RCH_TMPDIR_OVERRIDE=""
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  LOCAL_RCH_TMPDIR_OVERRIDE="/tmp"
+fi
 
 emit_log() {
   local component="$1"
@@ -74,14 +80,44 @@ run_step() {
   return "${rc}"
 }
 
-record_rch_mode() {
-  local decision_path="$1"
-  if grep -q "\\[RCH\\] local" "${LAST_STEP_LOG}"; then
-    RCH_LOCAL_FALLBACK_COUNT=$((RCH_LOCAL_FALLBACK_COUNT + 1))
-    emit_log "validation" "${decision_path}.rch_mode" "rch_exec_mode" "degraded" "rch_fail_open_local_fallback" "none" "$(basename "${LAST_STEP_LOG}")"
+rch_fail_open_detected() {
+  local log_path="$1"
+  grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${log_path}"
+}
+
+rch_socket_path_issue_detected() {
+  local log_path="$1"
+  grep -Eq "${RCH_SOCKET_PATH_REGEX}" "${log_path}"
+}
+
+healthy_workers_from_probe_log() {
+  local log_path="$1"
+  awk 'BEGIN { capture = 0 } /^[[:space:]]*\{/ { capture = 1 } capture { print }' "${log_path}" \
+    | jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' 2>/dev/null \
+    || echo 0
+}
+
+run_rch() {
+  if [[ -n "${LOCAL_RCH_TMPDIR_OVERRIDE}" ]]; then
+    TMPDIR="${LOCAL_RCH_TMPDIR_OVERRIDE}" rch "$@"
   else
-    emit_log "validation" "${decision_path}.rch_mode" "rch_exec_mode" "passed" "rch_remote_offload" "none" "$(basename "${LAST_STEP_LOG}")"
+    rch "$@"
   fi
+}
+
+ensure_rch_remote_only() {
+  local decision_path="$1"
+  local input_summary="$2"
+  if rch_fail_open_detected "${LAST_STEP_LOG}"; then
+    if rch_socket_path_issue_detected "${LAST_STEP_LOG}"; then
+      emit_log "validation" "${decision_path}" "${input_summary}" "failed" "rch_local_socket_path_too_long" "RCH-LOCAL-TMPDIR" "$(basename "${LAST_STEP_LOG}")"
+    else
+      emit_log "validation" "${decision_path}" "${input_summary}" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
+    fi
+    echo "rch fell back to local execution; failing per offload-only policy" >&2
+    exit 3
+  fi
+  emit_log "validation" "${decision_path}.rch_mode" "rch_exec_mode" "passed" "rch_remote_offload" "none" "$(basename "${LAST_STEP_LOG}")"
 }
 
 run_rch_expect_success() {
@@ -91,11 +127,11 @@ run_rch_expect_success() {
   shift 3
 
   emit_log "validation" "${decision_path}" "${input_summary}" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
-  if run_step "${label}" env CARGO_TARGET_DIR="${TARGET_DIR}" rch exec -- "$@"; then
-    record_rch_mode "${decision_path}"
+  if run_step "${label}" run_rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" "$@"; then
+    ensure_rch_remote_only "${decision_path}" "${input_summary}"
     emit_log "validation" "${decision_path}" "${input_summary}" "passed" "command_succeeded" "none" "$(basename "${LAST_STEP_LOG}")"
   else
-    record_rch_mode "${decision_path}"
+    ensure_rch_remote_only "${decision_path}" "${input_summary}"
     emit_log "validation" "${decision_path}" "${input_summary}" "failed" "command_failed" "CARGO-FAIL" "$(basename "${LAST_STEP_LOG}")"
     exit 1
   fi
@@ -109,7 +145,11 @@ require_cmd rg
 require_cmd rch
 require_cmd cargo
 
-if run_step "rch_check" rch check; then
+if [[ -n "${LOCAL_RCH_TMPDIR_OVERRIDE}" ]]; then
+  emit_log "preflight" "rch_local_tmpdir_workaround" "TMPDIR=${LOCAL_RCH_TMPDIR_OVERRIDE}" "applied" "darwin_controlmaster_socket_guard" "none" "$(basename "${STDOUT_FILE}")"
+fi
+
+if run_step "rch_check" run_rch check; then
   check_log="${LAST_STEP_LOG}"
   emit_log "preflight" "rch_check" "health_check" "passed" "rch_ready" "none" "$(basename "${check_log}")"
 else
@@ -117,16 +157,33 @@ else
   exit 2
 fi
 
-if run_step "rch_probe" rch workers probe --all --json; then
+if run_step "rch_probe" run_rch workers probe --all --json; then
   probe_log="${LAST_STEP_LOG}"
-  healthy_workers="$(jq '[.data[]? | select(.status == "ok" or .status == "healthy" or .status == "reachable")] | length' "${probe_log}" 2>/dev/null || echo 0)"
+  healthy_workers="$(healthy_workers_from_probe_log "${probe_log}")"
   if [[ "${healthy_workers}" -lt 1 ]]; then
-    emit_log "preflight" "rch_probe" "workers_probe" "degraded" "rch_workers_unreachable_probe" "RCH-E101" "$(basename "${probe_log}")"
+    emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_workers_unreachable_probe" "RCH-E101" "$(basename "${probe_log}")"
+    echo "no reachable rch workers; refusing local fallback" >&2
+    exit 2
   else
     emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
   fi
 else
-  emit_log "preflight" "rch_probe" "workers_probe" "degraded" "rch_probe_failed" "RCH-E101" "$(basename "${LAST_STEP_LOG}")"
+  if rch_socket_path_issue_detected "${LAST_STEP_LOG}"; then
+    emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_local_socket_path_too_long" "RCH-LOCAL-TMPDIR" "$(basename "${LAST_STEP_LOG}")"
+  else
+    emit_log "preflight" "rch_probe" "workers_probe" "failed" "rch_probe_failed" "RCH-E101" "$(basename "${LAST_STEP_LOG}")"
+  fi
+  exit 2
+fi
+
+emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
+if run_step "rch_remote_smoke" run_rch exec -- cargo check --help; then
+  ensure_rch_remote_only "rch_remote_smoke" "cargo check --help"
+  emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "passed" "remote_exec_confirmed" "none" "$(basename "${LAST_STEP_LOG}")"
+else
+  ensure_rch_remote_only "rch_remote_smoke" "cargo check --help"
+  emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_remote_smoke_failed" "RCH-E102" "$(basename "${LAST_STEP_LOG}")"
+  exit 2
 fi
 
 run_rch_expect_success \
@@ -156,13 +213,9 @@ run_rch_expect_success \
 run_rch_expect_success \
   "benchmark_compile_contract" \
   "benchmark_validation.no_run_compile" \
-  "cargo bench -p frankenterm-core --bench mmap_scrollback --no-run" \
-  cargo bench -p frankenterm-core --bench mmap_scrollback --no-run
+  "cargo check -p frankenterm-core --bench mmap_scrollback --message-format short" \
+  cargo check -p frankenterm-core --bench mmap_scrollback --message-format short
 
-if [[ "${RCH_LOCAL_FALLBACK_COUNT}" -gt 0 ]]; then
-  emit_log "summary" "scenario_complete" "scenario_complete_with_local_fallback" "degraded" "rch_fail_open_local_fallback" "none" "$(basename "${STDOUT_FILE}")"
-else
-  emit_log "summary" "scenario_complete" "scenario_complete_remote_offload" "passed" "all_checks_passed" "none" "$(basename "${STDOUT_FILE}")"
-fi
+emit_log "summary" "scenario_complete" "scenario_complete_remote_offload" "passed" "all_checks_passed" "none" "$(basename "${STDOUT_FILE}")"
 
 echo "ft-8vla mmap scrollback scenario complete. Logs: ${LOG_FILE#"${ROOT_DIR}/"}"

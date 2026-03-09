@@ -4,7 +4,7 @@
 
 `frankenterm-core` persists captured pane output to SQLite (`output_segments`) for durability and search. The `ft-8vla` track adds a file-backed mirror lane that supports fast tail retrieval for large scrollbacks while preserving SQLite as the source of truth.
 
-## Current Status (2026-02-26)
+## Current Status (2026-03-09)
 
 The implementation is now integrated into `storage.rs` behind runtime gates:
 
@@ -68,7 +68,9 @@ Store API in `mmap_store.rs` includes:
 
 - `tests/e2e/test_ft_8vla_mmap_scrollback.sh`
 - Emits structured JSONL logs (`tests/e2e/logs/ft_8vla_mmap_scrollback_*.jsonl`) with nominal, failure-injection, recovery, and benchmark-compile checks.
-- Executes cargo workloads through `rch exec -- ...` and records remote vs fail-open local execution mode.
+- Executes cargo workloads through `rch exec -- ...` and now fails closed if workers are unreachable or `rch` falls back to local execution.
+- Uses `cargo check -p frankenterm-core --bench mmap_scrollback --message-format short` for the benchmark compile contract. This matches the repo's other bench guards, stays on `rch`'s remote-only path, and avoids the unstable full remote bench-link path that was failing independently of the mmap logic.
+- On macOS, forces `TMPDIR=/tmp` for `rch` invocations to avoid ControlMaster socket path-length failures from masquerading as remote-offload success.
 
 ## Open Follow-ons
 
