@@ -6,7 +6,7 @@ use frankenterm_core::backpressure::{BackpressureSnapshot, BackpressureTier};
 use frankenterm_core::cost_tracker::{
     AlertSeverity, BudgetAlert, CostDashboardSnapshot, PaneCostSummary, ProviderCostSummary,
 };
-use frankenterm_core::dashboard::{DashboardManager, DashboardState, SystemHealthTier};
+use frankenterm_core::dashboard::{DashboardManager, DashboardState, QuotaPanel, SystemHealthTier};
 use frankenterm_core::quota_gate::{LaunchVerdict, QuotaGateSnapshot, QuotaGateTelemetrySnapshot};
 use frankenterm_core::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
 
@@ -410,5 +410,295 @@ proptest! {
         let deser: frankenterm_core::dashboard::DashboardTelemetrySnapshot =
             serde_json::from_str(&json).expect("deserialize");
         prop_assert_eq!(snap, deser);
+    }
+}
+
+// =============================================================================
+// Additional coverage tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// DB-11: SystemHealthTier serde roundtrip for all 4 variants.
+    #[test]
+    fn db11_health_tier_serde(
+        tier in prop_oneof![
+            Just(SystemHealthTier::Green),
+            Just(SystemHealthTier::Yellow),
+            Just(SystemHealthTier::Red),
+            Just(SystemHealthTier::Black),
+        ]
+    ) {
+        let json = serde_json::to_string(&tier).unwrap();
+        let back: SystemHealthTier = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(tier, back);
+    }
+
+    /// DB-12: SystemHealthTier Display produces lowercase strings.
+    #[test]
+    fn db12_health_tier_display(
+        tier in prop_oneof![
+            Just(SystemHealthTier::Green),
+            Just(SystemHealthTier::Yellow),
+            Just(SystemHealthTier::Red),
+            Just(SystemHealthTier::Black),
+        ]
+    ) {
+        let display = format!("{tier}");
+        prop_assert!(!display.is_empty());
+        let is_lower = display.chars().all(|c| c.is_lowercase());
+        prop_assert!(is_lower, "expected lowercase, got: {}", display);
+    }
+
+    /// DB-13: SystemHealthTier ordering: Green < Yellow < Red < Black.
+    #[test]
+    fn db13_health_tier_ordering(_dummy in 0u8..1) {
+        prop_assert!(SystemHealthTier::Green < SystemHealthTier::Yellow);
+        prop_assert!(SystemHealthTier::Yellow < SystemHealthTier::Red);
+        prop_assert!(SystemHealthTier::Red < SystemHealthTier::Black);
+    }
+
+    /// DB-14: BackpressureTier→SystemHealthTier mapping preserves severity.
+    #[test]
+    fn db14_bp_to_health_mapping(
+        bp_tier in arb_backpressure_tier(),
+    ) {
+        let health: SystemHealthTier = bp_tier.into();
+        match bp_tier {
+            BackpressureTier::Green => prop_assert_eq!(health, SystemHealthTier::Green),
+            BackpressureTier::Yellow => prop_assert_eq!(health, SystemHealthTier::Yellow),
+            BackpressureTier::Red => prop_assert_eq!(health, SystemHealthTier::Red),
+            BackpressureTier::Black => prop_assert_eq!(health, SystemHealthTier::Black),
+        }
+    }
+
+    /// DB-15: worst_launch_verdict is Allow when everything is Green.
+    #[test]
+    fn db15_allow_when_green(_dummy in 0u8..1) {
+        let mut mgr = DashboardManager::new();
+        // Provide green backpressure
+        mgr.update_backpressure(BackpressureSnapshot {
+            tier: BackpressureTier::Green,
+            timestamp_epoch_ms: 0,
+            capture_depth: 0,
+            capture_capacity: 1000,
+            write_depth: 0,
+            write_capacity: 1000,
+            duration_in_tier_ms: 0,
+            transitions: 0,
+            paused_panes: vec![],
+        });
+        let state = mgr.snapshot();
+        prop_assert_eq!(state.worst_launch_verdict(), LaunchVerdict::Allow);
+    }
+
+    /// DB-16: worst_launch_verdict is Warn when Yellow but not Red.
+    #[test]
+    fn db16_warn_when_yellow(_dummy in 0u8..1) {
+        let mut mgr = DashboardManager::new();
+        mgr.update_backpressure(BackpressureSnapshot {
+            tier: BackpressureTier::Yellow,
+            timestamp_epoch_ms: 0,
+            capture_depth: 500,
+            capture_capacity: 1000,
+            write_depth: 500,
+            write_capacity: 1000,
+            duration_in_tier_ms: 0,
+            transitions: 0,
+            paused_panes: vec![],
+        });
+        let state = mgr.snapshot();
+        prop_assert_eq!(state.worst_launch_verdict(), LaunchVerdict::Warn);
+    }
+
+    /// DB-17: has_critical_alerts is false when Green, true when Red/Black.
+    #[test]
+    fn db17_has_critical_alerts(
+        bp_tier in arb_backpressure_tier(),
+    ) {
+        let mut mgr = DashboardManager::new();
+        mgr.update_backpressure(BackpressureSnapshot {
+            tier: bp_tier,
+            timestamp_epoch_ms: 0,
+            capture_depth: 900,
+            capture_capacity: 1000,
+            write_depth: 900,
+            write_capacity: 1000,
+            duration_in_tier_ms: 0,
+            transitions: 0,
+            paused_panes: vec![],
+        });
+        let state = mgr.snapshot();
+        let expected = state.overall_health >= SystemHealthTier::Red;
+        prop_assert_eq!(state.has_critical_alerts(), expected);
+    }
+
+    /// DB-18: summary_line always starts with "health=".
+    #[test]
+    fn db18_summary_line_starts_with_health(
+        cost in arb_cost_dashboard_snapshot(),
+        bp in arb_backpressure_snapshot(),
+    ) {
+        let mut mgr = DashboardManager::new();
+        mgr.update_costs(cost);
+        mgr.update_backpressure(bp);
+        let state = mgr.snapshot();
+        let line = state.summary_line();
+        prop_assert!(
+            line.starts_with("health="),
+            "summary_line should start with 'health=': {}", line
+        );
+    }
+
+    /// DB-19: limited_provider_count accessor matches panel field.
+    #[test]
+    fn db19_limited_provider_count_accessor(
+        summaries in proptest::collection::vec(arb_rate_limit_summary(), 0..8),
+    ) {
+        let mut mgr = DashboardManager::new();
+        mgr.update_rate_limits(summaries);
+        let state = mgr.snapshot();
+        prop_assert_eq!(
+            state.limited_provider_count(),
+            state.rate_limits.limited_provider_count
+        );
+    }
+
+    /// DB-20: paused_pane_count accessor matches panel field.
+    #[test]
+    fn db20_paused_pane_count_accessor(bp in arb_backpressure_snapshot()) {
+        let mut mgr = DashboardManager::new();
+        mgr.update_backpressure(bp);
+        let state = mgr.snapshot();
+        prop_assert_eq!(
+            state.paused_pane_count(),
+            state.backpressure.paused_pane_count
+        );
+    }
+
+    /// DB-21: Rate limit total_limited_panes = sum of all providers' limited_pane_count.
+    #[test]
+    fn db21_total_limited_panes_sum(
+        summaries in proptest::collection::vec(arb_rate_limit_summary(), 0..8),
+    ) {
+        // The dashboard sums limited_pane_count from ALL providers (including Clear ones)
+        let expected: usize = summaries.iter()
+            .map(|s| s.limited_pane_count)
+            .sum();
+        let mut mgr = DashboardManager::new();
+        mgr.update_rate_limits(summaries);
+        let state = mgr.snapshot();
+        prop_assert_eq!(state.rate_limits.total_limited_panes, expected);
+    }
+
+    /// DB-22: Telemetry update counters track each update_* call.
+    #[test]
+    fn db22_telemetry_update_counters(
+        n_cost in 0u32..5,
+        n_rl in 0u32..5,
+        n_bp in 0u32..5,
+        n_quota in 0u32..5,
+    ) {
+        let mut mgr = DashboardManager::new();
+        for _ in 0..n_cost {
+            mgr.update_costs(CostDashboardSnapshot {
+                providers: vec![], panes: vec![], alerts: vec![],
+                grand_total_cost_usd: 0.0, grand_total_tokens: 0,
+            });
+        }
+        for _ in 0..n_rl {
+            mgr.update_rate_limits(vec![]);
+        }
+        for _ in 0..n_bp {
+            mgr.update_backpressure(BackpressureSnapshot {
+                tier: BackpressureTier::Green,
+                timestamp_epoch_ms: 0, capture_depth: 0, capture_capacity: 1,
+                write_depth: 0, write_capacity: 1, duration_in_tier_ms: 0,
+                transitions: 0, paused_panes: vec![],
+            });
+        }
+        for _ in 0..n_quota {
+            mgr.update_quota(QuotaGateSnapshot {
+                telemetry: QuotaGateTelemetrySnapshot {
+                    evaluations: 0, allowed: 0, warned: 0, blocked: 0,
+                },
+            });
+        }
+        let t = mgr.telemetry().snapshot();
+        prop_assert_eq!(t.cost_updates, u64::from(n_cost));
+        prop_assert_eq!(t.rate_limit_updates, u64::from(n_rl));
+        prop_assert_eq!(t.backpressure_updates, u64::from(n_bp));
+        prop_assert_eq!(t.quota_updates, u64::from(n_quota));
+    }
+
+    /// DB-23: Default DashboardManager produces all-zero/empty panels.
+    #[test]
+    fn db23_default_manager_empty(_dummy in 0u8..1) {
+        let mut mgr = DashboardManager::default();
+        let state = mgr.snapshot();
+        prop_assert_eq!(state.overall_health, SystemHealthTier::Green);
+        prop_assert!(state.costs.providers.is_empty());
+        prop_assert!(state.costs.alerts.is_empty());
+        prop_assert_eq!(state.quota.evaluations, 0);
+        prop_assert_eq!(state.rate_limits.limited_provider_count, 0);
+        prop_assert_eq!(state.backpressure.paused_pane_count, 0);
+    }
+
+    /// DB-24: Cost panel budget alerts have is_blocking=true for Critical severity.
+    #[test]
+    fn db24_critical_alerts_are_blocking(
+        cost_usd in 50.0..1000.0f64,
+        limit_usd in 10.0..49.0f64,
+    ) {
+        let cost = CostDashboardSnapshot {
+            providers: vec![ProviderCostSummary {
+                agent_type: "codex".to_string(),
+                total_tokens: 1000,
+                total_cost_usd: cost_usd,
+                pane_count: 1,
+                record_count: 10,
+            }],
+            panes: vec![],
+            alerts: vec![BudgetAlert {
+                agent_type: "codex".to_string(),
+                current_cost_usd: cost_usd,
+                budget_limit_usd: limit_usd,
+                usage_fraction: cost_usd / limit_usd,
+                severity: AlertSeverity::Critical,
+            }],
+            grand_total_cost_usd: cost_usd,
+            grand_total_tokens: 1000,
+        };
+        let mut mgr = DashboardManager::new();
+        mgr.update_costs(cost);
+        let state = mgr.snapshot();
+        // Critical alerts should be blocking
+        for alert in &state.costs.alerts {
+            if alert.severity == "critical" {
+                prop_assert!(alert.is_blocking, "critical alert should be blocking");
+            }
+        }
+    }
+
+    /// DB-25: QuotaPanel serde roundtrip.
+    #[test]
+    fn db25_quota_panel_serde(
+        evaluations in 0u64..10_000,
+        allowed in 0u64..5_000,
+        warned in 0u64..3_000,
+        blocked in 0u64..2_000,
+        block_rate_percent in 0u64..100,
+    ) {
+        let panel = QuotaPanel {
+            evaluations,
+            allowed,
+            warned,
+            blocked,
+            block_rate_percent,
+        };
+        let json = serde_json::to_string(&panel).unwrap();
+        let back: QuotaPanel = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(panel, back);
     }
 }
