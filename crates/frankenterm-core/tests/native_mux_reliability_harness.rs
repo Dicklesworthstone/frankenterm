@@ -2104,12 +2104,7 @@ fn commands_route_only_to_running_panes_after_topology_close() {
     let orch = TopologyOrchestrator::new();
 
     // Validate a topology plan that closes pane 4
-    let plan = orch.validate_plan(
-        vec![TopologyOp::Close {
-            target: pane_id(4),
-        }],
-        &registry,
-    );
+    let plan = orch.validate_plan(vec![TopologyOp::Close { target: pane_id(4) }], &registry);
     assert!(plan.validated, "close plan should validate");
 
     // Apply the close via lifecycle transition
@@ -2261,12 +2256,7 @@ fn topology_plan_validation_with_mixed_state_registry() {
 
     // Close on running pane → OK
     assert_eq!(
-        orch.validate_op(
-            &TopologyOp::Close {
-                target: pane_id(2),
-            },
-            &registry,
-        ),
+        orch.validate_op(&TopologyOp::Close { target: pane_id(2) }, &registry,),
         OpCheckResult::Ok
     );
 
@@ -2284,12 +2274,7 @@ fn topology_plan_validation_with_mixed_state_registry() {
 
     // Close on already-closed pane → InvalidState
     assert!(matches!(
-        orch.validate_op(
-            &TopologyOp::Close {
-                target: pane_id(7),
-            },
-            &registry,
-        ),
+        orch.validate_op(&TopologyOp::Close { target: pane_id(7) }, &registry,),
         OpCheckResult::InvalidState { .. }
     ));
 }
@@ -2392,7 +2377,10 @@ fn headless_server_checkpoint_preserved_across_federation_join() {
 
     // Diff should show the new pane
     let diff = durable.diff_from_current(cp1, &registry).unwrap();
-    assert!(!diff.added.is_empty(), "federated pane should appear in diff");
+    assert!(
+        !diff.added.is_empty(),
+        "federated pane should appear in diff"
+    );
     assert!(
         diff.added.iter().any(|ec| ec.identity == pane_id(10)),
         "pane 10 should be in added set"
@@ -2426,19 +2414,13 @@ fn headless_server_rollback_removes_federation_panes() {
             )
             .unwrap();
     }
-    assert_eq!(
-        registry.entity_count_by_kind(LifecycleEntityKind::Pane),
-        5
-    ); // 2 original + 3 federated
+    assert_eq!(registry.entity_count_by_kind(LifecycleEntityKind::Pane), 5); // 2 original + 3 federated
 
     // Rollback should remove federated panes
     durable
         .rollback(cp_before, &mut registry, "undo federation")
         .unwrap();
-    assert_eq!(
-        registry.entity_count_by_kind(LifecycleEntityKind::Pane),
-        2
-    );
+    assert_eq!(registry.entity_count_by_kind(LifecycleEntityKind::Pane), 2);
     assert!(registry.get(&pane_id(20)).is_none());
     assert!(registry.get(&pane_id(21)).is_none());
     assert!(registry.get(&pane_id(22)).is_none());
@@ -2515,7 +2497,9 @@ fn fleet_provisioning_checkpoint_diff_tracks_profile_assignments() {
         .unwrap();
 
     // Diff from provisioned checkpoint should show 1 changed
-    let diff2 = durable.diff_from_current(cp_provisioned, &registry).unwrap();
+    let diff2 = durable
+        .diff_from_current(cp_provisioned, &registry)
+        .unwrap();
     assert_eq!(diff2.changed.len(), 1);
     assert!(diff2.changed.iter().any(|ec| ec.identity == pane_id(3)));
 }

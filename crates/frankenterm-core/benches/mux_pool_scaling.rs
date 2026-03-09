@@ -15,8 +15,12 @@ use std::time::Duration;
 
 use codec::{CODEC_VERSION, GetCodecVersionResponse, ListPanesResponse, Pdu, UnitResponse};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+#[cfg(feature = "asupersync-runtime")]
+use frankenterm_core::cx;
 use frankenterm_core::pool::PoolConfig;
 use frankenterm_core::runtime_compat::sleep;
+#[cfg(feature = "asupersync-runtime")]
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig, MuxPool, MuxPoolConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -32,6 +36,10 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
         budget: "health_check overhead should be close to list_panes round-trip",
     },
     bench_common::BenchBudget {
+        name: "health_check_overhead/with_cx",
+        budget: "explicit-Cx health_check path should stay close to ambient overhead",
+    },
+    bench_common::BenchBudget {
         name: "throughput_scaling",
         budget: "throughput should increase with concurrency until saturation",
     },
@@ -43,6 +51,10 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
         name: "connection_factory_overhead",
         budget: "connect latency should remain bounded for local unix sockets",
     },
+    bench_common::BenchBudget {
+        name: "connection_factory_overhead/with_cx",
+        budget: "explicit-Cx connect path should stay bounded for local unix sockets",
+    },
 ];
 
 fn make_runtime() -> tokio::runtime::Runtime {
@@ -50,6 +62,13 @@ fn make_runtime() -> tokio::runtime::Runtime {
         .enable_all()
         .build()
         .expect("runtime")
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn make_compat_runtime() -> frankenterm_core::runtime_compat::Runtime {
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("compat runtime")
 }
 
 async fn spawn_mock_server(temp_dir: &tempfile::TempDir, response_delay: Duration) -> PathBuf {
@@ -174,6 +193,8 @@ fn bench_acquire_release_cycle(c: &mut Criterion) {
 fn bench_health_check_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("mux_pool_scaling/health_check_overhead");
     let rt = make_runtime();
+    #[cfg(feature = "asupersync-runtime")]
+    let compat_rt = make_compat_runtime();
 
     for &max_size in &[1usize, 8, 32] {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -191,6 +212,20 @@ fn bench_health_check_overhead(c: &mut Criterion) {
                 async move {
                     Box::pin(pool.health_check()).await.expect("health_check");
                 }
+            });
+        });
+
+        #[cfg(feature = "asupersync-runtime")]
+        group.bench_with_input(BenchmarkId::new("with_cx", max_size), &max_size, |b, _| {
+            let pool = Arc::clone(&pool);
+            b.iter(|| {
+                let pool = Arc::clone(&pool);
+                compat_rt.block_on(async move {
+                    let cx = cx::for_testing();
+                    pool.health_check_with_cx(&cx)
+                        .await
+                        .expect("health_check_with_cx");
+                });
             });
         });
     }
@@ -276,6 +311,8 @@ fn bench_idle_eviction_scan(c: &mut Criterion) {
 fn bench_connection_factory_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("mux_pool_scaling/connection_factory_overhead");
     let rt = make_runtime();
+    #[cfg(feature = "asupersync-runtime")]
+    let compat_rt = make_compat_runtime();
 
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let socket_path = rt.block_on(spawn_mock_server(&temp_dir, Duration::from_millis(0)));
@@ -290,6 +327,20 @@ fn bench_connection_factory_overhead(c: &mut Criterion) {
                     .expect("direct mux connect");
                 black_box(client);
             }
+        });
+    });
+
+    #[cfg(feature = "asupersync-runtime")]
+    group.bench_function("direct_connect_with_cx", |b| {
+        b.iter(|| {
+            let config = config.clone();
+            compat_rt.block_on(async move {
+                let cx = cx::for_testing();
+                let client = DirectMuxClient::connect_with_cx(&cx, config)
+                    .await
+                    .expect("direct mux connect with cx");
+                black_box(client);
+            });
         });
     });
 

@@ -204,7 +204,6 @@ pub enum AutoLayoutPolicy {
     Manual,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

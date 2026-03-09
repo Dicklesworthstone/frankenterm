@@ -63,8 +63,8 @@ fn arb_policy_summary() -> impl Strategy<Value = WorkflowStepPolicySummary> {
         proptest::option::of("[a-zA-Z0-9 ]{1,64}"),
         proptest::option::of("[a-zA-Z0-9 ]{1,64}"),
     )
-        .prop_map(
-            |(decision, action, rule_id, reason, summary, error)| WorkflowStepPolicySummary {
+        .prop_map(|(decision, action, rule_id, reason, summary, error)| {
+            WorkflowStepPolicySummary {
                 decision,
                 action,
                 rule_id,
@@ -72,8 +72,8 @@ fn arb_policy_summary() -> impl Strategy<Value = WorkflowStepPolicySummary> {
                 summary,
                 error,
                 decision_context: None,
-            },
-        )
+            }
+        })
 }
 
 // ── WorkflowStepPolicyDecision ──────────────────────────────────────────────

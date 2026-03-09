@@ -379,10 +379,7 @@ proptest! {
 #[test]
 fn transition_table_has_no_transitions_from_terminal() {
     let table = MissionLifecycleState::transition_table();
-    let terminal_sources: Vec<_> = table
-        .iter()
-        .filter(|r| r.from.is_terminal())
-        .collect();
+    let terminal_sources: Vec<_> = table.iter().filter(|r| r.from.is_terminal()).collect();
     assert!(
         terminal_sources.is_empty(),
         "Transition table should have no rows from terminal states, found: {:?}",
@@ -417,5 +414,8 @@ fn transition_table_every_from_state_appears() {
 
 #[test]
 fn default_lifecycle_state_is_planning() {
-    assert_eq!(MissionLifecycleState::default(), MissionLifecycleState::Planning);
+    assert_eq!(
+        MissionLifecycleState::default(),
+        MissionLifecycleState::Planning
+    );
 }

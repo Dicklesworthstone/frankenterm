@@ -2247,7 +2247,11 @@ mod tests {
             "my-server",
         );
         assert!(name.starts_with("wa_snapshot_"));
-        assert!(std::path::Path::new(&name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("db")));
+        assert!(
+            std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+        );
         assert!(name.contains("0.1.0"));
         assert!(name.contains("20260208_120000"));
         assert!(name.contains("my-server"));

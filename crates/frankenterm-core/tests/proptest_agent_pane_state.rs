@@ -37,29 +37,27 @@ fn arb_auto_layout_policy() -> impl Strategy<Value = AutoLayoutPolicy> {
 /// natural ordering: active < thinking <= stuck <= idle.
 fn arb_config() -> impl Strategy<Value = AgentDetectionConfig> {
     (
-        1u64..10_000,       // active_output_threshold_ms
-        1u64..60_000,       // thinking_silence_ms (offset above active)
-        1u64..120_000,      // stuck_silence_ms (offset above thinking)
-        1u64..300_000,      // idle_silence_ms (offset above stuck)
-        any::<bool>(),      // enabled
-        any::<bool>(),      // show_agent_name_overlay
-        any::<bool>(),      // show_backpressure_indicator
-        any::<bool>(),      // show_queue_sparkline
-        1u32..20,           // agent_border_width_px
+        1u64..10_000,  // active_output_threshold_ms
+        1u64..60_000,  // thinking_silence_ms (offset above active)
+        1u64..120_000, // stuck_silence_ms (offset above thinking)
+        1u64..300_000, // idle_silence_ms (offset above stuck)
+        any::<bool>(), // enabled
+        any::<bool>(), // show_agent_name_overlay
+        any::<bool>(), // show_backpressure_indicator
+        any::<bool>(), // show_queue_sparkline
+        1u32..20,      // agent_border_width_px
     )
         .prop_map(
-            |(active, think_off, stuck_off, idle_off, en, name, bp, qs, bw)| {
-                AgentDetectionConfig {
-                    enabled: en,
-                    active_output_threshold_ms: active,
-                    thinking_silence_ms: active + think_off,
-                    stuck_silence_ms: active + think_off + stuck_off,
-                    idle_silence_ms: active + think_off + stuck_off + idle_off,
-                    show_agent_name_overlay: name,
-                    show_backpressure_indicator: bp,
-                    show_queue_sparkline: qs,
-                    agent_border_width_px: bw,
-                }
+            |(active, think_off, stuck_off, idle_off, en, name, bp, qs, bw)| AgentDetectionConfig {
+                enabled: en,
+                active_output_threshold_ms: active,
+                thinking_silence_ms: active + think_off,
+                stuck_silence_ms: active + think_off + stuck_off,
+                idle_silence_ms: active + think_off + stuck_off + idle_off,
+                show_agent_name_overlay: name,
+                show_backpressure_indicator: bp,
+                show_queue_sparkline: qs,
+                agent_border_width_px: bw,
             },
         )
 }
@@ -68,11 +66,11 @@ fn arb_config() -> impl Strategy<Value = AgentDetectionConfig> {
 /// so that saturating_sub never saturates to 0 unexpectedly.
 fn arb_timestamps_with_now() -> impl Strategy<Value = (PaneActivityTimestamps, u64)> {
     (
-        0u64..1_000_000,    // last_output_ms
-        0u64..1_000_000,    // last_input_ms
-        any::<bool>(),      // is_agent
-        any::<bool>(),      // flagged_stuck
-        0u64..500_000,      // extra_ms added to max to get now_ms
+        0u64..1_000_000, // last_output_ms
+        0u64..1_000_000, // last_input_ms
+        any::<bool>(),   // is_agent
+        any::<bool>(),   // flagged_stuck
+        0u64..500_000,   // extra_ms added to max to get now_ms
     )
         .prop_map(|(out_ms, in_ms, is_agent, flagged_stuck, extra)| {
             let now_ms = out_ms.max(in_ms) + extra;

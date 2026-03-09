@@ -290,7 +290,7 @@ impl Stats {
     pub fn init() -> anyhow::Result<()> {
         let stats = Self::new();
         let inner = Arc::clone(&stats.inner);
-        let _handle = std::thread::spawn(move || Inner::run(inner));
+        std::thread::spawn(move || Inner::run(inner));
         metrics::set_global_recorder(stats)
             .map_err(|e| anyhow::anyhow!("Failed to set metrics recorder:{}", e))
     }

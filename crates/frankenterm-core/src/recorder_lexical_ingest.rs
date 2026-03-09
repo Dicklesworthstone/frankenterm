@@ -830,9 +830,8 @@ mod tests {
 
     #[test]
     fn error_is_error_trait() {
-        let e: Box<dyn std::error::Error> = Box::new(LexicalIngestError::Io(std::io::Error::other(
-            "test",
-        )));
+        let e: Box<dyn std::error::Error> =
+            Box::new(LexicalIngestError::Io(std::io::Error::other("test")));
         assert!(e.to_string().contains("I/O error"));
     }
 

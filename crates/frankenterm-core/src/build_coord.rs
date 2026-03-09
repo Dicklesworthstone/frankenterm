@@ -471,8 +471,8 @@ pub const fn recommended_rch_prefix() -> &'static str {
 fn command_tokens(command: &str) -> Vec<String> {
     let trimmed = command.trim_start();
     let trimmed = trimmed.strip_prefix('$').map_or(trimmed, str::trim_start);
-    shell_words::split(trimmed)
-        .unwrap_or_else(|_| trimmed.split_whitespace().map(str::to_string).collect())
+    shlex::split(trimmed)
+        .unwrap_or_else(|| trimmed.split_whitespace().map(str::to_string).collect())
 }
 
 fn cargo_payload_tokens(tokens: &[String]) -> Option<&[String]> {

@@ -181,7 +181,7 @@ pub fn spawn_tls_listener(tls_server: &TlsDomainServer) -> Result<(), Error> {
         })?,
         acceptor,
     );
-    let _listener_handle = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         net_listener.run();
     });
     Ok(())

@@ -65,7 +65,7 @@ impl From<&RenderMetrics> for CellMetricKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SizedBlockKey {
     pub block: BlockKey,
     pub size: CellMetricKey,
@@ -244,7 +244,7 @@ impl FrameDecoder {
             .format()
             .ok_or_else(|| anyhow::anyhow!("cannot determine image format"))?;
 
-        let _decoder_handle = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             if let Err(err) = Self::run_decoder_thread(reader, format, tx) {
                 if err
                     .downcast_ref::<std::sync::mpsc::SendError<DecodedFrame>>()

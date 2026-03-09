@@ -13,8 +13,8 @@ use proptest::prelude::*;
 use frankenterm_core::runtime_telemetry::{
     CancellationTelemetryEmitter, FailureClass, HealthTier, RuntimePhase,
     RuntimeTelemetryEventBuilder, RuntimeTelemetryKind, RuntimeTelemetryLog,
-    RuntimeTelemetryLogConfig, ScopeTelemetryEmitter, TierTransitionRecord,
-    UnifiedTelemetryRecord, UnifiedTelemetrySource,
+    RuntimeTelemetryLogConfig, ScopeTelemetryEmitter, TierTransitionRecord, UnifiedTelemetryRecord,
+    UnifiedTelemetrySource,
 };
 
 // =============================================================================

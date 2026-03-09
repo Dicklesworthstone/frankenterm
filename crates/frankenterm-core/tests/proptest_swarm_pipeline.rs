@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 
-
 use frankenterm_core::swarm_pipeline::*;
 
 // =============================================================================

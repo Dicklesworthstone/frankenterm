@@ -113,8 +113,7 @@ fn lifecycle_state_machine_invariant_no_backward_transitions() {
     assert!(
         matches!(
             pane.state,
-            LifecycleState::Pane(MuxPaneLifecycleState::Closed
-                | MuxPaneLifecycleState::Draining)
+            LifecycleState::Pane(MuxPaneLifecycleState::Closed | MuxPaneLifecycleState::Draining)
         ),
         "Pane should be Closed or Draining after Close event, got {:?}",
         pane.state

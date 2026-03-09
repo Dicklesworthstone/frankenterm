@@ -368,7 +368,9 @@ mod import_guardrail_tests {
     fn allowed_files_all_end_with_rs() {
         for f in ALLOWED_FILES {
             assert!(
-                std::path::Path::new(f).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs")),
+                std::path::Path::new(f)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("rs")),
                 "allowed file should end with .rs: {}",
                 f
             );
@@ -406,7 +408,9 @@ mod import_guardrail_tests {
     fn agnostic_modules_names_end_with_rs() {
         for (name, _) in AGNOSTIC_MODULES {
             assert!(
-                std::path::Path::new(name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs")),
+                std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("rs")),
                 "agnostic module name should end with .rs: {}",
                 name
             );
