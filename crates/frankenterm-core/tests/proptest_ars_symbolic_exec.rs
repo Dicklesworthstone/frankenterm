@@ -6,8 +6,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::ars_symbolic_exec::{
-    SafetyVerdict, SymExecConfig, SymbolicExecutor, ViolationCategory, parse_commands,
-    path_within_boundary, resolve_path, tokenize,
+    SafetyVerdict, SafetyViolation, SafetyViolations, SymExecConfig, SymbolicExecutor,
+    ViolationCategory, parse_commands, path_within_boundary, resolve_path, tokenize,
 };
 use frankenterm_core::mdl_extraction::CommandBlock;
 
@@ -365,5 +365,190 @@ proptest! {
                 cwd
             );
         }
+    }
+}
+
+// =============================================================================
+// Additional strategies for coverage gaps
+// =============================================================================
+
+fn arb_violation_category() -> impl Strategy<Value = ViolationCategory> {
+    prop_oneof![
+        Just(ViolationCategory::PathTraversal),
+        Just(ViolationCategory::BannedBinary),
+        Just(ViolationCategory::UnboundedDeletion),
+        Just(ViolationCategory::PrivilegeEscalation),
+        Just(ViolationCategory::ResourceExhaustion),
+        Just(ViolationCategory::Unparseable),
+        Just(ViolationCategory::OpaqueSubstitution),
+    ]
+}
+
+fn arb_safety_violation() -> impl Strategy<Value = SafetyViolation> {
+    (
+        0_u32..100,
+        arb_violation_category(),
+        "[a-zA-Z ]{5,30}",
+        "[a-zA-Z0-9/ \\-]{3,20}",
+    )
+        .prop_map(|(block_index, category, description, evidence)| SafetyViolation {
+            block_index,
+            category,
+            description,
+            evidence,
+        })
+}
+
+// =============================================================================
+// SafetyViolation serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn safety_violation_serde_roundtrip(violation in arb_safety_violation()) {
+        let json = serde_json::to_string(&violation).unwrap();
+        let back: SafetyViolation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, violation);
+    }
+}
+
+// =============================================================================
+// SafetyViolations serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn safety_violations_serde_roundtrip(
+        violations in proptest::collection::vec(arb_safety_violation(), 0..5),
+    ) {
+        let sv = SafetyViolations {
+            violations: violations.clone(),
+        };
+        let json = serde_json::to_string(&sv).unwrap();
+        let back: SafetyViolations = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.violations.len(), violations.len());
+        prop_assert_eq!(back, sv);
+    }
+}
+
+// =============================================================================
+// SafetyVerdict::Unsafe serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn verdict_unsafe_serde_roundtrip(
+        violations in proptest::collection::vec(arb_safety_violation(), 1..5),
+    ) {
+        let sv = SafetyViolations {
+            violations: violations.clone(),
+        };
+        let verdict = SafetyVerdict::Unsafe(sv);
+        prop_assert!(verdict.is_unsafe());
+        prop_assert!(!verdict.is_safe());
+
+        let json = serde_json::to_string(&verdict).unwrap();
+        let back: SafetyVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, verdict);
+    }
+}
+
+// =============================================================================
+// SymExecConfig — extra_banned/safe_binaries roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn config_with_extras_serde_roundtrip(
+        cwd in arb_cwd(),
+        depth in 4_usize..128,
+        allow_unparseable in proptest::bool::ANY,
+        banned in proptest::collection::vec("[a-z]{2,10}", 0..5),
+        safe in proptest::collection::vec("[a-z]{2,10}", 0..5),
+    ) {
+        let config = SymExecConfig {
+            cwd: cwd.clone(),
+            max_path_depth: depth,
+            allow_unparseable,
+            extra_banned_binaries: banned.clone(),
+            extra_safe_binaries: safe.clone(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: SymExecConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.cwd, &config.cwd);
+        prop_assert_eq!(back.max_path_depth, config.max_path_depth);
+        prop_assert_eq!(back.allow_unparseable, config.allow_unparseable);
+        prop_assert_eq!(back.extra_banned_binaries, config.extra_banned_binaries);
+        prop_assert_eq!(back.extra_safe_binaries, config.extra_safe_binaries);
+    }
+
+    #[test]
+    fn config_default_roundtrip(_dummy in 0..1_u32) {
+        let config = SymExecConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: SymExecConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.cwd, &config.cwd);
+        prop_assert_eq!(back.max_path_depth, config.max_path_depth);
+        prop_assert!(back.extra_banned_binaries.is_empty());
+        prop_assert!(back.extra_safe_binaries.is_empty());
+    }
+}
+
+// =============================================================================
+// ViolationCategory — all variants have distinct serde
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
+    #[test]
+    fn violation_categories_all_distinct(_dummy in 0..1_u32) {
+        let all = vec![
+            ViolationCategory::PathTraversal,
+            ViolationCategory::BannedBinary,
+            ViolationCategory::UnboundedDeletion,
+            ViolationCategory::PrivilegeEscalation,
+            ViolationCategory::ResourceExhaustion,
+            ViolationCategory::Unparseable,
+            ViolationCategory::OpaqueSubstitution,
+        ];
+        let jsons: Vec<String> = all.iter().map(|c| serde_json::to_string(c).unwrap()).collect();
+        for (i, j1) in jsons.iter().enumerate() {
+            for j2 in &jsons[i + 1..] {
+                prop_assert_ne!(j1, j2, "all categories should have distinct JSON");
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Extra banned binaries are enforced
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn extra_banned_binary_triggers_unsafe(
+        cwd in arb_cwd(),
+        binary in "[a-z]{3,8}",
+    ) {
+        let config = SymExecConfig {
+            cwd,
+            extra_banned_binaries: vec![binary.clone()],
+            ..Default::default()
+        };
+        let exec = SymbolicExecutor::new(config);
+        let blocks = vec![make_cmd_block(0, binary)];
+        let verdict = exec.analyze(&blocks);
+        prop_assert!(verdict.is_unsafe(), "extra_banned_binary should trigger unsafe");
     }
 }
