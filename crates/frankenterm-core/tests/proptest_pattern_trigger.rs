@@ -5,7 +5,10 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::pattern_trigger::{TriggerCategory, TriggerPattern, TriggerScanner};
+use frankenterm_core::pattern_trigger::{
+    TriggerCategory, TriggerMatch, TriggerPattern, TriggerScanResult, TriggerScanner,
+    all_default_patterns,
+};
 
 // =============================================================================
 // Strategies
@@ -209,9 +212,225 @@ proptest! {
         let scanner = TriggerScanner::default();
         let result = scanner.scan_counts(&data);
         let json = serde_json::to_string(&result).unwrap();
-        let rt: frankenterm_core::pattern_trigger::TriggerScanResult =
-            serde_json::from_str(&json).unwrap();
+        let rt: TriggerScanResult = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(rt.total_matches, result.total_matches);
         prop_assert_eq!(rt.bytes_scanned, result.bytes_scanned);
+    }
+}
+
+// =============================================================================
+// Category and type serde/Display tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// PT-14: TriggerCategory serde roundtrip for all 6 variants.
+    #[test]
+    fn pt14_category_serde_roundtrip(
+        cat in prop_oneof![
+            Just(TriggerCategory::Error),
+            Just(TriggerCategory::Warning),
+            Just(TriggerCategory::Completion),
+            Just(TriggerCategory::Progress),
+            Just(TriggerCategory::TestResult),
+            Just(TriggerCategory::Custom),
+        ]
+    ) {
+        let json = serde_json::to_string(&cat).unwrap();
+        let back: TriggerCategory = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(cat, back);
+    }
+
+    /// PT-15: TriggerCategory Display is non-empty and lowercase.
+    #[test]
+    fn pt15_category_display_non_empty(
+        cat in prop_oneof![
+            Just(TriggerCategory::Error),
+            Just(TriggerCategory::Warning),
+            Just(TriggerCategory::Completion),
+            Just(TriggerCategory::Progress),
+            Just(TriggerCategory::TestResult),
+            Just(TriggerCategory::Custom),
+        ]
+    ) {
+        let display = format!("{cat}");
+        prop_assert!(!display.is_empty());
+        let is_lower = display.chars().all(|c| c.is_lowercase() || c == '_');
+        prop_assert!(is_lower, "Display should be lowercase: {}", display);
+    }
+
+    /// PT-16: TriggerPattern serde roundtrip.
+    #[test]
+    fn pt16_pattern_serde_roundtrip(
+        pattern in "[A-Za-z]{3,20}",
+        cat in prop_oneof![
+            Just(TriggerCategory::Error),
+            Just(TriggerCategory::Custom),
+        ],
+        case_insensitive in any::<bool>(),
+    ) {
+        let tp = if case_insensitive {
+            TriggerPattern::case_insensitive(&pattern, cat)
+        } else {
+            TriggerPattern::new(&pattern, cat)
+        };
+        let json = serde_json::to_string(&tp).unwrap();
+        let back: TriggerPattern = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(tp.pattern, back.pattern);
+        prop_assert_eq!(tp.category, back.category);
+        prop_assert_eq!(tp.case_insensitive, back.case_insensitive);
+    }
+
+    /// PT-17: TriggerMatch serde roundtrip.
+    #[test]
+    fn pt17_match_serde_roundtrip(
+        offset in 0usize..10000,
+        length in 1usize..100,
+        pattern_index in 0usize..50,
+        cat in prop_oneof![
+            Just(TriggerCategory::Error),
+            Just(TriggerCategory::Warning),
+            Just(TriggerCategory::Completion),
+        ],
+    ) {
+        let m = TriggerMatch {
+            offset,
+            length,
+            pattern_index,
+            category: cat,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: TriggerMatch = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(m.offset, back.offset);
+        prop_assert_eq!(m.length, back.length);
+        prop_assert_eq!(m.pattern_index, back.pattern_index);
+        prop_assert_eq!(m.category, back.category);
+    }
+}
+
+// =============================================================================
+// Helper method and scanner property tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// PT-18: has_errors is false when input contains no error patterns.
+    #[test]
+    fn pt18_no_errors_means_has_errors_false(
+        text in "[a-z ]{10,200}\n",
+    ) {
+        let scanner = TriggerScanner::new(vec![
+            TriggerPattern::new("ERROR", TriggerCategory::Error),
+        ]);
+        let result = scanner.scan_counts(text.as_bytes());
+        prop_assert!(!result.has_errors());
+    }
+
+    /// PT-19: has_completions is false when no completion patterns present.
+    #[test]
+    fn pt19_no_completions_means_false(
+        text in "[a-z ]{10,200}\n",
+    ) {
+        let scanner = TriggerScanner::new(vec![
+            TriggerPattern::new("Finished", TriggerCategory::Completion),
+        ]);
+        let result = scanner.scan_counts(text.as_bytes());
+        prop_assert!(!result.has_completions());
+    }
+
+    /// PT-20: pattern_count matches the number of patterns passed to new().
+    #[test]
+    fn pt20_pattern_count_matches_input(n in 0usize..20) {
+        let patterns: Vec<TriggerPattern> = (0..n)
+            .map(|i| TriggerPattern::new(&format!("PAT{i}"), TriggerCategory::Custom))
+            .collect();
+        let scanner = TriggerScanner::new(patterns);
+        prop_assert_eq!(scanner.pattern_count(), n);
+    }
+
+    /// PT-21: Case-insensitive patterns match both upper and lower case.
+    #[test]
+    fn pt21_case_insensitive_matches_variants(
+        word in "[A-Z]{4,8}",
+    ) {
+        let scanner = TriggerScanner::new(vec![
+            TriggerPattern::case_insensitive(&word, TriggerCategory::Custom),
+        ]);
+        // Upper case
+        let upper_result = scanner.scan_counts(word.as_bytes());
+        // Lower case
+        let lower = word.to_lowercase();
+        let lower_result = scanner.scan_counts(lower.as_bytes());
+        prop_assert_eq!(
+            upper_result.get(&TriggerCategory::Custom).copied().unwrap_or(0), 1,
+            "Case-insensitive should match uppercase '{}'", word
+        );
+        prop_assert_eq!(
+            lower_result.get(&TriggerCategory::Custom).copied().unwrap_or(0), 1,
+            "Case-insensitive should match lowercase '{}'", lower
+        );
+    }
+
+    /// PT-22: Case-sensitive patterns do NOT match different case.
+    #[test]
+    fn pt22_case_sensitive_rejects_wrong_case(
+        word in "[A-Z]{4,8}",
+    ) {
+        let scanner = TriggerScanner::new(vec![
+            TriggerPattern::new(&word, TriggerCategory::Custom),
+        ]);
+        // Should match exact case
+        let exact_result = scanner.scan_counts(word.as_bytes());
+        prop_assert_eq!(
+            exact_result.get(&TriggerCategory::Custom).copied().unwrap_or(0), 1
+        );
+        // Should NOT match lowercase
+        let lower = word.to_lowercase();
+        let lower_result = scanner.scan_counts(lower.as_bytes());
+        prop_assert_eq!(
+            lower_result.get(&TriggerCategory::Custom).copied().unwrap_or(0), 0,
+            "Case-sensitive '{}' should not match '{}'", word, lower
+        );
+    }
+
+    /// PT-23: scan_locate match offsets point to actual pattern text.
+    #[test]
+    fn pt23_locate_offsets_match_pattern(
+        prefix_len in 0usize..100,
+        suffix_len in 0usize..100,
+    ) {
+        let pattern = "XMARKER";
+        let prefix: String = (0..prefix_len).map(|_| 'a').collect();
+        let suffix: String = (0..suffix_len).map(|_| 'b').collect();
+        let input = format!("{prefix}{pattern}{suffix}");
+
+        let scanner = TriggerScanner::new(vec![
+            TriggerPattern::new(pattern, TriggerCategory::Custom),
+        ]);
+        let matches = scanner.scan_locate(input.as_bytes());
+        prop_assert_eq!(matches.len(), 1);
+        let m = &matches[0];
+        prop_assert_eq!(m.offset, prefix_len);
+        prop_assert_eq!(m.length, pattern.len());
+        let matched_bytes = &input.as_bytes()[m.offset..m.offset + m.length];
+        prop_assert_eq!(matched_bytes, pattern.as_bytes());
+    }
+
+    /// PT-24: Default scanner pattern_count matches all_default_patterns().
+    #[test]
+    fn pt24_default_scanner_count(_dummy in 0u8..1) {
+        let scanner = TriggerScanner::default();
+        let all = all_default_patterns();
+        prop_assert_eq!(scanner.pattern_count(), all.len());
+    }
+
+    /// PT-25: Scanning never panics on arbitrary binary input.
+    #[test]
+    fn pt25_no_panic_on_binary(data in prop::collection::vec(any::<u8>(), 0..4096)) {
+        let scanner = TriggerScanner::default();
+        let _ = scanner.scan_counts(&data);
+        let _ = scanner.scan_locate(&data);
     }
 }
