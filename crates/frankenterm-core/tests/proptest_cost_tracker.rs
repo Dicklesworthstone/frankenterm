@@ -251,4 +251,253 @@ proptest! {
         let deserialized: CostTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(snap, deserialized);
     }
+
+    // =========================================================================
+    // CT-10: warning_fraction is always clamped to [0.0, 1.0]
+    // =========================================================================
+
+    #[test]
+    fn ct10_warning_fraction_clamped(
+        agent_type in "[a-z]{3,10}",
+        max_cost in 1.0f64..1000.0,
+        raw_fraction in -2.0f64..3.0,
+    ) {
+        let threshold = BudgetThreshold::new(agent_type, max_cost, raw_fraction);
+        prop_assert!(threshold.warning_fraction >= 0.0);
+        prop_assert!(threshold.warning_fraction <= 1.0);
+    }
+
+    // =========================================================================
+    // CT-11: LRU eviction preserves most-recently-used panes
+    // =========================================================================
+
+    #[test]
+    fn ct11_lru_eviction_keeps_recent(
+        recent_pane_id in 600u64..700,
+    ) {
+        let mut tracker = CostTracker::new();
+        // Fill to capacity with pane IDs 0..512
+        for i in 0..512u64 {
+            tracker.record_usage(i, AgentType::Codex, 10, 0.001, i as i64);
+        }
+        // Touch the recent pane — it should survive eviction
+        tracker.record_usage(recent_pane_id, AgentType::Codex, 10, 0.001, 1000);
+        prop_assert!(tracker.pane_summary(recent_pane_id).is_some(),
+            "Recently added pane should survive");
+        prop_assert!(tracker.tracked_pane_count() <= 512);
+    }
+
+    // =========================================================================
+    // CT-12: Pane summaries are always sorted by pane_id (BTreeMap guarantee)
+    // =========================================================================
+
+    #[test]
+    fn ct12_pane_summaries_sorted(
+        records in proptest::collection::vec(arb_usage_record(), 2..30)
+    ) {
+        let mut tracker = CostTracker::new();
+        for (pane_id, agent_type, tokens, cost, ts) in &records {
+            tracker.record_usage(*pane_id, *agent_type, *tokens, *cost, *ts);
+        }
+        let summaries = tracker.all_pane_summaries();
+        let is_sorted = summaries.windows(2).all(|w| w[0].pane_id <= w[1].pane_id);
+        prop_assert!(is_sorted, "Pane summaries should be sorted by pane_id");
+    }
+
+    // =========================================================================
+    // CT-13: Re-registering a pane with different agent_type updates the type
+    // =========================================================================
+
+    #[test]
+    fn ct13_agent_type_update_on_reuse(
+        pane_id in arb_pane_id(),
+        first_type in arb_agent_type(),
+        second_type in arb_agent_type(),
+        tokens1 in arb_tokens(),
+        tokens2 in arb_tokens(),
+        cost1 in arb_cost_usd(),
+        cost2 in arb_cost_usd(),
+    ) {
+        let mut tracker = CostTracker::new();
+        tracker.record_usage(pane_id, first_type, tokens1, cost1, 100);
+        tracker.record_usage(pane_id, second_type, tokens2, cost2, 200);
+
+        let summary = tracker.pane_summary(pane_id).unwrap();
+        // Agent type should be the most recent
+        prop_assert_eq!(summary.agent_type, second_type.to_string());
+        // Tokens accumulate across both
+        prop_assert_eq!(summary.total_tokens, tokens1.saturating_add(tokens2));
+    }
+
+    // =========================================================================
+    // CT-14: record_count tracks number of record_usage calls per pane
+    // =========================================================================
+
+    #[test]
+    fn ct14_record_count_per_pane(
+        pane_id in arb_pane_id(),
+        n in 1usize..20,
+    ) {
+        let mut tracker = CostTracker::new();
+        for i in 0..n {
+            tracker.record_usage(pane_id, AgentType::Codex, 100, 0.01, i as i64);
+        }
+        let summary = tracker.pane_summary(pane_id).unwrap();
+        prop_assert_eq!(summary.record_count, n as u64);
+    }
+
+    // =========================================================================
+    // CT-15: last_updated_ms tracks the maximum timestamp
+    // =========================================================================
+
+    #[test]
+    fn ct15_last_updated_is_max_timestamp(
+        pane_id in arb_pane_id(),
+        timestamps in proptest::collection::vec(arb_timestamp_ms(), 2..10),
+    ) {
+        let mut tracker = CostTracker::new();
+        for &ts in &timestamps {
+            tracker.record_usage(pane_id, AgentType::Codex, 100, 0.01, ts);
+        }
+        let summary = tracker.pane_summary(pane_id).unwrap();
+        let max_ts = *timestamps.iter().max().unwrap();
+        prop_assert_eq!(summary.last_updated_ms, max_ts);
+    }
+
+    // =========================================================================
+    // CT-16: Zero budget produces no alerts regardless of cost
+    // =========================================================================
+
+    #[test]
+    fn ct16_zero_budget_no_alerts(cost in arb_cost_usd()) {
+        let config = CostTrackerConfig {
+            budgets: vec![BudgetThreshold::new("codex", 0.0, 0.8)],
+        };
+        let mut tracker = CostTracker::with_config(config);
+        tracker.record_usage(1, AgentType::Codex, 1000, cost, 100);
+        let alerts = tracker.budget_alerts();
+        prop_assert!(alerts.is_empty(), "Zero budget should never trigger alerts");
+    }
+
+    // =========================================================================
+    // CT-17: Grand total cost equals sum of all provider summaries
+    // =========================================================================
+
+    #[test]
+    fn ct17_grand_total_equals_provider_sum(
+        records in proptest::collection::vec(arb_usage_record(), 1..30)
+    ) {
+        let mut tracker = CostTracker::new();
+        for (pane_id, agent_type, tokens, cost, ts) in &records {
+            tracker.record_usage(*pane_id, *agent_type, *tokens, *cost, *ts);
+        }
+
+        let provider_cost_sum: f64 = tracker.all_provider_summaries()
+            .iter()
+            .map(|p| p.total_cost_usd)
+            .sum();
+        let grand_total = tracker.grand_total_cost();
+
+        prop_assert!((provider_cost_sum - grand_total).abs() < 1e-6,
+            "provider sum {} != grand total {}", provider_cost_sum, grand_total);
+    }
+
+    // =========================================================================
+    // CT-18: Grand total tokens equals sum of all provider summary tokens
+    // =========================================================================
+
+    #[test]
+    fn ct18_grand_total_tokens_equals_provider_sum(
+        records in proptest::collection::vec(arb_usage_record(), 1..30)
+    ) {
+        let mut tracker = CostTracker::new();
+        for (pane_id, agent_type, tokens, cost, ts) in &records {
+            tracker.record_usage(*pane_id, *agent_type, *tokens, *cost, *ts);
+        }
+
+        let provider_token_sum: u64 = tracker.all_provider_summaries()
+            .iter()
+            .map(|p| p.total_tokens)
+            .sum();
+        let grand_total = tracker.grand_total_tokens();
+
+        prop_assert_eq!(provider_token_sum, grand_total);
+    }
+
+    // =========================================================================
+    // CT-19: set_config dynamically changes alert behavior
+    // =========================================================================
+
+    #[test]
+    fn ct19_set_config_changes_alerts(
+        cost in 5.0f64..50.0,
+    ) {
+        let mut tracker = CostTracker::new();
+        tracker.record_usage(1, AgentType::Codex, 1000, cost, 100);
+
+        // No config → no alerts
+        let alerts1 = tracker.budget_alerts();
+        prop_assert!(alerts1.is_empty());
+
+        // Set config with limit below cost → should trigger
+        tracker.set_config(CostTrackerConfig {
+            budgets: vec![BudgetThreshold::new("codex", cost * 0.5, 0.5)],
+        });
+        let alerts2 = tracker.budget_alerts();
+        prop_assert!(!alerts2.is_empty(),
+            "Should trigger alert when cost {} exceeds limit {}", cost, cost * 0.5);
+    }
+
+    // =========================================================================
+    // CT-20: usages_recorded equals total number of record_usage calls
+    // =========================================================================
+
+    #[test]
+    fn ct20_usages_recorded_matches_calls(
+        records in proptest::collection::vec(arb_usage_record(), 1..50)
+    ) {
+        let mut tracker = CostTracker::new();
+        for (pane_id, agent_type, tokens, cost, ts) in &records {
+            tracker.record_usage(*pane_id, *agent_type, *tokens, *cost, *ts);
+        }
+        prop_assert_eq!(tracker.telemetry().snapshot().usages_recorded, records.len() as u64);
+    }
+
+    // =========================================================================
+    // CT-21: AlertSeverity serde roundtrip
+    // =========================================================================
+
+    #[test]
+    fn ct21_alert_severity_serde(
+        severity in prop_oneof![
+            Just(AlertSeverity::Warning),
+            Just(AlertSeverity::Critical),
+        ]
+    ) {
+        let json = serde_json::to_string(&severity).unwrap();
+        let back: AlertSeverity = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(severity, back);
+    }
+
+    // =========================================================================
+    // CT-22: Remove then re-add a pane starts fresh (no cost carryover)
+    // =========================================================================
+
+    #[test]
+    fn ct22_remove_readd_starts_fresh(
+        pane_id in arb_pane_id(),
+        cost1 in 1.0f64..50.0,
+        cost2 in 1.0f64..50.0,
+    ) {
+        let mut tracker = CostTracker::new();
+        tracker.record_usage(pane_id, AgentType::Codex, 1000, cost1, 100);
+        tracker.remove_pane(pane_id);
+        tracker.record_usage(pane_id, AgentType::Codex, 500, cost2, 200);
+
+        let summary = tracker.pane_summary(pane_id).unwrap();
+        // Should only reflect the second recording
+        prop_assert_eq!(summary.total_tokens, 500);
+        prop_assert!((summary.total_cost_usd - cost2).abs() < 1e-10);
+        prop_assert_eq!(summary.record_count, 1);
+    }
 }

@@ -251,4 +251,360 @@ proptest! {
         let expected = decision.warnings.iter().filter(|w| w.blocking).count();
         prop_assert_eq!(decision.block_count(), expected);
     }
+
+    // =========================================================================
+    // QG-8: is_blocked exactly mirrors verdict == Block
+    // =========================================================================
+
+    #[test]
+    fn qg8_is_blocked_matches_verdict(
+        agent_type in arb_agent_type(),
+        signals in arb_agent_type().prop_flat_map(arb_signals),
+    ) {
+        let mut gate = QuotaGate::new();
+        let decision = gate.evaluate(agent_type, &signals);
+        prop_assert_eq!(decision.is_blocked(), decision.verdict == LaunchVerdict::Block);
+    }
+
+    // =========================================================================
+    // QG-9: is_warned exactly mirrors verdict == Warn
+    // =========================================================================
+
+    #[test]
+    fn qg9_is_warned_matches_verdict(
+        agent_type in arb_agent_type(),
+        signals in arb_agent_type().prop_flat_map(arb_signals),
+    ) {
+        let mut gate = QuotaGate::new();
+        let decision = gate.evaluate(agent_type, &signals);
+        prop_assert_eq!(decision.is_warned(), decision.verdict == LaunchVerdict::Warn);
+    }
+
+    // =========================================================================
+    // QG-10: Default signals always produce Allow
+    // =========================================================================
+
+    #[test]
+    fn qg10_default_signals_always_allow(agent_type in arb_agent_type()) {
+        let mut gate = QuotaGate::new();
+        let decision = gate.evaluate(agent_type, &QuotaSignals::default());
+        prop_assert_eq!(decision.verdict, LaunchVerdict::Allow);
+        prop_assert!(decision.warnings.is_empty());
+    }
+
+    // =========================================================================
+    // QG-11: Exhausted quota always blocks (regardless of other clear signals)
+    // =========================================================================
+
+    #[test]
+    fn qg11_exhausted_quota_always_blocks(agent_type in arb_agent_type()) {
+        let mut gate = QuotaGate::new();
+        let signals = QuotaSignals {
+            budget_alerts: vec![],
+            rate_limit_summary: None,
+            quota_availability: Some(QuotaAvailability::Exhausted),
+            selected_quota_percent: None,
+        };
+        let decision = gate.evaluate(agent_type, &signals);
+        prop_assert_eq!(decision.verdict, LaunchVerdict::Block);
+        let has_account_block = decision.warnings.iter()
+            .any(|w| w.blocking && matches!(w.source, WarningSource::AccountQuota));
+        prop_assert!(has_account_block);
+    }
+
+    // =========================================================================
+    // QG-12: FullyLimited rate limit always blocks
+    // =========================================================================
+
+    #[test]
+    fn qg12_fully_limited_always_blocks(
+        agent_type in arb_agent_type(),
+        limited_count in 1usize..20,
+        earliest in 0u64..600,
+    ) {
+        let mut gate = QuotaGate::new();
+        let signals = QuotaSignals {
+            budget_alerts: vec![],
+            rate_limit_summary: Some(ProviderRateLimitSummary {
+                agent_type: agent_type.to_string(),
+                status: ProviderRateLimitStatus::FullyLimited,
+                limited_pane_count: limited_count,
+                total_pane_count: limited_count,
+                earliest_clear_secs: earliest,
+                total_events: 1,
+            }),
+            quota_availability: None,
+            selected_quota_percent: None,
+        };
+        let decision = gate.evaluate(agent_type, &signals);
+        prop_assert_eq!(decision.verdict, LaunchVerdict::Block);
+        let has_rl_block = decision.warnings.iter()
+            .any(|w| w.blocking && matches!(w.source, WarningSource::RateLimit));
+        prop_assert!(has_rl_block);
+    }
+
+    // =========================================================================
+    // QG-13: Critical budget alert always blocks
+    // =========================================================================
+
+    #[test]
+    fn qg13_critical_budget_always_blocks(
+        agent_type in arb_agent_type(),
+        budget_limit in 1.0f64..100.0,
+        usage_fraction in 1.0f64..5.0,
+    ) {
+        let provider = agent_type.to_string();
+        let mut gate = QuotaGate::new();
+        let signals = QuotaSignals {
+            budget_alerts: vec![BudgetAlert {
+                agent_type: provider,
+                severity: AlertSeverity::Critical,
+                budget_limit_usd: budget_limit,
+                current_cost_usd: budget_limit * usage_fraction,
+                usage_fraction,
+            }],
+            rate_limit_summary: None,
+            quota_availability: None,
+            selected_quota_percent: None,
+        };
+        let decision = gate.evaluate(agent_type, &signals);
+        prop_assert_eq!(decision.verdict, LaunchVerdict::Block);
+    }
+
+    // =========================================================================
+    // QG-14: Warning budget alert alone never blocks
+    // =========================================================================
+
+    #[test]
+    fn qg14_warning_budget_alone_never_blocks(
+        agent_type in arb_agent_type(),
+        budget_limit in 1.0f64..100.0,
+        usage_fraction in 0.5f64..0.99,
+    ) {
+        let provider = agent_type.to_string();
+        let mut gate = QuotaGate::new();
+        let signals = QuotaSignals {
+            budget_alerts: vec![BudgetAlert {
+                agent_type: provider,
+                severity: AlertSeverity::Warning,
+                budget_limit_usd: budget_limit,
+                current_cost_usd: budget_limit * usage_fraction,
+                usage_fraction,
+            }],
+            rate_limit_summary: None,
+            quota_availability: None,
+            selected_quota_percent: None,
+        };
+        let decision = gate.evaluate(agent_type, &signals);
+        prop_assert_eq!(decision.verdict, LaunchVerdict::Warn);
+        prop_assert!(!decision.is_blocked());
+    }
+
+    // =========================================================================
+    // QG-15: Clear rate limit status adds no warnings
+    // =========================================================================
+
+    #[test]
+    fn qg15_clear_rate_limit_no_warnings(
+        agent_type in arb_agent_type(),
+        total_panes in 1usize..20,
+    ) {
+        let mut gate = QuotaGate::new();
+        let signals = QuotaSignals {
+            budget_alerts: vec![],
+            rate_limit_summary: Some(ProviderRateLimitSummary {
+                agent_type: agent_type.to_string(),
+                status: ProviderRateLimitStatus::Clear,
+                limited_pane_count: 0,
+                total_pane_count: total_panes,
+                earliest_clear_secs: 0,
+                total_events: 0,
+            }),
+            quota_availability: None,
+            selected_quota_percent: None,
+        };
+        let decision = gate.evaluate(agent_type, &signals);
+        prop_assert_eq!(decision.verdict, LaunchVerdict::Allow);
+    }
+
+    // =========================================================================
+    // QG-16: PartiallyLimited produces Warn (not Block)
+    // =========================================================================
+
+    #[test]
+    fn qg16_partially_limited_warns_not_blocks(
+        agent_type in arb_agent_type(),
+        limited in 1usize..10,
+        total in 2usize..20,
+    ) {
+        let total = total.max(limited + 1);
+        let mut gate = QuotaGate::new();
+        let signals = QuotaSignals {
+            budget_alerts: vec![],
+            rate_limit_summary: Some(ProviderRateLimitSummary {
+                agent_type: agent_type.to_string(),
+                status: ProviderRateLimitStatus::PartiallyLimited,
+                limited_pane_count: limited,
+                total_pane_count: total,
+                earliest_clear_secs: 60,
+                total_events: 1,
+            }),
+            quota_availability: None,
+            selected_quota_percent: None,
+        };
+        let decision = gate.evaluate(agent_type, &signals);
+        prop_assert_eq!(decision.verdict, LaunchVerdict::Warn);
+        prop_assert!(!decision.is_blocked());
+    }
+
+    // =========================================================================
+    // QG-17: Verdict serde roundtrip for all three variants
+    // =========================================================================
+
+    #[test]
+    fn qg17_verdict_serde_roundtrip(
+        verdict in prop_oneof![
+            Just(LaunchVerdict::Allow),
+            Just(LaunchVerdict::Warn),
+            Just(LaunchVerdict::Block),
+        ]
+    ) {
+        let json = serde_json::to_string(&verdict).unwrap();
+        let back: LaunchVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(verdict, back);
+    }
+
+    // =========================================================================
+    // QG-18: WarningSource serde roundtrip
+    // =========================================================================
+
+    #[test]
+    fn qg18_warning_source_serde_roundtrip(
+        source in prop_oneof![
+            Just(WarningSource::Budget),
+            Just(WarningSource::RateLimit),
+            Just(WarningSource::AccountQuota),
+        ]
+    ) {
+        let json = serde_json::to_string(&source).unwrap();
+        let back: WarningSource = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(source, back);
+    }
+
+    // =========================================================================
+    // QG-19: Verdict ordering: Allow < Warn < Block
+    // =========================================================================
+
+    #[test]
+    fn qg19_verdict_total_order(
+        a in prop_oneof![
+            Just(LaunchVerdict::Allow),
+            Just(LaunchVerdict::Warn),
+            Just(LaunchVerdict::Block),
+        ],
+        b in prop_oneof![
+            Just(LaunchVerdict::Allow),
+            Just(LaunchVerdict::Warn),
+            Just(LaunchVerdict::Block),
+        ],
+    ) {
+        // Total ordering: exactly one of <, ==, > holds
+        let lt = a < b;
+        let eq = a == b;
+        let gt = a > b;
+        let count = lt as u8 + eq as u8 + gt as u8;
+        prop_assert_eq!(count, 1, "trichotomy violated for {:?} vs {:?}", a, b);
+
+        // Consistency with named ordering
+        if a == LaunchVerdict::Allow && b == LaunchVerdict::Block {
+            prop_assert!(a < b);
+        }
+    }
+
+    // =========================================================================
+    // QG-20: Low quota produces Warn with percentage in message
+    // =========================================================================
+
+    #[test]
+    fn qg20_low_quota_includes_percentage(
+        agent_type in arb_agent_type(),
+        pct in 0.1f64..50.0,
+    ) {
+        let mut gate = QuotaGate::new();
+        let signals = QuotaSignals {
+            budget_alerts: vec![],
+            rate_limit_summary: None,
+            quota_availability: Some(QuotaAvailability::Low),
+            selected_quota_percent: Some(pct),
+        };
+        let decision = gate.evaluate(agent_type, &signals);
+        prop_assert_eq!(decision.verdict, LaunchVerdict::Warn);
+        // The message should include the percentage
+        let has_pct = decision.warnings.iter().any(|w| {
+            matches!(w.source, WarningSource::AccountQuota) && w.message.contains("remaining")
+        });
+        prop_assert!(has_pct, "Low quota warning should include 'remaining' with percentage");
+    }
+
+    // =========================================================================
+    // QG-21: Multiple evaluations accumulate telemetry correctly
+    // =========================================================================
+
+    #[test]
+    fn qg21_telemetry_evaluations_count(
+        n in 1usize..50,
+        agent_type in arb_agent_type(),
+    ) {
+        let mut gate = QuotaGate::new();
+        let signals = QuotaSignals::default();
+        for _ in 0..n {
+            gate.evaluate(agent_type, &signals);
+        }
+        let snap = gate.telemetry().snapshot();
+        prop_assert_eq!(snap.evaluations, n as u64);
+    }
+
+    // =========================================================================
+    // QG-22: agent_type in decision matches what was passed
+    // =========================================================================
+
+    #[test]
+    fn qg22_decision_agent_type_matches(
+        agent_type in arb_agent_type(),
+        signals in arb_agent_type().prop_flat_map(arb_signals),
+    ) {
+        let mut gate = QuotaGate::new();
+        let decision = gate.evaluate(agent_type, &signals);
+        prop_assert_eq!(decision.agent_type, agent_type.to_string());
+    }
+
+    // =========================================================================
+    // QG-23: Adding a blocking signal to warn-only signals escalates to Block
+    // =========================================================================
+
+    #[test]
+    fn qg23_escalation_from_warn_to_block(agent_type in arb_agent_type()) {
+        let mut gate = QuotaGate::new();
+
+        // First: warning-only signal (Low quota)
+        let warn_signals = QuotaSignals {
+            budget_alerts: vec![],
+            rate_limit_summary: None,
+            quota_availability: Some(QuotaAvailability::Low),
+            selected_quota_percent: Some(5.0),
+        };
+        let warn_decision = gate.evaluate(agent_type, &warn_signals);
+        prop_assert_eq!(warn_decision.verdict, LaunchVerdict::Warn);
+
+        // Second: add blocking signal (Exhausted quota)
+        let block_signals = QuotaSignals {
+            budget_alerts: vec![],
+            rate_limit_summary: None,
+            quota_availability: Some(QuotaAvailability::Exhausted),
+            selected_quota_percent: None,
+        };
+        let block_decision = gate.evaluate(agent_type, &block_signals);
+        prop_assert_eq!(block_decision.verdict, LaunchVerdict::Block);
+        prop_assert!(block_decision.verdict > warn_decision.verdict);
+    }
 }
