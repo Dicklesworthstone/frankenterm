@@ -220,6 +220,7 @@ pub mod mission_agent_mail;
 pub mod mission_events;
 #[cfg(feature = "subprocess-bridge")]
 pub mod mission_loop;
+pub mod namespace_isolation;
 pub mod network_observer;
 pub mod network_reliability;
 pub mod notifications;
