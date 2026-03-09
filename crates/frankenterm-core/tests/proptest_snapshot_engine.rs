@@ -18,7 +18,9 @@ use proptest::prelude::*;
 use std::collections::HashSet;
 
 use frankenterm_core::config::{SnapshotConfig, SnapshotSchedulingConfig, SnapshotSchedulingMode};
-use frankenterm_core::snapshot_engine::{SnapshotError, SnapshotResult, SnapshotTrigger};
+use frankenterm_core::snapshot_engine::{
+    SnapshotEngineTelemetrySnapshot, SnapshotError, SnapshotResult, SnapshotTrigger,
+};
 
 // =============================================================================
 // Constants
@@ -734,5 +736,68 @@ proptest! {
         let json = format!("\"{}\"", s);
         let result = serde_json::from_str::<SnapshotSchedulingMode>(&json);
         prop_assert!(result.is_err(), "unknown string '{}' should fail to deserialize", s);
+    }
+}
+
+// =============================================================================
+// SnapshotEngineTelemetrySnapshot serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip(
+        attempted in 0_u64..10_000,
+        succeeded in 0_u64..10_000,
+        dedup in 0_u64..10_000,
+        errors in 0_u64..1000,
+        cleanup_runs in 0_u64..1000,
+        cleanup_removed in 0_u64..10_000,
+        triggers_emitted in 0_u64..10_000,
+        triggers_accepted in 0_u64..10_000,
+        panes in 0_u64..10_000,
+        bytes in 0_u64..100_000_000,
+    ) {
+        let snap = SnapshotEngineTelemetrySnapshot {
+            captures_attempted: attempted,
+            captures_succeeded: succeeded,
+            dedup_skips: dedup,
+            capture_errors: errors,
+            cleanup_runs,
+            cleanup_removed,
+            triggers_emitted,
+            triggers_accepted,
+            panes_captured: panes,
+            bytes_persisted: bytes,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SnapshotEngineTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn telemetry_snapshot_json_keys(
+        attempted in 0_u64..100,
+        succeeded in 0_u64..100,
+    ) {
+        let snap = SnapshotEngineTelemetrySnapshot {
+            captures_attempted: attempted,
+            captures_succeeded: succeeded,
+            dedup_skips: 0,
+            capture_errors: 0,
+            cleanup_runs: 0,
+            cleanup_removed: 0,
+            triggers_emitted: 0,
+            triggers_accepted: 0,
+            panes_captured: 0,
+            bytes_persisted: 0,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = val.as_object().unwrap();
+        prop_assert!(obj.contains_key("captures_attempted"));
+        prop_assert!(obj.contains_key("captures_succeeded"));
+        prop_assert!(obj.contains_key("bytes_persisted"));
     }
 }

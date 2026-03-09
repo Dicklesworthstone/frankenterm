@@ -20,8 +20,11 @@
 
 use proptest::prelude::*;
 
+use std::collections::HashMap;
+
 use frankenterm_core::telemetry::{
-    CircularMetricBuffer, Histogram, MetricRegistry, ResourceSnapshot, TelemetryStore,
+    CircularMetricBuffer, Histogram, HistogramSummary, HourlyAggregate, MetricPoint,
+    MetricRegistry, ResourceSnapshot, TelemetryConfig, TelemetrySnapshot, TelemetryStore,
 };
 
 // =============================================================================
@@ -811,5 +814,189 @@ proptest! {
         let h = Histogram::new("empty", 50);
         prop_assert!(h.quantile(0.5).is_none(),
             "empty histogram quantile should be None");
+    }
+}
+
+// =============================================================================
+// TelemetryConfig serde roundtrip + Default
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn telemetry_config_default_serde(_dummy in 0..1_u8) {
+        let config = TelemetryConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: TelemetryConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.buffer_capacity, 120);
+        prop_assert_eq!(back.histogram_buckets, 1024);
+        prop_assert_eq!(back.mux_server_pid, 0);
+    }
+
+    #[test]
+    fn telemetry_config_custom_serde(
+        capacity in 10_usize..1000,
+        buckets in 64_usize..4096,
+        pid in 0_u32..65535,
+    ) {
+        let mut config = TelemetryConfig::default();
+        config.buffer_capacity = capacity;
+        config.histogram_buckets = buckets;
+        config.mux_server_pid = pid;
+        let json = serde_json::to_string(&config).unwrap();
+        let back: TelemetryConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.buffer_capacity, capacity);
+        prop_assert_eq!(back.histogram_buckets, buckets);
+        prop_assert_eq!(back.mux_server_pid, pid);
+    }
+}
+
+// =============================================================================
+// MetricPoint serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn metric_point_serde_roundtrip(
+        name in "[a-z_]{3,15}",
+        value in -1000.0_f64..1000.0,
+        ts in 0_u64..2_000_000_000,
+    ) {
+        let point = MetricPoint {
+            name,
+            value,
+            timestamp_secs: ts,
+            tags: HashMap::new(),
+        };
+        let json = serde_json::to_string(&point).unwrap();
+        let back: MetricPoint = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &point.name);
+        prop_assert_eq!(back.timestamp_secs, point.timestamp_secs);
+    }
+
+    #[test]
+    fn metric_point_with_tags_serde(
+        name in "[a-z_]{3,15}",
+        tag_key in "[a-z]{3,8}",
+        tag_val in "[a-z0-9]{3,8}",
+    ) {
+        let point = MetricPoint {
+            name,
+            value: 42.0,
+            timestamp_secs: 1700000000,
+            tags: HashMap::from([(tag_key.clone(), tag_val.clone())]),
+        };
+        let json = serde_json::to_string(&point).unwrap();
+        let back: MetricPoint = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.tags.get(&tag_key).map(|s| s.as_str()), Some(tag_val.as_str()));
+    }
+
+    #[test]
+    fn metric_point_empty_tags_skipped(_dummy in 0..1_u8) {
+        let point = MetricPoint {
+            name: "test".to_string(),
+            value: 1.0,
+            timestamp_secs: 0,
+            tags: HashMap::new(),
+        };
+        let json = serde_json::to_string(&point).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let has_tags = val.as_object().unwrap().contains_key("tags");
+        prop_assert!(!has_tags, "empty tags should be skipped via skip_serializing_if");
+    }
+}
+
+// =============================================================================
+// TelemetrySnapshot serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip(
+        ts in 0_u64..2_000_000_000,
+        buffer_samples in 0_u64..1000,
+        total_samples in 0_u64..10_000,
+    ) {
+        let snap = TelemetrySnapshot {
+            timestamp_secs: ts,
+            resource: None,
+            histograms: vec![],
+            counters: HashMap::from([("test".to_string(), 42)]),
+            buffer_samples,
+            total_samples,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: TelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.timestamp_secs, ts);
+        prop_assert_eq!(back.buffer_samples, buffer_samples);
+        prop_assert_eq!(back.counters.get("test"), Some(&42));
+    }
+
+    #[test]
+    fn telemetry_snapshot_with_resource(
+        pid in 1_u32..65535,
+        rss in 0_u64..10_000_000,
+    ) {
+        let resource = ResourceSnapshot {
+            pid,
+            rss_bytes: rss,
+            virt_bytes: rss * 2,
+            fd_count: 10,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            cpu_percent: Some(25.0),
+            timestamp_secs: 1700000000,
+        };
+        let snap = TelemetrySnapshot {
+            timestamp_secs: 1700000000,
+            resource: Some(resource),
+            histograms: vec![],
+            counters: HashMap::new(),
+            buffer_samples: 1,
+            total_samples: 1,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: TelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        let back_res = back.resource.unwrap();
+        prop_assert_eq!(back_res.pid, pid);
+        prop_assert_eq!(back_res.rss_bytes, rss);
+    }
+}
+
+// =============================================================================
+// HourlyAggregate serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn hourly_aggregate_serde_roundtrip(
+        hour_ts in 0_u64..2_000_000_000,
+        samples in 1_u32..1000,
+        mean_rss in 0_u64..10_000_000_000,
+        peak_rss in 0_u64..10_000_000_000,
+        cpu in proptest::option::of(0.0_f64..100.0),
+    ) {
+        let agg = HourlyAggregate {
+            hour_ts,
+            sample_count: samples,
+            mean_rss_bytes: mean_rss,
+            peak_rss_bytes: peak_rss,
+            mean_fd_count: 50,
+            peak_fd_count: 100,
+            mean_cpu_percent: cpu,
+        };
+        let json = serde_json::to_string(&agg).unwrap();
+        let back: HourlyAggregate = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.hour_ts, hour_ts);
+        prop_assert_eq!(back.sample_count, samples);
+        prop_assert_eq!(back.mean_rss_bytes, mean_rss);
+        prop_assert_eq!(back.mean_cpu_percent.is_some(), cpu.is_some());
     }
 }

@@ -8,8 +8,8 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 
 use frankenterm_core::ars_evidence::{
-    EvidenceBuilder, EvidenceCategory, EvidenceConfig, EvidenceLedger, EvidenceValue,
-    EvidenceVerdict, LedgerDigest,
+    ChainVerification, EvidenceBuilder, EvidenceCategory, EvidenceConfig, EvidenceEntry,
+    EvidenceLedger, EvidenceValue, EvidenceVerdict, LedgerDigest,
 };
 
 // =============================================================================
@@ -398,5 +398,138 @@ proptest! {
         if !is_safe || !is_clean {
             prop_assert!(ledger.has_rejection());
         }
+    }
+}
+
+// =============================================================================
+// EvidenceEntry serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn evidence_entry_serde_roundtrip(
+        cat in arb_category(),
+        verdict in arb_verdict(),
+        ts in 1000_u64..2_000_000_000,
+    ) {
+        let mut payload = BTreeMap::new();
+        payload.insert("key".to_string(), EvidenceValue::String("val".to_string()));
+        let entry = EvidenceEntry {
+            seq: 0,
+            category: cat,
+            timestamp_us: ts,
+            summary: "test entry".to_string(),
+            payload,
+            verdict,
+            entry_hash: "abc123".to_string(),
+            prev_hash: "000000".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: EvidenceEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.seq, entry.seq);
+        prop_assert_eq!(back.category, entry.category);
+        prop_assert_eq!(back.verdict, entry.verdict);
+        prop_assert_eq!(&back.entry_hash, &entry.entry_hash);
+    }
+
+    #[test]
+    fn evidence_entry_from_ledger_serde(
+        cat in arb_category(),
+        verdict in arb_verdict(),
+    ) {
+        let mut ledger = EvidenceLedger::with_defaults();
+        let mut payload = BTreeMap::new();
+        payload.insert("k".to_string(), EvidenceValue::Bool(true));
+        ledger.append(cat, 1000, "test".to_string(), payload, verdict);
+        let entries = ledger.entries();
+        prop_assert_eq!(entries.len(), 1);
+        let json = serde_json::to_string(&entries[0]).unwrap();
+        let back: EvidenceEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.seq, 0);
+        prop_assert!(!back.entry_hash.is_empty());
+    }
+}
+
+// =============================================================================
+// LedgerDigest serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn ledger_digest_serde_roundtrip(
+        entry_count in 0_usize..100,
+        is_complete in any::<bool>(),
+        verdict in arb_verdict(),
+    ) {
+        let digest = LedgerDigest {
+            root_hash: "deadbeef".to_string(),
+            entry_count,
+            categories_present: vec![EvidenceCategory::SafetyProof],
+            is_complete,
+            overall_verdict: verdict,
+            timestamp_range: (1000, 2000),
+        };
+        let json = serde_json::to_string(&digest).unwrap();
+        let back: LedgerDigest = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, digest);
+    }
+
+    #[test]
+    fn ledger_digest_from_real_ledger(
+        n in 1_usize..5,
+    ) {
+        let mut builder = EvidenceBuilder::new();
+        for _ in 0..n {
+            builder.add_change_detection(1000, 5.0, 3, true);
+        }
+        let ledger = builder.build();
+        let digest = ledger.digest();
+        let json = serde_json::to_string(&digest).unwrap();
+        let back: LedgerDigest = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.entry_count, n);
+        prop_assert_eq!(back, digest);
+    }
+}
+
+// =============================================================================
+// ChainVerification serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn chain_verification_serde_roundtrip(
+        is_valid in any::<bool>(),
+        checked in 0_usize..100,
+        invalid_seq in proptest::option::of(0_u64..100),
+    ) {
+        let cv = ChainVerification {
+            is_valid,
+            entries_checked: checked,
+            first_invalid_seq: invalid_seq,
+        };
+        let json = serde_json::to_string(&cv).unwrap();
+        let back: ChainVerification = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, cv);
+    }
+
+    #[test]
+    fn chain_verification_from_real_ledger(n in 1_usize..5) {
+        let mut builder = EvidenceBuilder::new();
+        for _ in 0..n {
+            builder.add_secret_scan(1000, true, 0);
+        }
+        let ledger = builder.build();
+        let cv = ledger.verify_chain();
+        let is_valid = cv.is_valid;
+        let json = serde_json::to_string(&cv).unwrap();
+        let back: ChainVerification = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, cv);
+        prop_assert!(is_valid);
     }
 }
