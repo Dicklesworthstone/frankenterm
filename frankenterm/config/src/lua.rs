@@ -4,7 +4,7 @@ use crate::{
     Config, FontAttributes, FontStretch, FontStyle, FontWeight, FreeTypeLoadTarget, RgbaColor,
     TextStyle,
 };
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{
     FromDynamic, FromDynamicOptions, ToDynamic, UnknownFieldAction, Value as DynValue,
 };

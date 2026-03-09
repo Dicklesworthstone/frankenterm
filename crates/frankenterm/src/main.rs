@@ -41718,63 +41718,65 @@ log_level = "debug"
         assert!(json["accounts"].as_array().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn robot_accounts_db_round_trip() {
-        // End-to-end: insert accounts into DB, fetch, build robot response
-        let (storage, db_path) = setup_storage("robot_accounts").await;
+    #[test]
+    fn robot_accounts_db_round_trip() {
+        run_async_test(async {
+            // End-to-end: insert accounts into DB, fetch, build robot response
+            let (storage, db_path) = setup_storage("robot_accounts").await;
 
-        let record = frankenterm_core::accounts::AccountRecord {
-            id: 0,
-            account_id: "test-acc".to_string(),
-            service: "openai".to_string(),
-            name: Some("Test".to_string()),
-            percent_remaining: 75.0,
-            reset_at: None,
-            tokens_used: Some(2500),
-            tokens_remaining: Some(7500),
-            tokens_limit: Some(10000),
-            last_refreshed_at: 1000,
-            last_used_at: None,
-            created_at: 1000,
-            updated_at: 1000,
-        };
-        storage.upsert_account(record).await.unwrap();
+            let record = frankenterm_core::accounts::AccountRecord {
+                id: 0,
+                account_id: "test-acc".to_string(),
+                service: "openai".to_string(),
+                name: Some("Test".to_string()),
+                percent_remaining: 75.0,
+                reset_at: None,
+                tokens_used: Some(2500),
+                tokens_remaining: Some(7500),
+                tokens_limit: Some(10000),
+                last_refreshed_at: 1000,
+                last_used_at: None,
+                created_at: 1000,
+                updated_at: 1000,
+            };
+            storage.upsert_account(record).await.unwrap();
 
-        let accounts = storage.get_accounts_by_service("openai").await.unwrap();
-        assert_eq!(accounts.len(), 1);
+            let accounts = storage.get_accounts_by_service("openai").await.unwrap();
+            assert_eq!(accounts.len(), 1);
 
-        // Build the same robot response the handler would
-        let total = accounts.len();
-        let account_infos: Vec<RobotAccountInfo> = accounts
-            .into_iter()
-            .map(|a| RobotAccountInfo {
-                account_id: a.account_id,
-                service: a.service,
-                name: a.name,
-                percent_remaining: a.percent_remaining,
-                reset_at: a.reset_at,
-                tokens_used: a.tokens_used,
-                tokens_remaining: a.tokens_remaining,
-                tokens_limit: a.tokens_limit,
-                last_refreshed_at: a.last_refreshed_at,
-                last_used_at: a.last_used_at,
-            })
-            .collect();
+            // Build the same robot response the handler would
+            let total = accounts.len();
+            let account_infos: Vec<RobotAccountInfo> = accounts
+                .into_iter()
+                .map(|a| RobotAccountInfo {
+                    account_id: a.account_id,
+                    service: a.service,
+                    name: a.name,
+                    percent_remaining: a.percent_remaining,
+                    reset_at: a.reset_at,
+                    tokens_used: a.tokens_used,
+                    tokens_remaining: a.tokens_remaining,
+                    tokens_limit: a.tokens_limit,
+                    last_refreshed_at: a.last_refreshed_at,
+                    last_used_at: a.last_used_at,
+                })
+                .collect();
 
-        let data = RobotAccountsListData {
-            accounts: account_infos,
-            total,
-            service: "openai".to_string(),
-            pick_preview: None,
-        };
-        let json = serde_json::to_value(&data).unwrap();
+            let data = RobotAccountsListData {
+                accounts: account_infos,
+                total,
+                service: "openai".to_string(),
+                pick_preview: None,
+            };
+            let json = serde_json::to_value(&data).unwrap();
 
-        assert_eq!(json["total"].as_u64().unwrap(), 1);
-        let acc = &json["accounts"][0];
-        assert_eq!(acc["account_id"].as_str().unwrap(), "test-acc");
-        assert!((acc["percent_remaining"].as_f64().unwrap() - 75.0).abs() < 0.001);
+            assert_eq!(json["total"].as_u64().unwrap(), 1);
+            let acc = &json["accounts"][0];
+            assert_eq!(acc["account_id"].as_str().unwrap(), "test-acc");
+            assert!((acc["percent_remaining"].as_f64().unwrap() - 75.0).abs() < 0.001);
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
     // =========================================================================
@@ -41873,151 +41875,155 @@ log_level = "debug"
         assert!(hint.contains("gemini"));
     }
 
-    #[tokio::test]
-    async fn robot_refresh_db_mirror_round_trip() {
-        // Simulate the refresh → DB mirror path:
-        // Parse CautRefresh fixture → from_caut → upsert → verify DB state
-        let (storage, db_path) = setup_storage("refresh_mirror").await;
+    #[test]
+    fn robot_refresh_db_mirror_round_trip() {
+        run_async_test(async {
+            // Simulate the refresh → DB mirror path:
+            // Parse CautRefresh fixture → from_caut → upsert → verify DB state
+            let (storage, db_path) = setup_storage("refresh_mirror").await;
 
-        let fixture = frankenterm_core::caut::CautRefresh {
-            service: Some("openai".to_string()),
-            refreshed_at: Some("2026-01-28T12:00:00Z".to_string()),
-            accounts: vec![
-                frankenterm_core::caut::CautAccountUsage {
-                    id: Some("acc-1".to_string()),
-                    name: Some("Primary".to_string()),
-                    percent_remaining: Some(85.0),
-                    tokens_used: Some(1500),
-                    tokens_remaining: Some(8500),
-                    tokens_limit: Some(10000),
-                    ..Default::default()
-                },
-                frankenterm_core::caut::CautAccountUsage {
-                    id: Some("acc-2".to_string()),
-                    name: Some("Backup".to_string()),
-                    percent_remaining: Some(20.0),
-                    tokens_used: Some(8000),
-                    tokens_remaining: Some(2000),
-                    tokens_limit: Some(10000),
-                    ..Default::default()
-                },
-            ],
-            extra: Default::default(),
-        };
+            let fixture = frankenterm_core::caut::CautRefresh {
+                service: Some("openai".to_string()),
+                refreshed_at: Some("2026-01-28T12:00:00Z".to_string()),
+                accounts: vec![
+                    frankenterm_core::caut::CautAccountUsage {
+                        id: Some("acc-1".to_string()),
+                        name: Some("Primary".to_string()),
+                        percent_remaining: Some(85.0),
+                        tokens_used: Some(1500),
+                        tokens_remaining: Some(8500),
+                        tokens_limit: Some(10000),
+                        ..Default::default()
+                    },
+                    frankenterm_core::caut::CautAccountUsage {
+                        id: Some("acc-2".to_string()),
+                        name: Some("Backup".to_string()),
+                        percent_remaining: Some(20.0),
+                        tokens_used: Some(8000),
+                        tokens_remaining: Some(2000),
+                        tokens_limit: Some(10000),
+                        ..Default::default()
+                    },
+                ],
+                extra: Default::default(),
+            };
 
-        let now = 1706400000000_i64; // fixed timestamp for determinism
+            let now = 1706400000000_i64; // fixed timestamp for determinism
 
-        // Mirror into DB (same as handler does)
-        let mut account_infos = Vec::new();
-        for usage in &fixture.accounts {
-            let record = frankenterm_core::accounts::AccountRecord::from_caut(
-                usage,
-                frankenterm_core::caut::CautService::OpenAI,
-                now,
-            );
-            storage.upsert_account(record.clone()).await.unwrap();
-            account_infos.push(RobotAccountInfo {
-                account_id: record.account_id,
-                service: record.service,
-                name: record.name,
-                percent_remaining: record.percent_remaining,
-                reset_at: record.reset_at,
-                tokens_used: record.tokens_used,
-                tokens_remaining: record.tokens_remaining,
-                tokens_limit: record.tokens_limit,
-                last_refreshed_at: record.last_refreshed_at,
-                last_used_at: record.last_used_at,
-            });
-        }
+            // Mirror into DB (same as handler does)
+            let mut account_infos = Vec::new();
+            for usage in &fixture.accounts {
+                let record = frankenterm_core::accounts::AccountRecord::from_caut(
+                    usage,
+                    frankenterm_core::caut::CautService::OpenAI,
+                    now,
+                );
+                storage.upsert_account(record.clone()).await.unwrap();
+                account_infos.push(RobotAccountInfo {
+                    account_id: record.account_id,
+                    service: record.service,
+                    name: record.name,
+                    percent_remaining: record.percent_remaining,
+                    reset_at: record.reset_at,
+                    tokens_used: record.tokens_used,
+                    tokens_remaining: record.tokens_remaining,
+                    tokens_limit: record.tokens_limit,
+                    last_refreshed_at: record.last_refreshed_at,
+                    last_used_at: record.last_used_at,
+                });
+            }
 
-        // Build response
-        let data = RobotAccountsRefreshData {
-            service: "openai".to_string(),
-            refreshed_count: account_infos.len(),
-            refreshed_at: fixture.refreshed_at,
-            accounts: account_infos,
-        };
-        let json = serde_json::to_value(&data).unwrap();
+            // Build response
+            let data = RobotAccountsRefreshData {
+                service: "openai".to_string(),
+                refreshed_count: account_infos.len(),
+                refreshed_at: fixture.refreshed_at,
+                accounts: account_infos,
+            };
+            let json = serde_json::to_value(&data).unwrap();
 
-        // Verify response structure
-        assert_eq!(json["service"].as_str().unwrap(), "openai");
-        assert_eq!(json["refreshed_count"].as_u64().unwrap(), 2);
-        assert_eq!(json["accounts"].as_array().unwrap().len(), 2);
+            // Verify response structure
+            assert_eq!(json["service"].as_str().unwrap(), "openai");
+            assert_eq!(json["refreshed_count"].as_u64().unwrap(), 2);
+            assert_eq!(json["accounts"].as_array().unwrap().len(), 2);
 
-        // Verify DB state
-        let db_accounts = storage.get_accounts_by_service("openai").await.unwrap();
-        assert_eq!(db_accounts.len(), 2);
-        // Sorted by percent_remaining DESC
-        assert_eq!(db_accounts[0].account_id, "acc-1");
-        assert!((db_accounts[0].percent_remaining - 85.0).abs() < 0.001);
-        assert_eq!(db_accounts[1].account_id, "acc-2");
-        assert!((db_accounts[1].percent_remaining - 20.0).abs() < 0.001);
+            // Verify DB state
+            let db_accounts = storage.get_accounts_by_service("openai").await.unwrap();
+            assert_eq!(db_accounts.len(), 2);
+            // Sorted by percent_remaining DESC
+            assert_eq!(db_accounts[0].account_id, "acc-1");
+            assert!((db_accounts[0].percent_remaining - 85.0).abs() < 0.001);
+            assert_eq!(db_accounts[1].account_id, "acc-2");
+            assert!((db_accounts[1].percent_remaining - 20.0).abs() < 0.001);
 
-        // Verify DB mirror is idempotent (refresh again with same data)
-        for usage in &fixture.accounts {
-            let record = frankenterm_core::accounts::AccountRecord::from_caut(
-                usage,
-                frankenterm_core::caut::CautService::OpenAI,
-                now + 1000,
-            );
-            storage.upsert_account(record).await.unwrap();
-        }
-        let db_after = storage.get_accounts_by_service("openai").await.unwrap();
-        assert_eq!(db_after.len(), 2); // still 2, not 4
+            // Verify DB mirror is idempotent (refresh again with same data)
+            for usage in &fixture.accounts {
+                let record = frankenterm_core::accounts::AccountRecord::from_caut(
+                    usage,
+                    frankenterm_core::caut::CautService::OpenAI,
+                    now + 1000,
+                );
+                storage.upsert_account(record).await.unwrap();
+            }
+            let db_after = storage.get_accounts_by_service("openai").await.unwrap();
+            assert_eq!(db_after.len(), 2); // still 2, not 4
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
-    #[tokio::test]
-    async fn robot_refresh_db_mirror_updates_existing() {
-        // Verify that refresh updates percent_remaining for existing accounts
-        let (storage, db_path) = setup_storage("refresh_update").await;
+    #[test]
+    fn robot_refresh_db_mirror_updates_existing() {
+        run_async_test(async {
+            // Verify that refresh updates percent_remaining for existing accounts
+            let (storage, db_path) = setup_storage("refresh_update").await;
 
-        let now = 1706400000000_i64;
+            let now = 1706400000000_i64;
 
-        // Initial insert
-        let initial = frankenterm_core::accounts::AccountRecord {
-            id: 0,
-            account_id: "acc-1".to_string(),
-            service: "openai".to_string(),
-            name: Some("Test".to_string()),
-            percent_remaining: 90.0,
-            reset_at: None,
-            tokens_used: Some(1000),
-            tokens_remaining: Some(9000),
-            tokens_limit: Some(10000),
-            last_refreshed_at: now,
-            last_used_at: None,
-            created_at: now,
-            updated_at: now,
-        };
-        storage.upsert_account(initial).await.unwrap();
+            // Initial insert
+            let initial = frankenterm_core::accounts::AccountRecord {
+                id: 0,
+                account_id: "acc-1".to_string(),
+                service: "openai".to_string(),
+                name: Some("Test".to_string()),
+                percent_remaining: 90.0,
+                reset_at: None,
+                tokens_used: Some(1000),
+                tokens_remaining: Some(9000),
+                tokens_limit: Some(10000),
+                last_refreshed_at: now,
+                last_used_at: None,
+                created_at: now,
+                updated_at: now,
+            };
+            storage.upsert_account(initial).await.unwrap();
 
-        // Simulate refresh with new usage data
-        let refreshed_usage = frankenterm_core::caut::CautAccountUsage {
-            id: Some("acc-1".to_string()),
-            name: Some("Test".to_string()),
-            percent_remaining: Some(50.0), // changed
-            tokens_used: Some(5000),       // changed
-            tokens_remaining: Some(5000),  // changed
-            tokens_limit: Some(10000),
-            ..Default::default()
-        };
+            // Simulate refresh with new usage data
+            let refreshed_usage = frankenterm_core::caut::CautAccountUsage {
+                id: Some("acc-1".to_string()),
+                name: Some("Test".to_string()),
+                percent_remaining: Some(50.0), // changed
+                tokens_used: Some(5000),       // changed
+                tokens_remaining: Some(5000),  // changed
+                tokens_limit: Some(10000),
+                ..Default::default()
+            };
 
-        let record = frankenterm_core::accounts::AccountRecord::from_caut(
-            &refreshed_usage,
-            frankenterm_core::caut::CautService::OpenAI,
-            now + 60_000, // 1 minute later
-        );
-        storage.upsert_account(record).await.unwrap();
+            let record = frankenterm_core::accounts::AccountRecord::from_caut(
+                &refreshed_usage,
+                frankenterm_core::caut::CautService::OpenAI,
+                now + 60_000, // 1 minute later
+            );
+            storage.upsert_account(record).await.unwrap();
 
-        let db_accounts = storage.get_accounts_by_service("openai").await.unwrap();
-        assert_eq!(db_accounts.len(), 1);
-        assert!((db_accounts[0].percent_remaining - 50.0).abs() < 0.001);
-        assert_eq!(db_accounts[0].tokens_used, Some(5000));
-        assert_eq!(db_accounts[0].last_refreshed_at, now + 60_000);
+            let db_accounts = storage.get_accounts_by_service("openai").await.unwrap();
+            assert_eq!(db_accounts.len(), 1);
+            assert!((db_accounts[0].percent_remaining - 50.0).abs() < 0.001);
+            assert_eq!(db_accounts[0].tokens_used, Some(5000));
+            assert_eq!(db_accounts[0].last_refreshed_at, now + 60_000);
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
     // =========================================================================
@@ -42173,126 +42179,132 @@ log_level = "debug"
     // Reservation DB integration tests
     // =========================================================================
 
-    #[tokio::test]
-    async fn reservation_create_and_list() {
-        let (storage, db_path) = setup_storage("res_create_list").await;
+    #[test]
+    fn reservation_create_and_list() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("res_create_list").await;
 
-        // Insert a pane for FK
-        let pane = PaneRecord {
-            pane_id: 100,
-            pane_uuid: None,
-            domain: "local".to_string(),
-            window_id: None,
-            tab_id: None,
-            title: Some("test".to_string()),
-            cwd: Some("/tmp".to_string()),
-            tty_name: None,
-            first_seen_at: now_ms(),
-            last_seen_at: now_ms(),
-            observed: true,
-            ignore_reason: None,
-            last_decision_at: None,
-        };
-        storage.upsert_pane(pane).await.unwrap();
+            // Insert a pane for FK
+            let pane = PaneRecord {
+                pane_id: 100,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("test".to_string()),
+                cwd: Some("/tmp".to_string()),
+                tty_name: None,
+                first_seen_at: now_ms(),
+                last_seen_at: now_ms(),
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
 
-        // Create a reservation
-        let r = storage
-            .create_reservation(100, "agent", "test-agent", Some("testing"), 60_000)
-            .await
-            .unwrap();
-        assert_eq!(r.pane_id, 100);
-        assert_eq!(r.owner_kind, "agent");
+            // Create a reservation
+            let r = storage
+                .create_reservation(100, "agent", "test-agent", Some("testing"), 60_000)
+                .await
+                .unwrap();
+            assert_eq!(r.pane_id, 100);
+            assert_eq!(r.owner_kind, "agent");
 
-        // List should show it
-        let list = storage.list_active_reservations().await.unwrap();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].id, r.id);
+            // List should show it
+            let list = storage.list_active_reservations().await.unwrap();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].id, r.id);
 
-        // Release it
-        let released = storage.release_reservation(r.id).await.unwrap();
-        assert!(released);
+            // Release it
+            let released = storage.release_reservation(r.id).await.unwrap();
+            assert!(released);
 
-        // List should be empty now
-        let list = storage.list_active_reservations().await.unwrap();
-        assert!(list.is_empty());
+            // List should be empty now
+            let list = storage.list_active_reservations().await.unwrap();
+            assert!(list.is_empty());
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
-    #[tokio::test]
-    async fn reservation_conflict_detection() {
-        let (storage, db_path) = setup_storage("res_conflict").await;
+    #[test]
+    fn reservation_conflict_detection() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("res_conflict").await;
 
-        let pane = PaneRecord {
-            pane_id: 200,
-            pane_uuid: None,
-            domain: "local".to_string(),
-            window_id: None,
-            tab_id: None,
-            title: Some("test".to_string()),
-            cwd: Some("/tmp".to_string()),
-            tty_name: None,
-            first_seen_at: now_ms(),
-            last_seen_at: now_ms(),
-            observed: true,
-            ignore_reason: None,
-            last_decision_at: None,
-        };
-        storage.upsert_pane(pane).await.unwrap();
+            let pane = PaneRecord {
+                pane_id: 200,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("test".to_string()),
+                cwd: Some("/tmp".to_string()),
+                tty_name: None,
+                first_seen_at: now_ms(),
+                last_seen_at: now_ms(),
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
 
-        // First reservation succeeds
-        let _r1 = storage
-            .create_reservation(200, "workflow", "wf-1", None, 600_000)
-            .await
-            .unwrap();
+            // First reservation succeeds
+            let _r1 = storage
+                .create_reservation(200, "workflow", "wf-1", None, 600_000)
+                .await
+                .unwrap();
 
-        // Second reservation on same pane fails
-        let r2 = storage
-            .create_reservation(200, "workflow", "wf-2", None, 60_000)
-            .await;
-        assert!(r2.is_err());
+            // Second reservation on same pane fails
+            let r2 = storage
+                .create_reservation(200, "workflow", "wf-2", None, 60_000)
+                .await;
+            assert!(r2.is_err());
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
-    #[tokio::test]
-    async fn reservation_expire_stale() {
-        let (storage, db_path) = setup_storage("res_expire").await;
+    #[test]
+    fn reservation_expire_stale() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("res_expire").await;
 
-        let pane = PaneRecord {
-            pane_id: 300,
-            pane_uuid: None,
-            domain: "local".to_string(),
-            window_id: None,
-            tab_id: None,
-            title: Some("test".to_string()),
-            cwd: Some("/tmp".to_string()),
-            tty_name: None,
-            first_seen_at: now_ms(),
-            last_seen_at: now_ms(),
-            observed: true,
-            ignore_reason: None,
-            last_decision_at: None,
-        };
-        storage.upsert_pane(pane).await.unwrap();
+            let pane = PaneRecord {
+                pane_id: 300,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("test".to_string()),
+                cwd: Some("/tmp".to_string()),
+                tty_name: None,
+                first_seen_at: now_ms(),
+                last_seen_at: now_ms(),
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
 
-        // Create a reservation with very short TTL (already effectively expired in processing)
-        // Use the storage directly - insert a past-expiry record
-        let r = storage
-            .create_reservation(300, "workflow", "wf-old", None, 60_000)
-            .await
-            .unwrap();
+            // Create a reservation with very short TTL (already effectively expired in processing)
+            // Use the storage directly - insert a past-expiry record
+            let r = storage
+                .create_reservation(300, "workflow", "wf-old", None, 60_000)
+                .await
+                .unwrap();
 
-        // Active before expiry
-        let active = storage.get_active_reservation(300).await.unwrap();
-        assert!(active.is_some());
+            // Active before expiry
+            let active = storage.get_active_reservation(300).await.unwrap();
+            assert!(active.is_some());
 
-        // Release it so we can test the list is clean after
-        storage.release_reservation(r.id).await.unwrap();
-        let active = storage.get_active_reservation(300).await.unwrap();
-        assert!(active.is_none());
+            // Release it so we can test the list is clean after
+            storage.release_reservation(r.id).await.unwrap();
+            let active = storage.get_active_reservation(300).await.unwrap();
+            assert!(active.is_none());
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
     #[test]
@@ -44526,301 +44538,315 @@ log_level = "debug"
         }
     }
 
-    #[tokio::test]
-    async fn read_search_policy_default_allows_robot_search() {
-        let config = frankenterm_core::config::Config::default();
-        let (decision, _domain) = authorize_read_or_search_policy(
-            &config,
-            None,
-            None,
-            frankenterm_core::policy::ActionKind::SearchOutput,
-            frankenterm_core::policy::ActorKind::Robot,
-            None,
-            "robot search test",
-        )
-        .await;
-        assert!(
-            decision.is_allowed(),
-            "default robot search should be allowed"
-        );
-        let context = decision
-            .context()
-            .expect("read/search decisions should include decision context");
-        assert_eq!(
-            context.surface,
-            frankenterm_core::policy::PolicySurface::Mux
-        );
+    #[test]
+    fn read_search_policy_default_allows_robot_search() {
+        run_async_test(async {
+            let config = frankenterm_core::config::Config::default();
+            let (decision, _domain) = authorize_read_or_search_policy(
+                &config,
+                None,
+                None,
+                frankenterm_core::policy::ActionKind::SearchOutput,
+                frankenterm_core::policy::ActorKind::Robot,
+                None,
+                "robot search test",
+            )
+            .await;
+            assert!(
+                decision.is_allowed(),
+                "default robot search should be allowed"
+            );
+            let context = decision
+                .context()
+                .expect("read/search decisions should include decision context");
+            assert_eq!(
+                context.surface,
+                frankenterm_core::policy::PolicySurface::Mux
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn read_search_policy_rule_can_deny_robot_search() {
-        let mut config = frankenterm_core::config::Config::default();
-        config.safety.rules.enabled = true;
-        config
-            .safety
-            .rules
-            .rules
-            .push(frankenterm_core::config::PolicyRule {
-                id: "test.deny.robot.search".to_string(),
-                description: Some("deny robot search output".to_string()),
-                priority: 1,
-                match_on: frankenterm_core::config::PolicyRuleMatch {
-                    actions: vec!["search_output".to_string()],
-                    actors: vec!["robot".to_string()],
-                    ..Default::default()
-                },
-                decision: frankenterm_core::config::PolicyRuleDecision::Deny,
-                message: Some("robot search blocked for test".to_string()),
-            });
+    #[test]
+    fn read_search_policy_rule_can_deny_robot_search() {
+        run_async_test(async {
+            let mut config = frankenterm_core::config::Config::default();
+            config.safety.rules.enabled = true;
+            config
+                .safety
+                .rules
+                .rules
+                .push(frankenterm_core::config::PolicyRule {
+                    id: "test.deny.robot.search".to_string(),
+                    description: Some("deny robot search output".to_string()),
+                    priority: 1,
+                    match_on: frankenterm_core::config::PolicyRuleMatch {
+                        actions: vec!["search_output".to_string()],
+                        actors: vec!["robot".to_string()],
+                        ..Default::default()
+                    },
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: Some("robot search blocked for test".to_string()),
+                });
 
-        let (decision, _domain) = authorize_read_or_search_policy(
-            &config,
-            None,
-            None,
-            frankenterm_core::policy::ActionKind::SearchOutput,
-            frankenterm_core::policy::ActorKind::Robot,
-            None,
-            "robot search test",
-        )
-        .await;
-        assert!(decision.is_denied(), "rule should deny robot search");
-        assert_eq!(decision.reason(), Some("robot search blocked for test"));
-        let context = decision
-            .context()
-            .expect("read/search decisions should include decision context");
-        assert_eq!(
-            context.surface,
-            frankenterm_core::policy::PolicySurface::Mux
-        );
+            let (decision, _domain) = authorize_read_or_search_policy(
+                &config,
+                None,
+                None,
+                frankenterm_core::policy::ActionKind::SearchOutput,
+                frankenterm_core::policy::ActorKind::Robot,
+                None,
+                "robot search test",
+            )
+            .await;
+            assert!(decision.is_denied(), "rule should deny robot search");
+            assert_eq!(decision.reason(), Some("robot search blocked for test"));
+            let context = decision
+                .context()
+                .expect("read/search decisions should include decision context");
+            assert_eq!(
+                context.surface,
+                frankenterm_core::policy::PolicySurface::Mux
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn read_search_policy_mcp_actor_uses_mux_surface_override() {
-        let mut config = frankenterm_core::config::Config::default();
-        config.safety.rules.enabled = true;
-        config
-            .safety
-            .rules
-            .rules
-            .push(frankenterm_core::config::PolicyRule {
-                id: "test.deny.mcp.surface.mcp".to_string(),
-                description: Some("deny mcp read only when surface is mcp".to_string()),
-                priority: 1,
-                match_on: frankenterm_core::config::PolicyRuleMatch {
-                    actions: vec!["read_output".to_string()],
-                    actors: vec!["mcp".to_string()],
-                    surfaces: vec!["mcp".to_string()],
-                    ..Default::default()
-                },
-                decision: frankenterm_core::config::PolicyRuleDecision::Deny,
-                message: Some("should not match when helper sets mux surface".to_string()),
-            });
+    #[test]
+    fn read_search_policy_mcp_actor_uses_mux_surface_override() {
+        run_async_test(async {
+            let mut config = frankenterm_core::config::Config::default();
+            config.safety.rules.enabled = true;
+            config
+                .safety
+                .rules
+                .rules
+                .push(frankenterm_core::config::PolicyRule {
+                    id: "test.deny.mcp.surface.mcp".to_string(),
+                    description: Some("deny mcp read only when surface is mcp".to_string()),
+                    priority: 1,
+                    match_on: frankenterm_core::config::PolicyRuleMatch {
+                        actions: vec!["read_output".to_string()],
+                        actors: vec!["mcp".to_string()],
+                        surfaces: vec!["mcp".to_string()],
+                        ..Default::default()
+                    },
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: Some("should not match when helper sets mux surface".to_string()),
+                });
 
-        let (decision, _domain) = authorize_read_or_search_policy(
-            &config,
-            None,
-            None,
-            frankenterm_core::policy::ActionKind::ReadOutput,
-            frankenterm_core::policy::ActorKind::Mcp,
-            None,
-            "mcp read test",
-        )
-        .await;
+            let (decision, _domain) = authorize_read_or_search_policy(
+                &config,
+                None,
+                None,
+                frankenterm_core::policy::ActionKind::ReadOutput,
+                frankenterm_core::policy::ActorKind::Mcp,
+                None,
+                "mcp read test",
+            )
+            .await;
 
-        assert!(
-            decision.is_allowed(),
-            "mcp-surface-only deny rule should not match when helper sets mux surface"
-        );
-        let context = decision
-            .context()
-            .expect("read/search decisions should include decision context");
-        assert_eq!(
-            context.surface,
-            frankenterm_core::policy::PolicySurface::Mux
-        );
+            assert!(
+                decision.is_allowed(),
+                "mcp-surface-only deny rule should not match when helper sets mux surface"
+            );
+            let context = decision
+                .context()
+                .expect("read/search decisions should include decision context");
+            assert_eq!(
+                context.surface,
+                frankenterm_core::policy::PolicySurface::Mux
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn read_search_policy_mcp_actor_matches_mux_surface_rule() {
-        let mut config = frankenterm_core::config::Config::default();
-        config.safety.rules.enabled = true;
-        config
-            .safety
-            .rules
-            .rules
-            .push(frankenterm_core::config::PolicyRule {
-                id: "test.deny.mcp.surface.mux".to_string(),
-                description: Some("deny mcp read when helper surface is mux".to_string()),
-                priority: 1,
-                match_on: frankenterm_core::config::PolicyRuleMatch {
-                    actions: vec!["read_output".to_string()],
-                    actors: vec!["mcp".to_string()],
-                    surfaces: vec!["mux".to_string()],
-                    ..Default::default()
-                },
-                decision: frankenterm_core::config::PolicyRuleDecision::Deny,
-                message: Some("mcp read blocked on mux surface".to_string()),
-            });
+    #[test]
+    fn read_search_policy_mcp_actor_matches_mux_surface_rule() {
+        run_async_test(async {
+            let mut config = frankenterm_core::config::Config::default();
+            config.safety.rules.enabled = true;
+            config
+                .safety
+                .rules
+                .rules
+                .push(frankenterm_core::config::PolicyRule {
+                    id: "test.deny.mcp.surface.mux".to_string(),
+                    description: Some("deny mcp read when helper surface is mux".to_string()),
+                    priority: 1,
+                    match_on: frankenterm_core::config::PolicyRuleMatch {
+                        actions: vec!["read_output".to_string()],
+                        actors: vec!["mcp".to_string()],
+                        surfaces: vec!["mux".to_string()],
+                        ..Default::default()
+                    },
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: Some("mcp read blocked on mux surface".to_string()),
+                });
 
-        let (decision, _domain) = authorize_read_or_search_policy(
-            &config,
-            None,
-            None,
-            frankenterm_core::policy::ActionKind::ReadOutput,
-            frankenterm_core::policy::ActorKind::Mcp,
-            None,
-            "mcp read test",
-        )
-        .await;
+            let (decision, _domain) = authorize_read_or_search_policy(
+                &config,
+                None,
+                None,
+                frankenterm_core::policy::ActionKind::ReadOutput,
+                frankenterm_core::policy::ActorKind::Mcp,
+                None,
+                "mcp read test",
+            )
+            .await;
 
-        assert!(
-            decision.is_denied(),
-            "mux-surface deny rule should match for mcp actor read/search helper"
-        );
-        assert_eq!(decision.reason(), Some("mcp read blocked on mux surface"));
-        let context = decision
-            .context()
-            .expect("read/search decisions should include decision context");
-        assert_eq!(
-            context.surface,
-            frankenterm_core::policy::PolicySurface::Mux
-        );
+            assert!(
+                decision.is_denied(),
+                "mux-surface deny rule should match for mcp actor read/search helper"
+            );
+            assert_eq!(decision.reason(), Some("mcp read blocked on mux surface"));
+            let context = decision
+                .context()
+                .expect("read/search decisions should include decision context");
+            assert_eq!(
+                context.surface,
+                frankenterm_core::policy::PolicySurface::Mux
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn search_policy_mcp_actor_uses_mux_surface_override() {
-        let mut config = frankenterm_core::config::Config::default();
-        config.safety.rules.enabled = true;
-        config
-            .safety
-            .rules
-            .rules
-            .push(frankenterm_core::config::PolicyRule {
-                id: "test.deny.mcp.search.surface.mcp".to_string(),
-                description: Some("deny mcp search only when surface is mcp".to_string()),
-                priority: 1,
-                match_on: frankenterm_core::config::PolicyRuleMatch {
-                    actions: vec!["search_output".to_string()],
-                    actors: vec!["mcp".to_string()],
-                    surfaces: vec!["mcp".to_string()],
-                    ..Default::default()
-                },
-                decision: frankenterm_core::config::PolicyRuleDecision::Deny,
-                message: Some("should not match when helper sets mux surface".to_string()),
-            });
+    #[test]
+    fn search_policy_mcp_actor_uses_mux_surface_override() {
+        run_async_test(async {
+            let mut config = frankenterm_core::config::Config::default();
+            config.safety.rules.enabled = true;
+            config
+                .safety
+                .rules
+                .rules
+                .push(frankenterm_core::config::PolicyRule {
+                    id: "test.deny.mcp.search.surface.mcp".to_string(),
+                    description: Some("deny mcp search only when surface is mcp".to_string()),
+                    priority: 1,
+                    match_on: frankenterm_core::config::PolicyRuleMatch {
+                        actions: vec!["search_output".to_string()],
+                        actors: vec!["mcp".to_string()],
+                        surfaces: vec!["mcp".to_string()],
+                        ..Default::default()
+                    },
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: Some("should not match when helper sets mux surface".to_string()),
+                });
 
-        let (decision, _domain) = authorize_read_or_search_policy(
-            &config,
-            None,
-            None,
-            frankenterm_core::policy::ActionKind::SearchOutput,
-            frankenterm_core::policy::ActorKind::Mcp,
-            None,
-            "mcp search test",
-        )
-        .await;
+            let (decision, _domain) = authorize_read_or_search_policy(
+                &config,
+                None,
+                None,
+                frankenterm_core::policy::ActionKind::SearchOutput,
+                frankenterm_core::policy::ActorKind::Mcp,
+                None,
+                "mcp search test",
+            )
+            .await;
 
-        assert!(
-            decision.is_allowed(),
-            "mcp-surface-only deny rule should not match when helper sets mux surface"
-        );
-        let context = decision
-            .context()
-            .expect("read/search decisions should include decision context");
-        assert_eq!(
-            context.surface,
-            frankenterm_core::policy::PolicySurface::Mux
-        );
+            assert!(
+                decision.is_allowed(),
+                "mcp-surface-only deny rule should not match when helper sets mux surface"
+            );
+            let context = decision
+                .context()
+                .expect("read/search decisions should include decision context");
+            assert_eq!(
+                context.surface,
+                frankenterm_core::policy::PolicySurface::Mux
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn search_policy_mcp_actor_matches_mux_surface_rule() {
-        let mut config = frankenterm_core::config::Config::default();
-        config.safety.rules.enabled = true;
-        config
-            .safety
-            .rules
-            .rules
-            .push(frankenterm_core::config::PolicyRule {
-                id: "test.deny.mcp.search.surface.mux".to_string(),
-                description: Some("deny mcp search when helper surface is mux".to_string()),
-                priority: 1,
-                match_on: frankenterm_core::config::PolicyRuleMatch {
-                    actions: vec!["search_output".to_string()],
-                    actors: vec!["mcp".to_string()],
-                    surfaces: vec!["mux".to_string()],
-                    ..Default::default()
-                },
-                decision: frankenterm_core::config::PolicyRuleDecision::Deny,
-                message: Some("mcp search blocked on mux surface".to_string()),
-            });
+    #[test]
+    fn search_policy_mcp_actor_matches_mux_surface_rule() {
+        run_async_test(async {
+            let mut config = frankenterm_core::config::Config::default();
+            config.safety.rules.enabled = true;
+            config
+                .safety
+                .rules
+                .rules
+                .push(frankenterm_core::config::PolicyRule {
+                    id: "test.deny.mcp.search.surface.mux".to_string(),
+                    description: Some("deny mcp search when helper surface is mux".to_string()),
+                    priority: 1,
+                    match_on: frankenterm_core::config::PolicyRuleMatch {
+                        actions: vec!["search_output".to_string()],
+                        actors: vec!["mcp".to_string()],
+                        surfaces: vec!["mux".to_string()],
+                        ..Default::default()
+                    },
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: Some("mcp search blocked on mux surface".to_string()),
+                });
 
-        let (decision, _domain) = authorize_read_or_search_policy(
-            &config,
-            None,
-            None,
-            frankenterm_core::policy::ActionKind::SearchOutput,
-            frankenterm_core::policy::ActorKind::Mcp,
-            None,
-            "mcp search test",
-        )
-        .await;
+            let (decision, _domain) = authorize_read_or_search_policy(
+                &config,
+                None,
+                None,
+                frankenterm_core::policy::ActionKind::SearchOutput,
+                frankenterm_core::policy::ActorKind::Mcp,
+                None,
+                "mcp search test",
+            )
+            .await;
 
-        assert!(
-            decision.is_denied(),
-            "mux-surface deny rule should match for mcp actor read/search helper"
-        );
-        assert_eq!(decision.reason(), Some("mcp search blocked on mux surface"));
-        let context = decision
-            .context()
-            .expect("read/search decisions should include decision context");
-        assert_eq!(
-            context.surface,
-            frankenterm_core::policy::PolicySurface::Mux
-        );
+            assert!(
+                decision.is_denied(),
+                "mux-surface deny rule should match for mcp actor read/search helper"
+            );
+            assert_eq!(decision.reason(), Some("mcp search blocked on mux surface"));
+            let context = decision
+                .context()
+                .expect("read/search decisions should include decision context");
+            assert_eq!(
+                context.surface,
+                frankenterm_core::policy::PolicySurface::Mux
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn read_search_policy_all_actor_variants_preserve_mux_surface() {
-        let config = frankenterm_core::config::Config::default();
-        let actions = [
-            frankenterm_core::policy::ActionKind::ReadOutput,
-            frankenterm_core::policy::ActionKind::SearchOutput,
-        ];
-        let actors = [
-            frankenterm_core::policy::ActorKind::Robot,
-            frankenterm_core::policy::ActorKind::Human,
-            frankenterm_core::policy::ActorKind::Mcp,
-            frankenterm_core::policy::ActorKind::Workflow,
-        ];
+    #[test]
+    fn read_search_policy_all_actor_variants_preserve_mux_surface() {
+        run_async_test(async {
+            let config = frankenterm_core::config::Config::default();
+            let actions = [
+                frankenterm_core::policy::ActionKind::ReadOutput,
+                frankenterm_core::policy::ActionKind::SearchOutput,
+            ];
+            let actors = [
+                frankenterm_core::policy::ActorKind::Robot,
+                frankenterm_core::policy::ActorKind::Human,
+                frankenterm_core::policy::ActorKind::Mcp,
+                frankenterm_core::policy::ActorKind::Workflow,
+            ];
 
-        for action in actions {
-            for actor in actors {
-                let summary = format!(
-                    "surface contract test: {} / {}",
-                    action.as_str(),
-                    actor.as_str()
-                );
-                let (decision, _domain) = authorize_read_or_search_policy(
-                    &config, None, None, action, actor, None, &summary,
-                )
-                .await;
-                let context = decision.context().unwrap_or_else(|| {
-                    panic!(
-                        "decision context missing for action {} actor {}",
+            for action in actions {
+                for actor in actors {
+                    let summary = format!(
+                        "surface contract test: {} / {}",
                         action.as_str(),
                         actor.as_str()
+                    );
+                    let (decision, _domain) = authorize_read_or_search_policy(
+                        &config, None, None, action, actor, None, &summary,
                     )
-                });
-                assert_eq!(
-                    context.surface,
-                    frankenterm_core::policy::PolicySurface::Mux,
-                    "expected mux surface for action {} actor {}",
-                    action.as_str(),
-                    actor.as_str()
-                );
+                    .await;
+                    let context = decision.context().unwrap_or_else(|| {
+                        panic!(
+                            "decision context missing for action {} actor {}",
+                            action.as_str(),
+                            actor.as_str()
+                        )
+                    });
+                    assert_eq!(
+                        context.surface,
+                        frankenterm_core::policy::PolicySurface::Mux,
+                        "expected mux surface for action {} actor {}",
+                        action.as_str(),
+                        actor.as_str()
+                    );
+                }
             }
-        }
+        });
     }
 
     #[test]
@@ -45444,98 +45470,104 @@ log_level = "debug"
 
     // ── mute CLI storage round-trip tests ─────────────────────────────────
 
-    #[tokio::test]
-    async fn mute_add_list_remove_roundtrip() {
-        use frankenterm_core::storage::EventMuteRecord;
+    #[test]
+    fn mute_add_list_remove_roundtrip() {
+        run_async_test(async {
+            use frankenterm_core::storage::EventMuteRecord;
 
-        let (storage, db_path) = setup_storage("mute_roundtrip").await;
-        let now = now_ms();
+            let (storage, db_path) = setup_storage("mute_roundtrip").await;
+            let now = now_ms();
 
-        // Initially no mutes
-        let mutes = storage.list_active_mutes(now).await.unwrap();
-        assert!(mutes.is_empty());
+            // Initially no mutes
+            let mutes = storage.list_active_mutes(now).await.unwrap();
+            assert!(mutes.is_empty());
 
-        // Add a mute
-        let record = EventMuteRecord {
-            identity_key: "evt:test_key_1".to_string(),
-            scope: "workspace".to_string(),
-            created_at: now,
-            expires_at: Some(now + 3_600_000),
-            created_by: Some("cli".to_string()),
-            reason: Some("too noisy".to_string()),
-        };
-        storage.add_event_mute(record).await.unwrap();
+            // Add a mute
+            let record = EventMuteRecord {
+                identity_key: "evt:test_key_1".to_string(),
+                scope: "workspace".to_string(),
+                created_at: now,
+                expires_at: Some(now + 3_600_000),
+                created_by: Some("cli".to_string()),
+                reason: Some("too noisy".to_string()),
+            };
+            storage.add_event_mute(record).await.unwrap();
 
-        // List should show one mute
-        let mutes = storage.list_active_mutes(now).await.unwrap();
-        assert_eq!(mutes.len(), 1);
-        assert_eq!(mutes[0].identity_key, "evt:test_key_1");
-        assert_eq!(mutes[0].scope, "workspace");
-        assert_eq!(mutes[0].reason.as_deref(), Some("too noisy"));
+            // List should show one mute
+            let mutes = storage.list_active_mutes(now).await.unwrap();
+            assert_eq!(mutes.len(), 1);
+            assert_eq!(mutes[0].identity_key, "evt:test_key_1");
+            assert_eq!(mutes[0].scope, "workspace");
+            assert_eq!(mutes[0].reason.as_deref(), Some("too noisy"));
 
-        // Remove the mute
-        let removed = storage.remove_event_mute("evt:test_key_1").await.unwrap();
-        assert!(removed);
+            // Remove the mute
+            let removed = storage.remove_event_mute("evt:test_key_1").await.unwrap();
+            assert!(removed);
 
-        // List should be empty again
-        let mutes = storage.list_active_mutes(now).await.unwrap();
-        assert!(mutes.is_empty());
+            // List should be empty again
+            let mutes = storage.list_active_mutes(now).await.unwrap();
+            assert!(mutes.is_empty());
 
-        // Removing again should return false
-        let removed = storage.remove_event_mute("evt:test_key_1").await.unwrap();
-        assert!(!removed);
+            // Removing again should return false
+            let removed = storage.remove_event_mute("evt:test_key_1").await.unwrap();
+            assert!(!removed);
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
-    #[tokio::test]
-    async fn mute_permanent_no_expiry() {
-        use frankenterm_core::storage::EventMuteRecord;
+    #[test]
+    fn mute_permanent_no_expiry() {
+        run_async_test(async {
+            use frankenterm_core::storage::EventMuteRecord;
 
-        let (storage, db_path) = setup_storage("mute_permanent").await;
-        let now = now_ms();
+            let (storage, db_path) = setup_storage("mute_permanent").await;
+            let now = now_ms();
 
-        let record = EventMuteRecord {
-            identity_key: "evt:permanent".to_string(),
-            scope: "global".to_string(),
-            created_at: now,
-            expires_at: None,
-            created_by: Some("cli".to_string()),
-            reason: None,
-        };
-        storage.add_event_mute(record).await.unwrap();
+            let record = EventMuteRecord {
+                identity_key: "evt:permanent".to_string(),
+                scope: "global".to_string(),
+                created_at: now,
+                expires_at: None,
+                created_by: Some("cli".to_string()),
+                reason: None,
+            };
+            storage.add_event_mute(record).await.unwrap();
 
-        // Should be listed even far in the future
-        let far_future = now + 365 * 86_400_000;
-        let mutes = storage.list_active_mutes(far_future).await.unwrap();
-        assert_eq!(mutes.len(), 1);
-        assert_eq!(mutes[0].identity_key, "evt:permanent");
-        assert!(mutes[0].expires_at.is_none());
+            // Should be listed even far in the future
+            let far_future = now + 365 * 86_400_000;
+            let mutes = storage.list_active_mutes(far_future).await.unwrap();
+            assert_eq!(mutes.len(), 1);
+            assert_eq!(mutes[0].identity_key, "evt:permanent");
+            assert!(mutes[0].expires_at.is_none());
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
-    #[tokio::test]
-    async fn mute_expired_not_listed() {
-        use frankenterm_core::storage::EventMuteRecord;
+    #[test]
+    fn mute_expired_not_listed() {
+        run_async_test(async {
+            use frankenterm_core::storage::EventMuteRecord;
 
-        let (storage, db_path) = setup_storage("mute_expired").await;
-        let now = now_ms();
+            let (storage, db_path) = setup_storage("mute_expired").await;
+            let now = now_ms();
 
-        let record = EventMuteRecord {
-            identity_key: "evt:expired".to_string(),
-            scope: "workspace".to_string(),
-            created_at: now - 7_200_000,
-            expires_at: Some(now - 3_600_000), // expired 1h ago
-            created_by: Some("cli".to_string()),
-            reason: None,
-        };
-        storage.add_event_mute(record).await.unwrap();
+            let record = EventMuteRecord {
+                identity_key: "evt:expired".to_string(),
+                scope: "workspace".to_string(),
+                created_at: now - 7_200_000,
+                expires_at: Some(now - 3_600_000), // expired 1h ago
+                created_by: Some("cli".to_string()),
+                reason: None,
+            };
+            storage.add_event_mute(record).await.unwrap();
 
-        let mutes = storage.list_active_mutes(now).await.unwrap();
-        assert!(mutes.is_empty());
+            let mutes = storage.list_active_mutes(now).await.unwrap();
+            assert!(mutes.is_empty());
 
-        cleanup_storage(storage, &db_path).await;
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
     // ========================================================================
@@ -45935,96 +45967,98 @@ log_level = "debug"
         }
     }
 
-    #[tokio::test]
-    async fn doctor_fixture_healthy_workspace() {
-        let temp = unique_temp_dir("doctor_healthy");
-        let layout = make_test_layout(&temp);
-        std::fs::create_dir_all(&layout.logs_dir).unwrap();
+    #[test]
+    fn doctor_fixture_healthy_workspace() {
+        run_async_test(async {
+            let temp = unique_temp_dir("doctor_healthy");
+            let layout = make_test_layout(&temp);
+            std::fs::create_dir_all(&layout.logs_dir).unwrap();
 
-        // Create a valid SQLite DB with correct schema version
-        let storage = StorageHandle::new(&layout.db_path.to_string_lossy())
-            .await
-            .unwrap();
-        let _ = storage.shutdown().await;
-        let config = frankenterm_core::config::Config::default();
+            // Create a valid SQLite DB with correct schema version
+            let storage = StorageHandle::new(&layout.db_path.to_string_lossy())
+                .await
+                .unwrap();
+            let _ = storage.shutdown().await;
+            let config = frankenterm_core::config::Config::default();
 
-        let checks = run_diagnostics(&[], &config, &layout);
+            let checks = run_diagnostics(&[], &config, &layout);
 
-        // Should have multiple checks
-        assert!(
-            checks.len() >= 5,
-            "expected at least 5 checks, got {}",
-            checks.len()
-        );
-
-        // Find specific checks by name
-        let core_check = checks.iter().find(|c| c.name == "frankenterm-core loaded");
-        assert!(core_check.is_some());
-        assert_eq!(core_check.unwrap().status, DiagnosticStatus::Ok);
-
-        let ws_check = checks.iter().find(|c| c.name == "workspace root");
-        assert!(ws_check.is_some());
-        assert_eq!(ws_check.unwrap().status, DiagnosticStatus::Ok);
-
-        let ft_dir_check = checks.iter().find(|c| c.name == ".ft directory");
-        assert!(ft_dir_check.is_some());
-        assert_eq!(ft_dir_check.unwrap().status, DiagnosticStatus::Ok);
-
-        let db_check = checks.iter().find(|c| c.name == "database");
-        assert!(db_check.is_some());
-        assert_eq!(db_check.unwrap().status, DiagnosticStatus::Ok);
-        let db_detail = db_check.unwrap().detail.as_deref().unwrap();
-        assert!(
-            db_detail.contains("schema v"),
-            "DB detail should show schema version"
-        );
-        assert!(db_detail.contains("wal"), "DB detail should show WAL mode");
-
-        let daemon_check = checks.iter().find(|c| c.name == "daemon status");
-        assert!(daemon_check.is_some());
-        // No lock file → not running
-        assert_eq!(daemon_check.unwrap().status, DiagnosticStatus::Ok);
-        assert!(
-            daemon_check
-                .unwrap()
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("not running")
-        );
-
-        let logs_check = checks.iter().find(|c| c.name == "logs directory");
-        assert!(logs_check.is_some());
-        assert_eq!(logs_check.unwrap().status, DiagnosticStatus::Ok);
-
-        // Verify JSON shape
-        let json_checks: Vec<serde_json::Value> =
-            checks.iter().map(|c| c.to_json_value()).collect();
-        for jc in &json_checks {
-            assert!(jc.get("name").is_some());
-            assert!(jc.get("status").is_some());
-            let status = jc["status"].as_str().unwrap();
+            // Should have multiple checks
             assert!(
-                ["ok", "warning", "error"].contains(&status),
-                "invalid status: {status}"
+                checks.len() >= 5,
+                "expected at least 5 checks, got {}",
+                checks.len()
             );
-        }
 
-        // No errors in healthy workspace (except compatibility-backend checks which depend on runtime)
-        let wezterm_check_names = ["WezTerm CLI", "WezTerm connection"];
-        let error_names: Vec<&str> = checks
-            .iter()
-            .filter(|c| c.status == DiagnosticStatus::Error)
-            .filter(|c| !wezterm_check_names.contains(&c.name))
-            .map(|c| c.name)
-            .collect();
-        assert!(
-            error_names.is_empty(),
-            "healthy workspace should have no non-backend errors: {error_names:?}"
-        );
+            // Find specific checks by name
+            let core_check = checks.iter().find(|c| c.name == "frankenterm-core loaded");
+            assert!(core_check.is_some());
+            assert_eq!(core_check.unwrap().status, DiagnosticStatus::Ok);
 
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&temp);
+            let ws_check = checks.iter().find(|c| c.name == "workspace root");
+            assert!(ws_check.is_some());
+            assert_eq!(ws_check.unwrap().status, DiagnosticStatus::Ok);
+
+            let ft_dir_check = checks.iter().find(|c| c.name == ".ft directory");
+            assert!(ft_dir_check.is_some());
+            assert_eq!(ft_dir_check.unwrap().status, DiagnosticStatus::Ok);
+
+            let db_check = checks.iter().find(|c| c.name == "database");
+            assert!(db_check.is_some());
+            assert_eq!(db_check.unwrap().status, DiagnosticStatus::Ok);
+            let db_detail = db_check.unwrap().detail.as_deref().unwrap();
+            assert!(
+                db_detail.contains("schema v"),
+                "DB detail should show schema version"
+            );
+            assert!(db_detail.contains("wal"), "DB detail should show WAL mode");
+
+            let daemon_check = checks.iter().find(|c| c.name == "daemon status");
+            assert!(daemon_check.is_some());
+            // No lock file -> not running
+            assert_eq!(daemon_check.unwrap().status, DiagnosticStatus::Ok);
+            assert!(
+                daemon_check
+                    .unwrap()
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("not running")
+            );
+
+            let logs_check = checks.iter().find(|c| c.name == "logs directory");
+            assert!(logs_check.is_some());
+            assert_eq!(logs_check.unwrap().status, DiagnosticStatus::Ok);
+
+            // Verify JSON shape
+            let json_checks: Vec<serde_json::Value> =
+                checks.iter().map(|c| c.to_json_value()).collect();
+            for jc in &json_checks {
+                assert!(jc.get("name").is_some());
+                assert!(jc.get("status").is_some());
+                let status = jc["status"].as_str().unwrap();
+                assert!(
+                    ["ok", "warning", "error"].contains(&status),
+                    "invalid status: {status}"
+                );
+            }
+
+            // No errors in healthy workspace (except compatibility-backend checks which depend on runtime)
+            let wezterm_check_names = ["WezTerm CLI", "WezTerm connection"];
+            let error_names: Vec<&str> = checks
+                .iter()
+                .filter(|c| c.status == DiagnosticStatus::Error)
+                .filter(|c| !wezterm_check_names.contains(&c.name))
+                .map(|c| c.name)
+                .collect();
+            assert!(
+                error_names.is_empty(),
+                "healthy workspace should have no non-backend errors: {error_names:?}"
+            );
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&temp);
+        });
     }
 
     #[test]

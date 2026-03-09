@@ -233,8 +233,8 @@ mod tests {
     use super::*;
     use crate::ScriptingEngine;
     use proptest::prelude::*;
-    use tempfile::tempdir;
     use std::ops::RangeInclusive;
+    use tempfile::tempdir;
 
     fn dynamic_strategy() -> impl Strategy<Value = Value> {
         let uint_range: RangeInclusive<u64> = 0..=i64::MAX as u64;
