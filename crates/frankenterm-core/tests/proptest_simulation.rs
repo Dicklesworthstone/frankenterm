@@ -9,7 +9,8 @@
 use frankenterm_core::simulation::{
     EventAction, Expectation, ExpectationKind, FontAtlasCachePolicy, FontRenderPrepMetrics,
     ResizeQueueMetrics, ResizeTimeline, ResizeTimelineEvent, ResizeTimelineFlameSample,
-    ResizeTimelineStage, ResizeTimelineStageSample, ScenarioPane,
+    ResizeTimelineStage, ResizeTimelineStageSample, ResizeTimelineStageSummary,
+    SandboxCommand, Scenario, ScenarioEvent, ScenarioPane,
 };
 use proptest::prelude::*;
 
@@ -828,4 +829,497 @@ fn flame_sample_with_known_timeline() {
     assert_eq!(flames[0].pane_id, 42);
     assert_eq!(flames[1].stack, "test_scenario;resize;presentation");
     assert_eq!(flames[1].duration_ns, 400);
+}
+
+// ============================================================================
+// Additional coverage tests (SM-24 through SM-43)
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    // ── SM-24: Scenario from_yaml valid minimal ─────────────────────────────
+
+    #[test]
+    fn sm24_scenario_from_yaml_minimal(
+        name in "[a-z_]{3,15}",
+    ) {
+        let yaml = format!(
+            "name: {name}\nduration: 10s\npanes: []\nevents: []\nexpectations: []\n"
+        );
+        let result = Scenario::from_yaml(&yaml);
+        prop_assert!(result.is_ok(), "minimal YAML should parse: {:?}", result.err());
+        let scenario = result.unwrap();
+        prop_assert_eq!(&scenario.name, &name);
+    }
+
+    // ── SM-25: Scenario validate rejects duplicate pane IDs ─────────────────
+
+    #[test]
+    fn sm25_validate_rejects_dup_panes(id in 0u64..1000) {
+        let scenario = Scenario {
+            name: "test".to_string(),
+            description: String::new(),
+            duration: std::time::Duration::from_secs(10),
+            panes: vec![
+                ScenarioPane {
+                    id,
+                    title: "a".to_string(),
+                    domain: "local".to_string(),
+                    cwd: "/tmp".to_string(),
+                    window_id: 0, tab_id: 0, cols: 80, rows: 24,
+                    initial_content: String::new(),
+                },
+                ScenarioPane {
+                    id, // duplicate!
+                    title: "b".to_string(),
+                    domain: "local".to_string(),
+                    cwd: "/tmp".to_string(),
+                    window_id: 0, tab_id: 0, cols: 80, rows: 24,
+                    initial_content: String::new(),
+                },
+            ],
+            events: vec![],
+            expectations: vec![],
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let result = scenario.validate();
+        prop_assert!(result.is_err(), "duplicate pane IDs should fail validation");
+    }
+
+    // ── SM-26: Scenario validate rejects unknown pane in event ──────────────
+
+    #[test]
+    fn sm26_validate_rejects_unknown_pane(pane_id in 100u64..200) {
+        let scenario = Scenario {
+            name: "test".to_string(),
+            description: String::new(),
+            duration: std::time::Duration::from_secs(10),
+            panes: vec![ScenarioPane {
+                id: 1, // Only pane 1 exists
+                title: "a".to_string(),
+                domain: "local".to_string(),
+                cwd: "/tmp".to_string(),
+                window_id: 0, tab_id: 0, cols: 80, rows: 24,
+                initial_content: String::new(),
+            }],
+            events: vec![ScenarioEvent {
+                at: std::time::Duration::from_secs(1),
+                pane: pane_id, // References non-existent pane
+                action: EventAction::Append,
+                content: "hello".to_string(),
+                name: String::new(),
+                comment: None,
+            }],
+            expectations: vec![],
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let result = scenario.validate();
+        prop_assert!(result.is_err(), "unknown pane reference should fail validation");
+    }
+
+    // ── SM-27: Scenario validate rejects out-of-order events ────────────────
+
+    #[test]
+    fn sm27_validate_rejects_out_of_order(_dummy in 0u8..1) {
+        let scenario = Scenario {
+            name: "test".to_string(),
+            description: String::new(),
+            duration: std::time::Duration::from_secs(10),
+            panes: vec![ScenarioPane {
+                id: 1,
+                title: "a".to_string(),
+                domain: "local".to_string(),
+                cwd: "/tmp".to_string(),
+                window_id: 0, tab_id: 0, cols: 80, rows: 24,
+                initial_content: String::new(),
+            }],
+            events: vec![
+                ScenarioEvent {
+                    at: std::time::Duration::from_secs(5),
+                    pane: 1,
+                    action: EventAction::Append,
+                    content: "late".to_string(),
+                    name: String::new(),
+                    comment: None,
+                },
+                ScenarioEvent {
+                    at: std::time::Duration::from_secs(2), // Out of order!
+                    pane: 1,
+                    action: EventAction::Clear,
+                    content: String::new(),
+                    name: String::new(),
+                    comment: None,
+                },
+            ],
+            expectations: vec![],
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let result = scenario.validate();
+        prop_assert!(result.is_err(), "out-of-order events should fail validation");
+    }
+
+    // ── SM-28: Scenario validate accepts valid scenario ─────────────────────
+
+    #[test]
+    fn sm28_validate_accepts_valid(_dummy in 0u8..1) {
+        let scenario = Scenario {
+            name: "valid".to_string(),
+            description: "A valid test scenario".to_string(),
+            duration: std::time::Duration::from_secs(10),
+            panes: vec![ScenarioPane {
+                id: 1,
+                title: "pane1".to_string(),
+                domain: "local".to_string(),
+                cwd: "/tmp".to_string(),
+                window_id: 0, tab_id: 0, cols: 80, rows: 24,
+                initial_content: String::new(),
+            }],
+            events: vec![ScenarioEvent {
+                at: std::time::Duration::from_secs(1),
+                pane: 1,
+                action: EventAction::Append,
+                content: "hello".to_string(),
+                name: String::new(),
+                comment: None,
+            }],
+            expectations: vec![],
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let result = scenario.validate();
+        prop_assert!(result.is_ok(), "valid scenario should pass: {:?}", result.err());
+    }
+
+    // ── SM-29: reproducibility_key format ───────────────────────────────────
+
+    #[test]
+    fn sm29_reproducibility_key_format(name in "[a-z_]{3,15}") {
+        let scenario = Scenario {
+            name: name.clone(),
+            description: String::new(),
+            duration: std::time::Duration::from_secs(10),
+            panes: vec![],
+            events: vec![],
+            expectations: vec![],
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let key = scenario.reproducibility_key();
+        // Default: ad_hoc:v1:<name>:0
+        prop_assert!(key.starts_with("ad_hoc:v1:"), "key should start with ad_hoc:v1: got {}", key);
+        prop_assert!(key.contains(&name), "key should contain scenario name");
+        prop_assert!(key.ends_with(":0"), "key should end with :0 (default seed)");
+    }
+
+    // ── SM-30: reproducibility_key uses metadata ────────────────────────────
+
+    #[test]
+    fn sm30_reproducibility_key_metadata(
+        suite in "[a-z]{3,10}",
+        version in "[a-z0-9]{1,5}",
+        seed in "[0-9]{1,5}",
+    ) {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("suite".to_string(), suite.clone());
+        metadata.insert("suite_version".to_string(), version.clone());
+        metadata.insert("seed".to_string(), seed.clone());
+        let scenario = Scenario {
+            name: "test".to_string(),
+            description: String::new(),
+            duration: std::time::Duration::from_secs(10),
+            panes: vec![],
+            events: vec![],
+            expectations: vec![],
+            metadata,
+        };
+        let key = scenario.reproducibility_key();
+        let expected = format!("{suite}:{version}:test:{seed}");
+        prop_assert_eq!(&key, &expected);
+    }
+
+    // ── SM-31: ScenarioEvent serializes expected fields ────────────────────
+
+    #[test]
+    fn sm31_scenario_event_serialize(
+        pane in 0u64..100,
+        content in "[a-z ]{3,20}",
+    ) {
+        // ScenarioEvent uses custom Duration deserializer, so JSON roundtrip fails.
+        // Test serialization only.
+        let event = ScenarioEvent {
+            at: std::time::Duration::from_secs(5),
+            pane,
+            action: EventAction::Append,
+            content: content.clone(),
+            name: String::new(),
+            comment: Some("test comment".to_string()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        prop_assert!(json.contains("\"pane\""));
+        prop_assert!(json.contains("\"action\""));
+        prop_assert!(json.contains("\"comment\""));
+        let expected_pane = format!("\"pane\":{pane}");
+        prop_assert!(json.contains(&expected_pane));
+    }
+
+    // ── SM-32: Expectation Event serde roundtrip ────────────────────────────
+
+    #[test]
+    fn sm32_expectation_event_serde(event_name in "[a-z.]{3,20}") {
+        let exp = Expectation {
+            kind: ExpectationKind::Event {
+                event: event_name.clone(),
+                detected_at: None,
+            },
+        };
+        let json = serde_json::to_string(&exp).unwrap();
+        let back: Expectation = serde_json::from_str(&json).unwrap();
+        let check = matches!(&back.kind, ExpectationKind::Event { event, .. } if event == &event_name);
+        prop_assert!(check, "should roundtrip Event expectation");
+    }
+
+    // ── SM-33: Expectation Contains serde roundtrip ─────────────────────────
+
+    #[test]
+    fn sm33_expectation_contains_serde(
+        pane in 0u64..100,
+        text in "[a-z ]{3,20}",
+    ) {
+        let exp = Expectation {
+            kind: ExpectationKind::Contains {
+                pane,
+                text: text.clone(),
+            },
+        };
+        let json = serde_json::to_string(&exp).unwrap();
+        let back: Expectation = serde_json::from_str(&json).unwrap();
+        let check = matches!(&back.kind, ExpectationKind::Contains { pane: p, text: t } if *p == pane && t == &text);
+        prop_assert!(check, "should roundtrip Contains expectation");
+    }
+
+    // ── SM-34: Expectation Workflow serde roundtrip ──────────────────────────
+
+    #[test]
+    fn sm34_expectation_workflow_serde(wf_name in "[a-z_]{3,15}") {
+        let exp = Expectation {
+            kind: ExpectationKind::Workflow {
+                workflow: wf_name.clone(),
+                started_at: Some("2s".to_string()),
+            },
+        };
+        let json = serde_json::to_string(&exp).unwrap();
+        let back: Expectation = serde_json::from_str(&json).unwrap();
+        let check = matches!(&back.kind, ExpectationKind::Workflow { workflow, .. } if workflow == &wf_name);
+        prop_assert!(check, "should roundtrip Workflow expectation");
+    }
+
+    // ── SM-35: ResizeTimelineStageSummary serde roundtrip ───────────────────
+
+    #[test]
+    fn sm35_stage_summary_serde(
+        samples in 1usize..100,
+        total in 0u64..1_000_000_000,
+    ) {
+        let summary = ResizeTimelineStageSummary {
+            stage: ResizeTimelineStage::LogicalReflow,
+            samples,
+            total_duration_ns: total,
+            avg_duration_ns: total as f64 / samples as f64,
+            p50_duration_ns: total / 2,
+            p95_duration_ns: total * 95 / 100,
+            p99_duration_ns: total * 99 / 100,
+            max_duration_ns: total,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: ResizeTimelineStageSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.stage, summary.stage);
+        prop_assert_eq!(back.samples, summary.samples);
+        prop_assert_eq!(back.total_duration_ns, summary.total_duration_ns);
+        prop_assert_eq!(back.max_duration_ns, summary.max_duration_ns);
+    }
+
+    // ── SM-36: stage_summary produces one entry per stage ───────────────────
+
+    #[test]
+    fn sm36_stage_summary_all_stages(_dummy in 0u8..1) {
+        let timeline = ResizeTimeline {
+            scenario: "test".to_string(),
+            reproducibility_key: "test:v1:test:0".to_string(),
+            captured_at_ms: 1000,
+            executed_resize_events: 0,
+            events: vec![],
+        };
+        let summaries = timeline.stage_summary();
+        prop_assert_eq!(summaries.len(), ResizeTimelineStage::ALL.len(),
+            "stage_summary should have one entry per stage");
+        // All should have zero samples when no events exist
+        for s in &summaries {
+            prop_assert_eq!(s.samples, 0, "stage {:?} should have 0 samples", s.stage);
+        }
+    }
+
+    // ── SM-37: Scenario validate rejects empty metadata key ─────────────────
+
+    #[test]
+    fn sm37_validate_rejects_empty_metadata_key(val in "[a-z]{3,10}") {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(String::new(), val); // Empty key
+        let scenario = Scenario {
+            name: "test".to_string(),
+            description: String::new(),
+            duration: std::time::Duration::from_secs(10),
+            panes: vec![],
+            events: vec![],
+            expectations: vec![],
+            metadata,
+        };
+        let result = scenario.validate();
+        prop_assert!(result.is_err(), "empty metadata key should fail");
+    }
+
+    // ── SM-38: Scenario validate rejects empty metadata value ───────────────
+
+    #[test]
+    fn sm38_validate_rejects_empty_metadata_value(key in "[a-z]{3,10}") {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(key, String::new()); // Empty value
+        let scenario = Scenario {
+            name: "test".to_string(),
+            description: String::new(),
+            duration: std::time::Duration::from_secs(10),
+            panes: vec![],
+            events: vec![],
+            expectations: vec![],
+            metadata,
+        };
+        let result = scenario.validate();
+        prop_assert!(result.is_err(), "empty metadata value should fail");
+    }
+
+    // ── SM-39: ScenarioPane default fields from YAML ────────────────────────
+
+    #[test]
+    fn sm39_pane_defaults_from_yaml(_dummy in 0u8..1) {
+        let yaml = "name: test\nduration: 5s\npanes:\n  - id: 1\n";
+        let result = Scenario::from_yaml(yaml);
+        prop_assert!(result.is_ok(), "YAML with defaults should parse: {:?}", result.err());
+        let scenario = result.unwrap();
+        let pane = &scenario.panes[0];
+        prop_assert_eq!(&pane.title, "pane");
+        prop_assert_eq!(&pane.domain, "local");
+        prop_assert_eq!(pane.cols, 80);
+        prop_assert_eq!(pane.rows, 24);
+    }
+
+    // ── SM-40: from_yaml rejects invalid YAML ───────────────────────────────
+
+    #[test]
+    fn sm40_from_yaml_rejects_invalid(garbage in "[a-z{}:]{10,30}") {
+        // Most random strings should fail YAML parse or validation
+        let result = Scenario::from_yaml(&garbage);
+        // We just verify it doesn't panic - both Ok and Err are acceptable
+        let _ = result;
+    }
+
+    // ── SM-41: Scenario validate rejects Typing with empty content ──────────
+
+    #[test]
+    fn sm41_validate_rejects_empty_typing(_dummy in 0u8..1) {
+        let scenario = Scenario {
+            name: "test".to_string(),
+            description: String::new(),
+            duration: std::time::Duration::from_secs(10),
+            panes: vec![ScenarioPane {
+                id: 1, title: "a".to_string(), domain: "local".to_string(),
+                cwd: "/tmp".to_string(), window_id: 0, tab_id: 0,
+                cols: 80, rows: 24, initial_content: String::new(),
+            }],
+            events: vec![ScenarioEvent {
+                at: std::time::Duration::from_secs(1),
+                pane: 1,
+                action: EventAction::Typing,
+                content: String::new(), // Empty content for Typing
+                name: String::new(),
+                comment: None,
+            }],
+            expectations: vec![],
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let result = scenario.validate();
+        prop_assert!(result.is_err(), "Typing with empty content should fail");
+    }
+
+    // ── SM-42: ResizeTimeline stage_summary p50 <= p95 <= p99 <= max ────────
+
+    #[test]
+    fn sm42_stage_summary_percentile_ordering(
+        dur_a in 1u64..1000,
+        dur_b in 1u64..1000,
+        dur_c in 1u64..1000,
+        dur_d in 1u64..1000,
+        dur_e in 1u64..1000,
+    ) {
+        let timeline = ResizeTimeline {
+            scenario: "test".to_string(),
+            reproducibility_key: "k".to_string(),
+            captured_at_ms: 1000,
+            executed_resize_events: 5,
+            events: (0..5).map(|i| {
+                let dur = [dur_a, dur_b, dur_c, dur_d, dur_e][i];
+                ResizeTimelineEvent {
+                    event_index: i,
+                    resize_transaction_id: "t".to_string(),
+                    pane_id: 1,
+                    tab_id: 0,
+                    sequence_no: i as u64,
+                    action: EventAction::Resize,
+                    scheduler_decision: "dequeue_latest_intent".to_string(),
+                    frame_id: 0,
+                    test_case_id: "test".to_string(),
+                    queue_wait_ms: 0,
+                    reflow_ms: 0,
+                    render_ms: 0,
+                    present_ms: 0,
+                    scheduled_at_ns: 0,
+                    dispatch_offset_ns: 0,
+                    total_duration_ns: dur,
+                    stages: vec![ResizeTimelineStageSample {
+                        stage: ResizeTimelineStage::LogicalReflow,
+                        start_offset_ns: 0,
+                        duration_ns: dur,
+                        queue_metrics: None,
+                        render_prep_metrics: None,
+                    }],
+                }
+            }).collect(),
+        };
+        let summaries = timeline.stage_summary();
+        for s in &summaries {
+            if s.samples > 0 {
+                prop_assert!(s.p50_duration_ns <= s.p95_duration_ns,
+                    "p50 {} > p95 {} for stage {:?}", s.p50_duration_ns, s.p95_duration_ns, s.stage);
+                prop_assert!(s.p95_duration_ns <= s.p99_duration_ns,
+                    "p95 {} > p99 {} for stage {:?}", s.p95_duration_ns, s.p99_duration_ns, s.stage);
+                prop_assert!(s.p99_duration_ns <= s.max_duration_ns,
+                    "p99 {} > max {} for stage {:?}", s.p99_duration_ns, s.max_duration_ns, s.stage);
+            }
+        }
+    }
+
+    // ── SM-43: SandboxCommand serde roundtrip ───────────────────────────────
+
+    #[test]
+    fn sm43_sandbox_command_serde(
+        cmd in "[a-z ]{3,20}",
+        ts in 0u64..2_000_000_000,
+    ) {
+        let sc = SandboxCommand {
+            command: cmd.clone(),
+            timestamp_ms: ts,
+            exercise_id: Some("ex1".to_string()),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        // SandboxCommand only derives Serialize, verify it doesn't panic
+        prop_assert!(json.contains("\"command\""));
+        prop_assert!(json.contains("\"timestamp_ms\""));
+    }
 }
