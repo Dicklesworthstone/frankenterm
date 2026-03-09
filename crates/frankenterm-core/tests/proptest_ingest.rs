@@ -14,8 +14,11 @@ use std::collections::HashMap;
 use proptest::prelude::*;
 
 use frankenterm_core::ingest::{
-    CapturedSegmentKind, DiscoveryDiff, ObservationDecision, PaneCursor, PaneFingerprint,
-    PanePriorityOverride, generate_pane_uuid,
+    AltScreenChange, CapturedSegmentKind, DiscoveryDiff, IngestTelemetrySnapshot,
+    ObservationDecision, Osc133Marker, Osc133State, OutputCache, OutputCacheConfig,
+    OverflowPolicy, PaneCursor, PaneFingerprint, PanePriorityOverride, ShellState, StreamChannel,
+    StreamChannelConfig, StreamEvent, StreamIngester, StreamIngesterTelemetrySnapshot,
+    detect_alt_screen_changes, generate_pane_uuid,
 };
 use frankenterm_core::wezterm::PaneInfo;
 
@@ -695,5 +698,410 @@ proptest! {
         let gap = CapturedSegmentKind::Gap { reason };
         let not_equal = delta != gap;
         prop_assert!(not_equal, "Delta should not equal Gap");
+    }
+}
+
+// =============================================================================
+// 8. Additional coverage tests (IN-41 through IN-62)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    // ── IN-41: IngestTelemetrySnapshot serde roundtrip ──────────────────────
+
+    #[test]
+    fn in41_telemetry_snapshot_serde(
+        ticks in 0u64..10000,
+        discovered in 0u64..1000,
+        closed in 0u64..1000,
+    ) {
+        let snap = IngestTelemetrySnapshot {
+            discovery_ticks: ticks,
+            panes_discovered: discovered,
+            panes_closed: closed,
+            generation_changes: 5,
+            metadata_changes: 10,
+            panes_filtered: 2,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: IngestTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&snap, &back);
+    }
+
+    // ── IN-42: OverflowPolicy serde roundtrip ───────────────────────────────
+
+    #[test]
+    fn in42_overflow_policy_serde(idx in 0u8..2) {
+        let policy = match idx {
+            0 => OverflowPolicy::EmitGap,
+            _ => OverflowPolicy::DropOldest,
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: OverflowPolicy = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(policy, back);
+    }
+
+    // ── IN-43: StreamChannelConfig serde roundtrip ──────────────────────────
+
+    #[test]
+    fn in43_stream_channel_config_serde(capacity in 1usize..10000) {
+        let config = StreamChannelConfig {
+            capacity,
+            overflow_policy: OverflowPolicy::EmitGap,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: StreamChannelConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(config.capacity, back.capacity);
+        prop_assert_eq!(config.overflow_policy, back.overflow_policy);
+    }
+
+    // ── IN-44: StreamIngesterTelemetrySnapshot serde roundtrip ──────────────
+
+    #[test]
+    fn in44_stream_ingester_snap_serde(
+        active in 0u64..100,
+        segments in 0u64..10000,
+        gaps in 0u64..1000,
+        overflow in 0u64..50,
+    ) {
+        let snap = StreamIngesterTelemetrySnapshot {
+            active_panes: active,
+            segments_emitted: segments,
+            gaps_emitted: gaps,
+            overflow_pending: overflow,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: StreamIngesterTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&snap, &back);
+    }
+
+    // ── IN-45: ShellState::is_at_prompt ─────────────────────────────────────
+
+    #[test]
+    fn in45_shell_state_at_prompt(idx in 0u8..5) {
+        let state = match idx {
+            0 => ShellState::Unknown,
+            1 => ShellState::PromptActive,
+            2 => ShellState::InputActive,
+            3 => ShellState::CommandRunning,
+            _ => ShellState::CommandFinished { exit_code: Some(0) },
+        };
+        let expected = matches!(
+            state,
+            ShellState::PromptActive | ShellState::InputActive | ShellState::CommandFinished { .. }
+        );
+        prop_assert_eq!(state.is_at_prompt(), expected);
+    }
+
+    // ── IN-46: ShellState::is_command_running ───────────────────────────────
+
+    #[test]
+    fn in46_shell_state_running(idx in 0u8..5) {
+        let state = match idx {
+            0 => ShellState::Unknown,
+            1 => ShellState::PromptActive,
+            2 => ShellState::InputActive,
+            3 => ShellState::CommandRunning,
+            _ => ShellState::CommandFinished { exit_code: None },
+        };
+        let expected = matches!(state, ShellState::CommandRunning);
+        prop_assert_eq!(state.is_command_running(), expected);
+    }
+
+    // ── IN-47: ShellState::is_idle == is_at_prompt ──────────────────────────
+
+    #[test]
+    fn in47_shell_idle_equals_at_prompt(idx in 0u8..5) {
+        let state = match idx {
+            0 => ShellState::Unknown,
+            1 => ShellState::PromptActive,
+            2 => ShellState::InputActive,
+            3 => ShellState::CommandRunning,
+            _ => ShellState::CommandFinished { exit_code: Some(1) },
+        };
+        prop_assert_eq!(state.is_idle(), state.is_at_prompt());
+    }
+
+    // ── IN-48: Osc133State marker processing transitions ────────────────────
+
+    #[test]
+    fn in48_osc133_state_transitions(_dummy in 0u8..1) {
+        let mut s = Osc133State::new();
+        let check_unknown = s.state == ShellState::Unknown;
+        prop_assert!(check_unknown);
+
+        s.process_marker(Osc133Marker::PromptStart);
+        let check_prompt = s.state == ShellState::PromptActive;
+        prop_assert!(check_prompt);
+
+        s.process_marker(Osc133Marker::CommandStart);
+        let check_input = s.state == ShellState::InputActive;
+        prop_assert!(check_input);
+
+        s.process_marker(Osc133Marker::CommandExecuted);
+        let check_running = s.state == ShellState::CommandRunning;
+        prop_assert!(check_running);
+
+        s.process_marker(Osc133Marker::CommandFinished { exit_code: Some(0) });
+        let check_finished = matches!(s.state, ShellState::CommandFinished { exit_code: Some(0) });
+        prop_assert!(check_finished);
+
+        prop_assert_eq!(s.markers_seen, 4);
+        prop_assert_eq!(s.last_exit_code, Some(0));
+    }
+
+    // ── IN-49: Osc133State markers_seen increments ──────────────────────────
+
+    #[test]
+    fn in49_osc133_markers_seen_increments(n in 1usize..20) {
+        let mut s = Osc133State::new();
+        for _ in 0..n {
+            s.process_marker(Osc133Marker::PromptStart);
+        }
+        prop_assert_eq!(s.markers_seen, n as u64);
+    }
+
+    // ── IN-50: OutputCache dedup behavior ───────────────────────────────────
+
+    #[test]
+    fn in50_output_cache_dedup(content in "[a-z]{5,50}") {
+        let mut cache = OutputCache::with_defaults();
+        // First check: new content
+        let first = cache.is_new(1, &content);
+        prop_assert!(first, "first check should be new");
+        // Second check: same content, same pane
+        let second = cache.is_new(1, &content);
+        prop_assert!(!second, "same content should be cached");
+    }
+
+    // ── IN-51: OutputCache different content is always new ──────────────────
+
+    #[test]
+    fn in51_output_cache_different_content(
+        c1 in "alpha[a-z]{5,20}",
+        c2 in "beta[a-z]{5,20}",
+    ) {
+        let mut cache = OutputCache::with_defaults();
+        prop_assert!(cache.is_new(1, &c1));
+        prop_assert!(cache.is_new(1, &c2));
+    }
+
+    // ── IN-52: OutputCache stats track hits and misses ──────────────────────
+
+    #[test]
+    fn in52_output_cache_stats(n in 1usize..10) {
+        let mut cache = OutputCache::with_defaults();
+        // All misses
+        for i in 0..n {
+            cache.is_new(i as u64, &format!("content-{i}"));
+        }
+        let stats = cache.stats();
+        prop_assert_eq!(stats.misses, n as u64);
+        prop_assert_eq!(stats.hits, 0);
+    }
+
+    // ── IN-53: AltScreenChange detection ────────────────────────────────────
+
+    #[test]
+    fn in53_alt_screen_detection(_dummy in 0u8..1) {
+        // Enter via DECSET 1049
+        let changes = detect_alt_screen_changes("\x1b[?1049h");
+        prop_assert_eq!(changes.len(), 1);
+        let is_entered = changes[0] == AltScreenChange::Entered;
+        prop_assert!(is_entered);
+
+        // Exit via DECRST 1049
+        let changes = detect_alt_screen_changes("\x1b[?1049l");
+        prop_assert_eq!(changes.len(), 1);
+        let is_exited = changes[0] == AltScreenChange::Exited;
+        prop_assert!(is_exited);
+
+        // No escape codes
+        let changes = detect_alt_screen_changes("hello world");
+        prop_assert!(changes.is_empty());
+    }
+
+    // ── IN-54: AltScreenChange enter+exit in same string ────────────────────
+
+    #[test]
+    fn in54_alt_screen_enter_exit(content in "[a-z]{0,20}") {
+        let text = format!("{content}\x1b[?1049h{content}\x1b[?1049l{content}");
+        let changes = detect_alt_screen_changes(&text);
+        prop_assert_eq!(changes.len(), 2);
+        let first_enter = changes[0] == AltScreenChange::Entered;
+        let second_exit = changes[1] == AltScreenChange::Exited;
+        prop_assert!(first_enter);
+        prop_assert!(second_exit);
+    }
+
+    // ── IN-55: StreamIngester emits segments with increasing pane_id seqs ──
+
+    #[test]
+    fn in55_stream_ingester_emits_segments(n in 2usize..10) {
+        let mut ingester = StreamIngester::new();
+        let mut seqs: Vec<u64> = Vec::new();
+        for i in 0..n {
+            let segments = ingester.process(StreamEvent::OutputData {
+                pane_id: 1,
+                data: format!("line {i}\n"),
+                received_at: (i as i64) * 1000,
+                overflow: false,
+            });
+            for seg in &segments {
+                seqs.push(seg.seq);
+            }
+        }
+        // All emitted segments should have strictly increasing seq
+        for window in seqs.windows(2) {
+            prop_assert!(window[1] > window[0],
+                "seq must be monotonic: {} should be > {}", window[1], window[0]);
+        }
+    }
+
+    // ── IN-56: StreamIngester overflow produces GAP ─────────────────────────
+
+    #[test]
+    fn in56_stream_ingester_overflow_gap(_dummy in 0u8..1) {
+        let mut ingester = StreamIngester::new();
+        // First normal event
+        let segs1 = ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "first".into(),
+            received_at: 1000,
+            overflow: false,
+        });
+        prop_assert_eq!(segs1.len(), 1);
+
+        // Overflow event
+        let segs2 = ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "after overflow".into(),
+            received_at: 2000,
+            overflow: true,
+        });
+        // Should produce GAP + delta = 2 segments
+        prop_assert_eq!(segs2.len(), 2);
+        let first_is_gap = matches!(segs2[0].kind, CapturedSegmentKind::Gap { .. });
+        prop_assert!(first_is_gap);
+        let second_is_delta = segs2[1].kind == CapturedSegmentKind::Delta;
+        prop_assert!(second_is_delta);
+    }
+
+    // ── IN-57: StreamChannel respects capacity ──────────────────────────────
+
+    #[test]
+    fn in57_stream_channel_capacity(capacity in 1usize..10) {
+        let config = StreamChannelConfig {
+            capacity,
+            overflow_policy: OverflowPolicy::EmitGap,
+        };
+        let mut channel = StreamChannel::new(&config);
+        for i in 0..(capacity + 2) {
+            channel.send(StreamEvent::OutputData {
+                pane_id: 1,
+                data: format!("event {i}"),
+                received_at: i as i64,
+                overflow: false,
+            });
+        }
+        // With EmitGap policy, excess events are dropped
+        // Channel should never exceed capacity
+        let mut count = 0;
+        while channel.recv().is_some() {
+            count += 1;
+        }
+        prop_assert!(count <= capacity, "channel should respect capacity");
+    }
+
+    // ── IN-58: StreamChannel DropOldest evicts oldest ───────────────────────
+
+    #[test]
+    fn in58_stream_channel_drop_oldest(_dummy in 0u8..1) {
+        let config = StreamChannelConfig {
+            capacity: 2,
+            overflow_policy: OverflowPolicy::DropOldest,
+        };
+        let mut channel = StreamChannel::new(&config);
+        // Fill to capacity
+        channel.send(StreamEvent::OutputData {
+            pane_id: 1, data: "first".into(), received_at: 1, overflow: false,
+        });
+        channel.send(StreamEvent::OutputData {
+            pane_id: 1, data: "second".into(), received_at: 2, overflow: false,
+        });
+        // Overflow: should drop "first"
+        channel.send(StreamEvent::OutputData {
+            pane_id: 1, data: "third".into(), received_at: 3, overflow: false,
+        });
+        // recv should give "second" (oldest remaining), then "third"
+        let first_recv = channel.recv().unwrap();
+        if let StreamEvent::OutputData { data, .. } = first_recv {
+            prop_assert_eq!(&data, "second");
+        }
+    }
+
+    // ── IN-59: DiscoveryDiff change_count consistency ───────────────────────
+
+    #[test]
+    fn in59_discovery_diff_count(
+        new in arb_pane_vec(),
+        closed in arb_pane_vec(),
+        changed in arb_pane_vec(),
+        gens in arb_pane_vec(),
+    ) {
+        let diff = DiscoveryDiff {
+            new_panes: new.clone(),
+            closed_panes: closed.clone(),
+            changed_panes: changed.clone(),
+            new_generations: gens.clone(),
+        };
+        let expected = new.len() + closed.len() + changed.len() + gens.len();
+        prop_assert_eq!(diff.change_count(), expected);
+        let should_be_empty = expected == 0;
+        prop_assert_eq!(diff.is_empty(), should_be_empty);
+    }
+
+    // ── IN-60: PanePriorityOverride serde roundtrip ─────────────────────────
+
+    #[test]
+    fn in60_priority_override_serde(prio in arb_priority(), ts in arb_timestamp()) {
+        let ovr = PanePriorityOverride {
+            priority: prio,
+            set_at: ts,
+            expires_at: Some(ts + 60_000),
+        };
+        let json = serde_json::to_string(&ovr).unwrap();
+        let back: PanePriorityOverride = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(ovr.priority, back.priority);
+        prop_assert_eq!(ovr.set_at, back.set_at);
+        prop_assert_eq!(ovr.expires_at, back.expires_at);
+    }
+
+    // ── IN-61: OutputCache LRU eviction ─────────────────────────────────────
+
+    #[test]
+    fn in61_output_cache_lru_eviction(capacity in 2usize..10) {
+        let config = OutputCacheConfig {
+            global_lru_capacity: capacity,
+            per_pane_max_age_ms: 300_000,
+        };
+        let mut cache = OutputCache::new(config);
+        // Fill cache beyond capacity
+        for i in 0..(capacity + 5) {
+            cache.is_new(i as u64, &format!("content-{i}"));
+        }
+        let stats = cache.stats();
+        prop_assert!(stats.global_entries <= capacity);
+    }
+
+    // ── IN-62: ObservationDecision Ignored stores reason ────────────────────
+
+    #[test]
+    fn in62_observation_ignored_reason(reason in arb_reason()) {
+        let decision = ObservationDecision::Ignored { reason: reason.clone() };
+        let is_observed = decision.is_observed();
+        prop_assert!(!is_observed);
+        prop_assert_eq!(decision.ignore_reason(), Some(reason.as_str()));
     }
 }
