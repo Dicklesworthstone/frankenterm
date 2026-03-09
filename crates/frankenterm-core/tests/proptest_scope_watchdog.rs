@@ -510,10 +510,9 @@ proptest! {
         let mut watchdog = ScopeWatchdog::with_config(config);
         let alerts = watchdog.scan(&tree, 50_000);
 
-        let deadlocks: Vec<_> = alerts.iter()
-            .filter(|a| matches!(a.kind, AlertKind::DeadlockRisk { .. }))
-            .collect();
-        prop_assert!(deadlocks.is_empty(), "deadlock detection should be disabled");
+        let has_deadlock = alerts.iter()
+            .any(|a| matches!(a.kind, AlertKind::DeadlockRisk { .. }));
+        prop_assert!(!has_deadlock, "deadlock detection should be disabled");
     }
 
     // ── WatchdogAlert serde roundtrip ──────────────────────────────────
@@ -679,12 +678,10 @@ proptest! {
         let sevs = [AlertSeverity::Info, AlertSeverity::Warning, AlertSeverity::Error, AlertSeverity::Critical];
         let sa = sevs[a];
         let sb = sevs[b];
-        if a < b {
-            prop_assert!(sa < sb);
-        } else if a > b {
-            prop_assert!(sa > sb);
-        } else {
-            prop_assert_eq!(sa, sb);
+        match a.cmp(&b) {
+            std::cmp::Ordering::Less => prop_assert!(sa < sb),
+            std::cmp::Ordering::Greater => prop_assert!(sa > sb),
+            std::cmp::Ordering::Equal => prop_assert_eq!(sa, sb),
         }
     }
 

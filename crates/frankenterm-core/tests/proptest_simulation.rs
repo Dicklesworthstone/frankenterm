@@ -1264,7 +1264,8 @@ proptest! {
             captured_at_ms: 1000,
             executed_resize_events: 5,
             events: (0..5).map(|i| {
-                let dur = [dur_a, dur_b, dur_c, dur_d, dur_e][i];
+                let durs: [u64; 5] = (dur_a, dur_b, dur_c, dur_d, dur_e).into();
+                let dur = durs[i];
                 ResizeTimelineEvent {
                     event_index: i,
                     resize_transaction_id: "t".to_string(),

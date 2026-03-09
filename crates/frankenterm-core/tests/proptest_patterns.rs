@@ -1177,7 +1177,7 @@ proptest! {
         let mut rule = make_anchor_only_rule("r1", "TEST");
         rule.id = rule_id.clone();
         let pack = PatternPack::new(&pack_name, "1.0.0", vec![rule]);
-        let user_packs: std::collections::HashSet<String> = [pack_name].into_iter().collect();
+        let user_packs: std::collections::HashSet<String> = std::iter::once(pack_name).collect();
         let lib = PatternLibrary::new_with_user_packs(vec![pack], &user_packs);
         prop_assert!(lib.is_ok(), "user pack should be accepted: {:?}", lib.err());
         let lib = lib.unwrap();

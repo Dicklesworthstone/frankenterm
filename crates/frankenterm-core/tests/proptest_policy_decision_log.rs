@@ -124,6 +124,7 @@ fn arb_decision_log_snapshot() -> impl Strategy<Value = DecisionLogSnapshot> {
 }
 
 /// Parameters for a record call.
+#[allow(clippy::type_complexity)]
 fn arb_record_params() -> impl Strategy<Value = (u64, ActionKind, ActorKind, PolicySurface, Option<u64>, DecisionOutcome, Option<String>, Option<String>, u32)> {
     (
         any::<u64>(),

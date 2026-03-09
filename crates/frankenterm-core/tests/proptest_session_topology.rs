@@ -21,7 +21,7 @@
 //! 16. PaneNode recursive: pane_count >= 1
 //! 17. TopologySnapshot: captured_at preserved in roundtrip
 //! 18. TopologySnapshot: workspace_id preserved in roundtrip
-//! 19-33: from_panes, match_panes, type tags (existing)
+//!     19-33: from_panes, match_panes, type tags (existing)
 //! 34. LifecycleEntityKind: serde roundtrip + as_str correctness
 //! 35. LifecycleEvent: serde roundtrip (all 10 variants)
 //! 36. SessionLifecycleState: serde roundtrip

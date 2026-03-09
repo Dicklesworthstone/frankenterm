@@ -511,7 +511,7 @@ proptest! {
 
     #[test]
     fn violation_categories_all_distinct(_dummy in 0..1_u32) {
-        let all = vec![
+        let all = [
             ViolationCategory::PathTraversal,
             ViolationCategory::BannedBinary,
             ViolationCategory::UnboundedDeletion,

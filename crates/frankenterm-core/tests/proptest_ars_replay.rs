@@ -574,12 +574,12 @@ proptest! {
         let rate_no = match &session_no.assessment {
             ReplayAssessment::Validated { pass_rate, .. } => *pass_rate,
             ReplayAssessment::Rejected { pass_rate, .. } => *pass_rate,
-            _ => 0.0,
+            ReplayAssessment::InsufficientData { .. } => 0.0,
         };
         let rate_yes = match &session_yes.assessment {
             ReplayAssessment::Validated { pass_rate, .. } => *pass_rate,
             ReplayAssessment::Rejected { pass_rate, .. } => *pass_rate,
-            _ => 0.0,
+            ReplayAssessment::InsufficientData { .. } => 0.0,
         };
         prop_assert!(
             rate_yes >= rate_no - 1e-10,
@@ -740,7 +740,7 @@ proptest! {
             let actual_rate = match &session.assessment {
                 ReplayAssessment::Validated { pass_rate, .. } => *pass_rate,
                 ReplayAssessment::Rejected { pass_rate, .. } => *pass_rate,
-                _ => -1.0,
+                ReplayAssessment::InsufficientData { .. } => -1.0,
             };
             prop_assert!(
                 (actual_rate - expected_rate).abs() < 1e-10,

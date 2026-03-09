@@ -2728,7 +2728,7 @@ impl RulePredicate {
                 Some(text) => {
                     !patterns.is_empty()
                         && patterns.iter().any(|p| {
-                            Regex::new(p).map_or(false, |re| re.is_match(text))
+                            Regex::new(p).is_ok_and(|re| re.is_match(text))
                         })
                 }
                 None => false,

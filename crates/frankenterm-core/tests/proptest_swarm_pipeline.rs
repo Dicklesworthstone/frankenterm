@@ -787,7 +787,7 @@ proptest! {
         for (i, &priority) in priorities.iter().enumerate() {
             registry.register(HookRegistration {
                 name: format!("hook-{i}"),
-                phases: [HookPhase::PreStep].into(),
+                phases: std::iter::once(HookPhase::PreStep).collect(),
                 priority,
                 enabled: true,
                 handler: HookHandler::Custom {
@@ -825,7 +825,7 @@ proptest! {
         for i in 0..n {
             registry.register(HookRegistration {
                 name: format!("hook-{i}"),
-                phases: [HookPhase::PreStep].into(),
+                phases: std::iter::once(HookPhase::PreStep).collect(),
                 priority: 100,
                 enabled: true,
                 handler: HookHandler::Custom {
@@ -851,7 +851,7 @@ proptest! {
         let mut registry = HookRegistry::new();
         registry.register(HookRegistration {
             name: "check".to_string(),
-            phases: [HookPhase::PipelineStart].into(),
+            phases: std::iter::once(HookPhase::PipelineStart).collect(),
             priority: 10,
             enabled: true,
             handler: HookHandler::Precondition {
@@ -883,7 +883,7 @@ proptest! {
         let mut registry = HookRegistry::new();
         registry.register(HookRegistration {
             name: "check".to_string(),
-            phases: [HookPhase::PreStep].into(),
+            phases: std::iter::once(HookPhase::PreStep).collect(),
             priority: 10,
             enabled: true,
             handler: HookHandler::Precondition {
@@ -1105,7 +1105,7 @@ proptest! {
         let mut registry = HookRegistry::new();
         let hook = HookRegistration {
             name: "test-hook".to_string(),
-            phases: [HookPhase::PreStep].into_iter().collect(),
+            phases: std::iter::once(HookPhase::PreStep).collect(),
             priority: 10,
             enabled: true,
             handler: HookHandler::Log {
@@ -1150,7 +1150,7 @@ proptest! {
         let mut registry = HookRegistry::new();
         registry.register(HookRegistration {
             name: "phase-hook".to_string(),
-            phases: [hook_phase].into_iter().collect(),
+            phases: std::iter::once(hook_phase).collect(),
             priority: 10,
             enabled: true,
             handler: HookHandler::Log {
@@ -1229,7 +1229,7 @@ proptest! {
         let step_c = step_with_deps("step-c", vec!["step-a"]);
         let pipeline = simple_pipeline("test", vec![step_a, step_b, step_c]);
 
-        let completed: HashSet<String> = ["step-a".to_string()].into_iter().collect();
+        let completed: HashSet<String> = std::iter::once("step-a".to_string()).collect();
         let ready = pipeline.ready_steps(&completed);
         // Both step-b (idx=1) and step-c (idx=2) should be ready
         prop_assert!(ready.contains(&1), "step-b should be ready");

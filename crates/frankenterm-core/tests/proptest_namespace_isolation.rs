@@ -18,7 +18,7 @@ fn arb_namespace_name() -> impl Strategy<Value = String> {
 }
 
 fn arb_tenant_namespace() -> impl Strategy<Value = TenantNamespace> {
-    arb_namespace_name().prop_filter_map("valid namespace", |name| TenantNamespace::new(name))
+    arb_namespace_name().prop_filter_map("valid namespace", TenantNamespace::new)
 }
 
 fn arb_resource_kind() -> impl Strategy<Value = NamespacedResourceKind> {

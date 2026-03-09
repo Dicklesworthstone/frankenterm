@@ -1136,7 +1136,7 @@ proptest! {
         };
         let mut q = SwarmWorkQueue::new(config);
 
-        for i in 0..(max_concurrent + 1) {
+        for i in 0..=max_concurrent {
             q.enqueue(make_item(&format!("cap-{i}"), 0)).unwrap();
         }
 

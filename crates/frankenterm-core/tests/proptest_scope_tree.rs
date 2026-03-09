@@ -635,7 +635,7 @@ proptest! {
         tree.close(&id, ts + 3).unwrap();
 
         let order = tree.shutdown_order();
-        let contains_closed = order.iter().any(|sid| *sid == id);
+        let contains_closed = order.contains(&id);
         prop_assert!(!contains_closed, "closed scope should not be in shutdown order");
     }
 }

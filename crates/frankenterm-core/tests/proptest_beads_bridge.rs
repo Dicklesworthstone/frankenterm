@@ -509,7 +509,7 @@ proptest! {
         if !detail.is_actionable() {
             return Ok(());
         }
-        let report = resolve_bead_readiness(&[detail.clone()]);
+        let report = resolve_bead_readiness(std::slice::from_ref(&detail));
         prop_assert!(
             report.ready_ids.contains(&detail.id),
             "expected {} to be ready",

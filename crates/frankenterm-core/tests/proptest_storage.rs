@@ -1879,7 +1879,7 @@ proptest! {
 
     #[test]
     fn prop_execution_error_all_variants_distinct(_dummy in 0..1_u8) {
-        let variants = vec![
+        let variants = [
             serde_json::to_string(&MigrationRollbackExecutionError::IndexHealthFailedPostCutover).unwrap(),
             serde_json::to_string(&MigrationRollbackExecutionError::ForensicCaptureMissing).unwrap(),
             serde_json::to_string(&MigrationRollbackExecutionError::ForensicPersistFailed {

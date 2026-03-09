@@ -155,6 +155,7 @@ impl RulePredicate {
 
     /// Negate this predicate.
     #[must_use]
+    #[allow(clippy::should_implement_trait)]
     pub fn not(self) -> Self {
         Self::Not {
             inner: Box::new(self),
@@ -401,7 +402,7 @@ pub fn evaluate_with_trace(pred: &RulePredicate, input: &PolicyInput) -> Predica
             let matched = if pane_ids.is_empty() {
                 true
             } else {
-                input.pane_id.map_or(false, |id| pane_ids.contains(&id))
+                input.pane_id.is_some_and(|id| pane_ids.contains(&id))
             };
             PredicateTrace {
                 description: format!("pane_id_in({pane_ids:?})"),
@@ -417,7 +418,7 @@ pub fn evaluate_with_trace(pred: &RulePredicate, input: &PolicyInput) -> Predica
                 input
                     .pane_title
                     .as_ref()
-                    .map_or(false, |title| patterns.iter().any(|p| match_glob(p, title)))
+                    .is_some_and(|title| patterns.iter().any(|p| match_glob(p, title)))
             };
             PredicateTrace {
                 description: format!("pane_title_glob({patterns:?})"),
@@ -433,7 +434,7 @@ pub fn evaluate_with_trace(pred: &RulePredicate, input: &PolicyInput) -> Predica
                 input
                     .pane_cwd
                     .as_ref()
-                    .map_or(false, |cwd| patterns.iter().any(|p| match_glob(p, cwd)))
+                    .is_some_and(|cwd| patterns.iter().any(|p| match_glob(p, cwd)))
             };
             PredicateTrace {
                 description: format!("pane_cwd_glob({patterns:?})"),
@@ -446,7 +447,7 @@ pub fn evaluate_with_trace(pred: &RulePredicate, input: &PolicyInput) -> Predica
             let matched = if domains.is_empty() {
                 true
             } else {
-                input.domain.as_ref().map_or(false, |d| {
+                input.domain.as_ref().is_some_and(|d| {
                     domains.iter().any(|dom| dom.eq_ignore_ascii_case(d))
                 })
             };
@@ -464,7 +465,7 @@ pub fn evaluate_with_trace(pred: &RulePredicate, input: &PolicyInput) -> Predica
                 input
                     .command_text
                     .as_ref()
-                    .map_or(false, |text| patterns.iter().any(|p| match_regex(p, text)))
+                    .is_some_and(|text| patterns.iter().any(|p| match_regex(p, text)))
             };
             PredicateTrace {
                 description: format!("command_regex({patterns:?})"),
@@ -477,7 +478,7 @@ pub fn evaluate_with_trace(pred: &RulePredicate, input: &PolicyInput) -> Predica
             let matched = if agent_types.is_empty() {
                 true
             } else {
-                input.agent_type.as_ref().map_or(false, |at| {
+                input.agent_type.as_ref().is_some_and(|at| {
                     agent_types.iter().any(|t| t.eq_ignore_ascii_case(at))
                 })
             };
@@ -762,6 +763,7 @@ impl DslTelemetry {
 // =============================================================================
 
 /// Simple glob pattern matching (`*` matches any sequence, `?` matches one char).
+#[allow(clippy::similar_names)]
 fn match_glob(pattern: &str, text: &str) -> bool {
     let pat_bytes = pattern.as_bytes();
     let text_bytes = text.as_bytes();
@@ -996,27 +998,27 @@ fn collect_flat_and_clauses(pred: &RulePredicate, m: &mut crate::config::PolicyR
             true
         }
         RulePredicate::PaneIdIn { pane_ids } => {
-            m.pane_ids = pane_ids.clone();
+            m.pane_ids.clone_from(pane_ids);
             true
         }
         RulePredicate::PaneTitleGlob { patterns } => {
-            m.pane_titles = patterns.clone();
+            m.pane_titles.clone_from(patterns);
             true
         }
         RulePredicate::PaneCwdGlob { patterns } => {
-            m.pane_cwds = patterns.clone();
+            m.pane_cwds.clone_from(patterns);
             true
         }
         RulePredicate::DomainIn { domains } => {
-            m.pane_domains = domains.clone();
+            m.pane_domains.clone_from(domains);
             true
         }
         RulePredicate::CommandRegex { patterns } => {
-            m.command_patterns = patterns.clone();
+            m.command_patterns.clone_from(patterns);
             true
         }
         RulePredicate::AgentTypeIn { agent_types } => {
-            m.agent_types = agent_types.clone();
+            m.agent_types.clone_from(agent_types);
             true
         }
         RulePredicate::And { left, right } => {
