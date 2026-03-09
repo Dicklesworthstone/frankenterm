@@ -241,6 +241,7 @@ pub mod plan;
 #[cfg(feature = "subprocess-bridge")]
 pub mod planner_features;
 pub mod policy;
+pub mod policy_dsl;
 pub mod pool;
 pub mod priority;
 pub mod process_tree;
