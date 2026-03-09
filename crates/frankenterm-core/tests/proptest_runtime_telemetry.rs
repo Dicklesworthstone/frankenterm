@@ -13,8 +13,8 @@ use proptest::prelude::*;
 use frankenterm_core::runtime_telemetry::{
     CancellationTelemetryEmitter, FailureClass, HealthTier, RuntimePhase,
     RuntimeTelemetryEventBuilder, RuntimeTelemetryKind, RuntimeTelemetryLog,
-    RuntimeTelemetryLogConfig, ScopeTelemetryEmitter, TierTransitionRecord, UnifiedTelemetryRecord,
-    UnifiedTelemetrySource,
+    RuntimeTelemetryLogConfig, ScopeTelemetryEmitter, TelemetryLogSnapshot,
+    TierTransitionRecord, UnifiedTelemetryRecord, UnifiedTelemetrySource,
 };
 
 // =============================================================================
@@ -649,5 +649,271 @@ proptest! {
         let expected_evicted = if total > capacity { (total - capacity) as u64 } else { 0 };
         prop_assert_eq!(log.total_evicted(), expected_evicted);
         prop_assert!(log.len() <= capacity);
+    }
+}
+
+// =============================================================================
+// Additional coverage tests (RT-28 through RT-45)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    // ── RT-28: RuntimePhase::is_terminal ────────────────────────────────────
+
+    #[test]
+    fn rt28_phase_is_terminal(phase in arb_runtime_phase()) {
+        let expected = phase == RuntimePhase::Shutdown;
+        prop_assert_eq!(phase.is_terminal(), expected);
+    }
+
+    // ── RT-29: RuntimePhase::is_shutting_down ───────────────────────────────
+
+    #[test]
+    fn rt29_phase_is_shutting_down(phase in arb_runtime_phase()) {
+        let expected = matches!(
+            phase,
+            RuntimePhase::Draining | RuntimePhase::Finalizing | RuntimePhase::Cancelling
+        );
+        prop_assert_eq!(phase.is_shutting_down(), expected);
+    }
+
+    // ── RT-30: HealthTier::requires_attention ───────────────────────────────
+
+    #[test]
+    fn rt30_requires_attention(tier in arb_health_tier()) {
+        let expected = matches!(tier, HealthTier::Red | HealthTier::Black);
+        prop_assert_eq!(tier.requires_attention(), expected);
+    }
+
+    // ── RT-31: FailureClass::is_retryable ───────────────────────────────────
+
+    #[test]
+    fn rt31_is_retryable(fc in arb_failure_class()) {
+        let expected = matches!(fc, FailureClass::Transient | FailureClass::Degraded | FailureClass::Timeout);
+        prop_assert_eq!(fc.is_retryable(), expected);
+    }
+
+    // ── RT-32: UnifiedTelemetrySource serde roundtrip ───────────────────────
+
+    #[test]
+    fn rt32_unified_source_serde(idx in 0u8..3) {
+        let source = match idx {
+            0 => UnifiedTelemetrySource::Runtime,
+            1 => UnifiedTelemetrySource::Connector,
+            _ => UnifiedTelemetrySource::Policy,
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        let back: UnifiedTelemetrySource = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(source, back);
+    }
+
+    // ── RT-33: TelemetryLogSnapshot serde roundtrip ─────────────────────────
+
+    #[test]
+    fn rt33_snapshot_serde(n in 1usize..20) {
+        let mut log = RuntimeTelemetryLog::with_defaults();
+        let tiers = [HealthTier::Green, HealthTier::Yellow, HealthTier::Red, HealthTier::Black];
+        for i in 0..n {
+            log.emit(
+                RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+                    .tier(tiers[i % 4])
+                    .reason("snap")
+            );
+        }
+        let snap = log.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: TelemetryLogSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap.buffered_events, back.buffered_events);
+        prop_assert_eq!(snap.total_emitted, back.total_emitted);
+        prop_assert_eq!(snap.total_evicted, back.total_evicted);
+        prop_assert_eq!(snap.sequence, back.sequence);
+        prop_assert_eq!(snap.tier_counts, back.tier_counts);
+    }
+
+    // ── RT-34: Builder detail_f64 preserves value ───────────────────────────
+
+    #[test]
+    fn rt34_detail_f64(val in -1000.0f64..1000.0) {
+        let event = RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::ResourceObserved)
+            .detail_f64("ratio", val)
+            .build();
+        let stored = event.details.get("ratio").and_then(|v| v.as_f64());
+        prop_assert!(stored.is_some());
+        prop_assert!((stored.unwrap() - val).abs() < 1e-10);
+    }
+
+    // ── RT-35: Builder detail_bool preserves value ──────────────────────────
+
+    #[test]
+    fn rt35_detail_bool(val in any::<bool>()) {
+        let event = RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::ConfigApplied)
+            .detail_bool("flag", val)
+            .build();
+        let stored = event.details.get("flag").and_then(|v| v.as_bool());
+        prop_assert_eq!(stored, Some(val));
+    }
+
+    // ── RT-36: Builder failure() sets failure_class ─────────────────────────
+
+    #[test]
+    fn rt36_builder_failure_class(fc in arb_failure_class()) {
+        let event = RuntimeTelemetryEventBuilder::new("rt.error", RuntimeTelemetryKind::TransientError)
+            .failure(fc)
+            .build();
+        prop_assert_eq!(event.failure_class, Some(fc));
+    }
+
+    // ── RT-37: count_category matches manual filter ─────────────────────────
+
+    #[test]
+    fn rt37_count_category(n in 2usize..20) {
+        let mut log = RuntimeTelemetryLog::with_defaults();
+        let kinds = [
+            RuntimeTelemetryKind::ScopeCreated,
+            RuntimeTelemetryKind::CancellationRequested,
+            RuntimeTelemetryKind::ThrottleApplied,
+            RuntimeTelemetryKind::QueueDepthObserved,
+            RuntimeTelemetryKind::TransientError,
+            RuntimeTelemetryKind::ResourceObserved,
+            RuntimeTelemetryKind::Heartbeat,
+        ];
+        for i in 0..n {
+            log.emit(
+                RuntimeTelemetryEventBuilder::new("rt.test", kinds[i % kinds.len()])
+                    .tier(HealthTier::Green)
+            );
+        }
+        let categories = ["scope", "cancellation", "backpressure", "queue", "error", "resource", "operational"];
+        let mut total = 0usize;
+        for cat in &categories {
+            total += log.count_category(cat);
+        }
+        prop_assert_eq!(total, log.len());
+    }
+
+    // ── RT-38: Disabled log ignores appends ─────────────────────────────────
+
+    #[test]
+    fn rt38_disabled_log(n in 1usize..20) {
+        let config = RuntimeTelemetryLogConfig {
+            max_events: 100,
+            enabled: false,
+        };
+        let mut log = RuntimeTelemetryLog::new(config);
+        for _ in 0..n {
+            let seq = log.emit(
+                RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+                    .reason("disabled")
+            );
+            prop_assert_eq!(seq, 0u64);
+        }
+        prop_assert!(log.is_empty());
+        prop_assert_eq!(log.total_emitted(), 0);
+    }
+
+    // ── RT-39: ScopeTelemetryEmitter produces correct event kinds ───────────
+
+    #[test]
+    fn rt39_scope_emitter_event_kinds(
+        scope_id in "[a-z]{3,8}",
+        corr_id in "[a-z]{3,8}",
+    ) {
+        let emitter = ScopeTelemetryEmitter::new("rt.scope", &scope_id, &corr_id);
+        prop_assert_eq!(emitter.created("daemon").event_kind, RuntimeTelemetryKind::ScopeCreated);
+        prop_assert_eq!(emitter.started().event_kind, RuntimeTelemetryKind::ScopeStarted);
+        prop_assert_eq!(emitter.draining("test").event_kind, RuntimeTelemetryKind::ScopeDraining);
+        prop_assert_eq!(emitter.finalizing(1).event_kind, RuntimeTelemetryKind::ScopeFinalizing);
+        prop_assert_eq!(emitter.closed(100).event_kind, RuntimeTelemetryKind::ScopeClosed);
+    }
+
+    // ── RT-40: CancellationTelemetryEmitter produces correct event kinds ────
+
+    #[test]
+    fn rt40_cancellation_emitter_event_kinds(
+        corr_id in "[a-z]{3,8}",
+    ) {
+        let emitter = CancellationTelemetryEmitter::new("rt.cancel", &corr_id);
+        prop_assert_eq!(
+            emitter.requested("scope", "reason").event_kind,
+            RuntimeTelemetryKind::CancellationRequested
+        );
+        prop_assert_eq!(
+            emitter.propagated("parent", 5).event_kind,
+            RuntimeTelemetryKind::CancellationPropagated
+        );
+        prop_assert_eq!(
+            emitter.grace_expired("scope", 5000).event_kind,
+            RuntimeTelemetryKind::GracePeriodExpired
+        );
+    }
+
+    // ── RT-41: TierTransitionRecord serde roundtrip ─────────────────────────
+
+    #[test]
+    fn rt41_tier_transition_serde(
+        from in arb_health_tier(),
+        to in arb_health_tier(),
+        ts in 1000u64..1_000_000_000,
+        duration in 0u64..100_000,
+    ) {
+        let record = TierTransitionRecord {
+            timestamp_ms: ts,
+            component: "rt.bp".into(),
+            from,
+            to,
+            reason_code: "test".into(),
+            duration_in_previous_ms: duration,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let back: TierTransitionRecord = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(record.from, back.from);
+        prop_assert_eq!(record.to, back.to);
+        prop_assert_eq!(record.timestamp_ms, back.timestamp_ms);
+        prop_assert_eq!(record.duration_in_previous_ms, back.duration_in_previous_ms);
+    }
+
+    // ── RT-42: HealthTier Display lowercase ─────────────────────────────────
+
+    #[test]
+    fn rt42_health_tier_display(tier in arb_health_tier()) {
+        let s = tier.to_string();
+        let expected = match tier {
+            HealthTier::Green => "green",
+            HealthTier::Yellow => "yellow",
+            HealthTier::Red => "red",
+            HealthTier::Black => "black",
+        };
+        prop_assert_eq!(&s, expected);
+    }
+
+    // ── RT-43: RuntimePhase Display non-empty ───────────────────────────────
+
+    #[test]
+    fn rt43_phase_display(phase in arb_runtime_phase()) {
+        let s = phase.to_string();
+        prop_assert!(!s.is_empty());
+    }
+
+    // ── RT-44: FailureClass Display non-empty ───────────────────────────────
+
+    #[test]
+    fn rt44_failure_display(fc in arb_failure_class()) {
+        let s = fc.to_string();
+        prop_assert!(!s.is_empty());
+    }
+
+    // ── RT-45: RuntimeTelemetryLogConfig serde roundtrip ────────────────────
+
+    #[test]
+    fn rt45_config_serde(max_events in 1usize..10000, enabled in any::<bool>()) {
+        let config = RuntimeTelemetryLogConfig {
+            max_events,
+            enabled,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: RuntimeTelemetryLogConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(config.max_events, back.max_events);
+        prop_assert_eq!(config.enabled, back.enabled);
     }
 }
