@@ -22,8 +22,9 @@ use std::collections::{HashMap, HashSet};
 use frankenterm_core::resize_scheduler::{
     ResizeControlPlaneGateState, ResizeDomain, ResizeExecutionPhase, ResizeIntent,
     ResizeLifecycleStage, ResizeOverloadReason, ResizeScheduler, ResizeSchedulerConfig,
-    ResizeSchedulerDebugSnapshot, ResizeSchedulerMetrics, ResizeStalledTransaction,
-    ResizeWorkClass, ScheduleFrameResult, ScheduledResizeWork, SubmitOutcome,
+    ResizeSchedulerDebugSnapshot, ResizeSchedulerMetrics, ResizeSchedulerPaneSnapshot,
+    ResizeSchedulerSnapshot, ResizeStalledTransaction, ResizeWorkClass, ScheduleFrameResult,
+    ScheduledResizeWork, SubmitOutcome,
 };
 use proptest::prelude::*;
 
@@ -1412,5 +1413,134 @@ proptest! {
         prop_assert_eq!(m.over_budget_runs, 0);
         prop_assert_eq!(m.overload_rejected, 0);
         prop_assert_eq!(m.overload_evicted, 0);
+    }
+}
+
+// =============================================================================
+// SubmitOutcome serde roundtrips
+// =============================================================================
+
+fn arb_submit_outcome() -> impl Strategy<Value = SubmitOutcome> {
+    prop_oneof![
+        proptest::option::of(0_u64..10_000)
+            .prop_map(|replaced| SubmitOutcome::Accepted { replaced_pending_seq: replaced }),
+        (0_u64..10_000)
+            .prop_map(|latest_seq| SubmitOutcome::RejectedNonMonotonic { latest_seq }),
+        (0_usize..100, proptest::option::of((0_u64..10_000, 0_u64..10_000)))
+            .prop_map(|(pending_total, evicted)| SubmitOutcome::DroppedOverload {
+                pending_total,
+                evicted_pending: evicted,
+            }),
+        any::<bool>()
+            .prop_map(|fb| SubmitOutcome::SuppressedByKillSwitch { legacy_fallback: fb }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_submit_outcome_serde(outcome in arb_submit_outcome()) {
+        let json = serde_json::to_string(&outcome).unwrap();
+        let back: SubmitOutcome = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, outcome);
+    }
+
+    #[test]
+    fn prop_submit_outcome_tagged(outcome in arb_submit_outcome()) {
+        let json = serde_json::to_string(&outcome).unwrap();
+        prop_assert!(json.contains("\"status\""), "tagged enum should contain status key: {}", json);
+    }
+}
+
+// =============================================================================
+// ResizeSchedulerPaneSnapshot serde roundtrip
+// =============================================================================
+
+fn arb_pane_snapshot() -> impl Strategy<Value = ResizeSchedulerPaneSnapshot> {
+    (
+        0_u64..10_000,
+        proptest::option::of(0_u64..10_000),
+        proptest::option::of(0_u64..10_000),
+        proptest::option::of(arb_work_class()),
+        proptest::option::of(0_u64..10_000),
+        proptest::option::of(arb_execution_phase()),
+        proptest::option::of(0_u64..2_000_000_000_000),
+        0_u32..100,
+        0_u32..100,
+    )
+        .prop_map(
+            |(pane_id, latest, pending, p_class, active, a_phase, a_started, deferrals, aging)| {
+                ResizeSchedulerPaneSnapshot {
+                    pane_id,
+                    latest_seq: latest,
+                    pending_seq: pending,
+                    pending_class: p_class,
+                    active_seq: active,
+                    active_phase: a_phase,
+                    active_phase_started_at_ms: a_started,
+                    deferrals,
+                    aging_credit: aging,
+                }
+            },
+        )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_pane_snapshot_serde(snap in arb_pane_snapshot()) {
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ResizeSchedulerPaneSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, snap);
+    }
+}
+
+// =============================================================================
+// ResizeSchedulerSnapshot serde roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn prop_scheduler_snapshot_serde(
+        config in arb_scheduler_config(),
+        metrics in arb_resize_metrics(),
+        pending in 0_usize..50,
+        active in 0_usize..10,
+        panes in proptest::collection::vec(arb_pane_snapshot(), 0..3),
+    ) {
+        let snap = ResizeSchedulerSnapshot {
+            config,
+            metrics,
+            pending_total: pending,
+            active_total: active,
+            panes,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ResizeSchedulerSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn prop_scheduler_snapshot_json_keys(
+        config in arb_scheduler_config(),
+        metrics in arb_resize_metrics(),
+    ) {
+        let snap = ResizeSchedulerSnapshot {
+            config,
+            metrics,
+            pending_total: 5,
+            active_total: 2,
+            panes: vec![],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = val.as_object().unwrap();
+        prop_assert!(obj.contains_key("config"));
+        prop_assert!(obj.contains_key("metrics"));
+        prop_assert!(obj.contains_key("panes"));
     }
 }
