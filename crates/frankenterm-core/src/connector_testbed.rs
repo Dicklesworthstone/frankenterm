@@ -805,7 +805,7 @@ mod tests {
         assert_eq!(p.provider_id, "github");
         assert!(p.online);
         assert_eq!(p.requests_received, 0);
-        assert_eq!(p.failure_ratio(), 0.0);
+        assert!((p.failure_ratio() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -841,7 +841,7 @@ mod tests {
         let mut p = MockProvider::new("github").with_failure_rate(100);
         let outcome = p.receive_request("conn-1", "invoke", 1000, 50);
         assert_eq!(outcome, MockProviderOutcome::SimulatedFailure);
-        assert_eq!(p.failure_ratio(), 1.0);
+        assert!((p.failure_ratio() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

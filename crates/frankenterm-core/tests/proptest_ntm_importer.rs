@@ -277,21 +277,21 @@ proptest! {
     fn session_import_produces_at_least_one_profile(session in arb_ntm_session()) {
         let importer = NtmImporter::new();
         let bundle = importer.import(&[session], &[], None);
-        prop_assert!(bundle.session_profiles.len() >= 1);
+        prop_assert!(!bundle.session_profiles.is_empty());
         prop_assert_eq!(bundle.report.total_items, 1);
     }
 
     #[test]
     fn session_import_layout_count_matches_window_count(session in arb_ntm_session()) {
         let importer = NtmImporter::new();
-        let bundle = importer.import(&[session.clone()], &[], None);
+        let bundle = importer.import(std::slice::from_ref(&session), &[], None);
         prop_assert_eq!(bundle.layout_templates.len(), session.windows.len());
     }
 
     #[test]
     fn workflow_import_preserves_step_count(workflow in arb_ntm_workflow()) {
         let importer = NtmImporter::new();
-        let bundle = importer.import(&[], &[workflow.clone()], None);
+        let bundle = importer.import(&[], std::slice::from_ref(&workflow), None);
         prop_assert_eq!(bundle.workflows.len(), 1);
         prop_assert_eq!(bundle.workflows[0].steps.len(), workflow.steps.len());
     }
@@ -299,7 +299,7 @@ proptest! {
     #[test]
     fn workflow_timeout_converts_to_ms(workflow in arb_ntm_workflow()) {
         let importer = NtmImporter::new();
-        let bundle = importer.import(&[], &[workflow.clone()], None);
+        let bundle = importer.import(&[], std::slice::from_ref(&workflow), None);
         let tw = &bundle.workflows[0];
         prop_assert_eq!(tw.timeout_ms, workflow.timeout_secs * 1000);
     }
@@ -343,7 +343,7 @@ proptest! {
     #[test]
     fn layout_template_min_panes_matches_actual(session in arb_ntm_session()) {
         let importer = NtmImporter::new();
-        let bundle = importer.import(&[session.clone()], &[], None);
+        let bundle = importer.import(std::slice::from_ref(&session), &[], None);
         for (i, template) in bundle.layout_templates.iter().enumerate() {
             if i < session.windows.len() {
                 let expected = session.windows[i].panes.len().max(1) as u32;

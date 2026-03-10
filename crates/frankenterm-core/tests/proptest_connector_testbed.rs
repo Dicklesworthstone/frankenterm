@@ -370,7 +370,7 @@ proptest! {
     #[test]
     fn mock_provider_zero_requests_zero_ratio(id in "[a-z]{1,8}") {
         let p = MockProvider::new(id);
-        prop_assert_eq!(p.failure_ratio(), 0.0);
+        prop_assert!((p.failure_ratio() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]

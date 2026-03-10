@@ -143,7 +143,7 @@ proptest! {
         Just(r#"{"record_allows":true}"#.to_string()),
     ]) {
         let config: AuditChainConfig = serde_json::from_str(&json_subset).unwrap();
-        prop_assert!(config.max_entries > 0 || config.max_entries == 0);
+        prop_assert!(config.max_entries <= 100_000);
     }
 
     #[test]
@@ -152,7 +152,7 @@ proptest! {
         let mut chain = AuditChain::from_config(&config);
         // Even with max_entries=0, chain accepts at least 1 entry
         chain.append(AuditEntryKind::PolicyDecision, "sys", "d", "r", 1000);
-        prop_assert!(chain.len() >= 1);
+        prop_assert!(!chain.is_empty());
     }
 
     #[test]
@@ -173,7 +173,7 @@ proptest! {
         }
         let snap = chain.telemetry_snapshot(0);
         prop_assert_eq!(snap.counters.entries_appended, inserts as u64);
-        let expected_evicted = if inserts > capacity { inserts - capacity } else { 0 };
+        let expected_evicted = inserts.saturating_sub(capacity);
         prop_assert_eq!(snap.counters.entries_evicted, expected_evicted as u64);
         prop_assert_eq!(chain.len(), inserts.min(capacity));
     }

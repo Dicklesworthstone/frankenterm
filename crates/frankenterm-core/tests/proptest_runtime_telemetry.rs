@@ -1004,7 +1004,7 @@ proptest! {
         now_ms in 0..u64::MAX / 2,
     ) {
         use frankenterm_core::policy_compliance::*;
-        let mut engine = ComplianceEngine::new(100, 3600_000);
+        let mut engine = ComplianceEngine::new(100, 3_600_000);
         engine.record_evaluation(denied);
         let snap = engine.snapshot(now_ms);
         let record = UnifiedTelemetryRecord::from_compliance_snapshot(&snap);

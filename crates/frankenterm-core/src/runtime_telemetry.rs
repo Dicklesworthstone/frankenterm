@@ -3942,7 +3942,7 @@ mod tests {
     #[test]
     fn compliance_snapshot_adapter_compliant() {
         use crate::policy_compliance::*;
-        let mut engine = ComplianceEngine::new(100, 3600_000);
+        let mut engine = ComplianceEngine::new(100, 3_600_000);
         engine.record_evaluation(false); // not denied
         let snap = engine.snapshot(5000);
         let record = UnifiedTelemetryRecord::from_compliance_snapshot(&snap);
@@ -3958,7 +3958,7 @@ mod tests {
     #[test]
     fn compliance_snapshot_from_trait() {
         use crate::policy_compliance::*;
-        let mut engine = ComplianceEngine::new(100, 3600_000);
+        let mut engine = ComplianceEngine::new(100, 3_600_000);
         let snap = engine.snapshot(5000);
         let record = UnifiedTelemetryRecord::from(&snap);
         assert_eq!(record.component, "policy.compliance_engine");

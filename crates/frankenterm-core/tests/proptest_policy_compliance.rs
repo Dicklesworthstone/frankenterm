@@ -6,7 +6,6 @@
 
 use frankenterm_core::policy_compliance::*;
 use proptest::prelude::*;
-use std::collections::BTreeMap;
 
 // =============================================================================
 // Strategies
@@ -208,9 +207,9 @@ proptest! {
         Just(r#"{"sla_threshold_ms":5000}"#.to_string()),
     ]) {
         let config: ComplianceConfig = serde_json::from_str(&json_subset).unwrap();
-        // Defaults should be reasonable
-        prop_assert!(config.max_violations > 0 || config.max_violations == 0);
-        prop_assert!(config.sla_threshold_ms > 0 || config.sla_threshold_ms == 0);
+        // Deserialized config should have reasonable values
+        prop_assert!(config.max_violations <= 10_000);
+        prop_assert!(config.sla_threshold_ms <= 86_400_000);
     }
 
     #[test]

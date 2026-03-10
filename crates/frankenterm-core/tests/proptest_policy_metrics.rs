@@ -1,7 +1,6 @@
 //! Property tests for policy_metrics module types and behavioral invariants.
 
 use proptest::prelude::*;
-use serde_json;
 use std::collections::BTreeMap;
 
 use frankenterm_core::policy_metrics::{
@@ -168,7 +167,7 @@ fn arb_policy_metrics_dashboard() -> impl Strategy<Value = PolicyMetricsDashboar
         )
 }
 
-fn arb_subsystem_input() -> impl Strategy<Value = PolicySubsystemInput> {
+fn _arb_subsystem_input() -> impl Strategy<Value = PolicySubsystemInput> {
     (any::<u64>(), any::<u64>(), any::<u32>(), any::<u32>()).prop_map(
         |(evaluations, denials, active_quarantines, active_violations)| PolicySubsystemInput {
             evaluations,
@@ -368,7 +367,7 @@ proptest! {
         // We can always push at least one
         let mut ts = ts;
         ts.push(1000, 42);
-        prop_assert!(ts.len() >= 1);
+        prop_assert!(!ts.is_empty());
     }
 }
 
