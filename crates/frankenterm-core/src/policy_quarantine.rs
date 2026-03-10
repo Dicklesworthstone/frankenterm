@@ -393,10 +393,36 @@ pub struct QuarantineTelemetrySnapshot {
 }
 
 // =============================================================================
+// Configuration
+// =============================================================================
+
+/// Configuration for the quarantine subsystem.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct QuarantineConfig {
+    /// Maximum number of audit events to retain (oldest evicted first).
+    pub max_audit_events: usize,
+    /// Whether to auto-expire quarantines on each authorize() tick.
+    pub auto_expire: bool,
+    /// Default quarantine severity when not explicitly specified.
+    pub default_severity: QuarantineSeverity,
+}
+
+impl Default for QuarantineConfig {
+    fn default() -> Self {
+        Self {
+            max_audit_events: 512,
+            auto_expire: true,
+            default_severity: QuarantineSeverity::Restricted,
+        }
+    }
+}
+
+// =============================================================================
 // Quarantine registry
 // =============================================================================
 
-const MAX_AUDIT_EVENTS: usize = 512;
+const DEFAULT_MAX_AUDIT_EVENTS: usize = 512;
 
 /// Error types for quarantine operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
