@@ -46,13 +46,19 @@ pub struct ForensicRecord {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ForensicActor {
     /// A human operator.
-    Operator { operator_id: String, session_id: String },
+    Operator {
+        operator_id: String,
+        session_id: String,
+    },
     /// An AI agent.
     Agent { agent_id: String, model: String },
     /// The system itself (automated).
     System { subsystem: String },
     /// A connector acting on behalf of an external service.
-    Connector { connector_id: String, provider: String },
+    Connector {
+        connector_id: String,
+        provider: String,
+    },
 }
 
 impl fmt::Display for ForensicActor {
@@ -71,23 +77,41 @@ impl fmt::Display for ForensicActor {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ForensicAction {
     /// Text or command sent to a terminal pane.
-    PaneWrite { pane_id: String, command_summary: String },
+    PaneWrite {
+        pane_id: String,
+        command_summary: String,
+    },
     /// Workflow started, stopped, or modified.
-    WorkflowLifecycle { workflow_id: String, transition: String },
+    WorkflowLifecycle {
+        workflow_id: String,
+        transition: String,
+    },
     /// Policy rule was evaluated.
     PolicyEvaluation { rule_id: String, surface: String },
     /// Connector dispatched an outbound action.
-    ConnectorDispatch { connector_id: String, action_type: String },
+    ConnectorDispatch {
+        connector_id: String,
+        action_type: String,
+    },
     /// Credential was issued, rotated, or revoked.
-    CredentialAction { credential_id: String, action_type: String },
+    CredentialAction {
+        credential_id: String,
+        action_type: String,
+    },
     /// Quarantine state was changed.
-    QuarantineChange { component_id: String, new_state: String },
+    QuarantineChange {
+        component_id: String,
+        new_state: String,
+    },
     /// Kill switch was tripped or reset.
     KillSwitchChange { new_level: String },
     /// Configuration was modified.
     ConfigChange { config_key: String },
     /// Session lifecycle (connect, disconnect, resume).
-    SessionLifecycle { session_id: String, transition: String },
+    SessionLifecycle {
+        session_id: String,
+        transition: String,
+    },
     /// Custom action for extensibility.
     Custom { category: String, detail: String },
 }
@@ -134,7 +158,10 @@ pub enum ForensicTarget {
     /// A policy rule.
     PolicyRule { rule_id: String },
     /// A component (for quarantine operations).
-    Component { component_id: String, component_kind: String },
+    Component {
+        component_id: String,
+        component_kind: String,
+    },
     /// The system itself.
     System { subsystem: String },
 }
@@ -439,9 +466,7 @@ impl ForensicStore {
         self.telemetry.exports_completed += 1;
 
         match format {
-            ExportFormat::Json => {
-                serde_json::to_string_pretty(&result.records).unwrap_or_default()
-            }
+            ExportFormat::Json => serde_json::to_string_pretty(&result.records).unwrap_or_default(),
             ExportFormat::Jsonl => result
                 .records
                 .iter()
@@ -535,10 +560,7 @@ impl ForensicStore {
 
         // Text search in metadata values
         if let Some(ref text) = q.text_search {
-            let found = record
-                .metadata
-                .values()
-                .any(|v| v.contains(text.as_str()));
+            let found = record.metadata.values().any(|v| v.contains(text.as_str()));
             if !found {
                 return false;
             }
@@ -628,7 +650,11 @@ mod tests {
     fn eviction_on_capacity() {
         let mut store = ForensicStore::new(3);
         for i in 0..5 {
-            store.ingest(make_record(&format!("r{i}"), i * 1000, SensitivityLevel::Public));
+            store.ingest(make_record(
+                &format!("r{i}"),
+                i * 1000,
+                SensitivityLevel::Public,
+            ));
         }
         assert_eq!(store.len(), 3);
         let result = store.query(&ForensicQuery::default());
@@ -698,7 +724,11 @@ mod tests {
     fn pagination() {
         let mut store = ForensicStore::new(100);
         for i in 0..10 {
-            store.ingest(make_record(&format!("r{i}"), i * 1000, SensitivityLevel::Public));
+            store.ingest(make_record(
+                &format!("r{i}"),
+                i * 1000,
+                SensitivityLevel::Public,
+            ));
         }
 
         let page1 = store.query(&ForensicQuery {
@@ -757,7 +787,8 @@ mod tests {
     fn text_search_in_metadata() {
         let mut store = ForensicStore::new(100);
         let mut r1 = make_record("r1", 1000, SensitivityLevel::Public);
-        r1.metadata.insert("command".to_string(), "rm -rf /".to_string());
+        r1.metadata
+            .insert("command".to_string(), "rm -rf /".to_string());
         store.ingest(r1);
 
         store.ingest(make_record("r2", 2000, SensitivityLevel::Public));
@@ -774,7 +805,8 @@ mod tests {
     fn redact_above_threshold() {
         let mut store = ForensicStore::new(100);
         let mut r1 = make_record("r1", 1000, SensitivityLevel::Confidential);
-        r1.metadata.insert("secret".to_string(), "value".to_string());
+        r1.metadata
+            .insert("secret".to_string(), "value".to_string());
         store.ingest(r1);
 
         store.ingest(make_record("r2", 2000, SensitivityLevel::Public));
@@ -820,7 +852,10 @@ mod tests {
 
         let csv = store.export(&ForensicQuery::default(), ExportFormat::Csv);
         let lines: Vec<&str> = csv.lines().collect();
-        assert_eq!(lines[0], "record_id,timestamp_ms,actor,action,verdict,outcome,sensitivity");
+        assert_eq!(
+            lines[0],
+            "record_id,timestamp_ms,actor,action,verdict,outcome,sensitivity"
+        );
         assert!(lines[1].starts_with("r1,1000,"));
     }
 
@@ -955,7 +990,11 @@ mod tests {
     fn telemetry_snapshot_accurate() {
         let mut store = ForensicStore::new(5);
         for i in 0..7 {
-            store.ingest(make_record(&format!("r{i}"), i * 1000, SensitivityLevel::Public));
+            store.ingest(make_record(
+                &format!("r{i}"),
+                i * 1000,
+                SensitivityLevel::Public,
+            ));
         }
         store.query(&ForensicQuery::default());
         store.query(&ForensicQuery::default());

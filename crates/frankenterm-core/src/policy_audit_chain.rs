@@ -207,7 +207,8 @@ impl AuditChain {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
 
-        let content_hash = Self::hash_content(sequence, timestamp_ms, kind, actor, description, entity_ref);
+        let content_hash =
+            Self::hash_content(sequence, timestamp_ms, kind, actor, description, entity_ref);
         let previous_hash = self.last_hash.clone();
         let chain_hash = Self::hash_chain(&content_hash, &previous_hash);
 
@@ -560,11 +561,13 @@ mod tests {
         let result = chain.verify();
         assert!(!result.valid);
         assert_eq!(result.first_invalid_at, Some(0));
-        assert!(result
-            .failure_reason
-            .as_ref()
-            .unwrap()
-            .contains("content hash"));
+        assert!(
+            result
+                .failure_reason
+                .as_ref()
+                .unwrap()
+                .contains("content hash")
+        );
     }
 
     #[test]
@@ -593,11 +596,13 @@ mod tests {
         let result = chain.verify();
         assert!(!result.valid);
         assert_eq!(result.first_invalid_at, Some(1));
-        assert!(result
-            .failure_reason
-            .as_ref()
-            .unwrap()
-            .contains("previous hash"));
+        assert!(
+            result
+                .failure_reason
+                .as_ref()
+                .unwrap()
+                .contains("previous hash")
+        );
     }
 
     #[test]
@@ -672,33 +677,15 @@ mod tests {
 
     #[test]
     fn content_hash_deterministic() {
-        let h1 = AuditChain::hash_content(
-            0,
-            1000,
-            AuditEntryKind::PolicyDecision,
-            "sys",
-            "test",
-            "r1",
-        );
-        let h2 = AuditChain::hash_content(
-            0,
-            1000,
-            AuditEntryKind::PolicyDecision,
-            "sys",
-            "test",
-            "r1",
-        );
+        let h1 =
+            AuditChain::hash_content(0, 1000, AuditEntryKind::PolicyDecision, "sys", "test", "r1");
+        let h2 =
+            AuditChain::hash_content(0, 1000, AuditEntryKind::PolicyDecision, "sys", "test", "r1");
         assert_eq!(h1, h2);
 
         // Different input → different hash
-        let h3 = AuditChain::hash_content(
-            1,
-            1000,
-            AuditEntryKind::PolicyDecision,
-            "sys",
-            "test",
-            "r1",
-        );
+        let h3 =
+            AuditChain::hash_content(1, 1000, AuditEntryKind::PolicyDecision, "sys", "test", "r1");
         assert_ne!(h1, h3);
     }
 
@@ -735,7 +722,13 @@ mod tests {
     fn get_by_sequence_after_eviction() {
         let mut chain = AuditChain::new(3);
         for i in 0..5 {
-            chain.append(AuditEntryKind::PolicyDecision, "sys", &format!("d{i}"), "r", i * 100);
+            chain.append(
+                AuditEntryKind::PolicyDecision,
+                "sys",
+                &format!("d{i}"),
+                "r",
+                i * 100,
+            );
         }
         // Sequences 0 and 1 are evicted
         assert!(chain.get_by_sequence(0).is_none());
@@ -747,7 +740,13 @@ mod tests {
     fn verify_chain_after_eviction_uses_local_hashes() {
         let mut chain = AuditChain::new(3);
         for i in 0..5 {
-            chain.append(AuditEntryKind::PolicyDecision, "sys", &format!("d{i}"), "r", i * 100);
+            chain.append(
+                AuditEntryKind::PolicyDecision,
+                "sys",
+                &format!("d{i}"),
+                "r",
+                i * 100,
+            );
         }
         // After eviction, the remaining entries still form a valid sub-chain
         // but the first remaining entry's previous_hash points to a now-evicted entry
@@ -764,7 +763,13 @@ mod tests {
     fn telemetry_snapshot_accurate() {
         let mut chain = AuditChain::new(5);
         for i in 0..7 {
-            chain.append(AuditEntryKind::PolicyDecision, "sys", &format!("d{i}"), "r", i * 100);
+            chain.append(
+                AuditEntryKind::PolicyDecision,
+                "sys",
+                &format!("d{i}"),
+                "r",
+                i * 100,
+            );
         }
         chain.verify();
         chain.export_json();
@@ -781,7 +786,10 @@ mod tests {
 
     #[test]
     fn entry_kind_display() {
-        assert_eq!(AuditEntryKind::PolicyDecision.to_string(), "policy_decision");
+        assert_eq!(
+            AuditEntryKind::PolicyDecision.to_string(),
+            "policy_decision"
+        );
         assert_eq!(
             AuditEntryKind::QuarantineAction.to_string(),
             "quarantine_action"
@@ -802,7 +810,10 @@ mod tests {
             AuditEntryKind::CredentialAction.to_string(),
             "credential_action"
         );
-        assert_eq!(AuditEntryKind::ForensicExport.to_string(), "forensic_export");
+        assert_eq!(
+            AuditEntryKind::ForensicExport.to_string(),
+            "forensic_export"
+        );
         assert_eq!(AuditEntryKind::ConfigChange.to_string(), "config_change");
     }
 

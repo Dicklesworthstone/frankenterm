@@ -2,8 +2,8 @@ use crate::sshd::*;
 use assert_fs::prelude::*;
 use assert_fs::TempDir;
 use frankenterm_ssh::runtime::block_on;
+use frankenterm_ssh::runtime::io::{AsyncReadExt, AsyncWriteExt};
 use rstest::*;
-use smol::io::{AsyncReadExt, AsyncWriteExt};
 use std::convert::TryInto;
 use std::path::PathBuf;
 

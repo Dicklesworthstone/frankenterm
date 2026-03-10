@@ -521,8 +521,7 @@ impl QuarantineRegistry {
             quarantine_count: quarantine_count + 1,
         };
 
-        self.components
-            .insert(component_id.to_string(), component);
+        self.components.insert(component_id.to_string(), component);
         self.telemetry.quarantines_imposed += 1;
 
         self.emit_audit(QuarantineAuditEvent {
@@ -546,12 +545,11 @@ impl QuarantineRegistry {
         now_ms: u64,
     ) -> Result<(), QuarantineError> {
         let (component_kind, audit_type) = {
-            let component =
-                self.components
-                    .get_mut(component_id)
-                    .ok_or_else(|| QuarantineError::ComponentNotFound {
-                        component_id: component_id.to_string(),
-                    })?;
+            let component = self.components.get_mut(component_id).ok_or_else(|| {
+                QuarantineError::ComponentNotFound {
+                    component_id: component_id.to_string(),
+                }
+            })?;
 
             if component.state != QuarantineState::Quarantined {
                 return Err(QuarantineError::NotQuarantined {
@@ -603,12 +601,11 @@ impl QuarantineRegistry {
         now_ms: u64,
     ) -> Result<(), QuarantineError> {
         let component_kind = {
-            let component =
-                self.components
-                    .get_mut(component_id)
-                    .ok_or_else(|| QuarantineError::ComponentNotFound {
-                        component_id: component_id.to_string(),
-                    })?;
+            let component = self.components.get_mut(component_id).ok_or_else(|| {
+                QuarantineError::ComponentNotFound {
+                    component_id: component_id.to_string(),
+                }
+            })?;
 
             if component.state != QuarantineState::ProbationaryRelease {
                 return Err(QuarantineError::NotQuarantined {
@@ -642,12 +639,11 @@ impl QuarantineRegistry {
         now_ms: u64,
     ) -> Result<(), QuarantineError> {
         let component_kind = {
-            let component =
-                self.components
-                    .get_mut(component_id)
-                    .ok_or_else(|| QuarantineError::ComponentNotFound {
-                        component_id: component_id.to_string(),
-                    })?;
+            let component = self.components.get_mut(component_id).ok_or_else(|| {
+                QuarantineError::ComponentNotFound {
+                    component_id: component_id.to_string(),
+                }
+            })?;
 
             if component.state != QuarantineState::ProbationaryRelease {
                 return Err(QuarantineError::NotQuarantined {
@@ -684,12 +680,11 @@ impl QuarantineRegistry {
         now_ms: u64,
     ) -> Result<QuarantineSeverity, QuarantineError> {
         let (component_kind, new_severity) = {
-            let component =
-                self.components
-                    .get_mut(component_id)
-                    .ok_or_else(|| QuarantineError::ComponentNotFound {
-                        component_id: component_id.to_string(),
-                    })?;
+            let component = self.components.get_mut(component_id).ok_or_else(|| {
+                QuarantineError::ComponentNotFound {
+                    component_id: component_id.to_string(),
+                }
+            })?;
 
             let new_severity = match component.severity {
                 QuarantineSeverity::Advisory => QuarantineSeverity::Restricted,
@@ -724,12 +719,11 @@ impl QuarantineRegistry {
         now_ms: u64,
     ) -> Result<QuarantineSeverity, QuarantineError> {
         let (component_kind, new_severity) = {
-            let component =
-                self.components
-                    .get_mut(component_id)
-                    .ok_or_else(|| QuarantineError::ComponentNotFound {
-                        component_id: component_id.to_string(),
-                    })?;
+            let component = self.components.get_mut(component_id).ok_or_else(|| {
+                QuarantineError::ComponentNotFound {
+                    component_id: component_id.to_string(),
+                }
+            })?;
 
             let new_severity = match component.severity {
                 QuarantineSeverity::Advisory => return Err(QuarantineError::AlreadyMinSeverity),

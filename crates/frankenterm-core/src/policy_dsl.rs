@@ -447,9 +447,10 @@ pub fn evaluate_with_trace(pred: &RulePredicate, input: &PolicyInput) -> Predica
             let matched = if domains.is_empty() {
                 true
             } else {
-                input.domain.as_ref().is_some_and(|d| {
-                    domains.iter().any(|dom| dom.eq_ignore_ascii_case(d))
-                })
+                input
+                    .domain
+                    .as_ref()
+                    .is_some_and(|d| domains.iter().any(|dom| dom.eq_ignore_ascii_case(d)))
             };
             PredicateTrace {
                 description: format!("domain_in({domains:?})"),
@@ -478,9 +479,10 @@ pub fn evaluate_with_trace(pred: &RulePredicate, input: &PolicyInput) -> Predica
             let matched = if agent_types.is_empty() {
                 true
             } else {
-                input.agent_type.as_ref().is_some_and(|at| {
-                    agent_types.iter().any(|t| t.eq_ignore_ascii_case(at))
-                })
+                input
+                    .agent_type
+                    .as_ref()
+                    .is_some_and(|at| agent_types.iter().any(|t| t.eq_ignore_ascii_case(at)))
             };
             PredicateTrace {
                 description: format!("agent_type_in({agent_types:?})"),

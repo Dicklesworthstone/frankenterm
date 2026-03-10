@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use crate::connector_credential_broker::{CredentialScope, CredentialSensitivity};
 use crate::connector_host_runtime::{ConnectorCapability, ConnectorSandboxZone};
 use crate::policy::{
     ActionKind as PolicyActionKind, ActorKind, PaneCapabilities, PolicyDecision, PolicyEngine,
@@ -310,6 +311,124 @@ pub struct ConnectorAction {
     pub params: serde_json::Value,
     /// Timestamp when the action was created.
     pub created_at_ms: u64,
+}
+
+/// Supported credential-broker operations for connector actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorCredentialOperation {
+    Lease,
+    Rotate,
+    RevokeLease,
+    RevokeCredential,
+}
+
+/// Typed payload for connector credential actions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectorCredentialActionRequest {
+    pub operation: ConnectorCredentialOperation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CredentialScope>,
+    #[serde(default = "default_connector_credential_sensitivity")]
+    pub sensitivity: CredentialSensitivity,
+}
+
+fn default_connector_credential_sensitivity() -> CredentialSensitivity {
+    CredentialSensitivity::Medium
+}
+
+impl ConnectorCredentialActionRequest {
+    fn from_payload(payload: &serde_json::Value) -> Result<Self, String> {
+        let request: Self = serde_json::from_value(payload.clone())
+            .map_err(|err| format!("invalid credential action payload: {err}"))?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        match self.operation {
+            ConnectorCredentialOperation::Lease
+            | ConnectorCredentialOperation::Rotate
+            | ConnectorCredentialOperation::RevokeCredential => {
+                if self.credential_id.as_deref().is_none_or(str::is_empty) {
+                    return Err("credential_id is required".to_string());
+                }
+            }
+            ConnectorCredentialOperation::RevokeLease => {
+                if self.lease_id.as_deref().is_none_or(str::is_empty) {
+                    return Err("lease_id is required".to_string());
+                }
+            }
+        }
+
+        let Some(scope) = &self.scope else {
+            return Err("scope is required".to_string());
+        };
+        if scope.provider.trim().is_empty() {
+            return Err("scope.provider must not be empty".to_string());
+        }
+        if scope.resource.trim().is_empty() {
+            return Err("scope.resource must not be empty".to_string());
+        }
+        if scope.operations.is_empty() || scope.operations.iter().any(|op| op.trim().is_empty()) {
+            return Err(
+                "scope.operations must contain at least one non-empty operation".to_string(),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn policy_scope(&self) -> &CredentialScope {
+        self.scope
+            .as_ref()
+            .expect("validated credential action request must contain scope")
+    }
+
+    fn summary(&self, connector_id: &str) -> String {
+        let scope = self.policy_scope();
+        let target = self
+            .credential_id
+            .as_deref()
+            .or(self.lease_id.as_deref())
+            .unwrap_or("unknown");
+        format!(
+            "connector {connector_id} credential {} for {}:{} ({}) target={target}",
+            match self.operation {
+                ConnectorCredentialOperation::Lease => "lease",
+                ConnectorCredentialOperation::Rotate => "rotate",
+                ConnectorCredentialOperation::RevokeLease => "revoke_lease",
+                ConnectorCredentialOperation::RevokeCredential => "revoke_credential",
+            },
+            scope.provider,
+            scope.resource,
+            self.sensitivity,
+        )
+    }
+}
+
+/// Sanitized broker-prepared payload forwarded to connector execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreparedConnectorCredentialAction {
+    pub operation: ConnectorCredentialOperation,
+    pub connector_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    pub scope: CredentialScope,
+    pub sensitivity: CredentialSensitivity,
+    pub broker_checked_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_lease_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_lease_expires_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_credential_version: Option<u32>,
 }
 
 // =============================================================================
@@ -732,13 +851,22 @@ impl ConnectorOutboundBridge {
         }
     }
 
-    fn build_policy_input(event: &OutboundEvent, rule: &OutboundRoutingRule) -> PolicyInput {
-        let summary = format!(
-            "connector {} {} for event {} ({})",
-            rule.target_connector,
-            rule.action_kind.as_str(),
-            event.event_type,
-            event.source.as_str()
+    fn build_policy_input(
+        event: &OutboundEvent,
+        rule: &OutboundRoutingRule,
+        credential_request: Option<&ConnectorCredentialActionRequest>,
+    ) -> PolicyInput {
+        let summary = credential_request.map_or_else(
+            || {
+                format!(
+                    "connector {} {} for event {} ({})",
+                    rule.target_connector,
+                    rule.action_kind.as_str(),
+                    event.event_type,
+                    event.source.as_str()
+                )
+            },
+            |request| request.summary(&rule.target_connector),
         );
 
         let mut input = PolicyInput::new(
@@ -747,7 +875,8 @@ impl ConnectorOutboundBridge {
         )
         .with_surface(PolicySurface::Connector)
         .with_capabilities(PaneCapabilities::prompt())
-        .with_text_summary(summary);
+        .with_text_summary(summary)
+        .with_domain(rule.target_connector.clone());
 
         if let Some(pane_id) = event.pane_id {
             input = input.with_pane(pane_id);
@@ -758,6 +887,95 @@ impl ConnectorOutboundBridge {
         }
 
         input
+    }
+
+    fn prepare_credential_action(
+        &mut self,
+        connector_id: &str,
+        request: &ConnectorCredentialActionRequest,
+        now_ms: u64,
+    ) -> Result<PreparedConnectorCredentialAction, String> {
+        match request.operation {
+            ConnectorCredentialOperation::Lease => {
+                let credential_id = request
+                    .credential_id
+                    .as_deref()
+                    .ok_or_else(|| "credential_id is required".to_string())?;
+                let lease = self
+                    .policy
+                    .credential_broker_mut()
+                    .request_lease(
+                        connector_id,
+                        credential_id,
+                        request.policy_scope().clone(),
+                        now_ms,
+                    )
+                    .map_err(|err| err.to_string())?;
+                Ok(PreparedConnectorCredentialAction {
+                    operation: request.operation,
+                    connector_id: connector_id.to_string(),
+                    credential_id: Some(lease.credential_id.clone()),
+                    lease_id: None,
+                    scope: lease.granted_scope.clone(),
+                    sensitivity: request.sensitivity,
+                    broker_checked_at_ms: now_ms,
+                    broker_lease_id: Some(lease.lease_id),
+                    broker_lease_expires_at_ms: Some(lease.expires_at_ms),
+                    broker_credential_version: Some(lease.credential_version),
+                })
+            }
+            ConnectorCredentialOperation::Rotate
+            | ConnectorCredentialOperation::RevokeCredential => {
+                let credential_id = request
+                    .credential_id
+                    .as_deref()
+                    .ok_or_else(|| "credential_id is required".to_string())?;
+                let credential = self
+                    .policy
+                    .credential_broker()
+                    .get_credential(credential_id)
+                    .ok_or_else(|| format!("credential not found: {credential_id}"))?;
+                Ok(PreparedConnectorCredentialAction {
+                    operation: request.operation,
+                    connector_id: connector_id.to_string(),
+                    credential_id: Some(credential_id.to_string()),
+                    lease_id: None,
+                    scope: request.policy_scope().clone(),
+                    sensitivity: request.sensitivity,
+                    broker_checked_at_ms: now_ms,
+                    broker_lease_id: None,
+                    broker_lease_expires_at_ms: None,
+                    broker_credential_version: Some(credential.version),
+                })
+            }
+            ConnectorCredentialOperation::RevokeLease => {
+                let lease_id = request
+                    .lease_id
+                    .as_deref()
+                    .ok_or_else(|| "lease_id is required".to_string())?;
+                let lease = self
+                    .policy
+                    .credential_broker()
+                    .active_leases_for_connector(connector_id)
+                    .into_iter()
+                    .find(|lease| lease.lease_id == lease_id)
+                    .ok_or_else(|| {
+                        format!("active lease not found for connector {connector_id}: {lease_id}")
+                    })?;
+                Ok(PreparedConnectorCredentialAction {
+                    operation: request.operation,
+                    connector_id: connector_id.to_string(),
+                    credential_id: Some(lease.credential_id.clone()),
+                    lease_id: Some(lease_id.to_string()),
+                    scope: request.policy_scope().clone(),
+                    sensitivity: request.sensitivity,
+                    broker_checked_at_ms: now_ms,
+                    broker_lease_id: Some(lease.lease_id.clone()),
+                    broker_lease_expires_at_ms: Some(lease.expires_at_ms),
+                    broker_credential_version: Some(lease.credential_version),
+                })
+            }
+        }
     }
 
     /// Process an event through the outbound bridge.
@@ -847,8 +1065,35 @@ impl ConnectorOutboundBridge {
         let now_ms = event.timestamp_ms;
 
         for rule in &matched_rules {
-            let policy_input = Self::build_policy_input(event, rule);
-            let policy_decision = self.policy.authorize(&policy_input);
+            let credential_request = if rule.action_kind == ConnectorActionKind::CredentialAction {
+                match ConnectorCredentialActionRequest::from_payload(&event.payload) {
+                    Ok(request) => Some(request),
+                    Err(reason) => {
+                        self.telemetry.actions_blocked_policy += 1;
+                        blocked.push(BlockedAction {
+                            rule_id: rule.rule_id.clone(),
+                            target_connector: rule.target_connector.clone(),
+                            action_kind: rule.action_kind,
+                            reason: format!("credential_action: {reason}"),
+                            policy_decision: None,
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let policy_input = Self::build_policy_input(event, rule, credential_request.as_ref());
+            let policy_decision = if let Some(request) = credential_request.as_ref() {
+                self.policy.authorize_connector_credential_action(
+                    &policy_input,
+                    request.policy_scope(),
+                    request.sensitivity,
+                )
+            } else {
+                self.policy.authorize(&policy_input)
+            };
             if !policy_decision.is_allowed() {
                 self.telemetry.actions_blocked_policy += 1;
                 let decision_kind = policy_decision.as_str();
@@ -905,11 +1150,35 @@ impl ConnectorOutboundBridge {
             }
 
             // 3c. Build action
+            let params = if let Some(request) = credential_request.as_ref() {
+                match self.prepare_credential_action(&rule.target_connector, request, now_ms) {
+                    Ok(prepared) => serde_json::to_value(&prepared).unwrap_or_else(|_| {
+                        serde_json::json!({
+                            "operation": "invalid",
+                            "connector_id": rule.target_connector,
+                            "broker_checked_at_ms": now_ms,
+                        })
+                    }),
+                    Err(reason) => {
+                        self.telemetry.actions_blocked_policy += 1;
+                        blocked.push(BlockedAction {
+                            rule_id: rule.rule_id.clone(),
+                            target_connector: rule.target_connector.clone(),
+                            action_kind: rule.action_kind,
+                            reason: format!("credential_broker: {reason}"),
+                            policy_decision: Some(policy_decision.clone()),
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                event.payload.clone()
+            };
             let action = ConnectorAction {
                 target_connector: rule.target_connector.clone(),
                 action_kind: rule.action_kind,
                 correlation_id: correlation_id.clone(),
-                params: event.payload.clone(),
+                params,
                 created_at_ms: now_ms,
             };
 
@@ -1617,6 +1886,197 @@ mod tests {
         let result = bridge.process_event(&event).unwrap();
         assert_eq!(result.actions_dispatched.len(), 2);
         assert_eq!(bridge.pending_action_count(), 2);
+    }
+
+    fn broker_ready_policy(max_sensitivity: CredentialSensitivity) -> PolicyEngine {
+        use crate::connector_credential_broker::{
+            CredentialAccessRule, CredentialKind, CredentialState, ManagedCredential,
+            SecretProviderConfig,
+        };
+
+        let config = crate::config::SafetyConfig {
+            credential_broker: crate::connector_credential_broker::CredentialBrokerConfig {
+                enabled: true,
+                max_sensitivity,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut policy = PolicyEngine::from_safety_config(&config);
+        policy
+            .credential_broker_mut()
+            .register_provider(
+                SecretProviderConfig {
+                    provider_id: "vault-1".to_string(),
+                    display_name: "Vault".to_string(),
+                    provider_type: "vault".to_string(),
+                    max_concurrent_leases: 10,
+                    default_lease_ttl_ms: 60_000,
+                    supports_rotation: true,
+                    max_sensitivity: CredentialSensitivity::Critical,
+                },
+                1000,
+            )
+            .unwrap();
+        policy
+            .credential_broker_mut()
+            .register_credential(
+                ManagedCredential {
+                    credential_id: "cred-1".to_string(),
+                    provider_id: "vault-1".to_string(),
+                    kind: CredentialKind::ApiKey,
+                    sensitivity: CredentialSensitivity::Medium,
+                    state: CredentialState::Active,
+                    permitted_scopes: vec![CredentialScope::new(
+                        "slack",
+                        "channels/*",
+                        vec!["write".to_string()],
+                    )],
+                    version: 7,
+                    created_at_ms: 1000,
+                    expires_at_ms: 0,
+                    last_rotated_at_ms: 0,
+                    active_lease_count: 0,
+                },
+                1000,
+            )
+            .unwrap();
+        policy
+            .credential_broker_mut()
+            .add_access_rule(CredentialAccessRule {
+                rule_id: "allow-broker-slack".to_string(),
+                connector_pattern: "broker-slack".to_string(),
+                permitted_scope: CredentialScope::new(
+                    "slack",
+                    "channels/*",
+                    vec!["write".to_string()],
+                ),
+                max_sensitivity: CredentialSensitivity::High,
+                max_lease_ttl_ms: 30_000,
+                max_concurrent_leases: 4,
+            });
+        policy
+    }
+
+    #[test]
+    fn connector_outbound_bridge_credential_action_leases_and_sanitizes_payload() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_policy_engine(broker_ready_policy(CredentialSensitivity::High));
+        bridge.register_sandbox_zone("broker-slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "cred.lease",
+            None,
+            Some("pattern."),
+            "broker-slack",
+            ConnectorActionKind::CredentialAction,
+        ));
+
+        let event = OutboundEvent::new(
+            OutboundEventSource::PatternDetected,
+            "pattern.connector.secret_needed",
+            serde_json::json!({
+                "operation": "lease",
+                "credential_id": "cred-1",
+                "scope": {
+                    "provider": "slack",
+                    "resource": "channels/alerts",
+                    "operations": ["write"]
+                },
+                "sensitivity": "medium"
+            }),
+        )
+        .with_timestamp_ms(5_000);
+
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_blocked.len(), 0);
+        assert_eq!(result.actions_dispatched.len(), 1);
+
+        let action = bridge.peek_action().unwrap();
+        assert_eq!(action.target_connector, "broker-slack");
+        assert_eq!(action.action_kind, ConnectorActionKind::CredentialAction);
+        assert_eq!(action.params["operation"], "lease");
+        assert_eq!(action.params["connector_id"], "broker-slack");
+        assert_eq!(action.params["credential_id"], "cred-1");
+        assert_eq!(action.params["scope"]["provider"], "slack");
+        assert_eq!(action.params["scope"]["resource"], "channels/alerts");
+        assert_eq!(action.params["broker_credential_version"], 7);
+        assert_eq!(action.params["broker_lease_id"], "lease-1");
+        assert_eq!(action.params["broker_lease_expires_at_ms"], 35_000);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_credential_action_rejects_invalid_payload() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("broker-slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "cred.invalid",
+            None,
+            Some("pattern."),
+            "broker-slack",
+            ConnectorActionKind::CredentialAction,
+        ));
+
+        let event = OutboundEvent::new(
+            OutboundEventSource::PatternDetected,
+            "pattern.connector.secret_needed",
+            serde_json::json!({
+                "operation": "lease",
+                "scope": {
+                    "provider": "slack",
+                    "resource": "channels/alerts",
+                    "operations": ["write"]
+                }
+            }),
+        )
+        .with_timestamp_ms(5_000);
+
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 0);
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("credential_id is required")
+        );
+    }
+
+    #[test]
+    fn connector_outbound_bridge_credential_action_requires_approval_above_ceiling() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_policy_engine(broker_ready_policy(CredentialSensitivity::Low));
+        bridge.register_sandbox_zone("broker-slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "cred.high",
+            None,
+            Some("pattern."),
+            "broker-slack",
+            ConnectorActionKind::CredentialAction,
+        ));
+
+        let event = OutboundEvent::new(
+            OutboundEventSource::PatternDetected,
+            "pattern.connector.secret_needed",
+            serde_json::json!({
+                "operation": "lease",
+                "credential_id": "cred-1",
+                "scope": {
+                    "provider": "slack",
+                    "resource": "channels/alerts",
+                    "operations": ["write"]
+                },
+                "sensitivity": "high"
+            }),
+        )
+        .with_timestamp_ms(5_000);
+
+        let result = bridge.process_event(&event).unwrap();
+        assert_eq!(result.actions_dispatched.len(), 0);
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("policy(require_approval)")
+        );
     }
 
     #[test]

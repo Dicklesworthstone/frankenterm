@@ -882,9 +882,7 @@ impl CommandDeduplicator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{
-        ActionKind, ActorKind, DecisionContext, PolicyDecision, PolicySurface,
-    };
+    use crate::policy::{ActionKind, ActorKind, DecisionContext, PolicyDecision, PolicySurface};
     use crate::session_topology::{
         LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
         MuxPaneLifecycleState, SessionLifecycleState, WindowLifecycleState,
@@ -1500,8 +1498,7 @@ mod tests {
             Some("wf-broadcast".to_string()),
         );
         ctx.set_determining_rule("policy.route.broadcast");
-        let decision =
-            PolicyDecision::allow_with_rule("policy.route.broadcast").with_context(ctx);
+        let decision = PolicyDecision::allow_with_rule("policy.route.broadcast").with_context(ctx);
         let request = CommandRequest {
             command_id: "trace-1".to_string(),
             scope: CommandScope::fleet(),

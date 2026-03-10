@@ -528,7 +528,11 @@ impl ComplianceEngine {
         let avg_time_to_remediate_ms = if completed > 0 {
             let total_time: u64 = period_remediations
                 .iter()
-                .map(|v| v.remediated_at_ms.unwrap_or(0).saturating_sub(v.detected_at_ms))
+                .map(|v| {
+                    v.remediated_at_ms
+                        .unwrap_or(0)
+                        .saturating_sub(v.detected_at_ms)
+                })
                 .sum();
             total_time / u64::from(completed)
         } else {
@@ -623,15 +627,30 @@ mod tests {
         let mut engine = ComplianceEngine::new(100, 3600_000);
 
         // Info violations don't change compliance
-        engine.record_violation(make_violation("v1", 1000, ViolationSeverity::Info, "policy"));
+        engine.record_violation(make_violation(
+            "v1",
+            1000,
+            ViolationSeverity::Info,
+            "policy",
+        ));
         assert_eq!(engine.compute_status(), ComplianceStatus::Compliant);
 
         // Medium triggers advisory
-        engine.record_violation(make_violation("v2", 2000, ViolationSeverity::Medium, "policy"));
+        engine.record_violation(make_violation(
+            "v2",
+            2000,
+            ViolationSeverity::Medium,
+            "policy",
+        ));
         assert_eq!(engine.compute_status(), ComplianceStatus::Advisory);
 
         // High triggers non-compliant
-        engine.record_violation(make_violation("v3", 3000, ViolationSeverity::High, "policy"));
+        engine.record_violation(make_violation(
+            "v3",
+            3000,
+            ViolationSeverity::High,
+            "policy",
+        ));
         assert_eq!(engine.compute_status(), ComplianceStatus::NonCompliant);
 
         // Critical triggers critical
@@ -647,7 +666,12 @@ mod tests {
     #[test]
     fn remediation_restores_compliance() {
         let mut engine = ComplianceEngine::new(100, 3600_000);
-        engine.record_violation(make_violation("v1", 1000, ViolationSeverity::High, "policy"));
+        engine.record_violation(make_violation(
+            "v1",
+            1000,
+            ViolationSeverity::High,
+            "policy",
+        ));
         assert_eq!(engine.compute_status(), ComplianceStatus::NonCompliant);
 
         engine.remediate("v1", "admin", 2000);
@@ -663,7 +687,12 @@ mod tests {
     #[test]
     fn double_remediation_is_idempotent() {
         let mut engine = ComplianceEngine::new(100, 3600_000);
-        engine.record_violation(make_violation("v1", 1000, ViolationSeverity::High, "policy"));
+        engine.record_violation(make_violation(
+            "v1",
+            1000,
+            ViolationSeverity::High,
+            "policy",
+        ));
         assert!(engine.remediate("v1", "admin", 2000).is_some());
         // Second remediation finds nothing unremediated
         assert!(engine.remediate("v1", "admin", 3000).is_none());
@@ -681,10 +710,7 @@ mod tests {
         // At capacity, adding one more should evict the remediated one
         engine.record_violation(make_violation("v4", 4000, ViolationSeverity::Low, "policy"));
         assert_eq!(
-            engine
-                .violations
-                .iter()
-                .any(|v| v.violation_id == "v1"),
+            engine.violations.iter().any(|v| v.violation_id == "v1"),
             false
         );
         assert_eq!(engine.violations.len(), 3);
@@ -694,8 +720,18 @@ mod tests {
     fn active_violations_above_threshold() {
         let mut engine = ComplianceEngine::new(100, 3600_000);
         engine.record_violation(make_violation("v1", 1000, ViolationSeverity::Low, "policy"));
-        engine.record_violation(make_violation("v2", 2000, ViolationSeverity::High, "policy"));
-        engine.record_violation(make_violation("v3", 3000, ViolationSeverity::Critical, "policy"));
+        engine.record_violation(make_violation(
+            "v2",
+            2000,
+            ViolationSeverity::High,
+            "policy",
+        ));
+        engine.record_violation(make_violation(
+            "v3",
+            3000,
+            ViolationSeverity::Critical,
+            "policy",
+        ));
 
         let high_plus = engine.active_violations_above(ViolationSeverity::High);
         assert_eq!(high_plus.len(), 2);
@@ -704,7 +740,12 @@ mod tests {
     #[test]
     fn subsystem_compliance_computed() {
         let mut engine = ComplianceEngine::new(100, 3600_000);
-        engine.record_violation(make_violation("v1", 1000, ViolationSeverity::High, "policy"));
+        engine.record_violation(make_violation(
+            "v1",
+            1000,
+            ViolationSeverity::High,
+            "policy",
+        ));
         engine.record_violation(make_violation(
             "v2",
             2000,
@@ -747,7 +788,12 @@ mod tests {
     #[test]
     fn report_generation() {
         let mut engine = ComplianceEngine::new(100, 3600_000);
-        engine.record_violation(make_violation("v1", 1000, ViolationSeverity::High, "policy"));
+        engine.record_violation(make_violation(
+            "v1",
+            1000,
+            ViolationSeverity::High,
+            "policy",
+        ));
         engine.record_violation(make_violation(
             "v2",
             2000,
@@ -769,9 +815,24 @@ mod tests {
     #[test]
     fn report_trend_degrading() {
         let mut engine = ComplianceEngine::new(100, 3600_000);
-        engine.record_violation(make_violation("v1", 1000, ViolationSeverity::High, "policy"));
-        engine.record_violation(make_violation("v2", 2000, ViolationSeverity::High, "policy"));
-        engine.record_violation(make_violation("v3", 3000, ViolationSeverity::High, "policy"));
+        engine.record_violation(make_violation(
+            "v1",
+            1000,
+            ViolationSeverity::High,
+            "policy",
+        ));
+        engine.record_violation(make_violation(
+            "v2",
+            2000,
+            ViolationSeverity::High,
+            "policy",
+        ));
+        engine.record_violation(make_violation(
+            "v3",
+            3000,
+            ViolationSeverity::High,
+            "policy",
+        ));
 
         let report = engine.generate_report("rpt-1", 0, 5000, 5000, make_coverage());
         assert_eq!(report.violation_trend.direction, TrendDirection::Degrading);
@@ -780,7 +841,12 @@ mod tests {
     #[test]
     fn report_sla_violations() {
         let mut engine = ComplianceEngine::new(100, 1000); // 1s SLA
-        engine.record_violation(make_violation("v1", 1000, ViolationSeverity::High, "policy"));
+        engine.record_violation(make_violation(
+            "v1",
+            1000,
+            ViolationSeverity::High,
+            "policy",
+        ));
 
         // At 1500ms: within SLA
         let report = engine.generate_report("rpt-1", 0, 2000, 1500, make_coverage());
@@ -830,7 +896,12 @@ mod tests {
     #[test]
     fn compliance_snapshot_serde_roundtrip() {
         let mut engine = ComplianceEngine::new(100, 3600_000);
-        engine.record_violation(make_violation("v1", 1000, ViolationSeverity::High, "policy"));
+        engine.record_violation(make_violation(
+            "v1",
+            1000,
+            ViolationSeverity::High,
+            "policy",
+        ));
         engine.update_subsystem_eval("policy", 1000);
 
         let snap = engine.snapshot(2000);
@@ -842,7 +913,12 @@ mod tests {
     #[test]
     fn compliance_report_serde_roundtrip() {
         let mut engine = ComplianceEngine::new(100, 3600_000);
-        engine.record_violation(make_violation("v1", 1000, ViolationSeverity::Medium, "policy"));
+        engine.record_violation(make_violation(
+            "v1",
+            1000,
+            ViolationSeverity::Medium,
+            "policy",
+        ));
         engine.remediate("v1", "admin", 2000);
 
         let report = engine.generate_report("rpt-1", 0, 5000, 5000, make_coverage());

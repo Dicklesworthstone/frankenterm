@@ -339,14 +339,13 @@ impl PolicyMetricsCollector {
         });
 
         // Quarantine density indicator
-        let quarantine_status =
-            if total_quarantines >= self.thresholds.quarantine_critical_count {
-                HealthStatus::Critical
-            } else if total_quarantines >= self.thresholds.quarantine_warning_count {
-                HealthStatus::Warning
-            } else {
-                HealthStatus::Healthy
-            };
+        let quarantine_status = if total_quarantines >= self.thresholds.quarantine_critical_count {
+            HealthStatus::Critical
+        } else if total_quarantines >= self.thresholds.quarantine_warning_count {
+            HealthStatus::Warning
+        } else {
+            HealthStatus::Healthy
+        };
         indicators.push(HealthIndicator {
             name: "quarantine_density".to_string(),
             status: quarantine_status,
@@ -421,7 +420,9 @@ impl PolicyMetricsCollector {
         // Per-subsystem summaries
         let mut subsystem_metrics = BTreeMap::new();
         for (name, input) in &self.subsystem_inputs {
-            let rate = (input.denials * 100).checked_div(input.evaluations).unwrap_or(0) as u32;
+            let rate = (input.denials * 100)
+                .checked_div(input.evaluations)
+                .unwrap_or(0) as u32;
 
             let health = if rate >= self.thresholds.denial_rate_critical_pct
                 || input.active_quarantines >= self.thresholds.quarantine_critical_count
@@ -510,7 +511,11 @@ mod tests {
             },
         );
         let dash = c.dashboard(1000);
-        let denial_ind = dash.indicators.iter().find(|i| i.name == "denial_rate").unwrap();
+        let denial_ind = dash
+            .indicators
+            .iter()
+            .find(|i| i.name == "denial_rate")
+            .unwrap();
         assert_eq!(denial_ind.status, HealthStatus::Healthy);
         assert_eq!(denial_ind.value, "5%");
     }
@@ -527,7 +532,11 @@ mod tests {
             },
         );
         let dash = c.dashboard(1000);
-        let denial_ind = dash.indicators.iter().find(|i| i.name == "denial_rate").unwrap();
+        let denial_ind = dash
+            .indicators
+            .iter()
+            .find(|i| i.name == "denial_rate")
+            .unwrap();
         assert_eq!(denial_ind.status, HealthStatus::Warning);
     }
 
@@ -543,7 +552,11 @@ mod tests {
             },
         );
         let dash = c.dashboard(1000);
-        let denial_ind = dash.indicators.iter().find(|i| i.name == "denial_rate").unwrap();
+        let denial_ind = dash
+            .indicators
+            .iter()
+            .find(|i| i.name == "denial_rate")
+            .unwrap();
         assert_eq!(denial_ind.status, HealthStatus::Critical);
     }
 
@@ -571,7 +584,11 @@ mod tests {
         let mut c = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
         c.update_kill_switch(true);
         let dash = c.dashboard(1000);
-        let ks_ind = dash.indicators.iter().find(|i| i.name == "kill_switch").unwrap();
+        let ks_ind = dash
+            .indicators
+            .iter()
+            .find(|i| i.name == "kill_switch")
+            .unwrap();
         assert_eq!(ks_ind.status, HealthStatus::Critical);
         assert_eq!(ks_ind.value, "ACTIVE");
     }
@@ -829,7 +846,11 @@ mod tests {
             },
         );
         let dash = c.dashboard(1000);
-        let denial_ind = dash.indicators.iter().find(|i| i.name == "denial_rate").unwrap();
+        let denial_ind = dash
+            .indicators
+            .iter()
+            .find(|i| i.name == "denial_rate")
+            .unwrap();
         assert_eq!(denial_ind.value, "0%");
         assert_eq!(denial_ind.status, HealthStatus::Healthy);
     }

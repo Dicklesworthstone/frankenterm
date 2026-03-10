@@ -1,5 +1,7 @@
 use super::{Metadata, SessionRequest, SessionSender, SftpChannelResult, SftpRequest};
 use crate::runtime::channel::{bounded, Sender};
+#[cfg(feature = "async-asupersync")]
+use crate::runtime::io::ReadBuf;
 use crate::runtime::io::{AsyncRead, AsyncWrite};
 use std::future::Future;
 use std::pin::Pin;
@@ -159,6 +161,7 @@ where
     poll
 }
 
+#[cfg(not(feature = "async-asupersync"))]
 impl AsyncRead for File {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -189,6 +192,43 @@ impl AsyncRead for File {
     }
 }
 
+#[cfg(feature = "async-asupersync")]
+impl AsyncRead for File {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        async fn read(tx: SessionSender, file_id: usize, len: usize) -> io::Result<Vec<u8>> {
+            inner_read(tx, file_id, len)
+                .await
+                .map_err(|x| io::Error::new(io::ErrorKind::Other, x))
+        }
+
+        let remaining = buf.remaining();
+        if remaining == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let tx = self.tx.as_ref().unwrap().clone();
+        let file_id = self.file_id;
+
+        let poll = poll_io_future(&mut self.state.f_read, cx, || {
+            Box::pin(read(tx, file_id, remaining))
+        });
+
+        match poll {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(x)) => Poll::Ready(Err(x)),
+            Poll::Ready(Ok(data)) => {
+                buf.put_slice(&data);
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "async-asupersync"))]
 impl AsyncWrite for File {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -225,6 +265,56 @@ impl AsyncWrite for File {
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        async fn close(tx: SessionSender, file_id: usize) -> io::Result<()> {
+            inner_close(tx, file_id)
+                .await
+                .map_err(|x| io::Error::new(io::ErrorKind::Other, x))
+        }
+
+        let tx = self.tx.as_ref().unwrap().clone();
+        let file_id = self.file_id;
+
+        poll_io_future(&mut self.state.f_close, cx, || Box::pin(close(tx, file_id)))
+    }
+}
+
+#[cfg(feature = "async-asupersync")]
+impl AsyncWrite for File {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        async fn write(tx: SessionSender, file_id: usize, buf: Vec<u8>) -> io::Result<usize> {
+            let n = buf.len();
+            inner_write(tx, file_id, buf)
+                .await
+                .map(|_| n)
+                .map_err(|x| io::Error::new(io::ErrorKind::Other, x))
+        }
+
+        let tx = self.tx.as_ref().unwrap().clone();
+        let file_id = self.file_id;
+
+        poll_io_future(&mut self.state.f_write, cx, || {
+            Box::pin(write(tx, file_id, buf.to_vec()))
+        })
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        async fn flush(tx: SessionSender, file_id: usize) -> io::Result<()> {
+            inner_flush(tx, file_id)
+                .await
+                .map_err(|x| io::Error::new(io::ErrorKind::Other, x))
+        }
+
+        let tx = self.tx.as_ref().unwrap().clone();
+        let file_id = self.file_id;
+
+        poll_io_future(&mut self.state.f_flush, cx, || Box::pin(flush(tx, file_id)))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         async fn close(tx: SessionSender, file_id: usize) -> io::Result<()> {
             inner_close(tx, file_id)
                 .await

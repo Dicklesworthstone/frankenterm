@@ -11368,6 +11368,29 @@ async fn run_distributed_agent(
         let socket = env_socket.unwrap_or_else(|| config.native.socket_path.clone());
         Some(PathBuf::from(socket))
     };
+    let vendored_mux_socket_paths =
+        if config.vendored.sharding.enabled && config.vendored.sharding.socket_paths.len() >= 2 {
+            config
+                .vendored
+                .sharding
+                .socket_paths
+                .iter()
+                .map(PathBuf::from)
+                .collect()
+        } else {
+            std::env::var("WEZTERM_UNIX_SOCKET")
+                .ok()
+                .filter(|path| !path.trim().is_empty())
+                .or_else(|| {
+                    config
+                        .vendored
+                        .mux_socket_path
+                        .clone()
+                        .filter(|path| !path.trim().is_empty())
+                })
+                .map(|path| vec![PathBuf::from(path)])
+                .unwrap_or_default()
+        };
 
     let runtime_config = RuntimeConfig {
         discovery_interval: Duration::from_millis(5_000),
@@ -11384,6 +11407,8 @@ async fn run_distributed_agent(
         retention_days: config.storage.retention_days,
         retention_max_mb: config.storage.retention_max_mb,
         checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
+        vendored_mux_socket_paths,
+        vendored_mux_compression: config.vendored.mux_pool.compression,
         native_event_socket,
         trauma_guard: config.safety.trauma_guard.clone(),
     };
@@ -11982,6 +12007,29 @@ async fn run_watcher(
         let socket = env_socket.unwrap_or_else(|| config.native.socket_path.clone());
         Some(PathBuf::from(socket))
     };
+    let vendored_mux_socket_paths =
+        if config.vendored.sharding.enabled && config.vendored.sharding.socket_paths.len() >= 2 {
+            config
+                .vendored
+                .sharding
+                .socket_paths
+                .iter()
+                .map(PathBuf::from)
+                .collect()
+        } else {
+            std::env::var("WEZTERM_UNIX_SOCKET")
+                .ok()
+                .filter(|path| !path.trim().is_empty())
+                .or_else(|| {
+                    config
+                        .vendored
+                        .mux_socket_path
+                        .clone()
+                        .filter(|path| !path.trim().is_empty())
+                })
+                .map(|path| vec![PathBuf::from(path)])
+                .unwrap_or_default()
+        };
 
     let runtime_config = RuntimeConfig {
         discovery_interval: Duration::from_millis(poll_interval),
@@ -11998,6 +12046,8 @@ async fn run_watcher(
         retention_days: config.storage.retention_days,
         retention_max_mb: config.storage.retention_max_mb,
         checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
+        vendored_mux_socket_paths,
+        vendored_mux_compression: config.vendored.mux_pool.compression,
         native_event_socket,
         trauma_guard: config.safety.trauma_guard.clone(),
     };

@@ -3281,8 +3281,9 @@ mod tests {
     #[test]
     fn legacy_decision_context_with_numeric_pane_id() {
         let mut action = sample_audit_action();
-        action.decision_context =
-            Some(r#"{"surface":"mux","actor":"workflow","action":"send_text","pane_id":7}"#.to_string());
+        action.decision_context = Some(
+            r#"{"surface":"mux","actor":"workflow","action":"send_text","pane_id":7}"#.to_string(),
+        );
         let ctx = RenderContext::new(OutputFormat::Plain);
         let output = AuditListRenderer::render_detail(&action, &ctx);
         assert!(output.contains("surface=mux"));
@@ -3338,8 +3339,7 @@ mod tests {
     #[test]
     fn legacy_decision_context_bool_and_null_values() {
         let mut action = sample_audit_action();
-        action.decision_context =
-            Some(r#"{"auto_approve":true,"override":null}"#.to_string());
+        action.decision_context = Some(r#"{"auto_approve":true,"override":null}"#.to_string());
         let ctx = RenderContext::new(OutputFormat::Plain);
         let output = AuditListRenderer::render_detail(&action, &ctx);
         assert!(output.contains("auto_approve=true"));
@@ -3349,8 +3349,7 @@ mod tests {
     #[test]
     fn legacy_decision_context_skips_nested_objects() {
         let mut action = sample_audit_action();
-        action.decision_context =
-            Some(r#"{"tag":"v1","nested":{"deep":"value"}}"#.to_string());
+        action.decision_context = Some(r#"{"tag":"v1","nested":{"deep":"value"}}"#.to_string());
         let ctx = RenderContext::new(OutputFormat::Plain);
         let output = AuditListRenderer::render_detail(&action, &ctx);
         assert!(output.contains("tag=v1"));

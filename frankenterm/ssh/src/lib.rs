@@ -50,9 +50,51 @@ pub mod runtime {
     }
 
     pub mod io {
+        #[cfg(feature = "async-asupersync")]
+        use std::io;
+
+        #[cfg(feature = "async-asupersync")]
+        use asupersync::io::AsyncWriteExt as RuntimeAsyncWriteExt;
+
         // Transitional shim: keep trait usage behind a crate-local path so
         // async runtime migration can switch implementations centrally.
-        pub use smol::io::{AsyncRead, AsyncWrite};
+        #[cfg(feature = "async-asupersync")]
+        pub use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+
+        // Transitional shim: keep trait usage behind a crate-local path so
+        // async runtime migration can switch implementations centrally.
+        #[cfg(not(feature = "async-asupersync"))]
+        pub use smol::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+        #[cfg(feature = "async-asupersync")]
+        pub trait AsyncWriteExt: AsyncWrite {
+            fn write_all<'a>(
+                &'a mut self,
+                buf: &'a [u8],
+            ) -> impl std::future::Future<Output = io::Result<()>> + 'a
+            where
+                Self: Unpin,
+            {
+                RuntimeAsyncWriteExt::write_all(self, buf)
+            }
+
+            fn flush(&mut self) -> impl std::future::Future<Output = io::Result<()>> + '_
+            where
+                Self: Unpin,
+            {
+                RuntimeAsyncWriteExt::flush(self)
+            }
+
+            fn close(&mut self) -> impl std::future::Future<Output = io::Result<()>> + '_
+            where
+                Self: Unpin,
+            {
+                RuntimeAsyncWriteExt::shutdown(self)
+            }
+        }
+
+        #[cfg(feature = "async-asupersync")]
+        impl<T: AsyncWrite + ?Sized> AsyncWriteExt for T {}
     }
 
     #[cfg(feature = "async-asupersync")]
@@ -96,6 +138,13 @@ mod runtime_migration_guards {
         let mut files = Vec::new();
         let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         collect_rust_files(&src_dir, &mut files);
+        files
+    }
+
+    fn rust_test_files() -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        collect_rust_files(&tests_dir, &mut files);
         files
     }
 
@@ -163,6 +212,22 @@ mod runtime_migration_guards {
                 continue;
             }
 
+            let source =
+                fs::read_to_string(&file).unwrap_or_else(|_| panic!("failed to read {:?}", file));
+            for (line_no, line) in source.lines().enumerate() {
+                assert!(
+                    !contains_non_comment_token(line, "smol::"),
+                    "direct smol usage must stay in runtime shim ({}:{})",
+                    file.display(),
+                    line_no + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_direct_smol_namespace_in_ssh_tests() {
+        for file in rust_test_files() {
             let source =
                 fs::read_to_string(&file).unwrap_or_else(|_| panic!("failed to read {:?}", file));
             for (line_no, line) in source.lines().enumerate() {
