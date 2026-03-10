@@ -130,7 +130,7 @@ impl WebGpuTexture {
             // So we check the limit ourselves here.
             // <https://github.com/wezterm/wezterm/issues/3713>
             anyhow::bail!(
-                "texture dimensions {width}x{height} exceeed the \
+                "texture dimensions {width}x{height} exceed the \
                  max dimension {limit} supported by your GPU"
             );
         }
@@ -141,7 +141,7 @@ impl WebGpuTexture {
             .flags
             .contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS)
         {
-            vec![format, format.remove_srgb_suffix()]
+            select_view_formats_for_format(format)
         } else {
             vec![]
         };
@@ -220,6 +220,16 @@ fn select_surface_format(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat
     }
 }
 
+fn select_view_formats_for_format(format: wgpu::TextureFormat) -> Vec<wgpu::TextureFormat> {
+    let srgb = format.add_srgb_suffix();
+    let linear = format.remove_srgb_suffix();
+    if srgb == linear {
+        vec![format]
+    } else {
+        vec![srgb, linear]
+    }
+}
+
 fn select_surface_view_formats(
     format: wgpu::TextureFormat,
     downlevel_caps: &wgpu::DownlevelCapabilities,
@@ -228,7 +238,7 @@ fn select_surface_view_formats(
         .flags
         .contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS)
     {
-        vec![format.add_srgb_suffix(), format.remove_srgb_suffix()]
+        select_view_formats_for_format(format)
     } else {
         vec![]
     }
@@ -574,7 +584,10 @@ impl WebGpuState {
 
 #[cfg(test)]
 mod tests {
-    use super::{select_composite_alpha_mode, select_surface_format, select_surface_view_formats};
+    use super::{
+        select_composite_alpha_mode, select_surface_format, select_surface_view_formats,
+        select_view_formats_for_format,
+    };
 
     #[test]
     fn surface_format_prefers_srgb_variant() {
@@ -619,6 +632,14 @@ mod tests {
                 wgpu::TextureFormat::Bgra8UnormSrgb,
                 wgpu::TextureFormat::Bgra8Unorm,
             ]
+        );
+    }
+
+    #[test]
+    fn view_formats_deduplicate_when_format_has_no_srgb_pair() {
+        assert_eq!(
+            select_view_formats_for_format(wgpu::TextureFormat::Rgba16Float),
+            vec![wgpu::TextureFormat::Rgba16Float]
         );
     }
 

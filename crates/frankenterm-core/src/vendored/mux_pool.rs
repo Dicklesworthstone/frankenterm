@@ -1905,6 +1905,32 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_batch_render_large_batch_with_cx_preserves_order() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let cx = crate::cx::for_testing();
+
+            let pane_ids: Vec<u64> = (100..150).collect();
+            let result = pool
+                .get_pane_render_changes_batch_with_cx(&cx, pane_ids.clone())
+                .await
+                .expect("large batch with cx should succeed");
+
+            assert_eq!(result.len(), 50, "should get 50 responses");
+            for (i, resp) in result.iter().enumerate() {
+                assert_eq!(
+                    resp.pane_id as u64, pane_ids[i],
+                    "response {i} pane_id mismatch: expected {} got {}",
+                    pane_ids[i], resp.pane_id
+                );
+            }
+        });
+    }
+
     #[test]
     fn pool_batch_render_duplicate_pane_ids() {
         run_async_test(async {
@@ -1918,6 +1944,27 @@ mod tests {
                 .get_pane_render_changes_batch(vec![42, 42, 42])
                 .await
                 .expect("duplicate pane ids should succeed");
+
+            assert_eq!(result.len(), 3, "should get 3 responses for 3 requests");
+            for resp in &result {
+                assert_eq!(resp.pane_id, 42, "all responses should be for pane 42");
+            }
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_batch_render_duplicate_pane_ids_with_cx() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let cx = crate::cx::for_testing();
+
+            let result = pool
+                .get_pane_render_changes_batch_with_cx(&cx, vec![42, 42, 42])
+                .await
+                .expect("duplicate pane ids with cx should succeed");
 
             assert_eq!(result.len(), 3, "should get 3 responses for 3 requests");
             for resp in &result {
