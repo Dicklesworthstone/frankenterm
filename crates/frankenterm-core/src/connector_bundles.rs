@@ -263,6 +263,13 @@ impl ConnectorBundle {
         self
     }
 
+    /// Add a connector to the bundle (builder pattern).
+    #[must_use]
+    pub fn with_connector(mut self, entry: BundleConnectorEntry) -> Self {
+        self.connectors.push(entry);
+        self
+    }
+
     /// Add a connector to the bundle.
     pub fn add_connector(&mut self, entry: BundleConnectorEntry) {
         self.connectors.push(entry);

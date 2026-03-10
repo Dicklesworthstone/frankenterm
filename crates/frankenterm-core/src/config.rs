@@ -1592,6 +1592,9 @@ pub struct SafetyConfig {
 
     /// Connector reliability settings (circuit breaker + DLQ)
     pub connector_reliability: crate::connector_reliability::ConnectorReliabilityConfig,
+
+    /// Connector bundle registry settings (tier-based connector packaging)
+    pub bundle_registry: crate::connector_bundles::BundleRegistryConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1620,6 +1623,7 @@ impl Default for SafetyConfig {
             connector_registry: crate::connector_registry::ConnectorRegistryConfig::default(),
             connector_host_runtime: crate::connector_host_runtime::ConnectorHostConfig::default(),
             connector_reliability: crate::connector_reliability::ConnectorReliabilityConfig::default(),
+            bundle_registry: crate::connector_bundles::BundleRegistryConfig::default(),
         }
     }
 }

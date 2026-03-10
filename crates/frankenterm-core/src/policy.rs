@@ -2898,6 +2898,8 @@ pub struct PolicyEngine {
     connector_host_runtime: crate::connector_host_runtime::ConnectorHostRuntime,
     /// Connector reliability registry (circuit breakers + DLQ)
     reliability_registry: crate::connector_reliability::ReliabilityRegistry,
+    /// Connector bundle registry for tier-based connector packaging and trust gating
+    bundle_registry: crate::connector_bundles::BundleRegistry,
 }
 
 impl PolicyEngine {
@@ -2939,6 +2941,9 @@ impl PolicyEngine {
             reliability_registry: crate::connector_reliability::ReliabilityRegistry::new(
                 crate::connector_reliability::ConnectorReliabilityConfig::default(),
             ),
+            bundle_registry: crate::connector_bundles::BundleRegistry::new(
+                crate::connector_bundles::BundleRegistryConfig::default(),
+            ),
         }
     }
 
@@ -2976,6 +2981,9 @@ impl PolicyEngine {
         ).expect("ConnectorHostConfig from SafetyConfig should be valid");
         engine.reliability_registry = crate::connector_reliability::ReliabilityRegistry::new(
             config.connector_reliability.clone(),
+        );
+        engine.bundle_registry = crate::connector_bundles::BundleRegistry::new(
+            config.bundle_registry.clone(),
         );
         engine
     }
@@ -3137,6 +3145,57 @@ impl PolicyEngine {
         &mut self.reliability_registry
     }
 
+    /// Access the bundle registry.
+    #[must_use]
+    pub fn bundle_registry(&self) -> &crate::connector_bundles::BundleRegistry {
+        &self.bundle_registry
+    }
+
+    /// Access the bundle registry mutably.
+    pub fn bundle_registry_mut(&mut self) -> &mut crate::connector_bundles::BundleRegistry {
+        &mut self.bundle_registry
+    }
+
+    /// Register a connector bundle with audit chain recording and compliance notification.
+    pub fn register_bundle(
+        &mut self,
+        bundle: crate::connector_bundles::ConnectorBundle,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<(), crate::connector_bundles::BundleRegistryError> {
+        let bundle_id = bundle.bundle_id.clone();
+        let tier = bundle.tier;
+        self.bundle_registry.register(bundle, actor, now_ms)?;
+        self.audit_chain.append(
+            AuditEntryKind::PolicyDecision,
+            actor,
+            &format!("registered connector bundle '{bundle_id}' (tier: {tier})"),
+            &bundle_id,
+            now_ms,
+        );
+        self.compliance_engine.record_evaluation(false);
+        Ok(())
+    }
+
+    /// Remove a connector bundle with audit chain recording and compliance notification.
+    pub fn remove_bundle(
+        &mut self,
+        bundle_id: &str,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<crate::connector_bundles::ConnectorBundle, crate::connector_bundles::BundleRegistryError> {
+        let bundle = self.bundle_registry.remove(bundle_id, actor, now_ms)?;
+        self.audit_chain.append(
+            AuditEntryKind::QuarantineAction,
+            actor,
+            &format!("removed connector bundle '{bundle_id}' (tier: {})", bundle.tier),
+            bundle_id,
+            now_ms,
+        );
+        self.compliance_engine.record_evaluation(false);
+        Ok(bundle)
+    }
+
     /// Record a credential broker denial to the compliance engine and audit chain.
     fn credential_broker_record_denial(&mut self, connector_id: &str) {
         let ts = SystemTime::now()
@@ -3257,6 +3316,18 @@ impl PolicyEngine {
             PolicySubsystemInput {
                 evaluations: gov_snap.telemetry.evaluations,
                 denials: gov_snap.telemetry.rejections,
+                active_quarantines: 0,
+                active_violations: 0,
+            },
+        );
+
+        // Feed bundle registry counters
+        let bundle_tel = self.bundle_registry.telemetry();
+        collector.update_subsystem(
+            "bundle_registry",
+            PolicySubsystemInput {
+                evaluations: bundle_tel.bundles_registered + bundle_tel.bundles_updated + bundle_tel.bundles_removed,
+                denials: bundle_tel.validation_failures,
                 active_quarantines: 0,
                 active_violations: 0,
             },
@@ -11217,5 +11288,90 @@ mod tests {
             .find(|i| i.name == "denial_rate")
             .unwrap();
         assert_eq!(denial_ind.status, crate::policy_metrics::HealthStatus::Warning);
+    }
+
+    // =========================================================================
+    // BundleRegistry integration tests
+    // =========================================================================
+
+    #[test]
+    fn bundle_registry_accessible_from_engine() {
+        let engine = PolicyEngine::permissive();
+        assert!(engine.bundle_registry().is_empty());
+        assert_eq!(engine.bundle_registry().len(), 0);
+    }
+
+    #[test]
+    fn register_bundle_records_audit_chain() {
+        use crate::connector_bundles::{BundleTier, BundleCategory, BundleConnectorEntry, ConnectorBundle};
+
+        let mut engine = PolicyEngine::permissive();
+        let mut bundle = ConnectorBundle::new("test-devtools", "Test DevTools", BundleTier::Tier1, BundleCategory::SourceControl, 500);
+        bundle.connectors.push(BundleConnectorEntry::required("github", "GitHub"));
+
+        let chain_before = engine.audit_chain().len();
+        engine.register_bundle(bundle, "policy-admin", 1000).unwrap();
+        assert_eq!(engine.bundle_registry().len(), 1);
+        assert!(engine.bundle_registry().get("test-devtools").is_some());
+        assert!(engine.audit_chain().len() > chain_before);
+    }
+
+    #[test]
+    fn remove_bundle_records_audit_chain() {
+        use crate::connector_bundles::{BundleTier, BundleCategory, BundleConnectorEntry, ConnectorBundle};
+
+        let mut engine = PolicyEngine::permissive();
+        let mut bundle = ConnectorBundle::new("test-rm", "Remove Me", BundleTier::Tier2, BundleCategory::Messaging, 500);
+        bundle.connectors.push(BundleConnectorEntry::required("slack", "Slack"));
+
+        engine.register_bundle(bundle, "admin", 1000).unwrap();
+        let chain_after_register = engine.audit_chain().len();
+        let removed = engine.remove_bundle("test-rm", "admin", 2000).unwrap();
+        assert_eq!(removed.bundle_id, "test-rm");
+        assert!(engine.bundle_registry().is_empty());
+        assert!(engine.audit_chain().len() > chain_after_register);
+    }
+
+    #[test]
+    fn register_bundle_feeds_compliance() {
+        use crate::connector_bundles::{BundleTier, BundleCategory, BundleConnectorEntry, ConnectorBundle};
+
+        let mut engine = PolicyEngine::permissive();
+        let mut bundle = ConnectorBundle::new("compliance-test", "Compliance Test", BundleTier::Tier1, BundleCategory::Monitoring, 500);
+        bundle.connectors.push(BundleConnectorEntry::required("datadog", "Datadog"));
+
+        let snap_before = engine.compliance_engine_mut().snapshot(1000);
+        engine.register_bundle(bundle, "admin", 1000).unwrap();
+        let snap_after = engine.compliance_engine_mut().snapshot(2000);
+        assert!(snap_after.counters.total_evaluations > snap_before.counters.total_evaluations);
+    }
+
+    #[test]
+    fn metrics_dashboard_reflects_bundle_registry() {
+        use crate::connector_bundles::{BundleTier, BundleCategory, BundleConnectorEntry, ConnectorBundle};
+
+        let mut engine = PolicyEngine::permissive();
+        let mut bundle = ConnectorBundle::new("dash-test", "Dashboard Test", BundleTier::Tier1, BundleCategory::SourceControl, 500);
+        bundle.connectors.push(BundleConnectorEntry::required("github", "GitHub"));
+
+        engine.register_bundle(bundle, "admin", 1000).unwrap();
+        let dash = engine.metrics_dashboard(2000);
+        let br = &dash.subsystem_metrics["bundle_registry"];
+        assert!(br.evaluations >= 1);
+    }
+
+    #[test]
+    fn bundle_registry_from_safety_config() {
+        use crate::connector_bundles::BundleRegistryConfig;
+
+        let config = crate::config::SafetyConfig {
+            bundle_registry: BundleRegistryConfig {
+                max_bundles: 64,
+                max_audit_entries: 128,
+            },
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from_safety_config(&config);
+        assert!(engine.bundle_registry().is_empty());
     }
 }
