@@ -2997,6 +2997,80 @@ impl PolicyEngine {
         &mut self.decision_log
     }
 
+    /// Quarantine a component and record the action in the audit chain.
+    pub fn quarantine_component(
+        &mut self,
+        component_id: &str,
+        component_kind: crate::policy_quarantine::ComponentKind,
+        severity: crate::policy_quarantine::QuarantineSeverity,
+        reason: crate::policy_quarantine::QuarantineReason,
+        imposed_by: &str,
+        now_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<(), crate::policy_quarantine::QuarantineError> {
+        self.quarantine_registry.quarantine(
+            component_id,
+            component_kind,
+            severity,
+            reason,
+            imposed_by,
+            now_ms,
+            expires_at_ms,
+        )?;
+        self.audit_chain.append(
+            AuditEntryKind::QuarantineAction,
+            imposed_by,
+            &format!("quarantined {component_id}"),
+            component_id,
+            now_ms,
+        );
+        Ok(())
+    }
+
+    /// Release a component from quarantine and record in the audit chain.
+    pub fn release_component(
+        &mut self,
+        component_id: &str,
+        released_by: &str,
+        probation: bool,
+        now_ms: u64,
+    ) -> Result<(), crate::policy_quarantine::QuarantineError> {
+        self.quarantine_registry
+            .release(component_id, released_by, probation, now_ms)?;
+        let detail = if probation {
+            format!("released {component_id} to probation")
+        } else {
+            format!("released {component_id} from quarantine")
+        };
+        self.audit_chain.append(
+            AuditEntryKind::QuarantineAction,
+            released_by,
+            &detail,
+            component_id,
+            now_ms,
+        );
+        Ok(())
+    }
+
+    /// Trip the kill switch and record in the audit chain.
+    pub fn trip_kill_switch(
+        &mut self,
+        level: crate::policy_quarantine::KillSwitchLevel,
+        by: &str,
+        reason: &str,
+        now_ms: u64,
+    ) {
+        self.quarantine_registry
+            .trip_kill_switch(level, by, reason, now_ms);
+        self.audit_chain.append(
+            AuditEntryKind::KillSwitchAction,
+            by,
+            &format!("kill switch tripped to {level}: {reason}"),
+            "kill_switch",
+            now_ms,
+        );
+    }
+
     /// Calculate risk score for the given input
     ///
     /// This evaluates all applicable risk factors and returns a composite score.
@@ -9896,5 +9970,134 @@ mod tests {
 
         // Bounded to max_entries
         assert_eq!(engine.audit_chain().len(), 3);
+    }
+
+    // ================================================================
+    // Audited quarantine/kill-switch operation tests
+    // ================================================================
+
+    #[test]
+    fn quarantine_component_records_to_audit_chain() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        engine
+            .quarantine_component(
+                "pane-10",
+                ComponentKind::Pane,
+                QuarantineSeverity::Restricted,
+                QuarantineReason::OperatorDirected {
+                    operator: "admin".into(),
+                    note: "suspicious".into(),
+                },
+                "admin",
+                5000,
+                0,
+            )
+            .unwrap();
+
+        // Should be in quarantine registry
+        assert!(engine.quarantine_registry().is_quarantined("pane-10"));
+
+        // Should be in audit chain
+        assert_eq!(engine.audit_chain().len(), 1);
+        let entry = engine.audit_chain().latest().unwrap();
+        assert_eq!(entry.kind, AuditEntryKind::QuarantineAction);
+        assert_eq!(entry.entity_ref, "pane-10");
+        assert!(entry.description.contains("quarantined pane-10"));
+    }
+
+    #[test]
+    fn release_component_records_to_audit_chain() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        engine
+            .quarantine_component(
+                "pane-11",
+                ComponentKind::Pane,
+                QuarantineSeverity::Restricted,
+                QuarantineReason::OperatorDirected {
+                    operator: "admin".into(),
+                    note: "test".into(),
+                },
+                "admin",
+                1000,
+                0,
+            )
+            .unwrap();
+
+        engine
+            .release_component("pane-11", "admin", false, 2000)
+            .unwrap();
+
+        // Two entries: quarantine + release
+        assert_eq!(engine.audit_chain().len(), 2);
+        let entry = engine.audit_chain().latest().unwrap();
+        assert_eq!(entry.kind, AuditEntryKind::QuarantineAction);
+        assert!(entry.description.contains("released pane-11 from quarantine"));
+    }
+
+    #[test]
+    fn trip_kill_switch_records_to_audit_chain() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        engine.trip_kill_switch(
+            KillSwitchLevel::EmergencyHalt,
+            "operator",
+            "critical incident",
+            3000,
+        );
+
+        assert!(engine.quarantine_registry().kill_switch().is_emergency());
+
+        assert_eq!(engine.audit_chain().len(), 1);
+        let entry = engine.audit_chain().latest().unwrap();
+        assert_eq!(entry.kind, AuditEntryKind::KillSwitchAction);
+        assert_eq!(entry.entity_ref, "kill_switch");
+        assert!(entry.description.contains("emergency_halt"));
+    }
+
+    #[test]
+    fn full_lifecycle_audit_chain_verifies() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        // Quarantine a component
+        engine
+            .quarantine_component(
+                "pane-20",
+                ComponentKind::Pane,
+                QuarantineSeverity::Isolated,
+                QuarantineReason::OperatorDirected {
+                    operator: "admin".into(),
+                    note: "audit".into(),
+                },
+                "admin",
+                1000,
+                0,
+            )
+            .unwrap();
+
+        // Deny an action against quarantined pane
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(20)
+            .with_capabilities(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+
+        // Release the component
+        engine
+            .release_component("pane-20", "admin", false, 3000)
+            .unwrap();
+
+        // Three entries: quarantine, deny, release
+        assert_eq!(engine.audit_chain().len(), 3);
+
+        // Chain should verify cleanly
+        let result = engine.audit_chain_mut().verify();
+        assert!(result.valid, "full lifecycle chain should verify: {result}");
+        assert_eq!(result.entries_checked, 3);
     }
 }
