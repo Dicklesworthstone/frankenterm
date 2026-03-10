@@ -1095,6 +1095,7 @@ mod tests {
             pane_title: title.map(|s| s.to_owned()),
             pane_cwd: cwd.map(|s| s.to_owned()),
             agent_type: agent_type.map(|s| s.to_owned()),
+            actor_namespace: None,
         }
     }
 

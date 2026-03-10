@@ -1601,6 +1601,9 @@ pub struct SafetyConfig {
 
     /// Ingestion pipeline settings (event ingestion, rate limiting, audit chain)
     pub ingestion_pipeline: crate::connector_bundles::IngestionPipelineConfig,
+
+    /// Namespace isolation settings (multi-tenant boundary enforcement)
+    pub namespace_isolation: crate::namespace_isolation::NamespaceIsolationConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1632,6 +1635,7 @@ impl Default for SafetyConfig {
             bundle_registry: crate::connector_bundles::BundleRegistryConfig::default(),
             connector_mesh: crate::connector_mesh::ConnectorMeshConfig::default(),
             ingestion_pipeline: crate::connector_bundles::IngestionPipelineConfig::default(),
+            namespace_isolation: crate::namespace_isolation::NamespaceIsolationConfig::default(),
         }
     }
 }

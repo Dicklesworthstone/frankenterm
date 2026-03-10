@@ -227,6 +227,7 @@ fn arb_policy_input() -> impl Strategy<Value = PolicyInput> {
                 pane_title: title,
                 pane_cwd: cwd,
                 agent_type: agent,
+                actor_namespace: None,
             },
         )
 }

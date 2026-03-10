@@ -794,6 +794,82 @@ pub struct NamespaceRegistrySnapshot {
 }
 
 // =============================================================================
+// Configuration
+// =============================================================================
+
+/// Configuration for namespace isolation within the policy engine.
+///
+/// Wraps [`CrossTenantPolicy`] and operational tuning parameters so the
+/// namespace isolation subsystem can be configured via TOML/`SafetyConfig`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceIsolationConfig {
+    /// Whether namespace isolation enforcement is enabled.
+    /// When `false`, the namespace registry still tracks bindings but
+    /// boundary checks always return `Allow`.
+    pub enabled: bool,
+
+    /// Cross-tenant access policy (default decision, hierarchical delegation,
+    /// system bypass, explicit rules).
+    pub cross_tenant_policy: CrossTenantPolicy,
+
+    /// Maximum audit log entries before oldest are discarded.
+    pub max_audit_entries: usize,
+}
+
+impl Default for NamespaceIsolationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::default(),
+            max_audit_entries: NamespaceRegistry::DEFAULT_MAX_AUDIT,
+        }
+    }
+}
+
+impl NamespaceIsolationConfig {
+    /// Creates a permissive config (allow all cross-tenant with audit).
+    #[must_use]
+    pub fn permissive() -> Self {
+        Self {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::permissive(),
+            max_audit_entries: NamespaceRegistry::DEFAULT_MAX_AUDIT,
+        }
+    }
+
+    /// Creates a strict config (deny all cross-tenant, no hierarchical).
+    #[must_use]
+    pub fn strict() -> Self {
+        Self {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            max_audit_entries: NamespaceRegistry::DEFAULT_MAX_AUDIT,
+        }
+    }
+
+    /// Creates a disabled config (no enforcement).
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+}
+
+impl NamespaceRegistry {
+    /// Creates a registry from a [`NamespaceIsolationConfig`].
+    #[must_use]
+    pub fn from_config(config: &NamespaceIsolationConfig) -> Self {
+        Self {
+            policy: config.cross_tenant_policy.clone(),
+            max_audit_entries: config.max_audit_entries,
+            ..Self::new()
+        }
+    }
+}
+
+// =============================================================================
 // Telemetry
 // =============================================================================
 

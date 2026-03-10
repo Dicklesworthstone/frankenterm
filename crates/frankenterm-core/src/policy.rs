@@ -1186,6 +1186,12 @@ pub struct PolicyInput {
     /// Inferred agent type for rule matching (e.g., "claude", "cursor", "shell")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+
+    /// Actor's namespace for multi-tenant isolation checks.
+    /// When set, the policy engine checks whether the actor's namespace
+    /// has cross-tenant access to the target resource's namespace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_namespace: Option<crate::namespace_isolation::TenantNamespace>,
 }
 
 impl PolicyInput {
@@ -1206,6 +1212,7 @@ impl PolicyInput {
             pane_title: None,
             pane_cwd: None,
             agent_type: None,
+            actor_namespace: None,
         }
     }
 
@@ -1283,6 +1290,13 @@ impl PolicyInput {
     #[must_use]
     pub fn with_agent_type(mut self, agent_type: impl Into<String>) -> Self {
         self.agent_type = Some(agent_type.into());
+        self
+    }
+
+    /// Set the actor's namespace for multi-tenant isolation checks.
+    #[must_use]
+    pub fn with_namespace(mut self, ns: crate::namespace_isolation::TenantNamespace) -> Self {
+        self.actor_namespace = Some(ns);
         self
     }
 
@@ -2904,6 +2918,10 @@ pub struct PolicyEngine {
     connector_mesh: crate::connector_mesh::ConnectorMesh,
     /// Ingestion pipeline for connector event recording and audit trails
     ingestion_pipeline: crate::connector_bundles::IngestionPipeline,
+    /// Namespace registry for multi-tenant isolation and cross-tenant guardrails
+    namespace_registry: crate::namespace_isolation::NamespaceRegistry,
+    /// Whether namespace isolation enforcement is enabled
+    namespace_isolation_enabled: bool,
 }
 
 impl PolicyEngine {
@@ -2941,7 +2959,8 @@ impl PolicyEngine {
             ),
             connector_host_runtime: crate::connector_host_runtime::ConnectorHostRuntime::new(
                 crate::connector_host_runtime::ConnectorHostConfig::default(),
-            ).expect("default ConnectorHostConfig should be valid"),
+            )
+            .expect("default ConnectorHostConfig should be valid"),
             reliability_registry: crate::connector_reliability::ReliabilityRegistry::new(
                 crate::connector_reliability::ConnectorReliabilityConfig::default(),
             ),
@@ -2954,6 +2973,8 @@ impl PolicyEngine {
             ingestion_pipeline: crate::connector_bundles::IngestionPipeline::new(
                 crate::connector_bundles::IngestionPipelineConfig::default(),
             ),
+            namespace_registry: crate::namespace_isolation::NamespaceRegistry::new(),
+            namespace_isolation_enabled: true,
         }
     }
 
@@ -2978,29 +2999,33 @@ impl PolicyEngine {
         engine.credential_broker =
             ConnectorCredentialBroker::from_config(&config.credential_broker);
         engine.credential_broker_config = config.credential_broker.clone();
-        engine.lifecycle_manager =
-            crate::connector_lifecycle::ConnectorLifecycleManager::new(config.lifecycle_manager.clone());
-        engine.data_classifier =
-            crate::connector_data_classification::ConnectorDataClassifier::new(config.data_classifier.clone());
+        engine.lifecycle_manager = crate::connector_lifecycle::ConnectorLifecycleManager::new(
+            config.lifecycle_manager.clone(),
+        );
+        engine.data_classifier = crate::connector_data_classification::ConnectorDataClassifier::new(
+            config.data_classifier.clone(),
+        );
         engine.connector_governor =
             crate::connector_governor::ConnectorGovernor::new(config.connector_governor.clone());
-        engine.connector_registry =
-            crate::connector_registry::ConnectorRegistryClient::new(config.connector_registry.clone());
+        engine.connector_registry = crate::connector_registry::ConnectorRegistryClient::new(
+            config.connector_registry.clone(),
+        );
         engine.connector_host_runtime = crate::connector_host_runtime::ConnectorHostRuntime::new(
             config.connector_host_runtime.clone(),
-        ).expect("ConnectorHostConfig from SafetyConfig should be valid");
+        )
+        .expect("ConnectorHostConfig from SafetyConfig should be valid");
         engine.reliability_registry = crate::connector_reliability::ReliabilityRegistry::new(
             config.connector_reliability.clone(),
         );
-        engine.bundle_registry = crate::connector_bundles::BundleRegistry::new(
-            config.bundle_registry.clone(),
-        );
-        engine.connector_mesh = crate::connector_mesh::ConnectorMesh::new(
-            config.connector_mesh.clone(),
-        );
-        engine.ingestion_pipeline = crate::connector_bundles::IngestionPipeline::new(
-            config.ingestion_pipeline.clone(),
-        );
+        engine.bundle_registry =
+            crate::connector_bundles::BundleRegistry::new(config.bundle_registry.clone());
+        engine.connector_mesh =
+            crate::connector_mesh::ConnectorMesh::new(config.connector_mesh.clone());
+        engine.ingestion_pipeline =
+            crate::connector_bundles::IngestionPipeline::new(config.ingestion_pipeline.clone());
+        engine.namespace_registry =
+            crate::namespace_isolation::NamespaceRegistry::from_config(&config.namespace_isolation);
+        engine.namespace_isolation_enabled = config.namespace_isolation.enabled;
         engine
     }
 
@@ -3102,18 +3127,24 @@ impl PolicyEngine {
     }
 
     /// Access the connector lifecycle manager mutably.
-    pub fn lifecycle_manager_mut(&mut self) -> &mut crate::connector_lifecycle::ConnectorLifecycleManager {
+    pub fn lifecycle_manager_mut(
+        &mut self,
+    ) -> &mut crate::connector_lifecycle::ConnectorLifecycleManager {
         &mut self.lifecycle_manager
     }
 
     /// Access the data classifier.
     #[must_use]
-    pub fn data_classifier(&self) -> &crate::connector_data_classification::ConnectorDataClassifier {
+    pub fn data_classifier(
+        &self,
+    ) -> &crate::connector_data_classification::ConnectorDataClassifier {
         &self.data_classifier
     }
 
     /// Access the data classifier mutably.
-    pub fn data_classifier_mut(&mut self) -> &mut crate::connector_data_classification::ConnectorDataClassifier {
+    pub fn data_classifier_mut(
+        &mut self,
+    ) -> &mut crate::connector_data_classification::ConnectorDataClassifier {
         &mut self.data_classifier
     }
 
@@ -3135,7 +3166,9 @@ impl PolicyEngine {
     }
 
     /// Access the connector registry mutably.
-    pub fn connector_registry_mut(&mut self) -> &mut crate::connector_registry::ConnectorRegistryClient {
+    pub fn connector_registry_mut(
+        &mut self,
+    ) -> &mut crate::connector_registry::ConnectorRegistryClient {
         &mut self.connector_registry
     }
 
@@ -3146,7 +3179,9 @@ impl PolicyEngine {
     }
 
     /// Access the connector host runtime mutably.
-    pub fn connector_host_runtime_mut(&mut self) -> &mut crate::connector_host_runtime::ConnectorHostRuntime {
+    pub fn connector_host_runtime_mut(
+        &mut self,
+    ) -> &mut crate::connector_host_runtime::ConnectorHostRuntime {
         &mut self.connector_host_runtime
     }
 
@@ -3157,7 +3192,9 @@ impl PolicyEngine {
     }
 
     /// Access the reliability registry mutably.
-    pub fn reliability_registry_mut(&mut self) -> &mut crate::connector_reliability::ReliabilityRegistry {
+    pub fn reliability_registry_mut(
+        &mut self,
+    ) -> &mut crate::connector_reliability::ReliabilityRegistry {
         &mut self.reliability_registry
     }
 
@@ -3194,6 +3231,108 @@ impl PolicyEngine {
         &mut self.ingestion_pipeline
     }
 
+    /// Access the namespace registry.
+    #[must_use]
+    pub fn namespace_registry(&self) -> &crate::namespace_isolation::NamespaceRegistry {
+        &self.namespace_registry
+    }
+
+    /// Access the namespace registry mutably.
+    pub fn namespace_registry_mut(&mut self) -> &mut crate::namespace_isolation::NamespaceRegistry {
+        &mut self.namespace_registry
+    }
+
+    /// Returns whether namespace isolation enforcement is enabled.
+    #[must_use]
+    pub fn namespace_isolation_enabled(&self) -> bool {
+        self.namespace_isolation_enabled
+    }
+
+    /// Bind a resource to a namespace with audit chain recording.
+    ///
+    /// Records the binding in both the namespace registry and the audit chain
+    /// for governance traceability.
+    pub fn bind_resource_to_namespace(
+        &mut self,
+        kind: crate::namespace_isolation::NamespacedResourceKind,
+        resource_id: &str,
+        namespace: crate::namespace_isolation::TenantNamespace,
+        actor: &str,
+        now_ms: u64,
+    ) -> Option<crate::namespace_isolation::TenantNamespace> {
+        let prev = self
+            .namespace_registry
+            .bind(kind, resource_id, namespace.clone());
+        self.audit_chain.append(
+            AuditEntryKind::PolicyDecision,
+            actor,
+            &format!(
+                "bound {kind} '{resource_id}' to namespace '{namespace}'{}",
+                prev.as_ref()
+                    .map(|p| format!(" (previously in '{p}')"))
+                    .unwrap_or_default(),
+                kind = kind.as_str(),
+            ),
+            &format!("namespace.bind.{}", kind.as_str()),
+            now_ms,
+        );
+        self.compliance_engine.record_evaluation(false);
+        prev
+    }
+
+    /// Check cross-tenant access with audit chain recording.
+    ///
+    /// Performs a namespace boundary check and records the result in both
+    /// the namespace registry's audit log and the policy audit chain.
+    /// Returns [`BoundaryCheckResult`](crate::namespace_isolation::BoundaryCheckResult).
+    pub fn check_cross_tenant_access(
+        &mut self,
+        source_ns: &crate::namespace_isolation::TenantNamespace,
+        target_ns: &crate::namespace_isolation::TenantNamespace,
+        resource_kind: crate::namespace_isolation::NamespacedResourceKind,
+        resource_id: &str,
+        actor: &str,
+        now_ms: u64,
+    ) -> crate::namespace_isolation::BoundaryCheckResult {
+        let result = self.namespace_registry.check_and_audit(
+            source_ns,
+            target_ns,
+            resource_kind,
+            resource_id,
+            now_ms,
+        );
+
+        if result.crosses_boundary {
+            let decision_str = if result.is_allowed() { "allow" } else { "deny" };
+            self.audit_chain.append(
+                AuditEntryKind::PolicyDecision,
+                actor,
+                &format!(
+                    "cross-tenant {decision_str}: {src} -> {tgt} for {kind}:'{rid}'{rule}",
+                    src = source_ns,
+                    tgt = target_ns,
+                    kind = resource_kind.as_str(),
+                    rid = resource_id,
+                    rule = result
+                        .matched_rule
+                        .as_deref()
+                        .map(|r| format!(" (rule: {r})"))
+                        .unwrap_or_default(),
+                ),
+                "policy.namespace_isolation",
+                now_ms,
+            );
+
+            if !result.is_allowed() {
+                self.compliance_engine.record_evaluation(true);
+            } else {
+                self.compliance_engine.record_evaluation(false);
+            }
+        }
+
+        result
+    }
+
     /// Register a connector bundle with audit chain recording and compliance notification.
     pub fn register_bundle(
         &mut self,
@@ -3221,12 +3360,18 @@ impl PolicyEngine {
         bundle_id: &str,
         actor: &str,
         now_ms: u64,
-    ) -> Result<crate::connector_bundles::ConnectorBundle, crate::connector_bundles::BundleRegistryError> {
+    ) -> Result<
+        crate::connector_bundles::ConnectorBundle,
+        crate::connector_bundles::BundleRegistryError,
+    > {
         let bundle = self.bundle_registry.remove(bundle_id, actor, now_ms)?;
         self.audit_chain.append(
             AuditEntryKind::QuarantineAction,
             actor,
-            &format!("removed connector bundle '{bundle_id}' (tier: {})", bundle.tier),
+            &format!(
+                "removed connector bundle '{bundle_id}' (tier: {})",
+                bundle.tier
+            ),
             bundle_id,
             now_ms,
         );
@@ -3325,14 +3470,14 @@ impl PolicyEngine {
 
         // Feed audit chain state
         let chain_verification = self.audit_chain.verify();
-        collector.update_audit_chain(
-            self.audit_chain.len() as u64,
-            chain_verification.valid,
-        );
+        collector.update_audit_chain(self.audit_chain.len() as u64, chain_verification.valid);
 
         // Feed kill switch state
         let ks = self.quarantine_registry.kill_switch();
-        let ks_active = !matches!(ks.level, crate::policy_quarantine::KillSwitchLevel::Disarmed);
+        let ks_active = !matches!(
+            ks.level,
+            crate::policy_quarantine::KillSwitchLevel::Disarmed
+        );
         collector.update_kill_switch(ks_active);
 
         // Feed credential broker counters
@@ -3340,7 +3485,8 @@ impl PolicyEngine {
         collector.update_subsystem(
             "credential_broker",
             PolicySubsystemInput {
-                evaluations: broker_snap.counters.leases_issued + broker_snap.counters.access_denied,
+                evaluations: broker_snap.counters.leases_issued
+                    + broker_snap.counters.access_denied,
                 denials: broker_snap.counters.access_denied,
                 active_quarantines: 0,
                 active_violations: 0,
@@ -3364,7 +3510,9 @@ impl PolicyEngine {
         collector.update_subsystem(
             "bundle_registry",
             PolicySubsystemInput {
-                evaluations: bundle_tel.bundles_registered + bundle_tel.bundles_updated + bundle_tel.bundles_removed,
+                evaluations: bundle_tel.bundles_registered
+                    + bundle_tel.bundles_updated
+                    + bundle_tel.bundles_removed,
                 denials: bundle_tel.validation_failures,
                 active_quarantines: 0,
                 active_violations: 0,
@@ -3390,6 +3538,18 @@ impl PolicyEngine {
             PolicySubsystemInput {
                 evaluations: ingest_tel.events_received,
                 denials: ingest_tel.events_rejected,
+                active_quarantines: 0,
+                active_violations: 0,
+            },
+        );
+
+        // Feed namespace isolation counters
+        let ns_snap = self.namespace_registry.snapshot();
+        collector.update_subsystem(
+            "namespace_isolation",
+            PolicySubsystemInput {
+                evaluations: ns_snap.total_bindings as u64,
+                denials: 0, // boundary denials tracked via compliance_engine
                 active_quarantines: 0,
                 active_violations: 0,
             },
@@ -3827,6 +3987,175 @@ impl PolicyEngine {
                     "policy.quarantine",
                 )
                 .with_context(context);
+            }
+        }
+
+        // ---- Namespace isolation check (domain-inferred) ----
+        // When namespace isolation is enabled and the actor's namespace is inferred
+        // from `domain` (not the explicit `actor_namespace` field), apply boundary
+        // checks using raw pane-id lookup.  The explicit `actor_namespace` path is
+        // handled by the subsequent block which uses the prefixed resource-id format.
+        if self.namespace_isolation_enabled && input.actor_namespace.is_none() {
+            if let Some(pane_id) = input.pane_id {
+                let actor_ns_opt = input
+                    .domain
+                    .as_deref()
+                    .and_then(crate::namespace_isolation::TenantNamespace::new);
+                if let Some(actor_ns) = actor_ns_opt {
+                    let target_ns = self.namespace_registry.lookup(
+                        crate::namespace_isolation::NamespacedResourceKind::Pane,
+                        &pane_id.to_string(),
+                    );
+                    let boundary = self.namespace_registry.check_boundary(
+                        &actor_ns,
+                        &target_ns,
+                        crate::namespace_isolation::NamespacedResourceKind::Pane,
+                    );
+                    if boundary.crosses_boundary {
+                        if !boundary.is_allowed() {
+                            context.record_rule(
+                                "policy.namespace_isolation",
+                                true,
+                                Some("deny"),
+                                Some(format!(
+                                    "cross-tenant access denied: {} -> {} for pane {pane_id}",
+                                    actor_ns, target_ns
+                                )),
+                            );
+                            context.set_determining_rule("policy.namespace_isolation");
+                            return PolicyDecision::deny_with_rule(
+                                format!(
+                                    "Cross-tenant access denied: namespace '{}' cannot access pane {} in namespace '{}'",
+                                    actor_ns, pane_id, target_ns
+                                ),
+                                "policy.namespace_isolation",
+                            )
+                            .with_context(context);
+                        }
+                        // Allowed but crosses boundary — record for audit
+                        context.record_rule(
+                            "policy.namespace_isolation",
+                            false,
+                            None,
+                            Some(format!(
+                                "cross-tenant access allowed: {} -> {} ({})",
+                                actor_ns,
+                                target_ns,
+                                boundary.matched_rule.as_deref().unwrap_or("default policy"),
+                            )),
+                        );
+                        context.add_evidence("namespace_boundary", "crossed");
+                    } else {
+                        context.record_rule(
+                            "policy.namespace_isolation",
+                            false,
+                            None,
+                            Some("same-namespace access".to_string()),
+                        );
+                    }
+                }
+            }
+        }
+
+        // ---- Namespace isolation check (explicit actor_namespace) ----
+        if self.namespace_isolation_enabled {
+            if let Some(actor_ns) = &input.actor_namespace {
+                let (resource_kind, resource_id) = if let Some(pane_id) = input.pane_id {
+                    (
+                        crate::namespace_isolation::NamespacedResourceKind::Pane,
+                        format!("pane-{pane_id}"),
+                    )
+                } else if input.action.is_connector_action() {
+                    (
+                        crate::namespace_isolation::NamespacedResourceKind::Connector,
+                        input
+                            .domain
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    )
+                } else if input.workflow_id.is_some() {
+                    (
+                        crate::namespace_isolation::NamespacedResourceKind::Workflow,
+                        input
+                            .workflow_id
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    )
+                } else {
+                    (
+                        crate::namespace_isolation::NamespacedResourceKind::Pane,
+                        String::new(),
+                    )
+                };
+
+                if !resource_id.is_empty() {
+                    let target_ns = self.namespace_registry.lookup(resource_kind, &resource_id);
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let boundary = self.namespace_registry.check_and_audit(
+                        actor_ns,
+                        &target_ns,
+                        resource_kind,
+                        &resource_id,
+                        now_ms,
+                    );
+
+                    if boundary.crosses_boundary && !boundary.is_allowed() {
+                        context.record_rule(
+                            "policy.namespace_isolation",
+                            true,
+                            Some("deny"),
+                            Some(format!(
+                                "cross-tenant access denied: {actor_ns} -> {target_ns} for {}:'{resource_id}'",
+                                resource_kind.as_str(),
+                            )),
+                        );
+                        context.set_determining_rule("policy.namespace_isolation");
+                        self.audit_chain.append(
+                            AuditEntryKind::PolicyDecision,
+                            &format!("{:?}", input.actor),
+                            &format!(
+                                "namespace isolation denied: {actor_ns} -> {target_ns} for {}:'{resource_id}'",
+                                resource_kind.as_str(),
+                            ),
+                            "policy.namespace_isolation",
+                            now_ms,
+                        );
+                        self.compliance_engine.record_evaluation(true);
+                        return PolicyDecision::deny_with_rule(
+                            format!(
+                                "Cross-tenant access denied: namespace '{actor_ns}' cannot access resource in namespace '{target_ns}'",
+                            ),
+                            "policy.namespace_isolation",
+                        )
+                        .with_context(context);
+                    }
+
+                    if boundary.crosses_boundary {
+                        context.record_rule(
+                            "policy.namespace_isolation",
+                            false,
+                            None,
+                            Some(format!(
+                                "cross-tenant access allowed: {actor_ns} -> {target_ns}{}",
+                                boundary
+                                    .matched_rule
+                                    .as_deref()
+                                    .map(|r| format!(" (rule: {r})"))
+                                    .unwrap_or_default(),
+                            )),
+                        );
+                    } else {
+                        context.record_rule(
+                            "policy.namespace_isolation",
+                            false,
+                            None,
+                            Some("same-namespace access".to_string()),
+                        );
+                    }
+                }
             }
         }
 
@@ -10747,6 +11076,7 @@ mod tests {
             pane_title: None,
             pane_cwd: None,
             agent_type: None,
+            actor_namespace: None,
         };
         let scope = crate::connector_credential_broker::CredentialScope {
             provider: "slack".to_string(),
@@ -10798,6 +11128,7 @@ mod tests {
             pane_title: None,
             pane_cwd: None,
             agent_type: None,
+            actor_namespace: None,
         };
         let scope = CredentialScope {
             provider: "slack".to_string(),
@@ -10829,6 +11160,7 @@ mod tests {
             pane_title: None,
             pane_cwd: None,
             agent_type: None,
+            actor_namespace: None,
         };
         let scope = crate::connector_credential_broker::CredentialScope {
             provider: "github".to_string(),
@@ -10889,6 +11221,7 @@ mod tests {
             pane_title: None,
             pane_cwd: None,
             agent_type: None,
+            actor_namespace: None,
         };
         let scope = CredentialScope {
             provider: "slack".to_string(),
@@ -10929,6 +11262,7 @@ mod tests {
             pane_title: None,
             pane_cwd: None,
             agent_type: None,
+            actor_namespace: None,
         };
         let decision = engine.authorize(&input);
         // Should not be denied by credential broker (may still hit rate limit, etc.)
@@ -10956,6 +11290,7 @@ mod tests {
             pane_title: None,
             pane_cwd: None,
             agent_type: None,
+            actor_namespace: None,
         };
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
@@ -11004,10 +11339,9 @@ mod tests {
             created_at_ms: 1000,
             metadata: std::collections::BTreeMap::new(),
         };
-        let result = engine.lifecycle_manager_mut().execute(
-            LifecycleIntent::Install { manifest },
-            1000,
-        );
+        let result = engine
+            .lifecycle_manager_mut()
+            .execute(LifecycleIntent::Install { manifest }, 1000);
         assert!(result.is_ok());
         assert_eq!(engine.lifecycle_manager().count(), 1);
         let conn = engine.lifecycle_manager().get("slack").unwrap();
@@ -11177,7 +11511,12 @@ mod tests {
             ..Default::default()
         };
         let engine = PolicyEngine::from_safety_config(&config);
-        assert!(engine.connector_host_runtime().transition_history().is_empty());
+        assert!(
+            engine
+                .connector_host_runtime()
+                .transition_history()
+                .is_empty()
+        );
     }
 
     // ── ReliabilityRegistry integration tests ────────────────────────
@@ -11210,7 +11549,10 @@ mod tests {
     fn metrics_dashboard_empty_engine_is_healthy() {
         let mut engine = PolicyEngine::permissive();
         let dash = engine.metrics_dashboard(1000);
-        assert_eq!(dash.overall_health, crate::policy_metrics::HealthStatus::Healthy);
+        assert_eq!(
+            dash.overall_health,
+            crate::policy_metrics::HealthStatus::Healthy
+        );
         assert_eq!(dash.counters.total_evaluations, 0);
         assert_eq!(dash.counters.total_denials, 0);
         assert_eq!(dash.counters.kill_switch_active, false);
@@ -11322,16 +11664,28 @@ mod tests {
         // Record 3 denials out of 10 = 30% denial rate
         for _ in 0..7 {
             engine.decision_log_mut().record(
-                1000, ActionKind::SendText, ActorKind::Human,
-                PolicySurface::Robot, Some(0), DecisionOutcome::Allow,
-                None, Some("allowed".to_string()), 1,
+                1000,
+                ActionKind::SendText,
+                ActorKind::Human,
+                PolicySurface::Robot,
+                Some(0),
+                DecisionOutcome::Allow,
+                None,
+                Some("allowed".to_string()),
+                1,
             );
         }
         for _ in 0..3 {
             engine.decision_log_mut().record(
-                1000, ActionKind::SendText, ActorKind::Human,
-                PolicySurface::Robot, Some(0), DecisionOutcome::Deny,
-                None, Some("denied".to_string()), 1,
+                1000,
+                ActionKind::SendText,
+                ActorKind::Human,
+                PolicySurface::Robot,
+                Some(0),
+                DecisionOutcome::Deny,
+                None,
+                Some("denied".to_string()),
+                1,
             );
         }
         // With default thresholds (warning=10, critical=25), 30% should be critical
@@ -11346,10 +11700,15 @@ mod tests {
             ..PolicyMetricsThresholds::default()
         };
         let dash2 = engine.metrics_dashboard_with_thresholds(3000, custom);
-        let denial_ind = dash2.indicators.iter()
+        let denial_ind = dash2
+            .indicators
+            .iter()
             .find(|i| i.name == "denial_rate")
             .unwrap();
-        assert_eq!(denial_ind.status, crate::policy_metrics::HealthStatus::Warning);
+        assert_eq!(
+            denial_ind.status,
+            crate::policy_metrics::HealthStatus::Warning
+        );
     }
 
     // =========================================================================
@@ -11365,14 +11724,26 @@ mod tests {
 
     #[test]
     fn register_bundle_records_audit_chain() {
-        use crate::connector_bundles::{BundleTier, BundleCategory, BundleConnectorEntry, ConnectorBundle};
+        use crate::connector_bundles::{
+            BundleCategory, BundleConnectorEntry, BundleTier, ConnectorBundle,
+        };
 
         let mut engine = PolicyEngine::permissive();
-        let mut bundle = ConnectorBundle::new("test-devtools", "Test DevTools", BundleTier::Tier1, BundleCategory::SourceControl, 500);
-        bundle.connectors.push(BundleConnectorEntry::required("github", "GitHub"));
+        let mut bundle = ConnectorBundle::new(
+            "test-devtools",
+            "Test DevTools",
+            BundleTier::Tier1,
+            BundleCategory::SourceControl,
+            500,
+        );
+        bundle
+            .connectors
+            .push(BundleConnectorEntry::required("github", "GitHub"));
 
         let chain_before = engine.audit_chain().len();
-        engine.register_bundle(bundle, "policy-admin", 1000).unwrap();
+        engine
+            .register_bundle(bundle, "policy-admin", 1000)
+            .unwrap();
         assert_eq!(engine.bundle_registry().len(), 1);
         assert!(engine.bundle_registry().get("test-devtools").is_some());
         assert!(engine.audit_chain().len() > chain_before);
@@ -11380,11 +11751,21 @@ mod tests {
 
     #[test]
     fn remove_bundle_records_audit_chain() {
-        use crate::connector_bundles::{BundleTier, BundleCategory, BundleConnectorEntry, ConnectorBundle};
+        use crate::connector_bundles::{
+            BundleCategory, BundleConnectorEntry, BundleTier, ConnectorBundle,
+        };
 
         let mut engine = PolicyEngine::permissive();
-        let mut bundle = ConnectorBundle::new("test-rm", "Remove Me", BundleTier::Tier2, BundleCategory::Messaging, 500);
-        bundle.connectors.push(BundleConnectorEntry::required("slack", "Slack"));
+        let mut bundle = ConnectorBundle::new(
+            "test-rm",
+            "Remove Me",
+            BundleTier::Tier2,
+            BundleCategory::Messaging,
+            500,
+        );
+        bundle
+            .connectors
+            .push(BundleConnectorEntry::required("slack", "Slack"));
 
         engine.register_bundle(bundle, "admin", 1000).unwrap();
         let chain_after_register = engine.audit_chain().len();
@@ -11396,11 +11777,21 @@ mod tests {
 
     #[test]
     fn register_bundle_feeds_compliance() {
-        use crate::connector_bundles::{BundleTier, BundleCategory, BundleConnectorEntry, ConnectorBundle};
+        use crate::connector_bundles::{
+            BundleCategory, BundleConnectorEntry, BundleTier, ConnectorBundle,
+        };
 
         let mut engine = PolicyEngine::permissive();
-        let mut bundle = ConnectorBundle::new("compliance-test", "Compliance Test", BundleTier::Tier1, BundleCategory::Monitoring, 500);
-        bundle.connectors.push(BundleConnectorEntry::required("datadog", "Datadog"));
+        let mut bundle = ConnectorBundle::new(
+            "compliance-test",
+            "Compliance Test",
+            BundleTier::Tier1,
+            BundleCategory::Monitoring,
+            500,
+        );
+        bundle
+            .connectors
+            .push(BundleConnectorEntry::required("datadog", "Datadog"));
 
         let snap_before = engine.compliance_engine_mut().snapshot(1000);
         engine.register_bundle(bundle, "admin", 1000).unwrap();
@@ -11410,11 +11801,21 @@ mod tests {
 
     #[test]
     fn metrics_dashboard_reflects_bundle_registry() {
-        use crate::connector_bundles::{BundleTier, BundleCategory, BundleConnectorEntry, ConnectorBundle};
+        use crate::connector_bundles::{
+            BundleCategory, BundleConnectorEntry, BundleTier, ConnectorBundle,
+        };
 
         let mut engine = PolicyEngine::permissive();
-        let mut bundle = ConnectorBundle::new("dash-test", "Dashboard Test", BundleTier::Tier1, BundleCategory::SourceControl, 500);
-        bundle.connectors.push(BundleConnectorEntry::required("github", "GitHub"));
+        let mut bundle = ConnectorBundle::new(
+            "dash-test",
+            "Dashboard Test",
+            BundleTier::Tier1,
+            BundleCategory::SourceControl,
+            500,
+        );
+        bundle
+            .connectors
+            .push(BundleConnectorEntry::required("github", "GitHub"));
 
         engine.register_bundle(bundle, "admin", 1000).unwrap();
         let dash = engine.metrics_dashboard(2000);
@@ -11444,7 +11845,14 @@ mod tests {
     #[test]
     fn connector_mesh_accessible_from_engine() {
         let engine = PolicyEngine::permissive();
-        assert_eq!(engine.connector_mesh().telemetry().snapshot().routing_requests, 0);
+        assert_eq!(
+            engine
+                .connector_mesh()
+                .telemetry()
+                .snapshot()
+                .routing_requests,
+            0
+        );
     }
 
     #[test]
@@ -11452,13 +11860,16 @@ mod tests {
         use crate::connector_mesh::MeshZone;
 
         let mut engine = PolicyEngine::permissive();
-        engine.connector_mesh_mut().register_zone(MeshZone {
-            zone_id: "us-east-1".to_string(),
-            label: "US East".to_string(),
-            priority: 1,
-            active: true,
-            metadata: std::collections::BTreeMap::new(),
-        }).unwrap();
+        engine
+            .connector_mesh_mut()
+            .register_zone(MeshZone {
+                zone_id: "us-east-1".to_string(),
+                label: "US East".to_string(),
+                priority: 1,
+                active: true,
+                metadata: std::collections::BTreeMap::new(),
+            })
+            .unwrap();
         let zones = engine.connector_mesh().zones();
         assert!(zones.iter().any(|z| z.zone_id == "us-east-1"));
     }
@@ -11476,7 +11887,14 @@ mod tests {
             ..Default::default()
         };
         let engine = PolicyEngine::from_safety_config(&config);
-        assert_eq!(engine.connector_mesh().telemetry().snapshot().routing_requests, 0);
+        assert_eq!(
+            engine
+                .connector_mesh()
+                .telemetry()
+                .snapshot()
+                .routing_requests,
+            0
+        );
     }
 
     #[test]
@@ -11521,5 +11939,448 @@ mod tests {
         let ip = &dash.subsystem_metrics["ingestion_pipeline"];
         assert_eq!(ip.evaluations, 0);
         assert_eq!(ip.denials, 0);
+    }
+
+    // =========================================================================
+    // NamespaceIsolation integration tests
+    // =========================================================================
+
+    #[test]
+    fn namespace_registry_accessible_from_engine() {
+        let engine = PolicyEngine::permissive();
+        assert_eq!(engine.namespace_registry().binding_count(), 0);
+        assert!(engine.namespace_isolation_enabled());
+    }
+
+    #[test]
+    fn namespace_registry_from_safety_config() {
+        use crate::namespace_isolation::{CrossTenantPolicy, NamespaceIsolationConfig};
+
+        let config = crate::config::SafetyConfig {
+            namespace_isolation: NamespaceIsolationConfig {
+                enabled: true,
+                cross_tenant_policy: CrossTenantPolicy::strict(),
+                max_audit_entries: 512,
+            },
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from_safety_config(&config);
+        assert!(engine.namespace_isolation_enabled());
+        assert_eq!(engine.namespace_registry().binding_count(), 0);
+    }
+
+    #[test]
+    fn namespace_isolation_disabled_allows_all() {
+        use crate::namespace_isolation::{
+            NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let config = crate::config::SafetyConfig {
+            namespace_isolation: NamespaceIsolationConfig::disabled(),
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::from_safety_config(&config);
+        assert!(!engine.namespace_isolation_enabled());
+
+        // Bind pane to a specific namespace
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Pane,
+            "0",
+            TenantNamespace::new("org-a").unwrap(),
+        );
+
+        // Even with different domain, should be allowed because isolation is disabled
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(0)
+            .with_domain("org-b")
+            .with_capabilities(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn namespace_isolation_denies_cross_tenant_access() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let config = crate::config::SafetyConfig {
+            namespace_isolation: NamespaceIsolationConfig {
+                enabled: true,
+                cross_tenant_policy: CrossTenantPolicy::strict(),
+                max_audit_entries: 1024,
+            },
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::from_safety_config(&config);
+
+        // Bind pane 5 to org-a
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Pane,
+            "5",
+            TenantNamespace::new("org-a").unwrap(),
+        );
+
+        // Actor in org-b tries to read pane 5 in org-a → denied
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(5)
+            .with_domain("org-b")
+            .with_capabilities(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+        assert!(!decision.is_allowed());
+        assert!(
+            decision
+                .context()
+                .and_then(|c| c.determining_rule.as_deref())
+                == Some("policy.namespace_isolation")
+        );
+    }
+
+    #[test]
+    fn namespace_isolation_allows_same_tenant_access() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let config = crate::config::SafetyConfig {
+            namespace_isolation: NamespaceIsolationConfig {
+                enabled: true,
+                cross_tenant_policy: CrossTenantPolicy::strict(),
+                max_audit_entries: 1024,
+            },
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::from_safety_config(&config);
+
+        // Bind pane 3 to org-a
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Pane,
+            "3",
+            TenantNamespace::new("org-a").unwrap(),
+        );
+
+        // Actor in org-a reads pane 3 in org-a → allowed
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(3)
+            .with_domain("org-a")
+            .with_capabilities(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn bind_resource_to_namespace_records_audit() {
+        use crate::namespace_isolation::{NamespacedResourceKind, TenantNamespace};
+
+        let mut engine = PolicyEngine::permissive();
+        let prev = engine.bind_resource_to_namespace(
+            NamespacedResourceKind::Pane,
+            "42",
+            TenantNamespace::new("org-x").unwrap(),
+            "test-agent",
+            1000,
+        );
+        assert!(prev.is_none());
+        assert_eq!(engine.namespace_registry().binding_count(), 1);
+        assert!(engine.audit_chain().len() > 0);
+    }
+
+    #[test]
+    fn check_cross_tenant_access_records_audit() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let config = crate::config::SafetyConfig {
+            namespace_isolation: NamespaceIsolationConfig {
+                enabled: true,
+                cross_tenant_policy: CrossTenantPolicy::strict(),
+                max_audit_entries: 1024,
+            },
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::from_safety_config(&config);
+
+        let src = TenantNamespace::new("team-a").unwrap();
+        let tgt = TenantNamespace::new("team-b").unwrap();
+        let result = engine.check_cross_tenant_access(
+            &src,
+            &tgt,
+            NamespacedResourceKind::Connector,
+            "slack-bot",
+            "test-agent",
+            2000,
+        );
+
+        // Strict policy → deny cross-tenant
+        assert!(!result.is_allowed());
+        assert!(result.crosses_boundary);
+        // Audit chain should have recorded the denial
+        assert!(engine.audit_chain().len() > 0);
+    }
+
+    #[test]
+    fn metrics_dashboard_reflects_namespace_isolation() {
+        use crate::namespace_isolation::{NamespacedResourceKind, TenantNamespace};
+
+        let mut engine = PolicyEngine::permissive();
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Pane,
+            "1",
+            TenantNamespace::default(),
+        );
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Session,
+            "s1",
+            TenantNamespace::new("team-a").unwrap(),
+        );
+
+        let dash = engine.metrics_dashboard(1000);
+        let ns = &dash.subsystem_metrics["namespace_isolation"];
+        assert_eq!(ns.evaluations, 2); // 2 bindings
+    }
+
+    // ========================================================================
+    // Namespace isolation — authorize() integration tests
+    // ========================================================================
+
+    #[test]
+    fn authorize_allows_same_namespace_access() {
+        use crate::namespace_isolation::{NamespacedResourceKind, TenantNamespace};
+
+        let mut engine = PolicyEngine::permissive();
+        let ns = TenantNamespace::new("team-a").unwrap();
+        engine
+            .namespace_registry_mut()
+            .bind(NamespacedResourceKind::Pane, "pane-42", ns.clone());
+
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(42)
+            .with_namespace(ns);
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_allowed(),
+            "same-namespace read access should be allowed: {:?}",
+            decision.reason()
+        );
+    }
+
+    #[test]
+    fn authorize_denies_cross_namespace_with_strict_policy() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let actor_ns = TenantNamespace::new("team-a").unwrap();
+        let target_ns = TenantNamespace::new("team-b").unwrap();
+        engine
+            .namespace_registry_mut()
+            .bind(NamespacedResourceKind::Pane, "pane-10", target_ns);
+
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(10)
+            .with_namespace(actor_ns);
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_denied(),
+            "cross-namespace access should be denied with strict policy"
+        );
+        assert!(
+            decision
+                .reason()
+                .unwrap_or("")
+                .contains("Cross-tenant access denied"),
+            "denial reason should mention cross-tenant"
+        );
+    }
+
+    #[test]
+    fn authorize_allows_cross_namespace_with_permissive_policy() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::permissive(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let actor_ns = TenantNamespace::new("team-a").unwrap();
+        let target_ns = TenantNamespace::new("team-b").unwrap();
+        engine
+            .namespace_registry_mut()
+            .bind(NamespacedResourceKind::Pane, "pane-20", target_ns);
+
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(20)
+            .with_namespace(actor_ns);
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_allowed(),
+            "cross-namespace read should be allowed with permissive policy: {:?}",
+            decision.reason()
+        );
+    }
+
+    #[test]
+    fn authorize_skips_namespace_check_when_disabled() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: false,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let actor_ns = TenantNamespace::new("team-a").unwrap();
+        let target_ns = TenantNamespace::new("team-b").unwrap();
+        engine
+            .namespace_registry_mut()
+            .bind(NamespacedResourceKind::Pane, "pane-30", target_ns);
+
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(30)
+            .with_namespace(actor_ns);
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_allowed(),
+            "namespace check should be skipped when disabled: {:?}",
+            decision.reason()
+        );
+    }
+
+    #[test]
+    fn authorize_skips_namespace_check_without_actor_namespace() {
+        use crate::namespace_isolation::{NamespacedResourceKind, TenantNamespace};
+
+        let mut engine = PolicyEngine::permissive();
+        let target_ns = TenantNamespace::new("team-b").unwrap();
+        engine
+            .namespace_registry_mut()
+            .bind(NamespacedResourceKind::Pane, "5", target_ns);
+
+        // No actor_namespace set — namespace check should be skipped
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot).with_pane(5);
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_allowed(),
+            "namespace check should be skipped when actor has no namespace: {:?}",
+            decision.reason()
+        );
+    }
+
+    #[test]
+    fn authorize_namespace_connector_action_denied_cross_tenant() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let actor_ns = TenantNamespace::new("org-a").unwrap();
+        let connector_ns = TenantNamespace::new("org-b").unwrap();
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Connector,
+            "slack-webhook",
+            connector_ns,
+        );
+
+        let input = PolicyInput::new(ActionKind::ConnectorNotify, ActorKind::Robot)
+            .with_domain("slack-webhook")
+            .with_namespace(actor_ns);
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_denied(),
+            "cross-tenant connector access should be denied"
+        );
+    }
+
+    #[test]
+    fn authorize_namespace_audit_chain_records_denial() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let actor_ns = TenantNamespace::new("ns-x").unwrap();
+        let target_ns = TenantNamespace::new("ns-y").unwrap();
+        engine
+            .namespace_registry_mut()
+            .bind(NamespacedResourceKind::Pane, "pane-99", target_ns);
+
+        let chain_len_before = engine.audit_chain().len();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(99)
+            .with_namespace(actor_ns);
+        let _decision = engine.authorize(&input);
+        assert!(
+            engine.audit_chain().len() > chain_len_before,
+            "audit chain should record namespace denial"
+        );
+    }
+
+    #[test]
+    fn authorize_namespace_compliance_records_violation() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let actor_ns = TenantNamespace::new("tenant-1").unwrap();
+        let target_ns = TenantNamespace::new("tenant-2").unwrap();
+        engine
+            .namespace_registry_mut()
+            .bind(NamespacedResourceKind::Pane, "pane-77", target_ns);
+
+        let violations_before = engine.compliance_engine().counters().total_denials;
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(77)
+            .with_namespace(actor_ns);
+        let _decision = engine.authorize(&input);
+        assert!(
+            engine.compliance_engine().counters().total_denials > violations_before,
+            "compliance engine should record namespace violation"
+        );
     }
 }
