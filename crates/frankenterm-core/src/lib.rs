@@ -178,8 +178,8 @@ pub mod extensions;
 pub mod fd_budget;
 pub mod fenwick_tree;
 pub mod fibonacci_heap;
-pub mod forensic_export;
 pub mod fleet_launcher;
+pub mod forensic_export;
 pub mod gc;
 pub mod graph_scoring;
 pub mod headless_mux_server;
@@ -225,6 +225,7 @@ pub mod namespace_isolation;
 pub mod network_observer;
 pub mod network_reliability;
 pub mod notifications;
+pub mod ntm_importer;
 pub mod ntm_parity;
 pub mod orphan_reaper;
 #[cfg(any(feature = "web", feature = "sync", feature = "asupersync-runtime"))]
@@ -242,9 +243,9 @@ pub mod plan;
 #[cfg(feature = "subprocess-bridge")]
 pub mod planner_features;
 pub mod policy;
-pub mod policy_decision_log;
 pub mod policy_audit_chain;
 pub mod policy_compliance;
+pub mod policy_decision_log;
 pub mod policy_dsl;
 pub mod policy_metrics;
 pub mod policy_quarantine;

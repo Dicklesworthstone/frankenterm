@@ -99,7 +99,7 @@ pub struct NtmPane {
 }
 
 /// An NTM workflow definition as exported from `ntm workflow list --json`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NtmWorkflow {
     /// Workflow name (unique within the NTM workspace).
     pub name: String,
@@ -139,7 +139,7 @@ pub struct NtmWorkflowTrigger {
 }
 
 /// An NTM workflow step definition.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NtmWorkflowStep {
     /// Step name.
     pub name: String,
@@ -157,7 +157,7 @@ pub struct NtmWorkflowStep {
 }
 
 /// NTM configuration as exported from `ntm config show --json`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NtmConfig {
     /// Log level.
     #[serde(default)]
@@ -186,7 +186,7 @@ pub struct NtmConfig {
 }
 
 /// NTM safety configuration section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NtmSafetyConfig {
     /// Whether command safety gate is enabled.
     #[serde(default)]
@@ -206,7 +206,7 @@ pub struct NtmSafetyConfig {
 }
 
 /// NTM robot mode configuration section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NtmRobotConfig {
     /// Robot mode bind address.
     #[serde(default)]
@@ -537,7 +537,7 @@ pub enum TranslatedStepType {
 }
 
 /// Translated FrankenTerm configuration fragment.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TranslatedConfig {
     /// General settings.
     #[serde(default)]
@@ -559,7 +559,7 @@ pub struct TranslatedConfig {
 }
 
 /// Translated safety configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TranslatedSafetyConfig {
     pub command_safety_gate: bool,
     pub require_approval_destructive: bool,
@@ -640,7 +640,7 @@ impl NtmImporter {
 
         let mut translated_workflows = Vec::new();
         for workflow in workflows {
-            let (translated, item_result) = self.translate_workflow(workflow);
+            let (translated, item_result) = Self::translate_workflow(workflow);
             if let Some(tw) = translated {
                 translated_workflows.push(tw);
             }
@@ -648,7 +648,7 @@ impl NtmImporter {
         }
 
         let translated_config = config.map(|c| {
-            let (tc, item_result) = self.translate_config(c);
+            let (tc, item_result) = Self::translate_config(c);
             report.add_item(item_result);
             tc
         });
@@ -730,11 +730,11 @@ impl NtmImporter {
 
         // Translate each window into a layout template + pane profiles.
         for (window_idx, window) in session.windows.iter().enumerate() {
-            let template = self.translate_window_layout(session, window, window_idx);
+            let template = Self::translate_window_layout(session, window, window_idx);
             templates.push(template);
 
             for pane in &window.panes {
-                let profile = self.translate_pane_to_profile(session, window, pane);
+                let profile = Self::translate_pane_to_profile(session, window, pane);
                 profiles.push(profile);
             }
 
@@ -807,7 +807,6 @@ impl NtmImporter {
 
     /// Translate a window's pane arrangement into a layout template.
     fn translate_window_layout(
-        &self,
         session: &NtmSession,
         window: &NtmWindow,
         _window_idx: usize,
@@ -820,7 +819,7 @@ impl NtmImporter {
                 weight: 1.0,
             }
         } else {
-            self.build_layout_tree(&window.panes, window.layout.as_deref())
+            Self::build_layout_tree(&window.panes, window.layout.as_deref())
         };
 
         TranslatedLayoutTemplate {
@@ -836,7 +835,6 @@ impl NtmImporter {
 
     /// Build a layout tree from NTM pane definitions.
     fn build_layout_tree(
-        &self,
         panes: &[NtmPane],
         layout_hint: Option<&str>,
     ) -> TranslatedLayoutNode {
@@ -856,11 +854,11 @@ impl NtmImporter {
             .collect();
 
         match layout_hint {
-            Some("vertical") | Some("vsplit") => TranslatedLayoutNode::VSplit { children },
-            Some("horizontal") | Some("hsplit") => TranslatedLayoutNode::HSplit { children },
-            Some("grid") | Some("tiled") => {
+            Some("vertical" | "vsplit") => TranslatedLayoutNode::VSplit { children },
+            Some("horizontal" | "hsplit") => TranslatedLayoutNode::HSplit { children },
+            Some("grid" | "tiled") => {
                 // For grid layouts, create a 2-column arrangement.
-                let mid = (children.len() + 1) / 2;
+                let mid = children.len().div_ceil(2);
                 let (left, right) = children.split_at(mid);
                 if right.is_empty() {
                     TranslatedLayoutNode::VSplit {
@@ -886,7 +884,6 @@ impl NtmImporter {
 
     /// Translate a single NTM pane into a session profile.
     fn translate_pane_to_profile(
-        &self,
         session: &NtmSession,
         window: &NtmWindow,
         pane: &NtmPane,
@@ -933,7 +930,6 @@ impl NtmImporter {
 
     /// Translate an NTM workflow into a FrankenTerm workflow definition.
     fn translate_workflow(
-        &self,
         workflow: &NtmWorkflow,
     ) -> (Option<TranslatedWorkflow>, ImportItemResult) {
         let source_id = format!("workflow:{}", workflow.name);
@@ -995,7 +991,7 @@ impl NtmImporter {
         let mut steps = Vec::new();
         for (step_idx, step) in workflow.steps.iter().enumerate() {
             let (translated_step, step_findings) =
-                self.translate_workflow_step(step, &source_id, step_idx);
+                Self::translate_workflow_step(step, &source_id, step_idx);
             steps.push(translated_step);
             for finding in step_findings {
                 result.add_finding(finding);
@@ -1008,7 +1004,7 @@ impl NtmImporter {
             .unwrap_or("review")
             .to_string();
 
-        let max_concurrent = if workflow.allow_parallel { 0 } else { 1 };
+        let max_concurrent = u32::from(!workflow.allow_parallel);
 
         let translated = TranslatedWorkflow {
             name: workflow.name.clone(),
@@ -1029,7 +1025,6 @@ impl NtmImporter {
 
     /// Translate a single workflow step.
     fn translate_workflow_step(
-        &self,
         step: &NtmWorkflowStep,
         source_id: &str,
         step_idx: usize,
@@ -1161,7 +1156,6 @@ impl NtmImporter {
 
     /// Translate NTM configuration to FrankenTerm config fragment.
     fn translate_config(
-        &self,
         config: &NtmConfig,
     ) -> (TranslatedConfig, ImportItemResult) {
         let source_id = "config".to_string();
@@ -1247,8 +1241,8 @@ fn translate_ntm_role(ntm_role: &str) -> &str {
     match ntm_role.to_lowercase().as_str() {
         "agent" | "agent_worker" | "worker" | "agent-worker" => "agent_worker",
         "monitor" | "log" | "logger" | "log-viewer" => "monitor",
-        "build" | "builder" | "ci" | "build-runner" => "build_runner",
-        "test" | "tester" | "test-runner" => "test_runner",
+        "build" | "builder" | "ci" | "build-runner" | "build_runner" => "build_runner",
+        "test" | "tester" | "test-runner" | "test_runner" => "test_runner",
         "service" | "server" | "daemon" => "service",
         "dev" | "shell" | "dev_shell" | "dev-shell" | "interactive" => "dev_shell",
         _ => "custom",
@@ -1571,7 +1565,6 @@ mod tests {
 
     #[test]
     fn vertical_layout_produces_vsplit() {
-        let importer = NtmImporter::new();
         let panes = vec![
             NtmPane {
                 role: Some("a".to_string()),
@@ -1584,28 +1577,26 @@ mod tests {
                 ..default_pane()
             },
         ];
-        let tree = importer.build_layout_tree(&panes, Some("vertical"));
+        let tree = NtmImporter::build_layout_tree(&panes, Some("vertical"));
         assert!(matches!(tree, TranslatedLayoutNode::VSplit { .. }));
     }
 
     #[test]
     fn horizontal_layout_produces_hsplit() {
-        let importer = NtmImporter::new();
         let panes = vec![default_pane(), default_pane()];
-        let tree = importer.build_layout_tree(&panes, Some("horizontal"));
+        let tree = NtmImporter::build_layout_tree(&panes, Some("horizontal"));
         assert!(matches!(tree, TranslatedLayoutNode::HSplit { .. }));
     }
 
     #[test]
     fn grid_layout_produces_nested_splits() {
-        let importer = NtmImporter::new();
         let panes = vec![
             default_pane(),
             default_pane(),
             default_pane(),
             default_pane(),
         ];
-        let tree = importer.build_layout_tree(&panes, Some("grid"));
+        let tree = NtmImporter::build_layout_tree(&panes, Some("grid"));
         match tree {
             TranslatedLayoutNode::HSplit { children } => {
                 assert_eq!(children.len(), 2);
@@ -1618,12 +1609,11 @@ mod tests {
 
     #[test]
     fn single_pane_produces_slot() {
-        let importer = NtmImporter::new();
         let panes = vec![NtmPane {
             role: Some("main".to_string()),
             ..default_pane()
         }];
-        let tree = importer.build_layout_tree(&panes, Some("vertical"));
+        let tree = NtmImporter::build_layout_tree(&panes, Some("vertical"));
         match tree {
             TranslatedLayoutNode::Slot { role, .. } => {
                 assert_eq!(role.as_deref(), Some("main"));
@@ -1677,9 +1667,8 @@ mod tests {
 
     #[test]
     fn import_workflow_translates_steps() {
-        let importer = NtmImporter::new();
         let workflow = sample_workflow();
-        let (translated, result) = importer.translate_workflow(&workflow);
+        let (translated, result) = NtmImporter::translate_workflow(&workflow);
 
         assert!(result.success);
         let tw = translated.unwrap();
@@ -1694,14 +1683,13 @@ mod tests {
 
     #[test]
     fn import_workflow_with_schedule_trigger_warns() {
-        let importer = NtmImporter::new();
         let mut workflow = sample_workflow();
         workflow.triggers.push(NtmWorkflowTrigger {
             kind: "schedule".to_string(),
             value: "*/5 * * * *".to_string(),
             pane_filter: None,
         });
-        let (_translated, result) = importer.translate_workflow(&workflow);
+        let (_translated, result) = NtmImporter::translate_workflow(&workflow);
 
         assert!(result.success);
         let warning = result
@@ -1714,14 +1702,13 @@ mod tests {
 
     #[test]
     fn import_workflow_with_unknown_trigger_errors() {
-        let importer = NtmImporter::new();
         let mut workflow = sample_workflow();
         workflow.triggers = vec![NtmWorkflowTrigger {
             kind: "webhook".to_string(),
             value: "https://example.com".to_string(),
             pane_filter: None,
         }];
-        let (_translated, result) = importer.translate_workflow(&workflow);
+        let (_translated, result) = NtmImporter::translate_workflow(&workflow);
 
         assert!(!result.success);
         let error = result
@@ -1734,7 +1721,6 @@ mod tests {
 
     #[test]
     fn import_workflow_with_unsupported_step_preserves_data() {
-        let importer = NtmImporter::new();
         let mut workflow = sample_workflow();
         workflow.steps.push(NtmWorkflowStep {
             name: "custom-action".to_string(),
@@ -1743,7 +1729,7 @@ mod tests {
             conditions: Vec::new(),
             timeout_secs: None,
         });
-        let (translated, result) = importer.translate_workflow(&workflow);
+        let (translated, result) = NtmImporter::translate_workflow(&workflow);
 
         assert!(!result.success);
         let tw = translated.unwrap();
@@ -1762,7 +1748,6 @@ mod tests {
 
     #[test]
     fn import_workflow_sleep_step_converts_to_ms() {
-        let importer = NtmImporter::new();
         let mut workflow = sample_workflow();
         workflow.steps = vec![NtmWorkflowStep {
             name: "pause".to_string(),
@@ -1771,7 +1756,7 @@ mod tests {
             conditions: Vec::new(),
             timeout_secs: None,
         }];
-        let (translated, _result) = importer.translate_workflow(&workflow);
+        let (translated, _result) = NtmImporter::translate_workflow(&workflow);
         let tw = translated.unwrap();
         match &tw.steps[0].step_type {
             TranslatedStepType::Sleep { duration_ms } => {
@@ -1783,10 +1768,9 @@ mod tests {
 
     #[test]
     fn import_workflow_step_with_conditions_warns() {
-        let importer = NtmImporter::new();
         let mut workflow = sample_workflow();
         workflow.steps[0].conditions = vec!["pane.is_alive".to_string()];
-        let (_translated, result) = importer.translate_workflow(&workflow);
+        let (_translated, result) = NtmImporter::translate_workflow(&workflow);
 
         assert!(result.success);
         let warning = result
@@ -1837,9 +1821,8 @@ mod tests {
 
     #[test]
     fn import_config_translates_safety() {
-        let importer = NtmImporter::new();
         let config = sample_config();
-        let (translated, result) = importer.translate_config(&config);
+        let (translated, result) = NtmImporter::translate_config(&config);
 
         assert!(result.success);
         assert!(translated.safety.command_safety_gate);
@@ -1851,9 +1834,8 @@ mod tests {
 
     #[test]
     fn import_config_warns_about_hooks() {
-        let importer = NtmImporter::new();
         let config = sample_config();
-        let (_translated, result) = importer.translate_config(&config);
+        let (_translated, result) = NtmImporter::translate_config(&config);
 
         let warning = result
             .findings
@@ -1866,9 +1848,8 @@ mod tests {
 
     #[test]
     fn import_config_notes_robot_auth() {
-        let importer = NtmImporter::new();
         let config = sample_config();
-        let (_translated, result) = importer.translate_config(&config);
+        let (_translated, result) = NtmImporter::translate_config(&config);
 
         let info = result
             .findings
@@ -1880,9 +1861,8 @@ mod tests {
 
     #[test]
     fn import_config_preserves_untranslated_keys() {
-        let importer = NtmImporter::new();
         let config = sample_config();
-        let (translated, result) = importer.translate_config(&config);
+        let (translated, result) = NtmImporter::translate_config(&config);
 
         assert_eq!(translated.untranslated.len(), 1);
         assert_eq!(translated.untranslated.get("custom_setting").unwrap(), &json!(42));
@@ -1896,7 +1876,6 @@ mod tests {
 
     #[test]
     fn import_config_without_hooks_or_auth_has_no_extra_findings() {
-        let importer = NtmImporter::new();
         let config = NtmConfig {
             log_level: Some("info".to_string()),
             workspace: None,
@@ -1907,7 +1886,7 @@ mod tests {
             hooks: Vec::new(),
             extra: HashMap::new(),
         };
-        let (_translated, result) = importer.translate_config(&config);
+        let (_translated, result) = NtmImporter::translate_config(&config);
 
         assert!(result.success);
         assert!(result.findings.is_empty());
@@ -2085,23 +2064,21 @@ mod tests {
 
     #[test]
     fn import_parallel_workflow_sets_unlimited_concurrency() {
-        let importer = NtmImporter::new();
         let mut workflow = sample_workflow();
         workflow.allow_parallel = true;
-        let (translated, _result) = importer.translate_workflow(&workflow);
+        let (translated, _result) = NtmImporter::translate_workflow(&workflow);
         assert_eq!(translated.unwrap().max_concurrent, 0);
     }
 
     #[test]
     fn import_workflow_manual_trigger_is_info() {
-        let importer = NtmImporter::new();
         let mut workflow = sample_workflow();
         workflow.triggers = vec![NtmWorkflowTrigger {
             kind: "manual".to_string(),
             value: String::new(),
             pane_filter: None,
         }];
-        let (_translated, result) = importer.translate_workflow(&workflow);
+        let (_translated, result) = NtmImporter::translate_workflow(&workflow);
         assert!(result.success);
         let info = result
             .findings
@@ -2113,7 +2090,6 @@ mod tests {
 
     #[test]
     fn import_topology_step_preserved_as_unsupported() {
-        let importer = NtmImporter::new();
         let mut workflow = sample_workflow();
         workflow.steps = vec![NtmWorkflowStep {
             name: "split-pane".to_string(),
@@ -2122,7 +2098,7 @@ mod tests {
             conditions: Vec::new(),
             timeout_secs: None,
         }];
-        let (translated, result) = importer.translate_workflow(&workflow);
+        let (translated, result) = NtmImporter::translate_workflow(&workflow);
         assert!(result.success); // Warning, not error.
         let tw = translated.unwrap();
         assert!(matches!(
@@ -2133,7 +2109,6 @@ mod tests {
 
     #[test]
     fn wait_for_step_uses_step_timeout_over_param() {
-        let importer = NtmImporter::new();
         let mut workflow = sample_workflow();
         workflow.steps = vec![NtmWorkflowStep {
             name: "wait".to_string(),
@@ -2145,11 +2120,11 @@ mod tests {
             conditions: Vec::new(),
             timeout_secs: Some(20), // Step-level timeout takes precedence.
         }];
-        let (translated, _result) = importer.translate_workflow(&workflow);
+        let (translated, _result) = NtmImporter::translate_workflow(&workflow);
         let tw = translated.unwrap();
         match &tw.steps[0].step_type {
             TranslatedStepType::WaitFor { timeout_ms, .. } => {
-                assert_eq!(*timeout_ms, Some(20_000));
+                assert_eq!(timeout_ms, &Some(20_000));
             }
             other => panic!("Expected WaitFor, got {other:?}"),
         }
