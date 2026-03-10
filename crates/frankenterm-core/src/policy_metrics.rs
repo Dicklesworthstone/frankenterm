@@ -285,11 +285,7 @@ impl PolicyMetricsCollector {
     pub fn sample_denial_rate(&mut self, timestamp_ms: u64) {
         let total_evals: u64 = self.subsystem_inputs.values().map(|i| i.evaluations).sum();
         let total_denials: u64 = self.subsystem_inputs.values().map(|i| i.denials).sum();
-        let rate = if total_evals > 0 {
-            (total_denials * 100 / total_evals) as u64
-        } else {
-            0
-        };
+        let rate = (total_denials * 100).checked_div(total_evals).unwrap_or(0);
         self.denial_rate_series.push(timestamp_ms, rate);
     }
 
@@ -320,11 +316,7 @@ impl PolicyMetricsCollector {
             .map(|i| i.active_violations)
             .sum();
 
-        let denial_rate_pct = if total_evals > 0 {
-            ((total_denials * 100) / total_evals) as u32
-        } else {
-            0
-        };
+        let denial_rate_pct = (total_denials * 100).checked_div(total_evals).unwrap_or(0) as u32;
 
         // Build indicators
         let mut indicators = Vec::new();
@@ -429,11 +421,7 @@ impl PolicyMetricsCollector {
         // Per-subsystem summaries
         let mut subsystem_metrics = BTreeMap::new();
         for (name, input) in &self.subsystem_inputs {
-            let rate = if input.evaluations > 0 {
-                ((input.denials * 100) / input.evaluations) as u32
-            } else {
-                0
-            };
+            let rate = (input.denials * 100).checked_div(input.evaluations).unwrap_or(0) as u32;
 
             let health = if rate >= self.thresholds.denial_rate_critical_pct
                 || input.active_quarantines >= self.thresholds.quarantine_critical_count

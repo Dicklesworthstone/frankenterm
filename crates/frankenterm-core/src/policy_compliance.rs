@@ -455,11 +455,11 @@ impl ComplianceEngine {
     ) -> ComplianceReport {
         let snapshot = self.snapshot(now_ms);
 
-        let period_violations: Vec<_> = self
+        let new_violations = self
             .violations
             .iter()
             .filter(|v| v.detected_at_ms >= period_start_ms && v.detected_at_ms <= period_end_ms)
-            .collect();
+            .count() as u32;
 
         let period_remediations: Vec<_> = self
             .violations
@@ -470,8 +470,6 @@ impl ComplianceEngine {
                         .is_some_and(|t| t >= period_start_ms && t <= period_end_ms)
             })
             .collect();
-
-        let new_violations = period_violations.len() as u32;
         let remediations_in_period = period_remediations.len() as u32;
         let carried_over = self
             .violations

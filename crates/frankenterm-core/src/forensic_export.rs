@@ -408,8 +408,8 @@ impl ForensicStore {
 
         // Sort
         match q.sort {
-            SortOrder::TimestampDesc => matching.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms)),
-            SortOrder::TimestampAsc => matching.sort_by(|a, b| a.timestamp_ms.cmp(&b.timestamp_ms)),
+            SortOrder::TimestampDesc => matching.sort_by_key(|b| std::cmp::Reverse(b.timestamp_ms)),
+            SortOrder::TimestampAsc => matching.sort_by_key(|a| a.timestamp_ms),
         }
 
         // Pagination
@@ -547,6 +547,7 @@ impl ForensicStore {
         true
     }
 
+    #[allow(clippy::unused_self)]
     fn export_csv(&self, records: &[ForensicRecord]) -> String {
         let mut out =
             String::from("record_id,timestamp_ms,actor,action,verdict,outcome,sensitivity\n");

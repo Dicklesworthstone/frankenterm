@@ -294,7 +294,7 @@ impl AuditChain {
                 };
             }
 
-            prev_hash = entry.chain_hash.clone();
+            prev_hash.clone_from(&entry.chain_hash);
         }
 
         ChainVerificationResult {
