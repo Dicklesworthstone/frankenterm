@@ -16,7 +16,7 @@ use crate::connector_event_model::{
 };
 use crate::connector_governor::{ConnectorGovernor, ConnectorGovernorConfig, GovernorVerdict};
 use crate::connector_host_runtime::{ConnectorCapability, ConnectorCapabilityEnvelope};
-use crate::connector_outbound_bridge::{ConnectorAction, ConnectorActionKind};
+use crate::connector_outbound_bridge::ConnectorAction;
 
 // =============================================================================
 // Mock provider
@@ -783,6 +783,7 @@ pub fn standard_escape_attempts() -> Vec<SandboxEscapeAttempt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector_outbound_bridge::ConnectorActionKind;
 
     fn sample_action(connector_id: &str, kind: ConnectorActionKind) -> ConnectorAction {
         ConnectorAction {
