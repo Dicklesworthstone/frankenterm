@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 
 use crate::connector_event_model::{CanonicalConnectorEvent, EventDirection};
-use crate::connector_host_runtime::{ConnectorCapability, ConnectorLifecyclePhase};
+use crate::connector_host_runtime::ConnectorCapability;
 use crate::connector_registry::{ConnectorManifest, TrustLevel};
 use crate::policy_audit_chain::{AuditChain, AuditEntryKind};
 
@@ -559,7 +559,7 @@ impl IngestionPipeline {
         }
 
         // Severity gate.
-        let event_severity = severity_to_level(&event.severity);
+        let event_severity = severity_to_level(event.severity);
         if event_severity < self.config.min_severity_level {
             self.telemetry.events_filtered += 1;
             return IngestionOutcome::Filtered;
@@ -1101,7 +1101,7 @@ pub fn tier1_observability_bundle(now_ms: u64) -> ConnectorBundle {
 
 use crate::connector_event_model::CanonicalSeverity;
 
-fn severity_to_level(severity: &CanonicalSeverity) -> u32 {
+fn severity_to_level(severity: CanonicalSeverity) -> u32 {
     match severity {
         CanonicalSeverity::Info => 0,
         CanonicalSeverity::Warning => 1,
@@ -1144,6 +1144,7 @@ fn classify_audit_kind(event: &CanonicalConnectorEvent) -> AuditEntryKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector_event_model::SchemaVersion;
 
     fn sample_event(
         connector_id: &str,
