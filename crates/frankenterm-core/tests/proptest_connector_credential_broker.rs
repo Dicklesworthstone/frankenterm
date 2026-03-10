@@ -1683,3 +1683,89 @@ proptest! {
         prop_assert_eq!(revoked.len(), 0);
     }
 }
+
+// =============================================================================
+// CredentialBrokerConfig serde roundtrip property tests
+// =============================================================================
+
+use frankenterm_core::connector_credential_broker::CredentialBrokerConfig;
+
+fn arb_broker_config() -> impl Strategy<Value = CredentialBrokerConfig> {
+    (
+        any::<bool>(),
+        1usize..=4096,
+        1usize..=100,
+        arb_sensitivity(),
+    )
+        .prop_map(
+            |(enabled, max_audit, max_leases, max_sens)| CredentialBrokerConfig {
+                enabled,
+                max_audit_events: max_audit,
+                max_leases_per_connector: max_leases,
+                max_sensitivity: max_sens,
+            },
+        )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// CredentialBrokerConfig survives serde JSON roundtrip.
+    #[test]
+    fn broker_config_serde_roundtrip(config in arb_broker_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: CredentialBrokerConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(config.enabled, back.enabled);
+        prop_assert_eq!(config.max_audit_events, back.max_audit_events);
+        prop_assert_eq!(config.max_leases_per_connector, back.max_leases_per_connector);
+        prop_assert_eq!(config.max_sensitivity, back.max_sensitivity);
+    }
+
+    /// from_config respects max_audit_events limit.
+    #[test]
+    fn from_config_audit_capacity(max_events in 2usize..=50) {
+        let config = CredentialBrokerConfig {
+            enabled: true,
+            max_audit_events: max_events,
+            max_leases_per_connector: 10,
+            max_sensitivity: CredentialSensitivity::High,
+        };
+        let mut broker = ConnectorCredentialBroker::from_config(&config);
+        // Emit more events than capacity
+        for i in 0..(max_events + 20) {
+            broker.register_provider(SecretProviderConfig {
+                provider_id: format!("p{i}"),
+                display_name: format!("P{i}"),
+                provider_type: "env".to_string(),
+                max_concurrent_leases: 10,
+                default_lease_ttl_ms: 60_000,
+                supports_rotation: false,
+                max_sensitivity: CredentialSensitivity::Low,
+            }, i as u64).unwrap();
+        }
+        prop_assert!(broker.audit_log().len() <= max_events);
+    }
+}
+
+// =============================================================================
+// CredentialScope Display property tests
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// CredentialScope Display format is "provider:resource[op1,op2,...]".
+    #[test]
+    fn scope_display_format(scope in arb_scope()) {
+        let display = scope.to_string();
+        // Should start with provider name
+        prop_assert!(display.starts_with(&scope.provider));
+        // Should contain the resource
+        prop_assert!(display.contains(&scope.resource));
+        // Should end with ']'
+        prop_assert!(display.ends_with(']'));
+        // Should contain '[' exactly once
+        let bracket_count = display.chars().filter(|&c| c == '[').count();
+        prop_assert_eq!(bracket_count, 1);
+    }
+}
