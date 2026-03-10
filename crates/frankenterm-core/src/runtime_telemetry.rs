@@ -1092,9 +1092,9 @@ impl UnifiedTelemetryRecord {
             crate::policy_compliance::ComplianceStatus::Critical => HealthTier::Black,
         };
 
-        let failure_class = if snapshot.counters.total_kill_switch_trips > 0 {
-            Some(FailureClass::Safety)
-        } else if !snapshot.active_violations.is_empty() {
+        let failure_class = if snapshot.counters.total_kill_switch_trips > 0
+            || !snapshot.active_violations.is_empty()
+        {
             Some(FailureClass::Safety)
         } else {
             None
