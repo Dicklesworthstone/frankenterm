@@ -3663,24 +3663,23 @@ impl PolicyEngine {
         // If the target pane is quarantined, check blocking semantics.
         if let Some(pane_id) = input.pane_id {
             let component_id = format!("pane-{pane_id}");
-            if input.action.is_mutating() {
-                if self
+            if input.action.is_mutating()
+                && self
                     .quarantine_registry
                     .is_blocked_for_writes(&component_id)
-                {
-                    context.record_rule(
-                        "policy.quarantine",
-                        true,
-                        Some("deny"),
-                        Some(format!("pane {pane_id} quarantined (writes blocked)")),
-                    );
-                    context.set_determining_rule("policy.quarantine");
-                    return PolicyDecision::deny_with_rule(
-                        format!("Pane {pane_id} is quarantined — writes blocked"),
-                        "policy.quarantine",
-                    )
-                    .with_context(context);
-                }
+            {
+                context.record_rule(
+                    "policy.quarantine",
+                    true,
+                    Some("deny"),
+                    Some(format!("pane {pane_id} quarantined (writes blocked)")),
+                );
+                context.set_determining_rule("policy.quarantine");
+                return PolicyDecision::deny_with_rule(
+                    format!("Pane {pane_id} is quarantined — writes blocked"),
+                    "policy.quarantine",
+                )
+                .with_context(context);
             }
             if self.quarantine_registry.is_blocked_for_all(&component_id) {
                 context.record_rule(
