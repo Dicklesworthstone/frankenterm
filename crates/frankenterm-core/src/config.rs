@@ -1559,6 +1559,9 @@ pub struct SafetyConfig {
 
     /// Custom policy rules (allow/deny/require_approval)
     pub rules: PolicyRulesConfig,
+
+    /// Policy decision log settings (forensics and compliance)
+    pub decision_log: crate::policy_decision_log::DecisionLogConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1576,6 +1579,7 @@ impl Default for SafetyConfig {
             trauma_guard: TraumaGuardConfig::default(),
             semantic_shock: SemanticShockSafetyConfig::default(),
             rules: PolicyRulesConfig::default(),
+            decision_log: crate::policy_decision_log::DecisionLogConfig::default(),
         }
     }
 }

@@ -32,6 +32,7 @@ use crate::config::{
     PolicyRulesConfig,
 };
 use crate::identity_graph::{AuthAction, PrincipalId, PrincipalKind, ResourceId, ResourceKind};
+use crate::policy_decision_log::{DecisionLogConfig, DecisionOutcome, PolicyDecisionLog};
 use crate::trauma_guard::TraumaDecision;
 // ============================================================================
 // Action Kinds
@@ -2857,6 +2858,8 @@ pub struct PolicyEngine {
     policy_rules: PolicyRulesConfig,
     /// Risk scoring configuration
     risk_config: RiskConfig,
+    /// Append-only decision log for forensics and compliance
+    decision_log: PolicyDecisionLog,
 }
 
 impl PolicyEngine {
@@ -2874,7 +2877,25 @@ impl PolicyEngine {
             trauma_guard_enabled: true,
             policy_rules: PolicyRulesConfig::default(),
             risk_config: RiskConfig::default(),
+            decision_log: PolicyDecisionLog::with_defaults(),
         }
+    }
+
+    /// Create a policy engine from a `SafetyConfig`.
+    ///
+    /// This is the recommended constructor when building from TOML config,
+    /// since it wires command gate, policy rules, decision log, and trauma
+    /// guard settings in a single call.
+    #[must_use]
+    pub fn from_safety_config(config: &crate::config::SafetyConfig) -> Self {
+        Self::new(
+            config.rate_limit_per_pane,
+            config.rate_limit_global,
+            config.require_prompt_active,
+        )
+        .with_command_gate_config(config.command_gate.clone())
+        .with_policy_rules(config.rules.clone())
+        .with_decision_log_config(config.decision_log.clone())
     }
 
     /// Create a policy engine with permissive defaults (for testing)
@@ -2917,10 +2938,28 @@ impl PolicyEngine {
         self
     }
 
+    /// Set decision log configuration
+    #[must_use]
+    pub fn with_decision_log_config(mut self, config: DecisionLogConfig) -> Self {
+        self.decision_log = PolicyDecisionLog::new(config);
+        self
+    }
+
     /// Get the current risk configuration
     #[must_use]
     pub fn risk_config(&self) -> &RiskConfig {
         &self.risk_config
+    }
+
+    /// Access the decision log for querying and export.
+    #[must_use]
+    pub fn decision_log(&self) -> &PolicyDecisionLog {
+        &self.decision_log
+    }
+
+    /// Access the decision log mutably (for filtering, export, etc.).
+    pub fn decision_log_mut(&mut self) -> &mut PolicyDecisionLog {
+        &mut self.decision_log
     }
 
     /// Calculate risk score for the given input
@@ -3199,6 +3238,13 @@ impl PolicyEngine {
     /// assert!(decision.is_allowed());
     /// ```
     pub fn authorize(&mut self, input: &PolicyInput) -> PolicyDecision {
+        let decision = self.evaluate_authorization(input);
+        self.record_to_decision_log(input, &decision);
+        decision
+    }
+
+    /// Core authorization logic (called by `authorize()`).
+    fn evaluate_authorization(&mut self, input: &PolicyInput) -> PolicyDecision {
         let mut context = DecisionContext::from_input(input);
 
         // Calculate and attach risk score (wa-upg.6.3)
@@ -3608,6 +3654,34 @@ impl PolicyEngine {
         );
 
         PolicyDecision::allow().with_context(context)
+    }
+
+    /// Record a policy decision to the append-only decision log.
+    fn record_to_decision_log(&mut self, input: &PolicyInput, decision: &PolicyDecision) {
+        let outcome = match decision {
+            PolicyDecision::Allow { .. } => DecisionOutcome::Allow,
+            PolicyDecision::Deny { .. } => DecisionOutcome::Deny,
+            PolicyDecision::RequireApproval { .. } => DecisionOutcome::RequireApproval,
+        };
+        let rules_evaluated = decision
+            .context()
+            .map(|ctx| ctx.rules_evaluated.len() as u32)
+            .unwrap_or(0);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.decision_log.record(
+            ts,
+            input.action,
+            input.actor,
+            input.surface,
+            input.pane_id,
+            outcome,
+            decision.rule_id().map(String::from),
+            decision.reason().map(String::from),
+            rules_evaluated,
+        );
     }
 
     /// Legacy: Check if send operation is allowed
@@ -9105,5 +9179,167 @@ mod tests {
         let json = serde_json::to_string(&pred).unwrap();
         assert!(json.contains("\"type\":\"action\""));
         assert!(json.contains("\"values\":[\"send_text\"]"));
+    }
+
+    // ========================================================================
+    // Decision log integration tests
+    // ========================================================================
+
+    #[test]
+    fn decision_log_records_allow() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Human);
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+
+        let log = engine.decision_log();
+        assert_eq!(log.len(), 1);
+        let snapshot = log.snapshot();
+        assert_eq!(snapshot.total_recorded, 1);
+        assert_eq!(snapshot.allow_count, 1);
+        assert_eq!(snapshot.deny_count, 0);
+    }
+
+    #[test]
+    fn decision_log_records_deny() {
+        let mut engine = PolicyEngine::new(30, 100, true);
+        // Trigger a deny: send text while command is running
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::running());
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+
+        let log = engine.decision_log();
+        assert_eq!(log.len(), 1);
+        let snapshot = log.snapshot();
+        assert_eq!(snapshot.deny_count, 1);
+    }
+
+    #[test]
+    fn decision_log_records_require_approval() {
+        let mut engine = PolicyEngine::new(30, 100, false);
+        // Trigger require_approval: destructive action by robot
+        let input = PolicyInput::new(ActionKind::Close, ActorKind::Robot).with_pane(1);
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+
+        let log = engine.decision_log();
+        assert_eq!(log.len(), 1);
+        let snapshot = log.snapshot();
+        assert_eq!(snapshot.require_approval_count, 1);
+    }
+
+    #[test]
+    fn decision_log_accumulates_multiple_decisions() {
+        let mut engine = PolicyEngine::permissive();
+
+        // 3 allows
+        for _ in 0..3 {
+            let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Human);
+            engine.authorize(&input);
+        }
+
+        // 1 deny (send to alt-screen)
+        let deny_input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities {
+                alt_screen: Some(true),
+                ..PaneCapabilities::default()
+            });
+        engine.authorize(&deny_input);
+
+        let log = engine.decision_log();
+        assert_eq!(log.len(), 4);
+        let snapshot = log.snapshot();
+        assert_eq!(snapshot.allow_count, 3);
+        assert_eq!(snapshot.deny_count, 1);
+    }
+
+    #[test]
+    fn decision_log_captures_rule_id() {
+        let mut engine = PolicyEngine::new(30, 100, true);
+        // Trigger deny: send text while command running -> rule_id = "policy.prompt_required"
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::running());
+        engine.authorize(&input);
+
+        let log = engine.decision_log();
+        let entries: Vec<_> = log.entries().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].rule_id.as_deref(),
+            Some("policy.prompt_required")
+        );
+    }
+
+    #[test]
+    fn decision_log_captures_pane_id_and_surface() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(42)
+            .with_surface(PolicySurface::Robot);
+        engine.authorize(&input);
+
+        let log = engine.decision_log();
+        let entries: Vec<_> = log.entries().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pane_id, Some(42));
+        assert_eq!(entries[0].surface, PolicySurface::Robot);
+        assert_eq!(entries[0].actor, ActorKind::Robot);
+        assert_eq!(entries[0].action, ActionKind::ReadOutput);
+    }
+
+    #[test]
+    fn decision_log_respects_config_skip_allows() {
+        use crate::policy_decision_log::DecisionLogConfig;
+        let config = DecisionLogConfig {
+            max_entries: 100,
+            record_allows: false,
+        };
+        let mut engine = PolicyEngine::permissive().with_decision_log_config(config);
+
+        // Allow should be skipped
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Human);
+        engine.authorize(&input);
+        assert_eq!(engine.decision_log().len(), 0);
+
+        // Deny should still be recorded
+        let deny_input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities {
+                alt_screen: Some(true),
+                ..PaneCapabilities::default()
+            });
+        engine.authorize(&deny_input);
+        assert_eq!(engine.decision_log().len(), 1);
+    }
+
+    #[test]
+    fn decision_log_records_rules_evaluated_count() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt());
+        engine.authorize(&input);
+
+        let log = engine.decision_log();
+        let entries: Vec<_> = log.entries().collect();
+        assert_eq!(entries.len(), 1);
+        // authorize evaluates multiple builtin gates (rate_limit, alt_screen, etc.)
+        assert!(entries[0].rules_evaluated > 0);
+    }
+
+    #[test]
+    fn decision_log_export_json() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Human);
+        engine.authorize(&input);
+
+        let json = engine.decision_log().export_json().unwrap();
+        assert!(json.contains("\"action\":\"read_output\""));
+        assert!(json.contains("\"actor\":\"human\""));
+        assert!(json.contains("\"decision\":\"allow\""));
     }
 }
