@@ -6727,4 +6727,38 @@ mode = "periodic"
         assert_eq!(sdc.worker_scan_interval_secs, 30);
         assert_eq!(sdc.worker_batch_size, 64);
     }
+
+    #[test]
+    fn safety_config_decision_log_defaults() {
+        let safety = SafetyConfig::default();
+        assert_eq!(safety.decision_log.max_entries, 10_000);
+        assert!(safety.decision_log.record_allows);
+    }
+
+    #[test]
+    fn safety_config_decision_log_toml_roundtrip() {
+        let mut safety = SafetyConfig::default();
+        safety.decision_log = crate::policy_decision_log::DecisionLogConfig {
+            max_entries: 500,
+            record_allows: false,
+        };
+        let toml_str = toml::to_string(&safety).expect("serialize");
+        let back: SafetyConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(back.decision_log.max_entries, 500);
+        assert!(!back.decision_log.record_allows);
+    }
+
+    #[test]
+    fn safety_config_missing_decision_log_uses_defaults() {
+        // Simulates an old TOML that lacks [safety.decision_log]
+        let toml_str = r#"
+rate_limit_per_pane = 30
+rate_limit_global = 100
+require_prompt_active = true
+block_alt_screen = true
+"#;
+        let safety: SafetyConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(safety.decision_log.max_entries, 10_000);
+        assert!(safety.decision_log.record_allows);
+    }
 }
