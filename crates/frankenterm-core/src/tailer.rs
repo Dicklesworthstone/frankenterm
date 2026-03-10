@@ -745,7 +745,7 @@ where
         macro_rules! reserve_capture_event_permit {
             ($pane_id:expr, $tx:expr, $send_timeout:expr, $reserve_cx:ident, $permit:ident) => {
                 #[cfg(feature = "asupersync-runtime")]
-                let $reserve_cx = crate::cx::for_testing();
+                let $reserve_cx = crate::cx::for_request();
                 #[cfg(feature = "asupersync-runtime")]
                 let $permit = match timeout($send_timeout, $tx.reserve(&$reserve_cx)).await {
                     Ok(Ok(permit)) => permit,

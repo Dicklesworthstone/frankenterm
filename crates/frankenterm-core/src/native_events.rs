@@ -335,7 +335,7 @@ async fn dispatch_event_with_timeout(
 ) -> EventDispatchOutcome {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let reserve_cx = crate::cx::for_testing();
+        let reserve_cx = crate::cx::for_request();
         match crate::runtime_compat::timeout(send_timeout, event_tx.reserve(&reserve_cx)).await {
             Ok(Ok(permit)) => {
                 permit.send(event);

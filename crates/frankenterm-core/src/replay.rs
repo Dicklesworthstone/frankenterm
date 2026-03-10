@@ -493,7 +493,7 @@ impl Player {
             PlayerControl::Pause => {
                 self.state = PlayerState::Paused;
                 #[cfg(feature = "asupersync-runtime")]
-                let watch_cx = crate::cx::for_testing();
+                let watch_cx = crate::cx::for_request();
                 loop {
                     #[cfg(feature = "asupersync-runtime")]
                     control_rx

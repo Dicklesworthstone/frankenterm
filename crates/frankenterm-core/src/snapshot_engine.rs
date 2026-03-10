@@ -592,7 +592,7 @@ impl SnapshotEngine {
                 let interval = Duration::from_secs(interval_secs);
                 let mut is_first = true;
                 #[cfg(feature = "asupersync-runtime")]
-                let shutdown_cx = crate::cx::for_testing();
+                let shutdown_cx = crate::cx::for_request();
 
                 loop {
                     if !is_first {
@@ -649,7 +649,7 @@ impl SnapshotEngine {
                 let mut accumulated_value = 0.0_f64;
                 let snapshot_threshold = self.config.scheduling.snapshot_threshold.max(0.0);
                 #[cfg(feature = "asupersync-runtime")]
-                let scheduler_cx = crate::cx::for_testing();
+                let scheduler_cx = crate::cx::for_request();
 
                 enum TriggerPoll {
                     Ready(SnapshotTrigger),

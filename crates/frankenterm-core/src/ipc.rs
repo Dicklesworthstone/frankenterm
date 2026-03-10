@@ -81,7 +81,7 @@ fn allocator_status_payload() -> serde_json::Value {
 async fn mpsc_recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let cx = crate::cx::for_testing();
+        let cx = crate::cx::for_request();
         rx.recv(&cx).await.ok()
     }
 

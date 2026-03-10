@@ -129,7 +129,7 @@ impl<C: Send + 'static> Pool<C> {
     pub async fn try_acquire(&self) -> Result<PoolAcquireResult<C>, PoolError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = cx::for_testing();
+            let cx = cx::for_request();
             return self.try_acquire_with_cx(&cx).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -175,7 +175,7 @@ impl<C: Send + 'static> Pool<C> {
     pub async fn acquire(&self) -> Result<PoolAcquireResult<C>, PoolError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = cx::for_testing();
+            let cx = cx::for_request();
             return self.acquire_with_cx(&cx).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]

@@ -87,7 +87,7 @@ fn config_take_update(rx: &watch::Receiver<HotReloadableConfig>) -> HotReloadabl
 async fn recv_event<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let cx = crate::cx::for_testing();
+        let cx = crate::cx::for_request();
         rx.recv(&cx).await.ok()
     }
 

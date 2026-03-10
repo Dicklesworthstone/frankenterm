@@ -5735,7 +5735,7 @@ impl WriteCommandSender {
     ) -> std::result::Result<(), mpsc::SendError<WriteCommand>> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_testing();
+            let cx = crate::cx::for_request();
             self.inner.send(&cx, command).await
         }
 
@@ -9368,7 +9368,7 @@ fn writer_loop(
         .build()
         .expect("failed to build writer runtime");
     #[cfg(feature = "asupersync-runtime")]
-    let recv_cx = crate::cx::for_testing();
+    let recv_cx = crate::cx::for_request();
 
     loop {
         #[cfg(feature = "asupersync-runtime")]

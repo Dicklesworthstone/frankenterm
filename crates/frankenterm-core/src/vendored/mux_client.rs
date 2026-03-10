@@ -1753,7 +1753,7 @@ impl PaneOutputSubscription {
     pub async fn next(&mut self) -> Option<PaneDelta> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_testing();
+            let cx = crate::cx::for_request();
             self.next_with_cx(&cx).await
         }
 
@@ -1839,7 +1839,7 @@ pub fn subscribe_pane_output(
 
     #[cfg(feature = "asupersync-runtime")]
     let task = SubscriptionTask::Ambient(task::spawn(async move {
-        let cx = crate::cx::for_testing();
+        let cx = crate::cx::for_request();
         run_subscription_loop(&cx, client, pane_id, config, tx, cancel_rx).await;
     }));
 
