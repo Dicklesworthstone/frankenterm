@@ -13,8 +13,8 @@ use proptest::prelude::*;
 use frankenterm_core::runtime_telemetry::{
     CancellationTelemetryEmitter, FailureClass, HealthTier, RuntimePhase,
     RuntimeTelemetryEventBuilder, RuntimeTelemetryKind, RuntimeTelemetryLog,
-    RuntimeTelemetryLogConfig, ScopeTelemetryEmitter, TelemetryLogSnapshot,
-    TierTransitionRecord, UnifiedTelemetryRecord, UnifiedTelemetrySource,
+    RuntimeTelemetryLogConfig, ScopeTelemetryEmitter, TelemetryLogSnapshot, TierTransitionRecord,
+    UnifiedTelemetryRecord, UnifiedTelemetrySource,
 };
 
 // =============================================================================
@@ -915,5 +915,105 @@ proptest! {
         let back: RuntimeTelemetryLogConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(config.max_events, back.max_events);
         prop_assert_eq!(config.enabled, back.enabled);
+    }
+
+    // ── RT-46: PolicyMetricsDashboard adapter health tier mapping ─────────
+
+    #[test]
+    fn rt46_dashboard_adapter_health_tier(
+        evals in 0..10000u64,
+        denials in 0..10000u64,
+        quarantines in 0..50u32,
+        violations in 0..50u32,
+        chain_valid in any::<bool>(),
+        ks_active in any::<bool>(),
+        now_ms in 0..u64::MAX / 2,
+    ) {
+        use frankenterm_core::policy_metrics::*;
+        let mut collector = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
+        collector.update_subsystem("test", PolicySubsystemInput {
+            evaluations: evals,
+            denials,
+            active_quarantines: quarantines,
+            active_violations: violations,
+        });
+        collector.update_audit_chain(100, chain_valid);
+        collector.update_kill_switch(ks_active);
+        let dash = collector.dashboard(now_ms);
+        let record = UnifiedTelemetryRecord::from_policy_metrics_dashboard(&dash);
+
+        // health tier must match dashboard health status
+        let expected_tier = match dash.overall_health {
+            HealthStatus::Healthy => HealthTier::Green,
+            HealthStatus::Warning => HealthTier::Yellow,
+            HealthStatus::Critical => HealthTier::Red,
+            HealthStatus::Unknown => HealthTier::Black,
+        };
+        prop_assert_eq!(record.health_tier, expected_tier);
+
+        // timestamp must pass through
+        prop_assert_eq!(record.timestamp_ms, now_ms);
+
+        // component must be policy.metrics_dashboard
+        prop_assert_eq!(&record.component, "policy.metrics_dashboard");
+
+        // serde roundtrip
+        let json = serde_json::to_string(&record).unwrap();
+        let back: UnifiedTelemetryRecord = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(record.health_tier, back.health_tier);
+        prop_assert_eq!(record.timestamp_ms, back.timestamp_ms);
+    }
+
+    // ── RT-47: Dashboard adapter failure class derivation ────────────────
+
+    #[test]
+    fn rt47_dashboard_failure_class_kill_switch(now_ms in 0..u64::MAX / 2) {
+        use frankenterm_core::policy_metrics::*;
+        let mut collector = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
+        collector.update_kill_switch(true);
+        let dash = collector.dashboard(now_ms);
+        let record = UnifiedTelemetryRecord::from_policy_metrics_dashboard(&dash);
+        prop_assert_eq!(record.failure_class, Some(FailureClass::Safety));
+    }
+
+    // ── RT-48: Dashboard adapter counter passthrough ─────────────────────
+
+    #[test]
+    fn rt48_dashboard_counter_passthrough(
+        evals in 0..10000u64,
+        denials in 0..10000u64,
+    ) {
+        use frankenterm_core::policy_metrics::*;
+        let mut collector = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
+        collector.update_subsystem("test", PolicySubsystemInput {
+            evaluations: evals,
+            denials,
+            ..Default::default()
+        });
+        let dash = collector.dashboard(1000);
+        let record = UnifiedTelemetryRecord::from_policy_metrics_dashboard(&dash);
+        prop_assert_eq!(&record.attributes["total_evaluations"], &serde_json::json!(evals));
+        prop_assert_eq!(&record.attributes["total_denials"], &serde_json::json!(denials));
+    }
+
+    // ── RT-49: ComplianceSnapshot adapter health tier mapping ────────────
+
+    #[test]
+    fn rt49_compliance_adapter_produces_valid_record(
+        denied in any::<bool>(),
+        now_ms in 0..u64::MAX / 2,
+    ) {
+        use frankenterm_core::policy_compliance::*;
+        let mut engine = ComplianceEngine::new(100, 3600_000);
+        engine.record_evaluation(denied);
+        let snap = engine.snapshot(now_ms);
+        let record = UnifiedTelemetryRecord::from_compliance_snapshot(&snap);
+        prop_assert_eq!(&record.component, "policy.compliance_engine");
+        prop_assert_eq!(record.timestamp_ms, now_ms);
+        // Must be valid JSON
+        let json = serde_json::to_string(&record).unwrap();
+        let back: UnifiedTelemetryRecord = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(record.component, back.component);
+        prop_assert_eq!(record.health_tier, back.health_tier);
     }
 }
