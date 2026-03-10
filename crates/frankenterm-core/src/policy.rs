@@ -2892,6 +2892,8 @@ pub struct PolicyEngine {
     data_classifier: crate::connector_data_classification::ConnectorDataClassifier,
     /// Connector governor for rate-limit, quota, and cost governance
     connector_governor: crate::connector_governor::ConnectorGovernor,
+    /// Connector registry client for package trust verification
+    connector_registry: crate::connector_registry::ConnectorRegistryClient,
 }
 
 impl PolicyEngine {
@@ -2924,6 +2926,9 @@ impl PolicyEngine {
             connector_governor: crate::connector_governor::ConnectorGovernor::new(
                 crate::connector_governor::ConnectorGovernorConfig::default(),
             ),
+            connector_registry: crate::connector_registry::ConnectorRegistryClient::new(
+                crate::connector_registry::ConnectorRegistryConfig::default(),
+            ),
         }
     }
 
@@ -2954,6 +2959,8 @@ impl PolicyEngine {
             crate::connector_data_classification::ConnectorDataClassifier::new(config.data_classifier.clone());
         engine.connector_governor =
             crate::connector_governor::ConnectorGovernor::new(config.connector_governor.clone());
+        engine.connector_registry =
+            crate::connector_registry::ConnectorRegistryClient::new(config.connector_registry.clone());
         engine
     }
 
@@ -3079,6 +3086,17 @@ impl PolicyEngine {
     /// Access the connector governor mutably.
     pub fn connector_governor_mut(&mut self) -> &mut crate::connector_governor::ConnectorGovernor {
         &mut self.connector_governor
+    }
+
+    /// Access the connector registry.
+    #[must_use]
+    pub fn connector_registry(&self) -> &crate::connector_registry::ConnectorRegistryClient {
+        &self.connector_registry
+    }
+
+    /// Access the connector registry mutably.
+    pub fn connector_registry_mut(&mut self) -> &mut crate::connector_registry::ConnectorRegistryClient {
+        &mut self.connector_registry
     }
 
     /// Record a credential broker denial to the compliance engine and audit chain.
@@ -10927,6 +10945,45 @@ mod tests {
         let gov = &dash.subsystem_metrics["connector_governor"];
         assert_eq!(gov.evaluations, 1);
         assert_eq!(gov.denials, 0);
+    }
+
+    // ── ConnectorRegistry integration tests ──────────────────────────
+
+    #[test]
+    fn connector_registry_default_in_policy_engine() {
+        let engine = PolicyEngine::new(30, 100, true);
+        assert_eq!(engine.connector_registry().package_count(), 0);
+    }
+
+    #[test]
+    fn connector_registry_from_safety_config() {
+        use crate::connector_registry::ConnectorRegistryConfig;
+        let config = crate::config::SafetyConfig {
+            connector_registry: ConnectorRegistryConfig {
+                max_packages: 512,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from_safety_config(&config);
+        assert_eq!(engine.connector_registry().package_count(), 0);
+    }
+
+    #[test]
+    fn connector_registry_config_accessible() {
+        use crate::connector_registry::ConnectorRegistryConfig;
+        let config = crate::config::SafetyConfig {
+            connector_registry: ConnectorRegistryConfig {
+                max_packages: 128,
+                enforce_transparency: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from_safety_config(&config);
+        let reg_config = engine.connector_registry().config();
+        assert_eq!(reg_config.max_packages, 128);
+        assert!(reg_config.enforce_transparency);
     }
 
     // =========================================================================

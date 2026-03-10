@@ -1583,6 +1583,9 @@ pub struct SafetyConfig {
 
     /// Connector governor settings (rate-limit, quota, cost governance)
     pub connector_governor: crate::connector_governor::ConnectorGovernorConfig,
+
+    /// Connector registry settings (package trust verification)
+    pub connector_registry: crate::connector_registry::ConnectorRegistryConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1608,6 +1611,7 @@ impl Default for SafetyConfig {
             lifecycle_manager: crate::connector_lifecycle::LifecycleManagerConfig::default(),
             data_classifier: crate::connector_data_classification::ClassifierConfig::default(),
             connector_governor: crate::connector_governor::ConnectorGovernorConfig::default(),
+            connector_registry: crate::connector_registry::ConnectorRegistryConfig::default(),
         }
     }
 }
