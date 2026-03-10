@@ -49,6 +49,9 @@ use std::fmt;
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
+use crate::connector_credential_broker::{
+    CredentialAuditEvent, CredentialAuditType, CredentialBrokerTelemetrySnapshot,
+};
 use crate::connector_data_classification::{DataSensitivity, RedactionStrategy};
 use crate::connector_event_model::{CanonicalConnectorEvent, CanonicalSeverity};
 use crate::connector_host_runtime::{
@@ -696,6 +699,152 @@ impl UnifiedTelemetryRecord {
         }
     }
 
+    /// Normalize a connector credential-broker audit event into the shared record shape.
+    #[must_use]
+    pub fn from_credential_audit(event: &CredentialAuditEvent) -> Self {
+        let mut attributes = BTreeMap::new();
+        let mut redaction_strategy = RedactionStrategy::Passthrough;
+        let failure_class = credential_audit_failure_class(event);
+
+        attributes.insert(
+            "event_type".to_string(),
+            serde_json::json!(enum_string(&event.event_type)),
+        );
+
+        if !event.credential_id.is_empty() {
+            attributes.insert(
+                "credential_id_hash".to_string(),
+                serde_json::json!(stable_hash(&event.credential_id)),
+            );
+            redaction_strategy = RedactionStrategy::Hash;
+        }
+
+        if let Some(connector_id) = &event.connector_id {
+            attributes.insert(
+                "connector_id_hash".to_string(),
+                serde_json::json!(stable_hash(connector_id)),
+            );
+            redaction_strategy = RedactionStrategy::Hash;
+        }
+
+        if let Some(lease_id) = &event.lease_id {
+            attributes.insert(
+                "lease_id_hash".to_string(),
+                serde_json::json!(stable_hash(lease_id)),
+            );
+            redaction_strategy = RedactionStrategy::Hash;
+        }
+
+        if let Some(provider_status) = credential_provider_status_label(&event.detail) {
+            attributes.insert(
+                "provider_status".to_string(),
+                serde_json::json!(provider_status),
+            );
+        }
+
+        if !event.detail.is_empty() {
+            attributes.insert("detail_redacted".to_string(), serde_json::json!(true));
+            attributes.insert(
+                "detail_length".to_string(),
+                serde_json::json!(event.detail.chars().count()),
+            );
+            redaction_strategy = RedactionStrategy::Remove;
+        }
+
+        Self {
+            schema_version: UNIFIED_TELEMETRY_SCHEMA_VERSION.to_string(),
+            source: UnifiedTelemetrySource::Connector,
+            record_id: credential_audit_record_id(event),
+            source_schema_version: None,
+            timestamp_ms: event.timestamp_ms,
+            component: "connector.credential_broker".to_string(),
+            reason_code: format!(
+                "connector.credential_broker.{}",
+                enum_string(&event.event_type)
+            ),
+            correlation_id: credential_audit_correlation_id(event),
+            scope_id: credential_audit_scope_id(event),
+            health_tier: credential_audit_health_tier(event, failure_class),
+            failure_class,
+            sensitivity: DataSensitivity::Restricted,
+            redaction_strategy,
+            attributes,
+        }
+    }
+
+    /// Normalize a credential-broker telemetry snapshot into the shared record shape.
+    #[must_use]
+    pub fn from_credential_broker_snapshot(snapshot: &CredentialBrokerTelemetrySnapshot) -> Self {
+        let failure_class = credential_broker_snapshot_failure_class(snapshot);
+        let mut attributes = BTreeMap::new();
+
+        attributes.insert(
+            "leases_issued".to_string(),
+            serde_json::json!(snapshot.counters.leases_issued),
+        );
+        attributes.insert(
+            "leases_expired".to_string(),
+            serde_json::json!(snapshot.counters.leases_expired),
+        );
+        attributes.insert(
+            "leases_revoked".to_string(),
+            serde_json::json!(snapshot.counters.leases_revoked),
+        );
+        attributes.insert(
+            "access_denied".to_string(),
+            serde_json::json!(snapshot.counters.access_denied),
+        );
+        attributes.insert(
+            "rotations_completed".to_string(),
+            serde_json::json!(snapshot.counters.rotations_completed),
+        );
+        attributes.insert(
+            "rotations_failed".to_string(),
+            serde_json::json!(snapshot.counters.rotations_failed),
+        );
+        attributes.insert(
+            "credentials_registered".to_string(),
+            serde_json::json!(snapshot.counters.credentials_registered),
+        );
+        attributes.insert(
+            "credentials_revoked".to_string(),
+            serde_json::json!(snapshot.counters.credentials_revoked),
+        );
+        attributes.insert(
+            "providers_registered".to_string(),
+            serde_json::json!(snapshot.counters.providers_registered),
+        );
+        attributes.insert(
+            "active_leases".to_string(),
+            serde_json::json!(snapshot.active_leases),
+        );
+        attributes.insert(
+            "active_credentials".to_string(),
+            serde_json::json!(snapshot.active_credentials),
+        );
+        attributes.insert(
+            "active_providers".to_string(),
+            serde_json::json!(snapshot.active_providers),
+        );
+
+        Self {
+            schema_version: UNIFIED_TELEMETRY_SCHEMA_VERSION.to_string(),
+            source: UnifiedTelemetrySource::Connector,
+            record_id: format!("broker-snapshot:{}", snapshot.captured_at_ms),
+            source_schema_version: None,
+            timestamp_ms: snapshot.captured_at_ms,
+            component: "connector.credential_broker".to_string(),
+            reason_code: "connector.credential_broker.snapshot".to_string(),
+            correlation_id: None,
+            scope_id: Some("connector:credential_broker".to_string()),
+            health_tier: credential_broker_snapshot_health_tier(snapshot, failure_class),
+            failure_class,
+            sensitivity: DataSensitivity::Confidential,
+            redaction_strategy: RedactionStrategy::Passthrough,
+            attributes,
+        }
+    }
+
     /// Normalize a recorder audit entry into the shared record shape.
     #[must_use]
     pub fn from_recorder_audit(entry: &RecorderAuditEntry) -> Self {
@@ -811,6 +960,18 @@ impl From<&RuntimeTelemetryEvent> for UnifiedTelemetryRecord {
 impl From<&CanonicalConnectorEvent> for UnifiedTelemetryRecord {
     fn from(event: &CanonicalConnectorEvent) -> Self {
         Self::from_connector_event(event)
+    }
+}
+
+impl From<&CredentialAuditEvent> for UnifiedTelemetryRecord {
+    fn from(event: &CredentialAuditEvent) -> Self {
+        Self::from_credential_audit(event)
+    }
+}
+
+impl From<&CredentialBrokerTelemetrySnapshot> for UnifiedTelemetryRecord {
+    fn from(snapshot: &CredentialBrokerTelemetrySnapshot) -> Self {
+        Self::from_credential_broker_snapshot(snapshot)
     }
 }
 
@@ -931,6 +1092,137 @@ fn connector_health_tier(
         };
         tier = tier.max(phase_tier);
     }
+
+    if let Some(failure_class) = failure_class {
+        tier = tier.max(failure_class.suggested_tier());
+    }
+
+    tier
+}
+
+fn credential_audit_record_id(event: &CredentialAuditEvent) -> String {
+    let discriminator = event
+        .lease_id
+        .as_ref()
+        .map(|lease_id| stable_hash(lease_id))
+        .or_else(|| (!event.credential_id.is_empty()).then(|| stable_hash(&event.credential_id)))
+        .unwrap_or_else(|| enum_string(&event.event_type));
+
+    format!("broker-audit:{}:{discriminator}", event.timestamp_ms)
+}
+
+fn credential_audit_correlation_id(event: &CredentialAuditEvent) -> Option<String> {
+    event
+        .lease_id
+        .as_ref()
+        .map(|lease_id| stable_hash(lease_id))
+        .or_else(|| {
+            event
+                .connector_id
+                .as_ref()
+                .map(|connector_id| stable_hash(connector_id))
+        })
+        .or_else(|| (!event.credential_id.is_empty()).then(|| stable_hash(&event.credential_id)))
+}
+
+fn credential_audit_scope_id(event: &CredentialAuditEvent) -> Option<String> {
+    event
+        .connector_id
+        .as_ref()
+        .map(|connector_id| format!("connector:{}", stable_hash(connector_id)))
+        .or_else(|| {
+            (!event.credential_id.is_empty())
+                .then(|| format!("credential:{}", stable_hash(&event.credential_id)))
+        })
+}
+
+fn credential_provider_status_label(detail: &str) -> Option<&'static str> {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("-> unavailable") {
+        Some("unavailable")
+    } else if detail.contains("-> degraded") {
+        Some("degraded")
+    } else if detail.contains("-> available") {
+        Some("available")
+    } else {
+        None
+    }
+}
+
+fn credential_audit_failure_class(event: &CredentialAuditEvent) -> Option<FailureClass> {
+    match event.event_type {
+        CredentialAuditType::AccessDenied => Some(FailureClass::Safety),
+        CredentialAuditType::CredentialExpired => Some(FailureClass::Permanent),
+        CredentialAuditType::ProviderStatusChanged => {
+            credential_provider_status_label(&event.detail).and_then(|status| match status {
+                "unavailable" => Some(FailureClass::Degraded),
+                _ => None,
+            })
+        }
+        CredentialAuditType::CredentialRegistered
+        | CredentialAuditType::LeaseIssued
+        | CredentialAuditType::LeaseExpired
+        | CredentialAuditType::LeaseRevoked
+        | CredentialAuditType::CredentialRotated
+        | CredentialAuditType::CredentialRevoked
+        | CredentialAuditType::ProviderRegistered => None,
+    }
+}
+
+fn credential_audit_health_tier(
+    event: &CredentialAuditEvent,
+    failure_class: Option<FailureClass>,
+) -> HealthTier {
+    let mut tier = match event.event_type {
+        CredentialAuditType::CredentialRegistered
+        | CredentialAuditType::LeaseIssued
+        | CredentialAuditType::CredentialRotated
+        | CredentialAuditType::ProviderRegistered => HealthTier::Green,
+        CredentialAuditType::LeaseExpired
+        | CredentialAuditType::LeaseRevoked
+        | CredentialAuditType::CredentialRevoked
+        | CredentialAuditType::CredentialExpired => HealthTier::Yellow,
+        CredentialAuditType::AccessDenied => HealthTier::Red,
+        CredentialAuditType::ProviderStatusChanged => {
+            match credential_provider_status_label(&event.detail) {
+                Some("unavailable") => HealthTier::Red,
+                Some("degraded") => HealthTier::Yellow,
+                _ => HealthTier::Green,
+            }
+        }
+    };
+
+    if let Some(failure_class) = failure_class {
+        tier = tier.max(failure_class.suggested_tier());
+    }
+
+    tier
+}
+
+fn credential_broker_snapshot_failure_class(
+    snapshot: &CredentialBrokerTelemetrySnapshot,
+) -> Option<FailureClass> {
+    if snapshot.active_leases > 0 && snapshot.active_providers == 0 {
+        Some(FailureClass::Safety)
+    } else if snapshot.active_credentials > 0 && snapshot.active_providers == 0 {
+        Some(FailureClass::Degraded)
+    } else {
+        None
+    }
+}
+
+fn credential_broker_snapshot_health_tier(
+    snapshot: &CredentialBrokerTelemetrySnapshot,
+    failure_class: Option<FailureClass>,
+) -> HealthTier {
+    let mut tier = if snapshot.active_providers == 0
+        && snapshot.active_credentials == 0
+        && snapshot.active_leases == 0
+    {
+        HealthTier::Yellow
+    } else {
+        HealthTier::Green
+    };
 
     if let Some(failure_class) = failure_class {
         tier = tier.max(failure_class.suggested_tier());
@@ -2833,6 +3125,120 @@ mod tests {
             Some(&serde_json::json!(6))
         );
         assert!(record.attributes.contains_key("actor_identity_hash"));
+    }
+
+    #[test]
+    fn unified_connector_broker_audit_hashes_ids_and_redacts_detail() {
+        let event = CredentialAuditEvent {
+            timestamp_ms: 4444,
+            event_type: CredentialAuditType::LeaseIssued,
+            credential_id: "cred-1".to_string(),
+            connector_id: Some("slack-sync".to_string()),
+            lease_id: Some("lease-9".to_string()),
+            detail: "lease issued, expires at 9999".to_string(),
+        };
+
+        let record = UnifiedTelemetryRecord::from(&event);
+
+        assert_eq!(record.source, UnifiedTelemetrySource::Connector);
+        assert_eq!(record.component, "connector.credential_broker");
+        assert_eq!(
+            record.reason_code,
+            "connector.credential_broker.lease_issued"
+        );
+        assert_eq!(
+            record.record_id,
+            format!("broker-audit:4444:{}", stable_hash("lease-9"))
+        );
+        assert_eq!(record.correlation_id, Some(stable_hash("lease-9")));
+        assert_eq!(
+            record.scope_id,
+            Some(format!("connector:{}", stable_hash("slack-sync")))
+        );
+        assert_eq!(record.health_tier, HealthTier::Green);
+        assert_eq!(record.failure_class, None);
+        assert_eq!(record.sensitivity, DataSensitivity::Restricted);
+        assert_eq!(record.redaction_strategy, RedactionStrategy::Remove);
+        assert_eq!(
+            record.attributes.get("credential_id_hash"),
+            Some(&serde_json::json!(stable_hash("cred-1")))
+        );
+        assert_eq!(
+            record.attributes.get("connector_id_hash"),
+            Some(&serde_json::json!(stable_hash("slack-sync")))
+        );
+        assert_eq!(
+            record.attributes.get("lease_id_hash"),
+            Some(&serde_json::json!(stable_hash("lease-9")))
+        );
+        assert_eq!(
+            record.attributes.get("detail_redacted"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn unified_connector_broker_access_denied_maps_to_safety() {
+        let event = CredentialAuditEvent {
+            timestamp_ms: 5555,
+            event_type: CredentialAuditType::AccessDenied,
+            credential_id: "cred-2".to_string(),
+            connector_id: Some("github-sync".to_string()),
+            lease_id: None,
+            detail: "connector github-sync denied access to cred-2".to_string(),
+        };
+
+        let record = UnifiedTelemetryRecord::from(&event);
+
+        assert_eq!(record.health_tier, HealthTier::Black);
+        assert_eq!(record.failure_class, Some(FailureClass::Safety));
+        assert_eq!(record.sensitivity, DataSensitivity::Restricted);
+        assert_eq!(record.redaction_strategy, RedactionStrategy::Remove);
+        assert_eq!(record.correlation_id, Some(stable_hash("github-sync")));
+    }
+
+    #[test]
+    fn unified_connector_broker_snapshot_preserves_safe_counts() {
+        let snapshot = CredentialBrokerTelemetrySnapshot {
+            captured_at_ms: 6666,
+            counters: crate::connector_credential_broker::CredentialBrokerTelemetry {
+                leases_issued: 4,
+                leases_expired: 1,
+                leases_revoked: 2,
+                access_denied: 3,
+                rotations_completed: 5,
+                rotations_failed: 0,
+                credentials_registered: 6,
+                credentials_revoked: 1,
+                providers_registered: 2,
+            },
+            active_leases: 2,
+            active_credentials: 3,
+            active_providers: 1,
+        };
+
+        let record = UnifiedTelemetryRecord::from(&snapshot);
+
+        assert_eq!(record.source, UnifiedTelemetrySource::Connector);
+        assert_eq!(record.component, "connector.credential_broker");
+        assert_eq!(record.record_id, "broker-snapshot:6666");
+        assert_eq!(record.reason_code, "connector.credential_broker.snapshot");
+        assert_eq!(
+            record.scope_id.as_deref(),
+            Some("connector:credential_broker")
+        );
+        assert_eq!(record.health_tier, HealthTier::Green);
+        assert_eq!(record.failure_class, None);
+        assert_eq!(record.sensitivity, DataSensitivity::Confidential);
+        assert_eq!(record.redaction_strategy, RedactionStrategy::Passthrough);
+        assert_eq!(
+            record.attributes.get("active_leases"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            record.attributes.get("access_denied"),
+            Some(&serde_json::json!(3))
+        );
     }
 
     // ── RuntimeTelemetryLog ──
