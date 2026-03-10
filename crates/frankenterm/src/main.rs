@@ -4417,12 +4417,33 @@ enum RuntimeProcessRole {
     Robot,
 }
 
+impl RuntimeProcessRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Watch => "watch",
+            Self::Web => "web",
+            Self::Robot => "robot",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RuntimeBootstrapSpec {
     role: RuntimeProcessRole,
     thread_name: &'static str,
     startup_reason_code: &'static str,
     shutdown_reason_code: &'static str,
+}
+
+impl RuntimeBootstrapSpec {
+    fn reason_code_for_phase(self, phase: &'static str) -> &'static str {
+        if phase == "startup" {
+            self.startup_reason_code
+        } else {
+            self.shutdown_reason_code
+        }
+    }
 }
 
 fn runtime_process_role_for_subcommand(subcommand: Option<&str>) -> RuntimeProcessRole {
@@ -4495,6 +4516,25 @@ fn build_process_runtime(
     builder.build()
 }
 
+fn runtime_bootstrap_lifecycle_payload(
+    spec: RuntimeBootstrapSpec,
+    phase: &'static str,
+    outcome: &'static str,
+    error_code: Option<&str>,
+    timestamp_s: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": "runtime_bootstrap.lifecycle",
+        "phase": phase,
+        "role": spec.role.as_str(),
+        "thread_name": spec.thread_name,
+        "reason_code": spec.reason_code_for_phase(phase),
+        "outcome": outcome,
+        "error_code": error_code,
+        "timestamp_s": timestamp_s,
+    })
+}
+
 fn emit_runtime_bootstrap_lifecycle(
     spec: RuntimeBootstrapSpec,
     phase: &'static str,
@@ -4508,25 +4548,7 @@ fn emit_runtime_bootstrap_lifecycle(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let payload = serde_json::json!({
-        "event": "runtime_bootstrap.lifecycle",
-        "phase": phase,
-        "role": match spec.role {
-            RuntimeProcessRole::Cli => "cli",
-            RuntimeProcessRole::Watch => "watch",
-            RuntimeProcessRole::Web => "web",
-            RuntimeProcessRole::Robot => "robot",
-        },
-        "thread_name": spec.thread_name,
-        "reason_code": if phase == "startup" {
-            spec.startup_reason_code
-        } else {
-            spec.shutdown_reason_code
-        },
-        "outcome": outcome,
-        "error_code": error_code,
-        "timestamp_s": now,
-    });
+    let payload = runtime_bootstrap_lifecycle_payload(spec, phase, outcome, error_code, now);
     eprintln!("{payload}");
 }
 
@@ -37128,6 +37150,48 @@ mod tests {
             robot.shutdown_reason_code,
             "runtime.bootstrap.robot.shutdown"
         );
+    }
+
+    #[test]
+    fn runtime_bootstrap_lifecycle_payload_uses_startup_contract() {
+        let spec = runtime_bootstrap_spec_for_role(RuntimeProcessRole::Robot);
+        let payload =
+            runtime_bootstrap_lifecycle_payload(spec, "startup", "runtime_initialized", None, 42);
+
+        assert_eq!(payload["event"].as_str(), Some("runtime_bootstrap.lifecycle"));
+        assert_eq!(payload["phase"].as_str(), Some("startup"));
+        assert_eq!(payload["role"].as_str(), Some("robot"));
+        assert_eq!(payload["thread_name"].as_str(), Some("ft-robot-runtime"));
+        assert_eq!(
+            payload["reason_code"].as_str(),
+            Some("runtime.bootstrap.robot.startup")
+        );
+        assert_eq!(payload["outcome"].as_str(), Some("runtime_initialized"));
+        assert!(payload["error_code"].is_null());
+        assert_eq!(payload["timestamp_s"].as_u64(), Some(42));
+    }
+
+    #[test]
+    fn runtime_bootstrap_lifecycle_payload_uses_shutdown_contract() {
+        let spec = runtime_bootstrap_spec_for_role(RuntimeProcessRole::Watch);
+        let payload = runtime_bootstrap_lifecycle_payload(
+            spec,
+            "shutdown",
+            "run_failed",
+            Some("runtime.run_failed"),
+            99,
+        );
+
+        assert_eq!(payload["phase"].as_str(), Some("shutdown"));
+        assert_eq!(payload["role"].as_str(), Some("watch"));
+        assert_eq!(payload["thread_name"].as_str(), Some("ft-watch-runtime"));
+        assert_eq!(
+            payload["reason_code"].as_str(),
+            Some("runtime.bootstrap.watch.shutdown")
+        );
+        assert_eq!(payload["outcome"].as_str(), Some("run_failed"));
+        assert_eq!(payload["error_code"].as_str(), Some("runtime.run_failed"));
+        assert_eq!(payload["timestamp_s"].as_u64(), Some(99));
     }
 
     fn sample_cli_mission() -> frankenterm_core::plan::Mission {

@@ -84,6 +84,7 @@ def run_self_tests() -> None:
     fn parse_runtime_worker_threads(value: Option<&str>) -> Result<Option<usize>, String> { Ok(None) }
     fn sniff_runtime_process_role_from_args() -> RuntimeProcessRole { RuntimeProcessRole::Cli }
     fn sniff_primary_subcommand_from_iter<I, S>(args: I) -> Option<String> where I: IntoIterator<Item=S>, S: AsRef<str> { None }
+    fn runtime_bootstrap_lifecycle_payload(spec: RuntimeBootstrapSpec, phase: &'static str, outcome: &'static str, error_code: Option<&str>, timestamp_s: u64) {}
     fn emit_runtime_bootstrap_lifecycle(spec: RuntimeBootstrapSpec, phase: &'static str, outcome: &'static str, error_code: Option<&str>) {}
     fn main() {
       let _ = RuntimeProcessRole::Watch;
@@ -143,12 +144,14 @@ try:
         "fn parse_runtime_worker_threads(",
         "fn sniff_runtime_process_role_from_args(",
         "fn sniff_primary_subcommand_from_iter<",
+        "fn runtime_bootstrap_lifecycle_payload(",
         "fn emit_runtime_bootstrap_lifecycle(",
         "let runtime_role = sniff_runtime_process_role_from_args();",
         "let runtime_spec = runtime_bootstrap_spec_for_role(runtime_role);",
         "let rt = match build_process_runtime(runtime_spec, runtime_worker_threads)",
         "emit_runtime_bootstrap_lifecycle(runtime_spec, \"startup\", \"runtime_initialized\", None);",
         "emit_runtime_bootstrap_lifecycle(runtime_spec, \"shutdown\", \"run_completed\", None);",
+        "Some(\"runtime.run_failed\")",
     ]
     for token in required_tokens:
         require(token in text, "missing_required_token", f"Required token missing: {token}")
@@ -172,6 +175,18 @@ try:
     )
     checks.append({"name": "main_runtime_bootstrap_contract", "status": "passed"})
 
+    require(
+        "fn runtime_bootstrap_lifecycle_payload(" in text,
+        "missing_lifecycle_payload_helper",
+        "runtime bootstrap lifecycle payload helper is required for stable contract coverage",
+    )
+    require(
+        "let payload = runtime_bootstrap_lifecycle_payload(" in text,
+        "emit_not_using_lifecycle_payload_helper",
+        "emit_runtime_bootstrap_lifecycle() must use runtime_bootstrap_lifecycle_payload()",
+    )
+    checks.append({"name": "lifecycle_payload_helper_contract", "status": "passed"})
+
     # Validate lifecycle reason-code mapping is present for all process roles.
     reason_code_tokens = [
         "runtime.bootstrap.cli.startup",
@@ -192,6 +207,8 @@ try:
         "fn runtime_bootstrap_subcommand_detection_covers_modes()",
         "fn runtime_bootstrap_worker_thread_parser_handles_errors()",
         "fn runtime_bootstrap_spec_maps_modes_to_thread_names()",
+        "fn runtime_bootstrap_lifecycle_payload_uses_startup_contract()",
+        "fn runtime_bootstrap_lifecycle_payload_uses_shutdown_contract()",
     ]
     for token in test_tokens:
         require(token in text, "missing_runtime_bootstrap_test", f"Missing runtime bootstrap unit test: {token}")

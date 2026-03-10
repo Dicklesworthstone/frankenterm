@@ -1,8 +1,8 @@
 {
-  "checked_at": "2026-02-25T07:29:03Z",
+  "checked_at": "2026-03-10T05:12:57Z",
   "checks": [
     {
-      "count": 16,
+      "count": 18,
       "name": "required_tokens",
       "status": "passed"
     },
@@ -11,12 +11,16 @@
       "status": "passed"
     },
     {
+      "name": "lifecycle_payload_helper_contract",
+      "status": "passed"
+    },
+    {
       "count": 8,
       "name": "lifecycle_reason_codes",
       "status": "passed"
     },
     {
-      "count": 3,
+      "count": 5,
       "name": "unit_test_contract",
       "status": "passed"
     }

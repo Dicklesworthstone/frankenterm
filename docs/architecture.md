@@ -30,6 +30,10 @@ ft runtime backends (current compatibility bridge includes WezTerm CLI)
 ### CLI entry + command dispatch (`crates/frankenterm/src/main.rs`)
 
 - `main()` bootstraps runtime threads and calls async `run(robot_mode)`.
+- `RuntimeProcessRole`, `RuntimeBootstrapSpec`, `build_process_runtime(...)`, and
+  `emit_runtime_bootstrap_lifecycle(...)` define the shared bootstrap contract
+  for CLI/watch/web/robot entrypoints, including stable thread names and
+  startup/shutdown reason codes.
 - `run()` parses `Commands` and routes to:
   - watcher path via `run_watcher_with_backoff(...)` -> `run_watcher(...)`
   - robot path via `Commands::Robot { ... }` and `RobotCommands`
@@ -37,6 +41,9 @@ ft runtime backends (current compatibility bridge includes WezTerm CLI)
 - Robot responses are normalized through `RobotResponse<T>`:
   - `ok`, `data`, `error`, `error_code`, `hint`, `elapsed_ms`, `version`, `now`
   - emitted as JSON or TOON via `print_robot_response(...)`.
+- Bootstrap contract validation is enforced by
+  `scripts/validate_asupersync_runtime_bootstrap.sh` and
+  `tests/e2e/test_ft_e34d9_10_2_1_runtime_bootstrap.sh`.
 
 ### Watcher lifecycle wiring (`run_watcher(...)`)
 
