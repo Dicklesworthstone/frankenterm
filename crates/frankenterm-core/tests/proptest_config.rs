@@ -1299,7 +1299,17 @@ fn arb_policy_rule_match() -> impl Strategy<Value = PolicyRuleMatch> {
         prop::collection::vec("[a-z]{1,8}", 0..=2),
     )
         .prop_map(
-            |(actions, actors, surfaces, pane_ids, pane_titles, pane_cwds, pane_domains, command_patterns, agent_types)| {
+            |(
+                actions,
+                actors,
+                surfaces,
+                pane_ids,
+                pane_titles,
+                pane_cwds,
+                pane_domains,
+                command_patterns,
+                agent_types,
+            )| {
                 PolicyRuleMatch {
                     actions,
                     actors,
@@ -1324,14 +1334,16 @@ fn arb_policy_rule() -> impl Strategy<Value = PolicyRule> {
         arb_policy_rule_decision(),
         prop::option::of("[a-z {}/]{1,30}"),
     )
-        .prop_map(|(id, description, priority, match_on, decision, message)| PolicyRule {
-            id,
-            description,
-            priority,
-            match_on,
-            decision,
-            message,
-        })
+        .prop_map(
+            |(id, description, priority, match_on, decision, message)| PolicyRule {
+                id,
+                description,
+                priority,
+                match_on,
+                decision,
+                message,
+            },
+        )
 }
 
 proptest! {

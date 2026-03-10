@@ -9,8 +9,8 @@
 use frankenterm_core::simulation::{
     EventAction, Expectation, ExpectationKind, FontAtlasCachePolicy, FontRenderPrepMetrics,
     ResizeQueueMetrics, ResizeTimeline, ResizeTimelineEvent, ResizeTimelineFlameSample,
-    ResizeTimelineStage, ResizeTimelineStageSample, ResizeTimelineStageSummary,
-    SandboxCommand, Scenario, ScenarioEvent, ScenarioPane,
+    ResizeTimelineStage, ResizeTimelineStageSample, ResizeTimelineStageSummary, SandboxCommand,
+    Scenario, ScenarioEvent, ScenarioPane,
 };
 use proptest::prelude::*;
 

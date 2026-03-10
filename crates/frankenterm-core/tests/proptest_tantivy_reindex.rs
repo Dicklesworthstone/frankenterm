@@ -578,7 +578,16 @@ fn arb_reindex_stats() -> impl Strategy<Value = ReindexStats> {
         any::<bool>(),
     )
         .prop_map(
-            |(event_count, indexed_count, skipped, filtered, errors, duration_ms, final_ordinal, caught_up)| {
+            |(
+                event_count,
+                indexed_count,
+                skipped,
+                filtered,
+                errors,
+                duration_ms,
+                final_ordinal,
+                caught_up,
+            )| {
                 let eps = if duration_ms > 0 {
                     event_count as f64 / (duration_ms as f64 / 1000.0)
                 } else {

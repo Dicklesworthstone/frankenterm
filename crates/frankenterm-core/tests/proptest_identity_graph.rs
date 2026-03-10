@@ -1137,19 +1137,17 @@ proptest! {
 
 fn arb_grant_condition() -> impl Strategy<Value = GrantCondition> {
     prop_oneof![
-        (0..1_000_000u64, 0..1_000_000u64)
-            .prop_map(|(s, e)| GrantCondition::TimeWindow {
-                start_ms: s,
-                end_ms: s + e,
-            }),
+        (0..1_000_000u64, 0..1_000_000u64).prop_map(|(s, e)| GrantCondition::TimeWindow {
+            start_ms: s,
+            end_ms: s + e,
+        }),
         arb_trust_level().prop_map(GrantCondition::MinTrust),
         arb_id_string().prop_map(GrantCondition::Domain),
         arb_principal_id().prop_map(GrantCondition::RequiresApproval),
-        (1..100u32, 1000..60_000u64)
-            .prop_map(|(m, w)| GrantCondition::RateLimit {
-                max_uses: m,
-                window_ms: w,
-            }),
+        (1..100u32, 1000..60_000u64).prop_map(|(m, w)| GrantCondition::RateLimit {
+            max_uses: m,
+            window_ms: w,
+        }),
     ]
 }
 
@@ -1167,7 +1165,18 @@ fn arb_auth_grant() -> impl Strategy<Value = AuthGrant> {
         proptest::option::of(arb_id_string()),
     )
         .prop_map(
-            |(grant_id, principal, actions, resource, conditions, active, created, expires, by, reason)| {
+            |(
+                grant_id,
+                principal,
+                actions,
+                resource,
+                conditions,
+                active,
+                created,
+                expires,
+                by,
+                reason,
+            )| {
                 AuthGrant {
                     grant_id,
                     principal,
@@ -1286,11 +1295,10 @@ fn arb_authz_decision() -> impl Strategy<Value = AuthzDecision> {
         prop::collection::vec(arb_id_string(), 1..=3)
             .prop_map(|ids| AuthzDecision::Allow { grant_ids: ids }),
         arb_id_string().prop_map(|r| AuthzDecision::Deny { reason: r }),
-        (arb_principal_id(), arb_id_string())
-            .prop_map(|(a, r)| AuthzDecision::RequireApproval {
-                approver: a,
-                reason: r,
-            }),
+        (arb_principal_id(), arb_id_string()).prop_map(|(a, r)| AuthzDecision::RequireApproval {
+            approver: a,
+            reason: r,
+        }),
     ]
 }
 

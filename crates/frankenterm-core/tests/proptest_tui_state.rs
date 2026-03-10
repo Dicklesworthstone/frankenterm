@@ -5,7 +5,7 @@
 
 #![cfg(any(feature = "tui", feature = "ftui"))]
 
-use frankenterm_core::tui::state::{reduce, Effect, ListState, UiAction, UiState, View};
+use frankenterm_core::tui::state::{Effect, ListState, UiAction, UiState, View, reduce};
 use proptest::prelude::*;
 
 // =============================================================================

@@ -24,20 +24,18 @@
 use frankenterm_core::recorder_storage::{RecorderBackendKind, RecorderOffset};
 use frankenterm_core::storage::{
     AgentMetricBreakdown, CheckpointResult, Correlation, CorrelationRef, CorrelationType,
-    DailyMetricSummary, DatabasePageStats, DbCheckItem, DbCheckReport, DbCheckStatus,
-    DbRepairItem, DbRepairReport, DbStatsReport, EmbeddingStats, EventAnnotations,
-    EventMuteRecord, EventTypeStats, FtsIndexState, FtsPaneProgress, FtsSyncResult, Gap,
-    HandledInfo, IndexingHealthReport, MetricType, MigrationForensicBackendState,
-    MigrationForensicBundle, MigrationForensicCaptureContext,
-    MigrationForensicCorruptionDetail, MigrationForensicMigrationCheckpoint,
-    MigrationInvariantSummary, MigrationRollbackClass, MigrationRollbackClassifierConfig,
-    MigrationRollbackClassifierInput, MigrationRollbackDecision,
+    DailyMetricSummary, DatabasePageStats, DbCheckItem, DbCheckReport, DbCheckStatus, DbRepairItem,
+    DbRepairReport, DbStatsReport, EmbeddingStats, EventAnnotations, EventMuteRecord,
+    EventTypeStats, FtsIndexState, FtsPaneProgress, FtsSyncResult, Gap, HandledInfo,
+    IndexingHealthReport, MetricType, MigrationForensicBackendState, MigrationForensicBundle,
+    MigrationForensicCaptureContext, MigrationForensicCorruptionDetail,
+    MigrationForensicMigrationCheckpoint, MigrationInvariantSummary, MigrationRollbackClass,
+    MigrationRollbackClassifierConfig, MigrationRollbackClassifierInput, MigrationRollbackDecision,
     MigrationRollbackExecutionError, MigrationRollbackExecutionReport,
-    MigrationRollbackExecutionState, MigrationRollbackTrigger, MigrationStage,
-    NotificationStatus, PaneIndexingStats, PaneInfo, PaneStats, SearchLint,
-    SearchLintSeverity, SearchResult, SearchSuggestion, Segment, SemanticBudgetConfig,
-    SemanticBudgetMetrics, SemanticBudgetSnapshot, SemanticSearchHit, TableStats, Timeline,
-    TimelineEvent, classify_migration_rollback_trigger,
+    MigrationRollbackExecutionState, MigrationRollbackTrigger, MigrationStage, NotificationStatus,
+    PaneIndexingStats, PaneInfo, PaneStats, SearchLint, SearchLintSeverity, SearchResult,
+    SearchSuggestion, Segment, SemanticBudgetConfig, SemanticBudgetMetrics, SemanticBudgetSnapshot,
+    SemanticSearchHit, TableStats, Timeline, TimelineEvent, classify_migration_rollback_trigger,
 };
 use proptest::prelude::*;
 
@@ -1097,12 +1095,13 @@ fn arb_db_check_item() -> impl Strategy<Value = DbCheckItem> {
 }
 
 fn arb_recorder_offset() -> impl Strategy<Value = RecorderOffset> {
-    (0_u64..100, 0_u64..100_000, 0_u64..100_000)
-        .prop_map(|(segment_id, byte_offset, ordinal)| RecorderOffset {
+    (0_u64..100, 0_u64..100_000, 0_u64..100_000).prop_map(|(segment_id, byte_offset, ordinal)| {
+        RecorderOffset {
             segment_id,
             byte_offset,
             ordinal,
-        })
+        }
+    })
 }
 
 fn arb_recorder_backend_kind() -> impl Strategy<Value = RecorderBackendKind> {
@@ -1139,7 +1138,6 @@ fn arb_pane_info() -> impl Strategy<Value = PaneInfo> {
             },
         )
 }
-
 
 // =========================================================================
 // DbCheckStatus — serde + Display

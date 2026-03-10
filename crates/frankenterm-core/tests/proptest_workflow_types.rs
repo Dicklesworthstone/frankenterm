@@ -57,16 +57,18 @@ fn arb_wait_condition() -> impl Strategy<Value = WaitCondition> {
     prop_oneof![
         (proptest::option::of(0..10_000u64), "[a-z_]{1,15}")
             .prop_map(|(pane_id, rule_id)| WaitCondition::Pattern { pane_id, rule_id }),
-        (proptest::option::of(0..10_000u64), 100..60_000u64)
-            .prop_map(|(pane_id, idle_threshold_ms)| WaitCondition::PaneIdle {
+        (proptest::option::of(0..10_000u64), 100..60_000u64).prop_map(
+            |(pane_id, idle_threshold_ms)| WaitCondition::PaneIdle {
                 pane_id,
                 idle_threshold_ms
-            }),
-        (proptest::option::of(0..10_000u64), 100..60_000u64)
-            .prop_map(|(pane_id, stable_for_ms)| WaitCondition::StableTail {
+            }
+        ),
+        (proptest::option::of(0..10_000u64), 100..60_000u64).prop_map(
+            |(pane_id, stable_for_ms)| WaitCondition::StableTail {
                 pane_id,
                 stable_for_ms
-            }),
+            }
+        ),
         (proptest::option::of(0..10_000u64), arb_text_match())
             .prop_map(|(pane_id, matcher)| WaitCondition::TextMatch { pane_id, matcher }),
         (100..60_000u64).prop_map(|duration_ms| WaitCondition::Sleep { duration_ms }),
@@ -82,11 +84,12 @@ fn arb_step_result() -> impl Strategy<Value = StepResult> {
         }),
         (0..60_000u64).prop_map(|delay_ms| StepResult::Retry { delay_ms }),
         "[a-z ]{1,30}".prop_map(|reason| StepResult::Abort { reason }),
-        (arb_wait_condition(), proptest::option::of(100..60_000u64))
-            .prop_map(|(condition, timeout_ms)| StepResult::WaitFor {
+        (arb_wait_condition(), proptest::option::of(100..60_000u64)).prop_map(
+            |(condition, timeout_ms)| StepResult::WaitFor {
                 condition,
                 timeout_ms
-            }),
+            }
+        ),
         (
             "[a-z ]{1,20}",
             proptest::option::of(arb_wait_condition()),
@@ -102,7 +105,8 @@ fn arb_step_result() -> impl Strategy<Value = StepResult> {
 }
 
 fn arb_workflow_step() -> impl Strategy<Value = WorkflowStep> {
-    ("[a-z_]{1,15}", "[a-z ]{1,30}").prop_map(|(name, description)| WorkflowStep { name, description })
+    ("[a-z_]{1,15}", "[a-z ]{1,30}")
+        .prop_map(|(name, description)| WorkflowStep { name, description })
 }
 
 fn arb_workflow_info() -> impl Strategy<Value = WorkflowInfo> {
@@ -161,8 +165,7 @@ fn arb_workflow_start_result() -> impl Strategy<Value = WorkflowStartResult> {
                 workflow_name,
             }
         }),
-        "[a-z_]{1,15}"
-            .prop_map(|rule_id| WorkflowStartResult::NoMatchingWorkflow { rule_id }),
+        "[a-z_]{1,15}".prop_map(|rule_id| WorkflowStartResult::NoMatchingWorkflow { rule_id }),
         (0..10_000u64, "[a-z_]{1,15}", "[a-z0-9_-]{1,15}").prop_map(
             |(pane_id, held_by_workflow, held_by_execution)| WorkflowStartResult::PaneLocked {
                 pane_id,
@@ -176,19 +179,16 @@ fn arb_workflow_start_result() -> impl Strategy<Value = WorkflowStartResult> {
 
 fn arb_workflow_execution_result() -> impl Strategy<Value = WorkflowExecutionResult> {
     prop_oneof![
-        (
-            "[a-z0-9_-]{1,15}",
-            0..100_000u64,
-            0..50usize,
-        )
-            .prop_map(|(execution_id, elapsed_ms, steps_executed)| {
+        ("[a-z0-9_-]{1,15}", 0..100_000u64, 0..50usize,).prop_map(
+            |(execution_id, elapsed_ms, steps_executed)| {
                 WorkflowExecutionResult::Completed {
                     execution_id,
                     result: serde_json::Value::Null,
                     elapsed_ms,
                     steps_executed,
                 }
-            }),
+            }
+        ),
         (
             "[a-z0-9_-]{1,15}",
             "[a-z ]{1,30}",
@@ -203,18 +203,15 @@ fn arb_workflow_execution_result() -> impl Strategy<Value = WorkflowExecutionRes
                     elapsed_ms,
                 }
             }),
-        (
-            "[a-z0-9_-]{1,15}",
-            0..50usize,
-            "[a-z ]{1,30}",
-        )
-            .prop_map(|(execution_id, step_index, reason)| {
+        ("[a-z0-9_-]{1,15}", 0..50usize, "[a-z ]{1,30}",).prop_map(
+            |(execution_id, step_index, reason)| {
                 WorkflowExecutionResult::PolicyDenied {
                     execution_id,
                     step_index,
                     reason,
                 }
-            }),
+            }
+        ),
         (proptest::option::of("[a-z0-9_-]{1,15}"), "[a-z ]{1,30}").prop_map(
             |(execution_id, error)| WorkflowExecutionResult::Error {
                 execution_id,
@@ -225,14 +222,20 @@ fn arb_workflow_execution_result() -> impl Strategy<Value = WorkflowExecutionRes
 }
 
 fn arb_pane_lock_info() -> impl Strategy<Value = PaneLockInfo> {
-    (0..10_000u64, "[a-z_]{1,15}", "[a-z0-9_-]{1,15}", 0..i64::MAX).prop_map(
-        |(pane_id, workflow_name, execution_id, locked_at_ms)| PaneLockInfo {
-            pane_id,
-            workflow_name,
-            execution_id,
-            locked_at_ms,
-        },
+    (
+        0..10_000u64,
+        "[a-z_]{1,15}",
+        "[a-z0-9_-]{1,15}",
+        0..i64::MAX,
     )
+        .prop_map(
+            |(pane_id, workflow_name, execution_id, locked_at_ms)| PaneLockInfo {
+                pane_id,
+                workflow_name,
+                execution_id,
+                locked_at_ms,
+            },
+        )
 }
 
 fn arb_workflow_config() -> impl Strategy<Value = WorkflowConfig> {

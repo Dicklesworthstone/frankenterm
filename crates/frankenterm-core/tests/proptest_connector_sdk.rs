@@ -15,10 +15,10 @@
 use frankenterm_core::connector_host_runtime::{ConnectorCapability, ConnectorHostConfig};
 use frankenterm_core::connector_registry::TrustLevel;
 use frankenterm_core::connector_sdk::{
-    CertificationPipeline, CertificationPhase, CertificationReport, CertificationTelemetry,
+    CertificationPhase, CertificationPipeline, CertificationReport, CertificationTelemetry,
     CertificationTelemetrySnapshot, CertificationVerdict, ConnectorSimulator, LintFinding,
-    LintReport, LintRule, LintSeverity, ManifestBuilder, ManifestLinter, PhaseResult,
-    PhaseVerdict, SimulationEvent, SimulationEventType, TrustPolicyBuilder, compute_sha256_hex,
+    LintReport, LintRule, LintSeverity, ManifestBuilder, ManifestLinter, PhaseResult, PhaseVerdict,
+    SimulationEvent, SimulationEventType, TrustPolicyBuilder, compute_sha256_hex,
 };
 use proptest::prelude::*;
 

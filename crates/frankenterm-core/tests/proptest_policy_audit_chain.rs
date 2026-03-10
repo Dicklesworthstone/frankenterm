@@ -51,17 +51,24 @@ fn arb_audit_chain_telemetry() -> impl Strategy<Value = AuditChainTelemetry> {
 }
 
 fn arb_audit_chain_telemetry_snapshot() -> impl Strategy<Value = AuditChainTelemetrySnapshot> {
-    (arb_audit_chain_telemetry(), any::<u64>(), 1..1000usize, 1..10000usize, any::<u64>()).prop_map(
-        |(counters, captured_at_ms, chain_length, max_entries, next_sequence)| {
-            AuditChainTelemetrySnapshot {
-                captured_at_ms,
-                counters,
-                chain_length,
-                max_entries,
-                next_sequence,
-            }
-        },
+    (
+        arb_audit_chain_telemetry(),
+        any::<u64>(),
+        1..1000usize,
+        1..10000usize,
+        any::<u64>(),
     )
+        .prop_map(
+            |(counters, captured_at_ms, chain_length, max_entries, next_sequence)| {
+                AuditChainTelemetrySnapshot {
+                    captured_at_ms,
+                    counters,
+                    chain_length,
+                    max_entries,
+                    next_sequence,
+                }
+            },
+        )
 }
 
 fn arb_chain_verification_result() -> impl Strategy<Value = ChainVerificationResult> {

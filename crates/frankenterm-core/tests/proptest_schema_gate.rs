@@ -5,7 +5,7 @@
 //! analysis properties.
 
 use frankenterm_core::search::schema_gate::{
-    check_schema_preservation, SchemaField, SchemaGateResult, SchemaSnapshot, SchemaTypeMismatch,
+    SchemaField, SchemaGateResult, SchemaSnapshot, SchemaTypeMismatch, check_schema_preservation,
 };
 use proptest::prelude::*;
 
@@ -15,10 +15,7 @@ use proptest::prelude::*;
 
 fn arb_field_name() -> impl Strategy<Value = String> {
     prop::collection::vec(
-        prop_oneof![
-            (b'a'..=b'z').prop_map(|b| b as char),
-            Just('_'),
-        ],
+        prop_oneof![(b'a'..=b'z').prop_map(|b| b as char), Just('_'),],
         1..20,
     )
     .prop_map(|chars| chars.into_iter().collect::<String>())
@@ -39,14 +36,18 @@ fn arb_type_name() -> impl Strategy<Value = String> {
 }
 
 fn arb_schema_field() -> impl Strategy<Value = SchemaField> {
-    (arb_field_name(), arb_type_name(), any::<bool>(), any::<bool>()).prop_map(
-        |(name, field_type, required, indexed)| SchemaField {
+    (
+        arb_field_name(),
+        arb_type_name(),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_map(|(name, field_type, required, indexed)| SchemaField {
             name,
             field_type,
             required,
             indexed,
-        },
-    )
+        })
 }
 
 fn arb_schema_snapshot() -> impl Strategy<Value = SchemaSnapshot> {
@@ -65,10 +66,7 @@ fn arb_schema_snapshot() -> impl Strategy<Value = SchemaSnapshot> {
 /// Snapshot with unique field names (no duplicates).
 fn arb_unique_schema_snapshot() -> impl Strategy<Value = SchemaSnapshot> {
     (
-        prop::collection::vec(
-            (arb_type_name(), any::<bool>(), any::<bool>()),
-            0..8,
-        ),
+        prop::collection::vec((arb_type_name(), any::<bool>(), any::<bool>()), 0..8),
         arb_field_name(),
         any::<i64>(),
     )

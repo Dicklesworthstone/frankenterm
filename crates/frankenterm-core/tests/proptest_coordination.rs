@@ -6,7 +6,6 @@
 use frankenterm_core::workflows::*;
 use proptest::prelude::*;
 
-
 // =============================================================================
 // Arbitrary strategies
 // =============================================================================
@@ -56,15 +55,13 @@ fn arb_pane_broadcast_outcome() -> impl Strategy<Value = PaneBroadcastOutcome> {
         prop::collection::vec("[a-z_]{1,15}", 1..5)
             .prop_map(|failed| PaneBroadcastOutcome::PreconditionFailed { failed }),
         "[a-z ]{1,30}".prop_map(|reason| PaneBroadcastOutcome::Skipped { reason }),
-        "[a-z ]{1,30}"
-            .prop_map(|reason| PaneBroadcastOutcome::VerificationFailed { reason }),
+        "[a-z ]{1,30}".prop_map(|reason| PaneBroadcastOutcome::VerificationFailed { reason }),
     ]
 }
 
 fn arb_pane_broadcast_entry() -> impl Strategy<Value = PaneBroadcastEntry> {
-    (0..10_000u64, arb_pane_broadcast_outcome()).prop_map(|(pane_id, outcome)| {
-        PaneBroadcastEntry { pane_id, outcome }
-    })
+    (0..10_000u64, arb_pane_broadcast_outcome())
+        .prop_map(|(pane_id, outcome)| PaneBroadcastEntry { pane_id, outcome })
 }
 
 fn arb_broadcast_result() -> impl Strategy<Value = BroadcastResult> {
@@ -86,13 +83,13 @@ fn arb_coordinate_agents_config() -> impl Strategy<Value = CoordinateAgentsConfi
         prop::collection::vec(arb_broadcast_precondition(), 0..5),
         prop::bool::ANY,
     )
-        .prop_map(|(strategy, preconditions, abort_on_lock_failure)| {
-            CoordinateAgentsConfig {
+        .prop_map(
+            |(strategy, preconditions, abort_on_lock_failure)| CoordinateAgentsConfig {
                 strategy,
                 preconditions,
                 abort_on_lock_failure,
-            }
-        })
+            },
+        )
 }
 
 fn arb_group_coordination_entry() -> impl Strategy<Value = GroupCoordinationEntry> {

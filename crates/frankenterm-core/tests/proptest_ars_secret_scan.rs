@@ -86,11 +86,7 @@ fn arb_command_block(index: u32, command: String) -> CommandBlock {
     }
 }
 
-fn arb_command_block_with_output(
-    index: u32,
-    command: String,
-    output: String,
-) -> CommandBlock {
+fn arb_command_block_with_output(index: u32, command: String, output: String) -> CommandBlock {
     CommandBlock {
         index,
         command,
@@ -154,7 +150,16 @@ fn arb_scan_finding() -> impl Strategy<Value = ScanFinding> {
         prop_oneof![Just(None), (1.0..8.0f64).prop_map(Some)],
     )
         .prop_map(
-            |(pattern_name, block_index, source, byte_offset, match_len, context, method, entropy)| {
+            |(
+                pattern_name,
+                block_index,
+                source,
+                byte_offset,
+                match_len,
+                context,
+                method,
+                entropy,
+            )| {
                 ScanFinding {
                     pattern_name,
                     block_index,

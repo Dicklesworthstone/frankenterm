@@ -16,8 +16,9 @@ fn arb_quarantine_reason() -> impl Strategy<Value = QuarantineReason> {
             .prop_map(|(rule_id, detail)| QuarantineReason::PolicyViolation { rule_id, detail }),
         "[a-z0-9_]{1,20}"
             .prop_map(|credential_id| QuarantineReason::CredentialCompromise { credential_id }),
-        ("[a-z_]{1,15}", "[0-9.%]{1,10}")
-            .prop_map(|(metric, observed)| QuarantineReason::AnomalousBehavior { metric, observed }),
+        ("[a-z_]{1,15}", "[0-9.%]{1,10}").prop_map(|(metric, observed)| {
+            QuarantineReason::AnomalousBehavior { metric, observed }
+        }),
         ("[a-z]{1,15}", "[a-z ]{1,30}")
             .prop_map(|(operator, note)| QuarantineReason::OperatorDirected { operator, note }),
         "[a-z0-9_-]{1,20}"
@@ -209,29 +210,32 @@ fn arb_quarantine_telemetry() -> impl Strategy<Value = QuarantineTelemetry> {
 }
 
 fn arb_quarantine_telemetry_snapshot() -> impl Strategy<Value = QuarantineTelemetrySnapshot> {
-    (arb_quarantine_telemetry(), 0..u64::MAX, 0..100u32, arb_kill_switch_level()).prop_map(
-        |(counters, captured_at_ms, active_quarantines, kill_switch_level)| {
-            QuarantineTelemetrySnapshot {
-                captured_at_ms,
-                counters,
-                active_quarantines,
-                kill_switch_level,
-            }
-        },
+    (
+        arb_quarantine_telemetry(),
+        0..u64::MAX,
+        0..100u32,
+        arb_kill_switch_level(),
     )
+        .prop_map(
+            |(counters, captured_at_ms, active_quarantines, kill_switch_level)| {
+                QuarantineTelemetrySnapshot {
+                    captured_at_ms,
+                    counters,
+                    active_quarantines,
+                    kill_switch_level,
+                }
+            },
+        )
 }
 
 fn arb_quarantine_config() -> impl Strategy<Value = QuarantineConfig> {
-    (
-        1..2048usize,
-        proptest::bool::ANY,
-        arb_quarantine_severity(),
-    )
-        .prop_map(|(max_audit_events, auto_expire, default_severity)| QuarantineConfig {
+    (1..2048usize, proptest::bool::ANY, arb_quarantine_severity()).prop_map(
+        |(max_audit_events, auto_expire, default_severity)| QuarantineConfig {
             max_audit_events,
             auto_expire,
             default_severity,
-        })
+        },
+    )
 }
 
 // =============================================================================

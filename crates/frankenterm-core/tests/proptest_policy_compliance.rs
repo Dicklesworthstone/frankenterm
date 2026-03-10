@@ -105,15 +105,22 @@ fn arb_compliance_counters() -> impl Strategy<Value = ComplianceCounters> {
 }
 
 fn arb_violation_trend() -> impl Strategy<Value = ViolationTrend> {
-    (0..100u32, 0..100u32, 0..100u32, 0..100u32, arb_trend_direction()).prop_map(
-        |(violations, remediations, new_v, carried, direction)| ViolationTrend {
-            violations_in_period: violations,
-            remediations_in_period: remediations,
-            new_violations: new_v,
-            carried_over: carried,
-            direction,
-        },
+    (
+        0..100u32,
+        0..100u32,
+        0..100u32,
+        0..100u32,
+        arb_trend_direction(),
     )
+        .prop_map(
+            |(violations, remediations, new_v, carried, direction)| ViolationTrend {
+                violations_in_period: violations,
+                remediations_in_period: remediations,
+                new_violations: new_v,
+                carried_over: carried,
+                direction,
+            },
+        )
 }
 
 fn arb_remediation_summary() -> impl Strategy<Value = RemediationSummary> {

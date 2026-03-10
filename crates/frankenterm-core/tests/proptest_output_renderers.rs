@@ -9,8 +9,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::output::{
-    AnalyticsSummaryData, HealthDiagnosticStatus, RuleDetail, RuleListItem, RuleTestMatch,
-    Summary, WorkflowResult, WorkflowStepResult,
+    AnalyticsSummaryData, HealthDiagnosticStatus, RuleDetail, RuleListItem, RuleTestMatch, Summary,
+    WorkflowResult, WorkflowStepResult,
 };
 
 // =============================================================================
@@ -38,7 +38,16 @@ fn arb_rule_list_item() -> impl Strategy<Value = RuleListItem> {
         any::<bool>(),
     )
         .prop_map(
-            |(id, agent_type, event_type, severity, description, workflow, anchor_count, has_regex)| {
+            |(
+                id,
+                agent_type,
+                event_type,
+                severity,
+                description,
+                workflow,
+                anchor_count,
+                has_regex,
+            )| {
                 RuleListItem {
                     id,
                     agent_type,
@@ -89,10 +98,7 @@ fn arb_rule_test_match() -> impl Strategy<Value = RuleTestMatch> {
 fn arb_rule_detail() -> impl Strategy<Value = RuleDetail> {
     (
         "[a-z_.]{5,20}",
-        prop_oneof![
-            Just("codex".to_string()),
-            Just("claude_code".to_string()),
-        ],
+        prop_oneof![Just("codex".to_string()), Just("claude_code".to_string()),],
         "[a-z_.]{5,20}",
         prop_oneof![Just("info".to_string()), Just("warning".to_string())],
         "[a-z ]{10,40}",

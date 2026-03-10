@@ -49,10 +49,10 @@ use frankenterm_core::session_topology::{
     AgentLifecycleState, InferenceQuality, LifecycleDecision, LifecycleEntityKind,
     LifecycleEntityRecord, LifecycleEvent, LifecycleIdentity, LifecycleState,
     LifecycleTransitionContext, LifecycleTransitionLogEntry, LifecycleTransitionRequest,
-    MuxPaneLifecycleState, PaneNode, SessionLifecycleState, TOPOLOGY_SCHEMA_VERSION,
-    TabSnapshot, TopologySnapshot, WindowLifecycleState, WindowSnapshot,
-    apply_lifecycle_state_transition, transition_session_state, transition_window_state,
-    transition_pane_state, transition_agent_state,
+    MuxPaneLifecycleState, PaneNode, SessionLifecycleState, TOPOLOGY_SCHEMA_VERSION, TabSnapshot,
+    TopologySnapshot, WindowLifecycleState, WindowSnapshot, apply_lifecycle_state_transition,
+    transition_agent_state, transition_pane_state, transition_session_state,
+    transition_window_state,
 };
 
 // =============================================================================

@@ -1585,30 +1585,24 @@ fn arb_approval_state() -> impl Strategy<Value = ApprovalState> {
                 requested_at_ms,
             }
         }),
-        (
-            "[a-z_]{3,15}",
-            0i64..9_999_999_999i64,
-            "[a-f0-9]{16,32}",
-        )
-            .prop_map(|(approved_by, approved_at_ms, approval_code_hash)| {
+        ("[a-z_]{3,15}", 0i64..9_999_999_999i64, "[a-f0-9]{16,32}",).prop_map(
+            |(approved_by, approved_at_ms, approval_code_hash)| {
                 ApprovalState::Approved {
                     approved_by,
                     approved_at_ms,
                     approval_code_hash,
                 }
-            }),
-        (
-            "[a-z_]{3,15}",
-            0i64..9_999_999_999i64,
-            "[a-z_.]{3,20}",
-        )
-            .prop_map(|(denied_by, denied_at_ms, reason_code)| {
+            }
+        ),
+        ("[a-z_]{3,15}", 0i64..9_999_999_999i64, "[a-z_.]{3,20}",).prop_map(
+            |(denied_by, denied_at_ms, reason_code)| {
                 ApprovalState::Denied {
                     denied_by,
                     denied_at_ms,
                     reason_code,
                 }
-            }),
+            }
+        ),
         (0i64..9_999_999_999i64, "[a-z_.]{3,20}").prop_map(|(expired_at_ms, reason_code)| {
             ApprovalState::Expired {
                 expired_at_ms,
@@ -1626,18 +1620,15 @@ fn arb_outcome() -> impl Strategy<Value = Outcome> {
                 completed_at_ms,
             }
         }),
-        (
-            "[a-z_.]{3,20}",
-            "[a-z_.]{3,20}",
-            0i64..9_999_999_999i64,
-        )
-            .prop_map(|(reason_code, error_code, completed_at_ms)| {
+        ("[a-z_.]{3,20}", "[a-z_.]{3,20}", 0i64..9_999_999_999i64,).prop_map(
+            |(reason_code, error_code, completed_at_ms)| {
                 Outcome::Failed {
                     reason_code,
                     error_code,
                     completed_at_ms,
                 }
-            }),
+            }
+        ),
         ("[a-z_.]{3,20}", 0i64..9_999_999_999i64).prop_map(|(reason_code, completed_at_ms)| {
             Outcome::Cancelled {
                 reason_code,

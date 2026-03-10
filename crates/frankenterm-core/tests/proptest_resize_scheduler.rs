@@ -1422,17 +1422,21 @@ proptest! {
 
 fn arb_submit_outcome() -> impl Strategy<Value = SubmitOutcome> {
     prop_oneof![
-        proptest::option::of(0_u64..10_000)
-            .prop_map(|replaced| SubmitOutcome::Accepted { replaced_pending_seq: replaced }),
-        (0_u64..10_000)
-            .prop_map(|latest_seq| SubmitOutcome::RejectedNonMonotonic { latest_seq }),
-        (0_usize..100, proptest::option::of((0_u64..10_000, 0_u64..10_000)))
+        proptest::option::of(0_u64..10_000).prop_map(|replaced| SubmitOutcome::Accepted {
+            replaced_pending_seq: replaced
+        }),
+        (0_u64..10_000).prop_map(|latest_seq| SubmitOutcome::RejectedNonMonotonic { latest_seq }),
+        (
+            0_usize..100,
+            proptest::option::of((0_u64..10_000, 0_u64..10_000))
+        )
             .prop_map(|(pending_total, evicted)| SubmitOutcome::DroppedOverload {
                 pending_total,
                 evicted_pending: evicted,
             }),
-        any::<bool>()
-            .prop_map(|fb| SubmitOutcome::SuppressedByKillSwitch { legacy_fallback: fb }),
+        any::<bool>().prop_map(|fb| SubmitOutcome::SuppressedByKillSwitch {
+            legacy_fallback: fb
+        }),
     ]
 }
 

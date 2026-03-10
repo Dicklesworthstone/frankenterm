@@ -27,16 +27,18 @@ fn arb_wait_condition() -> impl Strategy<Value = WaitCondition> {
     prop_oneof![
         (prop::option::of(0u64..10_000), "[a-z_.]{3,15}")
             .prop_map(|(pane_id, rule_id)| WaitCondition::Pattern { pane_id, rule_id }),
-        (prop::option::of(0u64..10_000), 100u64..30_000)
-            .prop_map(|(pane_id, idle_threshold_ms)| WaitCondition::PaneIdle {
+        (prop::option::of(0u64..10_000), 100u64..30_000).prop_map(
+            |(pane_id, idle_threshold_ms)| WaitCondition::PaneIdle {
                 pane_id,
                 idle_threshold_ms,
-            }),
-        (prop::option::of(0u64..10_000), 100u64..30_000)
-            .prop_map(|(pane_id, stable_for_ms)| WaitCondition::StableTail {
+            }
+        ),
+        (prop::option::of(0u64..10_000), 100u64..30_000).prop_map(|(pane_id, stable_for_ms)| {
+            WaitCondition::StableTail {
                 pane_id,
                 stable_for_ms,
-            }),
+            }
+        }),
         (prop::option::of(0u64..10_000), arb_text_match())
             .prop_map(|(pane_id, matcher)| WaitCondition::TextMatch { pane_id, matcher }),
         (100u64..30_000).prop_map(|duration_ms| WaitCondition::Sleep { duration_ms }),

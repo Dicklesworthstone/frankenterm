@@ -391,12 +391,14 @@ fn arb_safety_violation() -> impl Strategy<Value = SafetyViolation> {
         "[a-zA-Z ]{5,30}",
         "[a-zA-Z0-9/ \\-]{3,20}",
     )
-        .prop_map(|(block_index, category, description, evidence)| SafetyViolation {
-            block_index,
-            category,
-            description,
-            evidence,
-        })
+        .prop_map(
+            |(block_index, category, description, evidence)| SafetyViolation {
+                block_index,
+                category,
+                description,
+                evidence,
+            },
+        )
 }
 
 // =============================================================================

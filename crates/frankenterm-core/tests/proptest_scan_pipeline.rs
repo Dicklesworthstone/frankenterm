@@ -421,14 +421,20 @@ fn arb_compression_level_config() -> impl Strategy<Value = CompressionLevelConfi
 }
 
 fn arb_scan_metrics_summary() -> impl Strategy<Value = ScanMetricsSummary> {
-    (0usize..10_000, 0usize..10_000, 0usize..10_000, 0.0f64..=1.0f64).prop_map(
-        |(newline_count, ansi_byte_count, logical_lines, ansi_density)| ScanMetricsSummary {
-            newline_count,
-            ansi_byte_count,
-            logical_lines,
-            ansi_density,
-        },
+    (
+        0usize..10_000,
+        0usize..10_000,
+        0usize..10_000,
+        0.0f64..=1.0f64,
     )
+        .prop_map(
+            |(newline_count, ansi_byte_count, logical_lines, ansi_density)| ScanMetricsSummary {
+                newline_count,
+                ansi_byte_count,
+                logical_lines,
+                ansi_density,
+            },
+        )
 }
 
 proptest! {

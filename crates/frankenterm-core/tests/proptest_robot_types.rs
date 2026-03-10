@@ -998,17 +998,26 @@ fn arb_tx_compensation_kind() -> impl Strategy<Value = TxCompensationKind> {
         Just(TxCompensationKind::NotifyOperator),
         (1u32..10).prop_map(|max_retries| TxCompensationKind::RetryWithBackoff { max_retries }),
         Just(TxCompensationKind::SkipAndContinue),
-        "[a-z0-9-]{5,15}".prop_map(|alternative_step_id| TxCompensationKind::Alternative { alternative_step_id }),
+        "[a-z0-9-]{5,15}".prop_map(|alternative_step_id| TxCompensationKind::Alternative {
+            alternative_step_id
+        }),
     ]
 }
 
 fn arb_tx_step_outcome() -> impl Strategy<Value = TxStepOutcome> {
     prop_oneof![
         proptest::option::of("[a-z]{3,15}").prop_map(|result| TxStepOutcome::Success { result }),
-        ("[a-z.]{3,10}", "[a-z ]{5,20}", proptest::bool::ANY)
-            .prop_map(|(error_code, error_message, compensated)| TxStepOutcome::Failed { error_code, error_message, compensated }),
+        ("[a-z.]{3,10}", "[a-z ]{5,20}", proptest::bool::ANY).prop_map(
+            |(error_code, error_message, compensated)| TxStepOutcome::Failed {
+                error_code,
+                error_message,
+                compensated
+            }
+        ),
         "[a-z ]{5,20}".prop_map(|reason| TxStepOutcome::Skipped { reason }),
-        "[a-z ]{5,20}".prop_map(|compensation_result| TxStepOutcome::Compensated { compensation_result }),
+        "[a-z ]{5,20}".prop_map(|compensation_result| TxStepOutcome::Compensated {
+            compensation_result
+        }),
         Just(TxStepOutcome::Pending),
     ]
 }
@@ -1017,8 +1026,12 @@ fn arb_search_stream_phase() -> impl Strategy<Value = SearchStreamPhase> {
     prop_oneof![
         (0usize..1000).prop_map(|result_count| SearchStreamPhase::Fast { result_count }),
         (0usize..1000).prop_map(|result_count| SearchStreamPhase::Quality { result_count }),
-        (0usize..1000, 0u64..1_000_000)
-            .prop_map(|(total_results, total_us)| SearchStreamPhase::Done { total_results, total_us }),
+        (0usize..1000, 0u64..1_000_000).prop_map(|(total_results, total_us)| {
+            SearchStreamPhase::Done {
+                total_results,
+                total_us,
+            }
+        }),
     ]
 }
 

@@ -28,9 +28,8 @@ fn arb_migration_phase() -> impl Strategy<Value = MigrationPhase> {
 }
 
 fn arb_phase_transition_error() -> impl Strategy<Value = PhaseTransitionError> {
-    (arb_migration_phase(), arb_migration_phase(), "[a-z ]{5,30}").prop_map(
-        |(from, to, reason)| PhaseTransitionError { from, to, reason },
-    )
+    (arb_migration_phase(), arb_migration_phase(), "[a-z ]{5,30}")
+        .prop_map(|(from, to, reason)| PhaseTransitionError { from, to, reason })
 }
 
 fn arb_health_check_result() -> impl Strategy<Value = HealthCheckResult> {

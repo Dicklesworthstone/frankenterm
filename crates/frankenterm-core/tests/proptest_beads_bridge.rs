@@ -84,27 +84,26 @@ fn bead_detail_strategy() -> impl Strategy<Value = BeadIssueDetail> {
         0u8..5,
         bead_issue_type_strategy(),
     )
-        .prop_map(|(id, title, status, priority, issue_type)| BeadIssueDetail {
-            id,
-            title,
-            status,
-            priority,
-            issue_type,
-            assignee: None,
-            labels: Vec::new(),
-            dependencies: Vec::new(),
-            dependents: Vec::new(),
-            parent: None,
-            ingest_warning: None,
-            extra: HashMap::new(),
-        })
+        .prop_map(
+            |(id, title, status, priority, issue_type)| BeadIssueDetail {
+                id,
+                title,
+                status,
+                priority,
+                issue_type,
+                assignee: None,
+                labels: Vec::new(),
+                dependencies: Vec::new(),
+                dependents: Vec::new(),
+                parent: None,
+                ingest_warning: None,
+                extra: HashMap::new(),
+            },
+        )
 }
 
 /// Helper: compute expected backpressure tier from raw values.
-fn expected_tier(
-    actionable: usize,
-    config: &BeadsBackpressureConfig,
-) -> BeadsBackpressure {
+fn expected_tier(actionable: usize, config: &BeadsBackpressureConfig) -> BeadsBackpressure {
     if actionable >= config.red_threshold {
         BeadsBackpressure::Red
     } else if actionable >= config.yellow_threshold {

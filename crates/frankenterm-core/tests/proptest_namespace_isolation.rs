@@ -13,8 +13,7 @@ fn arb_namespace_segment() -> impl Strategy<Value = String> {
 }
 
 fn arb_namespace_name() -> impl Strategy<Value = String> {
-    prop::collection::vec(arb_namespace_segment(), 1..=4)
-        .prop_map(|segments| segments.join("."))
+    prop::collection::vec(arb_namespace_segment(), 1..=4).prop_map(|segments| segments.join("."))
 }
 
 fn arb_tenant_namespace() -> impl Strategy<Value = TenantNamespace> {
@@ -41,7 +40,11 @@ fn arb_cross_tenant_decision() -> impl Strategy<Value = CrossTenantDecision> {
 }
 
 fn arb_namespace_binding() -> impl Strategy<Value = NamespaceBinding> {
-    (arb_tenant_namespace(), arb_resource_kind(), "[a-z0-9]{1,20}")
+    (
+        arb_tenant_namespace(),
+        arb_resource_kind(),
+        "[a-z0-9]{1,20}",
+    )
         .prop_map(|(ns, kind, id)| NamespaceBinding::new(ns, kind, id))
 }
 
@@ -69,14 +72,14 @@ fn arb_cross_tenant_policy() -> impl Strategy<Value = CrossTenantPolicy> {
         any::<bool>(),
         prop::collection::vec(arb_cross_tenant_rule(), 0..=3),
     )
-        .prop_map(|(default_decision, allow_hierarchical, system_bypass, rules)| {
-            CrossTenantPolicy {
+        .prop_map(
+            |(default_decision, allow_hierarchical, system_bypass, rules)| CrossTenantPolicy {
                 default_decision,
                 allow_hierarchical,
                 system_bypass,
                 rules,
-            }
-        })
+            },
+        )
 }
 
 fn arb_boundary_check_result() -> impl Strategy<Value = BoundaryCheckResult> {
@@ -132,16 +135,16 @@ fn arb_registry_snapshot() -> impl Strategy<Value = NamespaceRegistrySnapshot> {
         any::<usize>(),
         arb_cross_tenant_decision(),
     )
-        .prop_map(
-            |(bindings, active, counts, audit, rules, decision)| NamespaceRegistrySnapshot {
+        .prop_map(|(bindings, active, counts, audit, rules, decision)| {
+            NamespaceRegistrySnapshot {
                 total_bindings: bindings,
                 active_namespaces: active,
                 namespace_counts: counts,
                 audit_log_size: audit,
                 policy_rule_count: rules,
                 default_decision: decision,
-            },
-        )
+            }
+        })
 }
 
 fn arb_telemetry_snapshot() -> impl Strategy<Value = NamespaceIsolationTelemetrySnapshot> {
@@ -153,18 +156,16 @@ fn arb_telemetry_snapshot() -> impl Strategy<Value = NamespaceIsolationTelemetry
         any::<u64>(),
         any::<u64>(),
     )
-        .prop_map(
-            |(total, cross, denied, audited, hier, bypass)| {
-                NamespaceIsolationTelemetrySnapshot {
-                    checks_total: total,
-                    cross_boundary_total: cross,
-                    cross_boundary_denied: denied,
-                    cross_boundary_audited: audited,
-                    hierarchical_grants: hier,
-                    system_bypass_grants: bypass,
-                }
-            },
-        )
+        .prop_map(|(total, cross, denied, audited, hier, bypass)| {
+            NamespaceIsolationTelemetrySnapshot {
+                checks_total: total,
+                cross_boundary_total: cross,
+                cross_boundary_denied: denied,
+                cross_boundary_audited: audited,
+                hierarchical_grants: hier,
+                system_bypass_grants: bypass,
+            }
+        })
 }
 
 // =============================================================================

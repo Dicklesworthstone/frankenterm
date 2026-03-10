@@ -15,8 +15,8 @@ use proptest::prelude::*;
 
 use frankenterm_core::ingest::{
     AltScreenChange, CapturedSegmentKind, DiscoveryDiff, IngestTelemetrySnapshot,
-    ObservationDecision, Osc133Marker, Osc133State, OutputCache, OutputCacheConfig,
-    OverflowPolicy, PaneCursor, PaneFingerprint, PanePriorityOverride, ShellState, StreamChannel,
+    ObservationDecision, Osc133Marker, Osc133State, OutputCache, OutputCacheConfig, OverflowPolicy,
+    PaneCursor, PaneFingerprint, PanePriorityOverride, ShellState, StreamChannel,
     StreamChannelConfig, StreamEvent, StreamIngester, StreamIngesterTelemetrySnapshot,
     detect_alt_screen_changes, generate_pane_uuid,
 };

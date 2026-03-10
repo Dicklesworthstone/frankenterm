@@ -114,14 +114,14 @@ fn arb_forensic_policy_decision() -> impl Strategy<Value = ForensicPolicyDecisio
         "[a-z_]{1,10}",
         "[a-z ]{1,20}",
     )
-        .prop_map(|(decision, matched_rules, surface, reason)| {
-            ForensicPolicyDecision {
+        .prop_map(
+            |(decision, matched_rules, surface, reason)| ForensicPolicyDecision {
                 decision,
                 matched_rules,
                 surface,
                 reason,
-            }
-        })
+            },
+        )
 }
 
 fn arb_forensic_outcome() -> impl Strategy<Value = ForensicOutcome> {
@@ -214,7 +214,10 @@ fn arb_time_range() -> impl Strategy<Value = TimeRange> {
 }
 
 fn arb_sort_order() -> impl Strategy<Value = SortOrder> {
-    prop_oneof![Just(SortOrder::TimestampDesc), Just(SortOrder::TimestampAsc),]
+    prop_oneof![
+        Just(SortOrder::TimestampDesc),
+        Just(SortOrder::TimestampAsc),
+    ]
 }
 
 fn arb_export_format() -> impl Strategy<Value = ExportFormat> {
@@ -275,7 +278,13 @@ fn arb_forensic_query() -> impl Strategy<Value = ForensicQuery> {
 
 fn arb_forensic_telemetry() -> impl Strategy<Value = ForensicTelemetry> {
     (0..1000u64, 0..1000u64, 0..1000u64, 0..1000u64, 0..1000u64).prop_map(
-        |(records_ingested, records_evicted, queries_executed, exports_completed, records_redacted)| {
+        |(
+            records_ingested,
+            records_evicted,
+            queries_executed,
+            exports_completed,
+            records_redacted,
+        )| {
             ForensicTelemetry {
                 records_ingested,
                 records_evicted,
@@ -288,16 +297,22 @@ fn arb_forensic_telemetry() -> impl Strategy<Value = ForensicTelemetry> {
 }
 
 fn arb_forensic_telemetry_snapshot() -> impl Strategy<Value = ForensicTelemetrySnapshot> {
-    (arb_forensic_telemetry(), 0..u64::MAX, 0..1000usize, 1..1000usize).prop_map(
-        |(counters, captured_at_ms, current_record_count, max_records)| {
-            ForensicTelemetrySnapshot {
-                captured_at_ms,
-                counters,
-                current_record_count,
-                max_records,
-            }
-        },
+    (
+        arb_forensic_telemetry(),
+        0..u64::MAX,
+        0..1000usize,
+        1..1000usize,
     )
+        .prop_map(
+            |(counters, captured_at_ms, current_record_count, max_records)| {
+                ForensicTelemetrySnapshot {
+                    captured_at_ms,
+                    counters,
+                    current_record_count,
+                    max_records,
+                }
+            },
+        )
 }
 
 // =============================================================================

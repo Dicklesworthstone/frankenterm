@@ -49,16 +49,14 @@ fn arb_workflow_execution_result() -> impl Strategy<Value = WorkflowExecutionRes
             0u64..120_000,
             0usize..100,
         )
-            .prop_map(
-                |(execution_id, result, elapsed_ms, steps_executed)| {
-                    WorkflowExecutionResult::Completed {
-                        execution_id,
-                        result,
-                        elapsed_ms,
-                        steps_executed,
-                    }
+            .prop_map(|(execution_id, result, elapsed_ms, steps_executed)| {
+                WorkflowExecutionResult::Completed {
+                    execution_id,
+                    result,
+                    elapsed_ms,
+                    steps_executed,
                 }
-            ),
+            }),
         ("[a-z0-9]{8,16}", "[a-z ]{5,30}", 0usize..100, 0u64..120_000).prop_map(
             |(execution_id, reason, step_index, elapsed_ms)| {
                 WorkflowExecutionResult::Aborted {
@@ -78,24 +76,30 @@ fn arb_workflow_execution_result() -> impl Strategy<Value = WorkflowExecutionRes
                 }
             }
         ),
-        (prop::option::of("[a-z0-9]{8,16}"), "[a-z ]{5,30}").prop_map(
-            |(execution_id, error)| WorkflowExecutionResult::Error {
+        (prop::option::of("[a-z0-9]{8,16}"), "[a-z ]{5,30}").prop_map(|(execution_id, error)| {
+            WorkflowExecutionResult::Error {
                 execution_id,
                 error,
             }
-        ),
+        }),
     ]
 }
 
 fn arb_pane_lock_info() -> impl Strategy<Value = PaneLockInfo> {
-    (0u64..10_000, "[a-z_]{3,20}", "[a-z0-9]{8,16}", 0i64..9_999_999_999_999i64).prop_map(
-        |(pane_id, workflow_name, execution_id, locked_at_ms)| PaneLockInfo {
-            pane_id,
-            workflow_name,
-            execution_id,
-            locked_at_ms,
-        },
+    (
+        0u64..10_000,
+        "[a-z_]{3,20}",
+        "[a-z0-9]{8,16}",
+        0i64..9_999_999_999_999i64,
     )
+        .prop_map(
+            |(pane_id, workflow_name, execution_id, locked_at_ms)| PaneLockInfo {
+                pane_id,
+                workflow_name,
+                execution_id,
+                locked_at_ms,
+            },
+        )
 }
 
 fn arb_workflow_config() -> impl Strategy<Value = WorkflowConfig> {

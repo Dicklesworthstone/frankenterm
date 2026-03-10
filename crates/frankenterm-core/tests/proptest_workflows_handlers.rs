@@ -63,15 +63,16 @@ fn arb_auth_cass_hints() -> impl Strategy<Value = AuthCassHintsLookup> {
 
 fn arb_auth_recovery_strategy() -> impl Strategy<Value = AuthRecoveryStrategy> {
     prop_oneof![
-        (prop::option::of("[A-Z0-9]{4,8}"), prop::option::of("[a-z:/]{10,30}"))
+        (
+            prop::option::of("[A-Z0-9]{4,8}"),
+            prop::option::of("[a-z:/]{10,30}")
+        )
             .prop_map(|(code, url)| AuthRecoveryStrategy::DeviceCode { code, url }),
         prop::option::of("[A-Z_]{5,15}")
             .prop_map(|key_hint| AuthRecoveryStrategy::ApiKeyError { key_hint }),
-        ("[a-z_]{3,15}", "[a-z ]{5,30}")
-            .prop_map(|(agent_type, hint)| AuthRecoveryStrategy::ManualIntervention {
-                agent_type,
-                hint,
-            }),
+        ("[a-z_]{3,15}", "[a-z ]{5,30}").prop_map(|(agent_type, hint)| {
+            AuthRecoveryStrategy::ManualIntervention { agent_type, hint }
+        }),
     ]
 }
 
@@ -159,9 +160,8 @@ fn arb_fallback_reason() -> impl Strategy<Value = FallbackReason> {
         Just(FallbackReason::FailoverDisabled),
         "[a-z_]{3,15}".prop_map(|tool| FallbackReason::ToolMissing { tool }),
         "[a-z_.]{3,20}".prop_map(|rule| FallbackReason::PolicyDenied { rule }),
-        (1u32..100).prop_map(|accounts_checked| FallbackReason::AllAccountsExhausted {
-            accounts_checked,
-        }),
+        (1u32..100)
+            .prop_map(|accounts_checked| FallbackReason::AllAccountsExhausted { accounts_checked }),
         "[a-z ]{5,30}".prop_map(|detail| FallbackReason::Other { detail }),
     ]
 }

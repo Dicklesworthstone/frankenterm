@@ -77,7 +77,11 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
                     timeout_ms,
                 }
             }),
-        ("[a-z_]{3,10}", prop::option::of("[a-z ]{5,20}"), 100u64..30_000)
+        (
+            "[a-z_]{3,10}",
+            prop::option::of("[a-z ]{5,20}"),
+            100u64..30_000
+        )
             .prop_map(|(id, description, duration_ms)| {
                 DescriptorStep::Sleep {
                     id,
@@ -101,25 +105,41 @@ fn arb_leaf_step() -> impl Strategy<Value = DescriptorStep> {
                     wait_timeout_ms,
                 }
             }),
-        ("[a-z_]{3,10}", prop::option::of("[a-z ]{5,20}"), arb_descriptor_control_key())
+        (
+            "[a-z_]{3,10}",
+            prop::option::of("[a-z ]{5,20}"),
+            arb_descriptor_control_key()
+        )
             .prop_map(|(id, description, key)| DescriptorStep::SendCtrl {
                 id,
                 description,
                 key,
             }),
-        ("[a-z_]{3,10}", prop::option::of("[a-z ]{5,20}"), "[a-z ]{5,50}")
+        (
+            "[a-z_]{3,10}",
+            prop::option::of("[a-z ]{5,20}"),
+            "[a-z ]{5,50}"
+        )
             .prop_map(|(id, description, message)| DescriptorStep::Notify {
                 id,
                 description,
                 message,
             }),
-        ("[a-z_]{3,10}", prop::option::of("[a-z ]{5,20}"), "[a-z ]{5,50}")
+        (
+            "[a-z_]{3,10}",
+            prop::option::of("[a-z ]{5,20}"),
+            "[a-z ]{5,50}"
+        )
             .prop_map(|(id, description, message)| DescriptorStep::Log {
                 id,
                 description,
                 message,
             }),
-        ("[a-z_]{3,10}", prop::option::of("[a-z ]{5,20}"), "[a-z ]{5,50}")
+        (
+            "[a-z_]{3,10}",
+            prop::option::of("[a-z ]{5,20}"),
+            "[a-z ]{5,50}"
+        )
             .prop_map(|(id, description, reason)| DescriptorStep::Abort {
                 id,
                 description,

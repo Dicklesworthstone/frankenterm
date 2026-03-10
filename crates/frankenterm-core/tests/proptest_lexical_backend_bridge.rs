@@ -5,9 +5,9 @@
 //! LexicalBackendMetrics rate computation bounds, and BridgeDocument serde.
 
 use frankenterm_core::search::lexical_backend_bridge::{
-    compute_churn_rate, compute_query_error_rate, compute_rejection_rate, BridgeDocument,
-    DocumentSource, IngestLifecyclePolicy, LexicalBackendConfig, LexicalBackendMetrics,
-    LexicalSchemaVersion,
+    BridgeDocument, DocumentSource, IngestLifecyclePolicy, LexicalBackendConfig,
+    LexicalBackendMetrics, LexicalSchemaVersion, compute_churn_rate, compute_query_error_rate,
+    compute_rejection_rate,
 };
 use proptest::prelude::*;
 
@@ -44,13 +44,13 @@ fn arb_config() -> impl Strategy<Value = LexicalBackendConfig> {
     (
         arb_lifecycle_policy(),
         arb_schema_version(),
-        1..1000usize,     // flush_batch_size
-        1..3600u64,       // flush_interval_secs
-        0..365u32,        // ttl_days
-        0..1_000_000u64,  // max_index_size_bytes
+        1..1000usize,        // flush_batch_size
+        1..3600u64,          // flush_interval_secs
+        0..365u32,           // ttl_days
+        0..1_000_000u64,     // max_index_size_bytes
         1..100_000_000usize, // writer_heap_bytes
-        any::<bool>(),    // terminal_tokenizers
-        0..10000u32,      // max_docs_per_second
+        any::<bool>(),       // terminal_tokenizers
+        0..10000u32,         // max_docs_per_second
     )
         .prop_map(
             |(lp, sv, fbs, fis, ttl, mis, whb, tt, mdps)| LexicalBackendConfig {
@@ -69,15 +69,15 @@ fn arb_config() -> impl Strategy<Value = LexicalBackendConfig> {
 
 fn arb_metrics() -> impl Strategy<Value = LexicalBackendMetrics> {
     (
-        0..100_000u64, // docs_ingested
-        0..100_000u64, // docs_expired
-        0..100_000u64, // docs_active
-        0..10_000u64,  // flush_count
-        0..100_000u64, // docs_rejected
-        0..100_000u64, // queries_executed
-        0..100_000u64, // query_errors
+        0..100_000u64,   // docs_ingested
+        0..100_000u64,   // docs_expired
+        0..100_000u64,   // docs_active
+        0..10_000u64,    // flush_count
+        0..100_000u64,   // docs_rejected
+        0..100_000u64,   // queries_executed
+        0..100_000u64,   // query_errors
         0..1_000_000u64, // index_size_bytes
-        0..100u32,     // segment_count
+        0..100u32,       // segment_count
     )
         .prop_map(
             |(di, de, da, fc, dr, qe, qerr, isb, sc)| LexicalBackendMetrics {
@@ -98,11 +98,11 @@ fn arb_metrics() -> impl Strategy<Value = LexicalBackendMetrics> {
 
 fn arb_bridge_document() -> impl Strategy<Value = BridgeDocument> {
     (
-        "[a-z0-9]{1,20}",       // doc_id
-        "[a-zA-Z0-9 ]{0,100}",  // text
+        "[a-z0-9]{1,20}",      // doc_id
+        "[a-zA-Z0-9 ]{0,100}", // text
         arb_document_source(),
-        any::<u64>(),            // captured_at_ms
-        proptest::option::of(any::<u64>()), // pane_id
+        any::<u64>(),                                               // captured_at_ms
+        proptest::option::of(any::<u64>()),                         // pane_id
         proptest::option::of("[a-z]{1,10}".prop_map(String::from)), // session_id
         proptest::option::of("[a-f0-9]{8}".prop_map(String::from)), // content_hash
     )

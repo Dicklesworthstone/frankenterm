@@ -54,15 +54,13 @@ fn arb_pane_broadcast_outcome() -> impl Strategy<Value = PaneBroadcastOutcome> {
         prop::collection::vec("[a-z_]{3,12}".prop_map(String::from), 1..5)
             .prop_map(|failed| PaneBroadcastOutcome::PreconditionFailed { failed }),
         "[a-z ]{5,30}".prop_map(|reason| PaneBroadcastOutcome::Skipped { reason }),
-        "[a-z ]{5,30}"
-            .prop_map(|reason| PaneBroadcastOutcome::VerificationFailed { reason }),
+        "[a-z ]{5,30}".prop_map(|reason| PaneBroadcastOutcome::VerificationFailed { reason }),
     ]
 }
 
 fn arb_pane_broadcast_entry() -> impl Strategy<Value = PaneBroadcastEntry> {
-    (0u64..10_000, arb_pane_broadcast_outcome()).prop_map(|(pane_id, outcome)| {
-        PaneBroadcastEntry { pane_id, outcome }
-    })
+    (0u64..10_000, arb_pane_broadcast_outcome())
+        .prop_map(|(pane_id, outcome)| PaneBroadcastEntry { pane_id, outcome })
 }
 
 fn arb_broadcast_result() -> impl Strategy<Value = BroadcastResult> {
