@@ -1574,6 +1574,12 @@ pub struct SafetyConfig {
 
     /// Credential broker settings (JIT lease management and sensitivity ceilings)
     pub credential_broker: crate::connector_credential_broker::CredentialBrokerConfig,
+
+    /// Connector lifecycle manager settings (install/update/enable/disable/restart)
+    pub lifecycle_manager: crate::connector_lifecycle::LifecycleManagerConfig,
+
+    /// Connector data classification settings (sensitivity tagging, redaction, audit)
+    pub data_classifier: crate::connector_data_classification::ClassifierConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1595,8 +1601,9 @@ impl Default for SafetyConfig {
             quarantine: crate::policy_quarantine::QuarantineConfig::default(),
             audit_chain: crate::policy_audit_chain::AuditChainConfig::default(),
             compliance: crate::policy_compliance::ComplianceConfig::default(),
-            credential_broker: crate::connector_credential_broker::CredentialBrokerConfig::default(
-            ),
+            credential_broker: crate::connector_credential_broker::CredentialBrokerConfig::default(),
+            lifecycle_manager: crate::connector_lifecycle::LifecycleManagerConfig::default(),
+            data_classifier: crate::connector_data_classification::ClassifierConfig::default(),
         }
     }
 }

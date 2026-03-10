@@ -38,6 +38,9 @@ use crate::identity_graph::{AuthAction, PrincipalId, PrincipalKind, ResourceId, 
 use crate::policy_audit_chain::{AuditChain, AuditEntryKind};
 use crate::policy_compliance::ComplianceEngine;
 use crate::policy_decision_log::{DecisionLogConfig, DecisionOutcome, PolicyDecisionLog};
+use crate::policy_metrics::{
+    PolicyMetricsCollector, PolicyMetricsDashboard, PolicyMetricsThresholds, PolicySubsystemInput,
+};
 use crate::policy_quarantine::QuarantineRegistry;
 use crate::trauma_guard::TraumaDecision;
 // ============================================================================
@@ -2883,6 +2886,10 @@ pub struct PolicyEngine {
     credential_broker: ConnectorCredentialBroker,
     /// Credential broker configuration (sensitivity ceiling, etc.)
     credential_broker_config: CredentialBrokerConfig,
+    /// Connector lifecycle manager for install/update/enable/disable/restart
+    lifecycle_manager: crate::connector_lifecycle::ConnectorLifecycleManager,
+    /// Connector data classifier for sensitivity tagging and redaction
+    data_classifier: crate::connector_data_classification::ConnectorDataClassifier,
 }
 
 impl PolicyEngine {
@@ -2906,6 +2913,12 @@ impl PolicyEngine {
             compliance_engine: ComplianceEngine::new(500, 3_600_000),
             credential_broker: ConnectorCredentialBroker::new(),
             credential_broker_config: CredentialBrokerConfig::default(),
+            lifecycle_manager: crate::connector_lifecycle::ConnectorLifecycleManager::new(
+                crate::connector_lifecycle::LifecycleManagerConfig::default(),
+            ),
+            data_classifier: crate::connector_data_classification::ConnectorDataClassifier::new(
+                crate::connector_data_classification::ClassifierConfig::default(),
+            ),
         }
     }
 
@@ -2930,6 +2943,10 @@ impl PolicyEngine {
         engine.credential_broker =
             ConnectorCredentialBroker::from_config(&config.credential_broker);
         engine.credential_broker_config = config.credential_broker.clone();
+        engine.lifecycle_manager =
+            crate::connector_lifecycle::ConnectorLifecycleManager::new(config.lifecycle_manager.clone());
+        engine.data_classifier =
+            crate::connector_data_classification::ConnectorDataClassifier::new(config.data_classifier.clone());
         engine
     }
 
@@ -3024,6 +3041,28 @@ impl PolicyEngine {
         &mut self.credential_broker
     }
 
+    /// Access the connector lifecycle manager.
+    #[must_use]
+    pub fn lifecycle_manager(&self) -> &crate::connector_lifecycle::ConnectorLifecycleManager {
+        &self.lifecycle_manager
+    }
+
+    /// Access the connector lifecycle manager mutably.
+    pub fn lifecycle_manager_mut(&mut self) -> &mut crate::connector_lifecycle::ConnectorLifecycleManager {
+        &mut self.lifecycle_manager
+    }
+
+    /// Access the data classifier.
+    #[must_use]
+    pub fn data_classifier(&self) -> &crate::connector_data_classification::ConnectorDataClassifier {
+        &self.data_classifier
+    }
+
+    /// Access the data classifier mutably.
+    pub fn data_classifier_mut(&mut self) -> &mut crate::connector_data_classification::ConnectorDataClassifier {
+        &mut self.data_classifier
+    }
+
     /// Record a credential broker denial to the compliance engine and audit chain.
     fn credential_broker_record_denial(&mut self, connector_id: &str) {
         let ts = SystemTime::now()
@@ -3055,6 +3094,89 @@ impl PolicyEngine {
     /// Access the decision log mutably (for filtering, export, etc.).
     pub fn decision_log_mut(&mut self) -> &mut PolicyDecisionLog {
         &mut self.decision_log
+    }
+
+    /// Generate a unified metrics dashboard aggregating all policy subsystems.
+    ///
+    /// Collects metrics from the decision log, compliance engine, quarantine
+    /// registry, audit chain, and credential broker into a single
+    /// `PolicyMetricsDashboard` with health indicators and counters.
+    ///
+    /// Uses `&mut self` because audit chain verification updates internal
+    /// telemetry counters.
+    pub fn metrics_dashboard(&mut self, now_ms: u64) -> PolicyMetricsDashboard {
+        self.metrics_dashboard_with_thresholds(now_ms, PolicyMetricsThresholds::default())
+    }
+
+    /// Generate a metrics dashboard with custom thresholds.
+    pub fn metrics_dashboard_with_thresholds(
+        &mut self,
+        now_ms: u64,
+        thresholds: PolicyMetricsThresholds,
+    ) -> PolicyMetricsDashboard {
+        let mut collector = PolicyMetricsCollector::new(thresholds);
+
+        // Feed decision log counters
+        let log_snapshot = self.decision_log.snapshot();
+        collector.update_subsystem(
+            "decision_log",
+            PolicySubsystemInput {
+                evaluations: log_snapshot.total_recorded,
+                denials: log_snapshot.deny_count,
+                active_quarantines: 0,
+                active_violations: 0,
+            },
+        );
+
+        // Feed compliance engine counters
+        let compliance_snap = self.compliance_engine.snapshot(now_ms);
+        collector.update_subsystem(
+            "compliance",
+            PolicySubsystemInput {
+                evaluations: compliance_snap.counters.total_evaluations,
+                denials: compliance_snap.counters.total_denials,
+                active_quarantines: 0,
+                active_violations: compliance_snap.active_violations.len() as u32,
+            },
+        );
+
+        // Feed quarantine registry state
+        let quarantine_count = self.quarantine_registry.active_quarantines().len() as u32;
+        collector.update_subsystem(
+            "quarantine",
+            PolicySubsystemInput {
+                evaluations: 0,
+                denials: 0,
+                active_quarantines: quarantine_count,
+                active_violations: 0,
+            },
+        );
+
+        // Feed audit chain state
+        let chain_verification = self.audit_chain.verify();
+        collector.update_audit_chain(
+            self.audit_chain.len() as u64,
+            chain_verification.valid,
+        );
+
+        // Feed kill switch state
+        let ks = self.quarantine_registry.kill_switch();
+        let ks_active = !matches!(ks.level, crate::policy_quarantine::KillSwitchLevel::Disarmed);
+        collector.update_kill_switch(ks_active);
+
+        // Feed credential broker counters
+        let broker_snap = self.credential_broker.telemetry_snapshot(now_ms);
+        collector.update_subsystem(
+            "credential_broker",
+            PolicySubsystemInput {
+                evaluations: broker_snap.counters.leases_issued + broker_snap.counters.access_denied,
+                denials: broker_snap.counters.access_denied,
+                active_quarantines: 0,
+                active_violations: 0,
+            },
+        );
+
+        collector.dashboard(now_ms)
     }
 
     /// Quarantine a component and record the action in the audit chain.
@@ -10619,5 +10741,246 @@ mod tests {
         };
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
+    }
+
+    // ── Lifecycle Manager integration tests ──────────────────────────
+
+    #[test]
+    fn lifecycle_manager_default_in_policy_engine() {
+        let engine = PolicyEngine::new(30, 100, true);
+        assert_eq!(engine.lifecycle_manager().count(), 0);
+    }
+
+    #[test]
+    fn lifecycle_manager_from_safety_config() {
+        use crate::connector_lifecycle::LifecycleManagerConfig;
+        let config = crate::config::SafetyConfig {
+            lifecycle_manager: LifecycleManagerConfig {
+                max_managed_connectors: 128,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from_safety_config(&config);
+        assert_eq!(engine.lifecycle_manager().count(), 0);
+    }
+
+    #[test]
+    fn lifecycle_manager_mut_accessible() {
+        use crate::connector_host_runtime::ConnectorCapability;
+        use crate::connector_lifecycle::{AdminState, LifecycleIntent};
+        use crate::connector_registry::ConnectorManifest;
+        let mut engine = PolicyEngine::permissive();
+        let manifest = ConnectorManifest {
+            schema_version: 1,
+            package_id: "slack".to_string(),
+            version: "1.0.0".to_string(),
+            display_name: "Slack".to_string(),
+            description: "test".to_string(),
+            author: "test".to_string(),
+            min_ft_version: None,
+            sha256_digest: "a".repeat(64),
+            required_capabilities: vec![ConnectorCapability::Invoke],
+            publisher_signature: Some("sig".to_string()),
+            transparency_token: None,
+            created_at_ms: 1000,
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let result = engine.lifecycle_manager_mut().execute(
+            LifecycleIntent::Install { manifest },
+            1000,
+        );
+        assert!(result.is_ok());
+        assert_eq!(engine.lifecycle_manager().count(), 1);
+        let conn = engine.lifecycle_manager().get("slack").unwrap();
+        assert_eq!(conn.admin_state, AdminState::Enabled);
+    }
+
+    // ── Data Classifier integration tests ────────────────────────────
+
+    #[test]
+    fn data_classifier_default_in_policy_engine() {
+        let engine = PolicyEngine::new(30, 100, true);
+        assert_eq!(engine.data_classifier().telemetry().total_events(), 0);
+    }
+
+    #[test]
+    fn data_classifier_from_safety_config() {
+        use crate::connector_data_classification::ClassifierConfig;
+        let config = crate::config::SafetyConfig {
+            data_classifier: ClassifierConfig {
+                max_audit_entries: 500,
+                redaction_marker: "[REDACTED]".to_string(),
+                hash_salt: "custom-salt".to_string(),
+                detailed_audit: true,
+            },
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from_safety_config(&config);
+        assert_eq!(engine.data_classifier().telemetry().total_events(), 0);
+    }
+
+    #[test]
+    fn data_classifier_mut_accessible() {
+        use crate::connector_data_classification::ClassificationPolicy;
+        let mut engine = PolicyEngine::permissive();
+        let policy = ClassificationPolicy {
+            policy_id: "slack-policy".to_string(),
+            connector_pattern: "slack".to_string(),
+            ..Default::default()
+        };
+        engine.data_classifier_mut().register_policy(policy);
+        // Verify the policy was registered (telemetry still zero, but no panic)
+        assert_eq!(engine.data_classifier().telemetry().total_events(), 0);
+    }
+
+    // =========================================================================
+    // metrics_dashboard integration tests
+    // =========================================================================
+
+    #[test]
+    fn metrics_dashboard_empty_engine_is_healthy() {
+        let mut engine = PolicyEngine::permissive();
+        let dash = engine.metrics_dashboard(1000);
+        assert_eq!(dash.overall_health, crate::policy_metrics::HealthStatus::Healthy);
+        assert_eq!(dash.counters.total_evaluations, 0);
+        assert_eq!(dash.counters.total_denials, 0);
+        assert_eq!(dash.counters.kill_switch_active, false);
+        assert_eq!(dash.counters.audit_chain_valid, true);
+    }
+
+    #[test]
+    fn metrics_dashboard_reflects_decision_log() {
+        let mut engine = PolicyEngine::permissive();
+        // Record some allow/deny decisions through the decision log
+        engine.decision_log_mut().record(
+            1000,
+            ActionKind::SendText,
+            ActorKind::Human,
+            PolicySurface::Robot,
+            Some(0),
+            DecisionOutcome::Allow,
+            None,
+            Some("allowed action".to_string()),
+            1,
+        );
+        engine.decision_log_mut().record(
+            1001,
+            ActionKind::SendText,
+            ActorKind::Robot,
+            PolicySurface::Robot,
+            Some(0),
+            DecisionOutcome::Deny,
+            None,
+            Some("denied action".to_string()),
+            1,
+        );
+        let dash = engine.metrics_dashboard(2000);
+        // Decision log subsystem should reflect the records
+        let dl = &dash.subsystem_metrics["decision_log"];
+        assert_eq!(dl.evaluations, 2);
+        assert_eq!(dl.denials, 1);
+    }
+
+    #[test]
+    fn metrics_dashboard_reflects_quarantine() {
+        use crate::policy_quarantine::{ComponentKind, QuarantineReason, QuarantineSeverity};
+        let mut engine = PolicyEngine::permissive();
+        engine
+            .quarantine_component(
+                "bad-connector",
+                ComponentKind::Connector,
+                QuarantineSeverity::Isolated,
+                QuarantineReason::OperatorDirected {
+                    operator: "admin".to_string(),
+                    note: "test quarantine".to_string(),
+                },
+                "admin",
+                1000,
+                u64::MAX,
+            )
+            .unwrap();
+        let dash = engine.metrics_dashboard(2000);
+        let q = &dash.subsystem_metrics["quarantine"];
+        assert_eq!(q.active_quarantines, 1);
+    }
+
+    #[test]
+    fn metrics_dashboard_reflects_kill_switch() {
+        use crate::policy_quarantine::KillSwitchLevel;
+        let mut engine = PolicyEngine::permissive();
+        engine.quarantine_registry_mut().trip_kill_switch(
+            KillSwitchLevel::HardStop,
+            "admin",
+            "emergency",
+            1000,
+        );
+        let dash = engine.metrics_dashboard(2000);
+        assert!(dash.counters.kill_switch_active);
+        assert!(
+            dash.overall_health >= crate::policy_metrics::HealthStatus::Critical,
+            "expected Critical+ but got {:?}",
+            dash.overall_health,
+        );
+    }
+
+    #[test]
+    fn metrics_dashboard_reflects_audit_chain() {
+        let mut engine = PolicyEngine::permissive();
+        // Append some audit entries
+        engine.audit_chain_mut().append(
+            crate::policy_audit_chain::AuditEntryKind::PolicyDecision,
+            "test-component",
+            "test decision",
+            "test-actor",
+            1000,
+        );
+        engine.audit_chain_mut().append(
+            crate::policy_audit_chain::AuditEntryKind::PolicyDecision,
+            "test-component",
+            "test decision 2",
+            "test-actor",
+            2000,
+        );
+        let dash = engine.metrics_dashboard(3000);
+        assert_eq!(dash.counters.audit_chain_length, 2);
+        assert!(dash.counters.audit_chain_valid);
+    }
+
+    #[test]
+    fn metrics_dashboard_with_custom_thresholds() {
+        use crate::policy_metrics::PolicyMetricsThresholds;
+        let mut engine = PolicyEngine::permissive();
+        // Record 3 denials out of 10 = 30% denial rate
+        for _ in 0..7 {
+            engine.decision_log_mut().record(
+                1000, ActionKind::SendText, ActorKind::Human,
+                PolicySurface::Robot, Some(0), DecisionOutcome::Allow,
+                None, Some("allowed".to_string()), 1,
+            );
+        }
+        for _ in 0..3 {
+            engine.decision_log_mut().record(
+                1000, ActionKind::SendText, ActorKind::Human,
+                PolicySurface::Robot, Some(0), DecisionOutcome::Deny,
+                None, Some("denied".to_string()), 1,
+            );
+        }
+        // With default thresholds (warning=10, critical=25), 30% should be critical
+        let dash = engine.metrics_dashboard(2000);
+        let dl = &dash.subsystem_metrics["decision_log"];
+        assert_eq!(dl.denial_rate_pct, 30);
+
+        // With raised thresholds, 30% should be just warning
+        let custom = PolicyMetricsThresholds {
+            denial_rate_warning_pct: 20,
+            denial_rate_critical_pct: 50,
+            ..PolicyMetricsThresholds::default()
+        };
+        let dash2 = engine.metrics_dashboard_with_thresholds(3000, custom);
+        let denial_ind = dash2.indicators.iter()
+            .find(|i| i.name == "denial_rate")
+            .unwrap();
+        assert_eq!(denial_ind.status, crate::policy_metrics::HealthStatus::Warning);
     }
 }
