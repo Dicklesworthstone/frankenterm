@@ -3295,7 +3295,7 @@ impl PolicyEngine {
                     );
                     context.set_determining_rule("policy.quarantine");
                     return PolicyDecision::deny_with_rule(
-                        &format!("Pane {pane_id} is quarantined — writes blocked"),
+                        format!("Pane {pane_id} is quarantined — writes blocked"),
                         "policy.quarantine",
                     )
                     .with_context(context);
@@ -3310,7 +3310,7 @@ impl PolicyEngine {
                 );
                 context.set_determining_rule("policy.quarantine");
                 return PolicyDecision::deny_with_rule(
-                    &format!("Pane {pane_id} is quarantined — all actions blocked"),
+                    format!("Pane {pane_id} is quarantined — all actions blocked"),
                     "policy.quarantine",
                 )
                 .with_context(context);

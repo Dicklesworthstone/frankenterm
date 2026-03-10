@@ -549,7 +549,7 @@ impl QuarantineRegistry {
             let component =
                 self.components
                     .get_mut(component_id)
-                    .ok_or(QuarantineError::ComponentNotFound {
+                    .ok_or_else(|| QuarantineError::ComponentNotFound {
                         component_id: component_id.to_string(),
                     })?;
 
@@ -606,7 +606,7 @@ impl QuarantineRegistry {
             let component =
                 self.components
                     .get_mut(component_id)
-                    .ok_or(QuarantineError::ComponentNotFound {
+                    .ok_or_else(|| QuarantineError::ComponentNotFound {
                         component_id: component_id.to_string(),
                     })?;
 
@@ -645,7 +645,7 @@ impl QuarantineRegistry {
             let component =
                 self.components
                     .get_mut(component_id)
-                    .ok_or(QuarantineError::ComponentNotFound {
+                    .ok_or_else(|| QuarantineError::ComponentNotFound {
                         component_id: component_id.to_string(),
                     })?;
 
@@ -687,7 +687,7 @@ impl QuarantineRegistry {
             let component =
                 self.components
                     .get_mut(component_id)
-                    .ok_or(QuarantineError::ComponentNotFound {
+                    .ok_or_else(|| QuarantineError::ComponentNotFound {
                         component_id: component_id.to_string(),
                     })?;
 
@@ -727,7 +727,7 @@ impl QuarantineRegistry {
             let component =
                 self.components
                     .get_mut(component_id)
-                    .ok_or(QuarantineError::ComponentNotFound {
+                    .ok_or_else(|| QuarantineError::ComponentNotFound {
                         component_id: component_id.to_string(),
                     })?;
 
