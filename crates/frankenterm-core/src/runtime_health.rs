@@ -907,6 +907,98 @@ pub fn check_failure_patterns(log: &RuntimeTelemetryLog) -> RuntimeHealthCheck {
     )
 }
 
+/// Generate health checks from a policy metrics dashboard.
+///
+/// Produces one [`RuntimeHealthCheck`] per policy health indicator
+/// (denial rate, quarantine density, compliance violations, audit chain
+/// integrity, and kill switch), mapping each to the appropriate tier and
+/// remediation hints.
+pub fn checks_from_policy_dashboard(
+    dashboard: &crate::policy_metrics::PolicyMetricsDashboard,
+) -> Vec<RuntimeHealthCheck> {
+    use crate::policy_metrics::HealthStatus;
+
+    let mut checks = Vec::new();
+
+    for indicator in &dashboard.indicators {
+        let (status, tier, failure_class) = match indicator.status {
+            HealthStatus::Healthy => (CheckStatus::Pass, HealthTier::Green, None),
+            HealthStatus::Warning => (CheckStatus::Warn, HealthTier::Yellow, None),
+            HealthStatus::Critical => {
+                (CheckStatus::Fail, HealthTier::Red, Some(FailureClass::Safety))
+            }
+            HealthStatus::Unknown => (CheckStatus::Skip, HealthTier::Black, None),
+        };
+
+        let check_id = format!("policy.{}", indicator.name);
+        let mut check = RuntimeHealthCheck {
+            check_id,
+            display_name: format!("Policy: {}", indicator.description),
+            status,
+            tier,
+            summary: format!(
+                "{}: {} (warn={}, crit={})",
+                indicator.name,
+                indicator.value,
+                indicator.threshold_warning,
+                indicator.threshold_critical,
+            ),
+            evidence: Vec::new(),
+            remediation: Vec::new(),
+            failure_class,
+            duration_us: 0,
+        };
+
+        // Add remediation hints for non-healthy indicators
+        if indicator.status == HealthStatus::Warning || indicator.status == HealthStatus::Critical {
+            match indicator.name.as_str() {
+                "denial_rate" => {
+                    check.remediation.push(
+                        RemediationHint::text("Review policy rules for over-restrictive patterns")
+                            .effort(RemediationEffort::Medium),
+                    );
+                }
+                "quarantine_density" => {
+                    check.remediation.push(
+                        RemediationHint::with_command(
+                            "Review quarantined components",
+                            "ft robot policy quarantine-list",
+                        )
+                        .effort(RemediationEffort::Medium),
+                    );
+                }
+                "compliance_violations" => {
+                    check.remediation.push(
+                        RemediationHint::text("Investigate and remediate active compliance violations")
+                            .effort(RemediationEffort::High),
+                    );
+                }
+                "audit_chain_integrity" => {
+                    check = check.with_failure_class(FailureClass::Corruption);
+                    check.remediation.push(
+                        RemediationHint::text("Audit chain tampered — investigate chain integrity and rebuild if necessary")
+                            .effort(RemediationEffort::High),
+                    );
+                }
+                "kill_switch" => {
+                    check.remediation.push(
+                        RemediationHint::with_command(
+                            "Review and reset kill switch when safe",
+                            "ft robot policy kill-switch reset",
+                        )
+                        .effort(RemediationEffort::Low),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        checks.push(check);
+    }
+
+    checks
+}
+
 // =============================================================================
 // Robot types for health/doctor surfaces
 // =============================================================================
@@ -1586,5 +1678,87 @@ mod tests {
             skip: 1,
         };
         assert_eq!(counts.total(), 7);
+    }
+
+    // ── Policy dashboard health checks ──
+
+    #[test]
+    fn policy_checks_healthy_dashboard_all_pass() {
+        use crate::policy_metrics::*;
+        let mut collector = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
+        collector.update_subsystem(
+            "test",
+            PolicySubsystemInput {
+                evaluations: 100,
+                denials: 2,
+                ..Default::default()
+            },
+        );
+        let dash = collector.dashboard(1000);
+        let checks = checks_from_policy_dashboard(&dash);
+        assert_eq!(checks.len(), 5);
+        for check in &checks {
+            assert_eq!(check.status, CheckStatus::Pass, "check {} should pass", check.check_id);
+        }
+    }
+
+    #[test]
+    fn policy_checks_kill_switch_critical() {
+        use crate::policy_metrics::*;
+        let mut collector = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
+        collector.update_kill_switch(true);
+        let dash = collector.dashboard(1000);
+        let checks = checks_from_policy_dashboard(&dash);
+        let ks = checks.iter().find(|c| c.check_id == "policy.kill_switch").unwrap();
+        assert_eq!(ks.status, CheckStatus::Fail);
+        assert_eq!(ks.tier, HealthTier::Red);
+        assert!(!ks.remediation.is_empty());
+    }
+
+    #[test]
+    fn policy_checks_high_denial_warning() {
+        use crate::policy_metrics::*;
+        let mut collector = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
+        collector.update_subsystem(
+            "test",
+            PolicySubsystemInput {
+                evaluations: 100,
+                denials: 15, // 15% > default warning threshold of 10%
+                ..Default::default()
+            },
+        );
+        let dash = collector.dashboard(1000);
+        let checks = checks_from_policy_dashboard(&dash);
+        let dr = checks.iter().find(|c| c.check_id == "policy.denial_rate").unwrap();
+        assert_eq!(dr.status, CheckStatus::Warn);
+        assert_eq!(dr.tier, HealthTier::Yellow);
+    }
+
+    #[test]
+    fn policy_checks_invalid_chain_critical() {
+        use crate::policy_metrics::*;
+        let mut collector = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
+        collector.update_audit_chain(50, false);
+        let dash = collector.dashboard(1000);
+        let checks = checks_from_policy_dashboard(&dash);
+        let chain = checks.iter().find(|c| c.check_id == "policy.audit_chain_integrity").unwrap();
+        assert_eq!(chain.status, CheckStatus::Fail);
+        assert_eq!(chain.failure_class, Some(FailureClass::Corruption));
+    }
+
+    #[test]
+    fn policy_checks_can_register_in_health_registry() {
+        use crate::policy_metrics::*;
+        let mut collector = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
+        let dash = collector.dashboard(1000);
+        let checks = checks_from_policy_dashboard(&dash);
+
+        let mut registry = HealthCheckRegistry::new();
+        for check in checks {
+            registry.register(check);
+        }
+        let report = registry.build_report();
+        assert!(report.overall_healthy());
+        assert_eq!(report.checks.len(), 5);
     }
 }
