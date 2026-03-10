@@ -949,6 +949,174 @@ impl UnifiedTelemetryRecord {
             attributes,
         }
     }
+
+    /// Normalize a policy metrics dashboard into the shared record shape.
+    #[must_use]
+    pub fn from_policy_metrics_dashboard(
+        dashboard: &crate::policy_metrics::PolicyMetricsDashboard,
+    ) -> Self {
+        let mut attributes = BTreeMap::new();
+
+        attributes.insert(
+            "total_evaluations".to_string(),
+            serde_json::json!(dashboard.counters.total_evaluations),
+        );
+        attributes.insert(
+            "total_denials".to_string(),
+            serde_json::json!(dashboard.counters.total_denials),
+        );
+        attributes.insert(
+            "total_quarantines_active".to_string(),
+            serde_json::json!(dashboard.counters.total_quarantines_active),
+        );
+        attributes.insert(
+            "total_violations_active".to_string(),
+            serde_json::json!(dashboard.counters.total_violations_active),
+        );
+        attributes.insert(
+            "audit_chain_length".to_string(),
+            serde_json::json!(dashboard.counters.audit_chain_length),
+        );
+        attributes.insert(
+            "audit_chain_valid".to_string(),
+            serde_json::json!(dashboard.counters.audit_chain_valid),
+        );
+        attributes.insert(
+            "kill_switch_active".to_string(),
+            serde_json::json!(dashboard.counters.kill_switch_active),
+        );
+        attributes.insert(
+            "forensic_records_count".to_string(),
+            serde_json::json!(dashboard.counters.forensic_records_count),
+        );
+        attributes.insert(
+            "snapshots_generated".to_string(),
+            serde_json::json!(dashboard.counters.snapshots_generated),
+        );
+        attributes.insert(
+            "overall_health".to_string(),
+            serde_json::json!(dashboard.overall_health.to_string()),
+        );
+        attributes.insert(
+            "indicator_count".to_string(),
+            serde_json::json!(dashboard.indicators.len()),
+        );
+        attributes.insert(
+            "subsystem_count".to_string(),
+            serde_json::json!(dashboard.subsystem_metrics.len()),
+        );
+
+        let health_tier = match dashboard.overall_health {
+            crate::policy_metrics::HealthStatus::Healthy => HealthTier::Green,
+            crate::policy_metrics::HealthStatus::Warning => HealthTier::Yellow,
+            crate::policy_metrics::HealthStatus::Critical => HealthTier::Red,
+            crate::policy_metrics::HealthStatus::Unknown => HealthTier::Black,
+        };
+
+        let failure_class = if dashboard.counters.kill_switch_active {
+            Some(FailureClass::Safety)
+        } else if !dashboard.counters.audit_chain_valid {
+            Some(FailureClass::Corruption)
+        } else if dashboard.overall_health >= crate::policy_metrics::HealthStatus::Critical {
+            Some(FailureClass::Overload)
+        } else {
+            None
+        };
+
+        Self {
+            schema_version: UNIFIED_TELEMETRY_SCHEMA_VERSION.to_string(),
+            source: UnifiedTelemetrySource::Policy,
+            record_id: format!("policy-dashboard:{}", dashboard.captured_at_ms),
+            source_schema_version: None,
+            timestamp_ms: dashboard.captured_at_ms,
+            component: "policy.metrics_dashboard".to_string(),
+            reason_code: "policy.metrics.dashboard_snapshot".to_string(),
+            correlation_id: None,
+            scope_id: Some("policy:all_subsystems".to_string()),
+            health_tier,
+            failure_class,
+            sensitivity: DataSensitivity::Internal,
+            redaction_strategy: RedactionStrategy::Passthrough,
+            attributes,
+        }
+    }
+
+    /// Normalize a compliance snapshot into the shared record shape.
+    #[must_use]
+    pub fn from_compliance_snapshot(
+        snapshot: &crate::policy_compliance::ComplianceSnapshot,
+    ) -> Self {
+        let mut attributes = BTreeMap::new();
+
+        attributes.insert(
+            "overall_status".to_string(),
+            serde_json::json!(format!("{:?}", snapshot.overall_status)),
+        );
+        attributes.insert(
+            "total_evaluations".to_string(),
+            serde_json::json!(snapshot.counters.total_evaluations),
+        );
+        attributes.insert(
+            "total_denials".to_string(),
+            serde_json::json!(snapshot.counters.total_denials),
+        );
+        attributes.insert(
+            "total_violations_detected".to_string(),
+            serde_json::json!(snapshot.counters.total_violations_detected),
+        );
+        attributes.insert(
+            "total_violations_remediated".to_string(),
+            serde_json::json!(snapshot.counters.total_violations_remediated),
+        );
+        attributes.insert(
+            "active_violations".to_string(),
+            serde_json::json!(snapshot.active_violations.len()),
+        );
+        attributes.insert(
+            "total_quarantines".to_string(),
+            serde_json::json!(snapshot.counters.total_quarantines),
+        );
+        attributes.insert(
+            "total_kill_switch_trips".to_string(),
+            serde_json::json!(snapshot.counters.total_kill_switch_trips),
+        );
+        attributes.insert(
+            "subsystem_count".to_string(),
+            serde_json::json!(snapshot.subsystem_status.len()),
+        );
+
+        let health_tier = match snapshot.overall_status {
+            crate::policy_compliance::ComplianceStatus::Compliant => HealthTier::Green,
+            crate::policy_compliance::ComplianceStatus::Advisory => HealthTier::Yellow,
+            crate::policy_compliance::ComplianceStatus::NonCompliant => HealthTier::Red,
+            crate::policy_compliance::ComplianceStatus::Critical => HealthTier::Black,
+        };
+
+        let failure_class = if snapshot.counters.total_kill_switch_trips > 0 {
+            Some(FailureClass::Safety)
+        } else if !snapshot.active_violations.is_empty() {
+            Some(FailureClass::Safety)
+        } else {
+            None
+        };
+
+        Self {
+            schema_version: UNIFIED_TELEMETRY_SCHEMA_VERSION.to_string(),
+            source: UnifiedTelemetrySource::Policy,
+            record_id: format!("compliance-snapshot:{}", snapshot.captured_at_ms),
+            source_schema_version: None,
+            timestamp_ms: snapshot.captured_at_ms,
+            component: "policy.compliance_engine".to_string(),
+            reason_code: "policy.compliance.snapshot".to_string(),
+            correlation_id: None,
+            scope_id: Some("policy:compliance".to_string()),
+            health_tier,
+            failure_class,
+            sensitivity: DataSensitivity::Confidential,
+            redaction_strategy: RedactionStrategy::Passthrough,
+            attributes,
+        }
+    }
 }
 
 impl From<&RuntimeTelemetryEvent> for UnifiedTelemetryRecord {
@@ -978,6 +1146,18 @@ impl From<&CredentialBrokerTelemetrySnapshot> for UnifiedTelemetryRecord {
 impl From<&RecorderAuditEntry> for UnifiedTelemetryRecord {
     fn from(entry: &RecorderAuditEntry) -> Self {
         Self::from_recorder_audit(entry)
+    }
+}
+
+impl From<&crate::policy_metrics::PolicyMetricsDashboard> for UnifiedTelemetryRecord {
+    fn from(dashboard: &crate::policy_metrics::PolicyMetricsDashboard) -> Self {
+        Self::from_policy_metrics_dashboard(dashboard)
+    }
+}
+
+impl From<&crate::policy_compliance::ComplianceSnapshot> for UnifiedTelemetryRecord {
+    fn from(snapshot: &crate::policy_compliance::ComplianceSnapshot) -> Self {
+        Self::from_compliance_snapshot(snapshot)
     }
 }
 
@@ -3689,5 +3869,92 @@ mod tests {
             assert!(seq > prev, "Sequence must be monotonically increasing");
             prev = seq;
         }
+    }
+
+    // ── Policy metrics dashboard adapter ──
+
+    #[test]
+    fn policy_dashboard_adapter_healthy() {
+        use crate::policy_metrics::*;
+        let mut collector = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
+        collector.update_subsystem(
+            "test",
+            PolicySubsystemInput {
+                evaluations: 100,
+                denials: 2,
+                ..Default::default()
+            },
+        );
+        let dash = collector.dashboard(5000);
+        let record = UnifiedTelemetryRecord::from_policy_metrics_dashboard(&dash);
+        assert_eq!(record.component, "policy.metrics_dashboard");
+        assert_eq!(record.health_tier, HealthTier::Green);
+        assert!(record.failure_class.is_none());
+        assert_eq!(record.timestamp_ms, 5000);
+        assert_eq!(
+            record.attributes["total_evaluations"],
+            serde_json::json!(100)
+        );
+    }
+
+    #[test]
+    fn policy_dashboard_adapter_kill_switch() {
+        use crate::policy_metrics::*;
+        let mut collector = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
+        collector.update_kill_switch(true);
+        let dash = collector.dashboard(6000);
+        let record = UnifiedTelemetryRecord::from_policy_metrics_dashboard(&dash);
+        assert_eq!(record.health_tier, HealthTier::Red);
+        assert_eq!(record.failure_class, Some(FailureClass::Safety));
+        assert_eq!(
+            record.attributes["kill_switch_active"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn policy_dashboard_adapter_invalid_chain() {
+        use crate::policy_metrics::*;
+        let mut collector = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
+        collector.update_audit_chain(50, false);
+        let dash = collector.dashboard(7000);
+        let record = UnifiedTelemetryRecord::from_policy_metrics_dashboard(&dash);
+        assert_eq!(record.failure_class, Some(FailureClass::Corruption));
+    }
+
+    #[test]
+    fn policy_dashboard_from_trait() {
+        use crate::policy_metrics::*;
+        let mut collector = PolicyMetricsCollector::new(PolicyMetricsThresholds::default());
+        let dash = collector.dashboard(8000);
+        let record = UnifiedTelemetryRecord::from(&dash);
+        assert_eq!(record.component, "policy.metrics_dashboard");
+    }
+
+    // ── Compliance snapshot adapter ──
+
+    #[test]
+    fn compliance_snapshot_adapter_compliant() {
+        use crate::policy_compliance::*;
+        let mut engine = ComplianceEngine::new(100, 3600_000);
+        engine.record_evaluation(false); // not denied
+        let snap = engine.snapshot(5000);
+        let record = UnifiedTelemetryRecord::from_compliance_snapshot(&snap);
+        assert_eq!(record.component, "policy.compliance_engine");
+        assert_eq!(record.health_tier, HealthTier::Green);
+        assert!(record.failure_class.is_none());
+        assert_eq!(
+            record.attributes["total_evaluations"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[test]
+    fn compliance_snapshot_from_trait() {
+        use crate::policy_compliance::*;
+        let mut engine = ComplianceEngine::new(100, 3600_000);
+        let snap = engine.snapshot(5000);
+        let record = UnifiedTelemetryRecord::from(&snap);
+        assert_eq!(record.component, "policy.compliance_engine");
     }
 }
