@@ -1568,6 +1568,9 @@ pub struct SafetyConfig {
 
     /// Tamper-evident audit chain settings
     pub audit_chain: crate::policy_audit_chain::AuditChainConfig,
+
+    /// Compliance engine settings (violation tracking and SLA)
+    pub compliance: crate::policy_compliance::ComplianceConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1588,6 +1591,7 @@ impl Default for SafetyConfig {
             decision_log: crate::policy_decision_log::DecisionLogConfig::default(),
             quarantine: crate::policy_quarantine::QuarantineConfig::default(),
             audit_chain: crate::policy_audit_chain::AuditChainConfig::default(),
+            compliance: crate::policy_compliance::ComplianceConfig::default(),
         }
     }
 }
@@ -6845,5 +6849,37 @@ block_alt_screen = true
         let safety: SafetyConfig = toml::from_str(toml_str).expect("deserialize");
         assert_eq!(safety.audit_chain.max_entries, 1024);
         assert!(!safety.audit_chain.record_allows);
+    }
+
+    #[test]
+    fn safety_config_compliance_defaults() {
+        let safety = SafetyConfig::default();
+        assert_eq!(safety.compliance.max_violations, 500);
+        assert_eq!(safety.compliance.sla_threshold_ms, 3_600_000);
+    }
+
+    #[test]
+    fn safety_config_compliance_toml_roundtrip() {
+        let mut safety = SafetyConfig::default();
+        safety.compliance.max_violations = 100;
+        safety.compliance.sla_threshold_ms = 60_000;
+
+        let toml_str = toml::to_string(&safety).expect("serialize");
+        let back: SafetyConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(back.compliance.max_violations, 100);
+        assert_eq!(back.compliance.sla_threshold_ms, 60_000);
+    }
+
+    #[test]
+    fn safety_config_missing_compliance_uses_defaults() {
+        let toml_str = r#"
+rate_limit_per_pane = 30
+rate_limit_global = 100
+require_prompt_active = true
+block_alt_screen = true
+"#;
+        let safety: SafetyConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(safety.compliance.max_violations, 500);
+        assert_eq!(safety.compliance.sla_threshold_ms, 3_600_000);
     }
 }

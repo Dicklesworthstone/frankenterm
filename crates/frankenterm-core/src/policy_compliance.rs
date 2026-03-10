@@ -236,6 +236,29 @@ pub struct PolicyCoverage {
 }
 
 // =============================================================================
+// Configuration
+// =============================================================================
+
+/// TOML-serializable configuration for the compliance engine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ComplianceConfig {
+    /// Maximum number of violations retained.
+    pub max_violations: usize,
+    /// SLA threshold in milliseconds — violations older than this are "past SLA".
+    pub sla_threshold_ms: u64,
+}
+
+impl Default for ComplianceConfig {
+    fn default() -> Self {
+        Self {
+            max_violations: 500,
+            sla_threshold_ms: 3_600_000, // 1 hour
+        }
+    }
+}
+
+// =============================================================================
 // Compliance engine — aggregation and reporting
 // =============================================================================
 
@@ -258,6 +281,11 @@ impl ComplianceEngine {
             counters: ComplianceCounters::default(),
             sla_threshold_ms,
         }
+    }
+
+    /// Create a compliance engine from configuration.
+    pub fn from_config(config: &ComplianceConfig) -> Self {
+        Self::new(config.max_violations, config.sla_threshold_ms)
     }
 
     /// Record a policy evaluation (allow or deny).

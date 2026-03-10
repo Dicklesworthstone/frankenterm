@@ -33,6 +33,7 @@ use crate::config::{
 };
 use crate::identity_graph::{AuthAction, PrincipalId, PrincipalKind, ResourceId, ResourceKind};
 use crate::policy_audit_chain::{AuditChain, AuditEntryKind};
+use crate::policy_compliance::ComplianceEngine;
 use crate::policy_decision_log::{DecisionLogConfig, DecisionOutcome, PolicyDecisionLog};
 use crate::policy_quarantine::QuarantineRegistry;
 use crate::trauma_guard::TraumaDecision;
@@ -2866,6 +2867,8 @@ pub struct PolicyEngine {
     quarantine_registry: QuarantineRegistry,
     /// Tamper-evident hash-linked audit chain
     audit_chain: AuditChain,
+    /// Compliance engine for violation tracking and reporting
+    compliance_engine: ComplianceEngine,
 }
 
 impl PolicyEngine {
@@ -2886,6 +2889,7 @@ impl PolicyEngine {
             decision_log: PolicyDecisionLog::with_defaults(),
             quarantine_registry: QuarantineRegistry::new(),
             audit_chain: AuditChain::new(1024),
+            compliance_engine: ComplianceEngine::new(500, 3_600_000),
         }
     }
 
@@ -2908,6 +2912,8 @@ impl PolicyEngine {
             QuarantineRegistry::from_config(&config.quarantine);
         engine.audit_chain =
             AuditChain::from_config(&config.audit_chain);
+        engine.compliance_engine =
+            ComplianceEngine::from_config(&config.compliance);
         engine
     }
 
@@ -2980,6 +2986,17 @@ impl PolicyEngine {
         &mut self.audit_chain
     }
 
+    /// Access the compliance engine for violation queries and snapshots.
+    #[must_use]
+    pub fn compliance_engine(&self) -> &ComplianceEngine {
+        &self.compliance_engine
+    }
+
+    /// Access the compliance engine mutably (for recording violations, remediations).
+    pub fn compliance_engine_mut(&mut self) -> &mut ComplianceEngine {
+        &mut self.compliance_engine
+    }
+
     /// Get the current risk configuration
     #[must_use]
     pub fn risk_config(&self) -> &RiskConfig {
@@ -3024,6 +3041,7 @@ impl PolicyEngine {
             component_id,
             now_ms,
         );
+        self.compliance_engine.record_quarantine();
         Ok(())
     }
 
@@ -3069,6 +3087,7 @@ impl PolicyEngine {
             "kill_switch",
             now_ms,
         );
+        self.compliance_engine.record_kill_switch_trip();
     }
 
     /// Calculate risk score for the given input
@@ -3868,6 +3887,12 @@ impl PolicyEngine {
                 ts,
             );
         }
+
+        // Feed compliance engine with evaluation counts
+        self.compliance_engine
+            .record_evaluation(decision.is_denied());
+        self.compliance_engine
+            .update_subsystem_eval(&format!("{:?}", input.surface), ts);
     }
 
     /// Legacy: Check if send operation is allowed
@@ -10099,5 +10124,101 @@ mod tests {
         let result = engine.audit_chain_mut().verify();
         assert!(result.valid, "full lifecycle chain should verify: {result}");
         assert_eq!(result.entries_checked, 3);
+    }
+
+    // ================================================================
+    // Compliance engine integration tests
+    // ================================================================
+
+    #[test]
+    fn compliance_engine_initially_empty() {
+        let engine = PolicyEngine::permissive();
+        assert_eq!(
+            engine.compliance_engine().compute_status(),
+            crate::policy_compliance::ComplianceStatus::Compliant
+        );
+        assert_eq!(engine.compliance_engine().active_violation_count(), 0);
+    }
+
+    #[test]
+    fn compliance_tracks_evaluations_from_authorize() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt());
+
+        engine.authorize(&input);
+        engine.authorize(&input);
+        engine.authorize(&input);
+
+        let counters = engine.compliance_engine().counters();
+        assert_eq!(counters.total_evaluations, 3);
+        assert_eq!(counters.total_denials, 0);
+    }
+
+    #[test]
+    fn compliance_tracks_denials_from_authorize() {
+        let mut engine = PolicyEngine::strict();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::running());
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+
+        let counters = engine.compliance_engine().counters();
+        assert_eq!(counters.total_evaluations, 1);
+        assert_eq!(counters.total_denials, 1);
+    }
+
+    #[test]
+    fn compliance_tracks_quarantine_from_audited_ops() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        engine
+            .quarantine_component(
+                "pane-30",
+                ComponentKind::Pane,
+                QuarantineSeverity::Restricted,
+                QuarantineReason::OperatorDirected {
+                    operator: "admin".into(),
+                    note: "test".into(),
+                },
+                "admin",
+                1000,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(engine.compliance_engine().counters().total_quarantines, 1);
+    }
+
+    #[test]
+    fn compliance_tracks_kill_switch_trips() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        engine.trip_kill_switch(KillSwitchLevel::SoftStop, "admin", "drill", 1000);
+
+        assert_eq!(
+            engine.compliance_engine().counters().total_kill_switch_trips,
+            1
+        );
+    }
+
+    #[test]
+    fn compliance_from_safety_config() {
+        let config = crate::config::SafetyConfig {
+            compliance: crate::policy_compliance::ComplianceConfig {
+                max_violations: 10,
+                sla_threshold_ms: 1000,
+            },
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from_safety_config(&config);
+        assert_eq!(
+            engine.compliance_engine().compute_status(),
+            crate::policy_compliance::ComplianceStatus::Compliant,
+        );
     }
 }
