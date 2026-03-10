@@ -2434,50 +2434,44 @@ pub fn evaluate_policy_rules(
         };
     }
 
-    let mut rules_checked = Vec::new();
-    let mut matched_rule_ids = Vec::new();
-    let mut candidates: Vec<&PolicyRule> = Vec::new();
+    let rules_checked = rules_config
+        .rules
+        .iter()
+        .map(|rule| rule.id.clone())
+        .collect::<Vec<_>>();
+    let dsl_rules = rules_config
+        .rules
+        .iter()
+        .map(crate::policy_dsl::compile_policy_rule)
+        .collect::<Vec<_>>();
+    let dsl_result = crate::policy_dsl::evaluate_dsl_rules(&dsl_rules, input);
 
-    for rule in &rules_config.rules {
-        rules_checked.push(rule.id.clone());
-
-        if matches_rule(&rule.match_on, input) {
-            matched_rule_ids.push(rule.id.clone());
-            candidates.push(rule);
-        }
+    for (rule, dsl_rule) in rules_config.rules.iter().zip(dsl_rules.iter()) {
+        debug_assert_eq!(
+            matches_rule(&rule.match_on, input),
+            crate::policy_dsl::evaluate_predicate(&dsl_rule.predicate, input),
+            "policy_dsl bridge diverged for rule {}",
+            rule.id
+        );
     }
 
-    if candidates.is_empty() {
-        return RuleEvaluationResult {
-            matching_rule: None,
-            decision: None,
-            rules_checked,
-            matched_rule_ids,
-        };
-    }
-
-    // Sort candidates by: priority (asc), decision severity (deny > require > allow), specificity (desc)
-    candidates.sort_by(|a, b| {
-        // First: priority (lower is better)
-        let priority_cmp = a.priority.cmp(&b.priority);
-        if priority_cmp != std::cmp::Ordering::Equal {
-            return priority_cmp;
-        }
-
-        // Second: decision severity (deny=0, require_approval=1, allow=2)
-        let decision_cmp = a.decision.priority().cmp(&b.decision.priority());
-        if decision_cmp != std::cmp::Ordering::Equal {
-            return decision_cmp;
-        }
-
-        // Third: specificity (higher is better, so reverse)
-        b.match_on.specificity().cmp(&a.match_on.specificity())
+    let matched_rule_ids = dsl_result
+        .evaluations
+        .iter()
+        .filter(|evaluation| evaluation.matched)
+        .map(|evaluation| evaluation.rule_id.clone())
+        .collect::<Vec<_>>();
+    let matching_rule = dsl_result.matched_rule.as_ref().and_then(|matched| {
+        rules_config
+            .rules
+            .iter()
+            .find(|rule| rule.id == matched.rule_id)
+            .cloned()
     });
 
-    let best = candidates.into_iter().next().unwrap();
     RuleEvaluationResult {
-        matching_rule: Some(best.clone()),
-        decision: Some(best.decision),
+        decision: matching_rule.as_ref().map(|rule| rule.decision),
+        matching_rule,
         rules_checked,
         matched_rule_ids,
     }
@@ -6695,6 +6689,76 @@ mod tests {
         assert!(!require_rule.matched);
         assert_eq!(require_rule.decision, None);
         assert_eq!(require_rule.reason.as_deref(), Some("rule checked"));
+    }
+
+    #[test]
+    fn policy_rules_dsl_bridge_preserves_selected_rule_and_matches() {
+        let config = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![
+                PolicyRule {
+                    id: "allow-robot".to_string(),
+                    description: None,
+                    priority: 100,
+                    match_on: PolicyRuleMatch {
+                        actors: vec!["robot".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Allow,
+                    message: None,
+                },
+                PolicyRule {
+                    id: "deny-critical-delete".to_string(),
+                    description: None,
+                    priority: 50,
+                    match_on: PolicyRuleMatch {
+                        actions: vec!["delete_file".to_string()],
+                        pane_titles: vec!["*critical*".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Deny,
+                    message: Some("critical deletes denied".to_string()),
+                },
+                PolicyRule {
+                    id: "require-mcp".to_string(),
+                    description: None,
+                    priority: 75,
+                    match_on: PolicyRuleMatch {
+                        actors: vec!["mcp".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::RequireApproval,
+                    message: None,
+                },
+            ],
+        };
+        let input = PolicyInput::new(ActionKind::DeleteFile, ActorKind::Robot)
+            .with_pane_title("critical maintenance")
+            .with_surface(PolicySurface::Mux);
+
+        let result = evaluate_policy_rules(&config, &input);
+        let dsl_rules = config
+            .rules
+            .iter()
+            .map(crate::policy_dsl::compile_policy_rule)
+            .collect::<Vec<_>>();
+        let dsl_result = crate::policy_dsl::evaluate_dsl_rules(&dsl_rules, &input);
+        let dsl_matched_ids = dsl_result
+            .evaluations
+            .iter()
+            .filter(|evaluation| evaluation.matched)
+            .map(|evaluation| evaluation.rule_id.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(result.matched_rule_ids, dsl_matched_ids);
+        assert_eq!(
+            result.matching_rule.as_ref().map(|rule| rule.id.as_str()),
+            dsl_result
+                .matched_rule
+                .as_ref()
+                .map(|matched| matched.rule_id.as_str())
+        );
+        assert_eq!(result.decision, Some(PolicyRuleDecision::Deny));
     }
 
     #[test]
