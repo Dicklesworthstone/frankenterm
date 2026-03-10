@@ -569,7 +569,7 @@ impl ConnectorTestbed {
             signal_kind: None,
             signal_sub_type: None,
             event_source: None,
-            action_kind: Some(action.action_kind.clone()),
+            action_kind: Some(action.action_kind),
             lifecycle_phase: None,
             failure_class: None,
             pane_id: None,
