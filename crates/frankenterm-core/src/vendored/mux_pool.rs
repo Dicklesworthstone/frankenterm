@@ -941,6 +941,102 @@ mod tests {
         socket_path
     }
 
+    /// Spawn a mock mux server that returns an unexpected response for the first
+    /// `GetPaneRenderChanges` request across all connections.
+    async fn spawn_mock_server_unexpected_batch_render_once(
+        temp_dir: &tempfile::TempDir,
+    ) -> PathBuf {
+        let socket_path = temp_dir.path().join("mux-pool-test-batch-unexpected.sock");
+        let listener = compat_unix::bind(&socket_path)
+            .await
+            .expect("bind mock mux listener");
+
+        let first_bad = Arc::new(AtomicBool::new(true));
+
+        task::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+
+                let first_bad = Arc::clone(&first_bad);
+                task::spawn(async move {
+                    let mut read_buf = Vec::new();
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = match unix_stream_read(&mut stream, &mut temp).await {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        read_buf.extend_from_slice(&temp[..read]);
+
+                        let mut responses: Vec<(u64, Pdu)> = Vec::new();
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            let response = match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "mock-mux-pool-batch-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    })
+                                }
+                                Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                                Pdu::GetPaneRenderChanges(req) => {
+                                    if first_bad.swap(false, AtomicOrdering::SeqCst) {
+                                        // Wrong response type: forces the mux pool batch path
+                                        // into its sequential fallback branch.
+                                        Pdu::UnitResponse(UnitResponse {})
+                                    } else {
+                                        Pdu::GetPaneRenderChangesResponse(
+                                            GetPaneRenderChangesResponse {
+                                                pane_id: req.pane_id,
+                                                mouse_grabbed: false,
+                                                cursor_position:
+                                                    mux::renderable::StableCursorPosition::default(),
+                                                dimensions: mux::renderable::RenderableDimensions {
+                                                    cols: 80,
+                                                    viewport_rows: 24,
+                                                    scrollback_rows: 0,
+                                                    physical_top: 0,
+                                                    scrollback_top: 0,
+                                                    dpi: 96,
+                                                    pixel_width: 0,
+                                                    pixel_height: 0,
+                                                    reverse_video: false,
+                                                },
+                                                dirty_lines: Vec::new(),
+                                                title: format!("pane-{}", req.pane_id),
+                                                working_dir: None,
+                                                bonus_lines: Vec::new().into(),
+                                                input_serial: None,
+                                                seqno: req.pane_id,
+                                            },
+                                        )
+                                    }
+                                }
+                                _ => continue,
+                            };
+                            responses.push((decoded.serial, response));
+                        }
+
+                        for (serial, pdu) in responses {
+                            let mut out = Vec::new();
+                            pdu.encode(&mut out, serial).expect("encode response");
+                            if stream.write_all(&out).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        socket_path
+    }
+
     fn pool_config(socket_path: PathBuf, max_size: usize) -> MuxPoolConfig {
         MuxPoolConfig {
             pool: PoolConfig {
@@ -1863,6 +1959,56 @@ mod tests {
     }
 
     #[test]
+    fn pool_batch_render_falls_back_to_sequential_after_pipeline_error() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server_unexpected_batch_render_once(&temp_dir).await;
+
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 4,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: false,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(1),
+                    ),
+                },
+                pipeline_depth: 4,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let result = pool
+                .get_pane_render_changes_batch(vec![10, 20, 30])
+                .await
+                .expect("batch fallback should succeed after pipeline error");
+
+            assert_eq!(result.len(), 3);
+            assert_eq!(result[0].pane_id, 10);
+            assert_eq!(result[1].pane_id, 20);
+            assert_eq!(result[2].pane_id, 30);
+
+            let stats = pool.stats().await;
+            assert_eq!(
+                stats.recovery_attempts, 0,
+                "sequential fallback should not consume recovery retries when recovery is disabled"
+            );
+            assert_eq!(
+                stats.connections_created, 2,
+                "fallback should create one failed pipeline connection and one sequential replacement"
+            );
+        });
+    }
+
+    #[test]
     fn pool_recovery_disabled_does_not_retry() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -2169,6 +2315,87 @@ mod tests {
                 .get_pane_render_changes_batch(vec![1, 2])
                 .await
                 .expect("batch with depth=1");
+            assert_eq!(result.len(), 2);
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_batch_render_with_cx_falls_back_to_sequential_after_pipeline_error() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server_unexpected_batch_render_once(&temp_dir).await;
+            let cx = crate::cx::for_testing();
+
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 4,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: false,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(1),
+                    ),
+                },
+                pipeline_depth: 4,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let result = pool
+                .get_pane_render_changes_batch_with_cx(&cx, vec![10, 20, 30])
+                .await
+                .expect("batch fallback with cx should succeed after pipeline error");
+
+            assert_eq!(result.len(), 3);
+            assert_eq!(result[0].pane_id, 10);
+            assert_eq!(result[1].pane_id, 20);
+            assert_eq!(result[2].pane_id, 30);
+
+            let stats = pool.stats().await;
+            assert_eq!(
+                stats.recovery_attempts, 0,
+                "explicit-Cx sequential fallback should not consume recovery retries when recovery is disabled"
+            );
+            assert_eq!(
+                stats.connections_created, 2,
+                "explicit-Cx fallback should create one failed pipeline connection and one sequential replacement"
+            );
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_batch_render_with_cx_pipeline_depth_one_skips_pipeline_fallback() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let cx = crate::cx::for_testing();
+
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 4,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig::default(),
+                pipeline_depth: 1,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let result = pool
+                .get_pane_render_changes_batch_with_cx(&cx, vec![1, 2])
+                .await
+                .expect("batch with cx and depth=1");
             assert_eq!(result.len(), 2);
         });
     }

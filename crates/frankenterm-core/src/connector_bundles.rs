@@ -11,9 +11,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::connector_event_model::{CanonicalConnectorEvent, EventDirection, SchemaVersion};
-use crate::connector_host_runtime::ConnectorCapability;
-use crate::connector_lifecycle::ConnectorLifecyclePhase;
+use crate::connector_event_model::{CanonicalConnectorEvent, EventDirection};
+use crate::connector_host_runtime::{ConnectorCapability, ConnectorLifecyclePhase};
 use crate::connector_registry::{ConnectorManifest, TrustLevel};
 use crate::policy_audit_chain::{AuditChain, AuditEntryKind};
 
@@ -662,20 +661,17 @@ impl IngestionPipeline {
     }
 
     /// Verify the integrity of the underlying audit chain.
-    #[must_use]
-    pub fn verify_chain(&self) -> crate::policy_audit_chain::ChainVerificationResult {
+    pub fn verify_chain(&mut self) -> crate::policy_audit_chain::ChainVerificationResult {
         self.audit_chain.verify()
     }
 
     /// Export the audit chain as JSON.
-    #[must_use]
-    pub fn export_json(&self) -> String {
+    pub fn export_json(&mut self) -> String {
         self.audit_chain.export_json()
     }
 
     /// Export the audit chain as JSONL.
-    #[must_use]
-    pub fn export_jsonl(&self) -> String {
+    pub fn export_jsonl(&mut self) -> String {
         self.audit_chain.export_jsonl()
     }
 }

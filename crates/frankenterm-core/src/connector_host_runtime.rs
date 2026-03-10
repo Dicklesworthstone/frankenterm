@@ -130,7 +130,7 @@ impl ConnectorRuntimeBudgets {
 }
 
 /// Capability gates available to connector operations inside sandbox zones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorCapability {
     Invoke,
