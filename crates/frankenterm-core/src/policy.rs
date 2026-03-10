@@ -32,6 +32,7 @@ use crate::config::{
     PolicyRulesConfig,
 };
 use crate::identity_graph::{AuthAction, PrincipalId, PrincipalKind, ResourceId, ResourceKind};
+use crate::policy_audit_chain::{AuditChain, AuditEntryKind};
 use crate::policy_decision_log::{DecisionLogConfig, DecisionOutcome, PolicyDecisionLog};
 use crate::policy_quarantine::QuarantineRegistry;
 use crate::trauma_guard::TraumaDecision;
@@ -2863,6 +2864,8 @@ pub struct PolicyEngine {
     decision_log: PolicyDecisionLog,
     /// Quarantine registry for component isolation
     quarantine_registry: QuarantineRegistry,
+    /// Tamper-evident hash-linked audit chain
+    audit_chain: AuditChain,
 }
 
 impl PolicyEngine {
@@ -2882,6 +2885,7 @@ impl PolicyEngine {
             risk_config: RiskConfig::default(),
             decision_log: PolicyDecisionLog::with_defaults(),
             quarantine_registry: QuarantineRegistry::new(),
+            audit_chain: AuditChain::new(1024),
         }
     }
 
@@ -2902,6 +2906,8 @@ impl PolicyEngine {
         .with_decision_log_config(config.decision_log.clone());
         engine.quarantine_registry =
             QuarantineRegistry::from_config(&config.quarantine);
+        engine.audit_chain =
+            AuditChain::from_config(&config.audit_chain);
         engine
     }
 
@@ -2961,6 +2967,17 @@ impl PolicyEngine {
     /// Access the quarantine registry mutably (for quarantine/release operations).
     pub fn quarantine_registry_mut(&mut self) -> &mut QuarantineRegistry {
         &mut self.quarantine_registry
+    }
+
+    /// Access the tamper-evident audit chain.
+    #[must_use]
+    pub fn audit_chain(&self) -> &AuditChain {
+        &self.audit_chain
+    }
+
+    /// Access the audit chain mutably (for verification, export, etc.).
+    pub fn audit_chain_mut(&mut self) -> &mut AuditChain {
+        &mut self.audit_chain
     }
 
     /// Get the current risk configuration
@@ -3752,6 +3769,31 @@ impl PolicyEngine {
             decision.reason().map(String::from),
             rules_evaluated,
         );
+
+        // Record to tamper-evident audit chain (skip allows unless configured)
+        let should_record = match decision {
+            PolicyDecision::Allow { .. } => self.audit_chain.records_allows(),
+            PolicyDecision::Deny { .. } | PolicyDecision::RequireApproval { .. } => true,
+        };
+        if should_record {
+            let description = format!(
+                "{}: {} by {:?} on {:?}",
+                decision.as_str(),
+                input.action.as_str(),
+                input.actor,
+                input.surface,
+            );
+            let entity_ref = decision
+                .rule_id()
+                .unwrap_or("policy.authorize");
+            self.audit_chain.append(
+                AuditEntryKind::PolicyDecision,
+                &format!("{:?}", input.actor),
+                &description,
+                entity_ref,
+                ts,
+            );
+        }
     }
 
     /// Legacy: Check if send operation is allowed
@@ -9701,5 +9743,158 @@ mod tests {
         // The denial should be recorded in the decision log
         let log = engine.decision_log();
         assert_eq!(log.len(), 1);
+    }
+
+    // ================================================================
+    // Audit chain integration tests
+    // ================================================================
+
+    #[test]
+    fn audit_chain_initially_empty() {
+        let engine = PolicyEngine::permissive();
+        assert!(engine.audit_chain().is_empty());
+        assert_eq!(engine.audit_chain().len(), 0);
+    }
+
+    #[test]
+    fn audit_chain_records_deny_decisions() {
+        let mut engine = PolicyEngine::strict();
+        // Strict engine requires prompt active, so non-prompt sends are denied
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::running());
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+
+        // Deny should always be recorded in audit chain
+        assert_eq!(engine.audit_chain().len(), 1);
+        let entry = engine.audit_chain().latest().unwrap();
+        assert_eq!(entry.kind, AuditEntryKind::PolicyDecision);
+        assert!(entry.description.starts_with("deny:"));
+    }
+
+    #[test]
+    fn audit_chain_skips_allows_by_default() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+
+        // By default, allows are NOT recorded in audit chain
+        assert!(engine.audit_chain().is_empty());
+    }
+
+    #[test]
+    fn audit_chain_records_allows_when_configured() {
+        let config = crate::config::SafetyConfig {
+            audit_chain: crate::policy_audit_chain::AuditChainConfig {
+                max_entries: 100,
+                record_allows: true,
+            },
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::from_safety_config(&config);
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+
+        assert_eq!(engine.audit_chain().len(), 1);
+        let entry = engine.audit_chain().latest().unwrap();
+        assert!(entry.description.starts_with("allow:"));
+    }
+
+    #[test]
+    fn audit_chain_records_require_approval() {
+        let mut engine = PolicyEngine::strict();
+        // Destructive action by robot → require approval
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("git reset --hard");
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+
+        assert_eq!(engine.audit_chain().len(), 1);
+        let entry = engine.audit_chain().latest().unwrap();
+        assert!(entry.description.starts_with("require_approval:"));
+    }
+
+    #[test]
+    fn audit_chain_links_entries_correctly() {
+        let mut engine = PolicyEngine::strict();
+
+        // Generate two deny decisions
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::running());
+        engine.authorize(&input);
+        engine.authorize(&input);
+
+        assert_eq!(engine.audit_chain().len(), 2);
+
+        // Verify chain integrity
+        let result = engine.audit_chain_mut().verify();
+        assert!(result.valid, "audit chain should verify: {result}");
+        assert_eq!(result.entries_checked, 2);
+    }
+
+    #[test]
+    fn audit_chain_quarantine_deny_recorded() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        engine
+            .quarantine_registry_mut()
+            .quarantine(
+                "pane-7",
+                ComponentKind::Pane,
+                QuarantineSeverity::Restricted,
+                QuarantineReason::OperatorDirected {
+                    operator: "admin".into(),
+                    note: "review".into(),
+                },
+                "admin",
+                1000,
+                0,
+            )
+            .unwrap();
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(7)
+            .with_capabilities(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+
+        // Quarantine deny should be in the audit chain
+        assert_eq!(engine.audit_chain().len(), 1);
+        let entry = engine.audit_chain().latest().unwrap();
+        assert_eq!(entry.entity_ref, "policy.quarantine");
+    }
+
+    #[test]
+    fn audit_chain_from_safety_config_max_entries() {
+        let config = crate::config::SafetyConfig {
+            audit_chain: crate::policy_audit_chain::AuditChainConfig {
+                max_entries: 3,
+                record_allows: true,
+            },
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::from_safety_config(&config);
+
+        // Generate 5 allow decisions
+        for _ in 0..5 {
+            let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
+                .with_pane(1)
+                .with_capabilities(PaneCapabilities::prompt());
+            engine.authorize(&input);
+        }
+
+        // Bounded to max_entries
+        assert_eq!(engine.audit_chain().len(), 3);
     }
 }

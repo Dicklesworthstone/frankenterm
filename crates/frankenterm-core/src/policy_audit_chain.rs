@@ -129,6 +129,29 @@ pub struct AuditChainTelemetrySnapshot {
 }
 
 // =============================================================================
+// Configuration
+// =============================================================================
+
+/// TOML-serializable configuration for the audit chain subsystem.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AuditChainConfig {
+    /// Maximum entries retained before oldest are evicted.
+    pub max_entries: usize,
+    /// Whether to record Allow decisions (can be noisy).
+    pub record_allows: bool,
+}
+
+impl Default for AuditChainConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 1024,
+            record_allows: false,
+        }
+    }
+}
+
+// =============================================================================
 // Audit chain — core data structure
 // =============================================================================
 
@@ -139,6 +162,7 @@ pub struct AuditChain {
     next_sequence: u64,
     last_hash: String,
     telemetry: AuditChainTelemetry,
+    record_allows: bool,
 }
 
 impl AuditChain {
@@ -150,7 +174,25 @@ impl AuditChain {
             next_sequence: 0,
             last_hash: String::new(),
             telemetry: AuditChainTelemetry::default(),
+            record_allows: false,
         }
+    }
+
+    /// Create an audit chain from configuration.
+    pub fn from_config(config: &AuditChainConfig) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            max_entries: config.max_entries.max(1),
+            next_sequence: 0,
+            last_hash: String::new(),
+            telemetry: AuditChainTelemetry::default(),
+            record_allows: config.record_allows,
+        }
+    }
+
+    /// Whether this chain records Allow decisions.
+    pub fn records_allows(&self) -> bool {
+        self.record_allows
     }
 
     /// Append an entry to the chain.
@@ -368,6 +410,54 @@ impl AuditChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_defaults() {
+        let config = AuditChainConfig::default();
+        assert_eq!(config.max_entries, 1024);
+        assert!(!config.record_allows);
+    }
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let config = AuditChainConfig {
+            max_entries: 512,
+            record_allows: true,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: AuditChainConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, back);
+    }
+
+    #[test]
+    fn config_missing_fields_use_defaults() {
+        let json = "{}";
+        let config: AuditChainConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_entries, 1024);
+        assert!(!config.record_allows);
+    }
+
+    #[test]
+    fn from_config_respects_settings() {
+        let config = AuditChainConfig {
+            max_entries: 5,
+            record_allows: true,
+        };
+        let chain = AuditChain::from_config(&config);
+        assert!(chain.is_empty());
+        assert!(chain.records_allows());
+
+        // Verify max_entries is bounded
+        let config_zero = AuditChainConfig {
+            max_entries: 0,
+            record_allows: false,
+        };
+        let mut chain = AuditChain::from_config(&config_zero);
+        // max_entries clamped to 1
+        chain.append(AuditEntryKind::PolicyDecision, "sys", "d1", "r1", 1000);
+        chain.append(AuditEntryKind::PolicyDecision, "sys", "d2", "r2", 2000);
+        assert_eq!(chain.len(), 1); // eviction at capacity 1
+    }
 
     #[test]
     fn empty_chain() {

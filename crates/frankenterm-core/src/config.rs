@@ -1565,6 +1565,9 @@ pub struct SafetyConfig {
 
     /// Quarantine subsystem settings (component isolation and kill switch)
     pub quarantine: crate::policy_quarantine::QuarantineConfig,
+
+    /// Tamper-evident audit chain settings
+    pub audit_chain: crate::policy_audit_chain::AuditChainConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1584,6 +1587,7 @@ impl Default for SafetyConfig {
             rules: PolicyRulesConfig::default(),
             decision_log: crate::policy_decision_log::DecisionLogConfig::default(),
             quarantine: crate::policy_quarantine::QuarantineConfig::default(),
+            audit_chain: crate::policy_audit_chain::AuditChainConfig::default(),
         }
     }
 }
@@ -6809,5 +6813,37 @@ block_alt_screen = true
         let safety: SafetyConfig = toml::from_str(toml_str).expect("deserialize");
         assert_eq!(safety.quarantine.max_audit_events, 512);
         assert!(safety.quarantine.auto_expire);
+    }
+
+    #[test]
+    fn safety_config_audit_chain_defaults() {
+        let safety = SafetyConfig::default();
+        assert_eq!(safety.audit_chain.max_entries, 1024);
+        assert!(!safety.audit_chain.record_allows);
+    }
+
+    #[test]
+    fn safety_config_audit_chain_toml_roundtrip() {
+        let mut safety = SafetyConfig::default();
+        safety.audit_chain.max_entries = 256;
+        safety.audit_chain.record_allows = true;
+
+        let toml_str = toml::to_string(&safety).expect("serialize");
+        let back: SafetyConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(back.audit_chain.max_entries, 256);
+        assert!(back.audit_chain.record_allows);
+    }
+
+    #[test]
+    fn safety_config_missing_audit_chain_uses_defaults() {
+        let toml_str = r#"
+rate_limit_per_pane = 30
+rate_limit_global = 100
+require_prompt_active = true
+block_alt_screen = true
+"#;
+        let safety: SafetyConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(safety.audit_chain.max_entries, 1024);
+        assert!(!safety.audit_chain.record_allows);
     }
 }
