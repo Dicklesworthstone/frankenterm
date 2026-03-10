@@ -61,12 +61,12 @@ use crate::storage::{MaintenanceRecord, StorageHandle, StoredEvent};
 #[cfg(all(feature = "vendored", unix))]
 use crate::tailer::StreamingBridge;
 use crate::tailer::{CaptureEvent, TailerConfig, TailerPollTaskSet, TailerSupervisor};
+#[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+use crate::vendored::subscribe_pane_output_with_inherited_cx;
 #[cfg(all(feature = "vendored", unix))]
 use crate::vendored::{
     DirectMuxClient, DirectMuxClientConfig, PaneDelta, SubscriptionConfig, subscribe_pane_output,
 };
-#[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
-use crate::vendored::subscribe_pane_output_with_inherited_cx;
 use crate::watchdog::HeartbeatRegistry;
 use crate::wezterm::{
     PaneInfo, WeztermHandle, WeztermHandleSource, WeztermInterface, wezterm_handle_with_timeout,

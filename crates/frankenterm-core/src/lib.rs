@@ -112,6 +112,7 @@ pub mod concurrent_map;
 pub mod config;
 pub mod config_profiles;
 pub mod conformal;
+pub mod connector_bundles;
 pub mod connector_credential_broker;
 pub mod connector_data_classification;
 pub mod connector_event_model;

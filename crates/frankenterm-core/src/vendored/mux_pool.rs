@@ -1132,6 +1132,49 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_list_panes_with_cx_recovers_from_unexpected_response_by_reconnecting() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server_unexpected_list_panes_once(&temp_dir).await;
+            let cx = crate::cx::for_testing();
+
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 2,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(2),
+                    ),
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+
+            let pool = MuxPool::new(config);
+            let resp = pool
+                .list_panes_with_cx(&cx)
+                .await
+                .expect("list_panes_with_cx should recover after reconnect");
+            assert!(resp.tabs.is_empty());
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.recovery_attempts, 1);
+            assert_eq!(stats.recovery_successes, 1);
+            assert_eq!(stats.connections_created, 2);
+        });
+    }
+
     #[test]
     fn pool_health_check_success() {
         run_async_test(async {
@@ -1857,6 +1900,54 @@ mod tests {
             assert_eq!(
                 stats.recovery_attempts, 0,
                 "no retries when recovery disabled"
+            );
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_list_panes_with_cx_without_recovery_does_not_retry() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server_unexpected_list_panes_once(&temp_dir).await;
+            let cx = crate::cx::for_testing();
+
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 2,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: false,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(5),
+                    ),
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+
+            let pool = MuxPool::new(config);
+            let err = pool
+                .list_panes_with_cx(&cx)
+                .await
+                .expect_err("list_panes_with_cx should fail without recovery");
+            assert!(matches!(err, MuxPoolError::Mux(_)));
+
+            let stats = pool.stats().await;
+            assert_eq!(
+                stats.recovery_attempts, 0,
+                "no retries when recovery disabled on explicit-Cx path"
+            );
+            assert_eq!(
+                stats.connections_created, 1,
+                "explicit-Cx path should not reconnect when recovery is disabled"
             );
         });
     }

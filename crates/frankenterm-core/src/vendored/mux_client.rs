@@ -4926,8 +4926,8 @@ mod tests {
                                 Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
                                     pane_id: 32,
                                     mouse_grabbed: false,
-                                    cursor_position:
-                                        mux::renderable::StableCursorPosition::default(),
+                                    cursor_position: mux::renderable::StableCursorPosition::default(
+                                    ),
                                     dimensions: mux::renderable::RenderableDimensions {
                                         cols: 80,
                                         viewport_rows: 24,
