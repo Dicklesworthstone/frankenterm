@@ -1571,6 +1571,9 @@ pub struct SafetyConfig {
 
     /// Compliance engine settings (violation tracking and SLA)
     pub compliance: crate::policy_compliance::ComplianceConfig,
+
+    /// Credential broker settings (JIT lease management and sensitivity ceilings)
+    pub credential_broker: crate::connector_credential_broker::CredentialBrokerConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1592,6 +1595,8 @@ impl Default for SafetyConfig {
             quarantine: crate::policy_quarantine::QuarantineConfig::default(),
             audit_chain: crate::policy_audit_chain::AuditChainConfig::default(),
             compliance: crate::policy_compliance::ComplianceConfig::default(),
+            credential_broker: crate::connector_credential_broker::CredentialBrokerConfig::default(
+            ),
         }
     }
 }
@@ -6792,8 +6797,7 @@ block_alt_screen = true
         let mut safety = SafetyConfig::default();
         safety.quarantine.max_audit_events = 1024;
         safety.quarantine.auto_expire = false;
-        safety.quarantine.default_severity =
-            crate::policy_quarantine::QuarantineSeverity::Isolated;
+        safety.quarantine.default_severity = crate::policy_quarantine::QuarantineSeverity::Isolated;
 
         let toml_str = toml::to_string(&safety).expect("serialize");
         let back: SafetyConfig = toml::from_str(&toml_str).expect("deserialize");

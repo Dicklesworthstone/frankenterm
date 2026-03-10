@@ -1724,7 +1724,8 @@ mod tests {
 
     #[test]
     fn scope_display_format() {
-        let scope = CredentialScope::new("github", "repos/foo", vec!["read".into(), "write".into()]);
+        let scope =
+            CredentialScope::new("github", "repos/foo", vec!["read".into(), "write".into()]);
         assert_eq!(scope.to_string(), "github:repos/foo[read,write]");
     }
 
@@ -1821,7 +1822,10 @@ mod tests {
         let back: CredentialBrokerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.enabled, config.enabled);
         assert_eq!(back.max_audit_events, config.max_audit_events);
-        assert_eq!(back.max_leases_per_connector, config.max_leases_per_connector);
+        assert_eq!(
+            back.max_leases_per_connector,
+            config.max_leases_per_connector
+        );
         assert_eq!(back.max_sensitivity, config.max_sensitivity);
     }
 

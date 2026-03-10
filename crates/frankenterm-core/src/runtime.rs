@@ -45,16 +45,26 @@ use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
+#[cfg(all(feature = "vendored", unix))]
+use crate::runtime_compat::mpsc_send;
 use crate::runtime_compat::{
     RwLock, mpsc, sleep,
     task::{self, JoinHandle},
     timeout, watch,
 };
+#[cfg(all(feature = "vendored", unix))]
+use crate::sharding::decode_sharded_pane_id;
 use crate::spsc_ring_buffer::{SpscConsumer, SpscProducer, channel as spsc_channel};
 #[cfg(feature = "native-wezterm")]
 use crate::storage::PaneRecord;
 use crate::storage::{MaintenanceRecord, StorageHandle, StoredEvent};
+#[cfg(all(feature = "vendored", unix))]
+use crate::tailer::StreamingBridge;
 use crate::tailer::{CaptureEvent, TailerConfig, TailerPollTaskSet, TailerSupervisor};
+#[cfg(all(feature = "vendored", unix))]
+use crate::vendored::{
+    DirectMuxClient, DirectMuxClientConfig, PaneDelta, SubscriptionConfig, subscribe_pane_output,
+};
 use crate::watchdog::HeartbeatRegistry;
 use crate::wezterm::{
     PaneInfo, WeztermHandle, WeztermHandleSource, WeztermInterface, wezterm_handle_with_timeout,
@@ -288,6 +298,14 @@ pub struct RuntimeConfig {
     pub retention_max_mb: u32,
     /// Database checkpoint interval in seconds
     pub checkpoint_interval_secs: u32,
+    /// Vendored mux socket paths used for pane-delta streaming subscriptions.
+    ///
+    /// When sharding is enabled, the index in this vector matches the encoded
+    /// shard id embedded in pane ids. When empty, the runtime falls back to
+    /// polling-only capture.
+    pub vendored_mux_socket_paths: Vec<PathBuf>,
+    /// Compression mode for vendored direct-mux subscriptions.
+    pub vendored_mux_compression: crate::config::VendoredCompressionMode,
     /// Optional Unix socket path for native WezTerm events
     pub native_event_socket: Option<PathBuf>,
     /// Trauma guard configuration for detecting recurring failure loops
@@ -311,10 +329,57 @@ impl Default for RuntimeConfig {
             retention_days: 30,
             retention_max_mb: 0,
             checkpoint_interval_secs: 60,
+            vendored_mux_socket_paths: Vec::new(),
+            vendored_mux_compression: crate::config::VendoredCompressionMode::Auto,
             native_event_socket: None,
             trauma_guard: crate::config::TraumaGuardConfig::default(),
         }
     }
+}
+
+#[cfg(all(feature = "vendored", unix))]
+#[derive(Debug)]
+struct StreamingTaskExit {
+    pane_id: u64,
+    reason: String,
+}
+
+#[cfg(all(feature = "vendored", unix))]
+fn streaming_subscription_config(
+    poll_interval: Duration,
+    min_poll_interval: Duration,
+    channel_capacity: usize,
+) -> SubscriptionConfig {
+    SubscriptionConfig {
+        poll_interval,
+        min_poll_interval,
+        channel_capacity: channel_capacity.max(1),
+    }
+}
+
+#[cfg(all(feature = "vendored", unix))]
+fn vendored_streaming_socket_for_pane(
+    socket_paths: &[PathBuf],
+    pane_id: u64,
+) -> Option<(u64, PathBuf)> {
+    if socket_paths.is_empty() {
+        return None;
+    }
+
+    if socket_paths.len() == 1 {
+        return Some((pane_id, socket_paths[0].clone()));
+    }
+
+    let (shard_id, local_pane_id) = decode_sharded_pane_id(pane_id);
+    socket_paths
+        .get(shard_id.0)
+        .cloned()
+        .map(|socket_path| (local_pane_id, socket_path))
+}
+
+#[cfg(all(feature = "vendored", unix))]
+fn should_record_streaming_fallback(reason: &str) -> bool {
+    !matches!(reason, "cancelled" | "capture ingress closed" | "shutdown")
 }
 
 /// Runtime metrics for health snapshots and shutdown summaries.
@@ -1053,10 +1118,10 @@ impl ObservationRuntime {
 
         let native_socket = self.config.native_event_socket.clone();
 
-        // Always spawn the polling capture task. When native push events are
-        // also active, both sources feed the same ingress channel — the cursor
-        // deduplication layer handles overlap. This means polling provides a
-        // safety net even when the native bridge is connected.
+        // Always spawn the capture task. It owns the polling supervisor and,
+        // when vendored direct-mux sockets are configured, per-pane streaming
+        // subscriptions. Native push events can still feed the same ingress
+        // channel in parallel, with polling remaining the safety net.
         let capture_handle = self.spawn_capture_task(capture_ingress_tx.clone());
 
         // Spawn native event listener if socket path is configured and the
@@ -1858,9 +1923,11 @@ impl ObservationRuntime {
         })
     }
 
-    /// Spawn the content capture task using TailerSupervisor with adaptive polling.
+    /// Spawn the content capture task using adaptive polling plus vendored
+    /// pane-delta streaming when direct mux sockets are configured.
     ///
-    /// This task manages per-pane tailers that:
+    /// This task manages per-pane capture that:
+    /// - Subscribes to vendored pane deltas when direct mux is available
     /// - Poll fast when output is changing (min_capture_interval)
     /// - Poll slow when idle (capture_interval)
     /// - Respect concurrency limits (max_concurrent_captures)
@@ -1875,6 +1942,22 @@ impl ObservationRuntime {
         let wezterm_handle = Arc::clone(&self.wezterm_handle);
         let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
         let replay_capture = self.replay_capture.clone();
+        #[cfg(all(feature = "vendored", unix))]
+        let vendored_streaming_enabled = !self.config.vendored_mux_socket_paths.is_empty();
+        #[cfg(all(feature = "vendored", unix))]
+        let vendored_mux_socket_paths = self.config.vendored_mux_socket_paths.clone();
+        #[cfg(all(feature = "vendored", unix))]
+        let vendored_mux_compression = self.config.vendored_mux_compression;
+        #[cfg(all(feature = "vendored", unix))]
+        let vendored_channel_capacity = self.config.channel_buffer.max(1);
+        #[cfg(all(feature = "vendored", unix))]
+        let initial_vendored_subscription_config = vendored_streaming_enabled.then(|| {
+            streaming_subscription_config(
+                self.config.capture_interval,
+                self.config.min_capture_interval,
+                vendored_channel_capacity,
+            )
+        });
 
         // Create tailer config from runtime config
         // Capture overlap_size for use in the async block (not hot-reloadable)
@@ -1891,11 +1974,12 @@ impl ObservationRuntime {
 
         task::spawn(async move {
             let source = Arc::new(WeztermHandleSource::new(wezterm_handle));
+            let capture_tx_for_supervisor = capture_tx.clone();
             // Create tailer supervisor with budget enforcement
             let initial_budget = config_rx.borrow().capture_budgets.clone();
             let mut supervisor = TailerSupervisor::with_budget(
                 initial_config,
-                capture_tx,
+                capture_tx_for_supervisor,
                 cursors,
                 Arc::clone(&registry), // Pass registry for authoritative state
                 Arc::clone(&shutdown_flag),
@@ -1910,6 +1994,15 @@ impl ObservationRuntime {
 
             // Cache hot-reloadable pane priority config for scheduling.
             let mut pane_priorities = config_rx.borrow().pane_priorities.clone();
+            #[cfg(all(feature = "vendored", unix))]
+            let mut vendored_subscription_config = initial_vendored_subscription_config;
+            #[cfg(all(feature = "vendored", unix))]
+            let (stream_exit_tx, stream_exit_rx) =
+                mpsc::channel::<StreamingTaskExit>(vendored_channel_capacity);
+            #[cfg(all(feature = "vendored", unix))]
+            let mut streaming_tasks: HashMap<u64, JoinHandle<()>> = HashMap::new();
+            #[cfg(all(feature = "vendored", unix))]
+            let mut observed_panes_cache: HashMap<u64, PaneInfo> = HashMap::new();
 
             // Sync tailers periodically with discovery interval.
             // Keep the first sync immediate to preserve prior interval behavior.
@@ -1922,6 +2015,33 @@ impl ObservationRuntime {
                 if shutdown_flag.load(Ordering::SeqCst) {
                     debug!("Capture task: shutdown signal received");
                     break;
+                }
+
+                #[cfg(all(feature = "vendored", unix))]
+                while let Ok(exit) = stream_exit_rx.try_recv() {
+                    streaming_tasks.remove(&exit.pane_id);
+                    if observed_panes_cache.contains_key(&exit.pane_id)
+                        && should_record_streaming_fallback(&exit.reason)
+                    {
+                        warn!(
+                            pane_id = exit.pane_id,
+                            reason = %exit.reason,
+                            "Vendored pane streaming ended; falling back to polling"
+                        );
+                    } else {
+                        debug!(
+                            pane_id = exit.pane_id,
+                            reason = %exit.reason,
+                            "Vendored pane streaming ended"
+                        );
+                    }
+
+                    let polling_observed_panes: HashMap<u64, PaneInfo> = observed_panes_cache
+                        .iter()
+                        .filter(|(pane_id, _)| !streaming_tasks.contains_key(*pane_id))
+                        .map(|(pane_id, pane)| (*pane_id, pane.clone()))
+                        .collect();
+                    supervisor.sync_tailers(&polling_observed_panes);
                 }
 
                 let now = Instant::now();
@@ -1941,9 +2061,23 @@ impl ObservationRuntime {
                             send_timeout: Duration::from_millis(100),
                             capture_timeout: Duration::from_secs(2),
                         };
+                        #[cfg(all(feature = "vendored", unix))]
+                        let tailer_max_interval = new_tailer_config.max_interval;
+                        #[cfg(all(feature = "vendored", unix))]
+                        let tailer_min_interval = new_tailer_config.min_interval;
                         supervisor.update_config(new_tailer_config);
                         supervisor.update_budget(new_config.capture_budgets.clone());
                         pane_priorities = new_config.pane_priorities.clone();
+                        #[cfg(all(feature = "vendored", unix))]
+                        {
+                            vendored_subscription_config = vendored_streaming_enabled.then(|| {
+                                streaming_subscription_config(
+                                    tailer_max_interval,
+                                    tailer_min_interval,
+                                    vendored_channel_capacity,
+                                )
+                            });
+                        }
                     }
 
                     // Get current observed panes from registry
@@ -1955,6 +2089,89 @@ impl ObservationRuntime {
                             .collect()
                     };
 
+                    #[cfg(all(feature = "vendored", unix))]
+                    {
+                        observed_panes_cache = observed_panes.clone();
+
+                        let departed_streams: Vec<u64> = streaming_tasks
+                            .keys()
+                            .filter(|pane_id| !observed_panes_cache.contains_key(*pane_id))
+                            .copied()
+                            .collect();
+                        for pane_id in departed_streams {
+                            if let Some(handle) = streaming_tasks.remove(&pane_id) {
+                                handle.abort();
+                                debug!(pane_id, "Cancelled vendored streaming for departed pane");
+                            }
+                        }
+
+                        if let Some(subscription_config) = vendored_subscription_config.clone() {
+                            for &pane_id in observed_panes_cache.keys() {
+                                if streaming_tasks.contains_key(&pane_id) {
+                                    continue;
+                                }
+
+                                let Some((subscription_pane_id, socket_path)) =
+                                    vendored_streaming_socket_for_pane(
+                                        &vendored_mux_socket_paths,
+                                        pane_id,
+                                    )
+                                else {
+                                    continue;
+                                };
+
+                                if !socket_path.exists() {
+                                    debug!(
+                                        pane_id,
+                                        path = %socket_path.display(),
+                                        "Skipping vendored pane streaming because mux socket is missing"
+                                    );
+                                    continue;
+                                }
+
+                                let capture_tx = capture_tx.clone();
+                                let stream_exit_tx = stream_exit_tx.clone();
+                                let shutdown_flag = Arc::clone(&shutdown_flag);
+                                let subscription_config = subscription_config.clone();
+                                let socket_path_for_task = socket_path.clone();
+                                let handle = task::spawn(async move {
+                                    let exit_reason = run_vendored_streaming_capture(
+                                        pane_id,
+                                        subscription_pane_id,
+                                        socket_path_for_task,
+                                        vendored_mux_compression,
+                                        subscription_config,
+                                        capture_tx,
+                                    )
+                                    .await;
+                                    let final_reason = if shutdown_flag.load(Ordering::SeqCst)
+                                        && exit_reason == "capture ingress closed"
+                                    {
+                                        "shutdown".to_string()
+                                    } else {
+                                        exit_reason
+                                    };
+                                    let _ = mpsc_send(
+                                        &stream_exit_tx,
+                                        StreamingTaskExit {
+                                            pane_id,
+                                            reason: final_reason,
+                                        },
+                                    )
+                                    .await;
+                                });
+                                streaming_tasks.insert(pane_id, handle);
+                            }
+                        }
+
+                        let polling_observed_panes: HashMap<u64, PaneInfo> = observed_panes_cache
+                            .iter()
+                            .filter(|(pane_id, _)| !streaming_tasks.contains_key(*pane_id))
+                            .map(|(pane_id, pane)| (*pane_id, pane.clone()))
+                            .collect();
+                        supervisor.sync_tailers(&polling_observed_panes);
+                    }
+                    #[cfg(not(all(feature = "vendored", unix)))]
                     supervisor.sync_tailers(&observed_panes);
 
                     // Update effective priorities (config rules + runtime overrides).
@@ -2025,6 +2242,11 @@ impl ObservationRuntime {
                 } else {
                     sleep(wait_duration).await;
                 }
+            }
+
+            #[cfg(all(feature = "vendored", unix))]
+            for (_pane_id, handle) in streaming_tasks.drain() {
+                handle.abort();
             }
 
             // Graceful shutdown of all tailers
@@ -2652,6 +2874,76 @@ async fn emit_native_output_delta(
             "Native output received before cursor initialized; dropping"
         );
     }
+}
+
+#[cfg(all(feature = "vendored", unix))]
+async fn run_vendored_streaming_capture(
+    pane_id: u64,
+    subscription_pane_id: u64,
+    socket_path: PathBuf,
+    compression_mode: crate::config::VendoredCompressionMode,
+    subscription_config: SubscriptionConfig,
+    capture_tx: mpsc::Sender<CaptureEvent>,
+) -> String {
+    let mut bridge = StreamingBridge::new();
+    let mut client_config = DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
+    client_config.compression_mode = compression_mode;
+
+    let client = match DirectMuxClient::connect(client_config).await {
+        Ok(client) => client,
+        Err(err) => {
+            bridge.record_fallback();
+            return format!("connect error: {err}");
+        }
+    };
+
+    info!(
+        pane_id,
+        local_pane_id = subscription_pane_id,
+        socket = %socket_path.display(),
+        "Started vendored pane streaming subscription"
+    );
+
+    let mut subscription =
+        subscribe_pane_output(client, subscription_pane_id, subscription_config.clone());
+    let mut exit_reason = "subscription receiver closed".to_string();
+
+    loop {
+        let Some(delta) = subscription.next().await else {
+            break;
+        };
+
+        let ended_reason = match &delta {
+            PaneDelta::Ended { reason, .. } => Some(reason.clone()),
+            _ => None,
+        };
+
+        let segments = bridge.process_delta(delta);
+        for segment in segments {
+            if mpsc_send(&capture_tx, CaptureEvent { segment })
+                .await
+                .is_err()
+            {
+                exit_reason = "capture ingress closed".to_string();
+                break;
+            }
+        }
+
+        if exit_reason == "capture ingress closed" {
+            break;
+        }
+
+        if let Some(reason) = ended_reason {
+            exit_reason = reason;
+            break;
+        }
+    }
+
+    if should_record_streaming_fallback(&exit_reason) {
+        bridge.record_fallback();
+    }
+    subscription.shutdown().await;
+    exit_reason
 }
 
 /// Handle to the running observation runtime.
@@ -5101,6 +5393,12 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_default_no_vendored_mux_socket_paths() {
+        let config = RuntimeConfig::default();
+        assert!(config.vendored_mux_socket_paths.is_empty());
+    }
+
+    #[test]
     fn runtime_config_default_no_native_event_socket() {
         let config = RuntimeConfig::default();
         assert!(config.native_event_socket.is_none());
@@ -5118,6 +5416,44 @@ mod tests {
         let cloned = config.clone();
         assert_eq!(cloned.discovery_interval, config.discovery_interval);
         assert_eq!(cloned.channel_buffer, config.channel_buffer);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn vendored_streaming_socket_for_single_backend_uses_raw_pane_id() {
+        let socket_paths = vec![PathBuf::from("/tmp/wa.sock")];
+        let (pane_id, socket_path) =
+            vendored_streaming_socket_for_pane(&socket_paths, 42).expect("single socket");
+        assert_eq!(pane_id, 42);
+        assert_eq!(socket_path, PathBuf::from("/tmp/wa.sock"));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn vendored_streaming_socket_for_sharded_backend_decodes_pane_bits() {
+        let socket_paths = vec![
+            PathBuf::from("/tmp/wa-0.sock"),
+            PathBuf::from("/tmp/wa-1.sock"),
+        ];
+        let global_pane_id =
+            crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(1), 7);
+        let (pane_id, socket_path) =
+            vendored_streaming_socket_for_pane(&socket_paths, global_pane_id)
+                .expect("sharded socket");
+        assert_eq!(pane_id, 7);
+        assert_eq!(socket_path, PathBuf::from("/tmp/wa-1.sock"));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn vendored_streaming_socket_for_unknown_shard_returns_none() {
+        let socket_paths = vec![
+            PathBuf::from("/tmp/wa-0.sock"),
+            PathBuf::from("/tmp/wa-1.sock"),
+        ];
+        let global_pane_id =
+            crate::sharding::encode_sharded_pane_id(crate::sharding::ShardId(3), 9);
+        assert!(vendored_streaming_socket_for_pane(&socket_paths, global_pane_id).is_none());
     }
 
     // =========================================================================

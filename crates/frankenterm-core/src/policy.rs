@@ -4773,7 +4773,7 @@ where
         // Notify ingress tap (ft-oegrb.2.2)
         if let Some(ref tap) = self.ingress_tap {
             use crate::recording::{
-                action_to_ingress_kind, actor_to_source, epoch_ms_now, IngressEvent, IngressOutcome,
+                IngressEvent, IngressOutcome, action_to_ingress_kind, actor_to_source, epoch_ms_now,
             };
             let outcome = match &result {
                 InjectionResult::Allowed { .. } => IngressOutcome::Allowed,
@@ -5156,9 +5156,11 @@ mod tests {
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
         assert_eq!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
-        assert!(decision
-            .reason()
-            .is_some_and(|reason| reason.contains("rch exec")));
+        assert!(
+            decision
+                .reason()
+                .is_some_and(|reason| reason.contains("rch exec"))
+        );
     }
 
     #[test]
@@ -7074,10 +7076,12 @@ mod tests {
             .expect("allow rule trace should be present");
         assert!(allow_rule.matched);
         assert_eq!(allow_rule.decision.as_deref(), Some("allow"));
-        assert!(allow_rule
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("won tie-breaking")));
+        assert!(
+            allow_rule
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("won tie-breaking"))
+        );
 
         let deny_rule = config_rules
             .iter()
@@ -7085,10 +7089,12 @@ mod tests {
             .expect("deny rule trace should be present");
         assert!(deny_rule.matched);
         assert_eq!(deny_rule.decision.as_deref(), Some("deny"));
-        assert!(deny_rule
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("matched and selected")));
+        assert!(
+            deny_rule
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("matched and selected"))
+        );
 
         let require_rule = config_rules
             .iter()
@@ -7416,10 +7422,11 @@ mod tests {
             .with_capabilities(PaneCapabilities::unknown());
 
         let risk = engine.calculate_risk(&input);
-        assert!(risk
-            .factors
-            .iter()
-            .any(|f| f.id == "state.alt_screen_unknown"));
+        assert!(
+            risk.factors
+                .iter()
+                .any(|f| f.id == "state.alt_screen_unknown")
+        );
     }
 
     #[test]
@@ -7431,10 +7438,11 @@ mod tests {
             .with_command_text("rm -rf /tmp/test");
 
         let risk = engine.calculate_risk(&input);
-        assert!(risk
-            .factors
-            .iter()
-            .any(|f| f.id == "content.destructive_tokens"));
+        assert!(
+            risk.factors
+                .iter()
+                .any(|f| f.id == "content.destructive_tokens")
+        );
     }
 
     #[test]
@@ -7446,10 +7454,11 @@ mod tests {
             .with_command_text("sudo apt update");
 
         let risk = engine.calculate_risk(&input);
-        assert!(risk
-            .factors
-            .iter()
-            .any(|f| f.id == "content.sudo_elevation"));
+        assert!(
+            risk.factors
+                .iter()
+                .any(|f| f.id == "content.sudo_elevation")
+        );
     }
 
     #[test]
@@ -9765,10 +9774,12 @@ mod tests {
     fn quarantine_registry_initially_empty() {
         let engine = PolicyEngine::permissive();
         assert!(engine.quarantine_registry().active_quarantines().is_empty());
-        assert!(engine
-            .quarantine_registry()
-            .kill_switch()
-            .allows_new_workflows());
+        assert!(
+            engine
+                .quarantine_registry()
+                .kill_switch()
+                .allows_new_workflows()
+        );
     }
 
     #[test]
@@ -10179,9 +10190,11 @@ mod tests {
         assert_eq!(engine.audit_chain().len(), 2);
         let entry = engine.audit_chain().latest().unwrap();
         assert_eq!(entry.kind, AuditEntryKind::QuarantineAction);
-        assert!(entry
-            .description
-            .contains("released pane-11 from quarantine"));
+        assert!(
+            entry
+                .description
+                .contains("released pane-11 from quarantine")
+        );
     }
 
     #[test]
