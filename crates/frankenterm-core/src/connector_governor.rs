@@ -165,7 +165,7 @@ impl GovernorDecision {
 // =============================================================================
 
 /// Configuration for a token bucket rate limiter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenBucketConfig {
     /// Maximum tokens (burst capacity).
     pub capacity: u64,
@@ -332,7 +332,7 @@ impl TokenBucket {
 // =============================================================================
 
 /// Configuration for quota enforcement.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuotaConfig {
     /// Maximum actions per window.
     pub max_actions: u64,
@@ -461,7 +461,7 @@ pub struct QuotaSnapshot {
 // =============================================================================
 
 /// Configuration for cost budget enforcement.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CostBudgetConfig {
     /// Maximum cost per budget window (USD cents to avoid float issues).
     pub max_cost_cents: u64,
@@ -691,7 +691,7 @@ impl AdaptiveBackoff {
 // =============================================================================
 
 /// Memory-aware queue backpressure for connector action dispatch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueueBackpressureConfig {
     /// Maximum queued actions before rejecting new ones.
     pub max_queue_depth: usize,
@@ -908,7 +908,7 @@ pub struct ConnectorGovernorSnapshot {
 // =============================================================================
 
 /// Configuration for the connector governor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectorGovernorConfig {
     /// Default rate limit config for new connectors.
     pub default_rate_limit: TokenBucketConfig,
