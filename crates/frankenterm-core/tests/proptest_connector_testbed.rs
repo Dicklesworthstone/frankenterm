@@ -474,3 +474,153 @@ proptest! {
         prop_assert!(s.intensity_pct <= 100);
     }
 }
+
+// =============================================================================
+// Additional behavioral properties
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn mock_provider_deterministic_seed(
+        pct in 1u8..100u8,
+        seed in any::<u64>(),
+    ) {
+        // Same seed + failure_rate produces identical outcome
+        let mut p1 = MockProvider::new("p").with_failure_rate(pct);
+        let mut p2 = MockProvider::new("p").with_failure_rate(pct);
+        let o1 = p1.receive_request("c", "a", 1000, seed);
+        let o2 = p2.receive_request("c", "a", 1000, seed);
+        prop_assert_eq!(o1, o2);
+    }
+
+    #[test]
+    fn mock_provider_online_toggle(name in "[a-z]{2,8}") {
+        let mut p = MockProvider::new(&name);
+        prop_assert!(p.online);
+        p.go_offline();
+        prop_assert!(!p.online);
+        p.go_online();
+        prop_assert!(p.online);
+    }
+
+    #[test]
+    fn mock_provider_new_defaults(name in "[a-z]{2,8}") {
+        let p = MockProvider::new(&name);
+        prop_assert_eq!(&p.provider_id, &name);
+        prop_assert!(p.online);
+        prop_assert_eq!(p.requests_received, 0);
+        prop_assert_eq!(p.requests_failed, 0);
+        prop_assert_eq!(p.failure_rate_pct, 0);
+        prop_assert_eq!(p.rate_limit_rps, 0);
+        prop_assert_eq!(p.max_log_entries, 256);
+    }
+
+    #[test]
+    fn chaos_scenario_kind_display_snake_case(kind in arb_chaos_scenario_kind()) {
+        let s = kind.to_string();
+        prop_assert!(s.chars().all(|c| c.is_lowercase() || c == '_'));
+    }
+
+    #[test]
+    fn chaos_provider_outage_intensity_always_100(dur in any::<u64>()) {
+        let s = ChaosScenario::provider_outage(dur);
+        prop_assert_eq!(s.kind, ChaosScenarioKind::ProviderOutage);
+        prop_assert_eq!(s.intensity_pct, 100);
+        prop_assert_eq!(s.duration_ms, dur);
+    }
+
+    #[test]
+    fn chaos_ingestion_flood_clamped(eps in any::<u8>()) {
+        let s = ChaosScenario::ingestion_flood(eps);
+        prop_assert_eq!(s.kind, ChaosScenarioKind::IngestionFlood);
+        prop_assert!(s.intensity_pct <= 100);
+        prop_assert_eq!(s.duration_ms, 5000);
+    }
+
+    #[test]
+    fn chaos_sandbox_probe_static(_seed in any::<u8>()) {
+        let s = ChaosScenario::sandbox_probe();
+        prop_assert_eq!(s.kind, ChaosScenarioKind::SandboxProbe);
+        prop_assert_eq!(s.duration_ms, 0);
+        prop_assert_eq!(s.intensity_pct, 100);
+    }
+
+    #[test]
+    fn escape_filesystem_read_factory(path in "[a-z/]{3,20}") {
+        let att = SandboxEscapeAttempt::filesystem_read(&path);
+        prop_assert_eq!(att.capability, ConnectorCapability::FilesystemRead);
+        prop_assert!(att.expected_blocked);
+        prop_assert!(att.description.contains(&path));
+    }
+
+    #[test]
+    fn escape_filesystem_write_factory(path in "[a-z/]{3,20}") {
+        let att = SandboxEscapeAttempt::filesystem_write(&path);
+        prop_assert_eq!(att.capability, ConnectorCapability::FilesystemWrite);
+        prop_assert!(att.expected_blocked);
+    }
+
+    #[test]
+    fn escape_network_egress_factory(host in "[a-z.]{3,20}") {
+        let att = SandboxEscapeAttempt::network_egress(&host);
+        prop_assert_eq!(att.capability, ConnectorCapability::NetworkEgress);
+        prop_assert!(att.expected_blocked);
+    }
+
+    #[test]
+    fn escape_process_exec_factory(cmd in "[a-z ]{3,20}") {
+        let att = SandboxEscapeAttempt::process_exec(&cmd);
+        prop_assert_eq!(att.capability, ConnectorCapability::ProcessExec);
+        prop_assert!(att.expected_blocked);
+    }
+
+    #[test]
+    fn probe_report_count_matches_results(rpt in arb_sandbox_probe_report()) {
+        prop_assert_eq!(rpt.total_attempts, rpt.results.len());
+    }
+
+    #[test]
+    fn testbed_config_default_values(_seed in any::<u8>()) {
+        let cfg = TestbedConfig::default();
+        prop_assert_eq!(cfg.max_providers, 32);
+        prop_assert_eq!(cfg.max_escape_results, 256);
+        prop_assert_eq!(cfg.max_scenario_results, 128);
+    }
+
+    #[test]
+    fn mock_provider_received_eq_success_plus_failed(
+        pct in 0u8..=100u8,
+        seeds in proptest::collection::vec(any::<u64>(), 1..20),
+    ) {
+        let mut p = MockProvider::new("p").with_failure_rate(pct);
+        for (i, seed) in seeds.iter().enumerate() {
+            p.receive_request("conn", "invoke", i as u64, *seed);
+        }
+        prop_assert_eq!(
+            p.requests_received,
+            p.successful_requests() + p.requests_failed
+        );
+    }
+
+    #[test]
+    fn testbed_snapshot_preserves_timestamp(snap in arb_testbed_snapshot()) {
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: TestbedSnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.captured_at_ms, snap.captured_at_ms);
+    }
+
+    #[test]
+    fn escape_result_passed_when_blocked_matches_expected(
+        att in arb_sandbox_escape_attempt(),
+    ) {
+        let res = SandboxEscapeResult {
+            attempt: att.clone(),
+            was_blocked: att.expected_blocked,
+            passed: true,
+        };
+        prop_assert!(res.passed);
+        prop_assert_eq!(res.was_blocked, res.attempt.expected_blocked);
+    }
+}
