@@ -1595,6 +1595,9 @@ pub struct SafetyConfig {
 
     /// Connector bundle registry settings (tier-based connector packaging)
     pub bundle_registry: crate::connector_bundles::BundleRegistryConfig,
+
+    /// Connector mesh settings (multi-host/zone routing federation)
+    pub connector_mesh: crate::connector_mesh::ConnectorMeshConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1624,6 +1627,7 @@ impl Default for SafetyConfig {
             connector_host_runtime: crate::connector_host_runtime::ConnectorHostConfig::default(),
             connector_reliability: crate::connector_reliability::ConnectorReliabilityConfig::default(),
             bundle_registry: crate::connector_bundles::BundleRegistryConfig::default(),
+            connector_mesh: crate::connector_mesh::ConnectorMeshConfig::default(),
         }
     }
 }
@@ -6795,12 +6799,12 @@ mode = "periodic"
     #[test]
     fn safety_config_missing_decision_log_uses_defaults() {
         // Simulates an old TOML that lacks [safety.decision_log]
-        let toml_str = r#"
+        let toml_str = r"
 rate_limit_per_pane = 30
 rate_limit_global = 100
 require_prompt_active = true
 block_alt_screen = true
-"#;
+";
         let safety: SafetyConfig = toml::from_str(toml_str).expect("deserialize");
         assert_eq!(safety.decision_log.max_entries, 10_000);
         assert!(safety.decision_log.record_allows);
@@ -6839,12 +6843,12 @@ block_alt_screen = true
     #[test]
     fn safety_config_missing_quarantine_uses_defaults() {
         // Old TOML without [safety.quarantine] should use defaults
-        let toml_str = r#"
+        let toml_str = r"
 rate_limit_per_pane = 30
 rate_limit_global = 100
 require_prompt_active = true
 block_alt_screen = true
-"#;
+";
         let safety: SafetyConfig = toml::from_str(toml_str).expect("deserialize");
         assert_eq!(safety.quarantine.max_audit_events, 512);
         assert!(safety.quarantine.auto_expire);
@@ -6871,12 +6875,12 @@ block_alt_screen = true
 
     #[test]
     fn safety_config_missing_audit_chain_uses_defaults() {
-        let toml_str = r#"
+        let toml_str = r"
 rate_limit_per_pane = 30
 rate_limit_global = 100
 require_prompt_active = true
 block_alt_screen = true
-"#;
+";
         let safety: SafetyConfig = toml::from_str(toml_str).expect("deserialize");
         assert_eq!(safety.audit_chain.max_entries, 1024);
         assert!(!safety.audit_chain.record_allows);
@@ -6903,12 +6907,12 @@ block_alt_screen = true
 
     #[test]
     fn safety_config_missing_compliance_uses_defaults() {
-        let toml_str = r#"
+        let toml_str = r"
 rate_limit_per_pane = 30
 rate_limit_global = 100
 require_prompt_active = true
 block_alt_screen = true
-"#;
+";
         let safety: SafetyConfig = toml::from_str(toml_str).expect("deserialize");
         assert_eq!(safety.compliance.max_violations, 500);
         assert_eq!(safety.compliance.sla_threshold_ms, 3_600_000);

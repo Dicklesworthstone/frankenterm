@@ -2900,6 +2900,8 @@ pub struct PolicyEngine {
     reliability_registry: crate::connector_reliability::ReliabilityRegistry,
     /// Connector bundle registry for tier-based connector packaging and trust gating
     bundle_registry: crate::connector_bundles::BundleRegistry,
+    /// Connector mesh for multi-host/zone routing federation
+    connector_mesh: crate::connector_mesh::ConnectorMesh,
 }
 
 impl PolicyEngine {
@@ -2944,6 +2946,9 @@ impl PolicyEngine {
             bundle_registry: crate::connector_bundles::BundleRegistry::new(
                 crate::connector_bundles::BundleRegistryConfig::default(),
             ),
+            connector_mesh: crate::connector_mesh::ConnectorMesh::new(
+                crate::connector_mesh::ConnectorMeshConfig::default(),
+            ),
         }
     }
 
@@ -2984,6 +2989,9 @@ impl PolicyEngine {
         );
         engine.bundle_registry = crate::connector_bundles::BundleRegistry::new(
             config.bundle_registry.clone(),
+        );
+        engine.connector_mesh = crate::connector_mesh::ConnectorMesh::new(
+            config.connector_mesh.clone(),
         );
         engine
     }
@@ -3154,6 +3162,17 @@ impl PolicyEngine {
     /// Access the bundle registry mutably.
     pub fn bundle_registry_mut(&mut self) -> &mut crate::connector_bundles::BundleRegistry {
         &mut self.bundle_registry
+    }
+
+    /// Access the connector mesh.
+    #[must_use]
+    pub fn connector_mesh(&self) -> &crate::connector_mesh::ConnectorMesh {
+        &self.connector_mesh
+    }
+
+    /// Access the connector mesh mutably.
+    pub fn connector_mesh_mut(&mut self) -> &mut crate::connector_mesh::ConnectorMesh {
+        &mut self.connector_mesh
     }
 
     /// Register a connector bundle with audit chain recording and compliance notification.
@@ -3328,6 +3347,18 @@ impl PolicyEngine {
             PolicySubsystemInput {
                 evaluations: bundle_tel.bundles_registered + bundle_tel.bundles_updated + bundle_tel.bundles_removed,
                 denials: bundle_tel.validation_failures,
+                active_quarantines: 0,
+                active_violations: 0,
+            },
+        );
+
+        // Feed connector mesh counters
+        let mesh_snap = self.connector_mesh.telemetry().snapshot();
+        collector.update_subsystem(
+            "connector_mesh",
+            PolicySubsystemInput {
+                evaluations: mesh_snap.routing_requests,
+                denials: mesh_snap.routing_failures,
                 active_quarantines: 0,
                 active_violations: 0,
             },
@@ -10782,7 +10813,7 @@ mod tests {
         let snap = engine.compliance_engine_mut().snapshot(1000);
         assert!(snap.counters.total_evaluations > 0);
         // Audit chain should have an entry
-        assert!(engine.audit_chain().len() > 0);
+        assert!(!engine.audit_chain().is_empty());
     }
 
     #[test]
@@ -11373,5 +11404,56 @@ mod tests {
         };
         let engine = PolicyEngine::from_safety_config(&config);
         assert!(engine.bundle_registry().is_empty());
+    }
+
+    // =========================================================================
+    // ConnectorMesh integration tests
+    // =========================================================================
+
+    #[test]
+    fn connector_mesh_accessible_from_engine() {
+        let engine = PolicyEngine::permissive();
+        assert_eq!(engine.connector_mesh().telemetry().snapshot().routing_requests, 0);
+    }
+
+    #[test]
+    fn connector_mesh_zone_management_through_engine() {
+        use crate::connector_mesh::MeshZone;
+
+        let mut engine = PolicyEngine::permissive();
+        engine.connector_mesh_mut().register_zone(MeshZone {
+            zone_id: "us-east-1".to_string(),
+            label: "US East".to_string(),
+            priority: 1,
+            active: true,
+            metadata: std::collections::BTreeMap::new(),
+        }).unwrap();
+        let zones = engine.connector_mesh().zones();
+        assert!(zones.iter().any(|z| z.zone_id == "us-east-1"));
+    }
+
+    #[test]
+    fn connector_mesh_from_safety_config() {
+        use crate::connector_mesh::ConnectorMeshConfig;
+
+        let config = crate::config::SafetyConfig {
+            connector_mesh: ConnectorMeshConfig {
+                heartbeat_timeout_ms: 10_000,
+                allow_cross_zone_fallback: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from_safety_config(&config);
+        assert_eq!(engine.connector_mesh().telemetry().snapshot().routing_requests, 0);
+    }
+
+    #[test]
+    fn metrics_dashboard_reflects_connector_mesh() {
+        let mut engine = PolicyEngine::permissive();
+        let dash = engine.metrics_dashboard(1000);
+        let mesh = &dash.subsystem_metrics["connector_mesh"];
+        assert_eq!(mesh.evaluations, 0);
+        assert_eq!(mesh.denials, 0);
     }
 }
