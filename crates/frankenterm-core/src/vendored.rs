@@ -15,6 +15,8 @@ pub use mux_client::{
     DirectMuxClient, DirectMuxClientConfig, DirectMuxError, PaneDelta, PaneOutputSubscription,
     SubscriptionConfig, subscribe_pane_output,
 };
+#[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+pub use mux_client::subscribe_pane_output_with_inherited_cx;
 
 #[cfg(all(feature = "vendored", unix))]
 pub mod mux_pool;

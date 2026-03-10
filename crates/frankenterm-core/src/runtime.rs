@@ -65,6 +65,8 @@ use crate::tailer::{CaptureEvent, TailerConfig, TailerPollTaskSet, TailerSupervi
 use crate::vendored::{
     DirectMuxClient, DirectMuxClientConfig, PaneDelta, SubscriptionConfig, subscribe_pane_output,
 };
+#[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+use crate::vendored::subscribe_pane_output_with_inherited_cx;
 use crate::watchdog::HeartbeatRegistry;
 use crate::wezterm::{
     PaneInfo, WeztermHandle, WeztermHandleSource, WeztermInterface, wezterm_handle_with_timeout,
@@ -2885,10 +2887,23 @@ async fn run_vendored_streaming_capture(
     subscription_config: SubscriptionConfig,
     capture_tx: mpsc::Sender<CaptureEvent>,
 ) -> String {
+    #[cfg(feature = "asupersync-runtime")]
+    let cx = crate::cx::for_request();
+
     let mut bridge = StreamingBridge::new();
     let mut client_config = DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
     client_config.compression_mode = compression_mode;
 
+    #[cfg(feature = "asupersync-runtime")]
+    let client = match DirectMuxClient::connect_with_cx(&cx, client_config).await {
+        Ok(client) => client,
+        Err(err) => {
+            bridge.record_fallback();
+            return format!("connect error: {err}");
+        }
+    };
+
+    #[cfg(not(feature = "asupersync-runtime"))]
     let client = match DirectMuxClient::connect(client_config).await {
         Ok(client) => client,
         Err(err) => {
@@ -2904,12 +2919,27 @@ async fn run_vendored_streaming_capture(
         "Started vendored pane streaming subscription"
     );
 
+    #[cfg(feature = "asupersync-runtime")]
+    let mut subscription = subscribe_pane_output_with_inherited_cx(
+        &cx,
+        client,
+        subscription_pane_id,
+        subscription_config.clone(),
+    );
+
+    #[cfg(not(feature = "asupersync-runtime"))]
     let mut subscription =
         subscribe_pane_output(client, subscription_pane_id, subscription_config.clone());
     let mut exit_reason = "subscription receiver closed".to_string();
 
     loop {
-        let Some(delta) = subscription.next().await else {
+        #[cfg(feature = "asupersync-runtime")]
+        let delta = subscription.next_with_cx(&cx).await;
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        let delta = subscription.next().await;
+
+        let Some(delta) = delta else {
             break;
         };
 

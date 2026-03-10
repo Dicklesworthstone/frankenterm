@@ -1829,6 +1829,28 @@ pub fn subscribe_pane_output_with_cx(
 ///
 /// Under `asupersync-runtime`, prefer [`subscribe_pane_output_with_cx`] so the
 /// background poller and receiver path share an explicit caller-owned `Cx`.
+#[cfg(feature = "asupersync-runtime")]
+pub fn subscribe_pane_output_with_inherited_cx(
+    cx: &Cx,
+    client: DirectMuxClient,
+    pane_id: u64,
+    config: SubscriptionConfig,
+) -> PaneOutputSubscription {
+    let (tx, rx) = mpsc::channel(config.channel_capacity);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let poller_cx = cx.clone();
+
+    let task = SubscriptionTask::Ambient(task::spawn(async move {
+        run_subscription_loop(&poller_cx, client, pane_id, config, tx, cancel_rx).await;
+    }));
+
+    PaneOutputSubscription {
+        receiver: rx,
+        cancel: cancel_tx,
+        task: Some(task),
+    }
+}
+
 pub fn subscribe_pane_output(
     client: DirectMuxClient,
     pane_id: u64,
@@ -4857,6 +4879,119 @@ mod tests {
 
             sub.cancel();
             assert_eq!(observed, Some((31, 1, 1, 2)));
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn subscription_with_inherited_cx_receives_output_delta() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("subscription-with-inherited-cx.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+
+            task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut emitted_output = false;
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = match unix_stream_read(&mut stream, &mut temp).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(_) => {
+                                let dirty_lines = if emitted_output {
+                                    Vec::new()
+                                } else {
+                                    emitted_output = true;
+                                    vec![0isize..2isize]
+                                };
+
+                                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+                                    pane_id: 32,
+                                    mouse_grabbed: false,
+                                    cursor_position:
+                                        mux::renderable::StableCursorPosition::default(),
+                                    dimensions: mux::renderable::RenderableDimensions {
+                                        cols: 80,
+                                        viewport_rows: 24,
+                                        scrollback_rows: 0,
+                                        physical_top: 0,
+                                        scrollback_top: 0,
+                                        dpi: 96,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                        reverse_video: false,
+                                    },
+                                    dirty_lines,
+                                    title: "with-inherited-cx".to_string(),
+                                    working_dir: None,
+                                    bonus_lines: Vec::new().into(),
+                                    input_serial: None,
+                                    seqno: 1,
+                                })
+                            }
+                            _ => continue,
+                        };
+                        let mut out = Vec::new();
+                        response.encode(&mut out, decoded.serial).expect("encode");
+                        stream.write_all(&out).await.expect("write");
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect");
+            let mut sub = subscribe_pane_output_with_inherited_cx(
+                &cx,
+                client,
+                32,
+                SubscriptionConfig {
+                    poll_interval: Duration::from_millis(10),
+                    min_poll_interval: Duration::from_millis(5),
+                    channel_capacity: 8,
+                },
+            );
+
+            let mut observed = None;
+            for _ in 0..20 {
+                match timeout(Duration::from_millis(200), sub.next_with_cx(&cx)).await {
+                    Ok(Some(PaneDelta::Output {
+                        pane_id,
+                        seqno,
+                        dirty_range_count,
+                        dirty_row_count,
+                        ..
+                    })) => {
+                        observed = Some((pane_id, seqno, dirty_range_count, dirty_row_count));
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+
+            sub.cancel();
+            assert_eq!(observed, Some((32, 1, 1, 2)));
         });
     }
 
