@@ -221,12 +221,34 @@ fn arb_quarantine_telemetry_snapshot() -> impl Strategy<Value = QuarantineTeleme
     )
 }
 
+fn arb_quarantine_config() -> impl Strategy<Value = QuarantineConfig> {
+    (
+        1..2048usize,
+        proptest::bool::ANY,
+        arb_quarantine_severity(),
+    )
+        .prop_map(|(max_audit_events, auto_expire, default_severity)| QuarantineConfig {
+            max_audit_events,
+            auto_expire,
+            default_severity,
+        })
+}
+
 // =============================================================================
 // Serde roundtrip tests
 // =============================================================================
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // -- QuarantineConfig --
+
+    #[test]
+    fn quarantine_config_json_roundtrip(config in arb_quarantine_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: QuarantineConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(config, back);
+    }
 
     // -- QuarantineReason --
 
@@ -775,5 +797,46 @@ proptest! {
         let mut reg = QuarantineRegistry::new();
         reg.trip_kill_switch(KillSwitchLevel::EmergencyHalt, "op", "test", 1000);
         prop_assert!(reg.is_blocked_for_all(&comp_id));
+    }
+
+    // -- QuarantineConfig behavioral properties --
+
+    #[test]
+    fn config_default_deserialization_always_valid(json_fragment in "\\{\\}") {
+        // Empty JSON object should always produce valid defaults
+        let _ = json_fragment; // Suppress unused warning
+        let config: QuarantineConfig = serde_json::from_str("{}").unwrap();
+        prop_assert_eq!(config.max_audit_events, 512);
+        prop_assert!(config.auto_expire);
+        prop_assert_eq!(config.default_severity, QuarantineSeverity::Restricted);
+    }
+
+    #[test]
+    fn from_config_respects_max_audit_events(
+        max_events in 1..100usize
+    ) {
+        let config = QuarantineConfig {
+            max_audit_events: max_events,
+            auto_expire: true,
+            default_severity: QuarantineSeverity::Advisory,
+        };
+        let mut reg = QuarantineRegistry::from_config(&config);
+        // Fill beyond max_events
+        for i in 0..(max_events + 10) {
+            reg.quarantine(
+                &format!("c{i}"),
+                ComponentKind::Pane,
+                QuarantineSeverity::Advisory,
+                QuarantineReason::PolicyViolation {
+                    rule_id: "r1".into(),
+                    detail: "test".into(),
+                },
+                "op",
+                i as u64,
+                0,
+            ).unwrap();
+        }
+        // Audit log should be bounded by config
+        prop_assert!(reg.audit_log().len() <= max_events);
     }
 }
