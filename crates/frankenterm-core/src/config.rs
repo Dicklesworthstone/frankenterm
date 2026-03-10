@@ -1562,6 +1562,9 @@ pub struct SafetyConfig {
 
     /// Policy decision log settings (forensics and compliance)
     pub decision_log: crate::policy_decision_log::DecisionLogConfig,
+
+    /// Quarantine subsystem settings (component isolation and kill switch)
+    pub quarantine: crate::policy_quarantine::QuarantineConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1580,6 +1583,7 @@ impl Default for SafetyConfig {
             semantic_shock: SemanticShockSafetyConfig::default(),
             rules: PolicyRulesConfig::default(),
             decision_log: crate::policy_decision_log::DecisionLogConfig::default(),
+            quarantine: crate::policy_quarantine::QuarantineConfig::default(),
         }
     }
 }
@@ -6760,5 +6764,50 @@ block_alt_screen = true
         let safety: SafetyConfig = toml::from_str(toml_str).expect("deserialize");
         assert_eq!(safety.decision_log.max_entries, 10_000);
         assert!(safety.decision_log.record_allows);
+    }
+
+    // ---- Quarantine config TOML tests ----
+
+    #[test]
+    fn safety_config_quarantine_defaults() {
+        let safety = SafetyConfig::default();
+        assert_eq!(safety.quarantine.max_audit_events, 512);
+        assert!(safety.quarantine.auto_expire);
+        assert_eq!(
+            safety.quarantine.default_severity,
+            crate::policy_quarantine::QuarantineSeverity::Restricted
+        );
+    }
+
+    #[test]
+    fn safety_config_quarantine_toml_roundtrip() {
+        let mut safety = SafetyConfig::default();
+        safety.quarantine.max_audit_events = 1024;
+        safety.quarantine.auto_expire = false;
+        safety.quarantine.default_severity =
+            crate::policy_quarantine::QuarantineSeverity::Isolated;
+
+        let toml_str = toml::to_string(&safety).expect("serialize");
+        let back: SafetyConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(back.quarantine.max_audit_events, 1024);
+        assert!(!back.quarantine.auto_expire);
+        assert_eq!(
+            back.quarantine.default_severity,
+            crate::policy_quarantine::QuarantineSeverity::Isolated
+        );
+    }
+
+    #[test]
+    fn safety_config_missing_quarantine_uses_defaults() {
+        // Old TOML without [safety.quarantine] should use defaults
+        let toml_str = r#"
+rate_limit_per_pane = 30
+rate_limit_global = 100
+require_prompt_active = true
+block_alt_screen = true
+"#;
+        let safety: SafetyConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(safety.quarantine.max_audit_events, 512);
+        assert!(safety.quarantine.auto_expire);
     }
 }

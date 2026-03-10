@@ -453,6 +453,7 @@ pub struct QuarantineRegistry {
     kill_switch: KillSwitch,
     audit_log: VecDeque<QuarantineAuditEvent>,
     telemetry: QuarantineTelemetry,
+    max_audit_events: usize,
 }
 
 impl QuarantineRegistry {
@@ -464,6 +465,19 @@ impl QuarantineRegistry {
             kill_switch: KillSwitch::disarmed(),
             audit_log: VecDeque::new(),
             telemetry: QuarantineTelemetry::default(),
+            max_audit_events: DEFAULT_MAX_AUDIT_EVENTS,
+        }
+    }
+
+    /// Create a registry from configuration.
+    #[must_use]
+    pub fn from_config(config: &QuarantineConfig) -> Self {
+        Self {
+            components: BTreeMap::new(),
+            kill_switch: KillSwitch::disarmed(),
+            audit_log: VecDeque::new(),
+            telemetry: QuarantineTelemetry::default(),
+            max_audit_events: config.max_audit_events,
         }
     }
 
@@ -932,7 +946,7 @@ impl QuarantineRegistry {
     // ---- Internal helpers ----
 
     fn emit_audit(&mut self, event: QuarantineAuditEvent) {
-        if self.audit_log.len() >= MAX_AUDIT_EVENTS {
+        if self.audit_log.len() >= self.max_audit_events {
             self.audit_log.pop_front();
         }
         self.audit_log.push_back(event);
@@ -1335,7 +1349,7 @@ mod tests {
     #[test]
     fn audit_log_bounded() {
         let mut reg = QuarantineRegistry::new();
-        for i in 0..MAX_AUDIT_EVENTS + 100 {
+        for i in 0..DEFAULT_MAX_AUDIT_EVENTS + 100 {
             reg.quarantine(
                 &format!("c{i}"),
                 ComponentKind::Pane,
@@ -1347,7 +1361,7 @@ mod tests {
             )
             .unwrap();
         }
-        assert!(reg.audit_log().len() <= MAX_AUDIT_EVENTS);
+        assert!(reg.audit_log().len() <= DEFAULT_MAX_AUDIT_EVENTS);
     }
 
     // ---- Display impls ----

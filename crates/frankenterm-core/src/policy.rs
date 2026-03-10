@@ -2892,14 +2892,17 @@ impl PolicyEngine {
     /// guard settings in a single call.
     #[must_use]
     pub fn from_safety_config(config: &crate::config::SafetyConfig) -> Self {
-        Self::new(
+        let mut engine = Self::new(
             config.rate_limit_per_pane,
             config.rate_limit_global,
             config.require_prompt_active,
         )
         .with_command_gate_config(config.command_gate.clone())
         .with_policy_rules(config.rules.clone())
-        .with_decision_log_config(config.decision_log.clone())
+        .with_decision_log_config(config.decision_log.clone());
+        engine.quarantine_registry =
+            QuarantineRegistry::from_config(&config.quarantine);
+        engine
     }
 
     /// Create a policy engine with permissive defaults (for testing)
