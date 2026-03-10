@@ -11,6 +11,7 @@ CORRELATION_ID="ft-nu4.4.3.2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}.jsonl"
 SUMMARY_FILE="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_summary.json"
 TARGET_DIR="target-rch-ft-nu4-4-3-2-${RUN_ID}"
+REMOTE_TARGET_DIR="/tmp/${TARGET_DIR}"
 
 emit_log() {
   local outcome="$1"
@@ -219,7 +220,7 @@ run_rch_guarded \
   "${CORE_E2E_LOG}" \
   env TMPDIR=/tmp \
     rch exec -- \
-    env CARGO_TARGET_DIR="${TARGET_DIR}" \
+    env TMPDIR=/tmp CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
     cargo test -p frankenterm-core --features distributed --test distributed_streaming_e2e -- --nocapture
 
 LISTENER_E2E_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_listener_stream_path.log"
@@ -232,7 +233,7 @@ run_rch_guarded \
   "${LISTENER_E2E_LOG}" \
   env TMPDIR=/tmp \
     rch exec -- \
-    env CARGO_TARGET_DIR="${TARGET_DIR}" \
+    env TMPDIR=/tmp CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
     cargo test -p frankenterm --features distributed distributed_listener_persists_agent_stream_and_surfaces_remote_status_and_query -- --nocapture
 
 BENCH_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_wa_agent_streaming_bench.log"
@@ -245,7 +246,7 @@ run_rch_guarded \
   "${BENCH_LOG}" \
   env TMPDIR=/tmp \
     rch exec -- \
-    env CARGO_TARGET_DIR="${TARGET_DIR}" \
+    env TMPDIR=/tmp CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
     cargo bench -p frankenterm-core --features distributed --bench wa_agent_streaming -- --quick
 
 emit_log \
