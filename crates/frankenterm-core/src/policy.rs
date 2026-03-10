@@ -2894,6 +2894,10 @@ pub struct PolicyEngine {
     connector_governor: crate::connector_governor::ConnectorGovernor,
     /// Connector registry client for package trust verification
     connector_registry: crate::connector_registry::ConnectorRegistryClient,
+    /// Connector host runtime for execution environment management
+    connector_host_runtime: crate::connector_host_runtime::ConnectorHostRuntime,
+    /// Connector reliability registry (circuit breakers + DLQ)
+    reliability_registry: crate::connector_reliability::ReliabilityRegistry,
 }
 
 impl PolicyEngine {
@@ -2929,6 +2933,12 @@ impl PolicyEngine {
             connector_registry: crate::connector_registry::ConnectorRegistryClient::new(
                 crate::connector_registry::ConnectorRegistryConfig::default(),
             ),
+            connector_host_runtime: crate::connector_host_runtime::ConnectorHostRuntime::new(
+                crate::connector_host_runtime::ConnectorHostConfig::default(),
+            ).expect("default ConnectorHostConfig should be valid"),
+            reliability_registry: crate::connector_reliability::ReliabilityRegistry::new(
+                crate::connector_reliability::ConnectorReliabilityConfig::default(),
+            ),
         }
     }
 
@@ -2961,6 +2971,12 @@ impl PolicyEngine {
             crate::connector_governor::ConnectorGovernor::new(config.connector_governor.clone());
         engine.connector_registry =
             crate::connector_registry::ConnectorRegistryClient::new(config.connector_registry.clone());
+        engine.connector_host_runtime = crate::connector_host_runtime::ConnectorHostRuntime::new(
+            config.connector_host_runtime.clone(),
+        ).expect("ConnectorHostConfig from SafetyConfig should be valid");
+        engine.reliability_registry = crate::connector_reliability::ReliabilityRegistry::new(
+            config.connector_reliability.clone(),
+        );
         engine
     }
 
@@ -3097,6 +3113,28 @@ impl PolicyEngine {
     /// Access the connector registry mutably.
     pub fn connector_registry_mut(&mut self) -> &mut crate::connector_registry::ConnectorRegistryClient {
         &mut self.connector_registry
+    }
+
+    /// Access the connector host runtime.
+    #[must_use]
+    pub fn connector_host_runtime(&self) -> &crate::connector_host_runtime::ConnectorHostRuntime {
+        &self.connector_host_runtime
+    }
+
+    /// Access the connector host runtime mutably.
+    pub fn connector_host_runtime_mut(&mut self) -> &mut crate::connector_host_runtime::ConnectorHostRuntime {
+        &mut self.connector_host_runtime
+    }
+
+    /// Access the reliability registry.
+    #[must_use]
+    pub fn reliability_registry(&self) -> &crate::connector_reliability::ReliabilityRegistry {
+        &self.reliability_registry
+    }
+
+    /// Access the reliability registry mutably.
+    pub fn reliability_registry_mut(&mut self) -> &mut crate::connector_reliability::ReliabilityRegistry {
+        &mut self.reliability_registry
     }
 
     /// Record a credential broker denial to the compliance engine and audit chain.
@@ -10984,6 +11022,52 @@ mod tests {
         let reg_config = engine.connector_registry().config();
         assert_eq!(reg_config.max_packages, 128);
         assert!(reg_config.enforce_transparency);
+    }
+
+    // ── ConnectorHostRuntime integration tests ───────────────────────
+
+    #[test]
+    fn connector_host_runtime_default_in_policy_engine() {
+        let engine = PolicyEngine::new(30, 100, true);
+        assert_eq!(
+            *engine.connector_host_runtime().state(),
+            crate::connector_host_runtime::ConnectorLifecycleState::Stopped,
+        );
+    }
+
+    #[test]
+    fn connector_host_runtime_from_safety_config() {
+        let config = crate::config::SafetyConfig {
+            connector_host_runtime: crate::connector_host_runtime::ConnectorHostConfig {
+                heartbeat_interval_ms: 5000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from_safety_config(&config);
+        assert!(engine.connector_host_runtime().transition_history().is_empty());
+    }
+
+    // ── ReliabilityRegistry integration tests ────────────────────────
+
+    #[test]
+    fn reliability_registry_default_in_policy_engine() {
+        let engine = PolicyEngine::new(30, 100, true);
+        // No controllers exist initially — get() returns None
+        assert!(engine.reliability_registry().get("slack").is_none());
+    }
+
+    #[test]
+    fn reliability_registry_mut_creates_controller() {
+        let mut engine = PolicyEngine::permissive();
+        // get_or_create should create a new controller
+        let ctrl = engine.reliability_registry_mut().get_or_create("slack");
+        assert_eq!(
+            ctrl.circuit_status().state,
+            crate::circuit_breaker::CircuitStateKind::Closed,
+        );
+        // Now the registry has one controller
+        assert!(engine.reliability_registry().get("slack").is_some());
     }
 
     // =========================================================================

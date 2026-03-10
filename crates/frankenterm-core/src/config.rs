@@ -1586,6 +1586,12 @@ pub struct SafetyConfig {
 
     /// Connector registry settings (package trust verification)
     pub connector_registry: crate::connector_registry::ConnectorRegistryConfig,
+
+    /// Connector host runtime settings (execution environment)
+    pub connector_host_runtime: crate::connector_host_runtime::ConnectorHostConfig,
+
+    /// Connector reliability settings (circuit breaker + DLQ)
+    pub connector_reliability: crate::connector_reliability::ConnectorReliabilityConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1612,6 +1618,8 @@ impl Default for SafetyConfig {
             data_classifier: crate::connector_data_classification::ClassifierConfig::default(),
             connector_governor: crate::connector_governor::ConnectorGovernorConfig::default(),
             connector_registry: crate::connector_registry::ConnectorRegistryConfig::default(),
+            connector_host_runtime: crate::connector_host_runtime::ConnectorHostConfig::default(),
+            connector_reliability: crate::connector_reliability::ConnectorReliabilityConfig::default(),
         }
     }
 }
