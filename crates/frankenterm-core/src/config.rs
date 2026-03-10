@@ -1580,6 +1580,9 @@ pub struct SafetyConfig {
 
     /// Connector data classification settings (sensitivity tagging, redaction, audit)
     pub data_classifier: crate::connector_data_classification::ClassifierConfig,
+
+    /// Connector governor settings (rate-limit, quota, cost governance)
+    pub connector_governor: crate::connector_governor::ConnectorGovernorConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1604,6 +1607,7 @@ impl Default for SafetyConfig {
             credential_broker: crate::connector_credential_broker::CredentialBrokerConfig::default(),
             lifecycle_manager: crate::connector_lifecycle::LifecycleManagerConfig::default(),
             data_classifier: crate::connector_data_classification::ClassifierConfig::default(),
+            connector_governor: crate::connector_governor::ConnectorGovernorConfig::default(),
         }
     }
 }

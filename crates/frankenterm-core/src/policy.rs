@@ -2890,6 +2890,8 @@ pub struct PolicyEngine {
     lifecycle_manager: crate::connector_lifecycle::ConnectorLifecycleManager,
     /// Connector data classifier for sensitivity tagging and redaction
     data_classifier: crate::connector_data_classification::ConnectorDataClassifier,
+    /// Connector governor for rate-limit, quota, and cost governance
+    connector_governor: crate::connector_governor::ConnectorGovernor,
 }
 
 impl PolicyEngine {
@@ -2919,6 +2921,9 @@ impl PolicyEngine {
             data_classifier: crate::connector_data_classification::ConnectorDataClassifier::new(
                 crate::connector_data_classification::ClassifierConfig::default(),
             ),
+            connector_governor: crate::connector_governor::ConnectorGovernor::new(
+                crate::connector_governor::ConnectorGovernorConfig::default(),
+            ),
         }
     }
 
@@ -2947,6 +2952,8 @@ impl PolicyEngine {
             crate::connector_lifecycle::ConnectorLifecycleManager::new(config.lifecycle_manager.clone());
         engine.data_classifier =
             crate::connector_data_classification::ConnectorDataClassifier::new(config.data_classifier.clone());
+        engine.connector_governor =
+            crate::connector_governor::ConnectorGovernor::new(config.connector_governor.clone());
         engine
     }
 
@@ -3063,6 +3070,17 @@ impl PolicyEngine {
         &mut self.data_classifier
     }
 
+    /// Access the connector governor.
+    #[must_use]
+    pub fn connector_governor(&self) -> &crate::connector_governor::ConnectorGovernor {
+        &self.connector_governor
+    }
+
+    /// Access the connector governor mutably.
+    pub fn connector_governor_mut(&mut self) -> &mut crate::connector_governor::ConnectorGovernor {
+        &mut self.connector_governor
+    }
+
     /// Record a credential broker denial to the compliance engine and audit chain.
     fn credential_broker_record_denial(&mut self, connector_id: &str) {
         let ts = SystemTime::now()
@@ -3171,6 +3189,18 @@ impl PolicyEngine {
             PolicySubsystemInput {
                 evaluations: broker_snap.counters.leases_issued + broker_snap.counters.access_denied,
                 denials: broker_snap.counters.access_denied,
+                active_quarantines: 0,
+                active_violations: 0,
+            },
+        );
+
+        // Feed connector governor counters
+        let gov_snap = self.connector_governor.snapshot(now_ms);
+        collector.update_subsystem(
+            "connector_governor",
+            PolicySubsystemInput {
+                evaluations: gov_snap.telemetry.evaluations,
+                denials: gov_snap.telemetry.rejections,
                 active_quarantines: 0,
                 active_violations: 0,
             },
@@ -10832,6 +10862,71 @@ mod tests {
         engine.data_classifier_mut().register_policy(policy);
         // Verify the policy was registered (telemetry still zero, but no panic)
         assert_eq!(engine.data_classifier().telemetry().total_events(), 0);
+    }
+
+    // ── ConnectorGovernor integration tests ─────────────────────────
+
+    #[test]
+    fn connector_governor_default_in_policy_engine() {
+        let engine = PolicyEngine::new(30, 100, true);
+        let mut engine = engine;
+        let snap = engine.connector_governor_mut().snapshot(1000);
+        assert_eq!(snap.telemetry.evaluations, 0);
+    }
+
+    #[test]
+    fn connector_governor_from_safety_config() {
+        use crate::connector_governor::ConnectorGovernorConfig;
+        let config = crate::config::SafetyConfig {
+            connector_governor: ConnectorGovernorConfig {
+                global_rate_limit: crate::connector_governor::TokenBucketConfig {
+                    capacity: 500,
+                    refill_rate: 50,
+                    refill_interval_ms: 1000,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::from_safety_config(&config);
+        let snap = engine.connector_governor_mut().snapshot(1000);
+        assert_eq!(snap.telemetry.evaluations, 0);
+    }
+
+    #[test]
+    fn connector_governor_mut_accessible() {
+        use crate::connector_outbound_bridge::{ConnectorAction, ConnectorActionKind};
+        let mut engine = PolicyEngine::permissive();
+        let action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "corr-test".to_string(),
+            params: serde_json::json!({"test": true}),
+            created_at_ms: 1000,
+        };
+        let decision = engine.connector_governor_mut().evaluate(&action, 1000);
+        assert!(decision.is_allowed());
+        let snap = engine.connector_governor_mut().snapshot(2000);
+        assert_eq!(snap.telemetry.evaluations, 1);
+        assert_eq!(snap.telemetry.allows, 1);
+    }
+
+    #[test]
+    fn metrics_dashboard_reflects_governor() {
+        use crate::connector_outbound_bridge::{ConnectorAction, ConnectorActionKind};
+        let mut engine = PolicyEngine::permissive();
+        let action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "corr-test".to_string(),
+            params: serde_json::json!({"test": true}),
+            created_at_ms: 1000,
+        };
+        engine.connector_governor_mut().evaluate(&action, 1000);
+        let dash = engine.metrics_dashboard(2000);
+        let gov = &dash.subsystem_metrics["connector_governor"];
+        assert_eq!(gov.evaluations, 1);
+        assert_eq!(gov.denials, 0);
     }
 
     // =========================================================================
