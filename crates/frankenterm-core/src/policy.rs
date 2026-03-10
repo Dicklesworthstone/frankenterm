@@ -2902,6 +2902,8 @@ pub struct PolicyEngine {
     bundle_registry: crate::connector_bundles::BundleRegistry,
     /// Connector mesh for multi-host/zone routing federation
     connector_mesh: crate::connector_mesh::ConnectorMesh,
+    /// Ingestion pipeline for connector event recording and audit trails
+    ingestion_pipeline: crate::connector_bundles::IngestionPipeline,
 }
 
 impl PolicyEngine {
@@ -2949,6 +2951,9 @@ impl PolicyEngine {
             connector_mesh: crate::connector_mesh::ConnectorMesh::new(
                 crate::connector_mesh::ConnectorMeshConfig::default(),
             ),
+            ingestion_pipeline: crate::connector_bundles::IngestionPipeline::new(
+                crate::connector_bundles::IngestionPipelineConfig::default(),
+            ),
         }
     }
 
@@ -2992,6 +2997,9 @@ impl PolicyEngine {
         );
         engine.connector_mesh = crate::connector_mesh::ConnectorMesh::new(
             config.connector_mesh.clone(),
+        );
+        engine.ingestion_pipeline = crate::connector_bundles::IngestionPipeline::new(
+            config.ingestion_pipeline.clone(),
         );
         engine
     }
@@ -3173,6 +3181,17 @@ impl PolicyEngine {
     /// Access the connector mesh mutably.
     pub fn connector_mesh_mut(&mut self) -> &mut crate::connector_mesh::ConnectorMesh {
         &mut self.connector_mesh
+    }
+
+    /// Access the ingestion pipeline.
+    #[must_use]
+    pub fn ingestion_pipeline(&self) -> &crate::connector_bundles::IngestionPipeline {
+        &self.ingestion_pipeline
+    }
+
+    /// Access the ingestion pipeline mutably.
+    pub fn ingestion_pipeline_mut(&mut self) -> &mut crate::connector_bundles::IngestionPipeline {
+        &mut self.ingestion_pipeline
     }
 
     /// Register a connector bundle with audit chain recording and compliance notification.
@@ -3359,6 +3378,18 @@ impl PolicyEngine {
             PolicySubsystemInput {
                 evaluations: mesh_snap.routing_requests,
                 denials: mesh_snap.routing_failures,
+                active_quarantines: 0,
+                active_violations: 0,
+            },
+        );
+
+        // Feed ingestion pipeline counters
+        let ingest_tel = self.ingestion_pipeline.telemetry();
+        collector.update_subsystem(
+            "ingestion_pipeline",
+            PolicySubsystemInput {
+                evaluations: ingest_tel.events_received,
+                denials: ingest_tel.events_rejected,
                 active_quarantines: 0,
                 active_violations: 0,
             },
@@ -11455,5 +11486,40 @@ mod tests {
         let mesh = &dash.subsystem_metrics["connector_mesh"];
         assert_eq!(mesh.evaluations, 0);
         assert_eq!(mesh.denials, 0);
+    }
+
+    // =========================================================================
+    // IngestionPipeline integration tests
+    // =========================================================================
+
+    #[test]
+    fn ingestion_pipeline_accessible_from_engine() {
+        let engine = PolicyEngine::permissive();
+        assert_eq!(engine.ingestion_pipeline().telemetry().events_received, 0);
+    }
+
+    #[test]
+    fn ingestion_pipeline_from_safety_config() {
+        use crate::connector_bundles::IngestionPipelineConfig;
+
+        let config = crate::config::SafetyConfig {
+            ingestion_pipeline: IngestionPipelineConfig {
+                max_ingest_per_sec: 100,
+                max_audit_entries: 2048,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from_safety_config(&config);
+        assert_eq!(engine.ingestion_pipeline().telemetry().events_received, 0);
+    }
+
+    #[test]
+    fn metrics_dashboard_reflects_ingestion_pipeline() {
+        let mut engine = PolicyEngine::permissive();
+        let dash = engine.metrics_dashboard(1000);
+        let ip = &dash.subsystem_metrics["ingestion_pipeline"];
+        assert_eq!(ip.evaluations, 0);
+        assert_eq!(ip.denials, 0);
     }
 }

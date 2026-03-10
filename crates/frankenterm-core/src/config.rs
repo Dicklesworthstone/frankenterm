@@ -1598,6 +1598,9 @@ pub struct SafetyConfig {
 
     /// Connector mesh settings (multi-host/zone routing federation)
     pub connector_mesh: crate::connector_mesh::ConnectorMeshConfig,
+
+    /// Ingestion pipeline settings (event ingestion, rate limiting, audit chain)
+    pub ingestion_pipeline: crate::connector_bundles::IngestionPipelineConfig,
 }
 
 impl Default for SafetyConfig {
@@ -1628,6 +1631,7 @@ impl Default for SafetyConfig {
             connector_reliability: crate::connector_reliability::ConnectorReliabilityConfig::default(),
             bundle_registry: crate::connector_bundles::BundleRegistryConfig::default(),
             connector_mesh: crate::connector_mesh::ConnectorMeshConfig::default(),
+            ingestion_pipeline: crate::connector_bundles::IngestionPipelineConfig::default(),
         }
     }
 }
