@@ -178,6 +178,7 @@ pub mod extensions;
 pub mod fd_budget;
 pub mod fenwick_tree;
 pub mod fibonacci_heap;
+pub mod forensic_export;
 pub mod fleet_launcher;
 pub mod gc;
 pub mod graph_scoring;
