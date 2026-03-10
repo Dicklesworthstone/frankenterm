@@ -31,6 +31,9 @@ use crate::config::{
     CommandGateConfig, DcgDenyPolicy, DcgMode, PolicyRule, PolicyRuleDecision, PolicyRuleMatch,
     PolicyRulesConfig,
 };
+use crate::connector_credential_broker::{
+    ConnectorCredentialBroker, CredentialBrokerConfig, CredentialScope, CredentialSensitivity,
+};
 use crate::identity_graph::{AuthAction, PrincipalId, PrincipalKind, ResourceId, ResourceKind};
 use crate::policy_audit_chain::{AuditChain, AuditEntryKind};
 use crate::policy_compliance::ComplianceEngine;
@@ -146,6 +149,20 @@ impl ActionKind {
                 | Self::DeleteFile
                 | Self::ExecCommand
                 | Self::ConnectorNotify
+                | Self::ConnectorTicket
+                | Self::ConnectorTriggerWorkflow
+                | Self::ConnectorAuditLog
+                | Self::ConnectorInvoke
+                | Self::ConnectorCredentialAction
+        )
+    }
+
+    /// Returns true if this is a connector-scoped action.
+    #[must_use]
+    pub const fn is_connector_action(&self) -> bool {
+        matches!(
+            self,
+            Self::ConnectorNotify
                 | Self::ConnectorTicket
                 | Self::ConnectorTriggerWorkflow
                 | Self::ConnectorAuditLog
@@ -2687,12 +2704,10 @@ impl RulePredicate {
     pub fn evaluate(&self, input: &PolicyInput) -> bool {
         match self {
             Self::Action { values } => {
-                !values.is_empty()
-                    && values.iter().any(|v| v == input.action.as_str())
+                !values.is_empty() && values.iter().any(|v| v == input.action.as_str())
             }
             Self::Actor { values } => {
-                !values.is_empty()
-                    && values.iter().any(|v| v == input.actor.as_str())
+                !values.is_empty() && values.iter().any(|v| v == input.actor.as_str())
             }
             Self::Surface { values } => {
                 !values.is_empty()
@@ -2706,16 +2721,12 @@ impl RulePredicate {
             },
             Self::PaneTitle { patterns } => match &input.pane_title {
                 Some(title) => {
-                    !patterns.is_empty()
-                        && patterns.iter().any(|p| glob_match(p, title))
+                    !patterns.is_empty() && patterns.iter().any(|p| glob_match(p, title))
                 }
                 None => false,
             },
             Self::PaneCwd { patterns } => match &input.pane_cwd {
-                Some(cwd) => {
-                    !patterns.is_empty()
-                        && patterns.iter().any(|p| glob_match(p, cwd))
-                }
+                Some(cwd) => !patterns.is_empty() && patterns.iter().any(|p| glob_match(p, cwd)),
                 None => false,
             },
             Self::PaneDomain { values } => match &input.domain {
@@ -2725,16 +2736,15 @@ impl RulePredicate {
             Self::CommandPattern { patterns } => match &input.command_text {
                 Some(text) => {
                     !patterns.is_empty()
-                        && patterns.iter().any(|p| {
-                            Regex::new(p).is_ok_and(|re| re.is_match(text))
-                        })
+                        && patterns
+                            .iter()
+                            .any(|p| Regex::new(p).is_ok_and(|re| re.is_match(text)))
                 }
                 None => false,
             },
             Self::AgentType { values } => match &input.agent_type {
                 Some(agent) => {
-                    !values.is_empty()
-                        && values.iter().any(|v| v.eq_ignore_ascii_case(agent))
+                    !values.is_empty() && values.iter().any(|v| v.eq_ignore_ascii_case(agent))
                 }
                 None => false,
             },
@@ -2869,6 +2879,10 @@ pub struct PolicyEngine {
     audit_chain: AuditChain,
     /// Compliance engine for violation tracking and reporting
     compliance_engine: ComplianceEngine,
+    /// Credential broker for JIT secret provisioning and access control
+    credential_broker: ConnectorCredentialBroker,
+    /// Credential broker configuration (sensitivity ceiling, etc.)
+    credential_broker_config: CredentialBrokerConfig,
 }
 
 impl PolicyEngine {
@@ -2890,6 +2904,8 @@ impl PolicyEngine {
             quarantine_registry: QuarantineRegistry::new(),
             audit_chain: AuditChain::new(1024),
             compliance_engine: ComplianceEngine::new(500, 3_600_000),
+            credential_broker: ConnectorCredentialBroker::new(),
+            credential_broker_config: CredentialBrokerConfig::default(),
         }
     }
 
@@ -2908,12 +2924,12 @@ impl PolicyEngine {
         .with_command_gate_config(config.command_gate.clone())
         .with_policy_rules(config.rules.clone())
         .with_decision_log_config(config.decision_log.clone());
-        engine.quarantine_registry =
-            QuarantineRegistry::from_config(&config.quarantine);
-        engine.audit_chain =
-            AuditChain::from_config(&config.audit_chain);
-        engine.compliance_engine =
-            ComplianceEngine::from_config(&config.compliance);
+        engine.quarantine_registry = QuarantineRegistry::from_config(&config.quarantine);
+        engine.audit_chain = AuditChain::from_config(&config.audit_chain);
+        engine.compliance_engine = ComplianceEngine::from_config(&config.compliance);
+        engine.credential_broker =
+            ConnectorCredentialBroker::from_config(&config.credential_broker);
+        engine.credential_broker_config = config.credential_broker.clone();
         engine
     }
 
@@ -2995,6 +3011,33 @@ impl PolicyEngine {
     /// Access the compliance engine mutably (for recording violations, remediations).
     pub fn compliance_engine_mut(&mut self) -> &mut ComplianceEngine {
         &mut self.compliance_engine
+    }
+
+    /// Access the credential broker.
+    #[must_use]
+    pub fn credential_broker(&self) -> &ConnectorCredentialBroker {
+        &self.credential_broker
+    }
+
+    /// Access the credential broker mutably (for registering providers, rules, etc.).
+    pub fn credential_broker_mut(&mut self) -> &mut ConnectorCredentialBroker {
+        &mut self.credential_broker
+    }
+
+    /// Record a credential broker denial to the compliance engine and audit chain.
+    fn credential_broker_record_denial(&mut self, connector_id: &str) {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.compliance_engine.record_evaluation(true);
+        self.audit_chain.append(
+            AuditEntryKind::PolicyDecision,
+            connector_id,
+            &format!("credential access denied for connector '{connector_id}'"),
+            "policy.credential_broker",
+            ts,
+        );
     }
 
     /// Get the current risk configuration
@@ -3366,13 +3409,30 @@ impl PolicyEngine {
     /// assert!(decision.is_allowed());
     /// ```
     pub fn authorize(&mut self, input: &PolicyInput) -> PolicyDecision {
-        let decision = self.evaluate_authorization(input);
+        let decision = self.evaluate_authorization(input, None, None);
+        self.record_to_decision_log(input, &decision);
+        decision
+    }
+
+    /// Authorize a connector credential action using an explicit least-privilege scope.
+    pub fn authorize_connector_credential_action(
+        &mut self,
+        input: &PolicyInput,
+        scope: &CredentialScope,
+        sensitivity: CredentialSensitivity,
+    ) -> PolicyDecision {
+        let decision = self.evaluate_authorization(input, Some(scope), Some(sensitivity));
         self.record_to_decision_log(input, &decision);
         decision
     }
 
     /// Core authorization logic (called by `authorize()`).
-    fn evaluate_authorization(&mut self, input: &PolicyInput) -> PolicyDecision {
+    fn evaluate_authorization(
+        &mut self,
+        input: &PolicyInput,
+        credential_scope: Option<&CredentialScope>,
+        credential_sensitivity: Option<CredentialSensitivity>,
+    ) -> PolicyDecision {
         let mut context = DecisionContext::from_input(input);
 
         // ---- Quarantine check (earliest gate) ----
@@ -3396,7 +3456,10 @@ impl PolicyEngine {
         if let Some(pane_id) = input.pane_id {
             let component_id = format!("pane-{pane_id}");
             if input.action.is_mutating() {
-                if self.quarantine_registry.is_blocked_for_writes(&component_id) {
+                if self
+                    .quarantine_registry
+                    .is_blocked_for_writes(&component_id)
+                {
                     context.record_rule(
                         "policy.quarantine",
                         true,
@@ -3431,6 +3494,74 @@ impl PolicyEngine {
         let risk = self.calculate_risk(input);
         if risk.score > 0 {
             context.set_risk(risk);
+        }
+
+        // ---- Credential broker gate (connector actions) ----
+        if self.credential_broker_config.enabled && input.action.is_connector_action() {
+            // For connector credential actions, check broker access rules
+            if matches!(input.action, ActionKind::ConnectorCredentialAction) {
+                let connector_id = input.domain.as_deref().unwrap_or("unknown");
+                let Some(scope) = credential_scope else {
+                    let reason = "connector credential action missing scope context".to_string();
+                    context.record_rule(
+                        "policy.credential_broker",
+                        true,
+                        Some("deny"),
+                        Some(reason.clone()),
+                    );
+                    context.set_determining_rule("policy.credential_broker");
+                    self.credential_broker_record_denial(connector_id);
+                    return PolicyDecision::deny_with_rule(reason, "policy.credential_broker")
+                        .with_context(context);
+                };
+                let sensitivity = credential_sensitivity.unwrap_or(CredentialSensitivity::Medium);
+                if !self
+                    .credential_broker
+                    .is_authorized(connector_id, scope, sensitivity)
+                {
+                    let reason = format!(
+                        "connector '{connector_id}' not authorized for scope {}:{} at sensitivity {sensitivity}",
+                        scope.provider, scope.resource
+                    );
+                    context.record_rule(
+                        "policy.credential_broker",
+                        true,
+                        Some("deny"),
+                        Some(reason.clone()),
+                    );
+                    context.set_determining_rule("policy.credential_broker");
+                    self.credential_broker_record_denial(connector_id);
+                    return PolicyDecision::deny_with_rule(reason, "policy.credential_broker")
+                        .with_context(context);
+                }
+                if sensitivity > self.credential_broker_config.max_sensitivity {
+                    let reason = format!(
+                        "credential sensitivity {sensitivity} exceeds configured ceiling {}",
+                        self.credential_broker_config.max_sensitivity
+                    );
+                    context.record_rule(
+                        "policy.credential_broker",
+                        true,
+                        Some("require_approval"),
+                        Some(reason.clone()),
+                    );
+                    context.set_determining_rule("policy.credential_broker");
+                    return PolicyDecision::require_approval_with_rule(
+                        reason,
+                        "policy.credential_broker",
+                    )
+                    .with_context(context);
+                }
+                context.record_rule(
+                    "policy.credential_broker",
+                    false,
+                    None,
+                    Some(format!(
+                        "credential access authorized for {}:{} at sensitivity {sensitivity}",
+                        scope.provider, scope.resource
+                    )),
+                );
+            }
         }
 
         // Check rate limit for configured action kinds
@@ -3876,9 +4007,7 @@ impl PolicyEngine {
                 input.actor,
                 input.surface,
             );
-            let entity_ref = decision
-                .rule_id()
-                .unwrap_or("policy.authorize");
+            let entity_ref = decision.rule_id().unwrap_or("policy.authorize");
             self.audit_chain.append(
                 AuditEntryKind::PolicyDecision,
                 &format!("{:?}", input.actor),
@@ -4644,7 +4773,7 @@ where
         // Notify ingress tap (ft-oegrb.2.2)
         if let Some(ref tap) = self.ingress_tap {
             use crate::recording::{
-                IngressEvent, IngressOutcome, action_to_ingress_kind, actor_to_source, epoch_ms_now,
+                action_to_ingress_kind, actor_to_source, epoch_ms_now, IngressEvent, IngressOutcome,
             };
             let outcome = match &result {
                 InjectionResult::Allowed { .. } => IngressOutcome::Allowed,
@@ -5027,11 +5156,9 @@ mod tests {
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval());
         assert_eq!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
-        assert!(
-            decision
-                .reason()
-                .is_some_and(|reason| reason.contains("rch exec"))
-        );
+        assert!(decision
+            .reason()
+            .is_some_and(|reason| reason.contains("rch exec")));
     }
 
     #[test]
@@ -6947,12 +7074,10 @@ mod tests {
             .expect("allow rule trace should be present");
         assert!(allow_rule.matched);
         assert_eq!(allow_rule.decision.as_deref(), Some("allow"));
-        assert!(
-            allow_rule
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("won tie-breaking"))
-        );
+        assert!(allow_rule
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("won tie-breaking")));
 
         let deny_rule = config_rules
             .iter()
@@ -6960,12 +7085,10 @@ mod tests {
             .expect("deny rule trace should be present");
         assert!(deny_rule.matched);
         assert_eq!(deny_rule.decision.as_deref(), Some("deny"));
-        assert!(
-            deny_rule
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("matched and selected"))
-        );
+        assert!(deny_rule
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("matched and selected")));
 
         let require_rule = config_rules
             .iter()
@@ -7293,11 +7416,10 @@ mod tests {
             .with_capabilities(PaneCapabilities::unknown());
 
         let risk = engine.calculate_risk(&input);
-        assert!(
-            risk.factors
-                .iter()
-                .any(|f| f.id == "state.alt_screen_unknown")
-        );
+        assert!(risk
+            .factors
+            .iter()
+            .any(|f| f.id == "state.alt_screen_unknown"));
     }
 
     #[test]
@@ -7309,11 +7431,10 @@ mod tests {
             .with_command_text("rm -rf /tmp/test");
 
         let risk = engine.calculate_risk(&input);
-        assert!(
-            risk.factors
-                .iter()
-                .any(|f| f.id == "content.destructive_tokens")
-        );
+        assert!(risk
+            .factors
+            .iter()
+            .any(|f| f.id == "content.destructive_tokens"));
     }
 
     #[test]
@@ -7325,11 +7446,10 @@ mod tests {
             .with_command_text("sudo apt update");
 
         let risk = engine.calculate_risk(&input);
-        assert!(
-            risk.factors
-                .iter()
-                .any(|f| f.id == "content.sudo_elevation")
-        );
+        assert!(risk
+            .factors
+            .iter()
+            .any(|f| f.id == "content.sudo_elevation"));
     }
 
     #[test]
@@ -9157,18 +9277,14 @@ mod tests {
     #[test]
     fn predicate_and_empty_children_matches() {
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
-        let pred = RulePredicate::And {
-            children: vec![],
-        };
+        let pred = RulePredicate::And { children: vec![] };
         assert!(pred.evaluate(&input));
     }
 
     #[test]
     fn predicate_or_empty_children_fails() {
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
-        let pred = RulePredicate::Or {
-            children: vec![],
-        };
+        let pred = RulePredicate::Or { children: vec![] };
         assert!(!pred.evaluate(&input));
     }
 
@@ -9221,9 +9337,7 @@ mod tests {
         };
         assert!(pred.evaluate(&input));
 
-        let pred2 = RulePredicate::PaneId {
-            values: vec![99],
-        };
+        let pred2 = RulePredicate::PaneId { values: vec![99] };
         assert!(!pred2.evaluate(&input));
     }
 
@@ -9353,8 +9467,7 @@ mod tests {
         let pred = RulePredicate::from_flat_match(&m);
 
         let input_match = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(42);
-        let input_no_match =
-            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(99);
+        let input_no_match = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(99);
 
         assert_eq!(matches_rule(&m, &input_match), pred.evaluate(&input_match));
         assert_eq!(
@@ -9550,7 +9663,10 @@ mod tests {
 
         let json = engine.decision_log().export_json().unwrap();
         // export_json uses to_string_pretty, so keys/values may be on separate lines
-        assert!(json.contains("read_output"), "expected read_output in: {json}");
+        assert!(
+            json.contains("read_output"),
+            "expected read_output in: {json}"
+        );
         assert!(json.contains("human"), "expected human in: {json}");
         assert!(json.contains("allow"), "expected allow in: {json}");
     }
@@ -9649,7 +9765,10 @@ mod tests {
     fn quarantine_registry_initially_empty() {
         let engine = PolicyEngine::permissive();
         assert!(engine.quarantine_registry().active_quarantines().is_empty());
-        assert!(engine.quarantine_registry().kill_switch().allows_new_workflows());
+        assert!(engine
+            .quarantine_registry()
+            .kill_switch()
+            .allows_new_workflows());
     }
 
     #[test]
@@ -10060,7 +10179,9 @@ mod tests {
         assert_eq!(engine.audit_chain().len(), 2);
         let entry = engine.audit_chain().latest().unwrap();
         assert_eq!(entry.kind, AuditEntryKind::QuarantineAction);
-        assert!(entry.description.contains("released pane-11 from quarantine"));
+        assert!(entry
+            .description
+            .contains("released pane-11 from quarantine"));
     }
 
     #[test]
@@ -10201,7 +10322,10 @@ mod tests {
         engine.trip_kill_switch(KillSwitchLevel::SoftStop, "admin", "drill", 1000);
 
         assert_eq!(
-            engine.compliance_engine().counters().total_kill_switch_trips,
+            engine
+                .compliance_engine()
+                .counters()
+                .total_kill_switch_trips,
             1
         );
     }
@@ -10220,5 +10344,267 @@ mod tests {
             engine.compliance_engine().compute_status(),
             crate::policy_compliance::ComplianceStatus::Compliant,
         );
+    }
+
+    // ========================================================================
+    // Credential Broker Integration Tests
+    // ========================================================================
+
+    #[test]
+    fn credential_broker_default_in_policy_engine() {
+        let engine = PolicyEngine::new(30, 100, true);
+        // Broker exists and is empty by default
+        assert!(engine.credential_broker().credential_ids().is_empty());
+    }
+
+    #[test]
+    fn credential_broker_from_safety_config() {
+        let config = crate::config::SafetyConfig {
+            credential_broker: crate::connector_credential_broker::CredentialBrokerConfig {
+                enabled: true,
+                max_audit_events: 512,
+                max_leases_per_connector: 5,
+                max_sensitivity: CredentialSensitivity::Medium,
+            },
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from_safety_config(&config);
+        assert!(engine.credential_broker().credential_ids().is_empty());
+        assert_eq!(
+            engine.credential_broker_config.max_sensitivity,
+            CredentialSensitivity::Medium,
+        );
+    }
+
+    #[test]
+    fn credential_broker_denies_unauthorized_connector_action() {
+        let mut engine = PolicyEngine::permissive();
+        // No access rules registered → connector credential action should be denied
+        let input = PolicyInput {
+            action: ActionKind::ConnectorCredentialAction,
+            actor: ActorKind::Robot,
+            surface: PolicySurface::Robot,
+            pane_id: None,
+            domain: Some("slack".to_string()),
+            capabilities: PaneCapabilities::default(),
+            text_summary: None,
+            workflow_id: None,
+            command_text: None,
+            trauma_decision: None,
+            pane_title: None,
+            pane_cwd: None,
+            agent_type: None,
+        };
+        let scope = crate::connector_credential_broker::CredentialScope {
+            provider: "slack".to_string(),
+            resource: "channels/alerts".to_string(),
+            operations: vec!["write".to_string()],
+        };
+        let decision = engine.authorize_connector_credential_action(
+            &input,
+            &scope,
+            CredentialSensitivity::Medium,
+        );
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("policy.credential_broker"));
+    }
+
+    #[test]
+    fn credential_broker_allows_authorized_connector_action() {
+        use crate::connector_credential_broker::{CredentialAccessRule, CredentialScope};
+
+        let mut engine = PolicyEngine::permissive();
+        // Register an access rule that permits "slack" connector at medium sensitivity
+        engine
+            .credential_broker_mut()
+            .add_access_rule(CredentialAccessRule {
+                rule_id: "test-slack".to_string(),
+                connector_pattern: "slack".to_string(),
+                permitted_scope: CredentialScope {
+                    provider: "slack".to_string(),
+                    resource: "*".to_string(),
+                    operations: vec!["*".to_string()],
+                },
+                max_sensitivity: CredentialSensitivity::High,
+                max_lease_ttl_ms: 0,
+                max_concurrent_leases: 10,
+            });
+
+        // Use Human actor (trusted) to bypass destructive-action approval gate
+        let input = PolicyInput {
+            action: ActionKind::ConnectorCredentialAction,
+            actor: ActorKind::Human,
+            surface: PolicySurface::Robot,
+            pane_id: None,
+            domain: Some("slack".to_string()),
+            capabilities: PaneCapabilities::default(),
+            text_summary: None,
+            workflow_id: None,
+            command_text: None,
+            trauma_decision: None,
+            pane_title: None,
+            pane_cwd: None,
+            agent_type: None,
+        };
+        let scope = CredentialScope {
+            provider: "slack".to_string(),
+            resource: "channels/alerts".to_string(),
+            operations: vec!["write".to_string()],
+        };
+        let decision = engine.authorize_connector_credential_action(
+            &input,
+            &scope,
+            CredentialSensitivity::Medium,
+        );
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn credential_broker_denial_feeds_compliance_and_audit() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput {
+            action: ActionKind::ConnectorCredentialAction,
+            actor: ActorKind::Robot,
+            surface: PolicySurface::Robot,
+            pane_id: None,
+            domain: Some("github".to_string()),
+            capabilities: PaneCapabilities::default(),
+            text_summary: None,
+            workflow_id: None,
+            command_text: None,
+            trauma_decision: None,
+            pane_title: None,
+            pane_cwd: None,
+            agent_type: None,
+        };
+        let scope = crate::connector_credential_broker::CredentialScope {
+            provider: "github".to_string(),
+            resource: "repos/frankenterm".to_string(),
+            operations: vec!["admin".to_string()],
+        };
+        let _decision = engine.authorize_connector_credential_action(
+            &input,
+            &scope,
+            CredentialSensitivity::High,
+        );
+        // Compliance engine should have recorded the evaluation
+        let snap = engine.compliance_engine_mut().snapshot(1000);
+        assert!(snap.counters.total_evaluations > 0);
+        // Audit chain should have an entry
+        assert!(engine.audit_chain().len() > 0);
+    }
+
+    #[test]
+    fn credential_broker_high_sensitivity_requires_approval() {
+        use crate::connector_credential_broker::{CredentialAccessRule, CredentialScope};
+
+        let config = crate::config::SafetyConfig {
+            credential_broker: crate::connector_credential_broker::CredentialBrokerConfig {
+                enabled: true,
+                max_sensitivity: CredentialSensitivity::Medium,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::from_safety_config(&config);
+        engine
+            .credential_broker_mut()
+            .add_access_rule(CredentialAccessRule {
+                rule_id: "test-slack".to_string(),
+                connector_pattern: "slack".to_string(),
+                permitted_scope: CredentialScope {
+                    provider: "slack".to_string(),
+                    resource: "*".to_string(),
+                    operations: vec!["*".to_string()],
+                },
+                max_sensitivity: CredentialSensitivity::Critical,
+                max_lease_ttl_ms: 0,
+                max_concurrent_leases: 10,
+            });
+
+        let input = PolicyInput {
+            action: ActionKind::ConnectorCredentialAction,
+            actor: ActorKind::Human,
+            surface: PolicySurface::Robot,
+            pane_id: None,
+            domain: Some("slack".to_string()),
+            capabilities: PaneCapabilities::default(),
+            text_summary: None,
+            workflow_id: None,
+            command_text: None,
+            trauma_decision: None,
+            pane_title: None,
+            pane_cwd: None,
+            agent_type: None,
+        };
+        let scope = CredentialScope {
+            provider: "slack".to_string(),
+            resource: "workspaces/main".to_string(),
+            operations: vec!["admin".to_string()],
+        };
+        let decision = engine.authorize_connector_credential_action(
+            &input,
+            &scope,
+            CredentialSensitivity::High,
+        );
+        assert_eq!(decision.rule_id(), Some("policy.credential_broker"));
+        assert!(decision.requires_approval());
+    }
+
+    #[test]
+    fn credential_broker_disabled_skips_check() {
+        let config = crate::config::SafetyConfig {
+            credential_broker: crate::connector_credential_broker::CredentialBrokerConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut engine = PolicyEngine::from_safety_config(&config);
+        // No access rules → but broker is disabled, so it should pass through
+        let input = PolicyInput {
+            action: ActionKind::ConnectorCredentialAction,
+            actor: ActorKind::Robot,
+            surface: PolicySurface::Robot,
+            pane_id: None,
+            domain: Some("slack".to_string()),
+            capabilities: PaneCapabilities::default(),
+            text_summary: None,
+            workflow_id: None,
+            command_text: None,
+            trauma_decision: None,
+            pane_title: None,
+            pane_cwd: None,
+            agent_type: None,
+        };
+        let decision = engine.authorize(&input);
+        // Should not be denied by credential broker (may still hit rate limit, etc.)
+        assert_ne!(decision.rule_id(), Some("policy.credential_broker"));
+    }
+
+    #[test]
+    fn credential_broker_non_connector_action_bypasses_broker() {
+        let mut engine = PolicyEngine::permissive();
+        // SendText is not a connector action, should bypass broker entirely
+        let input = PolicyInput {
+            action: ActionKind::SendText,
+            actor: ActorKind::Human,
+            surface: PolicySurface::Robot,
+            pane_id: Some(0),
+            domain: None,
+            capabilities: PaneCapabilities {
+                prompt_active: true,
+                ..Default::default()
+            },
+            text_summary: None,
+            workflow_id: None,
+            command_text: Some("echo hello".to_string()),
+            trauma_decision: None,
+            pane_title: None,
+            pane_cwd: None,
+            agent_type: None,
+        };
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
     }
 }
