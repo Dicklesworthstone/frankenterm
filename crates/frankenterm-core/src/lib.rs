@@ -125,6 +125,7 @@ pub mod connector_outbound_bridge;
 pub mod connector_registry;
 pub mod connector_reliability;
 pub mod connector_sdk;
+pub mod connector_testbed;
 pub mod consistent_hash;
 pub mod content_dedup;
 pub mod context_snapshot;
