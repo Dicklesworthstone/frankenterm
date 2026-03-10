@@ -1,0 +1,4 @@
+# The ft CLI command tree still overflows the default 8MB stack in debug/test
+# builds for some clap parser unit tests. 16MB is sufficient for those cases.
+[env]
+RUST_MIN_STACK = "16777216"

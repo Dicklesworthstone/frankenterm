@@ -4,8 +4,8 @@ target-*/
 **/*.rs.bk
 Cargo.lock.bak
 
-# Local Cargo overrides (use .cargo/config.toml.example as template)
-.cargo/config.toml
+# Tracked Cargo config lives in .cargo/config.toml; use the example/template
+# and extra per-agent override files for machine-local adjustments.
 
 # IDE and editor files
 .idea/
