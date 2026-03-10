@@ -2485,7 +2485,13 @@ mod tests {
             prop_assert_eq!(roundtrip.component, event.component);
             prop_assert_eq!(roundtrip.reason_code, event.reason_code);
             prop_assert_eq!(roundtrip.correlation_id, event.correlation_id);
-            prop_assert_eq!(roundtrip.details, event.details);
+            // Compare non-float details exactly, float with tolerance (JSON roundtrip precision).
+            prop_assert_eq!(roundtrip.details.get("scope_tier"), event.details.get("scope_tier"));
+            prop_assert_eq!(roundtrip.details.get("count"), event.details.get("count"));
+            prop_assert_eq!(roundtrip.details.get("active"), event.details.get("active"));
+            let orig = event.details.get("ratio").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let rt = roundtrip.details.get("ratio").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            prop_assert!((orig - rt).abs() < 1e-10, "ratio drift: {} vs {}", orig, rt);
         }
 
         #[test]
