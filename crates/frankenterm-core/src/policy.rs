@@ -33,6 +33,7 @@ use crate::config::{
 };
 use crate::identity_graph::{AuthAction, PrincipalId, PrincipalKind, ResourceId, ResourceKind};
 use crate::policy_decision_log::{DecisionLogConfig, DecisionOutcome, PolicyDecisionLog};
+use crate::policy_quarantine::QuarantineRegistry;
 use crate::trauma_guard::TraumaDecision;
 // ============================================================================
 // Action Kinds
@@ -2860,6 +2861,8 @@ pub struct PolicyEngine {
     risk_config: RiskConfig,
     /// Append-only decision log for forensics and compliance
     decision_log: PolicyDecisionLog,
+    /// Quarantine registry for component isolation
+    quarantine_registry: QuarantineRegistry,
 }
 
 impl PolicyEngine {
@@ -2878,6 +2881,7 @@ impl PolicyEngine {
             policy_rules: PolicyRulesConfig::default(),
             risk_config: RiskConfig::default(),
             decision_log: PolicyDecisionLog::with_defaults(),
+            quarantine_registry: QuarantineRegistry::new(),
         }
     }
 
@@ -2943,6 +2947,17 @@ impl PolicyEngine {
     pub fn with_decision_log_config(mut self, config: DecisionLogConfig) -> Self {
         self.decision_log = PolicyDecisionLog::new(config);
         self
+    }
+
+    /// Access the quarantine registry.
+    #[must_use]
+    pub fn quarantine_registry(&self) -> &QuarantineRegistry {
+        &self.quarantine_registry
+    }
+
+    /// Access the quarantine registry mutably (for quarantine/release operations).
+    pub fn quarantine_registry_mut(&mut self) -> &mut QuarantineRegistry {
+        &mut self.quarantine_registry
     }
 
     /// Get the current risk configuration
@@ -3246,6 +3261,58 @@ impl PolicyEngine {
     /// Core authorization logic (called by `authorize()`).
     fn evaluate_authorization(&mut self, input: &PolicyInput) -> PolicyDecision {
         let mut context = DecisionContext::from_input(input);
+
+        // ---- Quarantine check (earliest gate) ----
+        // If the kill switch is active at emergency level, block everything.
+        if self.quarantine_registry.kill_switch().is_emergency() {
+            context.record_rule(
+                "policy.kill_switch",
+                true,
+                Some("deny"),
+                Some("emergency halt active".to_string()),
+            );
+            context.set_determining_rule("policy.kill_switch");
+            return PolicyDecision::deny_with_rule(
+                "System kill switch is in emergency halt",
+                "policy.kill_switch",
+            )
+            .with_context(context);
+        }
+
+        // If the target pane is quarantined, check blocking semantics.
+        if let Some(pane_id) = input.pane_id {
+            let component_id = format!("pane-{pane_id}");
+            if input.action.is_mutating() {
+                if self.quarantine_registry.is_blocked_for_writes(&component_id) {
+                    context.record_rule(
+                        "policy.quarantine",
+                        true,
+                        Some("deny"),
+                        Some(format!("pane {pane_id} quarantined (writes blocked)")),
+                    );
+                    context.set_determining_rule("policy.quarantine");
+                    return PolicyDecision::deny_with_rule(
+                        &format!("Pane {pane_id} is quarantined — writes blocked"),
+                        "policy.quarantine",
+                    )
+                    .with_context(context);
+                }
+            }
+            if self.quarantine_registry.is_blocked_for_all(&component_id) {
+                context.record_rule(
+                    "policy.quarantine",
+                    true,
+                    Some("deny"),
+                    Some(format!("pane {pane_id} quarantined (all actions blocked)")),
+                );
+                context.set_determining_rule("policy.quarantine");
+                return PolicyDecision::deny_with_rule(
+                    &format!("Pane {pane_id} is quarantined — all actions blocked"),
+                    "policy.quarantine",
+                )
+                .with_context(context);
+            }
+        }
 
         // Calculate and attach risk score (wa-upg.6.3)
         let risk = self.calculate_risk(input);
@@ -9428,5 +9495,208 @@ mod tests {
         let back: crate::policy_decision_log::DecisionLogSnapshot =
             serde_json::from_str(&json).unwrap();
         assert_eq!(snapshot, back);
+    }
+
+    // ========================================================================
+    // Quarantine integration tests
+    // ========================================================================
+
+    #[test]
+    fn quarantine_registry_initially_empty() {
+        let engine = PolicyEngine::permissive();
+        assert!(engine.quarantine_registry().active_quarantines().is_empty());
+        assert!(engine.quarantine_registry().kill_switch().allows_new_workflows());
+    }
+
+    #[test]
+    fn quarantine_blocks_mutating_action_on_pane() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        // Quarantine pane-1
+        engine
+            .quarantine_registry_mut()
+            .quarantine(
+                "pane-1",
+                ComponentKind::Pane,
+                QuarantineSeverity::Restricted,
+                QuarantineReason::PolicyViolation {
+                    rule_id: "r1".into(),
+                    detail: "rate abuse".into(),
+                },
+                "operator",
+                1000,
+                0,
+            )
+            .unwrap();
+
+        // SendText is mutating — should be denied
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("policy.quarantine"));
+    }
+
+    #[test]
+    fn quarantine_allows_read_on_restricted_pane() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        engine
+            .quarantine_registry_mut()
+            .quarantine(
+                "pane-1",
+                ComponentKind::Pane,
+                QuarantineSeverity::Restricted,
+                QuarantineReason::AnomalousBehavior {
+                    metric: "error_rate".into(),
+                    observed: "50%".into(),
+                },
+                "system",
+                1000,
+                0,
+            )
+            .unwrap();
+
+        // ReadOutput is not mutating — should be allowed
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot).with_pane(1);
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn quarantine_isolated_blocks_all_actions() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        engine
+            .quarantine_registry_mut()
+            .quarantine(
+                "pane-2",
+                ComponentKind::Pane,
+                QuarantineSeverity::Isolated,
+                QuarantineReason::CredentialCompromise {
+                    credential_id: "key-abc".into(),
+                },
+                "security",
+                1000,
+                0,
+            )
+            .unwrap();
+
+        // Even reads should be blocked at Isolated severity
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot).with_pane(2);
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("policy.quarantine"));
+    }
+
+    #[test]
+    fn kill_switch_emergency_denies_all() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        engine.quarantine_registry_mut().trip_kill_switch(
+            KillSwitchLevel::EmergencyHalt,
+            "incident-commander",
+            "critical security breach",
+            1000,
+        );
+
+        // Any action should be denied
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Human);
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("policy.kill_switch"));
+    }
+
+    #[test]
+    fn kill_switch_soft_stop_blocks_writes_on_any_pane() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        engine.quarantine_registry_mut().trip_kill_switch(
+            KillSwitchLevel::SoftStop,
+            "operator",
+            "maintenance window",
+            1000,
+        );
+
+        // Write to any pane should be blocked (kill switch blocks at registry level)
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(99)
+            .with_capabilities(PaneCapabilities::prompt());
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("policy.quarantine"));
+    }
+
+    #[test]
+    fn quarantine_release_restores_access() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        engine
+            .quarantine_registry_mut()
+            .quarantine(
+                "pane-1",
+                ComponentKind::Pane,
+                QuarantineSeverity::Isolated,
+                QuarantineReason::CircuitBreakerTrip {
+                    circuit_id: "cb-1".into(),
+                },
+                "system",
+                1000,
+                0,
+            )
+            .unwrap();
+
+        // Blocked before release
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt());
+        assert!(engine.authorize(&input).is_denied());
+
+        // Release from quarantine
+        engine
+            .quarantine_registry_mut()
+            .release("pane-1", "operator", false, 2000)
+            .unwrap();
+
+        // Should be allowed after release
+        assert!(engine.authorize(&input).is_allowed());
+    }
+
+    #[test]
+    fn quarantine_decision_recorded_in_log() {
+        use crate::policy_quarantine::*;
+        let mut engine = PolicyEngine::permissive();
+
+        engine
+            .quarantine_registry_mut()
+            .quarantine(
+                "pane-5",
+                ComponentKind::Pane,
+                QuarantineSeverity::Restricted,
+                QuarantineReason::OperatorDirected {
+                    operator: "admin".into(),
+                    note: "investigation".into(),
+                },
+                "admin",
+                1000,
+                0,
+            )
+            .unwrap();
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(5)
+            .with_capabilities(PaneCapabilities::prompt());
+        engine.authorize(&input);
+
+        // The denial should be recorded in the decision log
+        let log = engine.decision_log();
+        assert_eq!(log.len(), 1);
     }
 }
