@@ -46,6 +46,12 @@ use crate::mcp_error::{
     map_mcp_error,
 };
 use crate::patterns::{AgentType, PatternEngine};
+use crate::plan::{
+    mission_tx_commit_step_inputs as mcp_build_tx_commit_step_inputs,
+    mission_tx_compensation_inputs as mcp_build_tx_compensation_inputs,
+    mission_tx_prepare_gate_inputs as mcp_build_tx_prepare_gate_inputs,
+    mission_tx_synthetic_commit_report as mcp_build_tx_synthetic_commit_report,
+};
 use crate::policy::{
     ActionKind, ActorKind, DecisionContext, InjectionResult, PaneCapabilities, PolicyDecision,
     PolicyEngine, PolicyGatedInjector, PolicyInput, PolicySurface,
@@ -90,9 +96,7 @@ use mcp_middleware::{
     extract_mcp_output_format, parse_mcp_output_format,
 };
 use mcp_missions::{
-    mcp_build_mission_assignments, mcp_build_tx_commit_step_inputs,
-    mcp_build_tx_compensation_inputs, mcp_build_tx_prepare_gate_inputs,
-    mcp_build_tx_synthetic_commit_report, mcp_load_mission_from_path,
+    mcp_build_mission_assignments, mcp_load_mission_from_path,
     mcp_load_mission_tx_contract_from_path, mcp_mission_failure_catalog,
     mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
     mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,

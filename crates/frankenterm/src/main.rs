@@ -15,6 +15,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
 use frankenterm_core::logging::{LogConfig, LogError, init_logging};
+use frankenterm_core::plan::{
+    mission_tx_commit_step_inputs as build_robot_tx_commit_step_inputs,
+    mission_tx_compensation_inputs as build_robot_tx_compensation_inputs,
+    mission_tx_prepare_gate_inputs as build_robot_tx_prepare_gate_inputs,
+    mission_tx_synthetic_commit_report as build_robot_tx_synthetic_commit_report,
+};
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 
 /// Build metadata captured at compile time.
@@ -31529,115 +31535,6 @@ fn robot_tx_transition_info(
         .collect()
 }
 
-fn build_robot_tx_prepare_gate_inputs(
-    contract: &frankenterm_core::plan::MissionTxContract,
-) -> Vec<frankenterm_core::plan::TxPrepareGateInput> {
-    contract
-        .plan
-        .steps
-        .iter()
-        .map(|step| frankenterm_core::plan::TxPrepareGateInput {
-            step_id: step.step_id.clone(),
-            policy_passed: true,
-            policy_reason_code: None,
-            reservation_available: true,
-            reservation_reason_code: None,
-            approval_satisfied: true,
-            approval_reason_code: None,
-            target_liveness: true,
-            liveness_reason_code: None,
-        })
-        .collect()
-}
-
-fn build_robot_tx_commit_step_inputs(
-    contract: &frankenterm_core::plan::MissionTxContract,
-    fail_step: Option<&str>,
-    completed_at_ms: i64,
-) -> Vec<frankenterm_core::plan::TxCommitStepInput> {
-    contract
-        .plan
-        .steps
-        .iter()
-        .map(|step| {
-            let should_fail = fail_step == Some(step.step_id.0.as_str());
-            frankenterm_core::plan::TxCommitStepInput {
-                step_id: step.step_id.clone(),
-                success: !should_fail,
-                reason_code: if should_fail {
-                    "commit_step_failed_injected".to_string()
-                } else {
-                    "commit_step_succeeded".to_string()
-                },
-                error_code: should_fail.then(|| "FTX3999".to_string()),
-                completed_at_ms,
-            }
-        })
-        .collect()
-}
-
-fn build_robot_tx_compensation_inputs(
-    commit_report: &frankenterm_core::plan::TxCommitReport,
-    fail_for_step: Option<&str>,
-    completed_at_ms: i64,
-) -> Vec<frankenterm_core::plan::TxCompensationStepInput> {
-    commit_report
-        .step_results
-        .iter()
-        .filter(|result| result.outcome.is_committed())
-        .map(|result| {
-            let should_fail = fail_for_step == Some(result.step_id.0.as_str());
-            frankenterm_core::plan::TxCompensationStepInput {
-                for_step_id: result.step_id.clone(),
-                success: !should_fail,
-                reason_code: if should_fail {
-                    "compensation_failed_injected".to_string()
-                } else {
-                    "compensation_succeeded".to_string()
-                },
-                error_code: should_fail.then(|| "FTX4999".to_string()),
-                completed_at_ms,
-            }
-        })
-        .collect()
-}
-
-fn build_robot_tx_synthetic_commit_report(
-    contract: &frankenterm_core::plan::MissionTxContract,
-    completed_at_ms: i64,
-) -> frankenterm_core::plan::TxCommitReport {
-    let step_results = contract
-        .plan
-        .steps
-        .iter()
-        .map(|step| frankenterm_core::plan::TxCommitStepResult {
-            step_id: step.step_id.clone(),
-            ordinal: step.ordinal,
-            outcome: frankenterm_core::plan::TxCommitStepOutcome::Committed {
-                reason_code: "synthetic_prior_commit".to_string(),
-            },
-            decision_path: "rollback_synthetic_commit_report".to_string(),
-            completed_at_ms,
-        })
-        .collect::<Vec<_>>();
-
-    frankenterm_core::plan::TxCommitReport {
-        tx_id: contract.intent.tx_id.clone(),
-        plan_id: contract.plan.plan_id.clone(),
-        outcome: frankenterm_core::plan::TxCommitOutcome::FullyCommitted,
-        step_results,
-        failure_boundary: None,
-        committed_count: contract.plan.steps.len(),
-        failed_count: 0,
-        skipped_count: 0,
-        decision_path: "rollback_synthetic_commit_report".to_string(),
-        reason_code: "synthetic_all_committed".to_string(),
-        error_code: None,
-        completed_at_ms,
-        receipts: Vec::new(),
-    }
-}
-
 fn persist_mission_to_path(
     path: &Path,
     mission: &frankenterm_core::plan::Mission,
@@ -37158,7 +37055,10 @@ mod tests {
         let payload =
             runtime_bootstrap_lifecycle_payload(spec, "startup", "runtime_initialized", None, 42);
 
-        assert_eq!(payload["event"].as_str(), Some("runtime_bootstrap.lifecycle"));
+        assert_eq!(
+            payload["event"].as_str(),
+            Some("runtime_bootstrap.lifecycle")
+        );
         assert_eq!(payload["phase"].as_str(), Some("startup"));
         assert_eq!(payload["role"].as_str(), Some("robot"));
         assert_eq!(payload["thread_name"].as_str(), Some("ft-robot-runtime"));

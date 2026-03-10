@@ -2894,6 +2894,121 @@ impl TxCompensationReport {
     }
 }
 
+/// Build the default prepare-gate inputs used by tx control surfaces.
+#[must_use]
+pub fn mission_tx_prepare_gate_inputs(contract: &MissionTxContract) -> Vec<TxPrepareGateInput> {
+    contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| TxPrepareGateInput {
+            step_id: step.step_id.clone(),
+            policy_passed: true,
+            policy_reason_code: None,
+            reservation_available: true,
+            reservation_reason_code: None,
+            approval_satisfied: true,
+            approval_reason_code: None,
+            target_liveness: true,
+            liveness_reason_code: None,
+        })
+        .collect()
+}
+
+/// Build deterministic commit inputs with optional single-step failure injection.
+#[must_use]
+pub fn mission_tx_commit_step_inputs(
+    contract: &MissionTxContract,
+    fail_step: Option<&str>,
+    completed_at_ms: i64,
+) -> Vec<TxCommitStepInput> {
+    contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| {
+            let should_fail = fail_step == Some(step.step_id.0.as_str());
+            TxCommitStepInput {
+                step_id: step.step_id.clone(),
+                success: !should_fail,
+                reason_code: if should_fail {
+                    "commit_step_failed_injected".to_string()
+                } else {
+                    "commit_step_succeeded".to_string()
+                },
+                error_code: should_fail.then(|| "FTX3999".to_string()),
+                completed_at_ms,
+            }
+        })
+        .collect()
+}
+
+/// Build deterministic compensation inputs for each committed step.
+#[must_use]
+pub fn mission_tx_compensation_inputs(
+    commit_report: &TxCommitReport,
+    fail_for_step: Option<&str>,
+    completed_at_ms: i64,
+) -> Vec<TxCompensationStepInput> {
+    commit_report
+        .step_results
+        .iter()
+        .filter(|result| result.outcome.is_committed())
+        .map(|result| {
+            let should_fail = fail_for_step == Some(result.step_id.0.as_str());
+            TxCompensationStepInput {
+                for_step_id: result.step_id.clone(),
+                success: !should_fail,
+                reason_code: if should_fail {
+                    "compensation_failed_injected".to_string()
+                } else {
+                    "compensation_succeeded".to_string()
+                },
+                error_code: should_fail.then(|| "FTX4999".to_string()),
+                completed_at_ms,
+            }
+        })
+        .collect()
+}
+
+/// Build a synthetic all-committed report for rollback-only tx surfaces.
+#[must_use]
+pub fn mission_tx_synthetic_commit_report(
+    contract: &MissionTxContract,
+    completed_at_ms: i64,
+) -> TxCommitReport {
+    let step_results = contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| TxCommitStepResult {
+            step_id: step.step_id.clone(),
+            ordinal: step.ordinal,
+            outcome: TxCommitStepOutcome::Committed {
+                reason_code: "synthetic_prior_commit".to_string(),
+            },
+            decision_path: "rollback_synthetic_commit_report".to_string(),
+            completed_at_ms,
+        })
+        .collect::<Vec<_>>();
+
+    TxCommitReport {
+        tx_id: contract.intent.tx_id.clone(),
+        plan_id: contract.plan.plan_id.clone(),
+        outcome: TxCommitOutcome::FullyCommitted,
+        step_results,
+        failure_boundary: None,
+        committed_count: contract.plan.steps.len(),
+        failed_count: 0,
+        skipped_count: 0,
+        decision_path: "rollback_synthetic_commit_report".to_string(),
+        reason_code: "synthetic_all_committed".to_string(),
+        error_code: None,
+        completed_at_ms,
+        receipts: Vec::new(),
+    }
+}
+
 fn tx_last_receipt_seq(receipts: &[serde_json::Value]) -> u64 {
     receipts
         .iter()
@@ -5763,6 +5878,63 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn tx_surface_prepare_gate_inputs_default_to_ready() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let inputs = mission_tx_prepare_gate_inputs(&contract);
+
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(inputs[0].step_id.0, "tx-step:1");
+        assert!(inputs.iter().all(|input| input.policy_passed
+            && input.reservation_available
+            && input.approval_satisfied
+            && input.target_liveness));
+    }
+
+    #[test]
+    fn tx_surface_commit_step_inputs_apply_failure_injection() {
+        let contract = sample_tx_contract(MissionTxState::Prepared);
+        let inputs = mission_tx_commit_step_inputs(&contract, Some("tx-step:2"), 42_424);
+
+        assert_eq!(inputs.len(), 3);
+        assert!(inputs[0].success);
+        assert!(!inputs[1].success);
+        assert_eq!(inputs[1].reason_code, "commit_step_failed_injected");
+        assert_eq!(inputs[1].error_code.as_deref(), Some("FTX3999"));
+        assert!(inputs[2].success);
+    }
+
+    #[test]
+    fn tx_surface_synthetic_commit_report_marks_every_step_committed() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let report = mission_tx_synthetic_commit_report(&contract, 5_151);
+
+        assert_eq!(report.tx_id.0, "tx:robot-interface-test");
+        assert_eq!(report.committed_count, 3);
+        assert_eq!(report.failed_count, 0);
+        assert_eq!(report.skipped_count, 0);
+        assert!(
+            report
+                .step_results
+                .iter()
+                .all(|result| result.outcome.is_committed())
+        );
+    }
+
+    #[test]
+    fn tx_surface_compensation_inputs_only_cover_committed_steps() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let commit_report = mission_tx_synthetic_commit_report(&contract, 100);
+        let inputs = mission_tx_compensation_inputs(&commit_report, Some("tx-step:2"), 200);
+
+        assert_eq!(inputs.len(), 3);
+        assert!(inputs[0].success);
+        assert!(!inputs[1].success);
+        assert_eq!(inputs[1].reason_code, "compensation_failed_injected");
+        assert_eq!(inputs[1].error_code.as_deref(), Some("FTX4999"));
+        assert!(inputs[2].success);
     }
 
     fn receipt_seq(receipt: &serde_json::Value) -> u64 {

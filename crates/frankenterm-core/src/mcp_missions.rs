@@ -1,8 +1,8 @@
 //! Mission and transaction lifecycle helpers for MCP tools.
 //!
 //! Extracted from `mcp.rs` as part of Wave 4A migration (ft-1fv0u).
-//! Contains file I/O, state resolution, assignment aggregation, and
-//! Tx commit/compensation input builders used by the mission/tx tool handlers.
+//! Contains file I/O, state resolution, and assignment aggregation helpers
+//! used by the mission/tx tool handlers.
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -350,115 +350,6 @@ pub(super) fn mcp_build_mission_assignments(
     matched.truncate(limit);
 
     (matched, counters, matched_count)
-}
-
-pub(super) fn mcp_build_tx_prepare_gate_inputs(
-    contract: &crate::plan::MissionTxContract,
-) -> Vec<crate::plan::TxPrepareGateInput> {
-    contract
-        .plan
-        .steps
-        .iter()
-        .map(|step| crate::plan::TxPrepareGateInput {
-            step_id: step.step_id.clone(),
-            policy_passed: true,
-            policy_reason_code: None,
-            reservation_available: true,
-            reservation_reason_code: None,
-            approval_satisfied: true,
-            approval_reason_code: None,
-            target_liveness: true,
-            liveness_reason_code: None,
-        })
-        .collect()
-}
-
-pub(super) fn mcp_build_tx_commit_step_inputs(
-    contract: &crate::plan::MissionTxContract,
-    fail_step: Option<&str>,
-    completed_at_ms: i64,
-) -> Vec<crate::plan::TxCommitStepInput> {
-    contract
-        .plan
-        .steps
-        .iter()
-        .map(|step| {
-            let should_fail = fail_step == Some(step.step_id.0.as_str());
-            crate::plan::TxCommitStepInput {
-                step_id: step.step_id.clone(),
-                success: !should_fail,
-                reason_code: if should_fail {
-                    "commit_step_failed_injected".to_string()
-                } else {
-                    "commit_step_succeeded".to_string()
-                },
-                error_code: should_fail.then(|| "FTX3999".to_string()),
-                completed_at_ms,
-            }
-        })
-        .collect()
-}
-
-pub(super) fn mcp_build_tx_compensation_inputs(
-    commit_report: &crate::plan::TxCommitReport,
-    fail_for_step: Option<&str>,
-    completed_at_ms: i64,
-) -> Vec<crate::plan::TxCompensationStepInput> {
-    commit_report
-        .step_results
-        .iter()
-        .filter(|result| result.outcome.is_committed())
-        .map(|result| {
-            let should_fail = fail_for_step == Some(result.step_id.0.as_str());
-            crate::plan::TxCompensationStepInput {
-                for_step_id: result.step_id.clone(),
-                success: !should_fail,
-                reason_code: if should_fail {
-                    "compensation_failed_injected".to_string()
-                } else {
-                    "compensation_succeeded".to_string()
-                },
-                error_code: should_fail.then(|| "FTX4999".to_string()),
-                completed_at_ms,
-            }
-        })
-        .collect()
-}
-
-pub(super) fn mcp_build_tx_synthetic_commit_report(
-    contract: &crate::plan::MissionTxContract,
-    completed_at_ms: i64,
-) -> crate::plan::TxCommitReport {
-    let step_results = contract
-        .plan
-        .steps
-        .iter()
-        .map(|step| crate::plan::TxCommitStepResult {
-            step_id: step.step_id.clone(),
-            ordinal: step.ordinal,
-            outcome: crate::plan::TxCommitStepOutcome::Committed {
-                reason_code: "synthetic_prior_commit".to_string(),
-            },
-            decision_path: "rollback_synthetic_commit_report".to_string(),
-            completed_at_ms,
-        })
-        .collect::<Vec<_>>();
-
-    crate::plan::TxCommitReport {
-        tx_id: contract.intent.tx_id.clone(),
-        plan_id: contract.plan.plan_id.clone(),
-        outcome: crate::plan::TxCommitOutcome::FullyCommitted,
-        step_results,
-        failure_boundary: None,
-        committed_count: contract.plan.steps.len(),
-        failed_count: 0,
-        skipped_count: 0,
-        decision_path: "rollback_synthetic_commit_report".to_string(),
-        reason_code: "synthetic_all_committed".to_string(),
-        error_code: None,
-        completed_at_ms,
-        receipts: Vec::new(),
-    }
 }
 
 #[cfg(test)]
@@ -909,13 +800,13 @@ mod tests {
     }
 
     // ========================================================================
-    // mcp_build_tx_prepare_gate_inputs Tests
+    // mission_tx_prepare_gate_inputs Tests
     // ========================================================================
 
     #[test]
     fn prepare_gate_inputs_match_step_count() {
         let contract = make_tx_contract(3);
-        let inputs = mcp_build_tx_prepare_gate_inputs(&contract);
+        let inputs = crate::plan::mission_tx_prepare_gate_inputs(&contract);
         assert_eq!(inputs.len(), 3);
         assert_eq!(inputs[0].step_id, TxStepId("step-0".to_string()));
         assert_eq!(inputs[2].step_id, TxStepId("step-2".to_string()));
@@ -924,7 +815,7 @@ mod tests {
     #[test]
     fn prepare_gate_inputs_all_pass_by_default() {
         let contract = make_tx_contract(2);
-        let inputs = mcp_build_tx_prepare_gate_inputs(&contract);
+        let inputs = crate::plan::mission_tx_prepare_gate_inputs(&contract);
         for input in &inputs {
             assert!(input.policy_passed);
             assert!(input.reservation_available);
@@ -934,13 +825,13 @@ mod tests {
     }
 
     // ========================================================================
-    // mcp_build_tx_commit_step_inputs Tests
+    // mission_tx_commit_step_inputs Tests
     // ========================================================================
 
     #[test]
     fn commit_step_inputs_all_succeed() {
         let contract = make_tx_contract(3);
-        let inputs = mcp_build_tx_commit_step_inputs(&contract, None, 999);
+        let inputs = crate::plan::mission_tx_commit_step_inputs(&contract, None, 999);
         assert_eq!(inputs.len(), 3);
         for input in &inputs {
             assert!(input.success);
@@ -953,7 +844,7 @@ mod tests {
     #[test]
     fn commit_step_inputs_one_fails() {
         let contract = make_tx_contract(3);
-        let inputs = mcp_build_tx_commit_step_inputs(&contract, Some("step-1"), 1000);
+        let inputs = crate::plan::mission_tx_commit_step_inputs(&contract, Some("step-1"), 1000);
         assert!(inputs[0].success);
         assert!(!inputs[1].success);
         assert_eq!(inputs[1].reason_code, "commit_step_failed_injected");
@@ -962,13 +853,13 @@ mod tests {
     }
 
     // ========================================================================
-    // mcp_build_tx_synthetic_commit_report Tests
+    // mission_tx_synthetic_commit_report Tests
     // ========================================================================
 
     #[test]
     fn synthetic_commit_report_basic() {
         let contract = make_tx_contract(2);
-        let report = mcp_build_tx_synthetic_commit_report(&contract, 5000);
+        let report = crate::plan::mission_tx_synthetic_commit_report(&contract, 5000);
         assert_eq!(report.tx_id, TxId("tx-001".to_string()));
         assert_eq!(report.plan_id, TxPlanId("plan-001".to_string()));
         assert_eq!(report.committed_count, 2);
@@ -981,7 +872,7 @@ mod tests {
     #[test]
     fn synthetic_commit_report_all_steps_committed() {
         let contract = make_tx_contract(3);
-        let report = mcp_build_tx_synthetic_commit_report(&contract, 100);
+        let report = crate::plan::mission_tx_synthetic_commit_report(&contract, 100);
         assert_eq!(report.step_results.len(), 3);
         for result in &report.step_results {
             assert!(result.outcome.is_committed());
@@ -990,14 +881,14 @@ mod tests {
     }
 
     // ========================================================================
-    // mcp_build_tx_compensation_inputs Tests
+    // mission_tx_compensation_inputs Tests
     // ========================================================================
 
     #[test]
     fn compensation_inputs_from_committed_report() {
         let contract = make_tx_contract(2);
-        let report = mcp_build_tx_synthetic_commit_report(&contract, 100);
-        let inputs = mcp_build_tx_compensation_inputs(&report, None, 200);
+        let report = crate::plan::mission_tx_synthetic_commit_report(&contract, 100);
+        let inputs = crate::plan::mission_tx_compensation_inputs(&report, None, 200);
         assert_eq!(inputs.len(), 2);
         for input in &inputs {
             assert!(input.success);
@@ -1010,8 +901,8 @@ mod tests {
     #[test]
     fn compensation_inputs_one_fails() {
         let contract = make_tx_contract(3);
-        let report = mcp_build_tx_synthetic_commit_report(&contract, 100);
-        let inputs = mcp_build_tx_compensation_inputs(&report, Some("step-1"), 300);
+        let report = crate::plan::mission_tx_synthetic_commit_report(&contract, 100);
+        let inputs = crate::plan::mission_tx_compensation_inputs(&report, Some("step-1"), 300);
         assert!(inputs[0].success);
         assert!(!inputs[1].success);
         assert_eq!(inputs[1].reason_code, "compensation_failed_injected");
