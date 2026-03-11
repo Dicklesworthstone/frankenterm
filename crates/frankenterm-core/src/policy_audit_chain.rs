@@ -269,7 +269,14 @@ impl AuditChain {
             .collect()
     }
 
-    /// Verify the integrity of the hash chain.
+    /// Verify the integrity of the retained hash chain.
+    ///
+    /// When bounded retention has evicted older entries, the first retained entry
+    /// is treated as an anchored head of the retained suffix. We can still verify
+    /// its `content_hash` and `chain_hash` against its recorded `previous_hash`,
+    /// and then verify that every later retained entry links to the previous
+    /// retained entry's `chain_hash`. This proves the retained window is
+    /// self-consistent without falsely flagging normal eviction as corruption.
     pub fn verify(&mut self) -> ChainVerificationResult {
         self.telemetry.verifications_run += 1;
 
@@ -282,7 +289,11 @@ impl AuditChain {
             };
         }
 
-        let mut prev_hash = String::new();
+        let mut prev_hash = self
+            .entries
+            .front()
+            .map(|entry| entry.previous_hash.clone())
+            .unwrap_or_default();
 
         for (i, entry) in self.entries.iter().enumerate() {
             // Verify content hash
@@ -308,7 +319,9 @@ impl AuditChain {
                 };
             }
 
-            // Verify previous hash linkage
+            // Verify previous hash linkage within the retained suffix. For the
+            // first retained entry, `prev_hash` is seeded from its recorded
+            // `previous_hash`, which may point to an evicted predecessor.
             if entry.previous_hash != prev_hash {
                 self.telemetry.verification_failures += 1;
                 return ChainVerificationResult {
@@ -748,15 +761,43 @@ mod tests {
                 i * 100,
             );
         }
-        // After eviction, the remaining entries still form a valid sub-chain
-        // but the first remaining entry's previous_hash points to a now-evicted entry
-        // Verification should handle this gracefully by checking what's present
+        // After eviction, the remaining entries still form a valid retained suffix
+        // even though the first retained entry points at an evicted predecessor.
         let result = chain.verify();
-        // The chain will be invalid since the first remaining entry's previous_hash
-        // doesn't match "" (genesis) — it matches the evicted entry's chain_hash.
-        // This is expected behavior: eviction breaks provable chain integrity
-        // but the entries themselves are internally consistent.
+        assert!(
+            result.valid,
+            "retained suffix should still verify: {result}"
+        );
+        assert_eq!(result.entries_checked, 3);
+    }
+
+    #[test]
+    fn verify_chain_after_eviction_still_detects_retained_link_corruption() {
+        let mut chain = AuditChain::new(3);
+        for i in 0..5 {
+            chain.append(
+                AuditEntryKind::PolicyDecision,
+                "sys",
+                &format!("d{i}"),
+                "r",
+                i * 100,
+            );
+        }
+
+        if let Some(entry) = chain.entries.get_mut(1) {
+            entry.previous_hash = "bad_hash".to_string();
+        }
+
+        let result = chain.verify();
         assert!(!result.valid);
+        assert_eq!(result.first_invalid_at, Some(1));
+        assert!(
+            result
+                .failure_reason
+                .as_ref()
+                .unwrap()
+                .contains("previous hash")
+        );
     }
 
     #[test]
