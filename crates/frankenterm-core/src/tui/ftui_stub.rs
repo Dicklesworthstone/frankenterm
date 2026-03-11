@@ -7746,10 +7746,11 @@ mod tests {
         s.press(ftui::KeyCode::Escape);
         assert!(s.model.view_state.history.filter_input.text().is_empty());
 
-        // 4. Panes (Tab from History through Search/Help/Home, then '2')
+        // 4. Panes (Tab from History through Search/Help/Timeline/Home, then '2')
         s.press(ftui::KeyCode::Tab); // History -> Search
         s.press(ftui::KeyCode::Tab); // Search -> Help
-        s.press(ftui::KeyCode::Tab); // Help -> Home
+        s.press(ftui::KeyCode::Tab); // Help -> Timeline
+        s.press(ftui::KeyCode::Tab); // Timeline -> Home
         s.char('2'); // Home -> Panes
         s.assert_view(View::Panes);
         s.press(ftui::KeyCode::Down);
@@ -7767,9 +7768,10 @@ mod tests {
         s.capture();
         assert_eq!(s.model.search_input.text(), "error");
 
-        // 6. Back to Home (Tab through Help)
+        // 6. Back to Home (Tab through Help/Timeline)
         s.press(ftui::KeyCode::Tab); // Search -> Help
-        s.press(ftui::KeyCode::Tab); // Help -> Home
+        s.press(ftui::KeyCode::Tab); // Help -> Timeline
+        s.press(ftui::KeyCode::Tab); // Timeline -> Home
         s.assert_view(View::Home);
         s.capture();
     }
