@@ -82,6 +82,23 @@ impl DistributedBridge {
         self.ingest_raw(&raw).await
     }
 
+    async fn ingest_envelope_at(
+        &mut self,
+        envelope: WireEnvelope,
+        received_at_ms: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match self
+            .aggregator
+            .ingest_envelope_at(envelope, received_at_ms)?
+        {
+            IngestResult::Accepted(payload) => self.persist_payload(payload).await,
+            IngestResult::Duplicate { sender: _, seq: _ } => {
+                self.diagnostics.duplicates += 1;
+                Ok(())
+            }
+        }
+    }
+
     async fn ingest_raw(&mut self, raw: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         match self.aggregator.ingest(raw)? {
             IngestResult::Accepted(payload) => self.persist_payload(payload).await,
@@ -104,6 +121,13 @@ impl DistributedBridge {
                 self.persist_delta(delta).await?;
             }
             WirePayload::Gap(gap) => {
+                self.ensure_pane_exists(gap.pane_id).await?;
+                self.pane_seq_by_pane
+                    .entry(gap.pane_id)
+                    .and_modify(|current| {
+                        *current = (*current).max(gap.seq_after.saturating_sub(1))
+                    })
+                    .or_insert_with(|| gap.seq_after.saturating_sub(1));
                 let reason = format!(
                     "distributed_gap:{}:{}:{}",
                     gap.reason, gap.seq_before, gap.seq_after
@@ -488,13 +512,18 @@ fn distributed_streaming_e2e_preserves_gap_and_handles_duplicate_out_of_order() 
         );
         assert!(
             gaps.iter()
-                .any(|gap| gap.reason.contains("distributed_seq_gap")
-                    || gap.reason.contains("distributed_out_of_order")),
+                .any(|gap| gap.reason.contains("distributed_out_of_order")),
             "out-of-order/discontinuity should be represented as gap diagnostics"
+        );
+        assert!(
+            !gaps
+                .iter()
+                .any(|gap| gap.reason.contains("distributed_seq_gap")),
+            "explicit remote gap should advance pane sequence tracking without adding a second synthetic seq gap"
         );
         assert_eq!(bridge.diagnostics.duplicates, 1);
         assert_eq!(bridge.diagnostics.pane_reorder_drops, 1);
-        assert_eq!(bridge.diagnostics.pane_seq_gap_repairs, 1);
+        assert_eq!(bridge.diagnostics.pane_seq_gap_repairs, 0);
         assert_eq!(
             bridge.diagnostics.replay_event_codes,
             vec!["dist.replay_detected".to_string()],
@@ -723,18 +752,18 @@ fn distributed_streaming_e2e_prunes_stale_sender_and_accepts_new_sender_at_capac
         .expect("bridge");
 
         let mut first = WireEnvelope::new(1, "agent-cap-a", WirePayload::PaneMeta(pane_meta(41)));
-        first.sent_at_ms = 100;
+        first.sent_at_ms = 50_000;
         bridge
-            .ingest_envelope(first)
+            .ingest_envelope_at(first, 100)
             .await
             .expect("first sender should be accepted");
 
         let mut second = WireEnvelope::new(1, "agent-cap-b", WirePayload::PaneMeta(pane_meta(42)));
-        second.sent_at_ms = 300;
+        second.sent_at_ms = 50_001;
         bridge
-            .ingest_envelope(second)
+            .ingest_envelope_at(second, 200)
             .await
-            .expect("stale sender should be pruned before second sender is admitted");
+            .expect("stale sender should be pruned using local receipt time");
 
         assert_eq!(bridge.aggregator.total_accepted(), 2);
         assert_eq!(bridge.aggregator.total_rejected(), 0);
@@ -770,22 +799,22 @@ fn distributed_streaming_e2e_duplicate_refresh_prevents_false_stale_eviction() {
         let mut first = WireEnvelope::new(1, "agent-dup-a", WirePayload::PaneMeta(pane_meta(51)));
         first.sent_at_ms = 100;
         bridge
-            .ingest_envelope(first)
+            .ingest_envelope_at(first, 100)
             .await
             .expect("first sender should be accepted");
 
         let mut duplicate =
             WireEnvelope::new(1, "agent-dup-a", WirePayload::PaneMeta(pane_meta(51)));
-        duplicate.sent_at_ms = 130;
+        duplicate.sent_at_ms = 1;
         bridge
-            .ingest_envelope(duplicate)
+            .ingest_envelope_at(duplicate, 130)
             .await
             .expect("duplicate should refresh liveness without persisting");
 
         let mut second = WireEnvelope::new(1, "agent-dup-b", WirePayload::PaneMeta(pane_meta(52)));
-        second.sent_at_ms = 160;
+        second.sent_at_ms = 10_000;
         let err = bridge
-            .ingest_envelope(second)
+            .ingest_envelope_at(second, 160)
             .await
             .expect_err("recent duplicate should keep first sender from being pruned");
         let wire_err = err
@@ -824,7 +853,7 @@ fn distributed_streaming_e2e_accepted_regressed_timestamp_does_not_trigger_false
         let mut first = WireEnvelope::new(1, "agent-reg-a", WirePayload::PaneMeta(pane_meta(61)));
         first.sent_at_ms = 100;
         bridge
-            .ingest_envelope(first)
+            .ingest_envelope_at(first, 100)
             .await
             .expect("first sender should be accepted");
 
@@ -833,14 +862,14 @@ fn distributed_streaming_e2e_accepted_regressed_timestamp_does_not_trigger_false
             WireEnvelope::new(2, "agent-reg-a", WirePayload::PaneMeta(pane_meta(61)));
         regressed.sent_at_ms = 90;
         bridge
-            .ingest_envelope(regressed)
+            .ingest_envelope_at(regressed, 140)
             .await
             .expect("regressed timestamp on accepted seq should not evict sender liveness");
 
         let mut second = WireEnvelope::new(1, "agent-reg-b", WirePayload::PaneMeta(pane_meta(62)));
-        second.sent_at_ms = 149;
-        let err = bridge.ingest_envelope(second).await.expect_err(
-            "sender-a should remain recent (last_seen=100), so capacity reject should fire",
+        second.sent_at_ms = 1_000;
+        let err = bridge.ingest_envelope_at(second, 180).await.expect_err(
+            "sender-a should remain recent based on receipt time, so capacity reject should fire",
         );
         let wire_err = err
             .downcast_ref::<WireProtocolError>()

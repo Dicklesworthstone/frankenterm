@@ -10302,6 +10302,7 @@ async fn distributed_persist_payload(
         }
         WirePayload::Gap(gap) => {
             let remote_pane_id = distributed_remote_pane_id(sender, gap.pane_id);
+            let seq_key = (sender.to_string(), gap.pane_id);
             let storage_handle = storage.lock().await.clone(); // ubs:ignore
             if storage_handle.get_pane(remote_pane_id).await?.is_none() {
                 let ts = now_ms_i64();
@@ -10317,6 +10318,16 @@ async fn distributed_persist_payload(
                 )
                 .await?;
             }
+
+            {
+                let mut seq_guard = pane_seq_by_sender.lock().await;
+                let next_expected_seq = gap.seq_after.saturating_sub(1);
+                seq_guard
+                    .entry(seq_key)
+                    .and_modify(|current| *current = (*current).max(next_expected_seq))
+                    .or_insert(next_expected_seq);
+            }
+
             let reason = format!(
                 "distributed_gap:{}:{}:{}",
                 gap.reason, gap.seq_before, gap.seq_after
@@ -10964,6 +10975,34 @@ async fn distributed_agent_seed_segment_cursors(
 }
 
 #[cfg(feature = "distributed")]
+async fn distributed_agent_seed_gap_cursors(
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
+    cursors: &mut std::collections::HashMap<u64, i64>,
+) -> anyhow::Result<()> {
+    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+    let local_pane_ids = storage_handle
+        .get_panes()
+        .await?
+        .into_iter()
+        .filter(distributed_agent_local_pane)
+        .map(|pane| pane.pane_id)
+        .collect::<std::collections::HashSet<_>>();
+
+    for gap in storage_handle.get_gaps().await? {
+        if local_pane_ids.contains(&gap.pane_id) {
+            cursors
+                .entry(gap.pane_id)
+                .and_modify(|current| *current = (*current).max(gap.id))
+                .or_insert(gap.id);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "distributed")]
 async fn distributed_agent_send_pane_snapshot(
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
     storage: &Arc<
@@ -11071,12 +11110,164 @@ async fn distributed_agent_flush_pane_deltas(
 }
 
 #[cfg(feature = "distributed")]
+#[derive(Debug)]
+enum DistributedReplayItem {
+    Segment(frankenterm_core::storage::Segment),
+    Gap(frankenterm_core::storage::Gap),
+}
+
+#[cfg(feature = "distributed")]
+impl DistributedReplayItem {
+    fn sort_key(&self) -> (i64, u64, u8, i64) {
+        match self {
+            // Replay order is primarily chronological, but equal-millisecond ties
+            // must still preserve the local sequence narrative for a pane:
+            // segments before a gap if they precede it, then the gap, then the
+            // next segment(s) that follow the gap.
+            Self::Segment(segment) => (segment.captured_at, segment.seq, 1, segment.id),
+            Self::Gap(gap) => (gap.detected_at, gap.seq_after, 0, gap.id),
+        }
+    }
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_collect_pending_gaps(
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
+    pane_id: u64,
+    after_id: Option<i64>,
+    limit: usize,
+) -> anyhow::Result<Vec<frankenterm_core::storage::Gap>> {
+    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+    let lower_bound = after_id.unwrap_or(0);
+    let mut gaps = storage_handle
+        .get_gaps()
+        .await?
+        .into_iter()
+        .filter(|gap| gap.pane_id == pane_id && gap.id > lower_bound)
+        .collect::<Vec<_>>();
+    gaps.sort_by_key(|gap| (gap.detected_at, gap.id));
+    if gaps.len() > limit {
+        gaps.truncate(limit);
+    }
+    Ok(gaps)
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_agent_flush_pane_history(
+    pane_id: u64,
+    streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
+    segment_cursors: &mut std::collections::HashMap<u64, i64>,
+    gap_cursors: &mut std::collections::HashMap<u64, i64>,
+    stream: &mut asupersync::io::BufReader<DistributedIoStream>,
+) -> anyhow::Result<usize> {
+    use frankenterm_core::events::Event;
+    use frankenterm_core::storage::SegmentScanQuery;
+    use frankenterm_core::wire_protocol::WirePayload;
+
+    const BATCH_LIMIT: usize = 256;
+    let mut total_sent = 0usize;
+    let mut after_segment_id = segment_cursors.get(&pane_id).copied();
+    let mut after_gap_id = gap_cursors.get(&pane_id).copied();
+
+    loop {
+        let segments = {
+            let storage_handle = storage.lock().await.clone(); // ubs:ignore
+            storage_handle
+                .scan_segments(SegmentScanQuery {
+                    after_id: after_segment_id,
+                    pane_id: Some(pane_id),
+                    since: None,
+                    until: None,
+                    limit: BATCH_LIMIT,
+                })
+                .await?
+        };
+        let pending_gaps =
+            distributed_agent_collect_pending_gaps(storage, pane_id, after_gap_id, BATCH_LIMIT)
+                .await?;
+
+        if segments.is_empty() && pending_gaps.is_empty() {
+            break;
+        }
+
+        let segments_full = segments.len() == BATCH_LIMIT;
+        let gaps_full = pending_gaps.len() == BATCH_LIMIT;
+
+        let mut items = Vec::with_capacity(segments.len() + pending_gaps.len());
+        items.extend(segments.into_iter().map(DistributedReplayItem::Segment));
+        items.extend(pending_gaps.into_iter().map(DistributedReplayItem::Gap));
+        items.sort_by_key(DistributedReplayItem::sort_key);
+
+        for item in items {
+            match item {
+                DistributedReplayItem::Segment(segment) => {
+                    let Some(mut envelope) = streamer.event_to_envelope(&Event::SegmentCaptured {
+                        pane_id: segment.pane_id,
+                        seq: segment.seq,
+                        content_len: segment.content_len,
+                    }) else {
+                        continue;
+                    };
+
+                    if let WirePayload::PaneDelta(delta) = &mut envelope.payload {
+                        delta.seq = segment.seq;
+                        delta.content = segment.content;
+                        delta.content_len = segment.content_len;
+                        delta.captured_at_ms = segment.captured_at;
+                    }
+                    distributed_agent_send_envelope(stream, &envelope).await?;
+
+                    total_sent += 1;
+                    after_segment_id = Some(segment.id);
+                    segment_cursors.insert(pane_id, segment.id);
+                }
+                DistributedReplayItem::Gap(gap) => {
+                    let Some(mut envelope) = streamer.event_to_envelope(&Event::GapDetected {
+                        pane_id: gap.pane_id,
+                        seq_before: gap.seq_before,
+                        seq_after: gap.seq_after,
+                        reason: gap.reason.clone(),
+                        detected_at_ms: gap.detected_at,
+                    }) else {
+                        continue;
+                    };
+
+                    if let WirePayload::Gap(gap_notice) = &mut envelope.payload {
+                        gap_notice.seq_before = gap.seq_before;
+                        gap_notice.seq_after = gap.seq_after;
+                        gap_notice.reason = gap.reason;
+                        gap_notice.detected_at_ms = gap.detected_at;
+                    }
+                    distributed_agent_send_envelope(stream, &envelope).await?;
+
+                    total_sent += 1;
+                    after_gap_id = Some(gap.id);
+                    gap_cursors.insert(pane_id, gap.id);
+                }
+            }
+        }
+
+        if !segments_full && !gaps_full {
+            break;
+        }
+    }
+
+    Ok(total_sent)
+}
+
+#[cfg(feature = "distributed")]
 async fn distributed_agent_flush_all_panes(
     streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
     storage: &Arc<
         frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
     >,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
+    gap_cursors: &mut std::collections::HashMap<u64, i64>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<usize> {
     let pane_ids = {
@@ -11092,11 +11283,12 @@ async fn distributed_agent_flush_all_panes(
 
     let mut sent = 0usize;
     for pane_id in pane_ids {
-        sent += distributed_agent_flush_pane_deltas(
+        sent += distributed_agent_flush_pane_history(
             pane_id,
             streamer,
             storage,
             segment_cursors,
+            gap_cursors,
             stream,
         )
         .await?;
@@ -11113,6 +11305,7 @@ async fn distributed_agent_stream_event(
         frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
     >,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
+    gap_cursors: &mut std::collections::HashMap<u64, i64>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
 ) -> anyhow::Result<()> {
     use frankenterm_core::events::Event;
@@ -11125,6 +11318,18 @@ async fn distributed_agent_stream_event(
                 streamer,
                 storage,
                 segment_cursors,
+                stream,
+            )
+            .await?;
+            Ok(())
+        }
+        Event::GapDetected { pane_id, .. } => {
+            let _ = distributed_agent_flush_pane_history(
+                pane_id,
+                streamer,
+                storage,
+                segment_cursors,
+                gap_cursors,
                 stream,
             )
             .await?;
@@ -11160,6 +11365,7 @@ async fn distributed_agent_stream_session(
     agent_id: &str,
     session_id: &str,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
+    gap_cursors: &mut std::collections::HashMap<u64, i64>,
     shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     use asupersync::io::AsyncWriteExt;
@@ -11239,10 +11445,16 @@ async fn distributed_agent_stream_session(
     }
 
     distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
-    let recovered =
-        distributed_agent_flush_all_panes(streamer, storage, segment_cursors, &mut stream).await?;
+    let recovered = distributed_agent_flush_all_panes(
+        streamer,
+        storage,
+        segment_cursors,
+        gap_cursors,
+        &mut stream,
+    )
+    .await?;
     if recovered > 0 {
-        tracing::debug!(recovered, "Flushed pending pane deltas after connect");
+        tracing::debug!(recovered, "Flushed pending pane history after connect");
     }
 
     let mut subscriber = event_bus.subscribe();
@@ -11264,6 +11476,7 @@ async fn distributed_agent_stream_session(
                         streamer,
                         storage,
                         segment_cursors,
+                        gap_cursors,
                         &mut stream,
                     )
                     .await?;
@@ -11271,16 +11484,17 @@ async fn distributed_agent_stream_session(
                 Err(frankenterm_core::events::RecvError::Lagged { missed_count }) => {
                     tracing::warn!(
                         missed = missed_count,
-                        "Distributed agent subscriber lagged; repairing via segment scan"
+                        "Distributed agent subscriber lagged; repairing via history scan"
                     );
                     let repaired = distributed_agent_flush_all_panes(
                         streamer,
                         storage,
                         segment_cursors,
+                        gap_cursors,
                         &mut stream,
                     )
                     .await?;
-                    tracing::debug!(repaired, "Distributed lag repair flushed pending deltas");
+                    tracing::debug!(repaired, "Distributed lag repair flushed pending history");
                 }
                 Err(frankenterm_core::events::RecvError::Closed) => {
                     anyhow::bail!("Distributed agent event bus closed");
@@ -11341,7 +11555,9 @@ async fn distributed_agent_stream_forever(
 
     let mut streamer = frankenterm_core::wire_protocol::AgentStreamer::new(agent_id.clone());
     let mut segment_cursors: std::collections::HashMap<u64, i64> = std::collections::HashMap::new();
+    let mut gap_cursors: std::collections::HashMap<u64, i64> = std::collections::HashMap::new();
     distributed_agent_seed_segment_cursors(&storage, &mut segment_cursors).await?;
+    distributed_agent_seed_gap_cursors(&storage, &mut gap_cursors).await?;
 
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
@@ -11361,6 +11577,7 @@ async fn distributed_agent_stream_forever(
                     &agent_id,
                     &session_id,
                     &mut segment_cursors,
+                    &mut gap_cursors,
                     &shutdown_flag,
                 )
                 .await
@@ -38677,7 +38894,7 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
-    fn distributed_persist_payload_gap_event_carries_recorded_bounds() {
+    fn distributed_persist_payload_gap_event_carries_reported_bounds() {
         run_async_test(async {
             let (storage_handle, db_path) = setup_storage("distributed_gap_event_bounds").await;
             let storage =
@@ -38745,8 +38962,8 @@ recorder_backend = "frankensqlite"
                     detected_at_ms,
                 } => {
                     assert_eq!(pane_id, remote_pane_id);
-                    assert_eq!(seq_before, 2);
-                    assert_eq!(seq_after, 3);
+                    assert_eq!(seq_before, 1);
+                    assert_eq!(seq_after, 4);
                     assert_eq!(reason, "distributed_gap:timeout:1:4");
                     assert!(detected_at_ms > 0);
                 }
@@ -38766,7 +38983,7 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
-    fn distributed_persist_payload_explicit_gap_preserves_reported_bounds_in_reason() {
+    fn distributed_persist_payload_explicit_gap_preserves_reported_bounds_in_storage() {
         run_async_test(async {
             let (storage_handle, db_path) = setup_storage("distributed_explicit_gap_bounds").await;
             let storage =
@@ -38821,9 +39038,13 @@ recorder_backend = "frankensqlite"
             {
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
                 let gaps = storage_handle.get_gaps().await.unwrap();
-                assert!(gaps.iter().any(|gap| {
-                    gap.pane_id == remote_pane_id && gap.reason == "distributed_gap:timeout:1:4"
-                }));
+                let gap = gaps
+                    .iter()
+                    .find(|gap| gap.pane_id == remote_pane_id)
+                    .expect("explicit remote gap should be stored");
+                assert_eq!(gap.seq_before, 1);
+                assert_eq!(gap.seq_after, 4);
+                assert_eq!(gap.reason, "distributed_gap:timeout:1:4");
             }
 
             {
@@ -38835,6 +39056,485 @@ recorder_backend = "frankensqlite"
             let _ = std::fs::remove_file(format!("{db_path}-wal"));
             let _ = std::fs::remove_file(format!("{db_path}-shm"));
         });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_persist_payload_explicit_gap_advances_sender_sequence_tracker() {
+        run_async_test(async {
+            let (storage_handle, db_path) =
+                setup_storage("distributed_explicit_gap_advances_sender_tracker").await;
+            let storage =
+                std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+            let pane_seq_by_sender =
+                frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<
+                    (String, u64),
+                    u64,
+                >::new());
+
+            let sender = "agent-gap-tracker";
+            let source_pane_id = 51_u64;
+            let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+
+            distributed_persist_payload(
+                sender,
+                frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                    frankenterm_core::wire_protocol::PaneDelta {
+                        pane_id: source_pane_id,
+                        seq: 1,
+                        content: "before-gap".to_string(),
+                        content_len: "before-gap".len(),
+                        captured_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            distributed_persist_payload(
+                sender,
+                frankenterm_core::wire_protocol::WirePayload::Gap(
+                    frankenterm_core::wire_protocol::GapNotice {
+                        pane_id: source_pane_id,
+                        seq_before: 1,
+                        seq_after: 4,
+                        reason: "timeout".to_string(),
+                        detected_at_ms: now_ms_i64(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            distributed_persist_payload(
+                sender,
+                frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                    frankenterm_core::wire_protocol::PaneDelta {
+                        pane_id: source_pane_id,
+                        seq: 4,
+                        content: "after-gap".to_string(),
+                        content_len: "after-gap".len(),
+                        captured_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                let gaps = storage_handle.get_gaps().await.unwrap();
+                let pane_gaps: Vec<_> = gaps
+                    .into_iter()
+                    .filter(|gap| gap.pane_id == remote_pane_id)
+                    .collect();
+                assert_eq!(pane_gaps.len(), 1);
+                assert_eq!(pane_gaps[0].reason, "distributed_gap:timeout:1:4");
+
+                let segments = storage_handle
+                    .get_segments(remote_pane_id, 10)
+                    .await
+                    .unwrap();
+                assert_eq!(segments.len(), 2);
+                assert_eq!(segments[0].content, "after-gap");
+                assert_eq!(segments[1].content, "before-gap");
+            }
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                storage_handle.shutdown().await.unwrap();
+            }
+            drop(storage);
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_agent_flush_pane_history_replays_gap_before_later_segment() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use asupersync::net::{TcpListener, TcpStream};
+                use frankenterm_core::storage::PaneRecord;
+                use frankenterm_core::wire_protocol::{AgentStreamer, WireEnvelope, WirePayload};
+
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_agent_replay_gap_history").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                    storage_handle,
+                ));
+                let pane_id = 77_u64;
+                let now = now_ms_i64();
+
+                let (first_segment, recorded_gap, second_segment) = {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    storage_handle
+                        .upsert_pane(PaneRecord {
+                            pane_id,
+                            pane_uuid: Some("local-gap-pane".to_string()),
+                            domain: "local".to_string(),
+                            title: Some("local-gap-pane".to_string()),
+                            cwd: Some("/tmp".to_string()),
+                            tty_name: None,
+                            first_seen_at: now,
+                            last_seen_at: now,
+                            observed: true,
+                            ignore_reason: None,
+                            last_decision_at: Some(now),
+                        })
+                        .await
+                        .unwrap();
+
+                    let first_segment = storage_handle
+                        .append_segment(pane_id, "before-gap", None)
+                        .await
+                        .unwrap();
+                    frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(2))
+                        .await;
+                    let recorded_gap = storage_handle
+                        .record_gap(pane_id, "repair-gap")
+                        .await
+                        .unwrap()
+                        .expect("gap should be recorded");
+                    frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(2))
+                        .await;
+                    let second_segment = storage_handle
+                        .append_segment(pane_id, "after-gap", None)
+                        .await
+                        .unwrap();
+
+                    (first_segment, recorded_gap, second_segment)
+                };
+
+                let bind_probe =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
+                drop(bind_probe);
+
+                let listener = TcpListener::bind(bind_addr.to_string())
+                    .await
+                    .expect("bind replay listener");
+                let client = TcpStream::connect(bind_addr.to_string())
+                    .await
+                    .expect("connect replay stream");
+                let (server, _) = listener.accept().await.expect("accept replay stream");
+
+                let mut stream =
+                    asupersync::io::BufReader::new(Box::new(client) as DistributedIoStream);
+                let mut reader = asupersync::io::BufReader::new(server);
+                let mut streamer = AgentStreamer::new("agent-replay-gap");
+                let mut segment_cursors =
+                    std::collections::HashMap::from([(pane_id, first_segment.id)]);
+                let mut gap_cursors = std::collections::HashMap::new();
+
+                let sent = distributed_agent_flush_pane_history(
+                    pane_id,
+                    &mut streamer,
+                    &storage,
+                    &mut segment_cursors,
+                    &mut gap_cursors,
+                    &mut stream,
+                )
+                .await
+                .expect("flush pane history");
+                assert_eq!(sent, 2);
+                drop(stream);
+
+                let mut line = String::new();
+                let first_size = distributed_read_line(
+                    &mut reader,
+                    &mut line,
+                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                )
+                .await
+                .expect("read first replay envelope");
+                assert!(first_size > 0);
+                let first_envelope =
+                    WireEnvelope::from_json(line.trim().as_bytes()).expect("parse first envelope");
+
+                line.clear();
+                let second_size = distributed_read_line(
+                    &mut reader,
+                    &mut line,
+                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                )
+                .await
+                .expect("read second replay envelope");
+                assert!(second_size > 0);
+                let second_envelope =
+                    WireEnvelope::from_json(line.trim().as_bytes()).expect("parse second envelope");
+
+                match first_envelope.payload {
+                    WirePayload::Gap(gap_notice) => {
+                        assert_eq!(gap_notice.pane_id, pane_id);
+                        assert_eq!(gap_notice.seq_before, recorded_gap.seq_before);
+                        assert_eq!(gap_notice.seq_after, recorded_gap.seq_after);
+                        assert_eq!(gap_notice.reason, "repair-gap");
+                    }
+                    other => panic!("expected gap replay first, got {other:?}"),
+                }
+
+                match second_envelope.payload {
+                    WirePayload::PaneDelta(delta) => {
+                        assert_eq!(delta.pane_id, pane_id);
+                        assert_eq!(delta.seq, second_segment.seq);
+                        assert_eq!(delta.content, "after-gap");
+                    }
+                    other => panic!("expected pane delta replay second, got {other:?}"),
+                }
+
+                assert_eq!(segment_cursors.get(&pane_id), Some(&second_segment.id));
+                assert_eq!(gap_cursors.get(&pane_id), Some(&recorded_gap.id));
+
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                cleanup_storage(storage_handle, &db_path).await;
+            });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_agent_flush_pane_history_orders_gap_before_later_segment_on_equal_timestamps() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use asupersync::net::{TcpListener, TcpStream};
+                use frankenterm_core::storage::PaneRecord;
+                use frankenterm_core::wire_protocol::{AgentStreamer, WireEnvelope, WirePayload};
+
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_agent_replay_gap_history_equal_ts").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                    storage_handle,
+                ));
+                let pane_id = 79_u64;
+                let now = now_ms_i64();
+
+                let (first_segment, recorded_gap, second_segment) = {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    storage_handle
+                        .upsert_pane(PaneRecord {
+                            pane_id,
+                            pane_uuid: Some("local-gap-pane-equal-ts".to_string()),
+                            domain: "local".to_string(),
+                            title: Some("local-gap-pane-equal-ts".to_string()),
+                            cwd: Some("/tmp".to_string()),
+                            tty_name: None,
+                            first_seen_at: now,
+                            last_seen_at: now,
+                            observed: true,
+                            ignore_reason: None,
+                            last_decision_at: Some(now),
+                        })
+                        .await
+                        .unwrap();
+
+                    let first_segment = storage_handle
+                        .append_segment(pane_id, "before-gap", None)
+                        .await
+                        .unwrap();
+                    let recorded_gap = storage_handle
+                        .record_gap(pane_id, "repair-gap")
+                        .await
+                        .unwrap()
+                        .expect("gap should be recorded");
+                    let second_segment = storage_handle
+                        .append_segment(pane_id, "after-gap", None)
+                        .await
+                        .unwrap();
+
+                    (first_segment, recorded_gap, second_segment)
+                };
+
+                let conn = rusqlite::Connection::open(&db_path).expect("open sqlite connection");
+                conn.execute(
+                    "UPDATE output_gaps SET detected_at = ?1 WHERE id = ?2",
+                    rusqlite::params![4_242_i64, recorded_gap.id],
+                )
+                .expect("set gap timestamp");
+                conn.execute(
+                    "UPDATE output_segments SET captured_at = ?1 WHERE id = ?2",
+                    rusqlite::params![4_242_i64, second_segment.id],
+                )
+                .expect("set later segment timestamp");
+                drop(conn);
+
+                let bind_probe =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
+                drop(bind_probe);
+
+                let listener = TcpListener::bind(bind_addr.to_string())
+                    .await
+                    .expect("bind replay listener");
+                let client = TcpStream::connect(bind_addr.to_string())
+                    .await
+                    .expect("connect replay stream");
+                let (server, _) = listener.accept().await.expect("accept replay stream");
+
+                let mut stream =
+                    asupersync::io::BufReader::new(Box::new(client) as DistributedIoStream);
+                let mut reader = asupersync::io::BufReader::new(server);
+                let mut streamer = AgentStreamer::new("agent-replay-gap-equal-ts");
+                let mut segment_cursors =
+                    std::collections::HashMap::from([(pane_id, first_segment.id)]);
+                let mut gap_cursors = std::collections::HashMap::new();
+
+                let sent = distributed_agent_flush_pane_history(
+                    pane_id,
+                    &mut streamer,
+                    &storage,
+                    &mut segment_cursors,
+                    &mut gap_cursors,
+                    &mut stream,
+                )
+                .await
+                .expect("flush pane history");
+                assert_eq!(sent, 2);
+                drop(stream);
+
+                let mut line = String::new();
+                let first_size = distributed_read_line(
+                    &mut reader,
+                    &mut line,
+                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                )
+                .await
+                .expect("read first replay envelope");
+                assert!(first_size > 0);
+                let first_envelope =
+                    WireEnvelope::from_json(line.trim().as_bytes()).expect("parse first envelope");
+
+                line.clear();
+                let second_size = distributed_read_line(
+                    &mut reader,
+                    &mut line,
+                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                )
+                .await
+                .expect("read second replay envelope");
+                assert!(second_size > 0);
+                let second_envelope =
+                    WireEnvelope::from_json(line.trim().as_bytes()).expect("parse second envelope");
+
+                match first_envelope.payload {
+                    WirePayload::Gap(gap_notice) => {
+                        assert_eq!(gap_notice.pane_id, pane_id);
+                        assert_eq!(gap_notice.seq_before, recorded_gap.seq_before);
+                        assert_eq!(gap_notice.seq_after, recorded_gap.seq_after);
+                    }
+                    other => panic!("expected gap replay first on timestamp tie, got {other:?}"),
+                }
+
+                match second_envelope.payload {
+                    WirePayload::PaneDelta(delta) => {
+                        assert_eq!(delta.pane_id, pane_id);
+                        assert_eq!(delta.seq, second_segment.seq);
+                        assert_eq!(delta.content, "after-gap");
+                    }
+                    other => {
+                        panic!("expected later pane delta replay second on timestamp tie, got {other:?}")
+                    }
+                }
+
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                cleanup_storage(storage_handle, &db_path).await;
+            });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_agent_seed_gap_cursors_tracks_highest_gap_id() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use frankenterm_core::storage::PaneRecord;
+
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_gap_cursor_seed_max_id").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                    storage_handle,
+                ));
+                let pane_id = 78_u64;
+                let now = now_ms_i64();
+
+                let (older_gap, newer_gap) = {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    storage_handle
+                        .upsert_pane(PaneRecord {
+                            pane_id,
+                            pane_uuid: Some("local-gap-cursor-pane".to_string()),
+                            domain: "local".to_string(),
+                            title: Some("local-gap-cursor-pane".to_string()),
+                            cwd: Some("/tmp".to_string()),
+                            tty_name: None,
+                            first_seen_at: now,
+                            last_seen_at: now,
+                            observed: true,
+                            ignore_reason: None,
+                            last_decision_at: Some(now),
+                        })
+                        .await
+                        .unwrap();
+                    storage_handle
+                        .append_segment(pane_id, "seed-gap-cursor", None)
+                        .await
+                        .unwrap();
+
+                    let older_gap = storage_handle
+                        .record_gap(pane_id, "older-gap")
+                        .await
+                        .unwrap()
+                        .expect("older gap should be recorded");
+                    let newer_gap = storage_handle
+                        .record_gap(pane_id, "newer-gap")
+                        .await
+                        .unwrap()
+                        .expect("newer gap should be recorded");
+                    (older_gap, newer_gap)
+                };
+
+                let conn = rusqlite::Connection::open(&db_path).expect("open sqlite connection");
+                conn.execute(
+                    "UPDATE output_gaps SET detected_at = ?1 WHERE id = ?2",
+                    rusqlite::params![200_i64, older_gap.id],
+                )
+                .expect("raise older gap timestamp");
+                conn.execute(
+                    "UPDATE output_gaps SET detected_at = ?1 WHERE id = ?2",
+                    rusqlite::params![100_i64, newer_gap.id],
+                )
+                .expect("lower newer gap timestamp");
+                drop(conn);
+
+                let mut gap_cursors = std::collections::HashMap::new();
+                distributed_agent_seed_gap_cursors(&storage, &mut gap_cursors)
+                    .await
+                    .expect("seed gap cursors");
+
+                assert_eq!(gap_cursors.get(&pane_id), Some(&newer_gap.id));
+
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                cleanup_storage(storage_handle, &db_path).await;
+            });
     }
 
     #[cfg(feature = "distributed")]
