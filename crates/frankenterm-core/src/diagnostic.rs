@@ -81,7 +81,9 @@ fn gather_environment() -> EnvironmentInfo {
         schema_version: SCHEMA_VERSION,
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        rust_version: option_env!("RUSTC_VERSION").map(String::from),
+        rust_version: option_env!("FT_RUSTC_VERSION")
+            .or(option_env!("RUSTC_VERSION"))
+            .map(String::from),
         cwd: std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string()),
@@ -157,6 +159,12 @@ struct TableCounts {
     approval_tokens: i64,
 }
 
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = db_path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
 fn gather_db_health(db_path: &Path) -> crate::Result<DbHealthStats> {
     let conn = Connection::open(db_path).map_err(|e| {
         crate::StorageError::Database(format!("Failed to open database for diagnostics: {e}"))
@@ -176,7 +184,7 @@ fn gather_db_health(db_path: &Path) -> crate::Result<DbHealthStats> {
 
     let db_file_size = fs::metadata(db_path).map_or(0, |m| m.len());
 
-    let wal_path = db_path.with_extension("db-wal");
+    let wal_path = sqlite_sidecar_path(db_path, "-wal");
     let wal_file_size = fs::metadata(&wal_path).map_or(0, |m| m.len());
 
     Ok(DbHealthStats {
@@ -805,6 +813,7 @@ mod tests {
         assert!(!env.os.is_empty());
         assert!(!env.arch.is_empty());
         assert_eq!(env.schema_version, SCHEMA_VERSION);
+        assert!(env.rust_version.is_some());
     }
 
     #[test]
@@ -1881,7 +1890,7 @@ mod tests {
     #[test]
     fn gather_db_health_missing_wal_file() {
         let tmp =
-            std::env::temp_dir().join(format!("wa_test_diag_nowal_{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("wa_test_diag_nowal_{}.sqlite3", std::process::id()));
         {
             let conn = Connection::open(&tmp).unwrap();
             conn.execute_batch(
@@ -1897,13 +1906,44 @@ mod tests {
             .unwrap();
         }
         // Ensure no WAL file exists
-        let wal_path = tmp.with_extension("db-wal");
+        let wal_path = sqlite_sidecar_path(&tmp, "-wal");
         let _ = fs::remove_file(&wal_path);
 
         let health = gather_db_health(&tmp).unwrap();
         assert_eq!(health.wal_file_size_bytes, 0);
         assert_eq!(health.table_counts.panes, 0);
 
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn gather_db_health_reads_wal_for_non_db_extension() {
+        let tmp = std::env::temp_dir().join(format!(
+            "wa_test_diag_wal_present_{}.sqlite3",
+            std::process::id()
+        ));
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE panes (id INTEGER PRIMARY KEY);
+                 CREATE TABLE output_segments (id INTEGER PRIMARY KEY);
+                 CREATE TABLE events (id INTEGER PRIMARY KEY);
+                 CREATE TABLE audit_actions (id INTEGER PRIMARY KEY);
+                 CREATE TABLE workflow_executions (id INTEGER PRIMARY KEY);
+                 CREATE TABLE workflow_step_logs (id INTEGER PRIMARY KEY);
+                 CREATE TABLE pane_reservations (id INTEGER PRIMARY KEY);
+                 CREATE TABLE approval_tokens (id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        }
+
+        let wal_path = sqlite_sidecar_path(&tmp, "-wal");
+        fs::write(&wal_path, b"wal!").unwrap();
+
+        let health = gather_db_health(&tmp).unwrap();
+        assert_eq!(health.wal_file_size_bytes, 4);
+
+        let _ = fs::remove_file(&wal_path);
         let _ = fs::remove_file(&tmp);
     }
 

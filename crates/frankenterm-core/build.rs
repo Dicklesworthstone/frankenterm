@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 #[derive(Default, Debug, Clone)]
 struct PackageInfo {
@@ -36,6 +37,15 @@ fn main() {
             println!("cargo:rustc-env=FT_WEZTERM_VENDORED_SOURCE={source}");
         }
     }
+
+    let rustc_ver = Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=FT_RUSTC_VERSION={rustc_ver}");
 }
 
 fn parse_lock_packages(contents: &str) -> std::collections::HashMap<String, PackageInfo> {
