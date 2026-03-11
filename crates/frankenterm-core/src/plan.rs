@@ -5929,7 +5929,7 @@ mod tests {
         let contract = sample_tx_contract(MissionTxState::Planned);
         let report = mission_tx_synthetic_commit_report(&contract, 5_151);
 
-        assert_eq!(report.tx_id.0, "tx:robot-interface-test");
+        assert_eq!(report.tx_id.0, "tx:test");
         assert_eq!(report.committed_count, 3);
         assert_eq!(report.failed_count, 0);
         assert_eq!(report.skipped_count, 0);

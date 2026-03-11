@@ -980,7 +980,7 @@ fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) ->
 /// - `^[charset]+$` — entire string matches charset
 /// - `^[charset]*$` — same but allows empty
 fn matches_safety_regex(value: &str, pattern: &str) -> bool {
-    if value.is_empty() {
+    if value.is_empty() || pattern.is_empty() {
         return false;
     }
     match regex::Regex::new(pattern) {

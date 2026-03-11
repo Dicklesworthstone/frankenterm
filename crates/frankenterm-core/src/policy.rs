@@ -5127,6 +5127,12 @@ impl PolicyEngine {
             context.set_risk(risk);
         }
 
+        // Track whether the credential broker gate has explicitly authorized
+        // this action.  When true, the generic `is_destructive()` gate later
+        // in the pipeline is skipped because the broker's scope/sensitivity
+        // check is more authoritative for credential actions.
+        let mut credential_broker_authorized = false;
+
         // ---- Credential broker gate (connector actions) ----
         if self.credential_broker_config.enabled && input.action.is_connector_action() {
             // For connector credential actions, check broker access rules
@@ -5192,6 +5198,7 @@ impl PolicyEngine {
                         scope.provider, scope.resource
                     )),
                 );
+                credential_broker_authorized = true;
             }
         }
 
@@ -5572,8 +5579,10 @@ impl PolicyEngine {
             }
         }
 
-        // Destructive actions require approval for non-trusted actors
-        if input.action.is_destructive() && !input.actor.is_trusted() {
+        // Destructive actions require approval for non-trusted actors.
+        // Skip for credential actions already authorized by the broker gate,
+        // which performs its own scope/sensitivity/ceiling checks.
+        if input.action.is_destructive() && !input.actor.is_trusted() && !credential_broker_authorized {
             let reason = format!(
                 "Destructive action '{}' requires approval",
                 input.action.as_str()

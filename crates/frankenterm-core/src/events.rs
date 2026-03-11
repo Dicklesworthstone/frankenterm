@@ -3539,8 +3539,8 @@ mod tests {
     #[test]
     fn match_rule_glob_star_prefix() {
         assert!(match_rule_glob("*.error", "codex.error"));
-        assert!(match_rule_glob("*.error", "codex.warning"));
-        assert!(!match_rule_glob("*.error", "gemini.error"));
+        assert!(!match_rule_glob("*.error", "codex.warning"));
+        assert!(match_rule_glob("*.error", "gemini.error"));
     }
 
     #[test]

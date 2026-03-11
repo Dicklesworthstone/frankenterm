@@ -825,13 +825,13 @@ mod tests {
         run_async_test(async {
             let dir = tempfile::tempdir().expect("tempdir");
             let socket_path = dir.path().join("stale.sock");
-            let stale_listener = compat_unix::bind(&socket_path)
-                .await
-                .expect("bind stale socket");
-            drop(stale_listener);
+            // Create a stale socket file via std::os::unix::net (no cleanup on drop)
+            let std_listener = std::os::unix::net::UnixListener::bind(&socket_path)
+                .expect("bind std socket");
+            drop(std_listener);
             assert!(
                 socket_path.exists(),
-                "socket path should persist after listener drop"
+                "socket path should persist after std listener drop"
             );
 
             let listener = NativeEventListener::bind(socket_path.clone())

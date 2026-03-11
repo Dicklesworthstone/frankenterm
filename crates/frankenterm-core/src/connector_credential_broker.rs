@@ -154,13 +154,16 @@ impl CredentialScope {
         if self.provider != other.provider {
             return false;
         }
-        // Wildcard resource in `other` covers everything
-        if other.resource == "*" {
-            return self.operations.iter().all(|op| {
-                other.operations.contains(op) || other.operations.contains(&"*".to_string())
-            });
-        }
-        if self.resource != other.resource {
+        // Check resource matching: exact, full wildcard, or prefix glob
+        let resource_matches = if other.resource == "*" {
+            true
+        } else if let Some(prefix) = other.resource.strip_suffix('*') {
+            // Prefix glob: "channels/*" matches "channels/alerts"
+            self.resource.starts_with(prefix)
+        } else {
+            self.resource == other.resource
+        };
+        if !resource_matches {
             return false;
         }
         self.operations

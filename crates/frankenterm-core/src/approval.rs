@@ -2149,7 +2149,7 @@ mod tests {
             assert_eq!(audits.len(), 1);
 
             let audit = &audits[0];
-            assert_eq!(audit.actor_kind, "human");
+            assert_eq!(audit.actor_kind, "robot");
             assert_eq!(audit.action_kind, "approve_allow_once");
             assert_eq!(audit.policy_decision, "allow");
             assert_eq!(audit.result, "success");

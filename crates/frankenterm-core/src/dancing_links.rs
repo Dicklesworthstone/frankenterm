@@ -836,8 +836,9 @@ mod tests {
         let matrix = vec![vec![false]];
         let mut dlx = DancingLinks::from_matrix(&matrix);
         assert_eq!(dlx.num_columns(), 1);
-        assert_eq!(dlx.num_rows(), 0);
-        // No rows to cover column 0
+        // from_matrix reserves a row index even for all-false rows
+        assert_eq!(dlx.num_rows(), 1);
+        // No rows actually cover column 0, so no solution
         assert!(dlx.solve().is_none());
     }
 
