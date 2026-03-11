@@ -1050,7 +1050,11 @@ impl ApprovalTracker {
 
     /// Approve a pending request. Returns true if the approval was found and updated.
     pub fn approve(&mut self, approval_id: &str, decided_by: &str, now_ms: u64) -> bool {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.approval_id == approval_id) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.approval_id == approval_id)
+        {
             if entry.status == ApprovalStatus::Pending {
                 entry.status = ApprovalStatus::Approved;
                 entry.decided_by = decided_by.to_string();
@@ -1063,7 +1067,11 @@ impl ApprovalTracker {
 
     /// Reject a pending request. Returns true if found and updated.
     pub fn reject(&mut self, approval_id: &str, decided_by: &str, now_ms: u64) -> bool {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.approval_id == approval_id) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.approval_id == approval_id)
+        {
             if entry.status == ApprovalStatus::Pending {
                 entry.status = ApprovalStatus::Rejected;
                 entry.decided_by = decided_by.to_string();
@@ -1076,7 +1084,11 @@ impl ApprovalTracker {
 
     /// Revoke a previously approved request. Returns true if found and revoked.
     pub fn revoke(&mut self, approval_id: &str, decided_by: &str, now_ms: u64) -> bool {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.approval_id == approval_id) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.approval_id == approval_id)
+        {
             if entry.status == ApprovalStatus::Approved {
                 entry.status = ApprovalStatus::Revoked;
                 entry.decided_by = decided_by.to_string();
@@ -3978,13 +3990,10 @@ impl PolicyEngine {
     /// Approve a pending request with audit chain recording.
     ///
     /// Returns true if the approval was found and granted.
-    pub fn grant_approval(
-        &mut self,
-        approval_id: &str,
-        decided_by: &str,
-        now_ms: u64,
-    ) -> bool {
-        let granted = self.approval_tracker.approve(approval_id, decided_by, now_ms);
+    pub fn grant_approval(&mut self, approval_id: &str, decided_by: &str, now_ms: u64) -> bool {
+        let granted = self
+            .approval_tracker
+            .approve(approval_id, decided_by, now_ms);
         if granted {
             self.audit_chain.append(
                 AuditEntryKind::PolicyDecision,
@@ -4000,13 +4009,10 @@ impl PolicyEngine {
     /// Reject a pending request with audit chain recording.
     ///
     /// Returns true if the approval was found and rejected.
-    pub fn reject_approval(
-        &mut self,
-        approval_id: &str,
-        decided_by: &str,
-        now_ms: u64,
-    ) -> bool {
-        let rejected = self.approval_tracker.reject(approval_id, decided_by, now_ms);
+    pub fn reject_approval(&mut self, approval_id: &str, decided_by: &str, now_ms: u64) -> bool {
+        let rejected = self
+            .approval_tracker
+            .reject(approval_id, decided_by, now_ms);
         if rejected {
             self.audit_chain.append(
                 AuditEntryKind::PolicyDecision,
@@ -4023,13 +4029,10 @@ impl PolicyEngine {
     /// Revoke a previously granted approval with audit chain recording.
     ///
     /// Returns true if the approval was found and revoked.
-    pub fn revoke_approval(
-        &mut self,
-        approval_id: &str,
-        decided_by: &str,
-        now_ms: u64,
-    ) -> bool {
-        let revoked = self.approval_tracker.revoke(approval_id, decided_by, now_ms);
+    pub fn revoke_approval(&mut self, approval_id: &str, decided_by: &str, now_ms: u64) -> bool {
+        let revoked = self
+            .approval_tracker
+            .revoke(approval_id, decided_by, now_ms);
         if revoked {
             self.audit_chain.append(
                 AuditEntryKind::QuarantineAction,
@@ -4068,13 +4071,9 @@ impl PolicyEngine {
         actor: &str,
         now_ms: u64,
     ) -> String {
-        let rev_id = self.revocation_registry.revoke(
-            resource_type,
-            resource_id,
-            reason,
-            actor,
-            now_ms,
-        );
+        let rev_id =
+            self.revocation_registry
+                .revoke(resource_type, resource_id, reason, actor, now_ms);
         self.audit_chain.append(
             AuditEntryKind::QuarantineAction,
             actor,
@@ -4091,12 +4090,7 @@ impl PolicyEngine {
     /// Reinstate a previously revoked resource with audit trail.
     ///
     /// Returns true if the revocation was found and deactivated.
-    pub fn reinstate_resource(
-        &mut self,
-        revocation_id: &str,
-        actor: &str,
-        now_ms: u64,
-    ) -> bool {
+    pub fn reinstate_resource(&mut self, revocation_id: &str, actor: &str, now_ms: u64) -> bool {
         let reinstated = self.revocation_registry.reinstate(revocation_id);
         if reinstated {
             self.audit_chain.append(
@@ -4125,15 +4119,24 @@ impl PolicyEngine {
     /// Aggregates evidence from the decision log, audit chain, namespace
     /// registry, approval tracker, revocation registry, compliance engine,
     /// and quarantine registry into a unified, exportable report.
-    pub fn generate_forensic_report(&mut self, query: &ForensicQuery, now_ms: u64) -> ForensicReport {
-        let end = if query.end_ms == 0 { u64::MAX } else { query.end_ms };
+    pub fn generate_forensic_report(
+        &mut self,
+        query: &ForensicQuery,
+        now_ms: u64,
+    ) -> ForensicReport {
+        let end = if query.end_ms == 0 {
+            u64::MAX
+        } else {
+            query.end_ms
+        };
 
         // Decision log entries
-        let mut decisions: Vec<crate::policy_decision_log::PolicyDecisionEntry> =
-            self.decision_log.by_time_range(query.start_ms, end)
-                .into_iter()
-                .cloned()
-                .collect();
+        let mut decisions: Vec<crate::policy_decision_log::PolicyDecisionEntry> = self
+            .decision_log
+            .by_time_range(query.start_ms, end)
+            .into_iter()
+            .cloned()
+            .collect();
 
         if let Some(actor) = query.actor {
             decisions.retain(|d| d.actor == actor);
@@ -4145,9 +4148,7 @@ impl PolicyEngine {
             decisions.retain(|d| d.pane_id == Some(pane_id));
         }
         if query.denials_only {
-            decisions.retain(|d| {
-                d.decision == crate::policy_decision_log::DecisionOutcome::Deny
-            });
+            decisions.retain(|d| d.decision == crate::policy_decision_log::DecisionOutcome::Deny);
         }
 
         // Audit chain entries
@@ -4201,17 +4202,14 @@ impl PolicyEngine {
         // Compliance summary
         let comp_snap = self.compliance_engine.snapshot(now_ms);
         let denial_rate = if comp_snap.counters.total_evaluations > 0 {
-            (comp_snap.counters.total_denials as f64
-                / comp_snap.counters.total_evaluations as f64)
+            (comp_snap.counters.total_denials as f64 / comp_snap.counters.total_evaluations as f64)
                 * 100.0
         } else {
             0.0
         };
 
         // Quarantine
-        let quarantine_active: Vec<String> = self
-            .quarantine_registry
-            .active_quarantines();
+        let quarantine_active: Vec<String> = self.quarantine_registry.active_quarantines();
 
         ForensicReport {
             generated_at_ms: now_ms,
@@ -4709,8 +4707,8 @@ impl PolicyEngine {
             );
         }
 
-        // Content factors (for SendText)
-        if input.action == ActionKind::SendText {
+        // Content factors for actions that carry executable command text.
+        if matches!(input.action, ActionKind::SendText | ActionKind::ExecCommand) {
             if let Some(text) = &input.command_text {
                 self.analyze_content_risk(text, &mut factors);
             }
@@ -5386,7 +5384,7 @@ impl PolicyEngine {
             Some("no reservation conflict".to_string()),
         );
 
-        // Command safety gate for SendText
+        // Trauma guard only applies to pane-injection send_text flows.
         if matches!(input.action, ActionKind::SendText) {
             if let Some(text) = input.command_text.as_deref() {
                 if let Some(trauma_decision) = input.trauma_decision.as_ref() {
@@ -5450,7 +5448,19 @@ impl PolicyEngine {
                         Some("no trauma decision".to_string()),
                     );
                 }
+            }
+        } else {
+            context.record_rule(
+                "policy.trauma_guard",
+                false,
+                None,
+                Some("non-send action".to_string()),
+            );
+        }
 
+        // Command safety gate for actions that carry executable command text.
+        if matches!(input.action, ActionKind::SendText | ActionKind::ExecCommand) {
+            if let Some(text) = input.command_text.as_deref() {
                 if input.actor != ActorKind::Human && crate::build_coord::requires_rch_offload(text)
                 {
                     let prefix = crate::build_coord::recommended_rch_prefix();
@@ -5519,7 +5529,7 @@ impl PolicyEngine {
                 "policy.command_gate",
                 false,
                 None,
-                Some("non-send action".to_string()),
+                Some("non-command action".to_string()),
             );
         }
 
@@ -5582,7 +5592,10 @@ impl PolicyEngine {
         // Destructive actions require approval for non-trusted actors.
         // Skip for credential actions already authorized by the broker gate,
         // which performs its own scope/sensitivity/ceiling checks.
-        if input.action.is_destructive() && !input.actor.is_trusted() && !credential_broker_authorized {
+        if input.action.is_destructive()
+            && !input.actor.is_trusted()
+            && !credential_broker_authorized
+        {
             let reason = format!(
                 "Destructive action '{}' requires approval",
                 input.action.as_str()
@@ -6846,6 +6859,34 @@ mod tests {
     }
 
     #[test]
+    fn mcp_heavy_cargo_exec_command_without_rch_requires_approval() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
+            .with_surface(PolicySurface::Mcp)
+            .with_command_text("cargo test -p frankenterm-core -- --nocapture");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+        assert_eq!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
+        assert!(
+            decision
+                .reason()
+                .is_some_and(|reason| reason.contains("rch exec"))
+        );
+    }
+
+    #[test]
+    fn mcp_exec_command_with_rch_prefix_is_allowed() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
+            .with_surface(PolicySurface::Mcp)
+            .with_command_text("TMPDIR=/tmp rch exec -- cargo check --help");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
     fn robot_light_cargo_without_rch_is_allowed() {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
@@ -6868,6 +6909,18 @@ mod tests {
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
         assert_ne!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
+    }
+
+    #[test]
+    fn exec_command_runs_through_command_gate() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
+            .with_surface(PolicySurface::Mcp)
+            .with_command_text("git reset --hard HEAD~1");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+        assert_eq!(decision.rule_id(), Some("dcg.core.git:reset-hard"));
     }
 
     #[test]
@@ -9106,6 +9159,21 @@ mod tests {
             .with_pane(1)
             .with_capabilities(PaneCapabilities::prompt())
             .with_command_text("rm -rf /tmp/test");
+
+        let risk = engine.calculate_risk(&input);
+        assert!(
+            risk.factors
+                .iter()
+                .any(|f| f.id == "content.destructive_tokens")
+        );
+    }
+
+    #[test]
+    fn risk_score_includes_destructive_content_for_exec_command() {
+        let engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
+            .with_surface(PolicySurface::Mcp)
+            .with_command_text("git reset --hard HEAD~1");
 
         let risk = engine.calculate_risk(&input);
         assert!(
@@ -13505,11 +13573,9 @@ mod tests {
 
         let parent_ns = TenantNamespace::new("org").unwrap();
         let child_ns = TenantNamespace::new("org.team-alpha").unwrap();
-        engine.namespace_registry_mut().bind(
-            NamespacedResourceKind::Pane,
-            "pane-200",
-            child_ns,
-        );
+        engine
+            .namespace_registry_mut()
+            .bind(NamespacedResourceKind::Pane, "pane-200", child_ns);
 
         let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
             .with_pane(200)
@@ -13623,12 +13689,8 @@ mod tests {
             cred_ns,
         );
 
-        let allowed = engine.check_credential_namespace(
-            "slack-bot-token",
-            &actor_ns,
-            "agent-007",
-            1000,
-        );
+        let allowed =
+            engine.check_credential_namespace("slack-bot-token", &actor_ns, "agent-007", 1000);
         assert!(!allowed, "cross-tenant credential access should be denied");
 
         // Verify audit chain recorded the check
@@ -13660,12 +13722,7 @@ mod tests {
             ns.clone(),
         );
 
-        let allowed = engine.check_credential_namespace(
-            "my-token",
-            &ns,
-            "agent-007",
-            1000,
-        );
+        let allowed = engine.check_credential_namespace("my-token", &ns, "agent-007", 1000);
         assert!(allowed, "same-tenant credential access should be allowed");
     }
 
@@ -13686,17 +13743,19 @@ mod tests {
             BundleCategory::Messaging,
             5000,
         )
-        .with_connector(BundleConnectorEntry::required("slack-hook", "Slack Webhook"));
+        .with_connector(BundleConnectorEntry::required(
+            "slack-hook",
+            "Slack Webhook",
+        ));
 
         engine
             .register_bundle_in_namespace(bundle, &ns, "admin", 5000)
             .expect("registration should succeed");
 
         // Verify the bundle's connector is bound to the namespace
-        let bound_ns = engine.namespace_registry().lookup(
-            NamespacedResourceKind::Connector,
-            "acme-slack",
-        );
+        let bound_ns = engine
+            .namespace_registry()
+            .lookup(NamespacedResourceKind::Connector, "acme-slack");
         assert_eq!(
             bound_ns.as_str(),
             "acme-corp",
@@ -13836,10 +13895,7 @@ mod tests {
         // --- Verify namespace registry has correct binding count ---
         let snap = engine.namespace_registry().snapshot();
         assert_eq!(snap.total_bindings, 6, "should have 6 resource bindings");
-        assert_eq!(
-            snap.active_namespaces, 2,
-            "should have 2 active namespaces"
-        );
+        assert_eq!(snap.active_namespaces, 2, "should have 2 active namespaces");
     }
 
     #[test]
@@ -14168,8 +14224,8 @@ mod tests {
         let rev_id =
             engine.revoke_resource("connector", "jira-api", "precautionary", "admin", 1000);
 
-        let input = PolicyInput::new(ActionKind::ConnectorNotify, ActorKind::Robot)
-            .with_domain("jira-api");
+        let input =
+            PolicyInput::new(ActionKind::ConnectorNotify, ActorKind::Robot).with_domain("jira-api");
         assert!(engine.authorize(&input).is_denied());
 
         assert!(engine.reinstate_resource(&rev_id, "admin", 2000));
@@ -14184,8 +14240,13 @@ mod tests {
         let mut engine = PolicyEngine::permissive();
 
         let chain_before = engine.audit_chain().len();
-        let rev_id =
-            engine.revoke_resource("credential", "api-key-12", "leaked in logs", "sec-bot", 1000);
+        let rev_id = engine.revoke_resource(
+            "credential",
+            "api-key-12",
+            "leaked in logs",
+            "sec-bot",
+            1000,
+        );
         assert!(engine.audit_chain().len() > chain_before);
 
         let chain_before2 = engine.audit_chain().len();
@@ -14320,8 +14381,24 @@ mod tests {
     fn forensic_report_captures_approvals() {
         let mut engine = PolicyEngine::permissive();
 
-        engine.submit_approval("ConnectorInvoke", "agent-1", "slack", "sensitive", "rule.1", 1000, 0);
-        engine.submit_approval("DeleteFile", "agent-2", "/tmp/data", "destructive", "rule.2", 2000, 0);
+        engine.submit_approval(
+            "ConnectorInvoke",
+            "agent-1",
+            "slack",
+            "sensitive",
+            "rule.1",
+            1000,
+            0,
+        );
+        engine.submit_approval(
+            "DeleteFile",
+            "agent-2",
+            "/tmp/data",
+            "destructive",
+            "rule.2",
+            2000,
+            0,
+        );
 
         let query = ForensicQuery {
             start_ms: 0,
@@ -14395,10 +14472,7 @@ mod tests {
         };
         let report = engine.generate_forensic_report(&query, 10000);
 
-        assert!(
-            !report.decisions.is_empty(),
-            "should have denial records"
-        );
+        assert!(!report.decisions.is_empty(), "should have denial records");
         for d in &report.decisions {
             assert_eq!(
                 d.decision,
@@ -14459,8 +14533,7 @@ mod tests {
         assert!(json.contains("test-api"));
         assert!(json.contains("generated_at_ms"));
         // Verify it's valid JSON
-        let _parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("should be valid JSON");
+        let _parsed: serde_json::Value = serde_json::from_str(&json).expect("should be valid JSON");
     }
 
     #[test]
@@ -14537,10 +14610,7 @@ mod tests {
         let report = engine.generate_forensic_report(&query, 10000);
 
         // Verify the report captures the full incident chain
-        assert!(
-            !report.decisions.is_empty(),
-            "should have decision records"
-        );
+        assert!(!report.decisions.is_empty(), "should have decision records");
         assert!(
             !report.audit_trail.is_empty(),
             "should have audit trail entries"
@@ -14585,8 +14655,7 @@ mod tests {
         let snap = engine.telemetry_snapshot(1_700_000_000_000);
         let json = serde_json::to_string(&snap).expect("should serialize");
         assert!(!json.is_empty());
-        let val: serde_json::Value =
-            serde_json::from_str(&json).expect("should be valid JSON");
+        let val: serde_json::Value = serde_json::from_str(&json).expect("should be valid JSON");
         let obj = val.as_object().expect("should be object");
         assert!(obj.contains_key("decision_log"));
         assert!(obj.contains_key("quarantine"));
