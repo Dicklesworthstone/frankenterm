@@ -767,7 +767,10 @@ mod tests {
     fn event_matches_pane_gap_event() {
         let event = Event::GapDetected {
             pane_id: 3,
+            seq_before: 9,
+            seq_after: 10,
             reason: "timeout".into(),
+            detected_at_ms: 1234,
         };
         assert!(event_matches_pane(&event, Some(3)));
         assert!(!event_matches_pane(&event, Some(4)));

@@ -581,7 +581,13 @@ pub(super) fn handle_stream_deltas(
                             break;
                         }
                     }
-                    Ok(Ok(Event::GapDetected { pane_id, reason })) => {
+                    Ok(Ok(Event::GapDetected {
+                        pane_id,
+                        seq_before,
+                        seq_after,
+                        reason,
+                        detected_at_ms,
+                    })) => {
                         if pane_filter.is_some_and(|pid| pid != pane_id) {
                             continue;
                         }
@@ -593,7 +599,10 @@ pub(super) fn handle_stream_deltas(
                             seq,
                             json!({
                                 "pane_id": pane_id,
+                                "seq_before": seq_before,
+                                "seq_after": seq_after,
                                 "reason": redactor.redact(&reason),
+                                "detected_at_ms": detected_at_ms,
                             }),
                         );
                         if let Some(event) = frame_to_sse("gap", seq, frame) {

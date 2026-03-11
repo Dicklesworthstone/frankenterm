@@ -313,12 +313,18 @@ impl AgentStreamer {
                 captured_at_ms: epoch_ms_now(),
             })),
 
-            Event::GapDetected { pane_id, reason } => Some(WirePayload::Gap(GapNotice {
+            Event::GapDetected {
+                pane_id,
+                seq_before,
+                seq_after,
+                reason,
+                detected_at_ms,
+            } => Some(WirePayload::Gap(GapNotice {
                 pane_id: *pane_id,
-                seq_before: 0, // Caller fills from storage
-                seq_after: 0,
+                seq_before: *seq_before,
+                seq_after: *seq_after,
                 reason: reason.clone(),
-                detected_at_ms: epoch_ms_now(),
+                detected_at_ms: *detected_at_ms,
             })),
 
             Event::PatternDetected {
@@ -968,13 +974,19 @@ mod tests {
         let mut streamer = AgentStreamer::new("test");
         let event = Event::GapDetected {
             pane_id: 5,
+            seq_before: 8,
+            seq_after: 12,
             reason: "timeout".into(),
+            detected_at_ms: 9876,
         };
         let envelope = streamer.event_to_envelope(&event).unwrap();
         match &envelope.payload {
             WirePayload::Gap(g) => {
                 assert_eq!(g.pane_id, 5);
+                assert_eq!(g.seq_before, 8);
+                assert_eq!(g.seq_after, 12);
                 assert_eq!(g.reason, "timeout");
+                assert_eq!(g.detected_at_ms, 9876);
             }
             other => panic!("expected Gap, got: {other:?}"),
         }
@@ -1070,7 +1082,10 @@ mod tests {
             },
             Event::GapDetected {
                 pane_id: 1,
+                seq_before: 4,
+                seq_after: 5,
                 reason: "test".into(),
+                detected_at_ms: 1234,
             },
             Event::PaneDiscovered {
                 pane_id: 2,
@@ -1293,7 +1308,10 @@ mod tests {
             },
             Event::GapDetected {
                 pane_id: 1,
+                seq_before: 6,
+                seq_after: 7,
                 reason: "restart".into(),
+                detected_at_ms: 4321,
             },
         ];
 

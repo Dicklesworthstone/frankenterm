@@ -1388,7 +1388,10 @@ mod tests {
     fn event_type_name_matches_serde() {
         let event = Event::GapDetected {
             pane_id: 1,
+            seq_before: 4,
+            seq_after: 5,
             reason: "test".to_string(),
+            detected_at_ms: 1234,
         };
         assert_eq!(event.type_name(), "gap_detected");
 
@@ -3193,7 +3196,10 @@ mod tests {
             (
                 Event::GapDetected {
                     pane_id: 1,
+                    seq_before: 4,
+                    seq_after: 5,
                     reason: "x".into(),
+                    detected_at_ms: 1234,
                 },
                 "gap_detected",
             ),

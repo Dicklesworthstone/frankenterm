@@ -2591,7 +2591,10 @@ impl ObservationRuntime {
                                 let delivered_gap =
                                     bus.publish(crate::events::Event::GapDetected {
                                         pane_id: gap.pane_id,
+                                        seq_before: gap.seq_before,
+                                        seq_after: gap.seq_after,
                                         reason: gap.reason.clone(),
+                                        detected_at_ms: gap.detected_at,
                                     });
                                 if delivered_gap == 0 {
                                     debug!(pane_id, "No subscribers for gap event bus");
@@ -3875,7 +3878,10 @@ mod tests {
             },
             Event::GapDetected {
                 pane_id: 1,
+                seq_before: 9,
+                seq_after: 10,
                 reason: "overlap_not_found".to_string(),
+                detected_at_ms: 1234,
             },
             Event::WorkflowStarted {
                 workflow_id: "wf-3".to_string(),
@@ -5051,7 +5057,10 @@ mod tests {
     fn event_counts_as_activity_gap_detected() {
         let event = Event::GapDetected {
             pane_id: 1,
+            seq_before: 4,
+            seq_after: 5,
             reason: "test gap".to_string(),
+            detected_at_ms: 1234,
         };
         assert!(event_counts_as_activity(&event));
     }
@@ -5320,7 +5329,10 @@ mod tests {
     fn snapshot_trigger_event_gap_detected_returns_none() {
         let event = Event::GapDetected {
             pane_id: 1,
+            seq_before: 4,
+            seq_after: 5,
             reason: "test".to_string(),
+            detected_at_ms: 1234,
         };
         assert_eq!(snapshot_trigger_from_event(&event), None);
     }
