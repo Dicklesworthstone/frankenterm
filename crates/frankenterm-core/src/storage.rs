@@ -9967,29 +9967,33 @@ fn append_segment_sync(
 fn record_gap_sync(conn: &Connection, pane_id: u64, reason: &str) -> Result<Option<Gap>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
 
-    // Get the last sequence for this pane
-    let last_seq: Option<u64> = conn
-        .query_row(
-            "SELECT MAX(seq) FROM output_segments WHERE pane_id = ?1",
-            [pane_id_i64],
-            |row| {
-                let val: Option<i64> = row.get(0)?;
-                #[allow(clippy::cast_sign_loss)]
-                Ok(val.map(|v| v as u64))
-            },
-        )
-        .optional()
-        .map_err(|e| StorageError::Database(format!("Failed to get last seq: {e}")))?
-        .flatten();
+    let explicit_bounds = parse_distributed_gap_reason(reason);
+    let (seq_before, seq_after) = if let Some((seq_before, seq_after)) = explicit_bounds {
+        (seq_before, seq_after)
+    } else {
+        // Get the last sequence for this pane
+        let last_seq: Option<u64> = conn
+            .query_row(
+                "SELECT MAX(seq) FROM output_segments WHERE pane_id = ?1",
+                [pane_id_i64],
+                |row| {
+                    let val: Option<i64> = row.get(0)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    Ok(val.map(|v| v as u64))
+                },
+            )
+            .optional()
+            .map_err(|e| StorageError::Database(format!("Failed to get last seq: {e}")))?
+            .flatten();
 
-    let Some(seq_before) = last_seq else {
-        // No segments yet, so no gap to record (start of stream)
-        return Ok(None);
+        let Some(seq_before) = last_seq else {
+            // No segments yet, so no local continuity gap to record.
+            return Ok(None);
+        };
+        (seq_before, seq_before + 1)
     };
 
-    let seq_after = seq_before + 1;
     let now = now_ms();
-
     let seq_before_i64 = u64_to_i64(seq_before, "seq_before")?;
     let seq_after_i64 = u64_to_i64(seq_after, "seq_after")?;
 
@@ -10010,6 +10014,18 @@ fn record_gap_sync(conn: &Connection, pane_id: u64, reason: &str) -> Result<Opti
         reason: reason.to_string(),
         detected_at: now,
     }))
+}
+
+fn parse_distributed_gap_reason(reason: &str) -> Option<(u64, u64)> {
+    let payload = reason.strip_prefix("distributed_gap:")?;
+    let (prefix_with_reason, seq_after_raw) = payload.rsplit_once(':')?;
+    let (reason_text, seq_before_raw) = prefix_with_reason.rsplit_once(':')?;
+    let seq_before = seq_before_raw.parse::<u64>().ok()?;
+    let seq_after = seq_after_raw.parse::<u64>().ok()?;
+    if reason_text.is_empty() || seq_after <= seq_before {
+        return None;
+    }
+    Some((seq_before, seq_after))
 }
 
 /// Record an event (synchronous)
@@ -18239,6 +18255,74 @@ mod tests {
             .collect();
 
         assert_eq!(recorded_reasons, reasons);
+    }
+
+    #[test]
+    fn distributed_explicit_gap_reason_preserves_reported_bounds() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "distributed:agent-a:prod", now_ms, now_ms, 1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, 1i64, "before gap", 10, now_ms],
+        )
+        .unwrap();
+
+        let gap = record_gap_sync(&conn, 1, "distributed_gap:timeout:1:4")
+            .unwrap()
+            .expect("distributed explicit gap should be recorded");
+
+        assert_eq!(gap.seq_before, 1);
+        assert_eq!(gap.seq_after, 4);
+        assert_eq!(gap.reason, "distributed_gap:timeout:1:4");
+    }
+
+    #[test]
+    fn distributed_explicit_gap_reason_records_start_of_stream_gap() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "distributed:agent-a:prod", now_ms, now_ms, 1],
+        )
+        .unwrap();
+
+        let gap = record_gap_sync(&conn, 1, "distributed_gap:startup_replay:0:3")
+            .unwrap()
+            .expect("explicit distributed gaps must not be dropped at stream start");
+
+        assert_eq!(gap.seq_before, 0);
+        assert_eq!(gap.seq_after, 3);
+        assert_eq!(gap.reason, "distributed_gap:startup_replay:0:3");
+    }
+
+    #[test]
+    fn distributed_explicit_gap_reason_allows_colons_in_reason_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "distributed:agent-a:prod", now_ms, now_ms, 1],
+        )
+        .unwrap();
+
+        let gap = record_gap_sync(&conn, 1, "distributed_gap:session:restart:4:9")
+            .unwrap()
+            .expect("colon-bearing distributed gap reason should still parse bounds");
+
+        assert_eq!(gap.seq_before, 4);
+        assert_eq!(gap.seq_after, 9);
+        assert_eq!(gap.reason, "distributed_gap:session:restart:4:9");
     }
 
     // =========================================================================

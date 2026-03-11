@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone, Timelike, Weekday};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -858,72 +858,42 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
     // Write header
     writeln!(file, "-- wa database backup (SQL dump)").map_err(&write_err)?;
     writeln!(file, "-- Schema version: {}", SCHEMA_VERSION).map_err(&write_err)?;
+    writeln!(file, "PRAGMA foreign_keys=OFF;").map_err(&write_err)?;
     writeln!(file, "BEGIN TRANSACTION;").map_err(&write_err)?;
 
-    // Get all table names
-    let mut stmt = conn
-        .prepare("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-        .map_err(|e| {
-            Error::Storage(crate::StorageError::Database(format!(
-                "Failed to list tables: {e}"
-            )))
-        })?;
+    let schema = load_dump_schema(&conn)?;
 
-    let tables: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(|e| {
-            Error::Storage(crate::StorageError::Database(format!(
-                "Failed to query tables: {e}"
-            )))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for (name, create_sql) in &tables {
+    for table in &schema.tables {
+        let name = &table.name;
         writeln!(file, "\n-- Table: {name}").map_err(&write_err)?;
-        writeln!(file, "{create_sql};").map_err(&write_err)?;
+        writeln!(file, "{};", table.create_sql).map_err(&write_err)?;
+        dump_rows_as_inserts(&conn, &mut file, name, false)?;
+    }
 
-        // Dump rows as INSERT statements
-        let row_sql = format!("SELECT * FROM \"{name}\"");
-        if let Ok(mut row_stmt) = conn.prepare(&row_sql) {
-            let col_count = row_stmt.column_count();
-            let col_names: Vec<String> = (0..col_count)
-                .map(|i| row_stmt.column_name(i).unwrap_or("?").to_string())
-                .collect();
-
-            let mut rows = match row_stmt.query([]) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(table = %name, error = %e, "Failed to query table for SQL dump");
-                    continue;
+    if !schema.virtual_tables.is_empty() {
+        writeln!(file, "\n-- Virtual tables").map_err(&write_err)?;
+        for table in &schema.virtual_tables {
+            writeln!(file, "{};", table.create_sql).map_err(&write_err)?;
+        }
+        for table in &schema.virtual_tables {
+            match table.virtual_table_restore_strategy {
+                Some(VirtualTableRestoreStrategy::RebuildExternalContent) => {
+                    let quoted = quote_identifier(&table.name);
+                    writeln!(file, "INSERT INTO {quoted}({quoted}) VALUES('rebuild');")
+                        .map_err(&write_err)?;
                 }
-            };
-            while let Ok(Some(row)) = rows.next() {
-                let values: Vec<String> = (0..col_count)
-                    .map(|i| match row.get_ref(i) {
-                        Ok(rusqlite::types::ValueRef::Null) => "NULL".to_string(),
-                        Ok(rusqlite::types::ValueRef::Integer(v)) => v.to_string(),
-                        Ok(rusqlite::types::ValueRef::Real(f)) => f.to_string(),
-                        Ok(rusqlite::types::ValueRef::Text(t)) => {
-                            let s = String::from_utf8_lossy(t);
-                            format!("'{}'", s.replace('\'', "''"))
-                        }
-                        Ok(rusqlite::types::ValueRef::Blob(b)) => {
-                            format!("X'{}'", hex::encode(b))
-                        }
-                        Err(_) => "NULL".to_string(),
-                    })
-                    .collect();
-
-                writeln!(
-                    file,
-                    "INSERT INTO \"{}\" ({}) VALUES ({});",
-                    name,
-                    col_names.join(", "),
-                    values.join(", ")
-                )
-                .map_err(&write_err)?;
+                Some(VirtualTableRestoreStrategy::DumpRows) => {
+                    dump_rows_as_inserts(&conn, &mut file, &table.name, true)?;
+                }
+                None => {}
             }
+        }
+    }
+
+    if !schema.views.is_empty() {
+        writeln!(file, "\n-- Views").map_err(&write_err)?;
+        for view in &schema.views {
+            writeln!(file, "{};", view.create_sql).map_err(&write_err)?;
         }
     }
 
@@ -955,7 +925,35 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
         }
     }
 
+    let mut trigger_stmt = conn
+        .prepare(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL ORDER BY name",
+        )
+        .map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to list triggers: {e}"
+            )))
+        })?;
+
+    let triggers: Vec<String> = trigger_stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to query triggers: {e}"
+            )))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if !triggers.is_empty() {
+        writeln!(file, "\n-- Triggers").map_err(&write_err)?;
+        for trigger_sql in &triggers {
+            writeln!(file, "{trigger_sql};").map_err(&write_err)?;
+        }
+    }
+
     writeln!(file, "\nCOMMIT;").map_err(&write_err)?;
+    writeln!(file, "PRAGMA foreign_keys=ON;").map_err(&write_err)?;
 
     Ok(())
 }
@@ -999,6 +997,273 @@ fn sha256_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
+}
+
+#[derive(Debug, Clone)]
+struct DumpSchemaObject {
+    name: String,
+    create_sql: String,
+    virtual_table_restore_strategy: Option<VirtualTableRestoreStrategy>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DumpSchema {
+    tables: Vec<DumpSchemaObject>,
+    virtual_tables: Vec<DumpSchemaObject>,
+    views: Vec<DumpSchemaObject>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtualTableRestoreStrategy {
+    DumpRows,
+    RebuildExternalContent,
+}
+
+fn dump_rows_as_inserts<W: Write>(
+    conn: &Connection,
+    writer: &mut W,
+    table_name: &str,
+    include_rowid: bool,
+) -> Result<()> {
+    let select_sql = if include_rowid {
+        format!("SELECT rowid, * FROM {}", quote_identifier(table_name))
+    } else {
+        format!("SELECT * FROM {}", quote_identifier(table_name))
+    };
+
+    let mut row_stmt = match conn.prepare(&select_sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            tracing::warn!(
+                table = %table_name,
+                error = %e,
+                "Failed to prepare SQL dump query"
+            );
+            return Ok(());
+        }
+    };
+
+    let value_count = row_stmt.column_count();
+    let column_names = if include_rowid {
+        let mut names = Vec::with_capacity(value_count);
+        names.push(quote_identifier("rowid"));
+        names.extend((1..value_count).map(|i| {
+            let name = row_stmt.column_name(i).unwrap_or("?");
+            quote_identifier(name)
+        }));
+        names
+    } else {
+        (0..value_count)
+            .map(|i| {
+                let name = row_stmt.column_name(i).unwrap_or("?");
+                quote_identifier(name)
+            })
+            .collect()
+    };
+
+    let mut rows = match row_stmt.query([]) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                table = %table_name,
+                error = %e,
+                "Failed to query table for SQL dump"
+            );
+            return Ok(());
+        }
+    };
+
+    while let Ok(Some(row)) = rows.next() {
+        let values: Vec<String> = (0..value_count)
+            .map(|i| match row.get_ref(i) {
+                Ok(rusqlite::types::ValueRef::Null) => "NULL".to_string(),
+                Ok(rusqlite::types::ValueRef::Integer(v)) => v.to_string(),
+                Ok(rusqlite::types::ValueRef::Real(f)) => f.to_string(),
+                Ok(rusqlite::types::ValueRef::Text(t)) => {
+                    let s = String::from_utf8_lossy(t);
+                    format!("'{}'", s.replace('\'', "''"))
+                }
+                Ok(rusqlite::types::ValueRef::Blob(b)) => {
+                    format!("X'{}'", hex::encode(b))
+                }
+                Err(_) => "NULL".to_string(),
+            })
+            .collect();
+
+        writeln!(
+            writer,
+            "INSERT INTO {} ({}) VALUES ({});",
+            quote_identifier(table_name),
+            column_names.join(", "),
+            values.join(", ")
+        )
+        .map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "SQL dump write failed: {e}"
+            )))
+        })?;
+    }
+
+    Ok(())
+}
+
+fn virtual_table_restore_strategy(create_sql: &str) -> VirtualTableRestoreStrategy {
+    let lowered = create_sql.to_ascii_lowercase();
+    if !lowered.contains("using fts5") {
+        return VirtualTableRestoreStrategy::DumpRows;
+    }
+
+    match find_fts5_option_value(&lowered, "content") {
+        Some(content) if !content.is_empty() => VirtualTableRestoreStrategy::RebuildExternalContent,
+        _ => VirtualTableRestoreStrategy::DumpRows,
+    }
+}
+
+fn find_fts5_option_value(sql: &str, option_name: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let option_bytes = option_name.as_bytes();
+    let mut search_from = 0;
+    while search_from + option_bytes.len() <= bytes.len() {
+        let Some(relative) = sql[search_from..].find(option_name) else {
+            return None;
+        };
+        let start = search_from + relative;
+        let end = start + option_bytes.len();
+        search_from = end;
+
+        if start > 0 && is_sql_identifier_char(bytes[start - 1]) {
+            continue;
+        }
+        if end < bytes.len() && is_sql_identifier_char(bytes[end]) {
+            continue;
+        }
+
+        let mut cursor = end;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'=' {
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            return Some(String::new());
+        }
+
+        let quote = bytes[cursor];
+        if matches!(quote, b'\'' | b'"') {
+            cursor += 1;
+            let mut value = String::new();
+            while cursor < bytes.len() {
+                if bytes[cursor] == quote {
+                    if cursor + 1 < bytes.len() && bytes[cursor + 1] == quote {
+                        value.push(quote as char);
+                        cursor += 2;
+                        continue;
+                    }
+                    return Some(value.trim().to_string());
+                }
+                value.push(bytes[cursor] as char);
+                cursor += 1;
+            }
+            return Some(value.trim().to_string());
+        }
+
+        let start_value = cursor;
+        while cursor < bytes.len() && !matches!(bytes[cursor], b',' | b')') {
+            cursor += 1;
+        }
+        return Some(sql[start_value..cursor].trim().to_string());
+    }
+
+    None
+}
+
+fn is_sql_identifier_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn load_dump_schema(conn: &Connection) -> Result<DumpSchema> {
+    let mut stmt = conn.prepare("PRAGMA table_list").map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "Failed to inspect schema objects: {e}"
+        )))
+    })?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to query schema objects: {e}"
+            )))
+        })?;
+
+    let mut schema = DumpSchema::default();
+    for row in rows {
+        let (schema_name, object_name, object_type) = row.map_err(|e| {
+            Error::Storage(crate::StorageError::Database(format!(
+                "Failed to read schema object row: {e}"
+            )))
+        })?;
+
+        if schema_name != "main" || object_name.starts_with("sqlite_") {
+            continue;
+        }
+
+        let Some(create_sql) = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = ?1 AND sql IS NOT NULL",
+                [object_name.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| {
+                Error::Storage(crate::StorageError::Database(format!(
+                    "Failed to load schema SQL for {object_name}: {e}"
+                )))
+            })?
+        else {
+            continue;
+        };
+
+        match object_type.as_str() {
+            "table" => schema.tables.push(DumpSchemaObject {
+                name: object_name,
+                create_sql,
+                virtual_table_restore_strategy: None,
+            }),
+            "virtual" => schema.virtual_tables.push(DumpSchemaObject {
+                name: object_name,
+                virtual_table_restore_strategy: Some(virtual_table_restore_strategy(&create_sql)),
+                create_sql,
+            }),
+            "view" => schema.views.push(DumpSchemaObject {
+                name: object_name,
+                create_sql,
+                virtual_table_restore_strategy: None,
+            }),
+            "shadow" => {}
+            _ => {}
+        }
+    }
+
+    schema.tables.sort_by(|a, b| a.name.cmp(&b.name));
+    schema.virtual_tables.sort_by(|a, b| a.name.cmp(&b.name));
+    schema.views.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(schema)
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn resolve_destination_root(workspace_root: &Path, destination: Option<&str>) -> PathBuf {
@@ -1162,6 +1427,71 @@ mod tests {
         conn
     }
 
+    fn create_test_db_with_virtual_objects(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE output_segments (
+                id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE output_segments_fts USING fts5(
+                content,
+                content='output_segments',
+                content_rowid='id'
+            );
+            CREATE TRIGGER output_segments_ai AFTER INSERT ON output_segments BEGIN
+                INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+            CREATE TRIGGER output_segments_ad AFTER DELETE ON output_segments BEGIN
+                INSERT INTO output_segments_fts(output_segments_fts, rowid, content)
+                VALUES('delete', old.id, old.content);
+            END;
+            CREATE VIEW action_history AS
+                SELECT id, content FROM output_segments;
+            INSERT INTO output_segments (id, content) VALUES (1, 'hello backup');
+            INSERT INTO output_segments (id, content) VALUES (2, 'world search');
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn create_test_db_with_contentless_fts(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE VIRTUAL TABLE notes_fts USING fts5(
+                title,
+                body,
+                content=''
+            );
+            INSERT INTO notes_fts(rowid, title, body) VALUES
+                (1, 'alpha', 'hello backup'),
+                (2, 'beta', 'world search');
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn create_test_db_with_rtree(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE VIRTUAL TABLE boxes USING rtree(
+                id,
+                min_x, max_x,
+                min_y, max_y
+            );
+            INSERT INTO boxes VALUES (1, 0.0, 1.0, 0.0, 1.0);
+            INSERT INTO boxes VALUES (2, 2.0, 3.0, 2.0, 3.0);
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
     #[test]
     fn export_creates_valid_backup() {
         let tmp = TempDir::new().unwrap();
@@ -1316,6 +1646,123 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM output_segments", [], |row| row.get(0))
             .unwrap();
         assert_eq!(seg_count, 3);
+    }
+
+    #[test]
+    fn sql_dump_restores_views_triggers_and_fts_without_shadow_tables() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("virtual.db");
+        let _conn = create_test_db_with_virtual_objects(&db_path);
+        drop(_conn);
+
+        let sql_path = tmp.path().join("database.sql");
+        dump_database_sql(&db_path, &sql_path).unwrap();
+
+        let sql_dump = fs::read_to_string(&sql_path).unwrap();
+        assert!(sql_dump.contains("PRAGMA foreign_keys=OFF;"));
+        assert!(sql_dump.contains("PRAGMA foreign_keys=ON;"));
+        assert!(sql_dump.contains("CREATE VIRTUAL TABLE output_segments_fts USING fts5"));
+        assert!(sql_dump.contains("CREATE VIEW action_history AS"));
+        assert!(sql_dump.contains("CREATE TRIGGER output_segments_ai"));
+        assert!(sql_dump.contains("VALUES('rebuild');"));
+        assert!(!sql_dump.contains("output_segments_fts_data"));
+        assert!(!sql_dump.contains("output_segments_fts_idx"));
+        assert!(!sql_dump.contains("output_segments_fts_docsize"));
+        assert!(!sql_dump.contains("output_segments_fts_config"));
+
+        let restored_path = tmp.path().join("restored.db");
+        let restored = Connection::open(&restored_path).unwrap();
+        restored.execute_batch(&sql_dump).unwrap();
+
+        let view_count: i64 = restored
+            .query_row("SELECT COUNT(*) FROM action_history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(view_count, 2);
+
+        let initial_fts_hits: i64 = restored
+            .query_row(
+                "SELECT COUNT(*) FROM output_segments_fts WHERE output_segments_fts MATCH 'hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(initial_fts_hits, 1);
+
+        restored
+            .execute(
+                "INSERT INTO output_segments (id, content) VALUES (?1, ?2)",
+                rusqlite::params![3_i64, "later trigger"],
+            )
+            .unwrap();
+
+        let trigger_fts_hits: i64 = restored
+            .query_row(
+                "SELECT COUNT(*) FROM output_segments_fts WHERE output_segments_fts MATCH 'later'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger_fts_hits, 1);
+    }
+
+    #[test]
+    fn sql_dump_restores_contentless_fts_by_replaying_rows() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("contentless.db");
+        let _conn = create_test_db_with_contentless_fts(&db_path);
+        drop(_conn);
+
+        let sql_path = tmp.path().join("contentless.sql");
+        dump_database_sql(&db_path, &sql_path).unwrap();
+
+        let sql_dump = fs::read_to_string(&sql_path).unwrap();
+        assert!(sql_dump.contains("CREATE VIRTUAL TABLE notes_fts USING fts5"));
+        assert!(!sql_dump.contains("INSERT INTO \"notes_fts\"(\"notes_fts\") VALUES('rebuild');"));
+        assert!(sql_dump.contains("INSERT INTO \"notes_fts\" (\"rowid\", \"title\", \"body\")"));
+
+        let restored_path = tmp.path().join("contentless-restored.db");
+        let restored = Connection::open(&restored_path).unwrap();
+        restored.execute_batch(&sql_dump).unwrap();
+
+        let row_count: i64 = restored
+            .query_row("SELECT COUNT(*) FROM notes_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 2);
+
+        let match_count: i64 = restored
+            .query_row(
+                "SELECT COUNT(*) FROM notes_fts WHERE notes_fts MATCH 'hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(match_count, 1);
+    }
+
+    #[test]
+    fn sql_dump_restores_non_fts_virtual_tables_by_replaying_rows() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("rtree.db");
+        let _conn = create_test_db_with_rtree(&db_path);
+        drop(_conn);
+
+        let sql_path = tmp.path().join("rtree.sql");
+        dump_database_sql(&db_path, &sql_path).unwrap();
+
+        let sql_dump = fs::read_to_string(&sql_path).unwrap();
+        assert!(sql_dump.contains("CREATE VIRTUAL TABLE boxes USING rtree"));
+        assert!(sql_dump.contains(
+            "INSERT INTO \"boxes\" (\"rowid\", \"id\", \"min_x\", \"max_x\", \"min_y\", \"max_y\")"
+        ));
+
+        let restored_path = tmp.path().join("rtree-restored.db");
+        let restored = Connection::open(&restored_path).unwrap();
+        restored.execute_batch(&sql_dump).unwrap();
+
+        let row_count: i64 = restored
+            .query_row("SELECT COUNT(*) FROM boxes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 2);
     }
 
     #[test]
@@ -1675,6 +2122,44 @@ mod tests {
     fn schedule_display_label_hourly() {
         let sched = BackupSchedule::parse("hourly").unwrap();
         assert_eq!(sched.display_label(), "hourly");
+    }
+
+    #[test]
+    fn virtual_table_restore_strategy_uses_rebuild_for_external_content_tables() {
+        assert_eq!(
+            virtual_table_restore_strategy(
+                "CREATE VIRTUAL TABLE output_segments_fts USING fts5(content, content='output_segments', content_rowid='id')"
+            ),
+            VirtualTableRestoreStrategy::RebuildExternalContent
+        );
+    }
+
+    #[test]
+    fn virtual_table_restore_strategy_replays_rows_for_contentless_tables() {
+        assert_eq!(
+            virtual_table_restore_strategy(
+                "CREATE VIRTUAL TABLE notes_fts USING fts5(title, body, content='')"
+            ),
+            VirtualTableRestoreStrategy::DumpRows
+        );
+    }
+
+    #[test]
+    fn virtual_table_restore_strategy_replays_rows_for_internal_content_tables() {
+        assert_eq!(
+            virtual_table_restore_strategy("CREATE VIRTUAL TABLE docs_fts USING fts5(title, body)"),
+            VirtualTableRestoreStrategy::DumpRows
+        );
+    }
+
+    #[test]
+    fn virtual_table_restore_strategy_replays_rows_for_non_fts_virtual_tables() {
+        assert_eq!(
+            virtual_table_restore_strategy(
+                "CREATE VIRTUAL TABLE boxes USING rtree(id, min_x, max_x)"
+            ),
+            VirtualTableRestoreStrategy::DumpRows
+        );
     }
 
     #[test]
