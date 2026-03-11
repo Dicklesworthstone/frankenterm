@@ -11,7 +11,7 @@
 #   6. Conflict detection config round-trips through JSON
 #
 # Usage: bash tests/e2e/test_ft_1i2ge_4_5.sh
-# Requires: rch (falls back to local cargo if workers offline)
+# Requires: rch with at least one reachable remote worker
 
 set -euo pipefail
 
@@ -30,6 +30,30 @@ log_structured() {
         | tee -a "$LOG_DIR/results.jsonl"
 }
 
+RCH_FAIL_OPEN_REGEX='\[RCH\] local|running locally'
+RCH_PROBE_LOG="$LOG_DIR/rch_probe.log"
+RCH_SMOKE_LOG="$LOG_DIR/rch_smoke.log"
+
+run_rch() {
+    TMPDIR=/tmp rch "$@"
+}
+
+probe_has_reachable_workers() {
+    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
+}
+
+check_rch_fallback_in_logs() {
+    local label="$1"
+    shift
+
+    if grep -Eq "$RCH_FAIL_OPEN_REGEX" "$@" 2>/dev/null; then
+        log_structured "FAIL" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK" \
+            "$(printf ',\"input_summary\":\"%s\",\"artifact_path\":\"%s\"' "$label" "$1")"
+        echo "rch fell back to local execution during ${label}; refusing offload policy violation." >&2
+        exit 3
+    fi
+}
+
 # ── Preflight ────────────────────────────────────────────────────────────────
 
 if ! command -v jq &>/dev/null; then
@@ -38,13 +62,36 @@ if ! command -v jq &>/dev/null; then
     exit 0
 fi
 
-# Determine cargo runner (rch or local)
-CARGO_CMD="cargo"
-if command -v rch &>/dev/null; then
-    if rch check --quiet 2>/dev/null; then
-        CARGO_CMD="rch exec cargo"
-    fi
+if ! command -v rch &>/dev/null; then
+    log_structured "FAIL" "rch_required_missing" "RCH-E001" ',"input_summary":"rch binary missing"'
+    echo "rch is required; refusing local cargo execution." >&2
+    exit 1
 fi
+
+set +e
+run_rch --json workers probe --all >"$RCH_PROBE_LOG" 2>&1
+probe_rc=$?
+set -e
+if [[ $probe_rc -ne 0 ]] || ! probe_has_reachable_workers "$RCH_PROBE_LOG"; then
+    log_structured "FAIL" "rch_workers_unhealthy" "RCH-E100" \
+        "$(printf ',\"input_summary\":\"rch workers probe\",\"artifact_path\":\"%s\"' "$RCH_PROBE_LOG")"
+    echo "rch workers are unavailable; refusing local cargo execution." >&2
+    exit 1
+fi
+
+set +e
+run_rch exec -- cargo check --help >"$RCH_SMOKE_LOG" 2>&1
+smoke_rc=$?
+set -e
+check_rch_fallback_in_logs "rch_remote_smoke" "$RCH_SMOKE_LOG"
+if [[ $smoke_rc -ne 0 ]]; then
+    log_structured "FAIL" "rch_remote_smoke_failed" "RCH-E101" \
+        "$(printf ',\"input_summary\":\"cargo check --help\",\"artifact_path\":\"%s\"' "$RCH_SMOKE_LOG")"
+    echo "rch remote smoke preflight failed; refusing local cargo execution." >&2
+    exit 1
+fi
+
+CARGO_CMD="run_rch exec -- cargo"
 
 echo "=== E2E: ${SCENARIO_ID} — Conflict Detection & Deconfliction ==="
 echo "    cargo_cmd=${CARGO_CMD}"
@@ -55,10 +102,12 @@ echo "    log_dir=${LOG_DIR}"
 echo "[1/3] Running conflict detection unit tests..."
 if $CARGO_CMD test --lib -p frankenterm-core --features subprocess-bridge \
     -- mission_loop::tests::conflict_detection 2>"$LOG_DIR/test_stderr.log" | tee "$LOG_DIR/test_stdout.log"; then
+    check_rch_fallback_in_logs "conflict_detection_tests" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
     PASS_COUNT=$(grep -c "test mission_loop::tests::conflict_detection.*ok" "$LOG_DIR/test_stdout.log" || echo "0")
     log_structured "PASS" "unit_tests_pass" "" "$(printf ',\"input_summary\":\"conflict_detection tests\",\"decision_path\":\"cargo test\",\"artifact_path\":\"%s/test_stdout.log\",\"pass_count\":\"%s\"' "$LOG_DIR" "$PASS_COUNT")"
     echo "    ✓ ${PASS_COUNT} conflict detection tests passed"
 else
+    check_rch_fallback_in_logs "conflict_detection_tests" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
     log_structured "FAIL" "unit_tests_fail" "E2E001" "$(printf ',\"input_summary\":\"conflict_detection tests\",\"artifact_path\":\"%s/test_stderr.log\"' "$LOG_DIR")"
     echo "    ✗ Unit tests failed — see $LOG_DIR/test_stderr.log"
     exit 1
@@ -69,10 +118,12 @@ fi
 echo "[2/3] Running path overlap tests..."
 if $CARGO_CMD test --lib -p frankenterm-core --features subprocess-bridge \
     -- mission_loop::tests::paths_overlap 2>>"$LOG_DIR/test_stderr.log" | tee -a "$LOG_DIR/test_stdout.log"; then
+    check_rch_fallback_in_logs "paths_overlap_tests" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
     PASS_COUNT=$(grep -c "test mission_loop::tests::paths_overlap.*ok" "$LOG_DIR/test_stdout.log" || echo "0")
     log_structured "PASS" "path_overlap_tests_pass" "" "$(printf ',\"input_summary\":\"paths_overlap + wildcard\",\"pass_count\":\"%s\"' "$PASS_COUNT")"
     echo "    ✓ Path overlap tests passed"
 else
+    check_rch_fallback_in_logs "paths_overlap_tests" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
     log_structured "FAIL" "path_overlap_tests_fail" "E2E002"
     exit 1
 fi
@@ -88,9 +139,11 @@ if $CARGO_CMD test --lib -p frankenterm-core --features subprocess-bridge \
     -- mission_loop::tests::conflict_resolution_serde 2>>"$LOG_DIR/test_stderr.log" | tee -a "$LOG_DIR/test_stdout.log" \
     && $CARGO_CMD test --lib -p frankenterm-core --features subprocess-bridge \
     -- mission_loop::tests::deconfliction_strategy_serde 2>>"$LOG_DIR/test_stderr.log" | tee -a "$LOG_DIR/test_stdout.log"; then
+    check_rch_fallback_in_logs "serde_roundtrip_tests" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
     log_structured "PASS" "serde_roundtrip_pass" "" ',"input_summary":"conflict types serde roundtrip"'
     echo "    ✓ Serde roundtrip tests passed"
 else
+    check_rch_fallback_in_logs "serde_roundtrip_tests" "$LOG_DIR/test_stdout.log" "$LOG_DIR/test_stderr.log"
     log_structured "FAIL" "serde_roundtrip_fail" "E2E003"
     exit 1
 fi

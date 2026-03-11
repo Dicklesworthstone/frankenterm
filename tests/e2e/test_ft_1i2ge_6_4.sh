@@ -40,23 +40,61 @@ log_event() {
         "$error_code" >> "$LOG_FILE"
 }
 
+RCH_FAIL_OPEN_REGEX='\[RCH\] local|running locally'
+RCH_PROBE_LOG="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_rch_probe.log"
+RCH_SMOKE_LOG="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_rch_smoke.log"
+
+run_rch() {
+    TMPDIR=/tmp rch "$@"
+}
+
+probe_has_reachable_workers() {
+    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
+}
+
+check_rch_fallback_in_logs() {
+    local label="$1"
+    shift
+
+    if grep -Eq "$RCH_FAIL_OPEN_REGEX" "$@" 2>/dev/null; then
+        log_event "rch_offload" "cargo_step" "$label" "fail" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK"
+        echo "rch fell back to local execution during ${label}; refusing offload policy violation." >&2
+        exit 3
+    fi
+}
+
 # ── Preflight ──────────────────────────────────────────────────────────────
 log_event "preflight" "startup" "checking_rch" "started"
 
 if ! command -v rch &>/dev/null; then
-    log_event "preflight" "startup" "rch_binary" "skip" "rch_not_found" "RCH-E001"
-    echo "WARN: rch not found, falling back to local cargo"
-    CARGO_CMD="cargo"
-else
-    if rch workers probe --all 2>&1 | grep -q '✓'; then
-        CARGO_CMD="rch exec -- cargo"
-        log_event "preflight" "startup" "rch_workers" "available" "rch_ok"
-    else
-        log_event "preflight" "startup" "rch_workers" "unavailable" "rch_workers_down" "RCH-E100"
-        echo "WARN: rch workers unavailable, falling back to local cargo"
-        CARGO_CMD="cargo"
-    fi
+    log_event "preflight" "startup" "rch_binary_missing" "fail" "rch_required_missing" "RCH-E001"
+    echo "rch is required; refusing local cargo execution." >&2
+    exit 1
 fi
+
+set +e
+run_rch --json workers probe --all >"$RCH_PROBE_LOG" 2>&1
+probe_rc=$?
+set -e
+if [[ $probe_rc -ne 0 ]] || ! probe_has_reachable_workers "$RCH_PROBE_LOG"; then
+    log_event "preflight" "startup" "rch_workers_probe" "fail" "rch_workers_unhealthy" "RCH-E100"
+    echo "rch workers are unavailable; refusing local cargo execution." >&2
+    exit 1
+fi
+
+set +e
+run_rch exec -- cargo check --help >"$RCH_SMOKE_LOG" 2>&1
+smoke_rc=$?
+set -e
+check_rch_fallback_in_logs "rch_remote_smoke" "$RCH_SMOKE_LOG"
+if [[ $smoke_rc -ne 0 ]]; then
+    log_event "preflight" "startup" "cargo_check_help" "fail" "rch_remote_smoke_failed" "RCH-E101"
+    echo "rch remote smoke preflight failed; refusing local cargo execution." >&2
+    exit 1
+fi
+
+CARGO_CMD="run_rch exec -- cargo"
+log_event "preflight" "startup" "cargo_check_help" "pass" "rch_remote_smoke_ok" "none"
 
 cd "$PROJECT_ROOT"
 
@@ -68,15 +106,18 @@ run_test() {
     local name="$1"
     shift
     local start
+    local output_file="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_${name}.log"
     start=$(date +%s)
     log_event "test" "run" "$name" "started"
 
-    if eval "$@" > /dev/null 2>&1; then
+    if eval "$@" >"$output_file" 2>&1; then
+        check_rch_fallback_in_logs "$name" "$output_file"
         local elapsed=$(( $(date +%s) - start ))
         log_event "test" "run" "$name" "pass" "nominal" "none"
         echo "  ✓ $name (${elapsed}s)"
         PASS=$((PASS + 1))
     else
+        check_rch_fallback_in_logs "$name" "$output_file"
         local elapsed=$(( $(date +%s) - start ))
         log_event "test" "run" "$name" "fail" "assertion_failed" "TEST-E001"
         echo "  ✗ $name (${elapsed}s)"
