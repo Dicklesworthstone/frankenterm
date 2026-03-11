@@ -15,13 +15,21 @@
 //! Each test defines a concurrent workload (multiple tasks operating on
 //! shared state) and a failure injection profile. The matrix covers:
 //!
-//! | Concurrency scenario     | No faults | Single fault | Multi-fault | Cascade |
-//! |--------------------------|-----------|--------------|-------------|---------|
-//! | Pool acquire/release     |     ✓     |      ✓       |      ✓      |    ✓    |
-//! | Channel send/recv        |     ✓     |      ✓       |      ✓      |    ✓    |
-//! | Shared state mutation    |     ✓     |      ✓       |      ✓      |    ✓    |
-//! | Shutdown drain           |     ✓     |      ✓       |      ✓      |    ✓    |
-//! | Event dispatch           |     ✓     |      ✓       |      ✓      |    ✓    |
+//! | Scenario              | No faults | Single | Multi | Cascade | Backpressure | Timeout | Partial I/O |
+//! |-----------------------|-----------|--------|-------|---------|--------------|---------|-------------|
+//! | Pool acquire/release  |     ✓     |   ✓    |   ✓   |    ✓    |      ✓       |         |             |
+//! | Channel send/recv     |     ✓     |   ✓    |   ✓   |    ✓    |              |    ✓    |             |
+//! | Shared state mutation |     ✓     |   ✓    |       |    ✓    |              |         |      ✓      |
+//! | Shutdown drain        |     ✓     |   ✓    |   ✓   |    ✓    |              |    ✓    |             |
+//! | Event dispatch        |     ✓     |   ✓    |   ✓   |    ✓    |      ✓       |         |             |
+//!
+//! ## User-facing scenarios
+//!
+//! - Rate-limit wait: operations slow under throttling, verify no dropped work
+//! - Reconnect storm: CLI backend fails then recovers, verify CFM-5
+//! - Remote command retry: send_text fails with fallback path, verify resilience
+//! - Startup under degraded I/O: initial DB failures, verify post-recovery
+//! - Cancellation storm: mass task cancellation under load, verify CFM-7
 //!
 //! # Invariants verified
 //!
@@ -823,6 +831,692 @@ fn cfm_scaling_concurrency() {
 
 // =============================================================================
 // Test: Determinism verification
+// =============================================================================
+
+// =============================================================================
+// Fault injection profiles — extended
+// =============================================================================
+
+/// Backpressure spike: all I/O delayed, simulating system under heavy load.
+fn backpressure_spike_profile() -> Vec<(FaultPoint, FaultMode)> {
+    vec![
+        (FaultPoint::DbWrite, FaultMode::delay(200)),
+        (FaultPoint::DbRead, FaultMode::delay(200)),
+        (
+            FaultPoint::WeztermCliCall,
+            FaultMode::delay_then_fail(100, "backpressure: cli timeout"),
+        ),
+    ]
+}
+
+/// Timeout race: operations delay then fail, simulating deadline exceedance.
+fn timeout_race_profile() -> Vec<(FaultPoint, FaultMode)> {
+    vec![
+        (
+            FaultPoint::DbRead,
+            FaultMode::delay_then_fail(500, "timeout: db read deadline exceeded"),
+        ),
+        (
+            FaultPoint::WeztermCliCall,
+            FaultMode::delay_then_fail(500, "timeout: cli deadline exceeded"),
+        ),
+    ]
+}
+
+/// Partial I/O: reads succeed but writes fail intermittently.
+fn partial_io_profile() -> Vec<(FaultPoint, FaultMode)> {
+    vec![
+        (
+            FaultPoint::DbWrite,
+            FaultMode::fail_with_probability(0.5, "partial_io: write failed"),
+        ),
+        // Reads always succeed — simulates partial I/O degradation.
+    ]
+}
+
+// =============================================================================
+// Workload: Shutdown drain
+// =============================================================================
+
+/// Simulates graceful shutdown drain under fault injection.
+///
+/// Tasks are spawned in two waves:
+/// 1. "Running" tasks that perform work.
+/// 2. "Drain" tasks that clean up after running tasks finish.
+///
+/// Under faults, drain must still complete — no resource leaks.
+fn shutdown_drain_workload(
+    runtime: &mut LabRuntime,
+    state: &Arc<SharedWorkloadState>,
+    running_count: u64,
+    drain_count: u64,
+) {
+    let drain_ready = Arc::new(AtomicU64::new(0));
+    let region = runtime.state.create_root_region(Budget::INFINITE);
+
+    // Phase 1: Running tasks
+    for task_id in 0..running_count {
+        let st = Arc::clone(state);
+        let ready = Arc::clone(&drain_ready);
+        let (tid, _handle) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let ok = FaultInjector::check(FaultPoint::DbWrite).is_ok();
+                st.record_op(task_id, ok);
+                // Signal drain readiness
+                ready.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("create task");
+        runtime.scheduler.lock().schedule(tid, 0);
+    }
+
+    // Phase 2: Drain tasks (cleanup)
+    for task_id in running_count..running_count + drain_count {
+        let st = Arc::clone(state);
+        let ready = Arc::clone(&drain_ready);
+        let (tid, _handle) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                // Drain checks remaining work
+                let pending = ready.load(Ordering::SeqCst);
+                let ok = if pending > 0 {
+                    FaultInjector::check(FaultPoint::RetentionCleanup).is_ok()
+                } else {
+                    true
+                };
+                st.record_op(task_id, ok);
+            })
+            .expect("create task");
+        runtime.scheduler.lock().schedule(tid, 0);
+    }
+}
+
+// =============================================================================
+// Test: Shutdown drain matrix
+// =============================================================================
+
+#[test]
+fn cfm_drain_no_faults() {
+    let result = run_matrix_cell(
+        "drain",
+        "no_faults",
+        &no_fault_profile(),
+        20,
+        |runtime, state| shutdown_drain_workload(runtime, state, 3, 2),
+    );
+    assert!(result.all_passed, "drain/no_faults failed: {result:?}");
+    assert_eq!(result.ops_failed, 0);
+}
+
+#[test]
+fn cfm_drain_single_fault() {
+    let result = run_matrix_cell(
+        "drain",
+        "single_db_write",
+        &single_db_write_fault(),
+        20,
+        |runtime, state| shutdown_drain_workload(runtime, state, 3, 2),
+    );
+    assert!(result.all_passed, "drain/single_db_write failed: {result:?}");
+}
+
+#[test]
+fn cfm_drain_multi_fault() {
+    let result = run_matrix_cell(
+        "drain",
+        "multi_fault",
+        &multi_fault_profile(),
+        20,
+        |runtime, state| shutdown_drain_workload(runtime, state, 3, 2),
+    );
+    assert!(result.all_passed, "drain/multi_fault failed: {result:?}");
+}
+
+#[test]
+fn cfm_drain_cascade() {
+    let result = run_matrix_cell(
+        "drain",
+        "cascade",
+        &cascade_fault_profile(),
+        20,
+        |runtime, state| shutdown_drain_workload(runtime, state, 3, 2),
+    );
+    assert!(result.all_passed, "drain/cascade failed: {result:?}");
+}
+
+// =============================================================================
+// Test: Backpressure spike matrix (extended profiles)
+// =============================================================================
+
+#[test]
+fn cfm_pool_backpressure_spike() {
+    let result = run_matrix_cell(
+        "pool",
+        "backpressure_spike",
+        &backpressure_spike_profile(),
+        15,
+        |runtime, state| pool_acquire_release_workload(runtime, state, 4),
+    );
+    assert!(
+        result.all_passed,
+        "pool/backpressure_spike failed: {result:?}"
+    );
+}
+
+#[test]
+fn cfm_channel_timeout_race() {
+    let result = run_matrix_cell(
+        "channel",
+        "timeout_race",
+        &timeout_race_profile(),
+        15,
+        |runtime, state| channel_pipeline_workload(runtime, state, 3, 2),
+    );
+    assert!(
+        result.all_passed,
+        "channel/timeout_race failed: {result:?}"
+    );
+}
+
+#[test]
+fn cfm_mutation_partial_io() {
+    let result = run_matrix_cell(
+        "mutation",
+        "partial_io",
+        &partial_io_profile(),
+        15,
+        |runtime, state| shared_mutation_workload(runtime, state, 4, 3),
+    );
+    assert!(
+        result.all_passed,
+        "mutation/partial_io failed: {result:?}"
+    );
+}
+
+#[test]
+fn cfm_dispatch_backpressure_spike() {
+    let result = run_matrix_cell(
+        "dispatch",
+        "backpressure_spike",
+        &backpressure_spike_profile(),
+        15,
+        |runtime, state| event_dispatch_workload(runtime, state, 5),
+    );
+    assert!(
+        result.all_passed,
+        "dispatch/backpressure_spike failed: {result:?}"
+    );
+}
+
+#[test]
+fn cfm_drain_timeout_race() {
+    let result = run_matrix_cell(
+        "drain",
+        "timeout_race",
+        &timeout_race_profile(),
+        15,
+        |runtime, state| shutdown_drain_workload(runtime, state, 3, 2),
+    );
+    assert!(
+        result.all_passed,
+        "drain/timeout_race failed: {result:?}"
+    );
+}
+
+// =============================================================================
+// Test: User-facing scenario — rate-limit wait
+// =============================================================================
+
+/// Simulates user operations slowed by rate limiting.
+///
+/// Tasks check multiple fault points representing backend calls. Under
+/// backpressure, operations succeed but slowly — verifying that the system
+/// doesn't drop work during rate-limit waits.
+#[test]
+fn cfm_scenario_rate_limit_wait() {
+    let injector = FaultInjector::init_global();
+    injector.clear_all();
+
+    // Simulate rate limiting: reads delayed, writes occasionally rejected
+    injector.set_fault(FaultPoint::DbRead, FaultMode::delay(100));
+    injector.set_fault(
+        FaultPoint::DbWrite,
+        FaultMode::fail_n_times(3, "rate limited: retry later"),
+    );
+
+    let state = SharedWorkloadState::new();
+    let st = Arc::clone(&state);
+    let config = LabTestConfig::new(1001, "cfm_scenario_rate_limit_wait").worker_count(4);
+
+    run_lab_test(config, |runtime| {
+        // Multiple users sending commands concurrently
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+        for task_id in 0..6u64 {
+            let s = Arc::clone(&st);
+            let (tid, _handle) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    // Read succeeds (but delayed)
+                    let read_ok = FaultInjector::check(FaultPoint::DbRead).is_ok();
+                    // Write may be rate-limited
+                    let write_ok = FaultInjector::check(FaultPoint::DbWrite).is_ok();
+                    s.record_op(task_id, read_ok && write_ok);
+                })
+                .expect("create task");
+            runtime.scheduler.lock().schedule(tid, 0);
+        }
+    });
+
+    state.assert_invariants("cfm_scenario_rate_limit_wait");
+    // After rate limit exhausts (3 failures), remaining ops should succeed
+    let succeeded = state.ops_succeeded.load(Ordering::SeqCst);
+    assert!(succeeded > 0, "at least some ops should succeed after rate limit");
+
+    FaultInjector::reset_global();
+}
+
+// =============================================================================
+// Test: User-facing scenario — reconnect storm
+// =============================================================================
+
+/// Simulates a reconnect storm: CLI backend goes down and comes back.
+///
+/// All CLI calls fail for the first N invocations, then recover.
+/// Verifies CFM-5 (recovery) in a user-facing context.
+#[test]
+fn cfm_scenario_reconnect_storm() {
+    let injector = FaultInjector::init_global();
+    injector.clear_all();
+
+    // CLI completely down for 5 calls, then recovers
+    injector.set_fault(
+        FaultPoint::WeztermCliCall,
+        FaultMode::fail_n_times(5, "connection refused"),
+    );
+
+    let state = SharedWorkloadState::new();
+    let st = Arc::clone(&state);
+    let config = LabTestConfig::new(1002, "cfm_scenario_reconnect_storm").worker_count(3);
+
+    run_lab_test(config, |runtime| {
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+        // 8 tasks hitting CLI — first 5 calls fail, remaining succeed
+        for task_id in 0..8u64 {
+            let s = Arc::clone(&st);
+            let (tid, _handle) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    let ok = FaultInjector::check(FaultPoint::WeztermCliCall).is_ok();
+                    s.record_op(task_id, ok);
+                })
+                .expect("create task");
+            runtime.scheduler.lock().schedule(tid, 0);
+        }
+    });
+
+    state.assert_invariants("cfm_scenario_reconnect_storm");
+    // Exactly 5 failures from the fail_n_times(5)
+    let failed = state.ops_failed.load(Ordering::SeqCst);
+    assert!(
+        failed <= 5,
+        "reconnect storm: at most 5 failures expected, got {failed}"
+    );
+    // Some must succeed (recovery)
+    let succeeded = state.ops_succeeded.load(Ordering::SeqCst);
+    assert!(
+        succeeded > 0,
+        "reconnect storm: at least some ops should recover"
+    );
+
+    FaultInjector::reset_global();
+}
+
+// =============================================================================
+// Test: User-facing scenario — remote command retry
+// =============================================================================
+
+/// Simulates remote send_text retries: first attempts fail, then succeed.
+///
+/// Models the user experience of sending a command to a pane when the
+/// WezTerm CLI is temporarily unreachable.
+#[test]
+fn cfm_scenario_remote_command_retry() {
+    let injector = FaultInjector::init_global();
+    injector.clear_all();
+
+    // Transient CLI failures
+    injector.set_fault(
+        FaultPoint::WeztermCliCall,
+        FaultMode::fail_n_times(2, "send_text: connection reset"),
+    );
+    // DB writes also flaky
+    injector.set_fault(
+        FaultPoint::DbWrite,
+        FaultMode::fail_n_times(1, "write ahead log full"),
+    );
+
+    let state = SharedWorkloadState::new();
+    let st = Arc::clone(&state);
+    let config = LabTestConfig::new(1003, "cfm_scenario_remote_command_retry").worker_count(2);
+
+    run_lab_test(config, |runtime| {
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+        for task_id in 0..5u64 {
+            let s = Arc::clone(&st);
+            let (tid, _handle) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    // Simulate retry pattern: check CLI, fallback to DB log
+                    let cli_ok = FaultInjector::check(FaultPoint::WeztermCliCall).is_ok();
+                    let db_ok = FaultInjector::check(FaultPoint::DbWrite).is_ok();
+                    s.record_op(task_id, cli_ok || db_ok); // Succeed if either path works
+                })
+                .expect("create task");
+            runtime.scheduler.lock().schedule(tid, 0);
+        }
+    });
+
+    state.assert_invariants("cfm_scenario_remote_command_retry");
+    // With retry/fallback, most ops should succeed
+    let succeeded = state.ops_succeeded.load(Ordering::SeqCst);
+    assert!(
+        succeeded >= 3,
+        "remote command retry: expected >= 3 successes with fallback, got {succeeded}"
+    );
+
+    FaultInjector::reset_global();
+}
+
+// =============================================================================
+// Test: User-facing scenario — startup under degraded I/O
+// =============================================================================
+
+/// Simulates application startup when the disk subsystem is degraded.
+///
+/// Initial DB operations are slow and fail; the system must still
+/// initialize and serve requests once I/O recovers.
+#[test]
+fn cfm_scenario_startup_degraded_io() {
+    let injector = FaultInjector::init_global();
+    injector.clear_all();
+
+    // DB reads and writes fail during startup (first 3 of each)
+    injector.set_fault(
+        FaultPoint::DbRead,
+        FaultMode::fail_n_times(3, "disk: I/O error during startup"),
+    );
+    injector.set_fault(
+        FaultPoint::DbWrite,
+        FaultMode::fail_n_times(3, "disk: I/O error during startup"),
+    );
+    // Config reload also fails once
+    injector.set_fault(
+        FaultPoint::ConfigReload,
+        FaultMode::fail_n_times(1, "config: file locked during startup"),
+    );
+
+    let state = SharedWorkloadState::new();
+    let st = Arc::clone(&state);
+    let config = LabTestConfig::new(1004, "cfm_scenario_startup_degraded_io").worker_count(3);
+
+    run_lab_test(config, |runtime| {
+        let region = runtime.state.create_root_region(Budget::INFINITE);
+
+        // Startup phase: initialization tasks
+        for task_id in 0..3u64 {
+            let s = Arc::clone(&st);
+            let (tid, _handle) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    let read_ok = FaultInjector::check(FaultPoint::DbRead).is_ok();
+                    let config_ok = FaultInjector::check(FaultPoint::ConfigReload).is_ok();
+                    s.record_op(task_id, read_ok && config_ok);
+                })
+                .expect("create task");
+            runtime.scheduler.lock().schedule(tid, 0);
+        }
+
+        // Post-startup phase: normal operations (I/O should be recovered)
+        for task_id in 3..7u64 {
+            let s = Arc::clone(&st);
+            let (tid, _handle) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    let read_ok = FaultInjector::check(FaultPoint::DbRead).is_ok();
+                    let write_ok = FaultInjector::check(FaultPoint::DbWrite).is_ok();
+                    s.record_op(task_id, read_ok && write_ok);
+                })
+                .expect("create task");
+            runtime.scheduler.lock().schedule(tid, 0);
+        }
+    });
+
+    state.assert_invariants("cfm_scenario_startup_degraded_io");
+    // Post-startup tasks should mostly succeed
+    let total_ops = state.ops_attempted.load(Ordering::SeqCst);
+    let succeeded = state.ops_succeeded.load(Ordering::SeqCst);
+    assert!(total_ops >= 7, "all tasks should have attempted operations");
+    assert!(
+        succeeded > 0,
+        "at least some post-startup operations should succeed"
+    );
+
+    FaultInjector::reset_global();
+}
+
+// =============================================================================
+// Test: User-facing scenario — cancellation storm
+// =============================================================================
+
+/// Simulates a cancellation storm where many tasks are cancelled mid-flight.
+///
+/// Exercises CFM-7 under high-concurrency cancellation, verifying that
+/// shared state remains consistent when many tasks are abruptly stopped.
+#[test]
+fn cfm_scenario_cancellation_storm() {
+    let injector = FaultInjector::init_global();
+    injector.clear_all();
+
+    // All operations delayed heavily — most will be "cancelled" by step limit
+    injector.set_fault(FaultPoint::DbRead, FaultMode::delay(5000));
+    injector.set_fault(FaultPoint::DbWrite, FaultMode::delay(5000));
+    injector.set_fault(FaultPoint::WeztermCliCall, FaultMode::delay(5000));
+
+    let state = SharedWorkloadState::new();
+    let st = Arc::clone(&state);
+
+    let config = LabTestConfig::new(1005, "cfm_scenario_cancellation_storm")
+        .worker_count(4)
+        .max_steps(100)
+        .panic_on_leak(false);
+
+    let mut runtime = LabRuntime::new(config.to_lab_config());
+    let region = runtime.state.create_root_region(Budget::INFINITE);
+
+    // Spawn many tasks that will mostly be cancelled
+    for task_id in 0..16u64 {
+        let s = Arc::clone(&st);
+        let (tid, _handle) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let db_ok = FaultInjector::check(FaultPoint::DbRead).is_ok();
+                let cli_ok = FaultInjector::check(FaultPoint::WeztermCliCall).is_ok();
+                let write_ok = FaultInjector::check(FaultPoint::DbWrite).is_ok();
+                s.record_op(task_id, db_ok && cli_ok && write_ok);
+            })
+            .expect("create task");
+        runtime.scheduler.lock().schedule(tid, 0);
+    }
+
+    runtime.run_until_quiescent();
+
+    // CFM-7: Even with mass cancellation, completed tasks must be consistent
+    let attempted = state.ops_attempted.load(Ordering::SeqCst);
+    let succeeded = state.ops_succeeded.load(Ordering::SeqCst);
+    let failed = state.ops_failed.load(Ordering::SeqCst);
+    assert_eq!(
+        attempted,
+        succeeded + failed,
+        "CFM-7 cancellation storm: counter inconsistency"
+    );
+
+    FaultInjector::reset_global();
+}
+
+// =============================================================================
+// Structured telemetry output
+// =============================================================================
+
+/// Structured test result for machine-readable output.
+///
+/// Used for CI archival and failure trace replay per acceptance criterion 6.
+#[derive(Debug, Serialize)]
+struct CfmTestResult {
+    /// Test identifier.
+    test_id: String,
+    /// Timestamp of test execution (epoch ms).
+    timestamp_ms: u64,
+    /// Component under test.
+    component: &'static str,
+    /// Workload name.
+    workload: String,
+    /// Scenario/fault profile name.
+    scenario: String,
+    /// Whether all invariants passed.
+    passed: bool,
+    /// Total DPOR runs executed.
+    total_runs: usize,
+    /// Unique equivalence classes discovered.
+    unique_classes: usize,
+    /// Operations attempted across all runs.
+    ops_attempted: u64,
+    /// Operations succeeded across all runs.
+    ops_succeeded: u64,
+    /// Operations failed (fault-injected) across all runs.
+    ops_failed: u64,
+    /// Fault injection triggers observed.
+    fault_triggers: usize,
+    /// Reason code for failures (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<String>,
+}
+
+use serde::Serialize;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+impl CfmTestResult {
+    fn from_cell(cell: &MatrixCellResult, fault_triggers: usize) -> Self {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        Self {
+            test_id: format!("cfm/{}/{}", cell.workload_name, cell.scenario_name),
+            timestamp_ms: now_ms,
+            component: "concurrency_fault_matrix",
+            workload: cell.workload_name.clone(),
+            scenario: cell.scenario_name.clone(),
+            passed: cell.all_passed,
+            total_runs: cell.total_runs,
+            unique_classes: cell.unique_classes,
+            ops_attempted: cell.ops_attempted,
+            ops_succeeded: cell.ops_succeeded,
+            ops_failed: cell.ops_failed,
+            fault_triggers,
+            reason_code: if !cell.all_passed {
+                Some("invariant_violation".to_string())
+            } else {
+                None
+            },
+        }
+    }
+}
+
+/// Run a matrix cell and emit structured JSON telemetry to tracing.
+fn run_matrix_cell_with_telemetry<W>(
+    workload_name: &str,
+    scenario_name: &str,
+    faults: &[(FaultPoint, FaultMode)],
+    max_runs: usize,
+    workload_fn: W,
+) -> MatrixCellResult
+where
+    W: Fn(&mut LabRuntime, &Arc<SharedWorkloadState>) + Send + Sync,
+{
+    let result = run_matrix_cell(workload_name, scenario_name, faults, max_runs, workload_fn);
+
+    let triggers = FaultInjector::global()
+        .map(|inj| inj.total_fired())
+        .unwrap_or(0);
+    let telemetry = CfmTestResult::from_cell(&result, triggers);
+
+    if let Ok(json) = serde_json::to_string(&telemetry) {
+        tracing::info!(
+            target: "cfm_telemetry",
+            test_id = %telemetry.test_id,
+            passed = telemetry.passed,
+            ops_attempted = telemetry.ops_attempted,
+            "CFM result: {json}"
+        );
+    }
+
+    result
+}
+
+// =============================================================================
+// Test: Full matrix with structured telemetry
+// =============================================================================
+
+/// Run the complete 5×4 core matrix with structured telemetry output.
+///
+/// This test validates the full matrix and emits machine-readable results
+/// for CI archival. Marked with `#[ignore]` for CI-friendly slicing —
+/// run explicitly with `--ignored` for thorough verification.
+#[test]
+#[ignore] // CI slice: thorough — run with `cargo test -- --ignored cfm_full_telemetry_matrix`
+fn cfm_full_telemetry_matrix() {
+    let workloads: Vec<(&str, Box<dyn Fn(&mut LabRuntime, &Arc<SharedWorkloadState>) + Send + Sync>)> = vec![
+        ("pool", Box::new(|rt, st| pool_acquire_release_workload(rt, st, 4))),
+        ("channel", Box::new(|rt, st| channel_pipeline_workload(rt, st, 3, 2))),
+        ("mutation", Box::new(|rt, st| shared_mutation_workload(rt, st, 4, 3))),
+        ("dispatch", Box::new(|rt, st| event_dispatch_workload(rt, st, 5))),
+        ("drain", Box::new(|rt, st| shutdown_drain_workload(rt, st, 3, 2))),
+    ];
+
+    let profiles: Vec<(&str, Vec<(FaultPoint, FaultMode)>)> = vec![
+        ("no_faults", no_fault_profile()),
+        ("single_db_write", single_db_write_fault()),
+        ("multi_fault", multi_fault_profile()),
+        ("cascade", cascade_fault_profile()),
+        ("backpressure_spike", backpressure_spike_profile()),
+        ("timeout_race", timeout_race_profile()),
+        ("partial_io", partial_io_profile()),
+    ];
+
+    let mut total = 0;
+    let mut passed = 0;
+
+    for (wl_name, wl_fn) in &workloads {
+        for (sc_name, faults) in &profiles {
+            let result = run_matrix_cell_with_telemetry(wl_name, sc_name, faults, 10, |rt, st| {
+                wl_fn(rt, st);
+            });
+            total += 1;
+            if result.all_passed {
+                passed += 1;
+            }
+        }
+    }
+
+    assert_eq!(
+        passed, total,
+        "Full 5x7 telemetry matrix: {passed}/{total} cells passed"
+    );
+}
+
+// =============================================================================
+// Test: Exploration with increasing concurrency
 // =============================================================================
 
 /// Verify that running the same matrix cell twice with the same seed

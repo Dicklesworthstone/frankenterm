@@ -1,8 +1,50 @@
 //! Extracted MCP tool handlers (strangler-fig migration slice).
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+#[allow(unused_imports)]
+use crate::mcp_framework::{
+    FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
+    FrameworkMcpResult as McpResult, FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
+};
 use crate::policy::PolicySurface;
+
+#[allow(clippy::wildcard_imports)]
+use super::mcp_types::*;
+#[allow(unused_imports)]
+use super::{
+    AccountRecord, ActionKind, ActorKind, AgentProvider, AgentType, ApprovalStore, CassAgent,
+    CassClient, CassError, CassSearchOptions, CassSearchResult, CassStatus, CassViewOptions,
+    CassViewResult, CautClient, CautService, CompatRuntime, CompatRuntimeBuilder, Config,
+    DecisionContext, EventQuery, HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction,
+    HandleGeminiQuota, HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits,
+    InjectionResult, MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY,
+    MCP_ERR_INVALID_ARGS, MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
+    MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
+    MCP_ERR_WORKFLOW, McpEnvelope, McpToolError, Osc133State, PaneCapabilities, PaneFilterConfig,
+    PaneInfo, PaneReservation, PaneWaiter, PaneWorkflowLockManager, PatternEngine, PolicyDecision,
+    PolicyEngine, PolicyGatedInjector, PolicyInput, SearchQueryDefaults, SearchQueryInput,
+    StorageHandle, UnifiedSearchMode, WaitMatcher, WaitOptions, WaitResult, WeztermError,
+    WeztermHandleSource, Workflow, WorkflowEngine, WorkflowExecutionResult, WorkflowRunner,
+    WorkflowRunnerConfig, approval_command, build_policy_engine, builtin_workflows,
+    default_wezterm_handle, effective_search_fusion_backend, effective_search_fusion_weights,
+    effective_search_quality_timeout_ms, effective_search_rrf_k, elapsed_ms, envelope_to_content,
+    map_cass_error, map_caut_error, map_mcp_error, mcp_build_mission_assignments,
+    mcp_build_tx_commit_step_inputs, mcp_build_tx_compensation_inputs,
+    mcp_build_tx_prepare_gate_inputs, mcp_build_tx_synthetic_commit_report,
+    mcp_load_mission_from_path, mcp_load_mission_tx_contract_from_path,
+    mcp_mission_failure_catalog, mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
+    mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,
+    mcp_tx_transition_info, parse_cass_agent, parse_caut_service, parse_unified_search_query,
+    policy_reason, record_mcp_audit_sync, redact_mcp_args, reservation_to_mcp_info,
+    resolve_alt_screen_state, resolve_workspace_id, to_storage_search_options,
+};
+use super::{
+    MCP_REFRESH_COOLDOWN_MS, check_refresh_cooldown, injection_from_decision,
+    register_builtin_workflows, resolve_pane_capabilities,
+};
 
 fn mcp_get_text_policy_input(
     pane_id: u64,
