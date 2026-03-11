@@ -171,8 +171,10 @@ fn proof_revocation_overrides_namespace() {
         cross_tenant_policy: CrossTenantPolicy::strict(),
         ..Default::default()
     };
-    let mut safety = frankenterm_core::config::SafetyConfig::default();
-    safety.namespace_isolation = ns_config;
+    let safety = frankenterm_core::config::SafetyConfig {
+        namespace_isolation: ns_config,
+        ..Default::default()
+    };
     let mut engine = PolicyEngine::from_safety_config(&safety);
 
     // Bind connector to ns-b
@@ -820,8 +822,8 @@ fn proof_cascading_governance_actions_all_audited() {
     let report = engine.generate_forensic_report(&ForensicQuery::default(), 10000);
 
     // Verify all actions are audited
-    assert!(report.approvals.len() >= 1, "approval tracked");
-    assert!(report.revocations.len() >= 1, "revocation tracked");
+    assert!(!report.approvals.is_empty(), "approval tracked");
+    assert!(!report.revocations.is_empty(), "revocation tracked");
     assert!(!report.quarantine_active.is_empty(), "quarantine tracked");
     assert!(report.audit_trail.len() >= 4, "at least 4 audit trail entries (revoke, quarantine, kill-switch, quarantine compliance)");
 }
@@ -871,8 +873,10 @@ fn proof_namespace_strict_isolation() {
         cross_tenant_policy: CrossTenantPolicy::strict(),
         ..Default::default()
     };
-    let mut safety = frankenterm_core::config::SafetyConfig::default();
-    safety.namespace_isolation = ns_config;
+    let safety = frankenterm_core::config::SafetyConfig {
+        namespace_isolation: ns_config,
+        ..Default::default()
+    };
     let mut engine = PolicyEngine::from_safety_config(&safety);
 
     let ns_prod = TenantNamespace::new("prod").unwrap();
