@@ -348,6 +348,7 @@ pub mod session_dna;
 pub mod session_pane_state;
 pub mod session_profiles;
 pub mod session_restore;
+pub mod session_workflow_explorer;
 #[cfg(feature = "session-resume")]
 pub mod session_resume;
 pub mod session_retention;
