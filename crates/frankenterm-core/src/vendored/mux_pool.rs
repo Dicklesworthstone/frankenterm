@@ -1110,6 +1110,32 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_list_panes_with_cx_reuses_idle_connection() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let cx = crate::cx::for_testing();
+
+            pool.list_panes_with_cx(&cx)
+                .await
+                .expect("first list_panes_with_cx");
+            pool.list_panes_with_cx(&cx)
+                .await
+                .expect("second list_panes_with_cx");
+
+            let stats = pool.stats().await;
+            assert_eq!(
+                stats.connections_created, 1,
+                "explicit-Cx path should have created only one connection"
+            );
+            assert_eq!(stats.pool.total_acquired, 2, "two acquire calls");
+        });
+    }
+
     #[test]
     fn pool_reuses_idle_connection() {
         run_async_test(async {
@@ -1325,6 +1351,35 @@ mod tests {
             pool.health_check()
                 .await
                 .expect_err("health check should fail");
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.health_checks, 1);
+            assert_eq!(stats.health_check_failures, 1);
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_health_check_with_cx_failure() {
+        run_async_test(async {
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 2,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default()
+                    .with_socket_path("/tmp/wa-mux-pool-test-nonexistent-cx.sock"),
+                recovery: MuxRecoveryConfig::default(),
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+            let cx = crate::cx::for_testing();
+
+            pool.health_check_with_cx(&cx)
+                .await
+                .expect_err("health_check_with_cx should fail");
 
             let stats = pool.stats().await;
             assert_eq!(stats.health_checks, 1);
@@ -2175,6 +2230,38 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_multiple_connect_failures_with_cx_increment_counter() {
+        run_async_test(async {
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 2,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default()
+                    .with_socket_path("/tmp/wa-mux-pool-test-nonexistent-multi-cx.sock"),
+                recovery: MuxRecoveryConfig {
+                    enabled: false,
+                    ..MuxRecoveryConfig::default()
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+            let cx = crate::cx::for_testing();
+
+            for _ in 0..3 {
+                let _ = pool.list_panes_with_cx(&cx).await;
+            }
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.connections_failed, 3, "3 failures should be counted");
+            assert_eq!(stats.connections_created, 0);
+        });
+    }
+
     #[test]
     fn pool_multiple_health_checks_track_counter() {
         run_async_test(async {
@@ -2190,6 +2277,31 @@ mod tests {
             let stats = pool.stats().await;
             assert_eq!(stats.health_checks, 5);
             assert_eq!(stats.health_check_failures, 0);
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_multiple_health_checks_with_cx_track_counter() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 2));
+            let cx = crate::cx::for_testing();
+
+            for _ in 0..5 {
+                pool.health_check_with_cx(&cx)
+                    .await
+                    .expect("health check with cx");
+            }
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.health_checks, 5);
+            assert_eq!(stats.health_check_failures, 0);
+            assert_eq!(
+                stats.connections_created, 1,
+                "explicit-Cx health checks should reuse a single pooled connection"
+            );
         });
     }
 
