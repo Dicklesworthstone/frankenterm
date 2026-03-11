@@ -358,9 +358,12 @@ impl PaneTierClassifier {
     }
 
     /// Get the effective polling interval for a pane under given backpressure.
+    ///
+    /// This reclassifies the pane first so callers do not need to manually call
+    /// `classify()` before asking for the current polling interval.
     #[must_use]
     pub fn effective_interval(&self, pane_id: u64, bp: BackpressureTier) -> Duration {
-        let tier = self.current_tier(pane_id);
+        let tier = self.classify(pane_id);
         let base = self.config.interval_for(tier);
         let mult = tier.backpressure_multiplier(bp);
         base.mul_f64(mult)
@@ -380,9 +383,10 @@ impl PaneTierClassifier {
         let mut estimated_rps = 0.0;
 
         for state in panes.values() {
-            *tier_counts.entry(state.tier.to_string()).or_insert(0u64) += 1;
+            let tier = self.compute_tier(state);
+            *tier_counts.entry(tier.to_string()).or_insert(0u64) += 1;
             // RPS contribution: 1 / interval_seconds
-            let interval = self.config.interval_for(state.tier);
+            let interval = self.config.interval_for(tier);
             estimated_rps += 1.0 / interval.as_secs_f64();
         }
 
@@ -735,6 +739,19 @@ mod tests {
         assert!(red > green);
     }
 
+    #[test]
+    fn effective_interval_reclassifies_before_interval_lookup() {
+        let clf = PaneTierClassifier::new(TierConfig::default());
+        clf.register_pane(1);
+        clf.set_background(1, true);
+
+        assert_eq!(
+            clf.effective_interval(1, BackpressureTier::Green),
+            Duration::from_secs(10)
+        );
+        assert_eq!(clf.current_tier(1), PaneTier::Background);
+    }
+
     // -- Metrics ---------------------------------------------------------------
 
     #[test]
@@ -753,6 +770,29 @@ mod tests {
         // Should have active and background panes
         assert!(m.tier_counts.contains_key("active"));
         assert!(m.tier_counts.contains_key("background"));
+    }
+
+    #[test]
+    fn metrics_compute_current_tiers_without_prior_classify() {
+        let clf = PaneTierClassifier::new(TierConfig {
+            idle_threshold_secs: 0,
+            dormant_threshold_secs: 300,
+            ..Default::default()
+        });
+        clf.register_pane(1);
+        clf.register_pane(2);
+        clf.set_background(2, true);
+
+        {
+            let mut panes = clf.panes.write().unwrap();
+            let state = panes.get_mut(&1).unwrap();
+            state.last_output = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        }
+
+        let metrics = clf.metrics();
+        assert_eq!(*metrics.tier_counts.get("idle").unwrap_or(&0), 1);
+        assert_eq!(*metrics.tier_counts.get("background").unwrap_or(&0), 1);
+        assert_eq!(*metrics.tier_counts.get("active").unwrap_or(&0), 0);
     }
 
     #[test]

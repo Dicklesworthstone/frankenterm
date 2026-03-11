@@ -58,8 +58,17 @@ pub fn select_backend() -> TuiBackend {
 }
 
 /// Parse a backend name string into a `TuiBackend` variant.
+///
+/// Human-operated env vars routinely pick up shell whitespace or mixed casing,
+/// so normalize before matching to avoid silently falling back to the rollout
+/// default backend.
 fn parse_backend(value: Option<&str>) -> TuiBackend {
-    match value {
+    let normalized = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+
+    match normalized.as_deref() {
         Some("ftui" | "frankentui") => TuiBackend::Ftui,
         Some("ratatui" | "legacy") => TuiBackend::Ratatui,
         _ => TuiBackend::STAGE_DEFAULT,
@@ -181,20 +190,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_backend_case_sensitive() {
-        assert_eq!(parse_backend(Some("FTUI")), TuiBackend::STAGE_DEFAULT);
-        assert_eq!(parse_backend(Some("Ftui")), TuiBackend::STAGE_DEFAULT);
-        assert_eq!(parse_backend(Some("RATATUI")), TuiBackend::STAGE_DEFAULT);
-        assert_eq!(parse_backend(Some("Ratatui")), TuiBackend::STAGE_DEFAULT);
-        assert_eq!(parse_backend(Some("LEGACY")), TuiBackend::STAGE_DEFAULT);
-        assert_eq!(parse_backend(Some("FRANKENTUI")), TuiBackend::STAGE_DEFAULT);
+    fn parse_backend_is_case_insensitive() {
+        assert_eq!(parse_backend(Some("FTUI")), TuiBackend::Ftui);
+        assert_eq!(parse_backend(Some("Ftui")), TuiBackend::Ftui);
+        assert_eq!(parse_backend(Some("RATATUI")), TuiBackend::Ratatui);
+        assert_eq!(parse_backend(Some("Ratatui")), TuiBackend::Ratatui);
+        assert_eq!(parse_backend(Some("LEGACY")), TuiBackend::Ratatui);
+        assert_eq!(parse_backend(Some("FRANKENTUI")), TuiBackend::Ftui);
     }
 
     #[test]
-    fn parse_backend_whitespace_not_trimmed() {
-        assert_eq!(parse_backend(Some(" ftui")), TuiBackend::STAGE_DEFAULT);
-        assert_eq!(parse_backend(Some("ftui ")), TuiBackend::STAGE_DEFAULT);
-        assert_eq!(parse_backend(Some(" ratatui ")), TuiBackend::STAGE_DEFAULT);
+    fn parse_backend_trims_surrounding_whitespace() {
+        assert_eq!(parse_backend(Some(" ftui")), TuiBackend::Ftui);
+        assert_eq!(parse_backend(Some("ftui ")), TuiBackend::Ftui);
+        assert_eq!(parse_backend(Some(" ratatui ")), TuiBackend::Ratatui);
+        assert_eq!(parse_backend(Some("\tLegacy\n")), TuiBackend::Ratatui);
     }
 
     #[test]
@@ -206,9 +216,9 @@ mod tests {
 
     #[test]
     fn parse_backend_special_characters() {
-        assert_eq!(parse_backend(Some("ftui\n")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(parse_backend(Some("ftui\n")), TuiBackend::Ftui);
         assert_eq!(parse_backend(Some("ftui\0")), TuiBackend::STAGE_DEFAULT);
-        assert_eq!(parse_backend(Some("ratatui\t")), TuiBackend::STAGE_DEFAULT);
+        assert_eq!(parse_backend(Some("ratatui\t")), TuiBackend::Ratatui);
     }
 
     #[test]
