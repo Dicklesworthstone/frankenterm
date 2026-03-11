@@ -917,6 +917,407 @@ pub struct ApprovalRequest {
     pub command: String,
 }
 
+// ── Approval Workflow Tracker ──────────────────────────────────────
+
+/// Status of a pending approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    /// Awaiting operator decision.
+    Pending,
+    /// Approved by an operator.
+    Approved,
+    /// Rejected by an operator.
+    Rejected,
+    /// Expired without a decision.
+    Expired,
+    /// Revoked after being approved.
+    Revoked,
+}
+
+impl ApprovalStatus {
+    /// Returns a stable string tag.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+            Self::Revoked => "revoked",
+        }
+    }
+
+    /// Returns true if the approval grants access.
+    #[must_use]
+    pub const fn grants_access(&self) -> bool {
+        matches!(self, Self::Approved)
+    }
+}
+
+/// A tracked approval entry in the workflow queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalEntry {
+    /// Unique approval ID.
+    pub approval_id: String,
+    /// The action kind that triggered the approval request.
+    pub action: String,
+    /// Actor who requested the action.
+    pub actor: String,
+    /// Domain/connector/resource involved.
+    pub resource: String,
+    /// Human-readable reason the approval is required.
+    pub reason: String,
+    /// Rule that triggered the approval requirement.
+    pub rule_id: String,
+    /// Timestamp when the approval was requested (epoch ms).
+    pub requested_at_ms: u64,
+    /// Expiration timestamp (epoch ms). 0 = no expiry.
+    pub expires_at_ms: u64,
+    /// Current status.
+    pub status: ApprovalStatus,
+    /// Who approved/rejected (empty if still pending).
+    pub decided_by: String,
+    /// Timestamp of the decision (0 if pending).
+    pub decided_at_ms: u64,
+}
+
+/// Bounded approval workflow tracker.
+///
+/// Maintains a queue of pending, approved, rejected, and revoked approvals.
+/// Integrates with the audit chain for governance traceability.
+#[derive(Debug, Clone)]
+pub struct ApprovalTracker {
+    entries: Vec<ApprovalEntry>,
+    max_entries: usize,
+    next_id: u64,
+}
+
+impl Default for ApprovalTracker {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            max_entries: 4096,
+            next_id: 1,
+        }
+    }
+}
+
+impl ApprovalTracker {
+    /// Create a new tracker with a given capacity.
+    #[must_use]
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            max_entries,
+            next_id: 1,
+        }
+    }
+
+    /// Submit a new approval request. Returns the generated approval ID.
+    pub fn submit(
+        &mut self,
+        action: &str,
+        actor: &str,
+        resource: &str,
+        reason: &str,
+        rule_id: &str,
+        requested_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> String {
+        let approval_id = format!("appr-{}", self.next_id);
+        self.next_id += 1;
+        let entry = ApprovalEntry {
+            approval_id: approval_id.clone(),
+            action: action.to_string(),
+            actor: actor.to_string(),
+            resource: resource.to_string(),
+            reason: reason.to_string(),
+            rule_id: rule_id.to_string(),
+            requested_at_ms,
+            expires_at_ms,
+            status: ApprovalStatus::Pending,
+            decided_by: String::new(),
+            decided_at_ms: 0,
+        };
+        self.entries.push(entry);
+        // Evict oldest if over capacity
+        if self.entries.len() > self.max_entries {
+            self.entries.remove(0);
+        }
+        approval_id
+    }
+
+    /// Approve a pending request. Returns true if the approval was found and updated.
+    pub fn approve(&mut self, approval_id: &str, decided_by: &str, now_ms: u64) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.approval_id == approval_id) {
+            if entry.status == ApprovalStatus::Pending {
+                entry.status = ApprovalStatus::Approved;
+                entry.decided_by = decided_by.to_string();
+                entry.decided_at_ms = now_ms;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Reject a pending request. Returns true if found and updated.
+    pub fn reject(&mut self, approval_id: &str, decided_by: &str, now_ms: u64) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.approval_id == approval_id) {
+            if entry.status == ApprovalStatus::Pending {
+                entry.status = ApprovalStatus::Rejected;
+                entry.decided_by = decided_by.to_string();
+                entry.decided_at_ms = now_ms;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Revoke a previously approved request. Returns true if found and revoked.
+    pub fn revoke(&mut self, approval_id: &str, decided_by: &str, now_ms: u64) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.approval_id == approval_id) {
+            if entry.status == ApprovalStatus::Approved {
+                entry.status = ApprovalStatus::Revoked;
+                entry.decided_by = decided_by.to_string();
+                entry.decided_at_ms = now_ms;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Expire all pending approvals past their deadline.
+    /// Returns the count of newly expired entries.
+    pub fn expire_stale(&mut self, now_ms: u64) -> usize {
+        let mut count = 0;
+        for entry in &mut self.entries {
+            if entry.status == ApprovalStatus::Pending
+                && entry.expires_at_ms > 0
+                && now_ms >= entry.expires_at_ms
+            {
+                entry.status = ApprovalStatus::Expired;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Look up an approval by ID.
+    #[must_use]
+    pub fn get(&self, approval_id: &str) -> Option<&ApprovalEntry> {
+        self.entries.iter().find(|e| e.approval_id == approval_id)
+    }
+
+    /// All pending approvals.
+    #[must_use]
+    pub fn pending(&self) -> Vec<&ApprovalEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.status == ApprovalStatus::Pending)
+            .collect()
+    }
+
+    /// Total number of tracked approvals (all statuses).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if the tracker has no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Count entries by status.
+    #[must_use]
+    pub fn count_by_status(&self, status: &ApprovalStatus) -> usize {
+        self.entries.iter().filter(|e| &e.status == status).count()
+    }
+
+    /// Diagnostic snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> ApprovalTrackerSnapshot {
+        ApprovalTrackerSnapshot {
+            total: self.entries.len(),
+            pending: self.count_by_status(&ApprovalStatus::Pending),
+            approved: self.count_by_status(&ApprovalStatus::Approved),
+            rejected: self.count_by_status(&ApprovalStatus::Rejected),
+            expired: self.count_by_status(&ApprovalStatus::Expired),
+            revoked: self.count_by_status(&ApprovalStatus::Revoked),
+            max_entries: self.max_entries,
+        }
+    }
+}
+
+/// Snapshot of the approval tracker state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalTrackerSnapshot {
+    pub total: usize,
+    pub pending: usize,
+    pub approved: usize,
+    pub rejected: usize,
+    pub expired: usize,
+    pub revoked: usize,
+    pub max_entries: usize,
+}
+
+// ── Revocation Engine ──────────────────────────────────────────────
+
+/// A revocation record for a credential, session, or connector access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationRecord {
+    /// Unique revocation ID.
+    pub revocation_id: String,
+    /// Type of resource revoked (e.g., "credential", "session", "connector").
+    pub resource_type: String,
+    /// Identifier of the revoked resource.
+    pub resource_id: String,
+    /// Reason for revocation.
+    pub reason: String,
+    /// Who initiated the revocation.
+    pub revoked_by: String,
+    /// Timestamp of revocation (epoch ms).
+    pub revoked_at_ms: u64,
+    /// Whether the revocation is currently active (can be un-revoked).
+    pub active: bool,
+}
+
+/// Bounded revocation registry.
+///
+/// Tracks revoked credentials, sessions, and connector access grants.
+/// Active revocations are checked during authorization to deny access.
+#[derive(Debug, Clone)]
+pub struct RevocationRegistry {
+    records: Vec<RevocationRecord>,
+    max_records: usize,
+    next_id: u64,
+}
+
+impl Default for RevocationRegistry {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            max_records: 4096,
+            next_id: 1,
+        }
+    }
+}
+
+impl RevocationRegistry {
+    /// Create with a given capacity.
+    #[must_use]
+    pub fn new(max_records: usize) -> Self {
+        Self {
+            records: Vec::new(),
+            max_records,
+            next_id: 1,
+        }
+    }
+
+    /// Revoke a resource. Returns the revocation ID.
+    pub fn revoke(
+        &mut self,
+        resource_type: &str,
+        resource_id: &str,
+        reason: &str,
+        revoked_by: &str,
+        now_ms: u64,
+    ) -> String {
+        let revocation_id = format!("rev-{}", self.next_id);
+        self.next_id += 1;
+        self.records.push(RevocationRecord {
+            revocation_id: revocation_id.clone(),
+            resource_type: resource_type.to_string(),
+            resource_id: resource_id.to_string(),
+            reason: reason.to_string(),
+            revoked_by: revoked_by.to_string(),
+            revoked_at_ms: now_ms,
+            active: true,
+        });
+        if self.records.len() > self.max_records {
+            self.records.remove(0);
+        }
+        revocation_id
+    }
+
+    /// Un-revoke (reinstate) a resource. Returns true if found and reinstated.
+    pub fn reinstate(&mut self, revocation_id: &str) -> bool {
+        if let Some(record) = self
+            .records
+            .iter_mut()
+            .find(|r| r.revocation_id == revocation_id && r.active)
+        {
+            record.active = false;
+            return true;
+        }
+        false
+    }
+
+    /// Check if a resource is currently revoked.
+    #[must_use]
+    pub fn is_revoked(&self, resource_type: &str, resource_id: &str) -> bool {
+        self.records
+            .iter()
+            .any(|r| r.active && r.resource_type == resource_type && r.resource_id == resource_id)
+    }
+
+    /// Get the active revocation for a resource, if any.
+    #[must_use]
+    pub fn active_revocation(
+        &self,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Option<&RevocationRecord> {
+        self.records
+            .iter()
+            .find(|r| r.active && r.resource_type == resource_type && r.resource_id == resource_id)
+    }
+
+    /// All active revocations.
+    #[must_use]
+    pub fn active_revocations(&self) -> Vec<&RevocationRecord> {
+        self.records.iter().filter(|r| r.active).collect()
+    }
+
+    /// Total records (active + inactive).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Returns true if empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Count of currently active revocations.
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.records.iter().filter(|r| r.active).count()
+    }
+
+    /// Diagnostic snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> RevocationRegistrySnapshot {
+        RevocationRegistrySnapshot {
+            total_records: self.records.len(),
+            active_revocations: self.active_count(),
+            max_records: self.max_records,
+        }
+    }
+}
+
+/// Snapshot of the revocation registry state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationRegistrySnapshot {
+    pub total_records: usize,
+    pub active_revocations: usize,
+    pub max_records: usize,
+}
+
 /// Result of policy evaluation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
@@ -2922,6 +3323,10 @@ pub struct PolicyEngine {
     namespace_registry: crate::namespace_isolation::NamespaceRegistry,
     /// Whether namespace isolation enforcement is enabled
     namespace_isolation_enabled: bool,
+    /// Approval workflow tracker for gating sensitive actions
+    approval_tracker: ApprovalTracker,
+    /// Revocation registry for credential/session/connector access revocation
+    revocation_registry: RevocationRegistry,
 }
 
 impl PolicyEngine {
@@ -2975,6 +3380,8 @@ impl PolicyEngine {
             ),
             namespace_registry: crate::namespace_isolation::NamespaceRegistry::new(),
             namespace_isolation_enabled: true,
+            approval_tracker: ApprovalTracker::default(),
+            revocation_registry: RevocationRegistry::default(),
         }
     }
 
@@ -3384,6 +3791,198 @@ impl PolicyEngine {
             now_ms,
         );
         result.is_allowed()
+    }
+
+    // ── Approval Tracker accessors ────────────────────────────────
+
+    /// Access the approval tracker.
+    #[must_use]
+    pub fn approval_tracker(&self) -> &ApprovalTracker {
+        &self.approval_tracker
+    }
+
+    /// Access the approval tracker mutably.
+    pub fn approval_tracker_mut(&mut self) -> &mut ApprovalTracker {
+        &mut self.approval_tracker
+    }
+
+    /// Submit an approval request with audit chain recording.
+    ///
+    /// Creates a pending approval entry and records it in the audit chain.
+    /// Returns the generated approval ID.
+    pub fn submit_approval(
+        &mut self,
+        action: &str,
+        actor: &str,
+        resource: &str,
+        reason: &str,
+        rule_id: &str,
+        now_ms: u64,
+        expires_at_ms: u64,
+    ) -> String {
+        let approval_id = self.approval_tracker.submit(
+            action,
+            actor,
+            resource,
+            reason,
+            rule_id,
+            now_ms,
+            expires_at_ms,
+        );
+        self.audit_chain.append(
+            AuditEntryKind::PolicyDecision,
+            actor,
+            &format!(
+                "approval requested: {approval_id} for {action} on '{resource}' (reason: {reason})",
+            ),
+            "policy.approval.submit",
+            now_ms,
+        );
+        self.compliance_engine.record_evaluation(false);
+        approval_id
+    }
+
+    /// Approve a pending request with audit chain recording.
+    ///
+    /// Returns true if the approval was found and granted.
+    pub fn grant_approval(
+        &mut self,
+        approval_id: &str,
+        decided_by: &str,
+        now_ms: u64,
+    ) -> bool {
+        let granted = self.approval_tracker.approve(approval_id, decided_by, now_ms);
+        if granted {
+            self.audit_chain.append(
+                AuditEntryKind::PolicyDecision,
+                decided_by,
+                &format!("approval granted: {approval_id}"),
+                "policy.approval.grant",
+                now_ms,
+            );
+        }
+        granted
+    }
+
+    /// Reject a pending request with audit chain recording.
+    ///
+    /// Returns true if the approval was found and rejected.
+    pub fn reject_approval(
+        &mut self,
+        approval_id: &str,
+        decided_by: &str,
+        now_ms: u64,
+    ) -> bool {
+        let rejected = self.approval_tracker.reject(approval_id, decided_by, now_ms);
+        if rejected {
+            self.audit_chain.append(
+                AuditEntryKind::PolicyDecision,
+                decided_by,
+                &format!("approval rejected: {approval_id}"),
+                "policy.approval.reject",
+                now_ms,
+            );
+            self.compliance_engine.record_evaluation(true);
+        }
+        rejected
+    }
+
+    /// Revoke a previously granted approval with audit chain recording.
+    ///
+    /// Returns true if the approval was found and revoked.
+    pub fn revoke_approval(
+        &mut self,
+        approval_id: &str,
+        decided_by: &str,
+        now_ms: u64,
+    ) -> bool {
+        let revoked = self.approval_tracker.revoke(approval_id, decided_by, now_ms);
+        if revoked {
+            self.audit_chain.append(
+                AuditEntryKind::QuarantineAction,
+                decided_by,
+                &format!("approval revoked: {approval_id}"),
+                "policy.approval.revoke",
+                now_ms,
+            );
+            self.compliance_engine.record_evaluation(true);
+        }
+        revoked
+    }
+
+    // ── Revocation Registry accessors ─────────────────────────────
+
+    /// Access the revocation registry.
+    #[must_use]
+    pub fn revocation_registry(&self) -> &RevocationRegistry {
+        &self.revocation_registry
+    }
+
+    /// Access the revocation registry mutably.
+    pub fn revocation_registry_mut(&mut self) -> &mut RevocationRegistry {
+        &mut self.revocation_registry
+    }
+
+    /// Revoke a resource (credential, session, connector) with audit trail.
+    ///
+    /// Returns the revocation ID.  The revocation is immediately active and
+    /// will cause future authorization checks to deny access.
+    pub fn revoke_resource(
+        &mut self,
+        resource_type: &str,
+        resource_id: &str,
+        reason: &str,
+        actor: &str,
+        now_ms: u64,
+    ) -> String {
+        let rev_id = self.revocation_registry.revoke(
+            resource_type,
+            resource_id,
+            reason,
+            actor,
+            now_ms,
+        );
+        self.audit_chain.append(
+            AuditEntryKind::QuarantineAction,
+            actor,
+            &format!(
+                "resource revoked: {rev_id} ({resource_type}:'{resource_id}', reason: {reason})",
+            ),
+            "policy.revocation.revoke",
+            now_ms,
+        );
+        self.compliance_engine.record_evaluation(true);
+        rev_id
+    }
+
+    /// Reinstate a previously revoked resource with audit trail.
+    ///
+    /// Returns true if the revocation was found and deactivated.
+    pub fn reinstate_resource(
+        &mut self,
+        revocation_id: &str,
+        actor: &str,
+        now_ms: u64,
+    ) -> bool {
+        let reinstated = self.revocation_registry.reinstate(revocation_id);
+        if reinstated {
+            self.audit_chain.append(
+                AuditEntryKind::PolicyDecision,
+                actor,
+                &format!("resource reinstated: {revocation_id}"),
+                "policy.revocation.reinstate",
+                now_ms,
+            );
+            self.compliance_engine.record_evaluation(false);
+        }
+        reinstated
+    }
+
+    /// Check if a resource is currently revoked.
+    #[must_use]
+    pub fn is_resource_revoked(&self, resource_type: &str, resource_id: &str) -> bool {
+        self.revocation_registry
+            .is_revoked(resource_type, resource_id)
     }
 
     /// Register a connector bundle with audit chain recording and compliance notification.
@@ -4040,6 +4639,27 @@ impl PolicyEngine {
                     "policy.quarantine",
                 )
                 .with_context(context);
+            }
+        }
+
+        // ---- Revocation check ----
+        // If the target connector or credential is revoked, deny immediately.
+        if input.action.is_connector_action() {
+            if let Some(domain) = &input.domain {
+                if self.revocation_registry.is_revoked("connector", domain) {
+                    context.record_rule(
+                        "policy.revocation",
+                        true,
+                        Some("deny"),
+                        Some(format!("connector '{domain}' has been revoked")),
+                    );
+                    context.set_determining_rule("policy.revocation");
+                    return PolicyDecision::deny_with_rule(
+                        format!("Connector '{domain}' has been revoked"),
+                        "policy.revocation",
+                    )
+                    .with_context(context);
+                }
             }
         }
 
@@ -12135,7 +12755,7 @@ mod tests {
         );
         assert!(prev.is_none());
         assert_eq!(engine.namespace_registry().binding_count(), 1);
-        assert!(engine.audit_chain().len() > 0);
+        assert!(!engine.audit_chain().is_empty());
     }
 
     #[test]
@@ -12169,7 +12789,7 @@ mod tests {
         assert!(!result.is_allowed());
         assert!(result.crosses_boundary);
         // Audit chain should have recorded the denial
-        assert!(engine.audit_chain().len() > 0);
+        assert!(!engine.audit_chain().is_empty());
     }
 
     #[test]
@@ -12684,7 +13304,7 @@ mod tests {
 
         // Verify audit chain recorded the check
         assert!(
-            engine.audit_chain().len() > 0,
+            !engine.audit_chain().is_empty(),
             "audit chain should record credential namespace check"
         );
     }
@@ -12837,27 +13457,27 @@ mod tests {
         );
 
         // --- Tenant B accessing tenant A's resources: all denied ---
-        let input_b_pane = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+        let cross_pane = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
             .with_pane(301)
             .with_namespace(tenant_b.clone());
         assert!(
-            engine.authorize(&input_b_pane).is_denied(),
+            engine.authorize(&cross_pane).is_denied(),
             "tenant-beta must not access tenant-alpha's pane"
         );
 
-        let input_b_conn = PolicyInput::new(ActionKind::ConnectorInvoke, ActorKind::Robot)
+        let cross_conn = PolicyInput::new(ActionKind::ConnectorInvoke, ActorKind::Robot)
             .with_domain("alpha-slack")
             .with_namespace(tenant_b.clone());
         assert!(
-            engine.authorize(&input_b_conn).is_denied(),
+            engine.authorize(&cross_conn).is_denied(),
             "tenant-beta must not access tenant-alpha's connector"
         );
 
-        let input_b_wf = PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Robot)
+        let cross_wf = PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Robot)
             .with_workflow("alpha-deploy")
             .with_namespace(tenant_b.clone());
         assert!(
-            engine.authorize(&input_b_wf).is_denied(),
+            engine.authorize(&cross_wf).is_denied(),
             "tenant-beta must not access tenant-alpha's workflow"
         );
 
@@ -12969,5 +13589,349 @@ mod tests {
             engine.audit_chain().len() > chain_len_before_fix,
             "audit chain should have recorded the rebinding"
         );
+    }
+
+    // ── Approval Tracker unit tests ───────────────────────────────
+
+    #[test]
+    fn approval_tracker_submit_and_lookup() {
+        let mut tracker = ApprovalTracker::default();
+        let id = tracker.submit(
+            "ConnectorInvoke",
+            "agent-1",
+            "slack-webhook",
+            "sensitive action",
+            "rule.sensitive",
+            1000,
+            2000,
+        );
+        assert!(id.starts_with("appr-"));
+        assert_eq!(tracker.len(), 1);
+        assert_eq!(tracker.pending().len(), 1);
+
+        let entry = tracker.get(&id).unwrap();
+        assert_eq!(entry.action, "ConnectorInvoke");
+        assert_eq!(entry.actor, "agent-1");
+        assert_eq!(entry.resource, "slack-webhook");
+        assert_eq!(entry.status, ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn approval_tracker_approve_reject_revoke() {
+        let mut tracker = ApprovalTracker::default();
+        let id1 = tracker.submit("a", "x", "r1", "reason", "rule", 100, 0);
+        let id2 = tracker.submit("a", "x", "r2", "reason", "rule", 100, 0);
+        let id3 = tracker.submit("a", "x", "r3", "reason", "rule", 100, 0);
+
+        assert!(tracker.approve(&id1, "admin", 200));
+        assert_eq!(tracker.get(&id1).unwrap().status, ApprovalStatus::Approved);
+        assert_eq!(tracker.get(&id1).unwrap().decided_by, "admin");
+
+        assert!(tracker.reject(&id2, "admin", 200));
+        assert_eq!(tracker.get(&id2).unwrap().status, ApprovalStatus::Rejected);
+
+        assert!(tracker.revoke(&id1, "admin", 300));
+        assert_eq!(tracker.get(&id1).unwrap().status, ApprovalStatus::Revoked);
+
+        assert!(!tracker.approve(&id2, "admin", 300));
+
+        assert_eq!(tracker.get(&id3).unwrap().status, ApprovalStatus::Pending);
+        assert_eq!(tracker.count_by_status(&ApprovalStatus::Pending), 1);
+    }
+
+    #[test]
+    fn approval_tracker_expire_stale() {
+        let mut tracker = ApprovalTracker::default();
+        tracker.submit("a", "x", "r1", "reason", "rule", 100, 500);
+        tracker.submit("a", "x", "r2", "reason", "rule", 100, 1000);
+        tracker.submit("a", "x", "r3", "reason", "rule", 100, 0);
+
+        let expired = tracker.expire_stale(600);
+        assert_eq!(expired, 1);
+        assert_eq!(tracker.count_by_status(&ApprovalStatus::Expired), 1);
+        assert_eq!(tracker.count_by_status(&ApprovalStatus::Pending), 2);
+
+        let expired2 = tracker.expire_stale(1100);
+        assert_eq!(expired2, 1);
+        assert_eq!(tracker.count_by_status(&ApprovalStatus::Pending), 1);
+    }
+
+    #[test]
+    fn approval_tracker_eviction() {
+        let mut tracker = ApprovalTracker::new(3);
+        tracker.submit("a", "x", "r1", "r", "rule", 100, 0);
+        tracker.submit("a", "x", "r2", "r", "rule", 200, 0);
+        tracker.submit("a", "x", "r3", "r", "rule", 300, 0);
+        assert_eq!(tracker.len(), 3);
+
+        tracker.submit("a", "x", "r4", "r", "rule", 400, 0);
+        assert_eq!(tracker.len(), 3);
+        assert!(tracker.get("appr-1").is_none());
+        assert!(tracker.get("appr-4").is_some());
+    }
+
+    #[test]
+    fn approval_tracker_snapshot() {
+        let mut tracker = ApprovalTracker::new(100);
+        let id1 = tracker.submit("a", "x", "r1", "r", "rule", 100, 0);
+        let id2 = tracker.submit("a", "x", "r2", "r", "rule", 100, 500);
+        tracker.submit("a", "x", "r3", "r", "rule", 100, 0);
+
+        tracker.approve(&id1, "admin", 200);
+        tracker.expire_stale(600);
+
+        let snap = tracker.snapshot();
+        assert_eq!(snap.total, 3);
+        assert_eq!(snap.approved, 1);
+        assert_eq!(snap.expired, 1);
+        assert_eq!(snap.pending, 1);
+
+        assert!(!tracker.reject(&id2, "admin", 700));
+    }
+
+    // ── Revocation Registry unit tests ────────────────────────────
+
+    #[test]
+    fn revocation_registry_revoke_and_check() {
+        let mut registry = RevocationRegistry::default();
+        let rev_id = registry.revoke("connector", "slack-api", "compromised", "admin", 1000);
+        assert!(rev_id.starts_with("rev-"));
+        assert!(registry.is_revoked("connector", "slack-api"));
+        assert!(!registry.is_revoked("connector", "jira-api"));
+        assert_eq!(registry.active_count(), 1);
+    }
+
+    #[test]
+    fn revocation_registry_reinstate() {
+        let mut registry = RevocationRegistry::default();
+        let rev_id = registry.revoke("credential", "my-token", "leaked", "admin", 1000);
+        assert!(registry.is_revoked("credential", "my-token"));
+
+        assert!(registry.reinstate(&rev_id));
+        assert!(!registry.is_revoked("credential", "my-token"));
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn revocation_registry_active_revocation() {
+        let mut registry = RevocationRegistry::default();
+        registry.revoke("session", "sess-42", "suspicious", "admin", 1000);
+
+        let active = registry.active_revocation("session", "sess-42");
+        assert!(active.is_some());
+        assert_eq!(active.unwrap().reason, "suspicious");
+        assert!(registry.active_revocation("session", "sess-99").is_none());
+    }
+
+    #[test]
+    fn revocation_registry_eviction() {
+        let mut registry = RevocationRegistry::new(2);
+        registry.revoke("c", "r1", "r", "admin", 100);
+        registry.revoke("c", "r2", "r", "admin", 200);
+        assert_eq!(registry.len(), 2);
+
+        registry.revoke("c", "r3", "r", "admin", 300);
+        assert_eq!(registry.len(), 2);
+        assert!(!registry.is_revoked("c", "r1"));
+        assert!(registry.is_revoked("c", "r3"));
+    }
+
+    #[test]
+    fn revocation_registry_snapshot() {
+        let mut registry = RevocationRegistry::default();
+        let rev1 = registry.revoke("connector", "c1", "r", "a", 100);
+        registry.revoke("connector", "c2", "r", "a", 200);
+        registry.reinstate(&rev1);
+
+        let snap = registry.snapshot();
+        assert_eq!(snap.total_records, 2);
+        assert_eq!(snap.active_revocations, 1);
+    }
+
+    // ── PolicyEngine: approval workflow integration tests ─────────
+
+    #[test]
+    fn policy_engine_approval_workflow_submit_grant_revoke() {
+        let mut engine = PolicyEngine::permissive();
+
+        let approval_id = engine.submit_approval(
+            "ConnectorInvoke",
+            "agent-007",
+            "slack-webhook",
+            "high-risk connector",
+            "policy.sensitive_action",
+            1000,
+            5000,
+        );
+        assert!(approval_id.starts_with("appr-"));
+        assert_eq!(engine.approval_tracker().pending().len(), 1);
+
+        let chain_before = engine.audit_chain().len();
+        assert!(engine.grant_approval(&approval_id, "operator", 2000));
+        assert!(engine.audit_chain().len() > chain_before);
+        assert!(
+            engine
+                .approval_tracker()
+                .get(&approval_id)
+                .unwrap()
+                .status
+                .grants_access()
+        );
+
+        assert!(engine.revoke_approval(&approval_id, "operator", 3000));
+        assert!(
+            !engine
+                .approval_tracker()
+                .get(&approval_id)
+                .unwrap()
+                .status
+                .grants_access()
+        );
+    }
+
+    #[test]
+    fn policy_engine_approval_reject_records_compliance() {
+        let mut engine = PolicyEngine::permissive();
+
+        let approval_id = engine.submit_approval(
+            "DeleteFile",
+            "agent-rogue",
+            "/etc/shadow",
+            "destructive action",
+            "policy.destructive",
+            1000,
+            0,
+        );
+
+        let denials_before = engine.compliance_engine().counters().total_denials;
+        engine.reject_approval(&approval_id, "operator", 2000);
+        assert!(
+            engine.compliance_engine().counters().total_denials > denials_before,
+            "rejecting an approval should count as a compliance denial"
+        );
+    }
+
+    // ── PolicyEngine: revocation integration tests ────────────────
+
+    #[test]
+    fn policy_engine_revoke_connector_blocks_authorize() {
+        let mut engine = PolicyEngine::permissive();
+
+        let input = PolicyInput::new(ActionKind::ConnectorInvoke, ActorKind::Robot)
+            .with_domain("slack-api");
+        assert!(
+            engine.authorize(&input).is_allowed(),
+            "connector should be allowed before revocation"
+        );
+
+        engine.revoke_resource("connector", "slack-api", "security incident", "admin", 1000);
+
+        let decision2 = engine.authorize(&input);
+        assert!(decision2.is_denied(), "should be denied after revocation");
+        assert!(decision2.reason().unwrap_or("").contains("revoked"));
+    }
+
+    #[test]
+    fn policy_engine_reinstate_connector_restores_access() {
+        let mut engine = PolicyEngine::permissive();
+
+        let rev_id =
+            engine.revoke_resource("connector", "jira-api", "precautionary", "admin", 1000);
+
+        let input = PolicyInput::new(ActionKind::ConnectorNotify, ActorKind::Robot)
+            .with_domain("jira-api");
+        assert!(engine.authorize(&input).is_denied());
+
+        assert!(engine.reinstate_resource(&rev_id, "admin", 2000));
+        assert!(
+            engine.authorize(&input).is_allowed(),
+            "should be allowed after reinstatement"
+        );
+    }
+
+    #[test]
+    fn policy_engine_revocation_audit_chain_records() {
+        let mut engine = PolicyEngine::permissive();
+
+        let chain_before = engine.audit_chain().len();
+        let rev_id =
+            engine.revoke_resource("credential", "api-key-12", "leaked in logs", "sec-bot", 1000);
+        assert!(engine.audit_chain().len() > chain_before);
+
+        let chain_before2 = engine.audit_chain().len();
+        engine.reinstate_resource(&rev_id, "admin", 2000);
+        assert!(engine.audit_chain().len() > chain_before2);
+    }
+
+    #[test]
+    fn policy_engine_revocation_compliance_tracks_denial() {
+        let mut engine = PolicyEngine::permissive();
+
+        let denials_before = engine.compliance_engine().counters().total_denials;
+        engine.revoke_resource("connector", "compromised-api", "incident", "admin", 1000);
+        assert!(engine.compliance_engine().counters().total_denials > denials_before);
+    }
+
+    // ── E2e: Approval + Revocation combined scenario ──────────────
+
+    #[test]
+    fn e2e_approval_revocation_full_lifecycle() {
+        let mut engine = PolicyEngine::permissive();
+
+        // Phase 1: Connector working normally
+        let input = PolicyInput::new(ActionKind::ConnectorInvoke, ActorKind::Robot)
+            .with_domain("payment-gateway");
+        assert!(engine.authorize(&input).is_allowed());
+
+        // Phase 2: Security incident — revoke the connector
+        let rev_id = engine.revoke_resource(
+            "connector",
+            "payment-gateway",
+            "suspected credential compromise",
+            "incident-commander",
+            1000,
+        );
+        assert!(engine.authorize(&input).is_denied());
+
+        // Phase 3: Submit approval for emergency access
+        let approval_id = engine.submit_approval(
+            "ConnectorInvoke",
+            "oncall-engineer",
+            "payment-gateway",
+            "emergency refund processing",
+            "policy.emergency_override",
+            2000,
+            3_600_000,
+        );
+        assert_eq!(engine.approval_tracker().pending().len(), 1);
+
+        // Phase 4: Operator approves but connector still revoked
+        engine.grant_approval(&approval_id, "incident-commander", 2500);
+        assert!(
+            engine.authorize(&input).is_denied(),
+            "revoked connector should stay denied even with approval"
+        );
+
+        // Phase 5: Reinstate connector after credential rotation
+        engine.reinstate_resource(&rev_id, "incident-commander", 3000);
+        assert!(engine.authorize(&input).is_allowed());
+
+        // Phase 6: Verify complete audit trail
+        let chain_len = engine.audit_chain().len();
+        assert!(
+            chain_len >= 4,
+            "audit chain should have revocation+approval+grant+reinstatement: got {chain_len}"
+        );
+
+        // Phase 7: Verify approval tracker state
+        let snap = engine.approval_tracker().snapshot();
+        assert_eq!(snap.total, 1);
+        assert_eq!(snap.approved, 1);
+
+        // Phase 8: Verify revocation registry state
+        let rev_snap = engine.revocation_registry().snapshot();
+        assert_eq!(rev_snap.total_records, 1);
+        assert_eq!(rev_snap.active_revocations, 0);
     }
 }

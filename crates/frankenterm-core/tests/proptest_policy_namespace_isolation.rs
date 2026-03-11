@@ -151,7 +151,7 @@ proptest! {
 
         engine.namespace_registry_mut().bind(
             NamespacedResourceKind::Pane,
-            &pane_id.to_string(),
+            pane_id.to_string(),
             ns.clone(),
         );
 
@@ -185,7 +185,7 @@ proptest! {
 
         engine.namespace_registry_mut().bind(
             NamespacedResourceKind::Pane,
-            &pane_id.to_string(),
+            pane_id.to_string(),
             ns_a.clone(),
         );
 
@@ -215,7 +215,7 @@ proptest! {
 
         engine.namespace_registry_mut().bind(
             NamespacedResourceKind::Pane,
-            &pane_id.to_string(),
+            pane_id.to_string(),
             ns_a,
         );
 
@@ -393,7 +393,7 @@ proptest! {
         for i in 0..n_bindings {
             engine.namespace_registry_mut().bind(
                 NamespacedResourceKind::Pane,
-                &format!("p{i}"),
+                format!("p{i}"),
                 ns.clone(),
             );
         }
