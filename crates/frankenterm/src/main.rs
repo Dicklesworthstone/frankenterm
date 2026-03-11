@@ -9902,6 +9902,9 @@ struct DistributedHandshake {
 }
 
 #[cfg(feature = "distributed")]
+const DISTRIBUTED_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "distributed")]
 fn distributed_validate_handshake_protocol_version(
     protocol_version: Option<u32>,
 ) -> Result<(), frankenterm_core::distributed::DistributedSecurityError> {
@@ -10445,13 +10448,12 @@ async fn distributed_handle_connection<S>(
 ) where
     S: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
 {
-    let handshake_timeout = Duration::from_secs(10);
     let message_timeout = Duration::from_secs(30);
     let mut reader = asupersync::io::BufReader::new(stream);
     let mut handshake_line = String::new();
 
     let handshake_size = match frankenterm_core::runtime_compat::timeout(
-        handshake_timeout,
+        DISTRIBUTED_HANDSHAKE_TIMEOUT,
         distributed_read_line(
             &mut reader,
             &mut handshake_line,
@@ -11174,7 +11176,7 @@ async fn distributed_agent_stream_session(
 
     let mut handshake_response = String::new();
     match frankenterm_core::runtime_compat::timeout(
-        Duration::from_millis(250),
+        DISTRIBUTED_HANDSHAKE_TIMEOUT,
         distributed_read_line(
             &mut stream,
             &mut handshake_response,
@@ -36242,7 +36244,7 @@ where
 
 /// Diagnostic result for a single check
 struct DiagnosticCheck {
-    name: &'static str,
+    name: String,
     status: DiagnosticStatus,
     detail: Option<String>,
     recommendation: Option<String>,
@@ -36256,18 +36258,18 @@ enum DiagnosticStatus {
 }
 
 impl DiagnosticCheck {
-    fn ok(name: &'static str) -> Self {
+    fn ok(name: impl Into<String>) -> Self {
         Self {
-            name,
+            name: name.into(),
             status: DiagnosticStatus::Ok,
             detail: None,
             recommendation: None,
         }
     }
 
-    fn ok_with_detail(name: &'static str, detail: impl Into<String>) -> Self {
+    fn ok_with_detail(name: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
-            name,
+            name: name.into(),
             status: DiagnosticStatus::Ok,
             detail: Some(detail.into()),
             recommendation: None,
@@ -36275,12 +36277,12 @@ impl DiagnosticCheck {
     }
 
     fn warning(
-        name: &'static str,
+        name: impl Into<String>,
         detail: impl Into<String>,
         recommendation: impl Into<String>,
     ) -> Self {
         Self {
-            name,
+            name: name.into(),
             status: DiagnosticStatus::Warning,
             detail: Some(detail.into()),
             recommendation: Some(recommendation.into()),
@@ -36288,12 +36290,12 @@ impl DiagnosticCheck {
     }
 
     fn error(
-        name: &'static str,
+        name: impl Into<String>,
         detail: impl Into<String>,
         recommendation: impl Into<String>,
     ) -> Self {
         Self {
-            name,
+            name: name.into(),
             status: DiagnosticStatus::Error,
             detail: Some(detail.into()),
             recommendation: Some(recommendation.into()),
@@ -36320,7 +36322,7 @@ impl DiagnosticCheck {
 
     fn to_json_value(&self) -> serde_json::Value {
         let mut obj = serde_json::json!({
-            "name": self.name,
+            "name": self.name.as_str(),
             "status": self.status.as_str(),
         });
         if let Some(detail) = &self.detail {
@@ -36340,6 +36342,42 @@ impl DiagnosticStatus {
             Self::Warning => "warning",
             Self::Error => "error",
         }
+    }
+}
+
+fn recommendation_from_runtime_health_check(
+    check: &frankenterm_core::runtime_health::RuntimeHealthCheck,
+) -> Option<String> {
+    check.remediation.first().map(|hint| {
+        hint.command.as_ref().map_or_else(
+            || hint.description.clone(),
+            |cmd| format!("{}: {cmd}", hint.description),
+        )
+    })
+}
+
+fn diagnostic_check_from_runtime_health(
+    check: &frankenterm_core::runtime_health::RuntimeHealthCheck,
+) -> DiagnosticCheck {
+    match check.status {
+        frankenterm_core::runtime_health::CheckStatus::Pass
+        | frankenterm_core::runtime_health::CheckStatus::Skip => {
+            DiagnosticCheck::ok_with_detail(check.display_name.clone(), check.summary.clone())
+        }
+        frankenterm_core::runtime_health::CheckStatus::Warn => DiagnosticCheck::warning(
+            check.display_name.clone(),
+            check.summary.clone(),
+            recommendation_from_runtime_health_check(check).unwrap_or_else(|| {
+                "Review the associated policy/runtime health details".to_string()
+            }),
+        ),
+        frankenterm_core::runtime_health::CheckStatus::Fail => DiagnosticCheck::error(
+            check.display_name.clone(),
+            check.summary.clone(),
+            recommendation_from_runtime_health_check(check).unwrap_or_else(|| {
+                "Investigate the failing policy/runtime health check".to_string()
+            }),
+        ),
     }
 }
 
@@ -36685,6 +36723,20 @@ fn run_diagnostics(
     };
     checks.push(DiagnosticCheck::ok_with_detail("config", config_source));
     checks.push(distributed_security_check(config));
+
+    // Surface policy-layer health in the same doctor output path used for
+    // environment/runtime diagnostics.
+    let mut policy_engine =
+        frankenterm_core::policy::PolicyEngine::from_safety_config(&config.safety);
+    let policy_checks = frankenterm_core::policy_diagnostics::check_policy_engine_health(
+        &mut policy_engine,
+        now_ms(),
+    );
+    checks.extend(
+        policy_checks
+            .iter()
+            .map(diagnostic_check_from_runtime_health),
+    );
 
     // Check 2: WezTerm CLI available
     let wezterm_timeout = std::time::Duration::from_secs(5);
@@ -46214,6 +46266,31 @@ log_level = "debug"
         assert!(err.get("recommendation").is_some());
     }
 
+    #[test]
+    fn runtime_health_check_bridge_uses_summary_and_command_hint() {
+        let check = frankenterm_core::runtime_health::RuntimeHealthCheck::warn(
+            "policy.connector_governor",
+            "Connector Governor",
+            "throttling active",
+        )
+        .with_remediation(
+            frankenterm_core::runtime_health::RemediationHint::with_command(
+                "Review connector throttles",
+                "ft robot policy quarantine-list",
+            ),
+        );
+
+        let diagnostic = diagnostic_check_from_runtime_health(&check);
+
+        assert_eq!(diagnostic.name, "Connector Governor");
+        assert_eq!(diagnostic.status, DiagnosticStatus::Warning);
+        assert_eq!(diagnostic.detail.as_deref(), Some("throttling active"));
+        assert_eq!(
+            diagnostic.recommendation.as_deref(),
+            Some("Review connector throttles: ft robot policy quarantine-list"),
+        );
+    }
+
     // --- Overall doctor JSON envelope ---
 
     #[test]
@@ -46409,6 +46486,13 @@ log_level = "debug"
             assert!(logs_check.is_some());
             assert_eq!(logs_check.unwrap().status, DiagnosticStatus::Ok);
 
+            let policy_check = checks.iter().find(|c| c.name == "Decision Log");
+            assert!(
+                policy_check.is_some(),
+                "expected policy diagnostics in doctor output"
+            );
+            assert_eq!(policy_check.unwrap().status, DiagnosticStatus::Ok);
+
             // Verify JSON shape
             let json_checks: Vec<serde_json::Value> =
                 checks.iter().map(|c| c.to_json_value()).collect();
@@ -46427,8 +46511,8 @@ log_level = "debug"
             let error_names: Vec<&str> = checks
                 .iter()
                 .filter(|c| c.status == DiagnosticStatus::Error)
-                .filter(|c| !wezterm_check_names.contains(&c.name))
-                .map(|c| c.name)
+                .filter(|c| !wezterm_check_names.contains(&c.name.as_str()))
+                .map(|c| c.name.as_str())
                 .collect();
             assert!(
                 error_names.is_empty(),
@@ -46580,8 +46664,8 @@ log_level = "debug"
         let checks_2 = run_diagnostics(&[], &config, &layout);
 
         // Same names in same order
-        let names_1: Vec<&str> = checks_1.iter().map(|c| c.name).collect();
-        let names_2: Vec<&str> = checks_2.iter().map(|c| c.name).collect();
+        let names_1: Vec<&str> = checks_1.iter().map(|c| c.name.as_str()).collect();
+        let names_2: Vec<&str> = checks_2.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names_1, names_2, "check names must be deterministic");
 
         // Same statuses
