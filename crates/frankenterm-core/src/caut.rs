@@ -9,6 +9,7 @@
 use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
+use crate::runtime_compat::process::Command;
 use crate::runtime_compat::timeout;
 use crate::suggestions::Platform;
 use serde::de::DeserializeOwned;
@@ -16,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::process::Command;
 
 /// Supported caut services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
