@@ -363,6 +363,7 @@ pub mod shortest_path;
 pub mod simd_scan;
 pub mod skip_list;
 pub mod sliding_window;
+pub mod slo_conformance;
 pub mod snapshot_engine;
 pub mod sparse_table;
 pub mod spectral;
