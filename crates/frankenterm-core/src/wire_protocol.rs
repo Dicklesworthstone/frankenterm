@@ -392,7 +392,7 @@ struct AgentSession {
     messages_received: u64,
     /// Total duplicates skipped.
     duplicates_skipped: u64,
-    /// Timestamp of last message.
+    /// Local receipt timestamp of the last accepted or duplicate envelope.
     last_seen_ms: i64,
 }
 
@@ -444,13 +444,26 @@ impl Aggregator {
                 return Err(err);
             }
         };
-        self.ingest_envelope(envelope)
+        self.ingest_envelope_at(envelope, epoch_ms_now())
     }
 
     /// Process a decoded envelope. Returns the payload if accepted.
     pub fn ingest_envelope(
         &mut self,
         envelope: WireEnvelope,
+    ) -> Result<IngestResult, WireProtocolError> {
+        self.ingest_envelope_at(envelope, epoch_ms_now())
+    }
+
+    /// Process a decoded envelope using the aggregator host's receipt clock.
+    ///
+    /// The caller must pass a local receive timestamp, not the sender-reported
+    /// `sent_at_ms`. Capacity eviction and stale-session pruning are local
+    /// liveness decisions and must not trust remote clocks.
+    pub fn ingest_envelope_at(
+        &mut self,
+        envelope: WireEnvelope,
+        received_at_ms: i64,
     ) -> Result<IngestResult, WireProtocolError> {
         if let Err(err) = validate_sender_identity(&envelope.sender) {
             self.total_rejected = self.total_rejected.saturating_add(1);
@@ -459,7 +472,7 @@ impl Aggregator {
 
         let is_new = !self.agents.contains_key(&envelope.sender);
         if is_new && self.agents.len() >= self.max_agents {
-            self.prune_stale_agents(envelope.sent_at_ms);
+            self.prune_stale_agents(received_at_ms);
         }
         if is_new && self.agents.len() >= self.max_agents {
             self.total_rejected = self.total_rejected.saturating_add(1);
@@ -483,7 +496,7 @@ impl Aggregator {
         // Use messages_received > 0 to allow seq=0 on first message.
         if session.messages_received > 0 && envelope.seq <= session.last_seq {
             session.duplicates_skipped += 1;
-            session.last_seen_ms = session.last_seen_ms.max(envelope.sent_at_ms);
+            session.last_seen_ms = session.last_seen_ms.max(received_at_ms);
             return Ok(IngestResult::Duplicate {
                 sender: envelope.sender,
                 seq: envelope.seq,
@@ -492,7 +505,7 @@ impl Aggregator {
 
         session.last_seq = envelope.seq;
         session.messages_received += 1;
-        session.last_seen_ms = session.last_seen_ms.max(envelope.sent_at_ms);
+        session.last_seen_ms = session.last_seen_ms.max(received_at_ms);
         self.total_accepted += 1;
 
         Ok(IngestResult::Accepted(envelope.payload))
@@ -1448,16 +1461,16 @@ mod tests {
         let mut agg = Aggregator::with_stale_after(1, 50);
 
         let mut first = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
-        first.sent_at_ms = 100;
+        first.sent_at_ms = 50_000;
         assert!(matches!(
-            agg.ingest_envelope(first).unwrap(),
+            agg.ingest_envelope_at(first, 100).unwrap(),
             IngestResult::Accepted(_)
         ));
 
         let mut second = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
-        second.sent_at_ms = 200;
+        second.sent_at_ms = 50_001;
         assert!(matches!(
-            agg.ingest_envelope(second).unwrap(),
+            agg.ingest_envelope_at(second, 200).unwrap(),
             IngestResult::Accepted(_)
         ));
 
@@ -1472,16 +1485,16 @@ mod tests {
         let mut agg = Aggregator::with_stale_after(1, 200);
 
         let mut first = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
-        first.sent_at_ms = 100;
+        first.sent_at_ms = 50_000;
         assert!(matches!(
-            agg.ingest_envelope(first).unwrap(),
+            agg.ingest_envelope_at(first, 100).unwrap(),
             IngestResult::Accepted(_)
         ));
 
         let mut second = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
-        second.sent_at_ms = 250;
+        second.sent_at_ms = 1;
         let err = agg
-            .ingest_envelope(second)
+            .ingest_envelope_at(second, 250)
             .expect_err("recent sender should still count against capacity");
         assert!(matches!(
             err,
@@ -1499,21 +1512,21 @@ mod tests {
         let mut first = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
         first.sent_at_ms = 100;
         assert!(matches!(
-            agg.ingest_envelope(first).unwrap(),
+            agg.ingest_envelope_at(first, 100).unwrap(),
             IngestResult::Accepted(_)
         ));
 
         let mut duplicate = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
-        duplicate.sent_at_ms = 130;
+        duplicate.sent_at_ms = 1;
         assert!(matches!(
-            agg.ingest_envelope(duplicate).unwrap(),
+            agg.ingest_envelope_at(duplicate, 130).unwrap(),
             IngestResult::Duplicate { .. }
         ));
 
         let mut second = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
-        second.sent_at_ms = 160;
+        second.sent_at_ms = 10_000;
         let err = agg
-            .ingest_envelope(second)
+            .ingest_envelope_at(second, 160)
             .expect_err("duplicate should refresh last_seen so sender-a is not stale yet");
         assert!(matches!(
             err,
@@ -1531,7 +1544,7 @@ mod tests {
         let mut first = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
         first.sent_at_ms = 100;
         assert!(matches!(
-            agg.ingest_envelope(first).unwrap(),
+            agg.ingest_envelope_at(first, 100).unwrap(),
             IngestResult::Accepted(_)
         ));
 
@@ -1539,14 +1552,14 @@ mod tests {
         let mut regressed = WireEnvelope::new(2, "agent-a", WirePayload::Gap(sample_gap()));
         regressed.sent_at_ms = 90;
         assert!(matches!(
-            agg.ingest_envelope(regressed).unwrap(),
+            agg.ingest_envelope_at(regressed, 140).unwrap(),
             IngestResult::Accepted(_)
         ));
 
         let mut second = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
-        second.sent_at_ms = 149;
+        second.sent_at_ms = 1_000;
         let err = agg
-            .ingest_envelope(second)
+            .ingest_envelope_at(second, 180)
             .expect_err("accepted seq with regressed timestamp must not make sender-a look stale");
         assert!(matches!(
             err,
