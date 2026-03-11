@@ -13,13 +13,14 @@ publish = false
 
 [features]
 default = ["libssh-rs", "ssh2", "async-smol"]
-async-smol = ["async_ossl/async-io", "frankenterm-uds/async-io"]
-# Transitional: keep smol active until source-level runtime migration lands.
+async-smol = ["dep:smol", "async_ossl/async-io", "frankenterm-uds/async-io"]
 async-asupersync = [
     "dep:asupersync",
+    "dep:async-channel",
     "async_ossl/async-asupersync",
+    "async_ossl/async-io",
     "frankenterm-uds/async-asupersync",
-    "async-smol",
+    "frankenterm-uds/async-io",
 ]
 vendored-openssl = ["ssh2/vendored-openssl", "libssh-rs/vendored-openssl"]
 vendored-openssl-ssh2 = ["ssh2/vendored-openssl"]
@@ -42,7 +43,8 @@ log.workspace = true
 portable-pty.workspace = true
 regex.workspace = true
 asupersync = { workspace = true, optional = true }
-smol.workspace = true
+async-channel = { workspace = true, optional = true }
+smol = { workspace = true, optional = true }
 socket2.workspace = true
 sha2.workspace = true
 ssh2 = {workspace=true, features=["openssl-on-win32"], optional = true}

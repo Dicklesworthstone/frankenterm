@@ -46,6 +46,10 @@ pub use portable_pty::{Child, ChildKiller, MasterPty, PtySize};
 
 pub mod runtime {
     pub mod channel {
+        #[cfg(feature = "async-asupersync")]
+        pub use async_channel::{bounded, Receiver, RecvError, Sender, TryRecvError};
+
+        #[cfg(not(feature = "async-asupersync"))]
         pub use smol::channel::{bounded, Receiver, RecvError, Sender, TryRecvError};
     }
 
@@ -236,6 +240,76 @@ mod runtime_migration_guards {
                     "direct smol usage must stay in runtime shim ({}:{})",
                     file.display(),
                     line_no + 1
+                );
+            }
+        }
+    }
+
+    /// Verify that when async-asupersync is enabled, every `smol::` reference in
+    /// the runtime shim (lib.rs) is guarded behind `cfg(not(feature = "async-asupersync"))`.
+    #[test]
+    #[cfg(feature = "async-asupersync")]
+    fn smol_references_gated_behind_not_asupersync() {
+        let lib_prefix = lib_before_test_module();
+        let mut in_not_asupersync_block = false;
+        let mut brace_depth: i32 = 0;
+
+        for (line_no, line) in lib_prefix.lines().enumerate() {
+            let trimmed = line.trim();
+
+            // Detect entry to cfg(not(feature = "async-asupersync")) blocks
+            if trimmed.contains("cfg(not(feature = \"async-asupersync\"))") {
+                in_not_asupersync_block = true;
+                brace_depth = 0;
+                continue;
+            }
+
+            // Track brace depth inside gated blocks
+            if in_not_asupersync_block {
+                for ch in trimmed.chars() {
+                    match ch {
+                        '{' => brace_depth += 1,
+                        '}' => {
+                            brace_depth -= 1;
+                            if brace_depth <= 0 {
+                                in_not_asupersync_block = false;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
+            // Outside gated blocks, smol:: must not appear
+            if contains_non_comment_token(line, "smol::") {
+                panic!(
+                    "ungated smol:: reference at src/lib.rs:{} — must be behind \
+                     cfg(not(feature = \"async-asupersync\"))",
+                    line_no + 1
+                );
+            }
+        }
+    }
+
+    /// Verify that smol is an optional dependency when async-asupersync is the active feature.
+    #[test]
+    #[cfg(feature = "async-asupersync")]
+    fn smol_dep_is_optional_in_manifest() {
+        let cargo_toml = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let manifest =
+            fs::read_to_string(&cargo_toml).expect("failed to read frankenterm-ssh Cargo.toml");
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            // If smol appears as a dep, it must be optional
+            if trimmed.starts_with("smol") && trimmed.contains("workspace") {
+                assert!(
+                    trimmed.contains("optional"),
+                    "smol dependency must be optional (found: {})",
+                    trimmed
                 );
             }
         }

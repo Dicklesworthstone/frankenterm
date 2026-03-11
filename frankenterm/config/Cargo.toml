@@ -18,7 +18,6 @@ no-lua = []
 distro-defaults = []
 async-smol = ["frankenterm-ssh/async-smol"]
 async-asupersync = [
-    "async-smol",
     "promise/async-asupersync",
     "frankenterm-ssh/async-asupersync",
 ]
