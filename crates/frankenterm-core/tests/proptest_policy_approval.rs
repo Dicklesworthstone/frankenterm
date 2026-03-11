@@ -239,12 +239,13 @@ proptest! {
         ],
     ) {
         let mut tracker = ApprovalTracker::new(100);
-        let id = tracker.submit("action", "actor", "resource", "reason", "rule", 1000, 0);
+        // Use non-zero expiry so expire_stale can actually expire the entry
+        let id = tracker.submit("action", "actor", "resource", "reason", "rule", 1000, 2000);
         // Transition to the target status first
         match status {
-            ApprovalStatus::Approved => { tracker.approve(&id, "op", 2000); },
-            ApprovalStatus::Rejected => { tracker.reject(&id, "op", 2000); },
-            ApprovalStatus::Expired => { tracker.expire_stale(u64::MAX); },
+            ApprovalStatus::Approved => { tracker.approve(&id, "op", 1500); },
+            ApprovalStatus::Rejected => { tracker.reject(&id, "op", 1500); },
+            ApprovalStatus::Expired => { tracker.expire_stale(3000); },
             ApprovalStatus::Revoked => {
                 tracker.approve(&id, "op", 2000);
                 tracker.revoke(&id, "op", 3000);

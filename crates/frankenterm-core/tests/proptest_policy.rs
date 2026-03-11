@@ -4,9 +4,11 @@
 //! RiskScore, RiskConfig, RiskFactor, ApprovalRequest, SendTextAuditSummary,
 //! RuleEvaluation, DecisionEvidence, RateLimitSnapshot, AppliedRiskFactor,
 //! Redactor, is_command_candidate, RateLimiter, PolicyEngine,
-//! evaluate_policy_rules, and InjectionResult.
+//! evaluate_policy_rules, InjectionResult, ForensicAuditEntry,
+//! ForensicNamespaceEvent, ForensicComplianceSummary, and ForensicReport.
 
 use frankenterm_core::policy::*;
+use frankenterm_core::policy_decision_log::{DecisionOutcome, PolicyDecisionEntry};
 use proptest::prelude::*;
 
 // ============================================================================
@@ -1843,5 +1845,348 @@ proptest! {
         let back: RiskFactor = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.category, cat,
             "RiskFactor category should survive serde roundtrip");
+    }
+}
+
+// ============================================================================
+// Forensic type strategies
+// ============================================================================
+
+fn arb_approval_status() -> impl Strategy<Value = ApprovalStatus> {
+    prop_oneof![
+        Just(ApprovalStatus::Pending),
+        Just(ApprovalStatus::Approved),
+        Just(ApprovalStatus::Rejected),
+        Just(ApprovalStatus::Expired),
+        Just(ApprovalStatus::Revoked),
+    ]
+}
+
+fn arb_approval_entry() -> impl Strategy<Value = ApprovalEntry> {
+    (
+        "[a-z0-9-]{8,20}",
+        "[a-z_]{3,15}",
+        "[a-z_]{3,15}",
+        "[a-z_]{3,15}",
+        "[a-z ]{5,30}",
+        "[a-z._]{3,20}",
+        any::<u64>(),
+        any::<u64>(),
+        arb_approval_status(),
+        "[a-z_]{0,15}",
+        any::<u64>(),
+    )
+        .prop_map(
+            |(id, action, actor, resource, reason, rule_id, req_at, exp_at, status, decided_by, decided_at)| {
+                ApprovalEntry {
+                    approval_id: id,
+                    action,
+                    actor,
+                    resource,
+                    reason,
+                    rule_id,
+                    requested_at_ms: req_at,
+                    expires_at_ms: exp_at,
+                    status,
+                    decided_by,
+                    decided_at_ms: decided_at,
+                }
+            },
+        )
+}
+
+fn arb_revocation_record() -> impl Strategy<Value = RevocationRecord> {
+    (
+        "[a-z0-9-]{8,20}",
+        prop_oneof![
+            Just("credential".to_string()),
+            Just("session".to_string()),
+            Just("connector".to_string()),
+        ],
+        "[a-z0-9_]{3,20}",
+        "[a-z ]{5,30}",
+        "[a-z_]{3,15}",
+        any::<u64>(),
+        any::<bool>(),
+    )
+        .prop_map(|(id, rtype, rid, reason, by, at, active)| RevocationRecord {
+            revocation_id: id,
+            resource_type: rtype,
+            resource_id: rid,
+            reason,
+            revoked_by: by,
+            revoked_at_ms: at,
+            active,
+        })
+}
+
+fn arb_forensic_audit_entry() -> impl Strategy<Value = ForensicAuditEntry> {
+    (
+        any::<u64>(),
+        "[a-z_]{3,15}",
+        "[a-z_]{3,15}",
+        "[a-zA-Z ]{5,40}",
+        "[a-z_]{3,15}",
+        "[a-f0-9]{16,64}",
+    )
+        .prop_map(|(ts, kind, actor, desc, surface, hash)| ForensicAuditEntry {
+            timestamp_ms: ts,
+            kind,
+            actor,
+            description: desc,
+            surface,
+            hash,
+        })
+}
+
+fn arb_forensic_namespace_event() -> impl Strategy<Value = ForensicNamespaceEvent> {
+    (
+        any::<u64>(),
+        "[a-z.]{3,20}",
+        "[a-z.]{3,20}",
+        "[a-z_]{3,15}",
+        "[a-z0-9]{1,10}",
+        prop_oneof![Just("allow".to_string()), Just("deny".to_string()), Just("audit".to_string())],
+        "[a-z ]{5,30}",
+    )
+        .prop_map(|(ts, src, tgt, kind, id, decision, reason)| ForensicNamespaceEvent {
+            timestamp_ms: ts,
+            source_namespace: src,
+            target_namespace: tgt,
+            resource_kind: kind,
+            resource_id: id,
+            decision,
+            reason,
+        })
+}
+
+fn arb_forensic_compliance_summary() -> impl Strategy<Value = ForensicComplianceSummary> {
+    (any::<u64>(), any::<u64>()).prop_map(|(total, denials)| {
+        let rate = if total == 0 {
+            0.0
+        } else {
+            (denials.min(total) as f64 / total as f64) * 100.0
+        };
+        ForensicComplianceSummary {
+            total_evaluations: total,
+            total_denials: denials.min(total),
+            denial_rate_percent: rate,
+        }
+    })
+}
+
+fn arb_decision_outcome() -> impl Strategy<Value = DecisionOutcome> {
+    prop_oneof![
+        Just(DecisionOutcome::Allow),
+        Just(DecisionOutcome::Deny),
+        Just(DecisionOutcome::RequireApproval),
+    ]
+}
+
+fn arb_policy_decision_entry() -> impl Strategy<Value = PolicyDecisionEntry> {
+    (
+        any::<u64>(),
+        any::<u64>(),
+        arb_action_kind(),
+        arb_actor_kind(),
+        arb_policy_surface(),
+        prop::option::of(0..1000u64),
+        arb_decision_outcome(),
+        prop::option::of("[a-z._]{3,20}"),
+        prop::option::of("[a-z ]{5,30}"),
+        0..100u32,
+    )
+        .prop_map(
+            |(seq, ts, action, actor, surface, pane_id, decision, rule_id, reason, rules_evaluated)| {
+                PolicyDecisionEntry {
+                    seq,
+                    timestamp_ms: ts,
+                    action,
+                    actor,
+                    surface,
+                    pane_id,
+                    decision,
+                    rule_id,
+                    reason,
+                    rules_evaluated,
+                }
+            },
+        )
+}
+
+fn arb_forensic_report() -> impl Strategy<Value = ForensicReport> {
+    (
+        any::<u64>(),
+        (any::<u64>(), any::<u64>()),
+        prop::collection::vec(arb_policy_decision_entry(), 0..=3),
+        prop::collection::vec(arb_forensic_audit_entry(), 0..=3),
+        prop::collection::vec(arb_revocation_record(), 0..=2),
+        prop::collection::vec(arb_approval_entry(), 0..=2),
+        prop::collection::vec(arb_forensic_namespace_event(), 0..=2),
+        arb_forensic_compliance_summary(),
+        prop::collection::vec("[a-z_]{3,15}", 0..=3),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(
+                generated_at_ms,
+                time_range,
+                decisions,
+                audit_trail,
+                revocations,
+                approvals,
+                namespace_violations,
+                compliance_summary,
+                quarantine_active,
+                kill_switch_active,
+            )| {
+                ForensicReport {
+                    generated_at_ms,
+                    time_range,
+                    decisions,
+                    audit_trail,
+                    revocations,
+                    approvals,
+                    namespace_violations,
+                    compliance_summary,
+                    quarantine_active,
+                    kill_switch_active,
+                }
+            },
+        )
+}
+
+// ============================================================================
+// Forensic type property tests
+// ============================================================================
+
+proptest! {
+    /// Property 100: ForensicAuditEntry serde roundtrip
+    #[test]
+    fn prop_forensic_audit_entry_serde_roundtrip(entry in arb_forensic_audit_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: ForensicAuditEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, entry);
+    }
+
+    /// Property 101: ForensicNamespaceEvent serde roundtrip
+    #[test]
+    fn prop_forensic_namespace_event_serde_roundtrip(event in arb_forensic_namespace_event()) {
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ForensicNamespaceEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, event);
+    }
+
+    /// Property 102: ForensicComplianceSummary serde roundtrip (f64 tolerance)
+    #[test]
+    fn prop_forensic_compliance_summary_serde_roundtrip(summary in arb_forensic_compliance_summary()) {
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: ForensicComplianceSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_evaluations, summary.total_evaluations);
+        prop_assert_eq!(back.total_denials, summary.total_denials);
+        prop_assert!((back.denial_rate_percent - summary.denial_rate_percent).abs() < 1e-10,
+            "denial_rate_percent drift: {} vs {}", back.denial_rate_percent, summary.denial_rate_percent);
+    }
+
+    /// Property 103: ForensicReport serde roundtrip
+    #[test]
+    fn prop_forensic_report_serde_roundtrip(report in arb_forensic_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ForensicReport = serde_json::from_str(&json).unwrap();
+        // Compare all non-f64 fields directly
+        prop_assert_eq!(back.generated_at_ms, report.generated_at_ms);
+        prop_assert_eq!(back.time_range, report.time_range);
+        prop_assert_eq!(back.decisions, report.decisions);
+        prop_assert_eq!(back.audit_trail, report.audit_trail);
+        prop_assert_eq!(back.revocations, report.revocations);
+        prop_assert_eq!(back.approvals, report.approvals);
+        prop_assert_eq!(back.namespace_violations, report.namespace_violations);
+        prop_assert_eq!(back.quarantine_active, report.quarantine_active);
+        prop_assert_eq!(back.kill_switch_active, report.kill_switch_active);
+        // Compliance summary with f64 tolerance
+        prop_assert_eq!(back.compliance_summary.total_evaluations, report.compliance_summary.total_evaluations);
+        prop_assert_eq!(back.compliance_summary.total_denials, report.compliance_summary.total_denials);
+        prop_assert!(
+            (back.compliance_summary.denial_rate_percent - report.compliance_summary.denial_rate_percent).abs() < 1e-10,
+            "denial_rate_percent drift"
+        );
+    }
+
+    /// Property 104: ForensicComplianceSummary denial rate is bounded [0, 100]
+    #[test]
+    fn prop_forensic_compliance_denial_rate_bounded(summary in arb_forensic_compliance_summary()) {
+        prop_assert!(summary.denial_rate_percent >= 0.0);
+        prop_assert!(summary.denial_rate_percent <= 100.0);
+    }
+
+    /// Property 105: ForensicComplianceSummary denials never exceed evaluations
+    #[test]
+    fn prop_forensic_compliance_denials_bounded(summary in arb_forensic_compliance_summary()) {
+        prop_assert!(
+            summary.total_denials <= summary.total_evaluations,
+            "denials ({}) must not exceed evaluations ({})",
+            summary.total_denials,
+            summary.total_evaluations
+        );
+    }
+
+    /// Property 106: ForensicReport preserves kill_switch_active through roundtrip
+    #[test]
+    fn prop_forensic_report_kill_switch_preserved(
+        kill_switch in any::<bool>(),
+    ) {
+        let report = ForensicReport {
+            generated_at_ms: 1000,
+            time_range: (0, 2000),
+            decisions: vec![],
+            audit_trail: vec![],
+            revocations: vec![],
+            approvals: vec![],
+            namespace_violations: vec![],
+            compliance_summary: ForensicComplianceSummary {
+                total_evaluations: 0,
+                total_denials: 0,
+                denial_rate_percent: 0.0,
+            },
+            quarantine_active: vec![],
+            kill_switch_active: kill_switch,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ForensicReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.kill_switch_active, kill_switch);
+    }
+
+    /// Property 107: ForensicReport nested collection sizes preserved
+    #[test]
+    fn prop_forensic_report_collection_sizes(report in arb_forensic_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ForensicReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.decisions.len(), report.decisions.len());
+        prop_assert_eq!(back.audit_trail.len(), report.audit_trail.len());
+        prop_assert_eq!(back.revocations.len(), report.revocations.len());
+        prop_assert_eq!(back.approvals.len(), report.approvals.len());
+        prop_assert_eq!(back.namespace_violations.len(), report.namespace_violations.len());
+        prop_assert_eq!(back.quarantine_active.len(), report.quarantine_active.len());
+    }
+
+    /// Property 108: ForensicAuditEntry hash field preserved as-is (no transformation)
+    #[test]
+    fn prop_forensic_audit_entry_hash_preserved(entry in arb_forensic_audit_entry()) {
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: ForensicAuditEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.hash, entry.hash, "hash must be preserved exactly");
+    }
+
+    /// Property 109: ForensicNamespaceEvent source/target namespaces distinct fields
+    #[test]
+    fn prop_forensic_namespace_event_fields_independent(
+        event in arb_forensic_namespace_event()
+    ) {
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ForensicNamespaceEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.source_namespace, event.source_namespace);
+        prop_assert_eq!(back.target_namespace, event.target_namespace);
+        prop_assert_eq!(back.resource_kind, event.resource_kind);
+        prop_assert_eq!(back.resource_id, event.resource_id);
     }
 }
