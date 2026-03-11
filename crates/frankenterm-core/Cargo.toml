@@ -231,7 +231,7 @@ required-features = ["vendored"]
 [[bench]]
 name = "wa_agent_streaming"
 harness = false
-required-features = ["distributed"]
+required-features = ["distributed", "asupersync-runtime"]
 
 [[bench]]
 name = "shard_routing"

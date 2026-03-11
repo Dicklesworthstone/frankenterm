@@ -1,4 +1,4 @@
-#![cfg(feature = "distributed")]
+#![cfg(all(feature = "distributed", feature = "asupersync-runtime"))]
 
 //! Criterion benchmarks for wa-agent distributed streaming hot paths.
 //!
@@ -12,11 +12,12 @@
 use std::hint::black_box;
 use std::time::Duration;
 
+use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+use asupersync::net::{TcpListener, TcpStream};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::ingest::{DeltaResult, extract_delta};
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::wire_protocol::{PaneDelta, WireEnvelope, WirePayload};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 
 mod bench_common;
 
@@ -39,11 +40,11 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+fn runtime() -> frankenterm_core::runtime_compat::Runtime {
+    RuntimeBuilder::current_thread()
         .enable_all()
         .build()
-        .expect("create tokio runtime")
+        .expect("create compat runtime")
 }
 
 fn capture_cycle_for_profile(pane_count: usize, append_bytes: usize, rounds: usize) -> usize {
@@ -104,18 +105,17 @@ fn envelope_for_payload_size(payload_size: usize) -> WireEnvelope {
 async fn send_frame_over_loopback(bytes: Vec<u8>) -> std::io::Result<usize> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await?;
-        let mut reader = tokio::io::BufReader::new(stream);
+    let server = frankenterm_core::runtime_compat::task::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
         let mut line = Vec::new();
-        let size = reader.read_until(b'\n', &mut line).await?;
+        let size = stream.read_to_end(&mut line).await?;
         Ok::<usize, std::io::Error>(size)
     });
 
     let mut client = TcpStream::connect(addr).await?;
     client.write_all(&bytes).await?;
     client.write_all(b"\n").await?;
-    client.flush().await?;
+    drop(client);
 
     server.await.expect("loopback server task join")
 }
@@ -205,11 +205,13 @@ fn bench_agent_network_send(c: &mut Criterion) {
                 let frame = envelope_for_payload_size(payload_size)
                     .to_json()
                     .expect("serialize frame");
-                b.to_async(&rt).iter(|| async {
-                    let sent = send_frame_over_loopback(frame.clone())
-                        .await
-                        .expect("send frame");
-                    black_box(sent);
+                b.iter(|| {
+                    rt.block_on(async {
+                        let sent = send_frame_over_loopback(frame.clone())
+                            .await
+                            .expect("send frame");
+                        black_box(sent);
+                    });
                 });
             },
         );
