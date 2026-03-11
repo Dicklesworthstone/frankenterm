@@ -315,3 +315,132 @@ mod runtime_migration_guards {
         }
     }
 }
+
+/// Behavioral tests for the runtime abstraction layer.
+/// These verify that channel, block_on, and I/O trait plumbing
+/// works correctly under the active async feature configuration.
+#[cfg(test)]
+mod runtime_behavior_tests {
+    use crate::runtime;
+
+    #[test]
+    fn channel_bounded_send_recv_roundtrip() {
+        let (tx, rx) = runtime::channel::bounded::<u64>(4);
+        runtime::block_on(async {
+            tx.send(42).await.expect("send failed");
+            tx.send(99).await.expect("send failed");
+            let v1 = rx.recv().await.expect("recv failed");
+            let v2 = rx.recv().await.expect("recv failed");
+            assert_eq!(v1, 42);
+            assert_eq!(v2, 99);
+        });
+    }
+
+    #[test]
+    fn channel_bounded_capacity_one() {
+        let (tx, rx) = runtime::channel::bounded::<String>(1);
+        runtime::block_on(async {
+            tx.send("hello".into()).await.expect("send failed");
+            let v = rx.recv().await.expect("recv failed");
+            assert_eq!(v, "hello");
+        });
+    }
+
+    #[test]
+    fn channel_try_recv_empty_returns_error() {
+        let (_tx, rx) = runtime::channel::bounded::<i32>(2);
+        match rx.try_recv() {
+            Err(runtime::channel::TryRecvError::Empty) => {} // expected
+            other => panic!("expected TryRecvError::Empty, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn channel_recv_error_on_closed_sender() {
+        let (tx, rx) = runtime::channel::bounded::<i32>(1);
+        drop(tx);
+        runtime::block_on(async {
+            match rx.recv().await {
+                Err(runtime::channel::RecvError) => {} // expected
+                Ok(v) => panic!("expected RecvError, got Ok({v})"),
+            }
+        });
+    }
+
+    #[test]
+    fn block_on_runs_simple_future() {
+        let result = runtime::block_on(async { 1 + 2 });
+        assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn block_on_handles_nested_await() {
+        let result = runtime::block_on(async {
+            let a = async { 10 }.await;
+            let b = async { 20 }.await;
+            a + b
+        });
+        assert_eq!(result, 30);
+    }
+
+    #[test]
+    fn channel_multiple_senders_single_receiver() {
+        let (tx, rx) = runtime::channel::bounded::<usize>(8);
+        let tx2 = tx.clone();
+        runtime::block_on(async {
+            tx.send(1).await.unwrap();
+            tx2.send(2).await.unwrap();
+            let mut vals = vec![rx.recv().await.unwrap(), rx.recv().await.unwrap()];
+            vals.sort();
+            assert_eq!(vals, vec![1, 2]);
+        });
+    }
+
+    #[test]
+    fn channel_large_batch_preserves_order() {
+        let (tx, rx) = runtime::channel::bounded::<usize>(256);
+        runtime::block_on(async {
+            for i in 0..100 {
+                tx.send(i).await.unwrap();
+            }
+            for i in 0..100 {
+                assert_eq!(rx.recv().await.unwrap(), i);
+            }
+        });
+    }
+
+    /// Verify that the IO trait types are available under the active feature config.
+    #[test]
+    fn io_trait_types_accessible() {
+        fn _assert_async_read<T: runtime::io::AsyncRead>() {}
+        fn _assert_async_write<T: runtime::io::AsyncWrite>() {}
+        // Type assertions compile — the traits are properly re-exported.
+    }
+
+    /// Verify block_on with channel interaction (sync→async bridge pattern
+    /// used throughout the SSH session code).
+    #[test]
+    fn block_on_with_channel_bridge_pattern() {
+        // Simulates the SessionSender pattern: sync code sends a request
+        // over a channel, waits for the response via block_on.
+        let (req_tx, req_rx) = runtime::channel::bounded::<String>(1);
+        let (resp_tx, resp_rx) = runtime::channel::bounded::<String>(1);
+
+        // Simulate async "session thread" processing
+        std::thread::spawn(move || {
+            runtime::block_on(async {
+                let request = req_rx.recv().await.unwrap();
+                resp_tx
+                    .send(format!("processed: {}", request))
+                    .await
+                    .unwrap();
+            });
+        });
+
+        runtime::block_on(async {
+            req_tx.send("test-command".into()).await.unwrap();
+            let response = resp_rx.recv().await.unwrap();
+            assert_eq!(response, "processed: test-command");
+        });
+    }
+}
