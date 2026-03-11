@@ -248,6 +248,7 @@ pub mod policy;
 pub mod policy_audit_chain;
 pub mod policy_compliance;
 pub mod policy_decision_log;
+pub mod policy_diagnostics;
 pub mod policy_dsl;
 pub mod policy_metrics;
 pub mod policy_quarantine;
