@@ -822,7 +822,7 @@ pub struct NamespaceIsolationConfig {
 impl Default for NamespaceIsolationConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             cross_tenant_policy: CrossTenantPolicy::default(),
             max_audit_entries: NamespaceRegistry::DEFAULT_MAX_AUDIT,
         }

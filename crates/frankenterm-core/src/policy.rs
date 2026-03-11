@@ -3467,7 +3467,7 @@ impl PolicyEngine {
                 crate::connector_bundles::IngestionPipelineConfig::default(),
             ),
             namespace_registry: crate::namespace_isolation::NamespaceRegistry::new(),
-            namespace_isolation_enabled: true,
+            namespace_isolation_enabled: false,
             approval_tracker: ApprovalTracker::default(),
             revocation_registry: RevocationRegistry::default(),
         }
@@ -12866,7 +12866,8 @@ mod tests {
     fn namespace_registry_accessible_from_engine() {
         let engine = PolicyEngine::permissive();
         assert_eq!(engine.namespace_registry().binding_count(), 0);
-        assert!(engine.namespace_isolation_enabled());
+        // Namespace isolation is opt-in (disabled by default)
+        assert!(!engine.namespace_isolation_enabled());
     }
 
     #[test]
