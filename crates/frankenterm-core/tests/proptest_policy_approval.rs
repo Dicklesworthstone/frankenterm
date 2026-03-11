@@ -1,5 +1,6 @@
 //! Property-based tests for ApprovalTracker, ApprovalEntry, ApprovalStatus,
-//! and ApprovalTrackerSnapshot serde roundtrips + behavioral invariants.
+//! ApprovalTrackerSnapshot, RevocationRecord, RevocationRegistry, and
+//! RevocationRegistrySnapshot serde roundtrips + behavioral invariants.
 
 use frankenterm_core::policy::*;
 use proptest::prelude::*;
@@ -243,13 +244,13 @@ proptest! {
         match status {
             ApprovalStatus::Approved => { tracker.approve(&id, "op", 2000); },
             ApprovalStatus::Rejected => { tracker.reject(&id, "op", 2000); },
-            ApprovalStatus::Expired => { tracker.expire_stale(u64::MAX); /* won't work with 0 expiry */ },
+            ApprovalStatus::Expired => { tracker.expire_stale(u64::MAX); },
             ApprovalStatus::Revoked => {
                 tracker.approve(&id, "op", 2000);
                 tracker.revoke(&id, "op", 3000);
             },
-            _ => {},
-        };
+            ApprovalStatus::Pending => {},
+        }
         // Second approve attempt should fail
         prop_assert!(!tracker.approve(&id, "op2", 5000));
     }
@@ -340,5 +341,183 @@ proptest! {
         let results = tracker.by_time_range(start_ms, end_ms);
         prop_assert_eq!(results.len(), 1);
         prop_assert_eq!(results[0].approval_id.clone(), in_range_id);
+    }
+}
+
+// =============================================================================
+// RevocationRecord / RevocationRegistrySnapshot strategies
+// =============================================================================
+
+fn arb_revocation_record() -> impl Strategy<Value = RevocationRecord> {
+    (
+        "[a-z0-9-]{1,20}",  // revocation_id
+        "[a-z_]{1,15}",     // resource_type
+        "[a-z0-9_]{1,20}",  // resource_id
+        "[a-z ]{1,30}",     // reason
+        "[a-z_]{1,15}",     // revoked_by
+        any::<u64>(),        // revoked_at_ms
+        any::<bool>(),       // active
+    )
+        .prop_map(|(id, rtype, rid, reason, by, at, active)| RevocationRecord {
+            revocation_id: id,
+            resource_type: rtype,
+            resource_id: rid,
+            reason,
+            revoked_by: by,
+            revoked_at_ms: at,
+            active,
+        })
+}
+
+fn arb_revocation_registry_snapshot() -> impl Strategy<Value = RevocationRegistrySnapshot> {
+    (any::<usize>(), any::<usize>(), any::<usize>()).prop_map(|(total, active, max)| {
+        RevocationRegistrySnapshot {
+            total_records: total,
+            active_revocations: active,
+            max_records: max,
+        }
+    })
+}
+
+// =============================================================================
+// RevocationRecord / RevocationRegistrySnapshot serde roundtrips
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn revocation_record_json_roundtrip(rec in arb_revocation_record()) {
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: RevocationRecord = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(rec, back);
+    }
+
+    #[test]
+    fn revocation_registry_snapshot_json_roundtrip(snap in arb_revocation_registry_snapshot()) {
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: RevocationRegistrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(snap, back);
+    }
+}
+
+// =============================================================================
+// RevocationRegistry behavioral tests
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn revoke_generates_unique_ids(n in 1..15usize) {
+        let mut reg = RevocationRegistry::new(100);
+        let mut ids = Vec::new();
+        for i in 0..n {
+            ids.push(reg.revoke("credential", &format!("cred-{i}"), "test", "op", i as u64));
+        }
+        ids.sort();
+        ids.dedup();
+        prop_assert_eq!(ids.len(), n, "all revocation IDs must be unique");
+    }
+
+    #[test]
+    fn revoke_increments_len(n in 0..10usize) {
+        let mut reg = RevocationRegistry::new(100);
+        for i in 0..n {
+            reg.revoke("session", &format!("s{i}"), "reason", "op", i as u64);
+        }
+        prop_assert_eq!(reg.len(), n);
+        let check_empty = n == 0;
+        prop_assert_eq!(reg.is_empty(), check_empty);
+    }
+
+    #[test]
+    fn revoked_resource_is_detected(
+        rtype in "[a-z]{1,10}",
+        rid in "[a-z0-9]{1,15}",
+    ) {
+        let mut reg = RevocationRegistry::new(100);
+        prop_assert!(!reg.is_revoked(&rtype, &rid));
+        reg.revoke(&rtype, &rid, "reason", "op", 1000);
+        prop_assert!(reg.is_revoked(&rtype, &rid));
+    }
+
+    #[test]
+    fn reinstate_clears_revocation(
+        rtype in "[a-z]{1,10}",
+        rid in "[a-z0-9]{1,15}",
+    ) {
+        let mut reg = RevocationRegistry::new(100);
+        let rev_id = reg.revoke(&rtype, &rid, "reason", "op", 1000);
+        prop_assert!(reg.is_revoked(&rtype, &rid));
+        prop_assert!(reg.reinstate(&rev_id));
+        prop_assert!(!reg.is_revoked(&rtype, &rid));
+    }
+
+    #[test]
+    fn reinstate_nonexistent_returns_false(
+        bogus_id in "[a-z0-9-]{1,20}",
+    ) {
+        let mut reg = RevocationRegistry::new(100);
+        prop_assert!(!reg.reinstate(&bogus_id));
+    }
+
+    #[test]
+    fn active_count_tracks_active_only(
+        n_revoke in 1..6usize,
+        n_reinstate in 0..3usize,
+    ) {
+        let n_reinstate = n_reinstate.min(n_revoke);
+        let mut reg = RevocationRegistry::new(100);
+        let mut ids = Vec::new();
+        for i in 0..n_revoke {
+            ids.push(reg.revoke("cred", &format!("c{i}"), "r", "op", i as u64));
+        }
+        for id in ids.iter().take(n_reinstate) {
+            reg.reinstate(id);
+        }
+        prop_assert_eq!(reg.active_count(), n_revoke - n_reinstate);
+        prop_assert_eq!(reg.len(), n_revoke);
+    }
+
+    #[test]
+    fn eviction_respects_max_records(
+        max in 2..8usize,
+        extra in 1..5usize,
+    ) {
+        let mut reg = RevocationRegistry::new(max);
+        for i in 0..(max + extra) {
+            reg.revoke("cred", &format!("c{i}"), "r", "op", i as u64);
+        }
+        prop_assert!(reg.len() <= max, "registry must not exceed max_records");
+    }
+
+    #[test]
+    fn snapshot_reflects_state(
+        n in 1..6usize,
+        n_reinstate in 0..3usize,
+    ) {
+        let n_reinstate = n_reinstate.min(n);
+        let mut reg = RevocationRegistry::new(100);
+        let mut ids = Vec::new();
+        for i in 0..n {
+            ids.push(reg.revoke("cred", &format!("c{i}"), "r", "op", i as u64));
+        }
+        for id in ids.iter().take(n_reinstate) {
+            reg.reinstate(id);
+        }
+        let snap = reg.snapshot();
+        prop_assert_eq!(snap.total_records, n);
+        prop_assert_eq!(snap.active_revocations, n - n_reinstate);
+        prop_assert_eq!(snap.max_records, 100);
+    }
+
+    #[test]
+    fn active_revocation_returns_correct_record(
+        rtype in "[a-z]{1,10}",
+        rid in "[a-z0-9]{1,15}",
+    ) {
+        let mut reg = RevocationRegistry::new(100);
+        let rev_id = reg.revoke(&rtype, &rid, "test reason", "op", 1000);
+        let active = reg.active_revocation(&rtype, &rid);
+        prop_assert!(active.is_some());
+        prop_assert_eq!(active.unwrap().revocation_id.clone(), rev_id);
+        prop_assert_eq!(active.unwrap().reason.as_str(), "test reason");
     }
 }
