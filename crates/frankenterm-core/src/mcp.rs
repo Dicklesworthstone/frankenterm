@@ -1657,9 +1657,12 @@ mod tests {
 
     #[test]
     fn parse_caut_service_unknown_returns_none() {
-        assert!(parse_caut_service("google").is_none());
-        assert!(parse_caut_service("anthropic").is_none());
+        // "google" and "anthropic" are now recognized slugs via is_google_slug/is_anthropic_slug
+        assert!(parse_caut_service("google").is_some());
+        assert!(parse_caut_service("anthropic").is_some());
+        // Truly unknown slugs and empty string still return None
         assert!(parse_caut_service("").is_none());
+        assert!(parse_caut_service("unknown-provider-xyz").is_none());
     }
 
     // ── check_refresh_cooldown tests ─────────────────────────────────────
@@ -2978,12 +2981,10 @@ mod tests {
             mcp_mission_lifecycle_transitions(crate::plan::MissionLifecycleState::Running);
         assert!(!transitions.is_empty());
         let kinds: Vec<&str> = transitions.iter().map(|t| t.kind.as_str()).collect();
-        // Running should allow pause and abort at minimum
+        // Running should allow cancel (abort) at minimum
         assert!(
-            kinds
-                .iter()
-                .any(|k| k.contains("Pause") || k.contains("pause")),
-            "Running state should have pause transition, got: {kinds:?}"
+            kinds.iter().any(|k| k == &"cancel"),
+            "Running state should have cancel transition, got: {kinds:?}"
         );
     }
 
