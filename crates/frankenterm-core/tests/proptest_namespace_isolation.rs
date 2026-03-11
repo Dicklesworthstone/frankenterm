@@ -168,6 +168,16 @@ fn arb_telemetry_snapshot() -> impl Strategy<Value = NamespaceIsolationTelemetry
         })
 }
 
+fn arb_namespace_isolation_config() -> impl Strategy<Value = NamespaceIsolationConfig> {
+    (any::<bool>(), arb_cross_tenant_policy(), 1..10_000usize).prop_map(
+        |(enabled, cross_tenant_policy, max_audit_entries)| NamespaceIsolationConfig {
+            enabled,
+            cross_tenant_policy,
+            max_audit_entries,
+        },
+    )
+}
+
 // =============================================================================
 // Serde roundtrip tests
 // =============================================================================
@@ -328,5 +338,59 @@ proptest! {
         let before = telem.checks_total;
         telem.record(&result);
         prop_assert_eq!(telem.checks_total, before + 1);
+    }
+
+    // ---- NamespaceIsolationConfig serde + behavioral tests ----
+
+    #[test]
+    fn namespace_isolation_config_json_roundtrip(config in arb_namespace_isolation_config()) {
+        let json = serde_json::to_string(&config).unwrap();
+        let back: NamespaceIsolationConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(config, back);
+    }
+
+    #[test]
+    fn from_config_preserves_policy(config in arb_namespace_isolation_config()) {
+        let reg = NamespaceRegistry::from_config(&config);
+        let snap = reg.snapshot();
+        prop_assert_eq!(snap.default_decision, config.cross_tenant_policy.default_decision);
+        prop_assert_eq!(snap.policy_rule_count, config.cross_tenant_policy.rules.len());
+    }
+
+    #[test]
+    fn permissive_config_allows_cross_tenant(
+        a in arb_tenant_namespace(),
+        b in arb_tenant_namespace(),
+        kind in arb_resource_kind()
+    ) {
+        prop_assume!(a != b);
+        let config = NamespaceIsolationConfig::permissive();
+        let reg = NamespaceRegistry::from_config(&config);
+        let result = reg.check_boundary(&a, &b, kind);
+        // Permissive default is AllowWithAudit
+        prop_assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn strict_config_denies_cross_tenant(
+        a in arb_tenant_namespace(),
+        b in arb_tenant_namespace(),
+        kind in arb_resource_kind()
+    ) {
+        prop_assume!(a != b && !a.is_system());
+        let config = NamespaceIsolationConfig::strict();
+        let reg = NamespaceRegistry::from_config(&config);
+        let result = reg.check_boundary(&a, &b, kind);
+        prop_assert!(!result.is_allowed());
+    }
+
+    #[test]
+    fn disabled_config_is_not_enabled(
+        policy in arb_cross_tenant_policy()
+    ) {
+        let config = NamespaceIsolationConfig::disabled();
+        prop_assert!(!config.enabled);
+        // The disabled factory should always set enabled=false regardless of policy
+        let _ = policy; // unused, just verifying disabled is independent
     }
 }
