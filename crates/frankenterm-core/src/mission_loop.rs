@@ -29,10 +29,9 @@ use std::time::Instant;
 use crate::beads_types::{BeadIssueDetail, BeadReadinessReport};
 use crate::plan::MissionAgentCapabilityProfile;
 use crate::planner_features::{
-    Assignment, AssignmentSet, PlannerExtractionConfig, PlannerExtractionContext,
-    PlannerExtractionReport, RejectedCandidate, RejectionReason, SafetyGate, ScorerConfig,
-    ScorerInput, ScorerReport, SolverConfig, extract_planner_features, score_candidates,
-    solve_assignments,
+    extract_planner_features, score_candidates, solve_assignments, Assignment, AssignmentSet,
+    PlannerExtractionConfig, PlannerExtractionContext, PlannerExtractionReport, RejectedCandidate,
+    RejectionReason, SafetyGate, ScorerConfig, ScorerInput, ScorerReport, SolverConfig,
 };
 
 // ── Loop state ──────────────────────────────────────────────────────────────
@@ -1122,23 +1121,22 @@ impl MissionLoop {
                 break;
             }
 
-            let assignment_resources: Vec<String> = known_resource_reservations
-                .iter()
-                .filter(|r| {
-                    r.bead_id.as_deref() == Some(assignment.bead_id.as_str())
-                        && r.holder == assignment.agent_id
-                })
-                .flat_map(|r| r.resources.clone())
-                .collect();
+            let assignment_resources = dedup_owned_strings(
+                known_resource_reservations
+                    .iter()
+                    .filter(|r| {
+                        r.bead_id.as_deref() == Some(assignment.bead_id.as_str())
+                            && r.holder == assignment.agent_id
+                    })
+                    .flat_map(|r| r.resources.iter().cloned()),
+            );
 
             if assignment_resources.is_empty() {
                 continue;
             }
 
+            let mut buckets = Vec::new();
             for reservation in known_resource_reservations {
-                if conflicts.len() >= max {
-                    break;
-                }
                 if !reservation.exclusive {
                     continue;
                 }
@@ -1151,56 +1149,64 @@ impl MissionLoop {
                     }
                 }
 
-                let overlapping: Vec<String> = assignment_resources
-                    .iter()
-                    .filter(|resource| {
-                        reservation
-                            .resources
-                            .iter()
-                            .any(|reserved| resource_scopes_overlap(resource, reserved))
-                    })
-                    .cloned()
-                    .collect();
+                let overlapping = dedup_owned_strings(
+                    assignment_resources
+                        .iter()
+                        .filter(|resource| {
+                            reservation
+                                .resources
+                                .iter()
+                                .any(|reserved| resource_scopes_overlap(resource, reserved))
+                        })
+                        .cloned(),
+                );
 
                 if !overlapping.is_empty() {
-                    let resolution = resolve_conflict(
-                        self.config.conflict_detection.strategy,
-                        &assignment.agent_id,
+                    merge_conflict_bucket(
+                        &mut buckets,
                         &reservation.holder,
-                        assignment.score,
-                        0.0,
-                        &assignment.bead_id,
-                        reservation.bead_id.as_deref().unwrap_or("unknown"),
-                        issues,
+                        reservation.bead_id.as_deref(),
+                        overlapping,
                     );
-
-                    let conflict_id = format!(
-                        "conflict-resource-{}-{}-{}",
-                        self.state.cycle_count, assignment.bead_id, reservation.holder
-                    );
-                    conflicts.push(AssignmentConflict {
-                        conflict_id,
-                        conflict_type: ConflictType::ResourceReservationOverlap,
-                        involved_agents: vec![
-                            assignment.agent_id.clone(),
-                            reservation.holder.clone(),
-                        ],
-                        involved_beads: {
-                            let mut beads = vec![assignment.bead_id.clone()];
-                            if let Some(ref bid) = reservation.bead_id {
-                                if !beads.contains(bid) {
-                                    beads.push(bid.clone());
-                                }
-                            }
-                            beads
-                        },
-                        conflicting_paths: overlapping,
-                        detected_at_ms: current_ms,
-                        resolution,
-                        reason_code: "resource_reservation_overlap".to_string(),
-                        error_code: "FTM2004".to_string(),
-                    });
                 }
+            }
+
+            for bucket in buckets {
+                if conflicts.len() >= max {
+                    break;
+                }
+
+                let resolution = resolve_conflict(
+                    self.config.conflict_detection.strategy,
+                    &assignment.agent_id,
+                    &bucket.holder,
+                    assignment.score,
+                    0.0,
+                    &assignment.bead_id,
+                    bucket.bead_id.as_deref().unwrap_or("unknown"),
+                    issues,
+                );
+
+                conflicts.push(AssignmentConflict {
+                    conflict_id: make_reservation_conflict_id(
+                        "conflict-resource",
+                        self.state.cycle_count,
+                        &assignment.bead_id,
+                        &bucket.holder,
+                        bucket.bead_id.as_deref(),
+                    ),
+                    conflict_type: ConflictType::ResourceReservationOverlap,
+                    involved_agents: vec![assignment.agent_id.clone(), bucket.holder.clone()],
+                    involved_beads: build_conflicting_beads(
+                        &assignment.bead_id,
+                        bucket.bead_id.as_deref(),
+                    ),
+                    conflicting_paths: bucket.overlaps,
+                    detected_at_ms: current_ms,
+                    resolution,
+                    reason_code: "resource_reservation_overlap".to_string(),
+                    error_code: "FTM2004".to_string(),
+                });
             }
         }
     }
@@ -1232,23 +1238,22 @@ impl MissionLoop {
             }
             // Derive file paths for this assignment from bead labels or
             // reservations that share the same bead_id.
-            let assignment_paths: Vec<String> = known_reservations
-                .iter()
-                .filter(|r| {
-                    r.bead_id.as_deref() == Some(assignment.bead_id.as_str())
-                        && r.holder == assignment.agent_id
-                })
-                .flat_map(|r| r.paths.clone())
-                .collect();
+            let assignment_paths = dedup_owned_strings(
+                known_reservations
+                    .iter()
+                    .filter(|r| {
+                        r.bead_id.as_deref() == Some(assignment.bead_id.as_str())
+                            && r.holder == assignment.agent_id
+                    })
+                    .flat_map(|r| r.paths.iter().cloned()),
+            );
 
             if assignment_paths.is_empty() {
                 continue;
             }
 
+            let mut buckets = Vec::new();
             for reservation in known_reservations {
-                if conflicts.len() >= max {
-                    break;
-                }
                 // Skip non-exclusive, expired, or same-agent reservations.
                 if !reservation.exclusive {
                     continue;
@@ -1262,51 +1267,59 @@ impl MissionLoop {
                     }
                 }
 
-                let overlapping: Vec<String> = assignment_paths
-                    .iter()
-                    .filter(|p| reservation.paths.iter().any(|rp| paths_overlap(p, rp)))
-                    .cloned()
-                    .collect();
+                let overlapping = dedup_owned_strings(
+                    assignment_paths
+                        .iter()
+                        .filter(|p| reservation.paths.iter().any(|rp| paths_overlap(p, rp)))
+                        .cloned(),
+                );
 
                 if !overlapping.is_empty() {
-                    let resolution = resolve_conflict(
-                        self.config.conflict_detection.strategy,
-                        &assignment.agent_id,
+                    merge_conflict_bucket(
+                        &mut buckets,
                         &reservation.holder,
-                        assignment.score,
-                        0.0, // existing reservation holder has no score context
-                        &assignment.bead_id,
-                        reservation.bead_id.as_deref().unwrap_or("unknown"),
-                        issues,
+                        reservation.bead_id.as_deref(),
+                        overlapping,
                     );
-
-                    let conflict_id = format!(
-                        "conflict-res-{}-{}-{}",
-                        self.state.cycle_count, assignment.bead_id, reservation.holder
-                    );
-                    conflicts.push(AssignmentConflict {
-                        conflict_id,
-                        conflict_type: ConflictType::FileReservationOverlap,
-                        involved_agents: vec![
-                            assignment.agent_id.clone(),
-                            reservation.holder.clone(),
-                        ],
-                        involved_beads: {
-                            let mut beads = vec![assignment.bead_id.clone()];
-                            if let Some(ref bid) = reservation.bead_id {
-                                if !beads.contains(bid) {
-                                    beads.push(bid.clone());
-                                }
-                            }
-                            beads
-                        },
-                        conflicting_paths: overlapping,
-                        detected_at_ms: current_ms,
-                        resolution,
-                        reason_code: "reservation_overlap".to_string(),
-                        error_code: "FTM2001".to_string(),
-                    });
                 }
+            }
+
+            for bucket in buckets {
+                if conflicts.len() >= max {
+                    break;
+                }
+
+                let resolution = resolve_conflict(
+                    self.config.conflict_detection.strategy,
+                    &assignment.agent_id,
+                    &bucket.holder,
+                    assignment.score,
+                    0.0, // existing reservation holder has no score context
+                    &assignment.bead_id,
+                    bucket.bead_id.as_deref().unwrap_or("unknown"),
+                    issues,
+                );
+
+                conflicts.push(AssignmentConflict {
+                    conflict_id: make_reservation_conflict_id(
+                        "conflict-res",
+                        self.state.cycle_count,
+                        &assignment.bead_id,
+                        &bucket.holder,
+                        bucket.bead_id.as_deref(),
+                    ),
+                    conflict_type: ConflictType::FileReservationOverlap,
+                    involved_agents: vec![assignment.agent_id.clone(), bucket.holder.clone()],
+                    involved_beads: build_conflicting_beads(
+                        &assignment.bead_id,
+                        bucket.bead_id.as_deref(),
+                    ),
+                    conflicting_paths: bucket.overlaps,
+                    detected_at_ms: current_ms,
+                    resolution,
+                    reason_code: "reservation_overlap".to_string(),
+                    error_code: "FTM2001".to_string(),
+                });
             }
         }
     }
@@ -1439,6 +1452,75 @@ impl MissionLoop {
 }
 
 // ── Free functions for conflict resolution ──────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReservationConflictBucket {
+    holder: String,
+    bead_id: Option<String>,
+    overlaps: Vec<String>,
+}
+
+fn dedup_owned_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut unique = Vec::new();
+    append_unique_strings(&mut unique, values);
+    unique
+}
+
+fn append_unique_strings(target: &mut Vec<String>, values: impl IntoIterator<Item = String>) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
+}
+
+fn merge_conflict_bucket(
+    buckets: &mut Vec<ReservationConflictBucket>,
+    holder: &str,
+    bead_id: Option<&str>,
+    overlaps: Vec<String>,
+) {
+    if let Some(existing) = buckets
+        .iter_mut()
+        .find(|bucket| bucket.holder == holder && bucket.bead_id.as_deref() == bead_id)
+    {
+        append_unique_strings(&mut existing.overlaps, overlaps);
+        return;
+    }
+
+    buckets.push(ReservationConflictBucket {
+        holder: holder.to_string(),
+        bead_id: bead_id.map(str::to_string),
+        overlaps: dedup_owned_strings(overlaps),
+    });
+}
+
+fn build_conflicting_beads(primary_bead_id: &str, peer_bead_id: Option<&str>) -> Vec<String> {
+    let mut beads = vec![primary_bead_id.to_string()];
+    if let Some(peer_bead_id) = peer_bead_id {
+        if !beads.iter().any(|bead| bead == peer_bead_id) {
+            beads.push(peer_bead_id.to_string());
+        }
+    }
+    beads
+}
+
+fn make_reservation_conflict_id(
+    prefix: &str,
+    cycle_id: u64,
+    assignment_bead_id: &str,
+    holder: &str,
+    peer_bead_id: Option<&str>,
+) -> String {
+    format!(
+        "{}-{}-{}-{}-{}",
+        prefix,
+        cycle_id,
+        assignment_bead_id,
+        holder,
+        peer_bead_id.unwrap_or("unknown")
+    )
+}
 
 /// Check if two file paths overlap (bidirectional wildcard matching).
 fn paths_overlap(a: &str, b: &str) -> bool {
@@ -3353,21 +3435,15 @@ mod tests {
         );
         assert_eq!(report.conflicts[0].reason_code, "reservation_overlap");
         assert_eq!(report.conflicts[0].error_code, "FTM2001");
-        assert!(
-            report.conflicts[0]
-                .conflicting_paths
-                .contains(&"src/plan.rs".to_string())
-        );
-        assert!(
-            report.conflicts[0]
-                .involved_agents
-                .contains(&"agent1".to_string())
-        );
-        assert!(
-            report.conflicts[0]
-                .involved_agents
-                .contains(&"agent2".to_string())
-        );
+        assert!(report.conflicts[0]
+            .conflicting_paths
+            .contains(&"src/plan.rs".to_string()));
+        assert!(report.conflicts[0]
+            .involved_agents
+            .contains(&"agent1".to_string()));
+        assert!(report.conflicts[0]
+            .involved_agents
+            .contains(&"agent2".to_string()));
     }
 
     #[test]
@@ -3400,11 +3476,9 @@ mod tests {
             "resource_reservation_overlap"
         );
         assert_eq!(report.conflicts[0].error_code, "FTM2004");
-        assert!(
-            report.conflicts[0]
-                .conflicting_paths
-                .contains(&"pane:alpha".to_string())
-        );
+        assert!(report.conflicts[0]
+            .conflicting_paths
+            .contains(&"pane:alpha".to_string()));
     }
 
     #[test]
@@ -3431,6 +3505,123 @@ mod tests {
         assert_eq!(
             report.conflicts[0].conflict_type,
             ConflictType::ResourceReservationOverlap
+        );
+    }
+
+    #[test]
+    fn conflict_detection_reservation_overlap_same_peer_bead_aggregates_once() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let reservations = vec![
+            make_reservation("agent1", &["src/plan.rs"], Some("a")),
+            make_reservation("agent2", &["src/plan.rs"], Some("b")),
+            make_reservation("agent2", &["src/*.rs"], Some("b")),
+        ];
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(report.messages.len(), 2);
+        assert_eq!(
+            report.conflicts[0].involved_beads,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            report.conflicts[0].conflicting_paths,
+            vec!["src/plan.rs".to_string()]
+        );
+        assert_eq!(
+            report
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.recipient == "agent1"
+                        && message.conflict_id == report.conflicts[0].conflict_id
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            report
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.recipient == "agent2"
+                        && message.conflict_id == report.conflicts[0].conflict_id
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn conflict_detection_reservation_overlap_distinguishes_peer_beads_in_conflict_id() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let reservations = vec![
+            make_reservation("agent1", &["src/plan.rs"], Some("a")),
+            make_reservation("agent2", &["src/plan.rs"], Some("b")),
+            make_reservation("agent2", &["src/plan.rs"], Some("c")),
+        ];
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+            sample_detail("c", BeadStatus::Open, 2, &[]),
+        ];
+
+        let report = ml.detect_conflicts(&aset, &reservations, &[], 5000, &issues);
+
+        assert_eq!(report.conflicts.len(), 2);
+        assert_ne!(
+            report.conflicts[0].conflict_id,
+            report.conflicts[1].conflict_id
+        );
+        assert_eq!(
+            report.conflicts[0].involved_beads,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            report.conflicts[1].involved_beads,
+            vec!["a".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn conflict_detection_resource_reservation_same_peer_bead_aggregates_once() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let resource_reservations = vec![
+            make_resource_reservation("agent1", &["pane:alpha"], Some("a")),
+            make_resource_reservation("agent2", &["pane:alpha"], Some("b")),
+            make_resource_reservation("agent2", &["pane:*"], Some("b")),
+        ];
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+
+        let report = ml.detect_conflicts_with_resources(
+            &aset,
+            &[],
+            &resource_reservations,
+            &[],
+            5000,
+            &issues,
+        );
+
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(report.messages.len(), 2);
+        assert_eq!(
+            report.conflicts[0].involved_beads,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            report.conflicts[0].conflicting_paths,
+            vec!["pane:alpha".to_string()]
         );
     }
 
@@ -3936,18 +4127,14 @@ mod tests {
         let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
 
         assert!(!report.messages.is_empty());
-        assert!(
-            report
-                .messages
-                .iter()
-                .all(|m| m.body.contains("- role: `participant`"))
-        );
-        assert!(
-            report
-                .messages
-                .iter()
-                .all(|m| m.body.contains("- action: `await_manual_resolution`"))
-        );
+        assert!(report
+            .messages
+            .iter()
+            .all(|m| m.body.contains("- role: `participant`")));
+        assert!(report
+            .messages
+            .iter()
+            .all(|m| m.body.contains("- action: `await_manual_resolution`")));
     }
 
     #[test]
@@ -4135,12 +4322,10 @@ mod tests {
         let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
         // Two conflicts: agent2 vs winner and agent3 vs winner.
         assert_eq!(report.conflicts.len(), 2);
-        assert!(
-            report
-                .conflicts
-                .iter()
-                .all(|c| c.conflict_type == ConflictType::ConcurrentBeadClaim)
-        );
+        assert!(report
+            .conflicts
+            .iter()
+            .all(|c| c.conflict_type == ConflictType::ConcurrentBeadClaim));
     }
 
     #[test]
@@ -4396,11 +4581,9 @@ mod tests {
         assert_eq!(report.assignment_table[0].agent_id, "alpha");
         assert_eq!(report.assignment_table[0].total_assignments, 10);
         assert_eq!(report.assignment_table[0].active_beads, 2);
-        assert!(
-            report.assignment_table[0]
-                .active_bead_ids
-                .contains(&"bead-a".to_string())
-        );
+        assert!(report.assignment_table[0]
+            .active_bead_ids
+            .contains(&"bead-a".to_string()));
     }
 
     #[test]
