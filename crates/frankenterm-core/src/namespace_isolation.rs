@@ -434,9 +434,12 @@ impl BoundaryCheckResult {
     }
 
     /// Returns `true` if audit logging is required.
+    ///
+    /// Both allowed and denied cross-boundary accesses are audited
+    /// for forensic and compliance reporting.
     #[must_use]
     pub fn requires_audit(&self) -> bool {
-        self.decision.requires_audit() || (self.crosses_boundary && self.decision.is_allowed())
+        self.crosses_boundary || self.decision.requires_audit()
     }
 }
 

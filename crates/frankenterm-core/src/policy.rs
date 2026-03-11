@@ -1332,7 +1332,7 @@ pub struct RevocationRegistrySnapshot {
 /// A unified forensic report aggregating evidence from all governance
 /// subsystems.  Designed for compliance export, incident review, and
 /// action chain reconstruction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ForensicReport {
     /// Report generation timestamp (epoch ms).
     pub generated_at_ms: u64,
@@ -1357,7 +1357,7 @@ pub struct ForensicReport {
 }
 
 /// A serializable audit chain entry for forensic reports.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForensicAuditEntry {
     pub timestamp_ms: u64,
     pub kind: String,
@@ -1368,7 +1368,7 @@ pub struct ForensicAuditEntry {
 }
 
 /// A namespace boundary crossing event for forensic reports.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForensicNamespaceEvent {
     pub timestamp_ms: u64,
     pub source_namespace: String,
@@ -1380,7 +1380,7 @@ pub struct ForensicNamespaceEvent {
 }
 
 /// Compliance summary for forensic reports.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ForensicComplianceSummary {
     pub total_evaluations: u64,
     pub total_denials: u64,
@@ -4081,7 +4081,7 @@ impl PolicyEngine {
     /// registry, approval tracker, revocation registry, compliance engine,
     /// and quarantine registry into a unified, exportable report.
     pub fn generate_forensic_report(&mut self, query: &ForensicQuery, now_ms: u64) -> ForensicReport {
-        let end = if query.end_ms == 0 { now_ms } else { query.end_ms };
+        let end = if query.end_ms == 0 { u64::MAX } else { query.end_ms };
 
         // Decision log entries
         let mut decisions: Vec<crate::policy_decision_log::PolicyDecisionEntry> =
@@ -5652,7 +5652,7 @@ impl PolicyEngine {
 const AUDIT_PREVIEW_CHARS: usize = 80;
 
 /// Redacted summary metadata for SendText audit entries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendTextAuditSummary {
     /// Original text length (bytes).
     pub text_length: usize,
@@ -5699,7 +5699,7 @@ pub fn build_send_text_audit_summary(
 // ============================================================================
 
 /// Result of a policy-gated injection attempt
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum InjectionResult {
     /// Injection was allowed and executed
