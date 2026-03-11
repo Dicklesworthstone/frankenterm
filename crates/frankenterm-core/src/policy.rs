@@ -1136,6 +1136,15 @@ impl ApprovalTracker {
         self.entries.iter().filter(|e| &e.status == status).count()
     }
 
+    /// Entries within a time range.
+    #[must_use]
+    pub fn by_time_range(&self, start_ms: u64, end_ms: u64) -> Vec<&ApprovalEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.requested_at_ms >= start_ms && e.requested_at_ms <= end_ms)
+            .collect()
+    }
+
     /// Diagnostic snapshot.
     #[must_use]
     pub fn snapshot(&self) -> ApprovalTrackerSnapshot {
@@ -1316,6 +1325,85 @@ pub struct RevocationRegistrySnapshot {
     pub total_records: usize,
     pub active_revocations: usize,
     pub max_records: usize,
+}
+
+// ── Forensic Report ────────────────────────────────────────────────
+
+/// A unified forensic report aggregating evidence from all governance
+/// subsystems.  Designed for compliance export, incident review, and
+/// action chain reconstruction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForensicReport {
+    /// Report generation timestamp (epoch ms).
+    pub generated_at_ms: u64,
+    /// Time range covered (start, end) in epoch ms.
+    pub time_range: (u64, u64),
+    /// Decision log entries matching the query.
+    pub decisions: Vec<crate::policy_decision_log::PolicyDecisionEntry>,
+    /// Audit chain entries (subset by time range).
+    pub audit_trail: Vec<ForensicAuditEntry>,
+    /// Active and recent revocations.
+    pub revocations: Vec<RevocationRecord>,
+    /// Approval workflow entries.
+    pub approvals: Vec<ApprovalEntry>,
+    /// Namespace boundary violations.
+    pub namespace_violations: Vec<ForensicNamespaceEvent>,
+    /// Compliance summary.
+    pub compliance_summary: ForensicComplianceSummary,
+    /// Quarantine events in the time range.
+    pub quarantine_active: Vec<String>,
+    /// Kill switch status at report time.
+    pub kill_switch_active: bool,
+}
+
+/// A serializable audit chain entry for forensic reports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForensicAuditEntry {
+    pub timestamp_ms: u64,
+    pub kind: String,
+    pub actor: String,
+    pub description: String,
+    pub surface: String,
+    pub hash: String,
+}
+
+/// A namespace boundary crossing event for forensic reports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForensicNamespaceEvent {
+    pub timestamp_ms: u64,
+    pub source_namespace: String,
+    pub target_namespace: String,
+    pub resource_kind: String,
+    pub resource_id: String,
+    pub decision: String,
+    pub reason: String,
+}
+
+/// Compliance summary for forensic reports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForensicComplianceSummary {
+    pub total_evaluations: u64,
+    pub total_denials: u64,
+    pub denial_rate_percent: f64,
+}
+
+/// Query parameters for forensic report generation.
+#[derive(Debug, Clone, Default)]
+pub struct ForensicQuery {
+    /// Start of time range (epoch ms). 0 = beginning.
+    pub start_ms: u64,
+    /// End of time range (epoch ms). 0 = now.
+    pub end_ms: u64,
+    /// Filter by actor kind.
+    pub actor: Option<ActorKind>,
+    /// Filter by action kind.
+    pub action: Option<ActionKind>,
+    /// Filter by pane ID.
+    pub pane_id: Option<u64>,
+    /// Filter by connector domain.
+    pub domain: Option<String>,
+    /// Include only denied decisions.
+    pub denials_only: bool,
 }
 
 /// Result of policy evaluation
@@ -3983,6 +4071,162 @@ impl PolicyEngine {
     pub fn is_resource_revoked(&self, resource_type: &str, resource_id: &str) -> bool {
         self.revocation_registry
             .is_revoked(resource_type, resource_id)
+    }
+
+    // ── Forensic Report ───────────────────────────────────────────
+
+    /// Generate a forensic report covering the specified query parameters.
+    ///
+    /// Aggregates evidence from the decision log, audit chain, namespace
+    /// registry, approval tracker, revocation registry, compliance engine,
+    /// and quarantine registry into a unified, exportable report.
+    pub fn generate_forensic_report(&mut self, query: &ForensicQuery, now_ms: u64) -> ForensicReport {
+        let end = if query.end_ms == 0 { now_ms } else { query.end_ms };
+
+        // Decision log entries
+        let mut decisions: Vec<crate::policy_decision_log::PolicyDecisionEntry> =
+            self.decision_log.by_time_range(query.start_ms, end)
+                .into_iter()
+                .cloned()
+                .collect();
+
+        if let Some(actor) = query.actor {
+            decisions.retain(|d| d.actor == actor);
+        }
+        if let Some(action) = query.action {
+            decisions.retain(|d| d.action == action);
+        }
+        if let Some(pane_id) = query.pane_id {
+            decisions.retain(|d| d.pane_id == Some(pane_id));
+        }
+        if query.denials_only {
+            decisions.retain(|d| {
+                d.decision == crate::policy_decision_log::DecisionOutcome::Deny
+            });
+        }
+
+        // Audit chain entries
+        let audit_trail: Vec<ForensicAuditEntry> = self
+            .audit_chain
+            .entries_in_range(query.start_ms, end)
+            .into_iter()
+            .map(|e| ForensicAuditEntry {
+                timestamp_ms: e.timestamp_ms,
+                kind: format!("{:?}", e.kind),
+                actor: e.actor.clone(),
+                description: e.description.clone(),
+                surface: e.entity_ref.clone(),
+                hash: e.chain_hash.clone(),
+            })
+            .collect();
+
+        // Revocations
+        let revocations: Vec<RevocationRecord> = self
+            .revocation_registry
+            .active_revocations()
+            .into_iter()
+            .cloned()
+            .collect();
+
+        // Approvals
+        let approvals: Vec<ApprovalEntry> = self
+            .approval_tracker
+            .by_time_range(query.start_ms, end)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        // Namespace violations
+        let namespace_violations: Vec<ForensicNamespaceEvent> = self
+            .namespace_registry
+            .audit_log()
+            .iter()
+            .filter(|e| e.timestamp_ms >= query.start_ms && e.timestamp_ms <= end)
+            .map(|e| ForensicNamespaceEvent {
+                timestamp_ms: e.timestamp_ms,
+                source_namespace: e.source_namespace.as_str().to_string(),
+                target_namespace: e.target_namespace.as_str().to_string(),
+                resource_kind: e.resource_kind.clone(),
+                resource_id: e.resource_id.clone(),
+                decision: format!("{:?}", e.decision),
+                reason: e.reason.clone().unwrap_or_default(),
+            })
+            .collect();
+
+        // Compliance summary
+        let comp_snap = self.compliance_engine.snapshot(now_ms);
+        let denial_rate = if comp_snap.counters.total_evaluations > 0 {
+            (comp_snap.counters.total_denials as f64
+                / comp_snap.counters.total_evaluations as f64)
+                * 100.0
+        } else {
+            0.0
+        };
+
+        // Quarantine
+        let quarantine_active: Vec<String> = self
+            .quarantine_registry
+            .active_quarantines();
+
+        ForensicReport {
+            generated_at_ms: now_ms,
+            time_range: (query.start_ms, end),
+            decisions,
+            audit_trail,
+            revocations,
+            approvals,
+            namespace_violations,
+            compliance_summary: ForensicComplianceSummary {
+                total_evaluations: comp_snap.counters.total_evaluations,
+                total_denials: comp_snap.counters.total_denials,
+                denial_rate_percent: denial_rate,
+            },
+            quarantine_active,
+            kill_switch_active: self.quarantine_registry.kill_switch().is_emergency(),
+        }
+    }
+
+    /// Generate a forensic report and export it as JSON.
+    pub fn export_forensic_report_json(
+        &mut self,
+        query: &ForensicQuery,
+        now_ms: u64,
+    ) -> Result<String, serde_json::Error> {
+        let report = self.generate_forensic_report(query, now_ms);
+        serde_json::to_string_pretty(&report)
+    }
+
+    /// Generate a forensic report and export it as JSONL (one record per line).
+    pub fn export_forensic_report_jsonl(
+        &mut self,
+        query: &ForensicQuery,
+        now_ms: u64,
+    ) -> Result<String, serde_json::Error> {
+        let report = self.generate_forensic_report(query, now_ms);
+        let mut lines = Vec::new();
+        // Emit decisions
+        for d in &report.decisions {
+            lines.push(serde_json::to_string(d)?);
+        }
+        // Emit audit trail
+        for a in &report.audit_trail {
+            lines.push(serde_json::to_string(a)?);
+        }
+        // Emit revocations
+        for r in &report.revocations {
+            lines.push(serde_json::to_string(r)?);
+        }
+        // Emit approvals
+        for ap in &report.approvals {
+            lines.push(serde_json::to_string(ap)?);
+        }
+        // Emit namespace violations
+        for ns in &report.namespace_violations {
+            lines.push(serde_json::to_string(ns)?);
+        }
+        // Emit compliance summary
+        lines.push(serde_json::to_string(&report.compliance_summary)?);
+        Ok(lines.join("\n"))
     }
 
     /// Register a connector bundle with audit chain recording and compliance notification.
@@ -13933,5 +14177,304 @@ mod tests {
         let rev_snap = engine.revocation_registry().snapshot();
         assert_eq!(rev_snap.total_records, 1);
         assert_eq!(rev_snap.active_revocations, 0);
+    }
+
+    // ── Forensic Report tests ─────────────────────────────────────
+
+    #[test]
+    fn forensic_report_empty_engine() {
+        let mut engine = PolicyEngine::permissive();
+        let query = ForensicQuery::default();
+        let report = engine.generate_forensic_report(&query, 10000);
+
+        assert_eq!(report.generated_at_ms, 10000);
+        assert!(report.decisions.is_empty());
+        assert!(report.revocations.is_empty());
+        assert!(report.approvals.is_empty());
+        assert!(report.namespace_violations.is_empty());
+        assert!(report.quarantine_active.is_empty());
+        assert!(!report.kill_switch_active);
+        assert_eq!(report.compliance_summary.total_evaluations, 0);
+    }
+
+    #[test]
+    fn forensic_report_captures_decisions() {
+        let mut engine = PolicyEngine::permissive();
+
+        // Generate some decisions
+        let input1 = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot).with_pane(1);
+        engine.authorize(&input1);
+
+        let input2 = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Human).with_pane(2);
+        engine.authorize(&input2);
+
+        let query = ForensicQuery::default();
+        let report = engine.generate_forensic_report(&query, 10000);
+
+        assert!(
+            !report.decisions.is_empty(),
+            "should capture decisions from authorize calls"
+        );
+    }
+
+    #[test]
+    fn forensic_report_captures_revocations() {
+        let mut engine = PolicyEngine::permissive();
+
+        engine.revoke_resource("connector", "slack-api", "compromised", "admin", 1000);
+        engine.revoke_resource("credential", "api-key", "leaked", "sec-bot", 2000);
+
+        let query = ForensicQuery::default();
+        let report = engine.generate_forensic_report(&query, 10000);
+
+        assert_eq!(report.revocations.len(), 2);
+        assert!(report.audit_trail.len() >= 2);
+    }
+
+    #[test]
+    fn forensic_report_captures_approvals() {
+        let mut engine = PolicyEngine::permissive();
+
+        engine.submit_approval("ConnectorInvoke", "agent-1", "slack", "sensitive", "rule.1", 1000, 0);
+        engine.submit_approval("DeleteFile", "agent-2", "/tmp/data", "destructive", "rule.2", 2000, 0);
+
+        let query = ForensicQuery {
+            start_ms: 0,
+            end_ms: 5000,
+            ..Default::default()
+        };
+        let report = engine.generate_forensic_report(&query, 5000);
+
+        assert_eq!(report.approvals.len(), 2);
+    }
+
+    #[test]
+    fn forensic_report_filters_by_time_range() {
+        let mut engine = PolicyEngine::permissive();
+
+        engine.submit_approval("a", "x", "r1", "r", "rule", 1000, 0);
+        engine.submit_approval("a", "x", "r2", "r", "rule", 3000, 0);
+        engine.submit_approval("a", "x", "r3", "r", "rule", 5000, 0);
+
+        let query = ForensicQuery {
+            start_ms: 2000,
+            end_ms: 4000,
+            ..Default::default()
+        };
+        let report = engine.generate_forensic_report(&query, 10000);
+
+        assert_eq!(
+            report.approvals.len(),
+            1,
+            "should only include approvals in time range"
+        );
+    }
+
+    #[test]
+    fn forensic_report_filters_denials_only() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        // Allow: same namespace
+        let ns_a = TenantNamespace::new("team-a").unwrap();
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Pane,
+            "pane-500",
+            ns_a.clone(),
+        );
+        let input_allow = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(500)
+            .with_namespace(ns_a);
+        engine.authorize(&input_allow);
+
+        // Deny: cross namespace
+        let ns_b = TenantNamespace::new("team-b").unwrap();
+        let input_deny = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(500)
+            .with_namespace(ns_b);
+        engine.authorize(&input_deny);
+
+        let query = ForensicQuery {
+            denials_only: true,
+            ..Default::default()
+        };
+        let report = engine.generate_forensic_report(&query, 10000);
+
+        assert!(
+            !report.decisions.is_empty(),
+            "should have denial records"
+        );
+        for d in &report.decisions {
+            assert_eq!(
+                d.decision,
+                crate::policy_decision_log::DecisionOutcome::Deny,
+                "denials_only filter should exclude non-deny decisions"
+            );
+        }
+    }
+
+    #[test]
+    fn forensic_report_captures_namespace_violations() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let ns_a = TenantNamespace::new("org-a").unwrap();
+        let ns_b = TenantNamespace::new("org-b").unwrap();
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Connector,
+            "shared-connector",
+            ns_b,
+        );
+
+        // This will trigger a cross-namespace check via authorize
+        let input = PolicyInput::new(ActionKind::ConnectorInvoke, ActorKind::Robot)
+            .with_domain("shared-connector")
+            .with_namespace(ns_a);
+        engine.authorize(&input);
+
+        let query = ForensicQuery::default();
+        let report = engine.generate_forensic_report(&query, 10000);
+
+        assert!(
+            !report.namespace_violations.is_empty(),
+            "should capture namespace boundary violations"
+        );
+    }
+
+    #[test]
+    fn forensic_report_export_json() {
+        let mut engine = PolicyEngine::permissive();
+        engine.revoke_resource("connector", "test-api", "test reason", "admin", 1000);
+
+        let query = ForensicQuery::default();
+        let json = engine
+            .export_forensic_report_json(&query, 5000)
+            .expect("JSON export should succeed");
+
+        assert!(json.contains("test-api"));
+        assert!(json.contains("generated_at_ms"));
+        // Verify it's valid JSON
+        let _parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("should be valid JSON");
+    }
+
+    #[test]
+    fn forensic_report_export_jsonl() {
+        let mut engine = PolicyEngine::permissive();
+        engine.submit_approval("a", "x", "r", "reason", "rule", 1000, 0);
+        engine.revoke_resource("connector", "c", "r", "admin", 2000);
+
+        let query = ForensicQuery::default();
+        let jsonl = engine
+            .export_forensic_report_jsonl(&query, 5000)
+            .expect("JSONL export should succeed");
+
+        let lines: Vec<&str> = jsonl.lines().collect();
+        assert!(
+            lines.len() >= 2,
+            "should have at least approval + revocation + compliance summary lines"
+        );
+        // Each line should be valid JSON
+        for line in &lines {
+            let _: serde_json::Value =
+                serde_json::from_str(line).expect("each JSONL line should be valid JSON");
+        }
+    }
+
+    #[test]
+    fn forensic_report_e2e_incident_reconstruction() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        // E2e scenario: Simulate a security incident and reconstruct it from
+        // the forensic report.
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let ns_legit = TenantNamespace::new("prod-team").unwrap();
+        let ns_attacker = TenantNamespace::new("rogue-actor").unwrap();
+
+        // Step 1: Normal operation — legit team accesses their connector
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Connector,
+            "payment-api",
+            ns_legit.clone(),
+        );
+        let legit_input = PolicyInput::new(ActionKind::ConnectorInvoke, ActorKind::Robot)
+            .with_domain("payment-api")
+            .with_namespace(ns_legit.clone());
+        engine.authorize(&legit_input);
+
+        // Step 2: Attack attempt — rogue actor tries cross-tenant access
+        let attack_input = PolicyInput::new(ActionKind::ConnectorInvoke, ActorKind::Robot)
+            .with_domain("payment-api")
+            .with_namespace(ns_attacker);
+        engine.authorize(&attack_input);
+
+        // Step 3: Incident response — revoke the connector
+        engine.revoke_resource(
+            "connector",
+            "payment-api",
+            "unauthorized access detected",
+            "incident-commander",
+            3000,
+        );
+
+        // Step 4: Generate forensic report
+        let query = ForensicQuery::default();
+        let report = engine.generate_forensic_report(&query, 10000);
+
+        // Verify the report captures the full incident chain
+        assert!(
+            !report.decisions.is_empty(),
+            "should have decision records"
+        );
+        assert!(
+            !report.audit_trail.is_empty(),
+            "should have audit trail entries"
+        );
+        assert_eq!(report.revocations.len(), 1, "should have the revocation");
+        assert!(
+            !report.namespace_violations.is_empty(),
+            "should have the cross-tenant violation"
+        );
+        assert!(
+            report.compliance_summary.total_denials > 0,
+            "should have compliance denials"
+        );
+
+        // Verify JSON export works
+        let json = engine
+            .export_forensic_report_json(&query, 10000)
+            .expect("should export");
+        assert!(json.contains("payment-api"));
+        assert!(json.contains("unauthorized access detected"));
     }
 }
