@@ -12,6 +12,13 @@ rich_rust = { path = "../rich_rust" }
 
 [patch."https://github.com/Dicklesworthstone/frankentui"]
 ftui = { path = "../frankentui/crates/ftui" }
+ftui-core = { path = "../frankentui/crates/ftui-core" }
+ftui-render = { path = "../frankentui/crates/ftui-render" }
+ftui-layout = { path = "../frankentui/crates/ftui-layout" }
+ftui-style = { path = "../frankentui/crates/ftui-style" }
+ftui-widgets = { path = "../frankentui/crates/ftui-widgets" }
+ftui-runtime = { path = "../frankentui/crates/ftui-runtime" }
+ftui-backend = { path = "../frankentui/crates/ftui-backend" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
 fastmcp-rust = { path = "../fastmcp_rust/crates/fastmcp" }

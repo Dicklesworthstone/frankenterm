@@ -3357,6 +3357,51 @@ pub fn evaluate_predicate(predicate: &RulePredicate, input: &PolicyInput) -> boo
 }
 
 // ============================================================================
+// Unified telemetry snapshot
+// ============================================================================
+
+/// Unified telemetry snapshot aggregating all PolicyEngine subsystem snapshots.
+///
+/// Provides a single serializable struct for `ft doctor --json`, dashboard feeds,
+/// and the unified telemetry schema (ft-3681t.7.1 precursor). Each field is an
+/// `Option` so subsystems that fail to snapshot don't block the aggregate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyEngineTelemetrySnapshot {
+    /// Capture timestamp (epoch ms).
+    pub captured_at_ms: u64,
+    /// Decision log snapshot.
+    pub decision_log: crate::policy_decision_log::DecisionLogSnapshot,
+    /// Quarantine registry snapshot.
+    pub quarantine: crate::policy_quarantine::QuarantineTelemetrySnapshot,
+    /// Audit chain snapshot.
+    pub audit_chain: crate::policy_audit_chain::AuditChainTelemetrySnapshot,
+    /// Compliance engine snapshot.
+    pub compliance: crate::policy_compliance::ComplianceSnapshot,
+    /// Credential broker snapshot.
+    pub credential_broker: crate::connector_credential_broker::CredentialBrokerTelemetrySnapshot,
+    /// Connector governor snapshot.
+    pub connector_governor: crate::connector_governor::GovernorSnapshot,
+    /// Connector registry telemetry snapshot.
+    pub connector_registry: crate::connector_registry::RegistryTelemetrySnapshot,
+    /// Connector reliability snapshots (one per connector).
+    pub connector_reliability: Vec<crate::connector_reliability::ConnectorReliabilitySnapshot>,
+    /// Bundle registry snapshot.
+    pub bundle_registry: crate::connector_bundles::BundleRegistrySnapshot,
+    /// Connector mesh telemetry snapshot.
+    pub connector_mesh: crate::connector_mesh::MeshTelemetrySnapshot,
+    /// Ingestion pipeline snapshot.
+    pub ingestion_pipeline: crate::connector_bundles::IngestionTelemetrySnapshot,
+    /// Namespace registry snapshot.
+    pub namespace_registry: crate::namespace_isolation::NamespaceRegistrySnapshot,
+    /// Approval tracker snapshot.
+    pub approval_tracker: ApprovalTrackerSnapshot,
+    /// Revocation registry snapshot.
+    pub revocation_registry: RevocationRegistrySnapshot,
+    /// Whether namespace isolation is enabled.
+    pub namespace_isolation_enabled: bool,
+}
+
+// ============================================================================
 // Policy Engine
 // ============================================================================
 
@@ -5646,6 +5691,36 @@ impl PolicyEngine {
     pub fn contains_secrets(&self, text: &str) -> bool {
         static REDACTOR: LazyLock<Redactor> = LazyLock::new(Redactor::new);
         REDACTOR.contains_secrets(text)
+    }
+
+    /// Capture a unified telemetry snapshot from all subsystems.
+    ///
+    /// Aggregates snapshots from decision log, quarantine, audit chain,
+    /// compliance, credential broker, connector governor, registry,
+    /// reliability, bundles, mesh, ingestion, namespace, approvals,
+    /// and revocations into a single [`PolicyEngineTelemetrySnapshot`].
+    ///
+    /// Some subsystem snapshots require `&mut self` (compliance, governor)
+    /// because they update internal counters during snapshot capture.
+    pub fn telemetry_snapshot(&mut self, now_ms: u64) -> PolicyEngineTelemetrySnapshot {
+        PolicyEngineTelemetrySnapshot {
+            captured_at_ms: now_ms,
+            decision_log: self.decision_log.snapshot(),
+            quarantine: self.quarantine_registry.telemetry_snapshot(now_ms),
+            audit_chain: self.audit_chain.telemetry_snapshot(now_ms),
+            compliance: self.compliance_engine.snapshot(now_ms),
+            credential_broker: self.credential_broker.telemetry_snapshot(now_ms),
+            connector_governor: self.connector_governor.snapshot(now_ms),
+            connector_registry: self.connector_registry.telemetry().snapshot(),
+            connector_reliability: self.reliability_registry.all_snapshots(),
+            bundle_registry: self.bundle_registry.snapshot(now_ms),
+            connector_mesh: self.connector_mesh.telemetry().snapshot(),
+            ingestion_pipeline: self.ingestion_pipeline.snapshot(now_ms),
+            namespace_registry: self.namespace_registry.snapshot(),
+            approval_tracker: self.approval_tracker.snapshot(),
+            revocation_registry: self.revocation_registry.snapshot(),
+            namespace_isolation_enabled: self.namespace_isolation_enabled,
+        }
     }
 }
 
@@ -14477,5 +14552,61 @@ mod tests {
             .expect("should export");
         assert!(json.contains("payment-api"));
         assert!(json.contains("unauthorized access detected"));
+    }
+
+    #[test]
+    fn telemetry_snapshot_captures_all_subsystems() {
+        let mut engine = PolicyEngine::new(10, 100, true);
+        let now_ms = 1_700_000_000_000;
+        let snap = engine.telemetry_snapshot(now_ms);
+
+        assert_eq!(snap.captured_at_ms, now_ms);
+        assert_eq!(snap.decision_log.current_entries, 0);
+        assert_eq!(snap.quarantine.active_quarantines, 0);
+        assert_eq!(snap.compliance.active_violations.len(), 0);
+        assert!(snap.connector_reliability.is_empty());
+        assert_eq!(snap.approval_tracker.total, 0);
+        assert_eq!(snap.revocation_registry.total_records, 0);
+        assert!(!snap.namespace_isolation_enabled);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serializes_to_json() {
+        let mut engine = PolicyEngine::new(10, 100, true);
+        let snap = engine.telemetry_snapshot(1_700_000_000_000);
+        let json = serde_json::to_string(&snap).expect("should serialize");
+        assert!(!json.is_empty());
+        let val: serde_json::Value =
+            serde_json::from_str(&json).expect("should be valid JSON");
+        let obj = val.as_object().expect("should be object");
+        assert!(obj.contains_key("decision_log"));
+        assert!(obj.contains_key("quarantine"));
+        assert!(obj.contains_key("audit_chain"));
+        assert!(obj.contains_key("compliance"));
+        assert!(obj.contains_key("connector_governor"));
+        assert!(obj.contains_key("namespace_isolation_enabled"));
+    }
+
+    #[test]
+    fn telemetry_snapshot_reflects_engine_state() {
+        let mut engine = PolicyEngine::new(10, 100, true);
+        let now_ms = 1_700_000_000_000;
+
+        // Quarantine a component
+        let _ = engine.quarantine_registry_mut().quarantine(
+            "snap-test",
+            crate::policy_quarantine::ComponentKind::Connector,
+            crate::policy_quarantine::QuarantineSeverity::Restricted,
+            crate::policy_quarantine::QuarantineReason::OperatorDirected {
+                operator: "test".to_string(),
+                note: "snapshot test".to_string(),
+            },
+            "test-op",
+            now_ms,
+            now_ms + 60_000,
+        );
+
+        let snap = engine.telemetry_snapshot(now_ms);
+        assert_eq!(snap.quarantine.active_quarantines, 1);
     }
 }

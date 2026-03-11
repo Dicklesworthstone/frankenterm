@@ -69,13 +69,13 @@ crossterm = { workspace = true, optional = true }
 
 # FrankenTUI (optional, migration target — see docs/adr/)
 ftui = { workspace = true, optional = true }
-ftui-core = { path = "../../../frankentui/crates/ftui-core", optional = true }
-ftui-render = { path = "../../../frankentui/crates/ftui-render", optional = true }
-ftui-layout = { path = "../../../frankentui/crates/ftui-layout", optional = true }
-ftui-style = { path = "../../../frankentui/crates/ftui-style", optional = true }
-ftui-widgets = { path = "../../../frankentui/crates/ftui-widgets", optional = true }
-ftui-runtime = { path = "../../../frankentui/crates/ftui-runtime", optional = true }
-ftui-backend = { path = "../../../frankentui/crates/ftui-backend", optional = true }
+ftui-core = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", optional = true }
+ftui-render = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", optional = true }
+ftui-layout = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", optional = true }
+ftui-style = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", optional = true }
+ftui-widgets = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", optional = true }
+ftui-runtime = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", optional = true }
+ftui-backend = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", optional = true }
 
 # MCP server (optional, behind feature)
 fastmcp = { workspace = true, optional = true }
@@ -423,6 +423,10 @@ required-features = ["recorder-lexical"]
 name = "proptest_tantivy_reindex"
 path = "tests/proptest_tantivy_reindex.rs"
 required-features = ["recorder-lexical"]
+
+[[test]]
+name = "proptest_daemon_bridge"
+path = "tests/proptest_daemon_bridge.rs"
 
 [[test]]
 name = "recorder_recovery_drills"
