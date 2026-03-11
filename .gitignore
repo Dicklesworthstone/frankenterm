@@ -104,8 +104,9 @@ docs/formal/*.tlc.log
 .cargo_*/
 .cargo-*/
 
-# Remote compilation helper cache
+# Remote compilation helper cache and build artifacts
 .rch/
+.rch-target/
 
 # Agent mail SQLite databases (runtime state, not project data)
 storage.sqlite3
