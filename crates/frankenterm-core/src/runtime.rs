@@ -84,7 +84,7 @@ fn config_update_pending(rx: &watch::Receiver<HotReloadableConfig>) -> bool {
     }
 }
 
-fn config_take_update(rx: &watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
+fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
     #[cfg(feature = "asupersync-runtime")]
     {
         rx.borrow_and_clone()
@@ -1358,7 +1358,7 @@ impl ObservationRuntime {
         let storage = self.storage.clone();
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let wezterm_handle = self.wezterm_handle.clone();
-        let config_rx = self.config_rx.clone();
+        let mut config_rx = self.config_rx.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
         let registry = Arc::clone(&self.registry);
         let cursors = Arc::clone(&self.cursors);
@@ -1399,7 +1399,7 @@ impl ObservationRuntime {
 
                 // Check for config updates
                 if config_update_pending(&config_rx) {
-                    let new_config = config_take_update(&config_rx);
+                    let new_config = config_take_update(&mut config_rx);
                     if new_config.retention_days != retention_days {
                         info!(
                             old = retention_days,
@@ -1713,7 +1713,7 @@ impl ObservationRuntime {
         let storage = self.storage.clone();
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let initial_interval = self.config.discovery_interval;
-        let config_rx = self.config_rx.clone();
+        let mut config_rx = self.config_rx.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
         let wezterm = Arc::clone(&self.wezterm_handle);
         let replay_capture = self.replay_capture.clone();
@@ -1743,7 +1743,7 @@ impl ObservationRuntime {
 
                 // Check for config updates (non-blocking)
                 if config_update_pending(&config_rx) {
-                    let new_config = config_take_update(&config_rx);
+                    let new_config = config_take_update(&mut config_rx);
                     let new_interval = Duration::from_millis(new_config.poll_interval_ms);
                     if new_interval != current_interval {
                         info!(
@@ -1939,7 +1939,7 @@ impl ObservationRuntime {
         let cursors = Arc::clone(&self.cursors);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let discovery_interval = self.config.discovery_interval;
-        let config_rx = self.config_rx.clone();
+        let mut config_rx = self.config_rx.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
         let wezterm_handle = Arc::clone(&self.wezterm_handle);
         let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
@@ -2053,7 +2053,7 @@ impl ObservationRuntime {
 
                     // Check for config updates
                     if config_update_pending(&config_rx) {
-                        let new_config = config_take_update(&config_rx);
+                        let new_config = config_take_update(&mut config_rx);
                         let new_tailer_config = TailerConfig {
                             min_interval: Duration::from_millis(new_config.min_poll_interval_ms),
                             max_interval: Duration::from_millis(new_config.poll_interval_ms),
@@ -2490,7 +2490,7 @@ impl ObservationRuntime {
         let event_bus = self.event_bus.clone();
         let recording = self.recording.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
-        let config_rx = self.config_rx.clone();
+        let mut config_rx = self.config_rx.clone();
         let mut current_patterns = self.config.patterns.clone();
         let patterns_root = self.config.patterns_root.clone();
         let registry = Arc::clone(&registry);
@@ -2506,7 +2506,7 @@ impl ObservationRuntime {
                 }
 
                 if config_update_pending(&config_rx) {
-                    let new_config = config_take_update(&config_rx);
+                    let new_config = config_take_update(&mut config_rx);
                     if new_config.patterns != current_patterns {
                         match PatternEngine::from_config_with_root(
                             &new_config.patterns,
