@@ -9895,9 +9895,30 @@ async fn emit_recorder_backend_lifecycle_event(
 #[cfg(feature = "distributed")]
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct DistributedHandshake {
+    protocol_version: Option<u32>,
     token: Option<String>,
     agent_id: Option<String>,
     session_id: Option<String>,
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_validate_handshake_protocol_version(
+    protocol_version: Option<u32>,
+) -> Result<(), frankenterm_core::distributed::DistributedSecurityError> {
+    match protocol_version {
+        Some(version) if version == frankenterm_core::wire_protocol::PROTOCOL_VERSION => Ok(()),
+        Some(got) => Err(
+            frankenterm_core::distributed::DistributedSecurityError::ProtocolVersionMismatch {
+                expected: frankenterm_core::wire_protocol::PROTOCOL_VERSION,
+                got,
+            },
+        ),
+        None => Err(
+            frankenterm_core::distributed::DistributedSecurityError::ProtocolVersionMissing {
+                expected: frankenterm_core::wire_protocol::PROTOCOL_VERSION,
+            },
+        ),
+    }
 }
 
 #[cfg(feature = "distributed")]
@@ -10076,10 +10097,31 @@ async fn distributed_publish_security_error<S>(
 
     let payload = serde_json::json!({
         "ok": false,
+        "protocol_version": frankenterm_core::wire_protocol::PROTOCOL_VERSION,
+        "server_version": frankenterm_core::VERSION,
         "error": {
             "code": err.code(),
             "message": err.to_string()
         }
+    });
+    if let Ok(encoded) = serde_json::to_string(&payload) {
+        let _ = reader.get_mut().write_all(encoded.as_bytes()).await;
+        let _ = reader.get_mut().write_all(b"\n").await;
+        let _ = reader.get_mut().flush().await;
+    }
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_publish_handshake_ok<S>(reader: &mut asupersync::io::BufReader<S>)
+where
+    S: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
+{
+    use asupersync::io::AsyncWriteExt;
+
+    let payload = serde_json::json!({
+        "ok": true,
+        "protocol_version": frankenterm_core::wire_protocol::PROTOCOL_VERSION,
+        "server_version": frankenterm_core::VERSION,
     });
     if let Ok(encoded) = serde_json::to_string(&payload) {
         let _ = reader.get_mut().write_all(encoded.as_bytes()).await;
@@ -10456,6 +10498,11 @@ async fn distributed_handle_connection<S>(
         }
     };
 
+    if let Err(err) = distributed_validate_handshake_protocol_version(handshake.protocol_version) {
+        distributed_publish_security_error(&mut reader, err).await;
+        return;
+    }
+
     if !allow_agent_ids.is_empty() {
         let Some(agent_id) = handshake.agent_id.as_deref() else {
             distributed_publish_security_error(
@@ -10485,6 +10532,8 @@ async fn distributed_handle_connection<S>(
         distributed_publish_security_error(&mut reader, err).await;
         return;
     }
+
+    distributed_publish_handshake_ok(&mut reader).await;
 
     let normalized_handshake_agent = handshake
         .agent_id
@@ -11100,6 +11149,7 @@ async fn distributed_agent_stream_session(
 
     let mut stream = asupersync::io::BufReader::new(io);
     let handshake = DistributedHandshake {
+        protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
         token: token.map(ToOwned::to_owned),
         agent_id: Some(agent_id.to_string()),
         session_id: Some(session_id.to_string()),
@@ -11128,22 +11178,46 @@ async fn distributed_agent_stream_session(
         }
         Ok(Ok(_)) => {
             let trimmed = handshake_response.trim();
-            if !trimmed.is_empty() {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    let ok = value.get("ok").and_then(serde_json::Value::as_bool);
-                    if ok == Some(false) {
-                        let message = value
-                            .get("error")
-                            .and_then(|err| err.get("message"))
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("distributed handshake rejected");
-                        anyhow::bail!("{message}");
-                    }
+            if trimmed.is_empty() {
+                anyhow::bail!("Distributed handshake acknowledgement missing payload");
+            }
+            let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+                anyhow::anyhow!("Distributed handshake acknowledgement was invalid JSON: {err}")
+            })?;
+            let Some(ok) = value.get("ok").and_then(serde_json::Value::as_bool) else {
+                anyhow::bail!("Distributed handshake acknowledgement missing ok field");
+            };
+            if !ok {
+                let code = value
+                    .get("error")
+                    .and_then(|err| err.get("code"))
+                    .and_then(serde_json::Value::as_str);
+                let message = value
+                    .get("error")
+                    .and_then(|err| err.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("distributed handshake rejected");
+                if let Some(code) = code {
+                    anyhow::bail!("{code}: {message}");
                 }
+                anyhow::bail!("{message}");
+            }
+            let Some(protocol_version) = value
+                .get("protocol_version")
+                .and_then(serde_json::Value::as_u64)
+            else {
+                anyhow::bail!("Distributed handshake acknowledgement missing protocol_version");
+            };
+            if protocol_version != u64::from(frankenterm_core::wire_protocol::PROTOCOL_VERSION) {
+                anyhow::bail!(
+                    "Distributed protocol version mismatch: expected {}, got {}",
+                    frankenterm_core::wire_protocol::PROTOCOL_VERSION,
+                    protocol_version
+                );
             }
         }
         Ok(Err(err)) => anyhow::bail!("Distributed handshake response read failed: {err}"),
-        Err(_) => {}
+        Err(_) => anyhow::bail!("Distributed handshake acknowledgement timed out"),
     }
 
     distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
@@ -38582,6 +38656,7 @@ recorder_backend = "frankensqlite"
         let now = now_ms();
 
         let handshake = DistributedHandshake {
+            protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
             token: distributed_config.token.clone(),
             agent_id: Some(sender.to_string()),
             session_id: Some("session-stream".to_string()),
@@ -38595,6 +38670,29 @@ recorder_backend = "frankensqlite"
             .write_all(b"\n")
             .await
             .expect("write handshake newline");
+        stream.flush().await.expect("flush handshake");
+
+        let mut reader = asupersync::io::BufReader::new(stream);
+        let mut line = String::new();
+        let read_size = frankenterm_core::runtime_compat::timeout(
+            std::time::Duration::from_secs(1),
+            distributed_read_line(
+                &mut reader,
+                &mut line,
+                frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+            ),
+        )
+        .await
+        .expect("read handshake acknowledgement within timeout")
+        .expect("read handshake acknowledgement");
+        assert!(read_size > 0, "listener should emit handshake acknowledgement");
+        let payload: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("parse handshake acknowledgement json");
+        assert_eq!(payload["ok"], serde_json::Value::Bool(true));
+        assert_eq!(
+            payload["protocol_version"],
+            serde_json::Value::from(frankenterm_core::wire_protocol::PROTOCOL_VERSION)
+        );
 
         let pane_meta = PaneMeta {
             pane_id: source_pane_id,
@@ -38620,14 +38718,23 @@ recorder_backend = "frankensqlite"
 
         for envelope in [envelope_meta, envelope_delta] {
             let bytes = envelope.to_json().expect("serialize envelope");
-            stream.write_all(&bytes).await.expect("write envelope");
-            stream
+            reader
+                .get_mut()
+                .write_all(&bytes)
+                .await
+                .expect("write envelope");
+            reader
+                .get_mut()
                 .write_all(b"\n")
                 .await
                 .expect("write envelope newline");
         }
-        stream.flush().await.expect("flush envelope writes");
-        drop(stream);
+        reader
+            .get_mut()
+            .flush()
+            .await
+            .expect("flush envelope writes");
+        drop(reader);
 
         frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(150)).await;
 
@@ -38724,6 +38831,7 @@ recorder_backend = "frankensqlite"
                     .expect("connect distributed listener");
 
                 let handshake = DistributedHandshake {
+                    protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
                     token: Some("wrong-token".to_string()),
                     agent_id: Some("agent-invalid".to_string()),
                     session_id: Some("session-invalid".to_string()),
@@ -38773,6 +38881,123 @@ recorder_backend = "frankensqlite"
                 assert!(
                     remote_records.is_empty(),
                     "invalid-token session must not persist remote pane metadata"
+                );
+
+                shutdown_flag.store(true, Ordering::SeqCst);
+                let _ = listener_handle.await;
+
+                {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    storage_handle.shutdown().await.expect("shutdown storage");
+                }
+                drop(storage);
+                let _ = std::fs::remove_file(&db_path);
+                let _ = std::fs::remove_file(format!("{db_path}-wal"));
+                let _ = std::fs::remove_file(format!("{db_path}-shm"));
+            });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_listener_rejects_handshake_version_mismatch_and_does_not_persist_remote_panes() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use asupersync::io::AsyncWriteExt;
+                use asupersync::net::TcpStream;
+                use std::sync::atomic::Ordering;
+
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_listener_version_mismatch_rejected").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                    storage_handle,
+                ));
+                let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                let bind_probe =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
+                drop(bind_probe);
+
+                let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
+                distributed_config.enabled = true;
+                distributed_config.bind_addr = bind_addr.to_string();
+                distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
+                distributed_config.token = Some("expected-token".to_string());
+
+                let listener_handle = spawn_distributed_listener(
+                    distributed_config.clone(),
+                    std::sync::Arc::clone(&storage),
+                    std::sync::Arc::clone(&event_bus),
+                    std::sync::Arc::clone(&shutdown_flag),
+                )
+                .await
+                .expect("spawn distributed listener");
+
+                let mut stream = TcpStream::connect(distributed_config.bind_addr.clone())
+                    .await
+                    .expect("connect distributed listener");
+
+                let handshake = DistributedHandshake {
+                    protocol_version: Some(
+                        frankenterm_core::wire_protocol::PROTOCOL_VERSION.saturating_add(1),
+                    ),
+                    token: distributed_config.token.clone(),
+                    agent_id: Some("agent-version".to_string()),
+                    session_id: Some("session-version".to_string()),
+                };
+                let handshake_json =
+                    serde_json::to_string(&handshake).expect("serialize handshake");
+                stream
+                    .write_all(handshake_json.as_bytes())
+                    .await
+                    .expect("write handshake");
+                stream
+                    .write_all(b"\n")
+                    .await
+                    .expect("write handshake newline");
+                stream.flush().await.expect("flush handshake");
+
+                let mut reader = asupersync::io::BufReader::new(stream);
+                let mut line = String::new();
+                let read_size = frankenterm_core::runtime_compat::timeout(
+                    std::time::Duration::from_secs(1),
+                    distributed_read_line(
+                        &mut reader,
+                        &mut line,
+                        frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                    ),
+                )
+                .await
+                .expect("read security response within timeout")
+                .expect("read security response");
+                assert!(
+                    read_size > 0,
+                    "listener should emit version mismatch response"
+                );
+
+                let payload: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse security response json");
+                assert_eq!(payload["ok"], serde_json::Value::Bool(false));
+                assert_eq!(payload["error"]["code"], "dist.version_mismatch");
+                assert_eq!(
+                    payload["protocol_version"],
+                    serde_json::Value::from(frankenterm_core::wire_protocol::PROTOCOL_VERSION)
+                );
+
+                drop(reader);
+                frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(100))
+                    .await;
+
+                let remote_records = load_distributed_remote_panes(std::path::Path::new(&db_path))
+                    .await
+                    .expect("load distributed remote panes");
+                assert!(
+                    remote_records.is_empty(),
+                    "version-mismatched session must not persist remote pane metadata"
                 );
 
                 shutdown_flag.store(true, Ordering::SeqCst);

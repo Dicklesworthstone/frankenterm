@@ -142,6 +142,10 @@ pub enum DistributedSecurityError {
     MissingToken,
     #[error("distributed auth failed")]
     AuthFailed,
+    #[error("distributed protocol version missing (expected {expected})")]
+    ProtocolVersionMissing { expected: u32 },
+    #[error("distributed protocol version mismatch: expected {expected}, got {got}")]
+    ProtocolVersionMismatch { expected: u32, got: u32 },
     #[error("distributed replay detected")]
     ReplayDetected,
     #[error("distributed session limit reached")]
@@ -163,6 +167,9 @@ impl DistributedSecurityError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::MissingToken | Self::AuthFailed => "dist.auth_failed",
+            Self::ProtocolVersionMissing { .. } | Self::ProtocolVersionMismatch { .. } => {
+                "dist.version_mismatch"
+            }
             Self::ReplayDetected => "dist.replay_detected",
             Self::SessionLimitReached => "dist.session_limit",
             Self::ConnectionLimitReached => "dist.connection_limit",
