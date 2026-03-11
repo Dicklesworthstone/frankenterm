@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://wezterm-automata.dev/schemas/wa-robot-workflow-run.json",
   "title": "WA Robot Workflow Run Response",
-  "description": "Schema for the data field when calling 'wa robot workflow run <name> --pane <id>'. Triggers a workflow execution.",
+  "description": "Schema for the data field when calling 'wa robot workflow run <name> <pane_id>'. Triggers a workflow execution.",
   "type": "object",
   "required": ["workflow_name", "pane_id", "status"],
   "properties": {

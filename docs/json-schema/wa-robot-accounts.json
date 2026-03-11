@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://wezterm-automata.dev/schemas/wa-robot-accounts.json",
   "title": "WA Robot Accounts Response",
-  "description": "Schema for the data field when calling 'wa robot accounts'. Lists AI coding service accounts and their usage.",
+  "description": "Schema for the data field when calling 'wa robot accounts list'. Lists AI coding service accounts and their usage.",
   "type": "object",
   "required": ["accounts", "total", "service"],
   "properties": {

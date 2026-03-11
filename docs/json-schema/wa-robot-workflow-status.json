@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://wezterm-automata.dev/schemas/wa-robot-workflow-status.json",
   "title": "WA Robot Workflow Status Response",
-  "description": "Schema for the data field when calling 'wa robot workflow status <execution_id>'. Returns workflow execution status.",
+  "description": "Schema for the data field when calling 'wa robot workflow status [<execution_id>] [--pane <id>] [--active]'. Returns workflow execution status.",
   "type": "object",
   "required": ["execution_id", "workflow_name", "status"],
   "properties": {
