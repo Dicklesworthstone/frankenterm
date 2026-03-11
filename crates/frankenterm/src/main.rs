@@ -10273,7 +10273,10 @@ async fn distributed_persist_payload(
                 if let Some(gap) = storage_handle.record_gap(remote_pane_id, &reason).await? {
                     let _ = event_bus.publish(Event::GapDetected {
                         pane_id: gap.pane_id,
+                        seq_before: gap.seq_before,
+                        seq_after: gap.seq_after,
                         reason: gap.reason,
+                        detected_at_ms: gap.detected_at,
                     });
                 }
             }
@@ -10321,7 +10324,10 @@ async fn distributed_persist_payload(
             if let Some(stored_gap) = storage_handle.record_gap(remote_pane_id, &reason).await? {
                 let _ = event_bus.publish(Event::GapDetected {
                     pane_id: stored_gap.pane_id,
+                    seq_before: stored_gap.seq_before,
+                    seq_after: stored_gap.seq_after,
                     reason: stored_gap.reason,
+                    detected_at_ms: stored_gap.detected_at,
                 });
             }
         }
@@ -10933,30 +10939,6 @@ async fn distributed_agent_send_envelope(
 }
 
 #[cfg(feature = "distributed")]
-async fn distributed_agent_gap_notice_for_persisted_gap(
-    storage: &Arc<
-        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
-    >,
-    pane_id: u64,
-    reason: &str,
-) -> anyhow::Result<Option<frankenterm_core::wire_protocol::GapNotice>> {
-    let storage_handle = storage.lock().await.clone(); // ubs:ignore
-    let gap = storage_handle
-        .get_gaps()
-        .await?
-        .into_iter()
-        .find(|gap| gap.pane_id == pane_id && gap.reason == reason);
-
-    Ok(gap.map(|gap| frankenterm_core::wire_protocol::GapNotice {
-        pane_id: gap.pane_id,
-        seq_before: gap.seq_before,
-        seq_after: gap.seq_after,
-        reason: gap.reason,
-        detected_at_ms: gap.detected_at,
-    }))
-}
-
-#[cfg(feature = "distributed")]
 async fn distributed_agent_seed_segment_cursors(
     storage: &Arc<
         frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
@@ -11157,16 +11139,6 @@ async fn distributed_agent_stream_event(
                     };
                     if let Some(record) = pane_record {
                         *meta = distributed_agent_pane_meta(&record);
-                    }
-                } else if let WirePayload::Gap(gap) = &mut envelope.payload {
-                    if let Some(persisted_gap) = distributed_agent_gap_notice_for_persisted_gap(
-                        storage,
-                        gap.pane_id,
-                        &gap.reason,
-                    )
-                    .await?
-                    {
-                        *gap = persisted_gap;
                     }
                 }
                 distributed_agent_send_envelope(stream, &envelope).await?;
@@ -38705,57 +38677,81 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
-    fn distributed_agent_gap_notice_for_persisted_gap_uses_recorded_bounds() {
+    fn distributed_persist_payload_gap_event_carries_recorded_bounds() {
         run_async_test(async {
-            let (storage_handle, db_path) =
-                setup_storage("distributed_agent_gap_notice_bounds").await;
+            let (storage_handle, db_path) = setup_storage("distributed_gap_event_bounds").await;
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+            let pane_seq_by_sender =
+                frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<
+                    (String, u64),
+                    u64,
+                >::new());
+            let sender = "agent-gap-event";
+            let source_pane_id = 41_u64;
+            let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+            let mut subscriber = event_bus.subscribe();
 
-            let pane_id = 41_u64;
-            let now = now_ms_i64();
-            let stored_gap = {
-                let storage_handle = storage.lock().await.clone(); // ubs:ignore
-                storage_handle
-                    .upsert_pane(frankenterm_core::storage::PaneRecord {
-                        pane_id,
-                        pane_uuid: None,
-                        domain: "local".to_string(),
-                        window_id: None,
-                        tab_id: None,
-                        title: Some("gap-source".to_string()),
-                        cwd: Some("/tmp".to_string()),
-                        tty_name: None,
-                        first_seen_at: now,
-                        last_seen_at: now,
-                        observed: true,
-                        ignore_reason: None,
-                        last_decision_at: None,
-                    })
-                    .await
-                    .unwrap();
-                let segment = storage_handle
-                    .append_segment(pane_id, "before-gap", None)
-                    .await
-                    .unwrap();
-                assert_eq!(segment.seq, 1);
-                storage_handle
-                    .record_gap(pane_id, "timeout")
-                    .await
-                    .unwrap()
-                    .unwrap()
-            };
+            distributed_persist_payload(
+                sender,
+                frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                    frankenterm_core::wire_protocol::PaneDelta {
+                        pane_id: source_pane_id,
+                        seq: 1,
+                        content: "before-gap".to_string(),
+                        content_len: "before-gap".len(),
+                        captured_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
 
-            let notice =
-                distributed_agent_gap_notice_for_persisted_gap(&storage, pane_id, "timeout")
-                    .await
-                    .unwrap()
-                    .unwrap();
-            assert_eq!(notice.pane_id, pane_id);
-            assert_eq!(notice.seq_before, stored_gap.seq_before);
-            assert_eq!(notice.seq_after, stored_gap.seq_after);
-            assert_eq!(notice.reason, stored_gap.reason);
-            assert_eq!(notice.detected_at_ms, stored_gap.detected_at);
+            let first = subscriber.recv().await.unwrap();
+            assert!(matches!(
+                first,
+                frankenterm_core::events::Event::SegmentCaptured { .. }
+            ));
+
+            distributed_persist_payload(
+                sender,
+                frankenterm_core::wire_protocol::WirePayload::Gap(
+                    frankenterm_core::wire_protocol::GapNotice {
+                        pane_id: source_pane_id,
+                        seq_before: 1,
+                        seq_after: 4,
+                        reason: "timeout".to_string(),
+                        detected_at_ms: now_ms_i64(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            let second = subscriber.recv().await.unwrap();
+            match second {
+                frankenterm_core::events::Event::GapDetected {
+                    pane_id,
+                    seq_before,
+                    seq_after,
+                    reason,
+                    detected_at_ms,
+                } => {
+                    assert_eq!(pane_id, remote_pane_id);
+                    assert_eq!(seq_before, 2);
+                    assert_eq!(seq_after, 3);
+                    assert_eq!(reason, "distributed_gap:timeout:1:4");
+                    assert!(detected_at_ms > 0);
+                }
+                other => panic!("expected gap event, got {other:?}"),
+            }
 
             {
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore

@@ -85,8 +85,22 @@ fn arb_event() -> impl Strategy<Value = Event> {
             }
         }),
         // GapDetected
-        (0..1000u64, "[a-z_ ]{1,30}")
-            .prop_map(|(pane_id, reason)| Event::GapDetected { pane_id, reason }),
+        (
+            0..1000u64,
+            0..10000u64,
+            0..10000u64,
+            "[a-z_ ]{1,30}",
+            0..1_000_000i64,
+        )
+            .prop_map(|(pane_id, seq_before, seq_after, reason, detected_at_ms)| {
+                Event::GapDetected {
+                    pane_id,
+                    seq_before,
+                    seq_after,
+                    reason,
+                    detected_at_ms,
+                }
+            }),
         // PatternDetected
         (0..1000u64, arb_detection()).prop_map(|(pane_id, detection)| Event::PatternDetected {
             pane_id,

@@ -993,6 +993,38 @@ mod tests {
     }
 
     #[test]
+    fn streamer_preserves_distinct_bounds_for_same_reason_gap_events() {
+        let mut streamer = AgentStreamer::new("test");
+        let first = Event::GapDetected {
+            pane_id: 5,
+            seq_before: 8,
+            seq_after: 12,
+            reason: "timeout".into(),
+            detected_at_ms: 1111,
+        };
+        let second = Event::GapDetected {
+            pane_id: 5,
+            seq_before: 12,
+            seq_after: 20,
+            reason: "timeout".into(),
+            detected_at_ms: 2222,
+        };
+
+        let first_env = streamer.event_to_envelope(&first).unwrap();
+        let second_env = streamer.event_to_envelope(&second).unwrap();
+
+        match (&first_env.payload, &second_env.payload) {
+            (WirePayload::Gap(first_gap), WirePayload::Gap(second_gap)) => {
+                assert_eq!((first_gap.seq_before, first_gap.seq_after), (8, 12));
+                assert_eq!((second_gap.seq_before, second_gap.seq_after), (12, 20));
+                assert_eq!(first_gap.reason, second_gap.reason);
+                assert_ne!(first_gap.detected_at_ms, second_gap.detected_at_ms);
+            }
+            other => panic!("expected gap payloads, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn streamer_converts_pattern_detected() {
         use crate::patterns::Detection;
 
