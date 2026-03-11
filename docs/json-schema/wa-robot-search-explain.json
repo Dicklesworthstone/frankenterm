@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-search-explain.json",
+  "title": "WA Robot Search Explain Response",
+  "description": "Schema for the data field when calling 'wa robot search-explain <query>'. Returns ranked reasons why search results may be missing or incomplete.",
+  "type": "object",
+  "required": [
+    "query",
+    "total_panes",
+    "observed_panes",
+    "ignored_panes",
+    "total_segments",
+    "reasons"
+  ],
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "The canonical query string after policy redaction"
+    },
+    "pane_filter": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "If set, the explanation was scoped to this pane_id"
+    },
+    "total_panes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total panes considered when building the explanation context"
+    },
+    "observed_panes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Panes currently observed and eligible for indexing"
+    },
+    "ignored_panes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Panes excluded from indexing or search coverage"
+    },
+    "total_segments": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total indexed segments across the explanation context"
+    },
+    "reasons": {
+      "type": "array",
+      "description": "Ranked reasons, highest-confidence first",
+      "items": {
+        "$ref": "#/$defs/reason"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "reason": {
+      "type": "object",
+      "description": "A single diagnosis for missing or incomplete search results",
+      "required": ["code", "summary", "evidence", "suggestions", "confidence"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Stable reason code for machine consumption"
+        },
+        "summary": {
+          "type": "string",
+          "description": "Human-readable reason summary"
+        },
+        "evidence": {
+          "type": "array",
+          "description": "Structured evidence supporting this diagnosis",
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        },
+        "suggestions": {
+          "type": "array",
+          "description": "Suggested commands or actions to address the issue",
+          "items": {
+            "type": "string"
+          }
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Confidence score for this diagnosis"
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "description": "Key/value evidence item associated with a diagnosis",
+      "required": ["key", "value"],
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "Evidence key"
+        },
+        "value": {
+          "type": "string",
+          "description": "Evidence value"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -303,6 +303,36 @@ impl SchemaRegistry {
                     since: "0.1.0".into(),
                 },
                 EndpointMeta {
+                    id: "agents_list".into(),
+                    title: "List Agents".into(),
+                    description: "List installed agents from filesystem detection".into(),
+                    robot_command: Some("robot agents list".into()),
+                    mcp_tool: None,
+                    schema_file: "wa-robot-agents-list.json".into(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
+                    id: "agents_running".into(),
+                    title: "List Running Agents".into(),
+                    description: "List running agents inferred from active panes".into(),
+                    robot_command: Some("robot agents running".into()),
+                    mcp_tool: None,
+                    schema_file: "wa-robot-agents-running.json".into(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
+                    id: "agents_detect".into(),
+                    title: "Detect Agents".into(),
+                    description: "Run installed-agent detection and return inventory".into(),
+                    robot_command: Some("robot agents detect".into()),
+                    mcp_tool: None,
+                    schema_file: "wa-robot-agents-detect.json".into(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
                     id: "workflow_run".into(),
                     title: "Run Workflow".into(),
                     description: "Execute a named workflow".into(),
@@ -976,6 +1006,9 @@ mod tests {
             "wa-robot-search-index-reindex.json",
             "wa-robot-events.json",
             "wa-robot-event-mutation.json",
+            "wa-robot-agents-list.json",
+            "wa-robot-agents-running.json",
+            "wa-robot-agents-detect.json",
             "wa-robot-workflow-run.json",
             "wa-robot-workflow-list.json",
             "wa-robot-workflow-status.json",
@@ -1051,6 +1084,33 @@ mod tests {
         assert_eq!(
             search_index_reindex.robot_command.as_deref(),
             Some("robot search-index reindex")
+        );
+    }
+
+    #[test]
+    fn agents_endpoints_use_nested_robot_command_paths() {
+        let reg = SchemaRegistry::canonical();
+
+        let agents_list = reg.get("agents_list").expect("agents_list endpoint exists");
+        assert_eq!(
+            agents_list.robot_command.as_deref(),
+            Some("robot agents list")
+        );
+
+        let agents_running = reg
+            .get("agents_running")
+            .expect("agents_running endpoint exists");
+        assert_eq!(
+            agents_running.robot_command.as_deref(),
+            Some("robot agents running")
+        );
+
+        let agents_detect = reg
+            .get("agents_detect")
+            .expect("agents_detect endpoint exists");
+        assert_eq!(
+            agents_detect.robot_command.as_deref(),
+            Some("robot agents detect")
         );
     }
 

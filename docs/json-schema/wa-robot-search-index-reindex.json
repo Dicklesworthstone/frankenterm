@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-search-index-reindex.json",
+  "title": "WA Robot Search Index Reindex Response",
+  "description": "Schema for the data field when calling 'wa robot search-index reindex'. Returns the batch, filter, and document-accounting summary for a forced search index rebuild.",
+  "type": "object",
+  "required": [
+    "batch_size",
+    "scanned_segments",
+    "submitted_docs",
+    "accepted_docs",
+    "skipped_empty_docs",
+    "skipped_duplicate_docs",
+    "skipped_cass_docs",
+    "skipped_resize_pause_docs",
+    "deferred_rate_limited_docs",
+    "flushed_docs",
+    "expired_docs",
+    "evicted_docs",
+    "pane_metadata_docs",
+    "flush_operations",
+    "final_document_count",
+    "final_index_size_bytes",
+    "source_counts"
+  ],
+  "properties": {
+    "batch_size": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Batch size used while replaying capture history into the index"
+    },
+    "pane_filter": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "If set, only this pane was reindexed"
+    },
+    "since_filter": {
+      "type": ["integer", "null"],
+      "description": "If set, only segments captured at or after this timestamp (epoch ms) were considered"
+    },
+    "until_filter": {
+      "type": ["integer", "null"],
+      "description": "If set, only segments captured at or before this timestamp (epoch ms) were considered"
+    },
+    "scanned_segments": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Segments scanned from storage during reindex"
+    },
+    "submitted_docs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Documents submitted to the index writer"
+    },
+    "accepted_docs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Submitted documents accepted after dedupe/filtering"
+    },
+    "skipped_empty_docs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Segments skipped because they contained no indexable text"
+    },
+    "skipped_duplicate_docs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Documents skipped as duplicates of existing indexed content"
+    },
+    "skipped_cass_docs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Documents skipped because they belong to Cass capture data"
+    },
+    "skipped_resize_pause_docs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Documents skipped because they were classified as resize/pause noise"
+    },
+    "deferred_rate_limited_docs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Documents deferred because indexing rate limits were reached"
+    },
+    "flushed_docs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Documents flushed to disk during this run"
+    },
+    "expired_docs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Documents expired by retention cleanup during this run"
+    },
+    "evicted_docs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Documents evicted to satisfy index size limits"
+    },
+    "pane_metadata_docs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Metadata-only pane documents emitted during reindex"
+    },
+    "flush_operations": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of explicit writer flush operations performed"
+    },
+    "final_document_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Document count after the reindex completed"
+    },
+    "final_index_size_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Approximate on-disk index size after the run"
+    },
+    "source_counts": {
+      "type": "object",
+      "description": "Accepted document counts grouped by source type",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    }
+  },
+  "additionalProperties": false
+}
