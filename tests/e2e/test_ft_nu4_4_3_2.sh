@@ -12,6 +12,7 @@ LOG_FILE="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}.jsonl"
 SUMMARY_FILE="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_summary.json"
 TARGET_DIR="target-rch-ft-nu4-4-3-2-${RUN_ID}"
 REMOTE_TARGET_DIR="/tmp/${TARGET_DIR}"
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|running locally'
 
 emit_log() {
   local outcome="$1"
@@ -99,7 +100,7 @@ run_rch_guarded() {
   local cmd_status=${PIPESTATUS[0]}
   set -e
 
-  if grep -q "\\[RCH\\] local" "${output_log}"; then
+  if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_log}"; then
     fail_now \
       "${scenario}" \
       "${decision_path}.offload_guard" \
@@ -247,7 +248,7 @@ run_rch_guarded \
   env TMPDIR=/tmp \
     rch exec -- \
     env TMPDIR=/tmp CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
-    cargo bench -p frankenterm-core --features distributed --bench wa_agent_streaming -- --quick
+    cargo bench -p frankenterm-core --features distributed,asupersync-runtime --bench wa_agent_streaming -- --quick
 
 emit_log \
   "passed" \

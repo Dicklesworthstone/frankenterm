@@ -21,6 +21,15 @@ CORRELATION_ID="${SCENARIO_ID}-$(date +%s)"
 LOG_DIR="${TMPDIR:-/tmp}/ft-e2e-${SCENARIO_ID}"
 mkdir -p "$LOG_DIR"
 
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft1i2ge-4-7"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+    CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+    CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
+
 log_structured() {
     local outcome="$1" reason_code="$2" error_code="${3:-}" extra="${4:-}"
     printf '{"timestamp":"%s","component":"%s","scenario_id":"%s","correlation_id":"%s","outcome":"%s","reason_code":"%s","error_code":"%s"%s}\n' \
@@ -35,6 +44,10 @@ RCH_SMOKE_LOG="$LOG_DIR/rch_smoke.log"
 
 run_rch() {
     TMPDIR=/tmp rch "$@"
+}
+
+run_rch_cargo() {
+    run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
 }
 
 probe_has_reachable_workers() {
@@ -73,7 +86,7 @@ if [[ $probe_rc -ne 0 ]] || ! probe_has_reachable_workers "$RCH_PROBE_LOG"; then
 fi
 
 set +e
-run_rch exec -- cargo check --help >"$RCH_SMOKE_LOG" 2>&1
+run_rch_cargo check --help >"$RCH_SMOKE_LOG" 2>&1
 smoke_rc=$?
 set -e
 check_rch_fallback_in_logs "rch_remote_smoke" "$RCH_SMOKE_LOG"
@@ -84,7 +97,7 @@ if [[ $smoke_rc -ne 0 ]]; then
     exit 1
 fi
 
-CARGO_CMD="run_rch exec -- cargo"
+CARGO_CMD="run_rch_cargo"
 
 echo "=== E2E: ${SCENARIO_ID} — Safety Guardrail Adversarial Suite ==="
 echo "    cargo_cmd=${CARGO_CMD}"

@@ -23,6 +23,15 @@ LOG_FILE="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}.jsonl"
 
 mkdir -p "$LOG_DIR"
 
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft3hbv9"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+    CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+    CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
+
 # ── Structured log helper ──────────────────────────────────────────────────
 log_event() {
     local component="$1"
@@ -51,6 +60,10 @@ run_rch() {
     TMPDIR=/tmp rch "$@"
 }
 
+run_rch_cargo() {
+    run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
+}
+
 probe_has_reachable_workers() {
     grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
 }
@@ -72,7 +85,7 @@ run_rch_cargo_logged() {
     shift 2
 
     set +e
-    run_rch exec -- cargo "$@" 2>&1 | tee "$output_file"
+    run_rch_cargo "$@" 2>&1 | tee "$output_file"
     local rc=${PIPESTATUS[0]}
     set -e
     check_rch_fallback_in_logs "$label" "$output_file"
@@ -99,7 +112,7 @@ if [[ $probe_rc -ne 0 ]] || ! probe_has_reachable_workers "$RCH_PROBE_LOG"; then
 fi
 
 set +e
-run_rch exec -- cargo check --help >"$RCH_SMOKE_LOG" 2>&1
+run_rch_cargo check --help >"$RCH_SMOKE_LOG" 2>&1
 smoke_rc=$?
 set -e
 check_rch_fallback_in_logs "rch_remote_smoke" "$RCH_SMOKE_LOG"
@@ -110,8 +123,6 @@ if [[ $smoke_rc -ne 0 ]]; then
 fi
 
 cd "$PROJECT_ROOT"
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/rch-e2e-ft3hbv9}"
-export CARGO_TARGET_DIR
 
 log_event "preflight" "startup" "cargo_target=$CARGO_TARGET_DIR" "ready"
 
