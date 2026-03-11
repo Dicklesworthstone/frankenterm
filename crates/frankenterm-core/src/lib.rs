@@ -175,6 +175,7 @@ pub mod event_stream;
 pub mod events;
 pub mod ewma;
 pub mod exp_histogram;
+pub mod explainability_console;
 pub mod explanations;
 pub mod export;
 pub mod extensions;
