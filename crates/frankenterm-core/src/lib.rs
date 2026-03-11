@@ -147,6 +147,7 @@ pub mod degradation;
 pub mod desktop_notify;
 pub mod diagnostic;
 pub mod diagnostic_redaction;
+pub mod disaster_recovery_drills;
 pub mod diagram_render;
 pub mod differential_snapshot;
 pub mod disjoint_intervals;
@@ -315,6 +316,7 @@ pub mod retry;
 pub mod ring_buffer;
 #[cfg(feature = "vc-export")]
 pub mod robot_envelope;
+pub mod robot_idempotency;
 pub mod robot_types;
 pub mod rope;
 pub mod rulesets;
