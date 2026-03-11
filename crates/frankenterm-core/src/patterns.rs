@@ -2036,7 +2036,7 @@ impl PatternEngine {
                     severity: rule.severity,
                     confidence: 0.6,
                     extracted: serde_json::Value::Object(serde_json::Map::new()),
-                    matched_text: fallback_anchor,
+                    matched_text: fallback_anchor.to_string(),
                     span: fallback_span,
                 });
             }
