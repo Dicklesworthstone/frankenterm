@@ -433,6 +433,37 @@ impl SchemaRegistry {
                     since: "0.1.0".into(),
                 },
                 EndpointMeta {
+                    id: "search_explain".into(),
+                    title: "Search Explain".into(),
+                    description: "Explain why search results may be missing or incomplete".into(),
+                    robot_command: Some("robot search-explain".into()),
+                    mcp_tool: None,
+                    schema_file: "wa-robot-search-explain.json".into(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
+                    id: "search_index_stats".into(),
+                    title: "Search Index Stats".into(),
+                    description: "Show search index size, freshness, and health metrics".into(),
+                    robot_command: Some("robot search-index stats".into()),
+                    mcp_tool: None,
+                    schema_file: "wa-robot-search-index-stats.json".into(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
+                    id: "search_index_reindex".into(),
+                    title: "Search Index Reindex".into(),
+                    description: "Rebuild search index from captured segments and pane metadata"
+                        .into(),
+                    robot_command: Some("robot search-index reindex".into()),
+                    mcp_tool: None,
+                    schema_file: "wa-robot-search-index-reindex.json".into(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
                     id: "approve".into(),
                     title: "Submit Approval".into(),
                     description: "Submit an approval code".into(),
@@ -940,6 +971,9 @@ mod tests {
             "wa-robot-send.json",
             "wa-robot-wait-for.json",
             "wa-robot-search.json",
+            "wa-robot-search-explain.json",
+            "wa-robot-search-index-stats.json",
+            "wa-robot-search-index-reindex.json",
             "wa-robot-events.json",
             "wa-robot-event-mutation.json",
             "wa-robot-workflow-run.json",
@@ -988,6 +1022,35 @@ mod tests {
         assert_eq!(
             release.robot_command.as_deref(),
             Some("robot reservations release")
+        );
+    }
+
+    #[test]
+    fn search_diagnostics_endpoints_use_live_robot_command_paths() {
+        let reg = SchemaRegistry::canonical();
+
+        let search_explain = reg
+            .get("search_explain")
+            .expect("search_explain endpoint exists");
+        assert_eq!(
+            search_explain.robot_command.as_deref(),
+            Some("robot search-explain")
+        );
+
+        let search_index_stats = reg
+            .get("search_index_stats")
+            .expect("search_index_stats endpoint exists");
+        assert_eq!(
+            search_index_stats.robot_command.as_deref(),
+            Some("robot search-index stats")
+        );
+
+        let search_index_reindex = reg
+            .get("search_index_reindex")
+            .expect("search_index_reindex endpoint exists");
+        assert_eq!(
+            search_index_reindex.robot_command.as_deref(),
+            Some("robot search-index reindex")
         );
     }
 
