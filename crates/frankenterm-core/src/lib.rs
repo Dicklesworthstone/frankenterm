@@ -170,6 +170,7 @@ pub mod error_clustering;
 pub mod error_codes;
 pub mod event_id;
 pub mod event_templates;
+pub mod event_stream;
 pub mod events;
 pub mod ewma;
 pub mod exp_histogram;
@@ -200,6 +201,7 @@ pub mod latency_stages;
 pub mod learn;
 pub mod lfu_cache;
 pub mod lock;
+pub mod lock_orchestration;
 pub mod logging;
 pub mod lru_cache;
 #[cfg(feature = "mcp")]
