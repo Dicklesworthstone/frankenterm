@@ -15,9 +15,11 @@ use codec::{
     CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu, UnitResponse,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat::sleep;
+use frankenterm_core::runtime_compat::unix::{AsyncReadExt, AsyncWriteExt};
+use frankenterm_core::runtime_compat::{
+    CompatRuntime, Mutex, Runtime, RuntimeBuilder, sleep, task, unix,
+};
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod bench_common;
 
@@ -40,8 +42,8 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
-fn make_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+fn make_runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
         .enable_all()
         .build()
         .expect("runtime")
@@ -78,9 +80,9 @@ async fn setup_client(
 ) -> (DirectMuxClient, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let socket_path = temp_dir.path().join("pdu-pipeline-bench.sock");
-    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+    let listener = unix::bind(&socket_path).await.expect("bind");
 
-    tokio::spawn(async move {
+    std::mem::drop(task::spawn(async move {
         let (mut stream, _) = match listener.accept().await {
             Ok(v) => v,
             Err(_) => return,
@@ -149,7 +151,7 @@ async fn setup_client(
                 }
             }
         }
-    });
+    }));
 
     let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
     let client = DirectMuxClient::connect(config)
@@ -166,14 +168,14 @@ fn bench_pipeline_vs_sequential_throughput(c: &mut Criterion) {
 
     let (sequential_client, _sequential_temp_dir) =
         rt.block_on(setup_client(Duration::from_millis(1), false));
-    let sequential_client = Arc::new(tokio::sync::Mutex::new(sequential_client));
+    let sequential_client = Arc::new(Mutex::new(sequential_client));
     group.bench_function("sequential_50", |b| {
         let pane_ids = Arc::clone(&pane_ids);
         let sequential_client = Arc::clone(&sequential_client);
-        b.to_async(&rt).iter(|| {
+        b.iter(|| {
             let pane_ids = Arc::clone(&pane_ids);
             let sequential_client = Arc::clone(&sequential_client);
-            async move {
+            rt.block_on(async move {
                 let mut client = sequential_client.lock().await;
                 for pane_id in pane_ids.iter() {
                     client
@@ -181,26 +183,26 @@ fn bench_pipeline_vs_sequential_throughput(c: &mut Criterion) {
                         .await
                         .expect("sequential request");
                 }
-            }
+            });
         });
     });
 
     let (pipelined_client, _pipelined_temp_dir) =
         rt.block_on(setup_client(Duration::from_millis(1), true));
-    let pipelined_client = Arc::new(tokio::sync::Mutex::new(pipelined_client));
+    let pipelined_client = Arc::new(Mutex::new(pipelined_client));
     group.bench_function("pipelined_50_depth32", |b| {
         let pane_ids = Arc::clone(&pane_ids);
         let pipelined_client = Arc::clone(&pipelined_client);
-        b.to_async(&rt).iter(|| {
+        b.iter(|| {
             let pane_ids = Arc::clone(&pane_ids);
             let pipelined_client = Arc::clone(&pipelined_client);
-            async move {
+            rt.block_on(async move {
                 let mut client = pipelined_client.lock().await;
                 client
                     .get_pane_render_changes_batch(&pane_ids, 32, Duration::from_secs(5))
                     .await
                     .expect("pipelined batch");
-            }
+            });
         });
     });
 
@@ -215,23 +217,23 @@ fn bench_pipeline_batch_latency(c: &mut Criterion) {
         group.throughput(Throughput::Elements(batch_size as u64));
         let pane_ids: Arc<Vec<u64>> = Arc::new((0..batch_size as u64).collect());
         let (client, _temp_dir) = rt.block_on(setup_client(Duration::from_millis(1), true));
-        let client = Arc::new(tokio::sync::Mutex::new(client));
+        let client = Arc::new(Mutex::new(client));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("batch_{batch_size}")),
             &batch_size,
             |b, _| {
                 let pane_ids = Arc::clone(&pane_ids);
                 let client = Arc::clone(&client);
-                b.to_async(&rt).iter(|| {
+                b.iter(|| {
                     let pane_ids = Arc::clone(&pane_ids);
                     let client = Arc::clone(&client);
-                    async move {
+                    rt.block_on(async move {
                         let mut client = client.lock().await;
                         client
                             .get_pane_render_changes_batch(&pane_ids, 32, Duration::from_secs(5))
                             .await
                             .expect("pipelined batch");
-                    }
+                    });
                 });
             },
         );
@@ -248,20 +250,20 @@ fn bench_pipeline_depth_saturation(c: &mut Criterion) {
     for &depth in &[1usize, 2, 4, 8, 16, 32, 64] {
         group.throughput(Throughput::Elements(50));
         let (client, _temp_dir) = rt.block_on(setup_client(Duration::from_millis(1), true));
-        let client = Arc::new(tokio::sync::Mutex::new(client));
+        let client = Arc::new(Mutex::new(client));
         group.bench_with_input(BenchmarkId::from_parameter(depth), &depth, |b, &depth| {
             let pane_ids = Arc::clone(&pane_ids);
             let client = Arc::clone(&client);
-            b.to_async(&rt).iter(|| {
+            b.iter(|| {
                 let pane_ids = Arc::clone(&pane_ids);
                 let client = Arc::clone(&client);
-                async move {
+                rt.block_on(async move {
                     let mut client = client.lock().await;
                     client
                         .get_pane_render_changes_batch(&pane_ids, depth, Duration::from_secs(5))
                         .await
                         .expect("batch");
-                }
+                });
             });
         });
     }

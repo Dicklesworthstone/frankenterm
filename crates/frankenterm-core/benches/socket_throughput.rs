@@ -7,7 +7,7 @@ use std::io;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat::unix;
+use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder, unix};
 use unix::{AsyncReadExt, AsyncWriteExt};
 
 mod bench_common;
@@ -31,11 +31,11 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+fn runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
         .enable_all()
         .build()
-        .expect("create tokio runtime")
+        .expect("create compat runtime")
 }
 
 fn socket_path(prefix: &str) -> std::path::PathBuf {
@@ -138,9 +138,11 @@ fn bench_roundtrip_latency(c: &mut Criterion) {
             BenchmarkId::new("unix_roundtrip", payload_size),
             &payload_size,
             |b, &size| {
-                b.to_async(&rt).iter(|| async move {
-                    let echoed = roundtrip_once(size).await.expect("roundtrip");
-                    black_box(echoed);
+                b.iter(|| {
+                    rt.block_on(async move {
+                        let echoed = roundtrip_once(size).await.expect("roundtrip");
+                        black_box(echoed);
+                    });
                 });
             },
         );
@@ -160,11 +162,13 @@ fn bench_streaming_throughput(c: &mut Criterion) {
             BenchmarkId::new("raw_stream", payload_size),
             &payload_size,
             |b, &size| {
-                b.to_async(&rt).iter(|| async move {
-                    let bytes = stream_throughput_once(size, frames, false)
-                        .await
-                        .expect("raw stream");
-                    black_box(bytes);
+                b.iter(|| {
+                    rt.block_on(async move {
+                        let bytes = stream_throughput_once(size, frames, false)
+                            .await
+                            .expect("raw stream");
+                        black_box(bytes);
+                    });
                 });
             },
         );
@@ -184,11 +188,13 @@ fn bench_pdu_framing_overhead(c: &mut Criterion) {
             BenchmarkId::new("framed_stream", payload_size),
             &payload_size,
             |b, &size| {
-                b.to_async(&rt).iter(|| async move {
-                    let bytes = stream_throughput_once(size, frames, true)
-                        .await
-                        .expect("framed stream");
-                    black_box(bytes);
+                b.iter(|| {
+                    rt.block_on(async move {
+                        let bytes = stream_throughput_once(size, frames, true)
+                            .await
+                            .expect("framed stream");
+                        black_box(bytes);
+                    });
                 });
             },
         );
@@ -203,8 +209,10 @@ fn bench_connect_accept_latency(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(8));
 
     group.bench_function("connect_accept", |b| {
-        b.to_async(&rt).iter(|| async {
-            connect_accept_once().await.expect("connect+accept");
+        b.iter(|| {
+            rt.block_on(async {
+                connect_accept_once().await.expect("connect+accept");
+            });
         });
     });
 

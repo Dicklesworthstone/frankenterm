@@ -15,15 +15,20 @@ use codec::{
     UnitResponse, WriteToPane,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat::{task, timeout};
+use frankenterm_core::runtime_compat::unix::{
+    AsyncReadExt as CompatAsyncReadExt, AsyncWriteExt as CompatAsyncWriteExt,
+};
+use frankenterm_core::runtime_compat::{
+    CompatRuntime, Mutex as CompatMutex, Runtime, RuntimeBuilder, task, timeout, unix,
+};
 use frankenterm_core::vendored::{
     DirectMuxClient, DirectMuxClientConfig, SubscriptionConfig, subscribe_pane_output,
 };
 use mux::client::ClientId;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt};
 use tokio::net::UnixStream as TokioUnixStream;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex as TokioMutex, watch};
 
 mod bench_common;
 
@@ -76,7 +81,14 @@ struct MockServerConfig {
     list_title_len: usize,
 }
 
-fn runtime() -> tokio::runtime::Runtime {
+fn compat_runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("create compat runtime")
+}
+
+fn tokio_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -140,7 +152,9 @@ async fn spawn_mock_mux_server(
     config: MockServerConfig,
 ) -> task::JoinHandle<()> {
     let _ = std::fs::remove_file(&socket_path);
-    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind mock mux socket");
+    let listener = unix::bind(&socket_path)
+        .await
+        .expect("bind mock mux socket");
 
     task::spawn(async move {
         loop {
@@ -149,7 +163,7 @@ async fn spawn_mock_mux_server(
                 Err(_) => break,
             };
             let server_config = config;
-            task::spawn(async move {
+            std::mem::drop(task::spawn(async move {
                 let mut read_buf = Vec::new();
                 let mut seqno = 0_usize;
                 loop {
@@ -197,7 +211,7 @@ async fn spawn_mock_mux_server(
                         }
                     }
                 }
-            });
+            }));
         }
     })
 }
@@ -371,20 +385,25 @@ async fn connect_tokio_baseline(socket_path: &Path) -> TokioMuxBaselineClient {
 }
 
 fn bench_pdu_encode_write(c: &mut Criterion) {
-    let rt = runtime();
+    let compat_rt = compat_runtime();
+    let tokio_rt = tokio_runtime();
     let mut group = c.benchmark_group("mux_client_ops/pdu_encode_write");
 
     for &payload_size in &[64usize, 1024, 64 * 1024] {
         let socket = socket_path("encode-write");
-        let _server = rt.block_on(spawn_mock_mux_server(
+        let _server = compat_rt.block_on(spawn_mock_mux_server(
             socket.clone(),
             MockServerConfig {
                 list_window_titles: 1,
                 list_title_len: 32,
             },
         ));
-        let direct_client = Arc::new(Mutex::new(rt.block_on(connect_client(&socket))));
-        let tokio_baseline = Arc::new(Mutex::new(rt.block_on(connect_tokio_baseline(&socket))));
+        let direct_client = Arc::new(CompatMutex::new(
+            compat_rt.block_on(connect_client(&socket)),
+        ));
+        let tokio_baseline = Arc::new(TokioMutex::new(
+            tokio_rt.block_on(connect_tokio_baseline(&socket)),
+        ));
         let payload = vec![b'x'; payload_size];
 
         group.throughput(Throughput::Bytes(payload_size as u64));
@@ -393,17 +412,17 @@ fn bench_pdu_encode_write(c: &mut Criterion) {
             &payload_size,
             |b, _| {
                 let direct_client = Arc::clone(&direct_client);
-                b.to_async(&rt).iter(|| {
+                b.iter(|| {
                     let direct_client = Arc::clone(&direct_client);
                     let data = payload.clone();
-                    async move {
+                    compat_rt.block_on(async move {
                         let mut client = direct_client.lock().await;
                         let response = client
                             .write_to_pane(7, data)
                             .await
                             .expect("write_to_pane response");
                         black_box(response);
-                    }
+                    });
                 });
             },
         );
@@ -412,17 +431,17 @@ fn bench_pdu_encode_write(c: &mut Criterion) {
             &payload_size,
             |b, _| {
                 let tokio_baseline = Arc::clone(&tokio_baseline);
-                b.to_async(&rt).iter(|| {
+                b.iter(|| {
                     let tokio_baseline = Arc::clone(&tokio_baseline);
                     let data = payload.clone();
-                    async move {
+                    tokio_rt.block_on(async move {
                         let mut client = tokio_baseline.lock().await;
                         client
                             .write_to_pane(7, data)
                             .await
                             .expect("tokio baseline write_to_pane");
                         black_box(());
-                    }
+                    });
                 });
             },
         );
@@ -432,7 +451,8 @@ fn bench_pdu_encode_write(c: &mut Criterion) {
 }
 
 fn bench_pdu_read_decode(c: &mut Criterion) {
-    let rt = runtime();
+    let compat_rt = compat_runtime();
+    let tokio_rt = tokio_runtime();
     let mut group = c.benchmark_group("mux_client_ops/pdu_read_decode");
 
     let cases = [
@@ -461,9 +481,13 @@ fn bench_pdu_read_decode(c: &mut Criterion) {
 
     for &(label, cfg) in &cases {
         let socket = socket_path("read-decode");
-        let _server = rt.block_on(spawn_mock_mux_server(socket.clone(), cfg));
-        let direct_client = Arc::new(Mutex::new(rt.block_on(connect_client(&socket))));
-        let tokio_baseline = Arc::new(Mutex::new(rt.block_on(connect_tokio_baseline(&socket))));
+        let _server = compat_rt.block_on(spawn_mock_mux_server(socket.clone(), cfg));
+        let direct_client = Arc::new(CompatMutex::new(
+            compat_rt.block_on(connect_client(&socket)),
+        ));
+        let tokio_baseline = Arc::new(TokioMutex::new(
+            tokio_rt.block_on(connect_tokio_baseline(&socket)),
+        ));
 
         group.throughput(Throughput::Bytes(approx_list_payload_bytes(cfg) as u64));
         group.bench_with_input(
@@ -471,13 +495,13 @@ fn bench_pdu_read_decode(c: &mut Criterion) {
             &label,
             |b, _| {
                 let direct_client = Arc::clone(&direct_client);
-                b.to_async(&rt).iter(|| {
+                b.iter(|| {
                     let direct_client = Arc::clone(&direct_client);
-                    async move {
+                    compat_rt.block_on(async move {
                         let mut client = direct_client.lock().await;
                         let response = client.list_panes().await.expect("list_panes response");
                         black_box(response.window_titles.len());
-                    }
+                    });
                 });
             },
         );
@@ -486,16 +510,16 @@ fn bench_pdu_read_decode(c: &mut Criterion) {
             &label,
             |b, _| {
                 let tokio_baseline = Arc::clone(&tokio_baseline);
-                b.to_async(&rt).iter(|| {
+                b.iter(|| {
                     let tokio_baseline = Arc::clone(&tokio_baseline);
-                    async move {
+                    tokio_rt.block_on(async move {
                         let mut client = tokio_baseline.lock().await;
                         let response = client
                             .list_panes()
                             .await
                             .expect("tokio baseline list_panes");
                         black_box(response.window_titles.len());
-                    }
+                    });
                 });
             },
         );
@@ -505,20 +529,25 @@ fn bench_pdu_read_decode(c: &mut Criterion) {
 }
 
 fn bench_pdu_roundtrip(c: &mut Criterion) {
-    let rt = runtime();
+    let compat_rt = compat_runtime();
+    let tokio_rt = tokio_runtime();
     let mut group = c.benchmark_group("mux_client_ops/pdu_roundtrip");
 
     for &payload_size in &[64usize, 1024, 64 * 1024] {
         let socket = socket_path("roundtrip");
-        let _server = rt.block_on(spawn_mock_mux_server(
+        let _server = compat_rt.block_on(spawn_mock_mux_server(
             socket.clone(),
             MockServerConfig {
                 list_window_titles: 1,
                 list_title_len: 32,
             },
         ));
-        let direct_client = Arc::new(Mutex::new(rt.block_on(connect_client(&socket))));
-        let tokio_baseline = Arc::new(Mutex::new(rt.block_on(connect_tokio_baseline(&socket))));
+        let direct_client = Arc::new(CompatMutex::new(
+            compat_rt.block_on(connect_client(&socket)),
+        ));
+        let tokio_baseline = Arc::new(TokioMutex::new(
+            tokio_rt.block_on(connect_tokio_baseline(&socket)),
+        ));
         let payload = "z".repeat(payload_size);
 
         group.throughput(Throughput::Bytes(payload_size as u64));
@@ -527,14 +556,14 @@ fn bench_pdu_roundtrip(c: &mut Criterion) {
             &payload_size,
             |b, _| {
                 let direct_client = Arc::clone(&direct_client);
-                b.to_async(&rt).iter(|| {
+                b.iter(|| {
                     let direct_client = Arc::clone(&direct_client);
                     let text = payload.clone();
-                    async move {
+                    compat_rt.block_on(async move {
                         let mut client = direct_client.lock().await;
                         let response = client.send_paste(9, text).await.expect("send_paste");
                         black_box(response);
-                    }
+                    });
                 });
             },
         );
@@ -543,17 +572,17 @@ fn bench_pdu_roundtrip(c: &mut Criterion) {
             &payload_size,
             |b, _| {
                 let tokio_baseline = Arc::clone(&tokio_baseline);
-                b.to_async(&rt).iter(|| {
+                b.iter(|| {
                     let tokio_baseline = Arc::clone(&tokio_baseline);
                     let text = payload.clone();
-                    async move {
+                    tokio_rt.block_on(async move {
                         let mut client = tokio_baseline.lock().await;
                         client
                             .send_paste(9, text)
                             .await
                             .expect("tokio baseline send_paste");
                         black_box(());
-                    }
+                    });
                 });
             },
         );
@@ -563,10 +592,11 @@ fn bench_pdu_roundtrip(c: &mut Criterion) {
 }
 
 fn bench_subscription_setup(c: &mut Criterion) {
-    let rt = runtime();
+    let compat_rt = compat_runtime();
+    let tokio_rt = tokio_runtime();
     let mut group = c.benchmark_group("mux_client_ops/subscription_setup");
     let socket = socket_path("subscription");
-    let _server = rt.block_on(spawn_mock_mux_server(
+    let _server = compat_rt.block_on(spawn_mock_mux_server(
         socket.clone(),
         MockServerConfig {
             list_window_titles: 1,
@@ -582,29 +612,30 @@ fn bench_subscription_setup(c: &mut Criterion) {
 
     group.measurement_time(Duration::from_secs(8));
     group.bench_function("direct_client_subscribe_cancel", |b| {
-        b.to_async(&rt).iter(|| {
+        b.iter(|| {
             let cfg = client_config.clone();
             let subscription_cfg = sub_config.clone();
-            async {
+            compat_rt.block_on(async {
                 let client = DirectMuxClient::connect(cfg)
                     .await
                     .expect("connect for subscription");
-                let mut sub = subscribe_pane_output(client, 42, subscription_cfg);
-                sub.cancel();
-                let _ = timeout(Duration::from_millis(250), sub.next()).await;
+                let sub = subscribe_pane_output(client, 42, subscription_cfg);
+                timeout(Duration::from_millis(250), sub.shutdown())
+                    .await
+                    .expect("subscription shutdown timeout");
                 black_box(());
-            }
+            });
         });
     });
     group.bench_function("tokio_baseline_setup_cancel", |b| {
-        b.to_async(&rt).iter(|| {
+        b.iter(|| {
             let socket = socket.clone();
-            async move {
+            tokio_rt.block_on(async move {
                 let client = connect_tokio_baseline(&socket).await;
-                let client = Arc::new(Mutex::new(client));
+                let client = Arc::new(TokioMutex::new(client));
                 let (cancel_tx, mut cancel_rx) = watch::channel(false);
                 let poll_client = Arc::clone(&client);
-                let poller = tokio::spawn(async move {
+                let mut poller = tokio::spawn(async move {
                     loop {
                         if *cancel_rx.borrow() {
                             break;
@@ -624,9 +655,16 @@ fn bench_subscription_setup(c: &mut Criterion) {
                     }
                 });
                 let _ = cancel_tx.send(true);
-                let _ = tokio::time::timeout(Duration::from_millis(250), poller).await;
+                match tokio::time::timeout(Duration::from_millis(250), &mut poller).await {
+                    Ok(join_result) => join_result.expect("tokio baseline poller join"),
+                    Err(_) => {
+                        poller.abort();
+                        let _ = poller.await;
+                        panic!("tokio baseline poller shutdown timed out");
+                    }
+                }
                 black_box(());
-            }
+            });
         });
     });
 
@@ -634,18 +672,23 @@ fn bench_subscription_setup(c: &mut Criterion) {
 }
 
 fn bench_render_changes_poll(c: &mut Criterion) {
-    let rt = runtime();
+    let compat_rt = compat_runtime();
+    let tokio_rt = tokio_runtime();
     let mut group = c.benchmark_group("mux_client_ops/render_changes_poll");
     let socket = socket_path("render-changes");
-    let _server = rt.block_on(spawn_mock_mux_server(
+    let _server = compat_rt.block_on(spawn_mock_mux_server(
         socket.clone(),
         MockServerConfig {
             list_window_titles: 1,
             list_title_len: 16,
         },
     ));
-    let direct_client = Arc::new(Mutex::new(rt.block_on(connect_client(&socket))));
-    let tokio_baseline = Arc::new(Mutex::new(rt.block_on(connect_tokio_baseline(&socket))));
+    let direct_client = Arc::new(CompatMutex::new(
+        compat_rt.block_on(connect_client(&socket)),
+    ));
+    let tokio_baseline = Arc::new(TokioMutex::new(
+        tokio_rt.block_on(connect_tokio_baseline(&socket)),
+    ));
 
     group.throughput(Throughput::Elements(1));
     for &pane_id in &[1_u64, 42, 4096] {
@@ -654,16 +697,16 @@ fn bench_render_changes_poll(c: &mut Criterion) {
             &pane_id,
             |b, &pane_id| {
                 let direct_client = Arc::clone(&direct_client);
-                b.to_async(&rt).iter(|| {
+                b.iter(|| {
                     let direct_client = Arc::clone(&direct_client);
-                    async move {
+                    compat_rt.block_on(async move {
                         let mut client = direct_client.lock().await;
                         let response = client
                             .get_pane_render_changes(pane_id)
                             .await
                             .expect("get_pane_render_changes");
                         black_box((response.pane_id, response.seqno));
-                    }
+                    });
                 });
             },
         );
@@ -672,16 +715,16 @@ fn bench_render_changes_poll(c: &mut Criterion) {
             &pane_id,
             |b, &pane_id| {
                 let tokio_baseline = Arc::clone(&tokio_baseline);
-                b.to_async(&rt).iter(|| {
+                b.iter(|| {
                     let tokio_baseline = Arc::clone(&tokio_baseline);
-                    async move {
+                    tokio_rt.block_on(async move {
                         let mut client = tokio_baseline.lock().await;
                         let response = client
                             .get_pane_render_changes(pane_id)
                             .await
                             .expect("tokio baseline get_pane_render_changes");
                         black_box((response.pane_id, response.seqno));
-                    }
+                    });
                 });
             },
         );

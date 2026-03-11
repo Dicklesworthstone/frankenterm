@@ -12,6 +12,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankenterm_core::events::{Event, EventBus};
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::policy::Redactor;
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 
 mod bench_common;
 
@@ -53,23 +54,28 @@ fn sample_detection(i: u64) -> Detection {
 }
 
 fn bench_subscription_first_message_latency(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().expect("create runtime");
+    let rt = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("create compat runtime");
     let mut group = c.benchmark_group("subscription_streaming");
 
     group.bench_function("bench_subscription_first_message_latency", |b| {
-        b.to_async(&rt).iter(|| async {
-            let bus = EventBus::new(256);
-            let mut sub = bus.subscribe_deltas();
+        b.iter(|| {
+            rt.block_on(async {
+                let bus = EventBus::new(256);
+                let mut sub = bus.subscribe_deltas();
 
-            let start = std::time::Instant::now();
-            let _ = bus.publish(Event::SegmentCaptured {
-                pane_id: 1,
-                seq: 1,
-                content_len: 24,
+                let start = std::time::Instant::now();
+                let _ = bus.publish(Event::SegmentCaptured {
+                    pane_id: 1,
+                    seq: 1,
+                    content_len: 24,
+                });
+                let received = sub.recv().await.expect("receive first message");
+                black_box(received);
+                black_box(start.elapsed());
             });
-            let received = sub.recv().await.expect("receive first message");
-            black_box(received);
-            black_box(start.elapsed());
         });
     });
 
@@ -77,23 +83,28 @@ fn bench_subscription_first_message_latency(c: &mut Criterion) {
 }
 
 fn bench_subscription_steady_state_throughput(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().expect("create runtime");
+    let rt = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("create compat runtime");
     let mut group = c.benchmark_group("subscription_streaming");
 
     group.bench_function("bench_subscription_steady_state_throughput", |b| {
-        b.to_async(&rt).iter(|| async {
-            let bus = EventBus::new(2048);
-            let mut sub = bus.subscribe_deltas();
+        b.iter(|| {
+            rt.block_on(async {
+                let bus = EventBus::new(2048);
+                let mut sub = bus.subscribe_deltas();
 
-            for i in 0..2_000_u64 {
-                let _ = bus.publish(Event::SegmentCaptured {
-                    pane_id: 2,
-                    seq: i,
-                    content_len: 48,
-                });
-                let event = sub.recv().await.expect("steady-state recv");
-                black_box(event);
-            }
+                for i in 0..2_000_u64 {
+                    let _ = bus.publish(Event::SegmentCaptured {
+                        pane_id: 2,
+                        seq: i,
+                        content_len: 48,
+                    });
+                    let event = sub.recv().await.expect("steady-state recv");
+                    black_box(event);
+                }
+            });
         });
     });
 
@@ -101,7 +112,10 @@ fn bench_subscription_steady_state_throughput(c: &mut Criterion) {
 }
 
 fn bench_multi_subscriber_fanout(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().expect("create runtime");
+    let rt = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("create compat runtime");
     let mut group = c.benchmark_group("subscription_streaming");
 
     for subscribers in [1_usize, 10, 50] {
@@ -109,26 +123,28 @@ fn bench_multi_subscriber_fanout(c: &mut Criterion) {
             BenchmarkId::new("bench_multi_subscriber_fanout", subscribers),
             &subscribers,
             |b, subscribers| {
-                b.to_async(&rt).iter(|| async move {
-                    let bus = EventBus::new(4096);
-                    let mut subs: Vec<_> = (0..*subscribers)
-                        .map(|_| bus.subscribe_detections())
-                        .collect();
+                b.iter(|| {
+                    rt.block_on(async {
+                        let bus = EventBus::new(4096);
+                        let mut subs: Vec<_> = (0..*subscribers)
+                            .map(|_| bus.subscribe_detections())
+                            .collect();
 
-                    for i in 0..256_u64 {
-                        let detection = sample_detection(i);
-                        let _ = bus.publish(Event::PatternDetected {
-                            pane_id: 42,
-                            pane_uuid: None,
-                            detection,
-                            event_id: None,
-                        });
+                        for i in 0..256_u64 {
+                            let detection = sample_detection(i);
+                            let _ = bus.publish(Event::PatternDetected {
+                                pane_id: 42,
+                                pane_uuid: None,
+                                detection,
+                                event_id: None,
+                            });
 
-                        for sub in &mut subs {
-                            let event = sub.recv().await.expect("fanout recv");
-                            black_box(&event);
+                            for sub in &mut subs {
+                                let event = sub.recv().await.expect("fanout recv");
+                                black_box(&event);
+                            }
                         }
-                    }
+                    });
                 });
             },
         );

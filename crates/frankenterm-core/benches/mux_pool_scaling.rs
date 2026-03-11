@@ -18,11 +18,9 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 #[cfg(feature = "asupersync-runtime")]
 use frankenterm_core::cx;
 use frankenterm_core::pool::PoolConfig;
-use frankenterm_core::runtime_compat::sleep;
-#[cfg(feature = "asupersync-runtime")]
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_compat::unix::{AsyncReadExt, AsyncWriteExt};
+use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder, sleep, task, unix};
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig, MuxPool, MuxPoolConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod bench_common;
 
@@ -57,32 +55,25 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
-fn make_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+fn make_runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
         .enable_all()
         .build()
         .expect("runtime")
 }
 
-#[cfg(feature = "asupersync-runtime")]
-fn make_compat_runtime() -> frankenterm_core::runtime_compat::Runtime {
-    RuntimeBuilder::current_thread()
-        .build()
-        .expect("compat runtime")
-}
-
 async fn spawn_mock_server(temp_dir: &tempfile::TempDir, response_delay: Duration) -> PathBuf {
     let socket_path = temp_dir.path().join("mux-pool-scaling.sock");
-    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind mock listener");
+    let listener = unix::bind(&socket_path).await.expect("bind mock listener");
 
-    tokio::spawn(async move {
+    std::mem::drop(task::spawn(async move {
         loop {
             let (mut stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(_) => break,
             };
 
-            tokio::spawn(async move {
+            std::mem::drop(task::spawn(async move {
                 let mut read_buf = Vec::new();
                 loop {
                     let mut temp = vec![0u8; 4096];
@@ -129,9 +120,9 @@ async fn spawn_mock_server(temp_dir: &tempfile::TempDir, response_delay: Duratio
                         }
                     }
                 }
-            });
+            }));
         }
-    });
+    }));
 
     socket_path
 }
@@ -152,7 +143,7 @@ async fn prime_connections(pool: Arc<MuxPool>, concurrent: usize) {
     let mut joins = Vec::with_capacity(concurrent);
     for _ in 0..concurrent {
         let pool = Arc::clone(&pool);
-        joins.push(tokio::spawn(async move {
+        joins.push(task::spawn(async move {
             Box::pin(pool.list_panes()).await.expect("prime list_panes");
         }));
     }
@@ -176,13 +167,13 @@ fn bench_acquire_release_cycle(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(max_size), &max_size, |b, _| {
             let pool = Arc::clone(&pool);
-            b.to_async(&rt).iter(|| {
+            b.iter(|| {
                 let pool = Arc::clone(&pool);
-                async move {
+                rt.block_on(async move {
                     Box::pin(pool.write_to_pane(1, b"echo hi\n".to_vec()))
                         .await
                         .expect("write_to_pane");
-                }
+                });
             });
         });
     }
@@ -194,7 +185,7 @@ fn bench_health_check_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("mux_pool_scaling/health_check_overhead");
     let rt = make_runtime();
     #[cfg(feature = "asupersync-runtime")]
-    let compat_rt = make_compat_runtime();
+    let compat_rt = make_runtime();
 
     for &max_size in &[1usize, 8, 32] {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -207,11 +198,11 @@ fn bench_health_check_overhead(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(max_size), &max_size, |b, _| {
             let pool = Arc::clone(&pool);
-            b.to_async(&rt).iter(|| {
+            b.iter(|| {
                 let pool = Arc::clone(&pool);
-                async move {
+                rt.block_on(async move {
                     Box::pin(pool.health_check()).await.expect("health_check");
-                }
+                });
             });
         });
 
@@ -252,20 +243,20 @@ fn bench_throughput_scaling(c: &mut Criterion) {
             &concurrency,
             |b, &n| {
                 let pool = Arc::clone(&pool);
-                b.to_async(&rt).iter(|| {
+                b.iter(|| {
                     let pool = Arc::clone(&pool);
-                    async move {
+                    rt.block_on(async move {
                         let mut joins = Vec::with_capacity(n);
                         for _ in 0..n {
                             let pool = Arc::clone(&pool);
-                            joins.push(tokio::spawn(async move {
+                            joins.push(task::spawn(async move {
                                 Box::pin(pool.list_panes()).await.expect("list_panes");
                             }));
                         }
                         for join in joins {
                             join.await.expect("throughput join");
                         }
-                    }
+                    });
                 });
             },
         );
@@ -288,9 +279,9 @@ fn bench_idle_eviction_scan(c: &mut Criterion) {
             &pool_size,
             |b, &size| {
                 let socket_path = socket_path.clone();
-                b.to_async(&rt).iter(|| {
+                b.iter(|| {
                     let socket_path = socket_path.clone();
-                    async move {
+                    rt.block_on(async move {
                         let pool = Arc::new(MuxPool::new(mux_pool_config(
                             socket_path,
                             size,
@@ -299,7 +290,7 @@ fn bench_idle_eviction_scan(c: &mut Criterion) {
                         prime_connections(Arc::clone(&pool), size).await;
                         let evicted = pool.evict_idle().await;
                         black_box(evicted);
-                    }
+                    });
                 });
             },
         );
@@ -312,21 +303,21 @@ fn bench_connection_factory_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("mux_pool_scaling/connection_factory_overhead");
     let rt = make_runtime();
     #[cfg(feature = "asupersync-runtime")]
-    let compat_rt = make_compat_runtime();
+    let compat_rt = make_runtime();
 
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let socket_path = rt.block_on(spawn_mock_server(&temp_dir, Duration::from_millis(0)));
     let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
 
     group.bench_function("direct_connect", |b| {
-        b.to_async(&rt).iter(|| {
+        b.iter(|| {
             let config = config.clone();
-            async move {
+            rt.block_on(async move {
                 let client = DirectMuxClient::connect(config)
                     .await
                     .expect("direct mux connect");
                 black_box(client);
-            }
+            });
         });
     });
 

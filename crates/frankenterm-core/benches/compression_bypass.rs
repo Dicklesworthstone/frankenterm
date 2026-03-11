@@ -14,10 +14,12 @@ use codec::{
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::config::VendoredCompressionMode;
-use frankenterm_core::runtime_compat::timeout;
+use frankenterm_core::runtime_compat::unix::{AsyncReadExt, AsyncWriteExt};
+use frankenterm_core::runtime_compat::{
+    CompatRuntime, Runtime, RuntimeBuilder, task, timeout, unix,
+};
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig};
 use std::hint::black_box;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod bench_common;
 
@@ -44,8 +46,8 @@ const COMPRESSED_MASK: u64 = 1 << 63;
 const BENCH_SERIAL: u64 = 77;
 const BENCH_PANE_ID: usize = 11;
 
-fn make_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+fn make_runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
         .enable_all()
         .build()
         .expect("runtime")
@@ -95,10 +97,7 @@ fn frame_marked_compressed(bytes: &[u8]) -> Option<bool> {
     decode_u64_leb128_prefix(bytes).map(|length| (length & COMPRESSED_MASK) != 0)
 }
 
-async fn serve_handshake(
-    stream: &mut tokio::net::UnixStream,
-    reject_uncompressed_first_frame: bool,
-) {
+async fn serve_handshake(stream: &mut unix::UnixStream, reject_uncompressed_first_frame: bool) {
     let mut read_buf = Vec::new();
     let mut first_frame_checked = false;
 
@@ -151,9 +150,11 @@ async fn serve_handshake(
 async fn connect_once(mode: VendoredCompressionMode) -> Result<(), String> {
     let temp_dir = tempfile::tempdir().map_err(|err| err.to_string())?;
     let socket_path = temp_dir.path().join("compression-bypass-negotiation.sock");
-    let listener = tokio::net::UnixListener::bind(&socket_path).map_err(|err| err.to_string())?;
+    let listener = unix::bind(&socket_path)
+        .await
+        .map_err(|err| err.to_string())?;
 
-    let server = tokio::spawn(async move {
+    let mut server = task::spawn(async move {
         if let Ok((mut stream, _)) = listener.accept().await {
             serve_handshake(&mut stream, false).await;
         }
@@ -161,21 +162,35 @@ async fn connect_once(mode: VendoredCompressionMode) -> Result<(), String> {
 
     let mut config = DirectMuxClientConfig::default().with_socket_path(socket_path);
     config.compression_mode = mode;
-    let client = DirectMuxClient::connect(config)
-        .await
-        .map_err(|err| err.to_string())?;
+    let client = match DirectMuxClient::connect(config).await {
+        Ok(client) => client,
+        Err(err) => {
+            server.abort();
+            return Err(err.to_string());
+        }
+    };
     drop(client);
 
-    let _ = timeout(Duration::from_secs(1), server).await;
+    match timeout(Duration::from_secs(1), &mut server).await {
+        Ok(join_result) => {
+            join_result.map_err(|err| format!("handshake server join failed: {err}"))?
+        }
+        Err(_) => {
+            server.abort();
+            return Err("timed out waiting for handshake server to exit".to_string());
+        }
+    }
     Ok(())
 }
 
 async fn connect_with_auto_fallback() -> Result<(), String> {
     let temp_dir = tempfile::tempdir().map_err(|err| err.to_string())?;
     let socket_path = temp_dir.path().join("compression-bypass-fallback.sock");
-    let listener = tokio::net::UnixListener::bind(&socket_path).map_err(|err| err.to_string())?;
+    let listener = unix::bind(&socket_path)
+        .await
+        .map_err(|err| err.to_string())?;
 
-    let server = tokio::spawn(async move {
+    let mut server = task::spawn(async move {
         for attempt in 0..2 {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
@@ -185,12 +200,24 @@ async fn connect_with_auto_fallback() -> Result<(), String> {
     });
 
     let auto = DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
-    let client = DirectMuxClient::connect(auto)
-        .await
-        .map_err(|err| format!("auto fallback connect failed: {err}"))?;
+    let client = match DirectMuxClient::connect(auto).await {
+        Ok(client) => client,
+        Err(err) => {
+            server.abort();
+            return Err(format!("auto fallback connect failed: {err}"));
+        }
+    };
     drop(client);
 
-    let _ = timeout(Duration::from_secs(1), server).await;
+    match timeout(Duration::from_secs(1), &mut server).await {
+        Ok(join_result) => {
+            join_result.map_err(|err| format!("fallback server join failed: {err}"))?
+        }
+        Err(_) => {
+            server.abort();
+            return Err("timed out waiting for fallback server to exit".to_string());
+        }
+    }
     Ok(())
 }
 
@@ -247,10 +274,12 @@ fn bench_negotiation_overhead(c: &mut Criterion) {
     group.sample_size(20);
 
     group.bench_function("auto_local_connect_handshake", |b| {
-        b.to_async(&rt).iter(|| async {
-            connect_once(VendoredCompressionMode::Auto)
-                .await
-                .expect("connect once");
+        b.iter(|| {
+            rt.block_on(async {
+                connect_once(VendoredCompressionMode::Auto)
+                    .await
+                    .expect("connect once");
+            });
         });
     });
 
@@ -263,8 +292,10 @@ fn bench_fallback_detection_latency(c: &mut Criterion) {
     group.sample_size(20);
 
     group.bench_function("auto_reject_then_auto_retry", |b| {
-        b.to_async(&rt).iter(|| async {
-            connect_with_auto_fallback().await.expect("auto fallback");
+        b.iter(|| {
+            rt.block_on(async {
+                connect_with_auto_fallback().await.expect("auto fallback");
+            });
         });
     });
 
