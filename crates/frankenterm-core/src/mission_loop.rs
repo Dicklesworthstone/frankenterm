@@ -3284,7 +3284,10 @@ mod tests {
     ) -> KnownResourceReservation {
         KnownResourceReservation {
             holder: holder.to_string(),
-            resources: resources.iter().map(|resource| resource.to_string()).collect(),
+            resources: resources
+                .iter()
+                .map(|resource| resource.to_string())
+                .collect(),
             exclusive: true,
             bead_id: bead_id.map(|b| b.to_string()),
             expires_at_ms: Some(999_999),

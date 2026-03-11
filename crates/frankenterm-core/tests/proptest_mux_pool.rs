@@ -23,7 +23,15 @@ fn arb_pool_stats() -> impl Strategy<Value = PoolStats> {
         0_u64..=10_000,
     )
         .prop_map(
-            |(max_size, idle_count, active_count, total_acquired, total_returned, total_evicted, total_timeouts)| {
+            |(
+                max_size,
+                idle_count,
+                active_count,
+                total_acquired,
+                total_returned,
+                total_evicted,
+                total_timeouts,
+            )| {
                 let idle = idle_count.min(max_size);
                 let active = active_count.min(max_size.saturating_sub(idle));
                 PoolStats {
