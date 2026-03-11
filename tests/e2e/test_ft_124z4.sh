@@ -11,7 +11,13 @@ CORRELATION_ID="ft-124z4-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.stdout.log"
 
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/rch-e2e-ft124z4}"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft124z4"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
 export CARGO_TARGET_DIR
 
 LAST_STEP_LOG=""
@@ -105,30 +111,66 @@ extract_rch_remote_base() {
 collect_external_cargo_manifest_paths() {
   python3 - "${ROOT_DIR}" <<'PY'
 from pathlib import Path
-import re
 import sys
+import tomllib
 
 root = Path(sys.argv[1]).resolve()
 project_parent = root.parent
-pattern = re.compile(r'path\s*=\s*"([^"]+)"')
 found = set()
+
+def iter_dependency_tables(doc: dict):
+    for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+        table = doc.get(key)
+        if isinstance(table, dict):
+            yield table
+
+    workspace = doc.get("workspace")
+    if isinstance(workspace, dict):
+        table = workspace.get("dependencies")
+        if isinstance(table, dict):
+            yield table
+
+    target = doc.get("target")
+    if isinstance(target, dict):
+        for target_cfg in target.values():
+            if not isinstance(target_cfg, dict):
+                continue
+            for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                table = target_cfg.get(key)
+                if isinstance(table, dict):
+                    yield table
+
+    for key in ("patch", "replace"):
+        table = doc.get(key)
+        if not isinstance(table, dict):
+            continue
+        for registry_cfg in table.values():
+            if isinstance(registry_cfg, dict):
+                yield registry_cfg
 
 for manifest in root.rglob("Cargo.toml"):
     try:
-        text = manifest.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        text = manifest.read_text(encoding="utf-8", errors="ignore")
+        doc = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        continue
 
-    for match in pattern.finditer(text):
-        resolved = (manifest.parent / match.group(1)).resolve()
-        if resolved == root or str(resolved).startswith(str(root) + "/"):
-            continue
-        try:
-            rel = resolved.relative_to(project_parent)
-        except ValueError:
-            continue
-        manifest_path = rel / "Cargo.toml" if resolved.is_dir() else rel
-        found.add(str(manifest_path))
+    for table in iter_dependency_tables(doc):
+        for spec in table.values():
+            if not isinstance(spec, dict):
+                continue
+            dep_path = spec.get("path")
+            if not isinstance(dep_path, str):
+                continue
+
+            resolved = (manifest.parent / dep_path).resolve()
+            if resolved == root or str(resolved).startswith(str(root) + "/"):
+                continue
+            try:
+                rel = resolved.relative_to(project_parent)
+            except ValueError:
+                continue
+            manifest_path = rel / "Cargo.toml" if resolved.is_dir() else rel
+            found.add(str(manifest_path))
 
 for item in sorted(found):
     print(item)
@@ -147,13 +189,16 @@ if not path.is_file():
 
 data = tomllib.loads(path.read_text(encoding="utf-8"))
 for worker in data.get("workers", []):
+    identity_file = worker.get("identity_file", "")
+    if identity_file:
+        identity_file = str(Path(identity_file).expanduser())
     print(
         "\t".join(
             [
                 worker.get("id", ""),
                 worker.get("host", ""),
                 worker.get("user", ""),
-                worker.get("identity_file", ""),
+                identity_file,
             ]
         )
     )
@@ -218,10 +263,11 @@ EOF
 
 run_rch_topology_preflight() {
   local remote_base
-  local deps_file topology_report
+  local deps_file topology_report worker_rows_raw worker_row
   local worker_id host user identity_file worker_log
   local missing_any="false"
-  local -a dep_paths=()
+  local worker_count=0
+  local -a dep_paths=() worker_rows=()
 
   remote_base="$(extract_rch_remote_base)"
   mapfile -t dep_paths < <(collect_external_cargo_manifest_paths)
@@ -244,8 +290,24 @@ run_rch_topology_preflight() {
 
   emit_log "preflight" "rch_topology_preflight" "external_cargo_paths" "running" "none" "none" "$(basename "${deps_file}")"
 
-  while IFS=$'\t' read -r worker_id host user identity_file; do
+  if ! worker_rows_raw="$(load_worker_topology_tsv)"; then
+    emit_log "preflight" "rch_topology_preflight" "external_cargo_paths" "failed" "invalid_workers_toml" "RCH-WORKERS-CONFIG-INVALID" "$(basename "${deps_file}")"
+    echo "failed to parse rch workers config: ${RCH_WORKERS_TOML}" >&2
+    return 2
+  fi
+
+  if [[ -z "${worker_rows_raw}" ]]; then
+    emit_log "preflight" "rch_topology_preflight" "external_cargo_paths" "failed" "no_workers_declared" "RCH-WORKERS-CONFIG-EMPTY" "$(basename "${deps_file}")"
+    echo "rch workers config contains no workers: ${RCH_WORKERS_TOML}" >&2
+    return 2
+  fi
+
+  mapfile -t worker_rows <<< "${worker_rows_raw}"
+
+  for worker_row in "${worker_rows[@]}"; do
+    IFS=$'\t' read -r worker_id host user identity_file <<< "${worker_row}"
     [[ -n "${worker_id}" && -n "${host}" && -n "${user}" && -n "${identity_file}" ]] || continue
+    worker_count=$((worker_count + 1))
     worker_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${worker_id}_topology.log"
 
     if probe_worker_remote_paths "${worker_id}" "${host}" "${user}" "${identity_file}" "${remote_base}" "${worker_log}" "${dep_paths[@]}"; then
@@ -254,7 +316,13 @@ run_rch_topology_preflight() {
       missing_any="true"
       append_topology_report "${topology_report}" "${worker_id}" "${host}" "missing" "$(tr '\n' ' ' < "${worker_log}")"
     fi
-  done < <(load_worker_topology_tsv)
+  done
+
+  if [[ ${worker_count} -lt 1 ]]; then
+    emit_log "preflight" "rch_topology_preflight" "external_cargo_paths" "failed" "no_valid_workers_declared" "RCH-WORKERS-CONFIG-EMPTY" "$(basename "${topology_report}")"
+    echo "rch workers config contains no valid worker rows: ${RCH_WORKERS_TOML}" >&2
+    return 2
+  fi
 
   if [[ "${missing_any}" == "true" ]]; then
     emit_log "preflight" "rch_topology_preflight" "external_cargo_paths" "failed" "rch_worker_topology_drift" "RCH-REMOTE-TOPOLOGY" "$(basename "${topology_report}")"
@@ -287,6 +355,10 @@ emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basen
 
 if [[ -n "${LOCAL_RCH_TMPDIR_OVERRIDE}" ]]; then
   emit_log "preflight" "rch_local_tmpdir_workaround" "TMPDIR=${LOCAL_RCH_TMPDIR_OVERRIDE}" "applied" "darwin_controlmaster_socket_guard" "none" "$(basename "${STDOUT_FILE}")"
+fi
+
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" == /* ]]; then
+  emit_log "preflight" "rch_target_dir_sanitizer" "inherited=${INHERITED_CARGO_TARGET_DIR}" "applied" "absolute_target_dir_rewritten_for_remote_exec" "none" "$(basename "${STDOUT_FILE}")"
 fi
 
 probe_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_probe.json"

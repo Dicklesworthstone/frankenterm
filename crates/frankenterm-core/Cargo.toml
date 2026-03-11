@@ -427,6 +427,16 @@ required-features = ["recorder-lexical"]
 [[test]]
 name = "proptest_daemon_bridge"
 path = "tests/proptest_daemon_bridge.rs"
+required-features = ["frankensearch"]
+
+[[test]]
+name = "proptest_step_results"
+path = "tests/proptest_step_results.rs"
+
+[[test]]
+name = "proptest_browser"
+path = "tests/proptest_browser.rs"
+required-features = ["browser"]
 
 [[test]]
 name = "recorder_recovery_drills"
