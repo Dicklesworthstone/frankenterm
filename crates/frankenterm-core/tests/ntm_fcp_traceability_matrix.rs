@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 const MATRIX_RELATIVE_PATH: &str = "docs/design/ntm-fcp-traceability-matrix.json";
+const ISSUES_JSONL_RELATIVE_PATH: &str = ".beads/issues.jsonl";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -26,11 +27,48 @@ fn matrix_path(root: &Path) -> PathBuf {
         .unwrap_or_else(|_| root.join(MATRIX_RELATIVE_PATH))
 }
 
+fn issues_jsonl_path(root: &Path) -> PathBuf {
+    root.join(ISSUES_JSONL_RELATIVE_PATH)
+}
+
 fn load_matrix(path: &Path) -> Value {
     let raw = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read matrix file {}: {err}", path.display()));
     serde_json::from_str::<Value>(&raw)
         .unwrap_or_else(|err| panic!("failed to parse matrix JSON {}: {err}", path.display()))
+}
+
+fn load_issue_ids(root: &Path) -> HashSet<String> {
+    let path = issues_jsonl_path(root);
+    let raw = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read issues jsonl {}: {err}", path.display()));
+
+    raw.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            let issue = serde_json::from_str::<Value>(trimmed).unwrap_or_else(|err| {
+                panic!(
+                    "failed to parse issues jsonl line {} in {}: {err}",
+                    index + 1,
+                    path.display()
+                )
+            });
+            let issue_id = string_field(&issue, "id").unwrap_or_else(|err| {
+                panic!(
+                    "missing/invalid issue id on issues jsonl line {} in {}: {err}",
+                    index + 1,
+                    path.display()
+                )
+            });
+
+            Some(issue_id.to_string())
+        })
+        .collect()
 }
 
 fn object_field<'a>(value: &'a Value, key: &str) -> Result<&'a Value, String> {
@@ -201,6 +239,38 @@ fn traceability_matrix_anchor_paths_exist() {
             );
         }
     }
+}
+
+#[test]
+fn traceability_matrix_mapped_bead_ids_exist_in_beads_export() {
+    let root = repo_root();
+    let path = matrix_path(&root);
+    let matrix = load_matrix(&path);
+    let entries = array_field(&matrix, "entries").expect("entries array should exist");
+    let issue_ids = load_issue_ids(&root);
+    let mut missing = Vec::new();
+
+    for entry in entries {
+        let capability_id =
+            string_field(entry, "capability_id").expect("capability_id should exist");
+        let mapped_bead_ids =
+            array_field(entry, "mapped_bead_ids").expect("mapped_bead_ids should exist");
+
+        for bead in mapped_bead_ids {
+            let bead_id = bead.as_str().unwrap_or_else(|| {
+                panic!("mapped bead id in `{capability_id}` should be a string")
+            });
+            if !issue_ids.contains(bead_id) {
+                missing.push(format!("{capability_id}:{bead_id}"));
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "traceability matrix references bead ids absent from .beads/issues.jsonl: {}",
+        missing.join(", ")
+    );
 }
 
 #[test]

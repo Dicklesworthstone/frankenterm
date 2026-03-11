@@ -72,6 +72,7 @@ echo "Log file:       ${LOG_FILE}"
 echo ""
 
 MATRIX_FILE="${ROOT_DIR}/docs/design/ntm-fcp-traceability-matrix.json"
+ISSUES_JSONL="${ROOT_DIR}/.beads/issues.jsonl"
 
 # ---------------------------------------------------------------------------
 # Scenario 1: Matrix artifact structure checks
@@ -114,6 +115,26 @@ else
   else
     emit_log "FAIL" "gap_mapping" "UNMAPPED_HIGH_MEDIUM" "E-TM-004" "${MATRIX_FILE}" "unmapped high/medium gaps"
     echo "  FAIL: found unmapped high/medium gaps"
+    fail
+  fi
+
+  if [ ! -f "${ISSUES_JSONL}" ]; then
+    emit_log "FAIL" "bead_reference_existence" "ISSUES_JSONL_MISSING" "E-TM-004A" "${ISSUES_JSONL}" "issues export missing"
+    echo "  FAIL: ${ISSUES_JSONL} not found"
+    fail
+  elif jq -s -e '
+      .[0:-1] as $issues
+      | .[-1] as $matrix
+      | ($issues | map(.id) | map({key: ., value: true}) | from_entries) as $issue_ids
+      | [ $matrix.entries[] | .mapped_bead_ids[]? | select($issue_ids[.] != true) ]
+      | length == 0
+    ' "${ISSUES_JSONL}" "${MATRIX_FILE}" >/dev/null; then
+    emit_log "PASS" "bead_reference_existence" "BEAD_REFERENCES_OK" "" "${MATRIX_FILE}" "mapped bead ids resolve in issues export"
+    echo "  PASS: all mapped bead ids resolve in .beads/issues.jsonl"
+    pass
+  else
+    emit_log "FAIL" "bead_reference_existence" "BEAD_REFERENCE_MISSING" "E-TM-004B" "${MATRIX_FILE}" "missing mapped bead ids in issues export"
+    echo "  FAIL: traceability matrix references missing bead ids"
     fail
   fi
 fi

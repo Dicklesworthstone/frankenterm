@@ -2,7 +2,7 @@
   "schema_version": "1.0.0",
   "artifact": "ntm-fcp-traceability-matrix",
   "bead_id": "ft-3681t.1.5.1",
-  "generated_at_utc": "2026-03-03T01:45:00Z",
+  "generated_at_utc": "2026-03-11T22:05:00Z",
   "entries": [
     {
       "capability_id": "ft.runtime.observation",
@@ -24,6 +24,28 @@
         "crates/frankenterm-core/src/ingest.rs"
       ],
       "evidence_notes": "Watcher bootstraps ObservationRuntime and enforces periodic discovery/capture loops."
+    },
+    {
+      "capability_id": "ft.runtime.compatibility_seam",
+      "capability_name": "Runtime compatibility seam for shared tokio/asupersync-adjacent primitives",
+      "source_domain": "frankenterm",
+      "status": "partial",
+      "gap_severity": "low",
+      "mapped_bead_ids": [
+        "ft-e34d9.10.2.3",
+        "ft-3681t.2",
+        "ft-3681t.3"
+      ],
+      "surfaces": [
+        "ft watch bootstrap",
+        "ft distributed agent",
+        "robot/distributed IPC helper paths"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/runtime_compat.rs",
+        "crates/frankenterm/src/main.rs"
+      ],
+      "evidence_notes": "runtime_compat already centralizes sync/channel/task/time seams and ships SURFACE_CONTRACT_V1 keep/replace/retire policy metadata; the seam is real and active, but still intentionally transitional."
     },
     {
       "capability_id": "ft.runtime.single_writer_lock",
@@ -64,6 +86,86 @@
         "docs/json-schema/wa-robot-envelope.json"
       ],
       "evidence_notes": "Robot responses consistently expose ok/data/error/error_code/hint/elapsed/version/now."
+    },
+    {
+      "capability_id": "ft.robot.search.diagnostics",
+      "capability_name": "Robot search explainability and index diagnostics surfaces",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": [
+        "ft-3681t.4.1",
+        "ft-3681t.4.5",
+        "ft-3681t.7.1"
+      ],
+      "surfaces": [
+        "ft robot search-explain",
+        "ft robot search-index stats",
+        "ft robot search-index reindex"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/search/facade.rs",
+        "crates/frankenterm-core/src/search_explain.rs",
+        "docs/json-schema/wa-robot-search-explain.json",
+        "docs/json-schema/wa-robot-search-index-stats.json",
+        "docs/json-schema/wa-robot-search-index-reindex.json"
+      ],
+      "evidence_notes": "Robot search diagnostics now expose explainability reasons, index freshness/count telemetry, and machine-triggerable reindex metadata with documented JSON schemas."
+    },
+    {
+      "capability_id": "ft.robot.agent_inventory",
+      "capability_name": "Robot-visible installed/running agent inventory and detection surfaces",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": [
+        "ft-3681t.3.1.1",
+        "ft-3681t.4.1",
+        "ft-3681t.8.5"
+      ],
+      "surfaces": [
+        "ft robot agents list",
+        "ft robot agents running",
+        "ft robot agents detect"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/agent_correlator.rs",
+        "docs/json-schema/wa-robot-agents-list.json",
+        "docs/json-schema/wa-robot-agents-running.json",
+        "docs/json-schema/wa-robot-agents-detect.json"
+      ],
+      "evidence_notes": "Robot agent inventory surfaces already serialize installed/running/configured summaries plus per-pane or per-install inventory entries, which makes local swarm-awareness machine-readable today."
+    },
+    {
+      "capability_id": "ft.robot.mission.tx_introspection",
+      "capability_name": "Mission explainability and transaction contract control surfaces",
+      "source_domain": "frankenterm",
+      "status": "partial",
+      "gap_severity": "low",
+      "mapped_bead_ids": [
+        "ft-3681t.3.7.1",
+        "ft-3681t.4.3",
+        "ft-3681t.4.4",
+        "ft-3681t.4.5"
+      ],
+      "surfaces": [
+        "ft robot mission state",
+        "ft robot mission decisions",
+        "ft robot tx plan",
+        "ft robot tx run",
+        "ft robot tx rollback",
+        "ft robot tx show"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/plan.rs",
+        "crates/frankenterm-core/src/mcp_missions.rs",
+        "crates/frankenterm-core/src/mission_events.rs",
+        "crates/frankenterm-core/src/tx_plan_compiler.rs"
+      ],
+      "evidence_notes": "Machine clients can already inspect filtered assignment state, decision payloads, tx legal transitions, and deterministic prepare/commit/compensation reports; schema stabilization and replay-compat hardening remain open in the downstream robot contract beads."
     },
     {
       "capability_id": "ft.patterns.detection",
