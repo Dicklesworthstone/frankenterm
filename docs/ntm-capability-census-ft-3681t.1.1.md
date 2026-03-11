@@ -13,6 +13,44 @@ NTM is a mature, feature-rich tmux session management platform for orchestrating
 
 **Key assessment**: NTM solved *tmux-based orchestration well*. FrankenTerm should solve *agent-agnostic orchestration* — the principles transfer, but the implementation details differ significantly.
 
+## Code-Grounded FrankenTerm Baseline (2026-03-11 delta)
+
+This census needs to stay connected to the current FrankenTerm codebase, not
+just the source NTM inventory. The highest-signal implementation anchors for
+downstream convergence work are:
+
+- `crates/frankenterm/src/main.rs`: monolithic CLI router for `watch`, `robot`,
+  `search`, `send`, `workflow`, `session`, `snapshot`, `doctor`, and MCP entry
+  paths. Track 4 robot-surface work will keep colliding here unless routing is
+  decomposed.
+- `crates/frankenterm-core/src/runtime.rs` +
+  `crates/frankenterm-core/src/ingest.rs`: passive observation runtime,
+  discovery loop, delta extraction, gap recording, and watcher orchestration.
+- `crates/frankenterm-core/src/storage.rs`,
+  `crates/frankenterm-core/src/search/*`,
+  `crates/frankenterm-core/src/patterns.rs`,
+  `crates/frankenterm-core/src/events.rs`: durable eventing, search, and
+  detection backbone that already covers a large part of NTM's monitoring and
+  analytics value.
+- `crates/frankenterm-core/src/policy.rs`,
+  `crates/frankenterm-core/src/approval.rs`,
+  `crates/frankenterm-core/src/command_guard.rs`: mutation authorization,
+  approval, and safety gates.
+- `crates/frankenterm-core/src/robot_types.rs`,
+  `crates/frankenterm-core/src/mcp.rs`,
+  `crates/frankenterm-core/src/mcp_bridge.rs`: machine-facing control plane and
+  MCP parity surfaces.
+- `crates/frankenterm-core/src/wezterm.rs`,
+  `crates/frankenterm-gui/src/native_bridge.rs`,
+  `crates/frankenterm-mux-server/src/main.rs`,
+  `crates/frankenterm-mux-server-impl/src/lib.rs`: current backend/mux
+  compatibility seam and the split between CLI, GUI, and headless mux server.
+
+The practical takeaway is that FrankenTerm already has strong building blocks
+for NTM-style observability, automation, and machine control, but the remaining
+gaps are concentrated in first-class swarm coordination, native mux/session
+semantics, and a less monolithic command-routing surface.
+
 ---
 
 ## Command Taxonomy (150+ commands)
@@ -85,6 +123,29 @@ Strategies: manual, adversarial, consensus, creative, analytical, deliberative, 
 
 ### R. Multi-Project Orchestration (5 commands)
 `swarm` (+ `stop`), `coordinator`, `controller`, `worktrees`
+
+## NTM Domain -> FrankenTerm Current-State Mapping
+
+| NTM Domain | Closest FrankenTerm Surface(s) | Classification | Current Implementation Anchors | Code-Grounded Gap / Note |
+|---|---|---|---|---|
+| Session lifecycle | `ft watch`, `ft status`, `ft stop`, `ft snapshot *`, `ft session *`, standalone GUI/mux binaries | Partial parity | `crates/frankenterm/src/main.rs`, `crates/frankenterm-core/src/runtime.rs`, `crates/frankenterm-core/src/snapshot_engine.rs`, `crates/frankenterm-core/src/session_restore.rs`, `crates/frankenterm-mux-server/src/main.rs` | Lacks a first-class `create/spawn/adopt/attach` family comparable to NTM's session-oriented operator verbs. |
+| Agent management | `ft send`, `ft robot send`, workflow handlers, pane reservations | Partial parity | `crates/frankenterm/src/main.rs`, `crates/frankenterm-core/src/policy.rs`, `crates/frankenterm-core/src/workflows/*`, `crates/frankenterm-core/src/storage.rs` | Strong per-pane mutation path, but no native type-targeted fanout or scale semantics equivalent to NTM's agent mix controls. |
+| Session navigation and display | `ft status`, `ft show`, `ft tui`, GUI surfaces | Partial parity | `crates/frankenterm/src/main.rs`, `crates/frankenterm-core/src/tui.rs`, `crates/frankenterm-gui/src/main.rs` | Current coverage is more diagnostic than operational; NTM-style dashboard, palette, and session navigation UX is not yet the primary path. |
+| Output capture and analysis | `ft get-text`, `ft search`, `ft robot get-text`, `ft robot search`, `ft events` | Superset | `crates/frankenterm-core/src/runtime.rs`, `crates/frankenterm-core/src/ingest.rs`, `crates/frankenterm-core/src/storage.rs`, `crates/frankenterm-core/src/search/*` | FrankenTerm already exceeds NTM here with durable deltas, explicit gaps, FTS, and semantic/hybrid search. |
+| Monitoring, health, analytics | `ft events`, `ft triage`, `ft doctor`, metrics, audit surfaces | Superset | `crates/frankenterm-core/src/events.rs`, `crates/frankenterm-core/src/storage.rs`, `crates/frankenterm-core/src/diagnostic.rs`, `crates/frankenterm-core/src/metrics.rs` | Strong foundation exists; the remaining work is operator presentation and mission-level rollups, not raw telemetry plumbing. |
+| Session persistence and recovery | `ft snapshot *`, `ft session *`, restore-on-watch startup | Partial parity | `crates/frankenterm-core/src/snapshot_engine.rs`, `crates/frankenterm-core/src/session_restore.rs`, `crates/frankenterm/src/main.rs` | Core persistence exists, but NTM-style operator-facing save/restore ergonomics are still uneven. |
+| Git integration and hooks | repo hook installer, diagnostics, external automation | Drop / defer | `scripts/install-hooks.sh`, `.git/hooks/pre-commit`, selected CLI diagnostics | NTM-style git and hook orchestration is not a core FrankenTerm differentiator and should stay decoupled unless it directly serves swarm safety. |
+| Context and memory management | `cass`, accounts, mission/planner scaffolding, search/replay surfaces | Partial parity | `crates/frankenterm-core/src/cass.rs`, `crates/frankenterm-core/src/accounts.rs`, `crates/frankenterm-core/src/plan.rs` | Pieces exist, but there is no single in-core context-rotation or memory-management workflow comparable to NTM. |
+| Approval and conflict management | `ft approve`, policy decisions, reservations, Agent Mail integration outside core | Superset / gap | `crates/frankenterm-core/src/policy.rs`, `crates/frankenterm-core/src/approval.rs`, `crates/frankenterm-core/src/storage.rs` | FrankenTerm is stronger on policy and audit, but work claims and cross-agent conflict handling are still partly externalized. |
+| Workflow and task orchestration | `ft workflow *`, tx and mission surfaces, Robot/MCP tools | Partial parity | `crates/frankenterm-core/src/workflows/*`, `crates/frankenterm-core/src/plan.rs`, `crates/frankenterm-core/src/mcp.rs`, `crates/frankenterm/src/main.rs` | Durable workflow substrate exists; mission-level assignment, claim, and rebalance semantics remain unfinished. |
+| Ensemble reasoning | no first-class equivalent yet | Gap | `crates/frankenterm-core/src/plan.rs`, related mission orchestration modules | NTM's explicit ensemble strategies are not yet a native FrankenTerm feature family. |
+| Policy, safety, access control | `ft send` dry-run and policy checks, approvals, audit chain, command guard | Superset | `crates/frankenterm-core/src/policy.rs`, `crates/frankenterm-core/src/approval.rs`, `crates/frankenterm-core/src/command_guard.rs`, `crates/frankenterm-core/src/policy_*` | This is already one of FrankenTerm's strongest convergence advantages over NTM. |
+| Notifications and messaging | event notifications, desktop/email hooks, Agent Mail used alongside ft | Partial parity | `crates/frankenterm-core/src/notifications.rs`, `crates/frankenterm-core/src/desktop_notify.rs`, `crates/frankenterm-core/src/email_notify.rs` | Notification plumbing exists, but an in-core mailbox and threading surface is still external to FrankenTerm proper. |
+| Redaction, privacy, encryption | redacted read/search paths, diagnostic redaction, policy guards | Superset | `crates/frankenterm-core/src/diagnostic_redaction.rs`, `crates/frankenterm-core/src/policy.rs`, `crates/frankenterm-core/src/storage.rs` | Secret-safe read surfaces are already a first-class design constraint. |
+| Project and template management | config profiles, setup flows, session/template docs | Partial parity | `crates/frankenterm-core/src/config_profiles.rs`, `crates/frankenterm/src/main.rs`, `docs/*` | Some scaffolding exists, but NTM's template, persona, and project bootstrapping story is broader than current ft UX. |
+| Configuration and system tooling | `ft config *`, `ft setup`, `ft doctor`, version/build metadata | Parity | `crates/frankenterm/src/main.rs`, `crates/frankenterm-core/src/config.rs`, `crates/frankenterm-core/src/logging.rs` | This area is already serviceable and mostly needs polish rather than new architecture. |
+| Advanced diagnostics | `ft triage`, `ft diag bundle`, replay, forensics, and export surfaces | Superset | `crates/frankenterm-core/src/diagnostic.rs`, `crates/frankenterm-core/src/incident_bundle.rs`, `crates/frankenterm-core/src/forensic_export.rs` | FrankenTerm's evidence-first diagnostics path is broader than NTM's current CLI model. |
+| Multi-project orchestration | distributed mode, headless mux server, future mission control | Gap | `crates/frankenterm-core/src/distributed.rs`, `crates/frankenterm-mux-server*`, `crates/frankenterm-core/src/plan.rs` | Early primitives exist, but there is no finished native equivalent to NTM's multi-project swarm and controller workflow yet. |
 
 ---
 
@@ -199,6 +260,24 @@ Green (all pass) → Yellow (warnings) → Red (failures) → Black (critical)
 
 ### Audit Trail
 Who, What, When, Why, Result — stored in `~/.cache/ntm/audit/{session}.jsonl`
+
+## Downstream Implementation Pressure Points
+
+1. `crates/frankenterm/src/main.rs` is the current command-surface choke point.
+   Any serious NTM-parity expansion in `ft robot`, mission control, or session
+   verbs will keep colliding here until routing is decomposed.
+2. `crates/frankenterm-core/src/wezterm.rs` and the
+   `crates/frankenterm-mux-server*` split define the transition seam from
+   compatibility backend to native mux ownership. Track 2 work should treat
+   this boundary as a first-class migration target.
+3. `runtime.rs` + `ingest.rs` + `storage.rs` + `patterns.rs` + `events.rs`
+   already realize much of NTM's observability and health value. Downstream
+   work should build on those subsystems rather than recreate parallel
+   coordinator state stores.
+4. Work claims, file coordination, and mailbox-style collaboration are still
+   split between in-repo primitives and external Agent Mail/Beads workflows.
+   Track 3, 4, and 6 convergence work needs an explicit decision on what
+   becomes native to FrankenTerm versus what remains an adjacent operating tool.
 
 ---
 

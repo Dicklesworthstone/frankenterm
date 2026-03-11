@@ -23,16 +23,48 @@ This artifact is intended to remove ambiguity for downstream implementation bead
 | Domain | Current FrankenTerm Capability | Surface | Implementation Anchors |
 |---|---|---|---|
 | Runtime observation | Pane discovery, capture, delta extraction, gap semantics | `ft watch`, `ft status` | `crates/frankenterm-core/src/runtime.rs`, `crates/frankenterm-core/src/ingest.rs` |
+| Runtime compatibility seam | Shared async/runtime/channel/task/time abstraction for watcher, IPC, distributed mode | watch/distributed/IPC code paths | `crates/frankenterm-core/src/runtime_compat.rs`, `crates/frankenterm/src/main.rs` |
 | Detection | Multi-agent pattern detection (codex/claude/gemini/wezterm) | `ft robot rules *`, `ft events` | `crates/frankenterm-core/src/patterns.rs`, `crates/frankenterm-core/src/events.rs` |
 | Durable eventing | Persisted events with triage, labels, notes, dedupe keys | `ft events`, `ft robot events` | `crates/frankenterm-core/src/storage.rs` (`events`, `event_labels`, `event_notes`) |
 | Search | Lexical FTS + semantic/hybrid facade | `ft search`, `ft robot search` | `crates/frankenterm-core/src/storage.rs`, `crates/frankenterm-core/src/search/*` |
 | Workflow automation | Event-driven workflows with pane locks and persistence | `ft workflow *`, `ft robot workflow *` | `crates/frankenterm-core/src/workflows/*`, `crates/frankenterm-core/src/events.rs`, `crates/frankenterm-core/src/storage.rs` |
 | Safe mutation gates | Capability/rate-limit/approval policy before send/run | `ft send`, `ft approve`, MCP tools | `crates/frankenterm-core/src/policy.rs`, `crates/frankenterm-core/src/approval.rs`, `crates/frankenterm-core/src/command_guard.rs` |
 | Machine API | Robot envelope + MCP parity | `ft robot *`, `ft mcp serve` | `crates/frankenterm-core/src/robot_types.rs`, `crates/frankenterm-core/src/mcp.rs` |
+| Robot search diagnostics | Explainability + index maintenance surfaces for machine clients | `ft robot search-explain`, `ft robot search-index *` | `crates/frankenterm/src/main.rs`, `crates/frankenterm-core/src/search/facade.rs`, `crates/frankenterm-core/src/search_explain.rs` |
+| Agent inventory | Installed/running agent detection exposed to robot callers | `ft robot agents list/running/detect` | `crates/frankenterm/src/main.rs`, `crates/frankenterm-core/src/agent_correlator.rs` |
+| Mission and tx introspection | Filtered mission state/decisions plus transaction plan/run/rollback/show | `ft robot mission *`, `ft robot tx *` | `crates/frankenterm/src/main.rs`, `crates/frankenterm-core/src/plan.rs`, `crates/frankenterm-core/src/mcp_missions.rs`, `crates/frankenterm-core/src/tx_plan_compiler.rs` |
 | Session continuity | Snapshots/session restore tracks | `ft snapshot *`, `ft session *` | `crates/frankenterm-core/src/snapshot_engine.rs`, `crates/frankenterm-core/src/session_restore.rs` |
 | Reservation/coordination | Pane-level reservations and ownership metadata | `ft reserve`, `ft reservations` | `crates/frankenterm-core/src/storage.rs` (`pane_reservations`), `crates/frankenterm-core/src/policy.rs` |
 | Headless/remote mux | Dedicated mux server + implementation crate | `frankenterm-mux-server` | `crates/frankenterm-mux-server*` |
 | Distributed transport (feature-gated) | Agent/aggregator mode for multi-host ingest | `ft distributed agent` | `crates/frankenterm-core/src/distributed.rs`, CLI distributed subcommands in `crates/frankenterm/src/main.rs` |
+
+### Current Operator and Backend Chokepoints
+
+- `crates/frankenterm/src/main.rs` is the current operator and robot routing
+  chokepoint. Session, robot, search, send, workflow, snapshot, and MCP command
+  surfaces all converge there, which is important for file ownership planning in
+  `ft-3681t.2.*`, `ft-3681t.3.*`, and `ft-3681t.4.*`.
+- `crates/frankenterm-core/src/wezterm.rs` is still the critical compatibility
+  seam between FrankenTerm control-plane logic and the current backend bridge.
+  Native mux convergence work should treat this as a temporary boundary rather
+  than a stable product-layer abstraction.
+- `crates/frankenterm-core/src/runtime_compat.rs` is another active convergence
+  chokepoint. It centralizes the temporary dual-runtime seam and already ships a
+  `SURFACE_CONTRACT_V1` catalog that marks exported APIs as keep/replace/retire.
+  New runtime-facing work should shrink that seam deliberately instead of adding
+  fresh ad hoc tokio-only dependencies around it.
+- `crates/frankenterm-gui/src/native_bridge.rs` plus
+  `crates/frankenterm-mux-server/src/main.rs` and
+  `crates/frankenterm-mux-server-impl/src/lib.rs` define the current split
+  between GUI event emission, headless mux hosting, and shared domain
+  registration. This split is already usable, but still needs convergence-level
+  cleanup before it can carry the full NTM-superset story cleanly.
+- `crates/frankenterm-core/src/plan.rs`, `crates/frankenterm-core/src/mcp_missions.rs`,
+  and `crates/frankenterm-core/src/tx_plan_compiler.rs` already define mission
+  nouns, filtered explainability payloads, transaction lifecycle states, and
+  deterministic failure/compensation paths. Downstream swarm and robot work
+  should treat mission/tx as an existing contract surface to harden rather than
+  a greenfield concept.
 
 ## NTM Capability Mapping (Parity / Superset / Gap)
 
