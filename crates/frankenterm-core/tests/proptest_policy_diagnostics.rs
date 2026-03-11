@@ -325,4 +325,104 @@ proptest! {
             prop_assert!(obj.contains_key("display_name"), "missing display_name field");
         }
     }
+
+    // =========================================================================
+    // PolicyEngineTelemetrySnapshot tests
+    // =========================================================================
+
+    /// Unified telemetry snapshot serializes to valid JSON.
+    #[test]
+    fn telemetry_snapshot_serializes(
+        (rate_pane, rate_global, require_prompt) in arb_engine_params(),
+        now_ms in arb_now_ms(),
+    ) {
+        let mut engine = PolicyEngine::new(rate_pane, rate_global, require_prompt);
+        let snap = engine.telemetry_snapshot(now_ms);
+        let json = serde_json::to_string(&snap);
+        prop_assert!(json.is_ok(), "telemetry snapshot serialization failed: {:?}", json.err());
+    }
+
+    /// Unified telemetry snapshot JSON roundtrips.
+    #[test]
+    fn telemetry_snapshot_json_roundtrip(
+        (rate_pane, rate_global, require_prompt) in arb_engine_params(),
+        now_ms in arb_now_ms(),
+    ) {
+        let mut engine = PolicyEngine::new(rate_pane, rate_global, require_prompt);
+        let snap = engine.telemetry_snapshot(now_ms);
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: frankenterm_core::policy::PolicyEngineTelemetrySnapshot =
+            serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.captured_at_ms, now_ms);
+        prop_assert_eq!(back.namespace_isolation_enabled, snap.namespace_isolation_enabled);
+        prop_assert_eq!(back.decision_log.current_entries, snap.decision_log.current_entries);
+        prop_assert_eq!(back.approval_tracker.total, snap.approval_tracker.total);
+    }
+
+    /// Unified telemetry snapshot captured_at_ms matches input.
+    #[test]
+    fn telemetry_snapshot_timestamp(
+        (rate_pane, rate_global, require_prompt) in arb_engine_params(),
+        now_ms in arb_now_ms(),
+    ) {
+        let mut engine = PolicyEngine::new(rate_pane, rate_global, require_prompt);
+        let snap = engine.telemetry_snapshot(now_ms);
+        prop_assert_eq!(snap.captured_at_ms, now_ms);
+    }
+
+    /// Unified telemetry snapshot JSON contains all top-level subsystem keys.
+    #[test]
+    fn telemetry_snapshot_has_all_subsystem_keys(
+        (rate_pane, rate_global, require_prompt) in arb_engine_params(),
+        now_ms in arb_now_ms(),
+    ) {
+        let mut engine = PolicyEngine::new(rate_pane, rate_global, require_prompt);
+        let snap = engine.telemetry_snapshot(now_ms);
+        let json = serde_json::to_string(&snap).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = val.as_object().unwrap();
+        let expected_keys = [
+            "captured_at_ms", "decision_log", "quarantine", "audit_chain",
+            "compliance", "credential_broker", "connector_governor",
+            "connector_registry", "connector_reliability", "bundle_registry",
+            "connector_mesh", "ingestion_pipeline", "namespace_registry",
+            "approval_tracker", "revocation_registry", "namespace_isolation_enabled",
+        ];
+        for key in &expected_keys {
+            prop_assert!(
+                obj.contains_key(*key),
+                "missing top-level key '{}' in telemetry snapshot",
+                key,
+            );
+        }
+    }
+
+    /// Pretty-printed JSON also roundtrips.
+    #[test]
+    fn telemetry_snapshot_pretty_json_roundtrip(
+        (rate_pane, rate_global, require_prompt) in arb_engine_params(),
+        now_ms in arb_now_ms(),
+    ) {
+        let mut engine = PolicyEngine::new(rate_pane, rate_global, require_prompt);
+        let snap = engine.telemetry_snapshot(now_ms);
+        let json = serde_json::to_string_pretty(&snap).unwrap();
+        let back: frankenterm_core::policy::PolicyEngineTelemetrySnapshot =
+            serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.captured_at_ms, snap.captured_at_ms);
+    }
+
+    /// Snapshot is idempotent: two calls on same engine yield consistent data.
+    #[test]
+    fn telemetry_snapshot_idempotent(
+        (rate_pane, rate_global, require_prompt) in arb_engine_params(),
+        now_ms in arb_now_ms(),
+    ) {
+        let mut engine = PolicyEngine::new(rate_pane, rate_global, require_prompt);
+        let s1 = engine.telemetry_snapshot(now_ms);
+        let s2 = engine.telemetry_snapshot(now_ms);
+        prop_assert_eq!(s1.captured_at_ms, s2.captured_at_ms);
+        prop_assert_eq!(s1.decision_log.current_entries, s2.decision_log.current_entries);
+        prop_assert_eq!(s1.quarantine.active_quarantines, s2.quarantine.active_quarantines);
+        prop_assert_eq!(s1.namespace_isolation_enabled, s2.namespace_isolation_enabled);
+    }
 }
