@@ -6803,23 +6803,6 @@ mod tests {
         );
     }
 
-    /// Stricter tab bar check for wide terminals (>= 80 cols).
-    fn assert_tab_bar_full(text: &str, active_view: View) {
-        let first_line = text.lines().next().expect("non-empty frame");
-        for v in View::all() {
-            assert!(
-                first_line.contains(v.name()),
-                "Tab bar missing '{name}' in: {first_line}",
-                name = v.name()
-            );
-        }
-        assert!(
-            first_line.contains(active_view.name()),
-            "Active view '{name}' not in tab bar: {first_line}",
-            name = active_view.name()
-        );
-    }
-
     fn assert_footer_present(text: &str, active_view: View) {
         let last_line = text.lines().last().expect("non-empty frame");
         // Footer should mention the current view name
