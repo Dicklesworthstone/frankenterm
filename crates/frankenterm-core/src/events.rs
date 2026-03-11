@@ -152,7 +152,13 @@ pub enum Event {
     },
 
     /// Gap detected in capture stream
-    GapDetected { pane_id: u64, reason: String },
+    GapDetected {
+        pane_id: u64,
+        seq_before: u64,
+        seq_after: u64,
+        reason: String,
+        detected_at_ms: i64,
+    },
 
     /// Pattern detected
     PatternDetected {
@@ -592,17 +598,21 @@ impl EventBus {
     /// Snapshot queue depths and oldest message lag per channel
     #[must_use]
     pub fn stats(&self) -> EventBusStats {
+        let delta_queued = self.delta_sender.len();
+        let detection_queued = self.detection_sender.len();
+        let signal_queued = self.signal_sender.len();
+
         EventBusStats {
             capacity: self.capacity,
-            delta_queued: self.delta_sender.len(),
-            detection_queued: self.detection_sender.len(),
-            signal_queued: self.signal_sender.len(),
+            delta_queued,
+            detection_queued,
+            signal_queued,
             delta_subscribers: self.delta_sender.receiver_count(),
             detection_subscribers: self.detection_sender.receiver_count(),
             signal_subscribers: self.signal_sender.receiver_count(),
-            delta_oldest_lag_ms: Self::oldest_lag_ms(&self.delta_times),
-            detection_oldest_lag_ms: Self::oldest_lag_ms(&self.detection_times),
-            signal_oldest_lag_ms: Self::oldest_lag_ms(&self.signal_times),
+            delta_oldest_lag_ms: Self::oldest_lag_ms(&self.delta_times, delta_queued),
+            detection_oldest_lag_ms: Self::oldest_lag_ms(&self.detection_times, detection_queued),
+            signal_oldest_lag_ms: Self::oldest_lag_ms(&self.signal_times, signal_queued),
         }
     }
 
@@ -627,8 +637,16 @@ impl EventBus {
         }
     }
 
-    fn oldest_lag_ms(times: &Mutex<VecDeque<Instant>>) -> Option<u64> {
-        let oldest = times.lock().ok()?.front().copied()?;
+    fn oldest_lag_ms(times: &Mutex<VecDeque<Instant>>, queued_len: usize) -> Option<u64> {
+        if queued_len == 0 {
+            return None;
+        }
+
+        let oldest = {
+            let guard = times.lock().ok()?;
+            let idx = guard.len().saturating_sub(queued_len);
+            guard.get(idx).copied()?
+        };
         let elapsed_ms = oldest.elapsed().as_millis();
         u64::try_from(elapsed_ms).ok()
     }
@@ -1609,6 +1627,50 @@ mod tests {
         assert_eq!(stats.delta_subscribers, 1);
         assert_eq!(stats.delta_queued, 2);
         assert!(stats.delta_oldest_lag_ms.is_some());
+    }
+
+    #[test]
+    fn stats_clear_oldest_lag_when_queue_is_drained() {
+        run_async_test(async {
+            let bus = EventBus::new(4);
+            let mut delta_sub = bus.subscribe_deltas();
+
+            let _ = bus.publish(Event::SegmentCaptured {
+                pane_id: 1,
+                seq: 0,
+                content_len: 1,
+            });
+            let _ = bus.publish(Event::SegmentCaptured {
+                pane_id: 1,
+                seq: 1,
+                content_len: 1,
+            });
+
+            delta_sub.recv().await.unwrap();
+            delta_sub.recv().await.unwrap();
+
+            let stats = bus.stats();
+            assert_eq!(stats.delta_queued, 0);
+            assert_eq!(stats.delta_oldest_lag_ms, None);
+        });
+    }
+
+    #[test]
+    fn oldest_lag_uses_oldest_buffered_timestamp() {
+        let now = Instant::now();
+        let times = Mutex::new(VecDeque::from([
+            now - Duration::from_millis(30),
+            now - Duration::from_millis(20),
+            now - Duration::from_millis(10),
+        ]));
+
+        let lag_one = EventBus::oldest_lag_ms(&times, 1).unwrap();
+        let lag_two = EventBus::oldest_lag_ms(&times, 2).unwrap();
+        let lag_three = EventBus::oldest_lag_ms(&times, 3).unwrap();
+
+        assert!(lag_three >= lag_two);
+        assert!(lag_two >= lag_one);
+        assert_eq!(EventBus::oldest_lag_ms(&times, 0), None);
     }
 
     #[test]
