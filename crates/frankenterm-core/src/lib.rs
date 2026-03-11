@@ -160,6 +160,7 @@ pub mod disk_scoring;
 pub mod docs_gen;
 pub mod drift;
 pub mod dry_run;
+pub mod dual_run_shadow_comparator;
 pub mod durable_state;
 pub mod edit_distance;
 pub mod email_notify;
