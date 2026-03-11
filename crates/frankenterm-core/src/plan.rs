@@ -3113,14 +3113,32 @@ pub fn evaluate_prepare_phase(
             outcome: TxPrepareOutcome::Denied,
         });
     }
-    let all_ready = gate_inputs.iter().all(|g| {
-        g.policy_passed && g.reservation_available && g.approval_satisfied && g.target_liveness
-    });
-    if !all_ready && gate_inputs.len() < plan.steps.len() {
-        return Ok(TxPrepareReport {
-            outcome: TxPrepareOutcome::Deferred,
-        });
+
+    let mut all_ready = true;
+    for step in &plan.steps {
+        let mut matched_any = false;
+        let mut step_ready = true;
+
+        for gate in gate_inputs
+            .iter()
+            .filter(|gate| gate.step_id == step.step_id)
+        {
+            matched_any = true;
+            step_ready &= gate.policy_passed
+                && gate.reservation_available
+                && gate.approval_satisfied
+                && gate.target_liveness;
+        }
+
+        if !matched_any {
+            return Ok(TxPrepareReport {
+                outcome: TxPrepareOutcome::Deferred,
+            });
+        }
+
+        all_ready &= step_ready;
     }
+
     Ok(TxPrepareReport {
         outcome: if all_ready {
             TxPrepareOutcome::AllReady
@@ -5935,6 +5953,85 @@ mod tests {
         assert_eq!(inputs[1].reason_code, "compensation_failed_injected");
         assert_eq!(inputs[1].error_code.as_deref(), Some("FTX4999"));
         assert!(inputs[2].success);
+    }
+
+    #[test]
+    fn tx_prepare_phase_defers_when_any_plan_step_lacks_gate_input() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let gate_inputs = vec![
+            TxPrepareGateInput {
+                step_id: TxStepId("tx-step:1".to_string()),
+                policy_passed: true,
+                policy_reason_code: None,
+                reservation_available: true,
+                reservation_reason_code: None,
+                approval_satisfied: true,
+                approval_reason_code: None,
+                target_liveness: true,
+                liveness_reason_code: None,
+            },
+            TxPrepareGateInput {
+                step_id: TxStepId("tx-step:1".to_string()),
+                policy_passed: true,
+                policy_reason_code: None,
+                reservation_available: true,
+                reservation_reason_code: None,
+                approval_satisfied: true,
+                approval_reason_code: None,
+                target_liveness: true,
+                liveness_reason_code: None,
+            },
+            TxPrepareGateInput {
+                step_id: TxStepId("tx-step:2".to_string()),
+                policy_passed: true,
+                policy_reason_code: None,
+                reservation_available: true,
+                reservation_reason_code: None,
+                approval_satisfied: true,
+                approval_reason_code: None,
+                target_liveness: true,
+                liveness_reason_code: None,
+            },
+        ];
+
+        let report = evaluate_prepare_phase(
+            &contract.intent.tx_id,
+            &contract.plan,
+            &gate_inputs,
+            MissionKillSwitchLevel::Off,
+            1_700_000_000_000,
+        )
+        .expect("prepare report");
+
+        assert_eq!(report.outcome, TxPrepareOutcome::Deferred);
+    }
+
+    #[test]
+    fn tx_prepare_phase_ignores_unrelated_gate_inputs() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let mut gate_inputs = mission_tx_prepare_gate_inputs(&contract);
+        gate_inputs.push(TxPrepareGateInput {
+            step_id: TxStepId("tx-step:unrelated".to_string()),
+            policy_passed: false,
+            policy_reason_code: Some("policy_denied".to_string()),
+            reservation_available: false,
+            reservation_reason_code: Some("reservation_missing".to_string()),
+            approval_satisfied: false,
+            approval_reason_code: Some("approval_missing".to_string()),
+            target_liveness: false,
+            liveness_reason_code: Some("target_unreachable".to_string()),
+        });
+
+        let report = evaluate_prepare_phase(
+            &contract.intent.tx_id,
+            &contract.plan,
+            &gate_inputs,
+            MissionKillSwitchLevel::Off,
+            1_700_000_000_000,
+        )
+        .expect("prepare report");
+
+        assert_eq!(report.outcome, TxPrepareOutcome::AllReady);
     }
 
     fn receipt_seq(receipt: &serde_json::Value) -> u64 {
