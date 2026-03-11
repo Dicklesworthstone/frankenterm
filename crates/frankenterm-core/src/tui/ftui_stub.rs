@@ -4226,13 +4226,13 @@ mod tests {
     #[test]
     fn render_panes_shows_header_and_columns() {
         let mut pool = ftui::GraphemePool::new();
-        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+        let mut frame = ftui::Frame::new(100, 30, &mut pool);
 
         let mut model = make_model(MockQuery::healthy());
         model.refresh_data();
 
         let filtered = model.filtered_pane_indices();
-        render_panes_view(&mut frame, 0, 100, 22, &model.panes, &filtered, 0, None);
+        render_panes_view(&mut frame, 0, 100, 28, &model.panes, &filtered, 0, None);
 
         let row0 = read_row(&frame, 0);
         assert!(row0.contains("Panes (3/3)"));
@@ -4795,7 +4795,7 @@ mod tests {
     #[test]
     fn render_events_shows_header_and_columns() {
         let mut pool = ftui::GraphemePool::new();
-        let mut frame = ftui::Frame::new(100, 24, &mut pool);
+        let mut frame = ftui::Frame::new(100, 30, &mut pool);
 
         let mut model = make_model(MockQuery::with_events());
         model.refresh_data();
@@ -4806,7 +4806,7 @@ mod tests {
             &mut frame,
             0,
             100,
-            22,
+            28,
             &model.view_state.events,
             &filtered,
             clamped,
